@@ -419,7 +419,7 @@ if you change what is built and do not change this, delete it instead.
 | 7a loading | ✅ `loading_ui.rs` |
 | 7b slow, and failed | ✅ `loading_ui.rs` |
 | 8a edit record | ✅ `vault_window/detail_edit.rs` |
-| 8b pick a running window | ✅ `detail_edit::running_app_rows` |
+| 8b pick a running window | ✅ `detail_edit::app_window_picker` — 8b's card (header band, monogram rows, wash + `↵` on the staged row, `already a target` chip, `Match this window by`, `Add target`/`Cancel` footer), drawn inline in the edit form rather than as a modal, over `detail_edit::running_app_rows`. The match band **reports** the rule instead of offering 8b's three radios: `match_engine` has only process and hosted-frame-title, so two of them would persist a choice nothing acts on. See that function's header |
 
 ### Keystroke sequences (turn 4)
 

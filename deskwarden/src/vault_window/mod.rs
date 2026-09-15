@@ -5188,6 +5188,12 @@ pub fn build_frame_with_search(
                         // lazy (see `EditDraft::offer_bank_domains`), so a
                         // frame with the picker shut walks nothing.
                         draft.offer_bank_domains(&items);
+                        // Design 8b's `already a target` chip, from the same
+                        // list and for the same reason: which programs the
+                        // vault's OTHER items already bind to is a fact this
+                        // scope holds and the form does not. Lazy in the same
+                        // way -- a frame with 8b's card shut walks nothing.
+                        draft.offer_bound_processes(&items, selected_item.as_ref());
                         // **8a's Sharing and History cards' two facts.**
                         // The directory is the sidebar's own -- one
                         // reader of `rest::organizations` in this

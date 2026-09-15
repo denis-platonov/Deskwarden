@@ -96,7 +96,7 @@ pub struct CardDraft {
     /// [`EditDraft::content_digest`] for the same reason.
     pub bank_picking: bool,
     /// The picker's search box. View state, like
-    /// [`AppMatchDraft::window_filter`].
+    /// [`AppMatchDraft::picking`].
     pub bank_filter: String,
     /// The domains the picker offers: every domain the vault's own items
     /// already resolve to, supplied by [`EditDraft::offer_bank_domains`].
@@ -661,7 +661,34 @@ pub struct AppMatchDraft {
     /// lookup per window; doing that on every repaint of an open form is the
     /// per-frame I/O this feature is otherwise careful to avoid.
     pub windows: Vec<AppWindowRow>,
-    pub window_filter: String,
+    /// The row the user has clicked in the list but has **not** yet added,
+    /// keyed by [`AppWindowRow::hwnd`].
+    ///
+    /// **Design 8b's card selects before it commits**: one row wears the blue
+    /// wash and the `\u{21b5}` keycap, and `Add target` in the footer is what
+    /// actually binds. This is that selection, and it is the handle rather
+    /// than the index for the reason [`AppWindowRow::hwnd`] gives -- Refresh
+    /// re-enumerates the desktop, and an index would then point at whatever
+    /// window happened to take that position.
+    ///
+    /// Nothing is written to the binding while this is set; a Cancel drops it
+    /// and the draft is exactly what it was.
+    pub picked: Option<isize>,
+    /// The executable names, **lowercased**, that OTHER items in the vault
+    /// already bind to -- what draws 8b's `already a target` chip.
+    ///
+    /// Filled by [`EditDraft::offer_bound_processes`], which the vault window
+    /// calls because the item list is the window's and `draw_detail_edit` has
+    /// never had one (the same arrangement, and the same reason, as
+    /// [`EditDraft::offer_bank_domains`]).
+    pub taken: Vec<String>,
+    /// Whether [`Self::taken`] has been filled for THIS opening of the list.
+    ///
+    /// A separate flag rather than "is the list empty", because empty is a
+    /// legitimate answer -- a vault whose only bound item is the one being
+    /// edited -- and a lazy fill keyed on emptiness would walk every item's
+    /// fields on every frame for exactly that vault.
+    pub taken_known: bool,
     /// The keystroke sequence, **as the stored string** rather than as a
     /// parsed value.
     ///
@@ -778,7 +805,9 @@ impl AppMatchDraft {
             trigger: NEW_BINDING_TRIGGER,
             picking: false,
             windows: Vec::new(),
-            window_filter: String::new(),
+            picked: None,
+            taken: Vec::new(),
+            taken_known: false,
             sequence: String::new(),
             previewing: false,
             literal_draft: String::new(),
@@ -821,7 +850,9 @@ impl AppMatchDraft {
             trigger: m.trigger,
             picking: false,
             windows: Vec::new(),
-            window_filter: String::new(),
+            picked: None,
+            taken: Vec::new(),
+            taken_known: false,
             // Verbatim. See the field's doc: this is the only copy, and it is
             // the one written back.
             sequence: m.sequence.clone(),
@@ -942,7 +973,38 @@ impl AppMatchDraft {
         self.title = if row.hosted { row.title.clone() } else { String::new() };
         self.path = row.exe_path.clone();
         self.bound = true;
-        self.picking = false;
+        self.close_picker();
+    }
+
+    /// Opens or shuts 8b's card, and clears everything that was only true
+    /// while it was open.
+    ///
+    /// **One writer of `picking`, so the three fields that hang off it cannot
+    /// be left behind by a second.** A stale [`Self::picked`] would paint the
+    /// wash on a row in the NEXT opening of the list -- a window the user has
+    /// not looked at, already staged for `Add target` -- and a stale
+    /// [`Self::taken_known`] would keep the `already a target` chips of a
+    /// vault that has been edited since.
+    pub fn set_picking(&mut self, open: bool) {
+        self.picking = open;
+        self.picked = None;
+        self.taken.clear();
+        self.taken_known = false;
+    }
+
+    /// [`Self::set_picking`] with `false`, which is what every way out of the
+    /// card does -- Cancel, `Add target`, Remove, and a save.
+    pub fn close_picker(&mut self) {
+        self.set_picking(false);
+    }
+
+    /// The row the user has staged, or `None` -- resolved through
+    /// [`Self::picked`]'s handle against the CURRENT enumeration, so a
+    /// Refresh that no longer lists the window simply un-stages it rather
+    /// than leaving `Add target` pointing at something that is gone.
+    pub fn picked_row(&self) -> Option<&AppWindowRow> {
+        let hwnd = self.picked?;
+        self.windows.iter().find(|w| w.hwnd == hwnd)
     }
 }
 
@@ -3121,6 +3183,48 @@ impl EditDraft {
         domains.sort();
         domains.dedup();
         self.card.bank_choices = domains;
+    }
+
+    /// Hands the window picker the executables **other items already bind
+    /// to** -- which is what draws design 8b's `already a target` chip.
+    ///
+    /// **This build really can know it**, and that is worth saying because the
+    /// chip looks like a judgement and is not one: an app binding is the
+    /// `deskwarden:app-match` custom field, `vault_bridge::extract_app_match`
+    /// reads it off any item, and `AppMatch::process` is the very string
+    /// `match_engine` keys on. So "some other login already claims this
+    /// program" is a fact about the vault the window is already holding, not
+    /// an inference.
+    ///
+    /// **Lowercased**, because Windows executable names are not
+    /// case-sensitive and a vault written by two different pickers can hold
+    /// both `Ledgerline.exe` and `ledgerline.exe`.
+    ///
+    /// **The item being edited is excluded.** A chip on the row this item is
+    /// already pointed at would read as somebody else's claim on it.
+    ///
+    /// Called by the vault window rather than by this form, and lazy, for
+    /// [`Self::offer_bank_domains`]'s two reasons exactly -- the item list is
+    /// the window's, and a frame with the card shut must walk nothing.
+    pub fn offer_bound_processes(&mut self, items: &[VaultItem], editing: Option<&VaultItem>) {
+        let Some(app) = self.app.as_mut() else {
+            return;
+        };
+        if !app.picking || app.taken_known {
+            return;
+        }
+        let editing_id = editing.map(|i| i.id.as_str());
+        let mut names: Vec<String> = items
+            .iter()
+            .filter(|i| Some(i.id.as_str()) != editing_id)
+            .filter_map(crate::vault_bridge::extract_app_match)
+            .map(|m| m.process.to_lowercase())
+            .filter(|p| !p.is_empty())
+            .collect();
+        names.sort();
+        names.dedup();
+        app.taken = names;
+        app.taken_known = true;
     }
 
     /// The app-binding half of [`Self::apply_to`], split out so the decision
@@ -5382,114 +5486,645 @@ pub fn sequence_warning(sequence: &str, source: &ResolveSource<'_>) -> Option<St
     Some(format!("{SEQUENCE_REFUSED_PREFIX}{}", refusal.message()))
 }
 
-/// The running-window list, shown under the buttons while `picking`.
-///
-/// **In the form, not a second window.** The tray's `picker_ui::run_picker`
-/// opens its own `eframe` loop on `main`'s thread, and the vault window is a
-/// blocking call on that same thread -- which is exactly why the read pane's
-/// card only *names* the tray flow instead of routing to it. eframe cannot nest
-/// event loops, so raising the tray picker from here would deadlock. What is
-/// reusable is the part that matters: `window_list::list_windows`, the one
-/// enumeration, reached through [`running_app_rows`]. The list is drawn with
-/// this form's own widgets, which costs a scroll area and buys a picker that
-/// cannot hang the window.
-/// The running-window list, opened by `Choose a running app\u{2026}` on the
-/// app block.
-///
-/// # Design 8b, and how far this is from it
-///
-/// 8b (`Pick a running window`) is a MODAL: a §5a-shaped card titled `Add a
-/// native app` with `6 windows open` at its right, rows of a 28-point
-/// monogram tile over a 13-point name and an 11-point mono executable, an
-/// `already a target` chip on the row that is one, the chosen row washed in
-/// blue, a `Match this window by` block of three radios -- `Process only`,
-/// `Process + title contains <box>`, `Exact title` -- with a verdict beside
-/// each (`too broad`, `recommended`, `breaks when the title changes`), and
-/// `Add target` / `Cancel` in a footer. This is an inline list under the
-/// button that opened it, with a filter box and one plain row per window.
-///
-/// The gap is recorded rather than closed, and the reasons are the app
-/// block's own one level up:
-///
-/// * **The radios would choose a match mode the matcher does not have.**
-///   `Process + title contains` and `Exact title` are two rules
-///   `match_engine` has never implemented; the one title match it does is the
-///   hosted-frame case, and [`AppMatchDraft::choose_window`] already records
-///   the title exactly when that case applies. A radio the user could set to
-///   `Exact title` on an ordinary window would persist a choice nothing acts
-///   on.
-/// * **The verdicts beside the radios are judgements this build cannot
-///   make.** `too broad -- every RDP session` requires knowing how many
-///   windows a process owns across time; this list sees one enumeration.
-/// * **A modal here would be a card inside a form inside a pane.** The row
-///   list is opened and closed in place so the form's own Save is still the
-///   only thing that writes, and the picker's answer is one draft field.
-///
-/// What IS 8b's: the rows are rows of name and executable, and the one
-/// refusal this build has -- a Store frame whose app cannot be identified --
-/// is drawn on the row through [`window_row_refusal`] rather than in a
-/// tooltip. 8b's greyed `Deskwarden -- can't target itself` row is not drawn
-/// because the row is not offered at all: [`running_app_rows`] excludes this
-/// process, so there is nothing to grey. The 28-point tile, the `already a
-/// target` chip and the row wash are not drawn, and would be the next thing
-/// to draw if this list is ever given 8b's card.
-fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
-    ui.horizontal(|ui| {
-        if theme::secondary_button(ui, "Refresh").clicked() {
-            app.windows = running_app_rows();
-        }
-        if theme::secondary_button(ui, "Close list").clicked() {
-            app.picking = false;
-        }
-    });
-    ui.add_space(6.0);
-    theme::section_text_field(ui, &mut app.window_filter, false);
-    ui.add_space(4.0);
+// ---------------------------------------------------------------------------
+// Design 8b, `Pick a running window`
+//
+// What 8b draws, read straight out of `docs/design/Deskwarden.dc.html`
+// (1 CSS px = 1 point, literally):
+//
+// * a card, `background: #ffffff; border: 1px solid #d7d3d3; border-radius:
+//   12px; box-shadow: 0 14px 34px rgba(45,43,43,.18); overflow: hidden`;
+// * a header band at `padding: 14px 18px; border-bottom: 1px solid #eae7e7`,
+//   holding `Add a native app` at `font-size: 15px; font-weight: 800` and, at
+//   the far right, `6 windows open` at `font-size: 12px; color: #9b9797`;
+// * a list at `padding: 8px` with `gap: 2px`, each row `display: flex;
+//   align-items: center; gap: 11px; padding: 9px 10px; border-radius: 8px`
+//   carrying
+//     - a `28x28` monogram tile, `border-radius: 7px; background: #f3f2f2;
+//       border: 1px solid #eae7e7`, its letters `font-size: 10px;
+//       font-weight: 700; color: #605d5d`,
+//     - a `flex: 1` column at `gap: 1px`: the window's name at `font-size:
+//       13px; font-weight: 600` over its executable in `ui-monospace` at
+//       `font-size: 11px; color: #9b9797`,
+//     - and a trailing chip -- `already a target` at `font-size: 11px; color:
+//       #7d7979; background: #f3f2f2; border-radius: 5px; padding: 2px 7px`;
+// * the chosen row washed: `background: #eef2fc; border: 1px solid #b8c7ea`,
+//   its tile `background: #ffffff; border: 1px solid #b8c7ea; color: #1b3fa0`,
+//   its name `font-weight: 700; color: #14307a` over `color: #444141`, and a
+//   `\u{21b5}` keycap in its chip slot -- `color: #ffffff; background:
+//   #1b3fa0; border-radius: 5px; padding: 3px 7px`;
+// * a row the picker will not take, at `opacity: 0.5`, with its reason in the
+//   subtitle after a `\u{b7}` (`deskwarden.exe \u{b7} can't target itself`);
+// * a `Match this window by` band at `padding: 14px 18px; border-top: 1px
+//   solid #eae7e7; background: #fbfaf9; gap: 10px`, its caption `font-size:
+//   11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase;
+//   color: #9b9797`, over three radio rows at `gap: 6px`, each `gap: 9px;
+//   font-size: 13px` with an 11px verdict pushed to the right;
+// * a footer at `padding: 12px 18px; border-top: 1px solid #eae7e7; gap: 9px`
+//   holding `Add target` (filled) and `Cancel` (outlined) at `height: 32px;
+//   padding: 0 14px; border-radius: 8px; font-size: 12px`, then a spacer and
+//   `Refreshes as windows open` at `font-size: 12px; color: #9b9797`.
+//
+// Every colour above is already named in `theme`: `#d7d3d3` is
+// `BORDER_STRONG`, `#eae7e7` is `HAIRLINE`, `#f3f2f2` is `CANVAS`, `#fbfaf9`
+// is `CARD_TINT`, `#9b9797` is `TEXT_GHOST`, `#7d7979` is `TEXT_FAINT`,
+// `#605d5d` is `TEXT_MUTED`, `#444141` is `TEXT_SECONDARY`, `#eef2fc` is
+// `BLUE_WASH`, `#b8c7ea` is `BLUE_EDGE`, `#1b3fa0` is `BLUE` and `#14307a` is
+// `BLUE_DEEP` -- so nothing below re-spells a hex.
+//
+// The departures, each because 8b is an artboard and this is the vault
+// window's edit form:
+//
+// * **It is drawn in the form, not as a second window and not as a modal.**
+//   The tray's `picker_ui::run_picker` opens its own `eframe` loop on `main`'s
+//   thread and the vault window is a blocking call on that same thread, so
+//   raising the tray picker from here would deadlock; and a modal would put
+//   the answer to one draft field behind a surface the form's own Save cannot
+//   see. What is reused is the part that matters -- `window_list::
+//   list_windows`, the one enumeration, through `running_app_rows`.
+// * **The card takes the pane's width, not 8b's 560.** 560 is the artboard's
+//   measure; the detail pane floors at 298 (`MIN_PANE_WIDTH`), so every band
+//   below sets itself to `available_width` and the footer wraps.
+// * **The monogram tile carries no fill.** 8b fills it `#f3f2f2` (selected,
+//   `#ffffff`); `theme::avatar` -- the app's ONE monogram tile, at 8b's own
+//   28 points, 7-point radius, `HAIRLINE`/`BLUE_EDGE` edge and
+//   `TEXT_MUTED`/`BLUE` letters -- is deliberately unfilled everywhere since
+//   the owner's "no backgound inside of tile". A second, filled tile drawn
+//   here would be the two-designs-in-one-column that comment exists to stop.
+//   Its letters are `28 * theme::MONOGRAM` = 11 rather than 8b's 10, which is
+//   the same rule, applied to the same tile, at the size this card asks for.
+// * **The `Match this window by` radios are a read-out, not a choice.**
+//   `Process + title contains` and `Exact title` are rules `match_engine` has
+//   never implemented; the one title match it does is the hosted-frame case,
+//   and `AppMatchDraft::choose_window` already records the title exactly when
+//   that case applies. A radio the user could set would persist a choice
+//   nothing acts on -- so the band says which of the two rules this window
+//   will be matched by, in 8b's band, with 8b's caption, and draws no radio,
+//   because a radio with one option is not a choice. 8b's verdicts go with
+//   them: `too broad -- every RDP session` needs to know how many windows a
+//   process owns across time and this list sees one enumeration.
+// * **`Refreshes as windows open` is not true here.** The desktop is
+//   enumerated when the card opens and when Refresh is clicked, never per
+//   frame -- an `EnumWindows` walk with four Win32 calls per window on every
+//   repaint is the per-frame I/O this feature is careful to avoid (see
+//   [`AppMatchDraft::windows`]). So the footer carries the control that makes
+//   the promise true on demand, and the note says what it really does.
+// * **The footer's note follows the buttons instead of being pushed right.**
+//   8b's footer is a `flex` row with a spacer; this one is
+//   `horizontal_wrapped`, which is the rule everywhere else on this form
+//   (`aae9429`: an unwrapped row does not shrink to fit, it pushes the card
+//   past the pane and inflates every `available_width` measured after it). A
+//   note pinned to the right edge of a card that can be 298 points wide is a
+//   note on a line of its own anyway.
+// * **There is no search box**, and there was one. 8b's header band says how
+//   long the list is (`6 windows open`) and the list is the whole of it; a
+//   filter was scaffolding from the days when this was a column of plain
+//   buttons, and it is not one of 8b's elements.
+// * **The 15px heading's `letter-spacing: -0.01em`** -- fifteen hundredths of
+//   a point -- is not applied. `theme::letterspaced` exists and could, but
+//   `theme::extrabold` is the app's own 800 and 0.15pt of negative tracking
+//   is below the resolution of the face at this size.
+// * **8b's greyed `Deskwarden \u{b7} can't target itself` row is not drawn**,
+//   because the row is not offered at all: `running_app_rows` excludes this
+//   process, so there is nothing to grey. The greyed treatment it demonstrates
+//   IS drawn -- on the one refusal this build has, a Store frame whose app
+//   Windows would not name.
+// ---------------------------------------------------------------------------
 
-    let filter = app.window_filter.to_lowercase();
-    let mut chosen: Option<usize> = None;
-    egui::ScrollArea::vertical()
-        .id_salt("edit-app-window-picker")
-        .max_height(180.0)
+/// 8b's card: `border-radius: 12px` over `1px solid #d7d3d3`.
+///
+/// Twelve, which is neither `theme::SECTION_CARD_RADIUS`'s 10 nor the modal's:
+/// this is the one surface the form draws ON TOP of its own section cards, and
+/// 8b says 12.
+const PICKER_CARD_RADIUS: u8 = 12;
+
+/// 8b's `1px` borders -- the card's `#d7d3d3` and the washed row's `#b8c7ea`.
+///
+/// Named because it is real geometry rather than decoration: egui's `Frame`
+/// counts its stroke in the box it allocates, exactly as a `content-box` CSS
+/// border does, so the rectangle a band or a row paints is 8b's BORDER box --
+/// content, plus the design's padding, plus this on each side. The paint tests
+/// measure it as one.
+const PICKER_BORDER: f32 = 1.0;
+
+/// 8b's `box-shadow: 0 14px 34px rgba(45, 43, 43, 0.18)`.
+///
+/// `0.18` of 255 is 45.9, so 46 -- the same alpha `theme::MODAL_SHADOW`
+/// carries for the same `rgba(45,43,43,.18)`, at 8b's own deeper offset and
+/// blur. Not `MODAL_SHADOW` itself: that constant is private to `theme` and
+/// is the *modal's* lift (`0 6px 20px`), and borrowing it would make this card
+/// claim a measurement it does not have.
+const PICKER_CARD_SHADOW: egui::Shadow = egui::Shadow {
+    offset: [0, 14],
+    blur: 34,
+    spread: 0,
+    color: egui::Color32::from_rgba_unmultiplied_const(45, 43, 43, 46),
+};
+
+/// The header band's and the footer's `padding: 14px 18px` / `12px 18px`.
+const PICKER_BAND_PAD_X: i8 = 18;
+const PICKER_BAND_PAD_Y: i8 = 14;
+const PICKER_FOOTER_PAD_Y: i8 = 12;
+
+/// 8b's card heading, at its `font-size: 15px; font-weight: 800`.
+///
+/// **`Add a native app` verbatim, although this card is also reached to
+/// RE-point a binding that exists.** It is the design's own words for the act
+/// the card performs -- this item gains a target -- and the alternative was a
+/// caption that changed under the user between two openings of one card.
+const PICKER_TITLE: &str = "Add a native app";
+const PICKER_TITLE_PX: f32 = 15.0;
+
+/// The header band's right-hand readout: `font-size: 12px; color: #9b9797`.
+const PICKER_COUNT_PX: f32 = 12.0;
+
+/// 8b's list: `padding: 8px`, `gap: 2px`.
+const PICKER_LIST_PAD: i8 = 8;
+const PICKER_LIST_GAP_Y: f32 = 2.0;
+
+/// 8b's row: `padding: 9px 10px; border-radius: 8px; gap: 11px`.
+const PICKER_ROW_PAD_X: i8 = 10;
+const PICKER_ROW_PAD_Y: i8 = 9;
+const PICKER_ROW_RADIUS: u8 = 8;
+const PICKER_ROW_GAP_X: f32 = 11.0;
+
+/// 8b's `28x28` monogram tile.
+const PICKER_TILE: f32 = 28.0;
+
+/// The label column: `font-size: 13px; font-weight: 600` over an 11px
+/// monospace, at `gap: 1px`.
+const PICKER_NAME_PX: f32 = 13.0;
+const PICKER_SUB_PX: f32 = 11.0;
+const PICKER_LABEL_GAP_Y: f32 = 1.0;
+
+/// 8b's `already a target` chip: `font-size: 11px; border-radius: 5px;
+/// padding: 2px 7px`, in `TEXT_FAINT` on `CANVAS`.
+const PICKER_CHIP_PX: f32 = 11.0;
+const PICKER_CHIP_PAD_X: f32 = 7.0;
+const PICKER_CHIP_PAD_Y: f32 = 2.0;
+const PICKER_CHIP_RADIUS: u8 = 5;
+
+/// The chip's words, which are 8b's own.
+const PICKER_TAKEN_CHIP: &str = "already a target";
+
+/// 8b's refused row, `opacity: 0.5`.
+///
+/// Not `theme::ENDED_ROW_OPACITY`'s 0.72: that is 5b's *ended Send*, a row
+/// whose state is over but which is still the user's to act on. This one
+/// cannot be clicked at all, and 8b draws it a good deal fainter.
+const PICKER_REFUSED_OPACITY: f32 = 0.5;
+
+/// How many of 8b's rows are shown before the list scrolls.
+///
+/// Six, which is the number 8b draws and the number its header counts. A
+/// desktop routinely has more, and the rest are reached by scrolling rather
+/// than by growing a card inside a scrolling form without bound.
+const PICKER_ROWS_SHOWN: f32 = 6.0;
+
+/// The height one row occupies including its `gap: 2px`, used ONLY to size
+/// the scroll viewport at [`PICKER_ROWS_SHOWN`] rows.
+///
+/// 9 + 9 of padding around a 28-point tile is 46, plus the gap. It does not
+/// have to be exact -- nothing is laid out from it, and a row whose two lines
+/// are taller than its tile simply shows a little less of the seventh row.
+const PICKER_ROW_HEIGHT_EST: f32 = PICKER_TILE + 2.0 * PICKER_ROW_PAD_Y as f32;
+
+/// 8b's `Match this window by`, `text-transform: uppercase` already applied,
+/// with its `letter-spacing: 0.1em` -- 1.1 points at 11px, which is what
+/// `theme::letterspaced` wants, `RichText` having no em to give it.
+const PICKER_MATCH_CAPTION: &str = "MATCH THIS WINDOW BY";
+const PICKER_MATCH_CAPTION_PX: f32 = 11.0;
+const PICKER_MATCH_CAPTION_TRACKING: f32 = 1.1;
+
+/// The band's `gap: 10px` down and its rows' `gap: 9px` across.
+const PICKER_MATCH_GAP_Y: f32 = 10.0;
+const PICKER_MATCH_GAP_X: f32 = 9.0;
+
+/// What the band says before a row has been chosen. 8b always has a selection;
+/// this card opens with none, and the band keeps its place rather than
+/// appearing from nowhere on the first click.
+const PICKER_MATCH_NONE: &str = "Choose a window above.";
+
+/// The two rules this build really has, and the fact beside each.
+///
+/// Neither is a setting. Which one applies is decided by the row --
+/// [`AppWindowRow::hosted`], copied into [`AppMatch::hosted`] by
+/// [`AppMatchDraft::choose_window`] -- and the band is reporting it.
+const PICKER_RULE_PROCESS: &str = "Process name";
+const PICKER_RULE_PROCESS_NOTE: &str = "every window this program opens";
+const PICKER_RULE_HOSTED: &str = "Process and window title";
+const PICKER_RULE_HOSTED_NOTE: &str = "a Store app has no other name to match";
+
+/// The footer's three controls and its note.
+///
+/// `Add target` and `Cancel` are 8b's own words. `Refresh` is the third,
+/// and the note is not 8b's `Refreshes as windows open` -- see the departures
+/// above.
+const PICKER_ADD: &str = "Add target";
+const PICKER_CANCEL: &str = "Cancel";
+const PICKER_REFRESH: &str = "Refresh";
+const PICKER_FOOTER_NOTE: &str = "Refresh to catch windows opened since";
+const PICKER_FOOTER_GAP: f32 = 9.0;
+
+/// What the list says when the desktop offered nothing.
+const PICKER_EMPTY: &str = "No open windows to choose from.";
+
+/// 8b's greyed row carries its refusal in the subtitle, after the executable
+/// and a `\u{b7}` -- `deskwarden.exe \u{b7} can't target itself`.
+///
+/// [`window_row_refusal`]'s sentence is two lines long and tells the user what
+/// to DO about it; it does not fit a subtitle, and cutting it there would be
+/// the silent no-op that doc is about. So the row prints this, and the
+/// sentence itself is the row's hover text -- both, never one.
+///
+/// **The two cannot drift**, because this string is only ever drawn where
+/// [`window_row_refusal`] has already answered `Some`: there is no second
+/// condition to get wrong. `the_refused_row_says_its_refusal_twice` measures
+/// exactly that.
+const PICKER_REFUSAL_SHORT: &str = "can't tell which app this is";
+
+/// The header band's count, in 8b's own words (`6 windows open`).
+fn picker_count(n: usize) -> String {
+    if n == 1 {
+        "1 window open".to_string()
+    } else {
+        format!("{n} windows open")
+    }
+}
+
+/// 8b's card, opened by `Choose a running app\u{2026}` on the app block.
+///
+/// Every number it draws is in the block above; what is here is the assembly
+/// and the one thing 8b cannot show, which is that the card's answer is
+/// STAGED. A click selects ([`AppMatchDraft::picked`]); `Add target` is what
+/// calls [`AppMatchDraft::choose_window`]; Cancel closes with the draft
+/// untouched. That is 8b's own shape -- it draws a washed row AND an
+/// `Add target` button, which only makes sense if the two are different
+/// moments -- and it is why the row-click tests below assert on `picked`
+/// where they used to assert on `process`.
+fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
+    // The `\u{21b5}` keycap on the washed row is an affordance, so Return is
+    // wired to the same act as `Add target`. Guarded on nothing having
+    // keyboard focus: the form is a column of text boxes, and Return typed
+    // into one of them must stay that box's.
+    let entered = ui.input(|i| i.key_pressed(egui::Key::Enter))
+        && ui.memory(|m| m.focused().is_none());
+
+    let mut add = false;
+    let mut cancel = false;
+    let mut refresh = false;
+
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .stroke(Stroke::new(PICKER_BORDER, theme::BORDER_STRONG))
+        .corner_radius(CornerRadius::same(PICKER_CARD_RADIUS))
+        .shadow(PICKER_CARD_SHADOW)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            // Matches the window title as well as the executable name, the same
-            // way the tray picker's search does -- "chrome" and "Google Chrome"
-            // should find the same row.
-            for index in 0..app.windows.len() {
-                let row = &app.windows[index];
-                if !filter.is_empty()
-                    && !row.title.to_lowercase().contains(&filter)
-                    && !row.exe_name.to_lowercase().contains(&filter)
-                {
-                    continue;
+            // The bands butt against their hairlines; every gap on this card
+            // is a padding one of them owns.
+            ui.spacing_mut().item_spacing.y = 0.0;
+
+            picker_header(ui, app.windows.len());
+            picker_rule(ui);
+            picker_rows(ui, app);
+            picker_rule(ui);
+            picker_match_band(ui, app);
+            picker_rule(ui);
+            let pressed = picker_footer(ui, app.picked_row().is_some());
+            add = pressed.0;
+            cancel = pressed.1;
+            refresh = pressed.2;
+        });
+
+    if refresh {
+        app.windows = running_app_rows();
+    }
+    if cancel {
+        app.close_picker();
+    }
+    // Last, and cloned first, so the borrow of `app.windows` is over before
+    // the row is copied into the draft.
+    if add || (entered && app.picked_row().is_some()) {
+        if let Some(row) = app.picked_row().cloned() {
+            app.choose_window(&row);
+        }
+    }
+}
+
+/// 8b's header band: the card's heading, and how many rows are under it.
+fn picker_header(ui: &mut egui::Ui, count: usize) {
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_BAND_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(theme::extrabold(PICKER_TITLE, PICKER_TITLE_PX).color(theme::INK));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(picker_count(count))
+                            .size(PICKER_COUNT_PX)
+                            .color(theme::TEXT_GHOST),
+                    );
+                });
+            });
+        });
+}
+
+/// One of the card's `1px solid #eae7e7` seams, drawn full-bleed.
+///
+/// Allocated rather than painted over the band above it, so the bands stack
+/// by layout and nothing has to know where the previous one ended.
+fn picker_rule(ui: &mut egui::Ui) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 0.0, theme::HAIRLINE);
+}
+
+/// 8b's list band. Writes the staged row straight onto the draft; nothing
+/// here binds anything.
+fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
+    let mut clicked: Option<isize> = None;
+    egui::Frame::new().inner_margin(Margin::same(PICKER_LIST_PAD)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        egui::ScrollArea::vertical()
+            .id_salt("edit-app-window-picker")
+            .max_height(PICKER_ROWS_SHOWN * (PICKER_ROW_HEIGHT_EST + PICKER_LIST_GAP_Y))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = PICKER_LIST_GAP_Y;
+                for row in &app.windows {
+                    let selected = app.picked == Some(row.hwnd);
+                    let taken = app.taken.iter().any(|p| p == &row.exe_name.to_lowercase());
+                    if picker_row(ui, row, selected, taken) {
+                        clicked = Some(row.hwnd);
+                    }
                 }
-                let refusal = window_row_refusal(row);
-                let label = format!("{}  \u{b7}  {}", row.title, row.exe_name);
-                let response =
-                    ui.add_enabled(refusal.is_none(), egui::Button::new(label).wrap());
-                if let Some(why) = refusal {
-                    // On the row itself, not only in a tooltip: a disabled row
-                    // with no visible reason is the silent no-op again.
-                    ui.label(RichText::new(why).size(11.0).color(theme::TEXT_FAINT));
-                } else if response.clicked() {
-                    chosen = Some(index);
+                if app.windows.is_empty() {
+                    ui.label(
+                        RichText::new(PICKER_EMPTY).size(PICKER_COUNT_PX).color(theme::TEXT_FAINT),
+                    );
                 }
-            }
-            if app.windows.is_empty() {
+            });
+    });
+    if let Some(hwnd) = clicked {
+        app.picked = Some(hwnd);
+    }
+}
+
+/// One 8b row. Returns true when it was clicked and may be staged.
+fn picker_row(ui: &mut egui::Ui, row: &AppWindowRow, selected: bool, taken: bool) -> bool {
+    let refusal = window_row_refusal(row);
+    // 8b's `opacity: 0.5` on a row that cannot be taken, applied to every ink
+    // and edge the row draws rather than to the words alone: a full-strength
+    // tile beside faded type reads as a row that is half disabled.
+    let dim = |colour: egui::Color32| {
+        if refusal.is_some() {
+            theme::faded(colour, PICKER_REFUSED_OPACITY)
+        } else {
+            colour
+        }
+    };
+    let framed = egui::Frame::new()
+        .fill(if selected { theme::BLUE_WASH } else { theme::CARD })
+        // 8b gives only the washed row a border, and a border that appears on
+        // selection would move every row below it by two points. Transparent
+        // on the others is the same box, drawn or not.
+        .stroke(Stroke::new(
+            PICKER_BORDER,
+            if selected { theme::BLUE_EDGE } else { egui::Color32::TRANSPARENT },
+        ))
+        .corner_radius(CornerRadius::same(PICKER_ROW_RADIUS))
+        .inner_margin(Margin::symmetric(PICKER_ROW_PAD_X, PICKER_ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.x = PICKER_ROW_GAP_X;
+            ui.horizontal(|ui| {
+                theme::avatar(ui, &theme::initials(&row.title), PICKER_TILE, selected);
+                // The trailing chip is measured BEFORE the label column is
+                // laid out, because 8b's column is `flex: 1`: what the two
+                // lines get is what the chip leaves.
+                let trailing = if selected {
+                    picker_keycap_width(ui)
+                } else if taken {
+                    picker_chip_width(ui, PICKER_TAKEN_CHIP)
+                } else {
+                    0.0
+                };
+                let room = (ui.available_width() - trailing - PICKER_ROW_GAP_X).max(1.0);
+                // **Both lines are laid out before either is added**, and the
+                // column is then allocated at the height they measured. It is
+                // not tidiness: `ui.horizontal` is `Align::Center`, and egui
+                // centres each item against the row height it knows AT THAT
+                // MOMENT. A column allocated at zero height is therefore
+                // pinned to the middle of the 28-point tile and then grows
+                // DOWNWARD from there, which drew 8b's row 62 points tall
+                // round 28 points of content. Measured, the column is 28 and
+                // the tile is 28, so the two share one mid line -- which is
+                // 8b's `align-items: center`.
+                let title = theme::truncated_galley(
+                    ui,
+                    theme::semibold(row.title.clone(), PICKER_NAME_PX)
+                        .color(dim(if selected { theme::BLUE_DEEP } else { theme::INK })),
+                    room,
+                    egui::TextStyle::Body,
+                );
+                let sub = theme::truncated_galley(
+                    ui,
+                    RichText::new(picker_subtitle(row, refusal.is_some()))
+                        .size(PICKER_SUB_PX)
+                        .family(egui::FontFamily::Monospace)
+                        .color(dim(if selected {
+                            theme::TEXT_SECONDARY
+                        } else {
+                            theme::TEXT_GHOST
+                        })),
+                    room,
+                    egui::TextStyle::Body,
+                );
+                let column = title.size().y + PICKER_LABEL_GAP_Y + sub.size().y;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(room, column),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = PICKER_LABEL_GAP_Y;
+                        ui.add(egui::Label::new(title));
+                        ui.add(egui::Label::new(sub));
+                    },
+                );
+                if selected {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(trailing, theme::CHIP_HEIGHT),
+                            egui::Sense::hover(),
+                        );
+                        theme::paint_return_keycap(ui.painter(), rect);
+                    });
+                } else if taken {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        picker_chip(ui, PICKER_TAKEN_CHIP, dim(theme::TEXT_FAINT));
+                    });
+                }
+            });
+        });
+
+    let response = framed.response.interact(egui::Sense::click());
+    if let Some(why) = refusal {
+        // The whole sentence, on the row the short form is printed on.
+        response.on_hover_text(why);
+        return false;
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.clicked()
+}
+
+/// The row's second line: the executable, and the one further fact 8b puts
+/// after a `\u{b7}`.
+///
+/// 8b's washed row reads `mstsc.exe \u{b7} class TscShellContainerClass`.
+/// `window_list::WindowInfo` carries no window class -- it enumerates handle,
+/// pid, image path, image name, title and `hosted`, and nothing else -- so
+/// the slot carries the fact this build actually has for that row: a refusal,
+/// or that the window's title is part of its match.
+fn picker_subtitle(row: &AppWindowRow, refused: bool) -> String {
+    if refused {
+        return format!("{} \u{b7} {PICKER_REFUSAL_SHORT}", row.exe_name);
+    }
+    if row.hosted {
+        return format!("{} \u{b7} matched by its title", row.exe_name);
+    }
+    row.exe_name.clone()
+}
+
+/// The width of 8b's `\u{21b5}` keycap: one monospace cell inside the
+/// design's `padding: 3px 7px`.
+///
+/// Measured off a digit rather than off the arrow, exactly as `totp_add`'s 6a
+/// row does: the face is monospace, so every glyph has the same advance, and
+/// U+21B5 is carried by neither Archivo nor egui's fallback stack (which is
+/// why `theme::paint_return_keycap` DRAWS it).
+fn picker_keycap_width(ui: &egui::Ui) -> f32 {
+    let cell = ui
+        .painter()
+        .layout_no_wrap(
+            "0".to_string(),
+            egui::FontId::new(theme::CHIP_TEXT_PX, egui::FontFamily::Monospace),
+            theme::TEXT_FAINT,
+        )
+        .size()
+        .x;
+    cell + theme::RETURN_KEYCAP_PAD_X * 2.0
+}
+
+/// The width 8b's text chip will occupy.
+fn picker_chip_width(ui: &egui::Ui, text: &str) -> f32 {
+    picker_chip_galley(ui, text, theme::TEXT_FAINT).size().x + PICKER_CHIP_PAD_X * 2.0
+}
+
+fn picker_chip_galley(
+    ui: &egui::Ui,
+    text: &str,
+    ink: egui::Color32,
+) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::new(PICKER_CHIP_PX, egui::FontFamily::Proportional),
+        ink,
+    )
+}
+
+/// 8b's text chip. **Not `theme::kbd_chip`**, which is the design's KEYBOARD
+/// chip -- 10px monospace, a 4-point radius and 6 points of padding -- where
+/// this one is 11px proportional at radius 5 and padding `2px 7px`. A chip
+/// that says `already a target` is a label, not a key.
+fn picker_chip(ui: &mut egui::Ui, text: &str, ink: egui::Color32) {
+    let galley = picker_chip_galley(ui, text, ink);
+    let size = egui::vec2(
+        galley.size().x + PICKER_CHIP_PAD_X * 2.0,
+        galley.size().y + PICKER_CHIP_PAD_Y * 2.0,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(PICKER_CHIP_RADIUS), theme::CANVAS);
+    ui.painter().galley(
+        egui::pos2(rect.min.x + PICKER_CHIP_PAD_X, rect.center().y - galley.size().y / 2.0),
+        galley,
+        ink,
+    );
+}
+
+/// 8b's `Match this window by` band, as a read-out of the rule the staged row
+/// will actually be matched by. See the departures above for why it draws no
+/// radio.
+fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
+    let picked = app.picked_row().cloned();
+    egui::Frame::new()
+        .fill(theme::CARD_TINT)
+        .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_BAND_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = PICKER_MATCH_GAP_Y;
+            ui.label(theme::letterspaced(
+                PICKER_MATCH_CAPTION,
+                PICKER_MATCH_CAPTION_PX,
+                theme::BOLD,
+                PICKER_MATCH_CAPTION_TRACKING,
+                theme::TEXT_GHOST,
+            ));
+            let Some(row) = picked else {
                 ui.label(
-                    RichText::new("No open windows to choose from.")
-                        .size(12.0)
+                    RichText::new(PICKER_MATCH_NONE)
+                        .size(PICKER_NAME_PX)
+                        .color(theme::TEXT_GHOST),
+                );
+                return;
+            };
+            let (rule, value, note) = if row.hosted {
+                (PICKER_RULE_HOSTED, row.title.clone(), PICKER_RULE_HOSTED_NOTE)
+            } else {
+                (PICKER_RULE_PROCESS, row.exe_name.clone(), PICKER_RULE_PROCESS_NOTE)
+            };
+            // Wrapped, like every other row on this form: an unwrapped one does
+            // not shrink to fit and pushes the card past the pane (`aae9429`).
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = PICKER_MATCH_GAP_X;
+                ui.label(theme::semibold(rule, PICKER_NAME_PX).color(theme::INK));
+                ui.label(
+                    RichText::new(value)
+                        .size(PICKER_SUB_PX)
+                        .family(egui::FontFamily::Monospace)
                         .color(theme::TEXT_FAINT),
                 );
-            }
+                ui.label(RichText::new(note).size(PICKER_SUB_PX).color(theme::TEXT_FAINT));
+            });
         });
-    // Applied after the loop, so the immutable borrow of `app.windows` above is
-    // over before the row is copied into the draft.
-    if let Some(index) = chosen {
-        let row = app.windows[index].clone();
-        app.choose_window(&row);
-    }
+}
+
+/// 8b's footer. Answers `(add, cancel, refresh)`.
+fn picker_footer(ui: &mut egui::Ui, staged: bool) -> (bool, bool, bool) {
+    let mut pressed = (false, false, false);
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_FOOTER_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = PICKER_FOOTER_GAP;
+                // `primary_button_enabled`, because there is a state in which
+                // this card has no answer to give: nothing is staged, and a
+                // filled blue button that does nothing is the drawn-and-dead
+                // control this file refuses everywhere else.
+                pressed.0 = theme::primary_button_enabled(ui, PICKER_ADD, None, staged).clicked();
+                pressed.1 = theme::secondary_button(ui, PICKER_CANCEL).clicked();
+                pressed.2 = theme::secondary_button(ui, PICKER_REFRESH).clicked();
+                ui.label(
+                    RichText::new(PICKER_FOOTER_NOTE)
+                        .size(PICKER_COUNT_PX)
+                        .color(theme::TEXT_GHOST),
+                );
+            });
+        });
+    pressed
 }
 
 /// The card's bank row: what is chosen, the button that opens the picker, and
@@ -6318,8 +6953,12 @@ fn app_block(
     // app..." is the longest button caption on the whole form.
     ui.horizontal_wrapped(|ui| {
         if theme::secondary_button(ui, "Choose a running app\u{2026}").clicked() {
-            app.picking = !app.picking;
-            if app.picking {
+            let opening = !app.picking;
+            // Through `set_picking`, not a bare assignment: it is what clears
+            // the staged row and the `already a target` list, so a second
+            // opening of 8b's card starts with nothing selected.
+            app.set_picking(opening);
+            if opening {
                 // Enumerated on OPEN, never per frame.
                 app.windows = running_app_rows();
             }
@@ -6416,7 +7055,7 @@ fn app_block(
     // block can still say what is going.
     if theme::secondary_button(ui, "Remove app match").clicked() {
         app.bound = false;
-        app.picking = false;
+        app.close_picker();
     }
     ui.add_space(10.0);
 
@@ -9773,6 +10412,116 @@ mod tests {
         assert!(refusal.is_some(), "matching the host fills this item into every Store app");
         // Positive control: an ordinary row is offered.
         assert_eq!(window_row_refusal(&window_row("Ledgerline.exe", false)), None);
+    }
+
+    #[test]
+    fn the_cards_readout_counts_in_words_a_person_uses() {
+        // 8b's header band reads `6 windows open`. A count that always said
+        // "windows" would read `1 windows open` on the commonest case there
+        // is -- one window left open behind the vault.
+        assert_eq!(picker_count(6), "6 windows open");
+        assert_eq!(picker_count(1), "1 window open");
+        assert_eq!(picker_count(0), "0 windows open");
+    }
+
+    #[test]
+    fn a_rows_second_line_carries_the_one_further_fact_this_build_has() {
+        // 8b's washed row reads `mstsc.exe · class TscShellContainerClass`, and
+        // `window_list::WindowInfo` has no window class to put there (handle,
+        // pid, image path, image name, title, `hosted`, and nothing else). So
+        // the slot after the `·` carries what this build really knows about
+        // that row, and this pins all three cases so the slot cannot quietly
+        // become decorative.
+        assert_eq!(picker_subtitle(&window_row("Ledgerline.exe", false), false), "Ledgerline.exe");
+        assert_eq!(
+            picker_subtitle(&window_row("Speedtest.exe", true), false),
+            "Speedtest.exe \u{b7} matched by its title",
+            "a hosted frame's title IS its match (see `AppMatch::hosted`) and the row must say so"
+        );
+        assert_eq!(
+            picker_subtitle(&window_row("ApplicationFrameHost.exe", false), true),
+            format!("ApplicationFrameHost.exe \u{b7} {PICKER_REFUSAL_SHORT}"),
+            "8b's greyed row puts its reason here"
+        );
+    }
+
+    #[test]
+    fn shutting_8bs_card_takes_everything_that_was_only_true_while_it_was_open() {
+        // Mutation this catches: a bare `picking = false` anywhere. The staged
+        // row would then be waiting, already washed and already the answer
+        // `Add target` would give, the next time the card is opened -- on a
+        // window the user has not looked at.
+        let mut app = AppMatchDraft::from_match(&chrome_match());
+        app.set_picking(true);
+        app.windows = vec![window_row("Ledgerline.exe", false)];
+        app.picked = Some(4242);
+        app.taken = vec!["saplogon.exe".to_string()];
+        app.taken_known = true;
+        assert!(app.picked_row().is_some(), "the premise: the staged row resolves");
+
+        app.close_picker();
+        assert!(!app.picking);
+        assert_eq!(app.picked, None);
+        assert!(app.taken.is_empty() && !app.taken_known);
+    }
+
+    #[test]
+    fn a_staged_row_that_a_refresh_no_longer_lists_stages_nothing() {
+        // `picked` is a window HANDLE, not an index, and this is the reason:
+        // Refresh re-enumerates the desktop, and a window closed since the card
+        // opened must not leave `Add target` pointing at whatever took its
+        // place in the list.
+        let mut app = AppMatchDraft::from_match(&chrome_match());
+        app.set_picking(true);
+        app.windows = vec![window_row("Ledgerline.exe", false)];
+        app.picked = Some(4242);
+        assert!(app.picked_row().is_some());
+
+        app.windows = vec![AppWindowRow { hwnd: 5151, ..window_row("saplogon.exe", false) }];
+        assert!(
+            app.picked_row().is_none(),
+            "a window that is gone was still staged, and by position rather than identity"
+        );
+    }
+
+    #[test]
+    fn the_already_a_target_list_is_the_vaults_own_bindings_minus_this_item() {
+        // The chip 8b draws is a fact, not a guess: the binding is a custom
+        // field, so every other item's `AppMatch::process` is readable. Two
+        // things have to hold, and neither is visible from the form alone --
+        // the item being edited is excluded (its own row is not somebody
+        // else's claim), and the names are lowercased (Windows executable
+        // names are case-insensitive and two pickers have written this field).
+        let mut draft = EditDraft::from_item(&bound_item(&chrome_match()));
+        draft.app.as_mut().expect("the fixture is bound").set_picking(true);
+
+        let mine = bound_item(&chrome_match());
+        let theirs = bound_item(&AppMatch {
+            process: "Ledgerline.EXE".to_string(),
+            ..chrome_match()
+        });
+        let theirs = VaultItem { id: "someone-else".to_string(), ..theirs };
+        draft.offer_bound_processes(&[mine.clone(), theirs], Some(&mine));
+
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(
+            app.taken,
+            vec!["ledgerline.exe".to_string()],
+            "the edited item claimed its own row, or the name was left cased"
+        );
+        assert!(app.taken_known, "a second frame would walk the whole vault again");
+    }
+
+    #[test]
+    fn the_already_a_target_list_is_not_filled_while_the_card_is_shut() {
+        // The lazy half, and the reason it is lazy: `offer_bank_domains`'
+        // exactly -- a frame with the card shut must walk nothing, and this is
+        // called from the vault window's draw.
+        let mut draft = EditDraft::from_item(&bound_item(&chrome_match()));
+        draft.offer_bound_processes(&[bound_item(&chrome_match())], None);
+        let app = draft.app.as_ref().unwrap();
+        assert!(!app.picking, "the premise: the card is shut");
+        assert!(app.taken.is_empty() && !app.taken_known, "the vault was walked for a shut card");
     }
 
     #[test]
@@ -13685,11 +14434,19 @@ mod generator_row_tests {
     }
 
     #[test]
-    fn opening_the_process_picker_is_one_click_and_lists_what_windows_there_are() {
+    fn opening_the_process_picker_is_one_click_and_draws_8bs_card() {
         // The enumeration is the real desktop's, so nothing here asserts a row.
-        // What it asserts is that the list opens at all, that it is NOT populated
-        // before it is opened (the per-frame-I/O mutation), and that it closes
-        // again.
+        // What it asserts is that the card opens at all, that the desktop is
+        // NOT walked before it is opened (the per-frame-I/O mutation), and that
+        // it closes again.
+        //
+        // **Re-targeted at 8b's card.** It used to look for `Refresh` and
+        // `Close list`, the two buttons the inline list carried; the card's
+        // controls are 8b's own -- a header band, `Add target`, `Cancel`, and
+        // the `Match this window by` band under the rows -- and `Close list`
+        // is now that band's `Cancel`. The premise it was written for (one
+        // click opens it, one closes it) is unchanged, which is why it is
+        // pointed at the new words rather than deleted.
         let ctx = styled_context();
         let mut draft = app_draft(&chrome());
         let (_, painted) = frame(&ctx, &mut draft, &[]);
@@ -13702,15 +14459,40 @@ mod generator_row_tests {
         let open = painted.rect_of("Choose a running app\u{2026}");
         let (_, listed) = frame(&ctx, &mut draft, &click(open.center()));
         assert!(draft.app.as_ref().unwrap().picking, "the picker did not open");
-        assert!(
-            listed.strings().contains(&"Refresh") && listed.strings().contains(&"Close list"),
-            "the open picker has no controls: {:?}",
-            listed.strings()
-        );
+        for expected in [PICKER_TITLE, PICKER_ADD, PICKER_REFRESH, PICKER_MATCH_CAPTION] {
+            assert!(
+                listed.strings().contains(&expected),
+                "8b's card is missing {expected:?}: {:?}",
+                listed.strings()
+            );
+        }
 
         let (_, after) = frame(&ctx, &mut draft, &[]);
-        let _ = frame(&ctx, &mut draft, &click(after.rect_of("Close list").center()));
+        let _ = frame(&ctx, &mut draft, &click(card_cancel(&after).center()));
         assert!(!draft.app.as_ref().unwrap().picking, "the picker did not close");
+    }
+
+    /// 8b's `Cancel`, which is **not** the form's own footer Cancel.
+    ///
+    /// Both are painted while the card is open, so `rect_of` cannot be used:
+    /// this takes the one on the footer's own line, found from `Add target`,
+    /// which is unique. A tolerance of 2 points because the two buttons are
+    /// laid out by one `horizontal_wrapped` and centred on each other.
+    fn card_cancel(painted: &Painted) -> Rect {
+        let add = painted.rect_of(PICKER_ADD);
+        let found: Vec<Rect> = painted
+            .rects_of(PICKER_CANCEL)
+            .into_iter()
+            .filter(|r| (r.center().y - add.center().y).abs() < 2.0)
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one Cancel beside {PICKER_ADD:?}, found {}; painted: {:?}",
+            found.len(),
+            painted.strings()
+        );
+        found[0]
     }
 
     /// A row for the running-app picker, injected rather than enumerated.
@@ -13721,7 +14503,19 @@ mod generator_row_tests {
     /// plain `pub Vec` filled on the button click and read on every frame after
     /// it, so a test can simply put a row there and open the list. Nothing in
     /// production is bent to allow it: this is the same field the button writes.
-    fn picker_row(title: &str, exe: &str) -> AppWindowRow {
+    ///
+    /// **Renamed from `picker_row`**, which is now the name of the production
+    /// function that draws one; a fixture shadowing it inside this module was a
+    /// second meaning for one word.
+    fn listed_window(title: &str, exe: &str) -> AppWindowRow {
+        listed_window_at(title, exe, 909)
+    }
+
+    /// [`listed_window`] with the handle spelled out, for the tests that list
+    /// more than one row: `hwnd` is the row's identity now that a click stages
+    /// it (see [`AppMatchDraft::picked`]), so two rows sharing 909 would be one
+    /// row as far as the selection is concerned.
+    fn listed_window_at(title: &str, exe: &str, hwnd: isize) -> AppWindowRow {
         AppWindowRow {
             title: title.to_string(),
             exe_name: exe.to_string(),
@@ -13731,88 +14525,331 @@ mod generator_row_tests {
             exe_path: format!(r"C:\Deskwarden Test\Picked\{exe}"),
             hosted: false,
             pid: 4242,
-            hwnd: 909,
+            hwnd,
         }
     }
 
-    /// The label `app_window_picker` paints for a row, spelled here in the
-    /// pieces the test supplies rather than by calling the production
-    /// formatter, so a row that stops being drawn cannot be found by this test
-    /// agreeing with itself.
-    fn row_label(title: &str, exe: &str) -> String {
-        format!("{title}  \u{b7}  {exe}")
-    }
-
-    #[test]
-    fn clicking_a_row_in_the_running_app_picker_binds_the_item_to_that_row() {
-        // Mutation this catches: dropping the `app.choose_window(&row)` after
-        // the loop (or the `chosen = Some(index)` inside it). The list still
-        // opens, the rows still draw, every click is a silent no-op, and
-        // `choose_window`'s own pure test keeps passing.
-        let ctx = styled_context();
+    /// Opens 8b's card on `rows`, which is what every test below starts from.
+    fn card_on(rows: Vec<AppWindowRow>) -> EditDraft {
         let mut draft = app_draft(&chrome());
         {
             let app = draft.app.as_mut().unwrap();
-            app.picking = true;
-            app.windows = vec![picker_row("Ledgerline - Invoices", "Ledgerline.exe")];
+            app.set_picking(true);
+            app.windows = rows;
         }
+        draft
+    }
+
+    /// A bare Return press, with nothing else in the frame.
+    fn press_return() -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }]
+    }
+
+    #[test]
+    fn clicking_a_row_stages_it_and_add_target_is_what_binds() {
+        // **Re-targeted, and the premise really changed.** This used to assert
+        // that a click bound the item, because the inline list committed on the
+        // click. 8b's card does not: it washes the row, puts a `↵` keycap on
+        // it, and offers `Add target` in the footer -- which only means
+        // anything if the click and the commit are two moments. So the same two
+        // mutations are still caught, one step apart: dropping the `clicked`
+        // write leaves every row inert, and dropping `choose_window` behind
+        // `Add target` leaves the card unable to answer.
+        let ctx = styled_context();
+        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
-        let row = listed.rect_of(row_label("Ledgerline - Invoices", "Ledgerline.exe").as_str());
+        let row = listed.rect_of("Ledgerline - Invoices");
         let _ = frame(&ctx, &mut draft, &click(row.center()));
 
+        {
+            let app = draft.app.as_ref().unwrap();
+            assert_eq!(app.picked, Some(909), "clicking a row staged nothing");
+            assert_eq!(
+                app.process, "chrome.exe",
+                "the click bound the item on its own, so `Add target` has nothing left to do"
+            );
+            assert!(app.picking, "staging a row closed the card");
+        }
+
+        let (_, staged) = frame(&ctx, &mut draft, &[]);
+        let _ = frame(&ctx, &mut draft, &click(staged.rect_of(PICKER_ADD).center()));
+
         let app = draft.app.as_ref().unwrap();
-        assert_eq!(app.process, "Ledgerline.exe", "clicking a row bound nothing");
+        assert_eq!(app.process, "Ledgerline.exe", "`Add target` bound nothing");
         assert_eq!(app.path, r"C:\Deskwarden Test\Picked\Ledgerline.exe");
         assert_eq!(app.args, chrome().args, "choosing an app threw away the user's arguments");
-        assert!(!app.picking, "choosing a row left the list open");
+        assert!(!app.picking, "adding the target left the card open");
+        assert_eq!(app.picked, None, "the staged row outlived the card that staged it");
     }
 
     #[test]
-    fn a_click_that_misses_every_row_binds_nothing() {
-        // The positive control: without it, a `choose_window` called
-        // unconditionally at the end of the picker -- on whatever row happened
-        // to be first -- would satisfy the test above.
+    fn add_target_is_dead_until_a_row_is_staged() {
+        // The other half of the two-step: with nothing staged the card has no
+        // answer to give, and 8b's filled button must not pretend otherwise.
+        // Mutation this catches: `primary_button` in place of
+        // `primary_button_enabled`, which would draw a live blue button whose
+        // click does nothing.
         let ctx = styled_context();
-        let mut draft = app_draft(&chrome());
-        {
-            let app = draft.app.as_mut().unwrap();
-            app.picking = true;
-            app.windows = vec![picker_row("Ledgerline - Invoices", "Ledgerline.exe")];
-        }
+        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
-        let row = listed.rect_of(row_label("Ledgerline - Invoices", "Ledgerline.exe").as_str());
+        let _ = frame(&ctx, &mut draft, &click(listed.rect_of(PICKER_ADD).center()));
+
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(
+            app.process, "chrome.exe",
+            "`Add target` bound something with no row staged; it added whatever was first"
+        );
+        assert!(app.picking, "`Add target` closed the card without having an answer");
+    }
+
+    #[test]
+    fn the_staged_row_can_be_added_with_return() {
+        // 8b paints a `↵` keycap on the washed row. The keycap is an
+        // affordance, so this asserts the key really does what it promises --
+        // without it the chip would be decoration. Mutation this catches:
+        // dropping the `entered` branch in `app_window_picker`.
+        let ctx = styled_context();
+        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        let _ = frame(&ctx, &mut draft, &click(listed.rect_of("Ledgerline - Invoices").center()));
+        let _ = frame(&ctx, &mut draft, &press_return());
+
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(app.process, "Ledgerline.exe", "Return did not add the staged row");
+        assert!(!app.picking, "Return added the row and left the card open");
+    }
+
+    #[test]
+    fn return_with_nothing_staged_adds_nothing() {
+        // The positive control for the test above: a Return wired to "add the
+        // first row" would pass that one and this is what notices.
+        let ctx = styled_context();
+        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+
+        let _ = frame(&ctx, &mut draft, &[]);
+        let _ = frame(&ctx, &mut draft, &press_return());
+
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(app.process, "chrome.exe", "Return bound a row nobody had chosen");
+        assert!(app.picking, "Return closed the card with nothing staged");
+    }
+
+    #[test]
+    fn cancelling_8bs_card_leaves_the_binding_exactly_as_it_was() {
+        // 8b's `Cancel` is the way out, and a way out that quietly kept the
+        // staged row would be the worst of both: the card shut, the item
+        // re-pointed, and nothing on screen having said so.
+        let ctx = styled_context();
+        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        let _ = frame(&ctx, &mut draft, &click(listed.rect_of("Ledgerline - Invoices").center()));
+        let (_, staged) = frame(&ctx, &mut draft, &[]);
+        let _ = frame(&ctx, &mut draft, &click(card_cancel(&staged).center()));
+
+        let app = draft.app.as_ref().unwrap();
+        assert!(!app.picking, "Cancel left the card open");
+        assert_eq!(app.process, "chrome.exe", "Cancel bound the row that was staged");
+        assert_eq!(app.picked, None, "Cancel left the staged row behind for the next opening");
+    }
+
+    #[test]
+    fn a_click_that_misses_every_row_stages_nothing() {
+        // The positive control: without it, a `picked` written unconditionally
+        // at the end of the list -- on whatever row happened to be first --
+        // would satisfy the staging test above.
+        let ctx = styled_context();
+        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        let row = listed.rect_of("Ledgerline - Invoices");
         let miss = Pos2::new(row.center().x, row.top() - 200.0);
         let _ = frame(&ctx, &mut draft, &click(miss));
 
         let app = draft.app.as_ref().unwrap();
+        assert_eq!(app.picked, None, "a click that hit no row staged one");
         assert_eq!(app.process, "chrome.exe", "a click that hit no row re-pointed the item");
-        assert!(app.picking, "a click that hit no row closed the list");
+        assert!(app.picking, "a click that hit no row closed the card");
     }
 
     #[test]
-    fn a_row_that_names_the_window_host_cannot_be_clicked() {
+    fn a_row_that_names_the_window_host_cannot_be_staged() {
         // The refusal has a pure test; what only this can see is whether the
-        // form honours it. Mutation this catches: `ui.add_enabled(true, ..)`.
+        // card honours it. Mutation this catches: returning
+        // `response.clicked()` for a refused row instead of `false`.
+        //
+        // **Re-targeted from "cannot be clicked"**: the row is no longer an
+        // `add_enabled(false)` button, it is 8b's greyed row -- drawn at
+        // `opacity: 0.5`, with its reason in the subtitle -- so what has to be
+        // asserted is that clicking it stages nothing, which is the same
+        // refusal one step earlier.
         let ctx = styled_context();
-        let mut draft = app_draft(&chrome());
-        {
-            let app = draft.app.as_mut().unwrap();
-            app.picking = true;
-            app.windows = vec![picker_row("Speedtest by Ookla", "ApplicationFrameHost.exe")];
-        }
+        let mut draft =
+            card_on(vec![listed_window("Speedtest by Ookla", "ApplicationFrameHost.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
-        let row =
-            listed.rect_of(row_label("Speedtest by Ookla", "ApplicationFrameHost.exe").as_str());
+        let row = listed.rect_of("Speedtest by Ookla");
         let _ = frame(&ctx, &mut draft, &click(row.center()));
 
+        let app = draft.app.as_ref().unwrap();
+        assert_eq!(app.picked, None, "a row Windows could not attribute was staged anyway");
         assert_eq!(
-            draft.app.as_ref().unwrap().process,
-            "chrome.exe",
+            app.process, "chrome.exe",
             "a row Windows could not attribute bound this item to the frame host, which would \
              fill it into every Store app on the machine"
+        );
+    }
+
+    #[test]
+    fn the_refused_row_prints_its_refusal_where_8b_puts_it() {
+        // 8b's greyed row says why in the SUBTITLE, after the executable and a
+        // `·` (`deskwarden.exe · can't target itself`). The sentence
+        // `window_row_refusal` returns is two lines and tells the user what to
+        // do about it; it is the row's hover text, and what is printed is the
+        // short form. Mutation this catches: dropping the refusal from the
+        // subtitle, which puts the reason nowhere a user can see it without
+        // hovering a row they cannot click.
+        let ctx = styled_context();
+        let mut draft =
+            card_on(vec![listed_window("Speedtest by Ookla", "ApplicationFrameHost.exe")]);
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        let subtitle = format!("ApplicationFrameHost.exe \u{b7} {PICKER_REFUSAL_SHORT}");
+        assert!(
+            listed.strings().contains(&subtitle.as_str()),
+            "the refused row does not say why: {:?}",
+            listed.strings()
+        );
+        // And the long sentence is NOT on the card -- it is the hover text, and
+        // a paragraph printed in an 11px subtitle would be the row that pushed
+        // the card past the pane.
+        let long = window_row_refusal(&listed_window("x", "ApplicationFrameHost.exe"))
+            .expect("the fixture is a host frame");
+        assert!(
+            !listed.strings().contains(&long),
+            "the whole refusal sentence was printed on the row"
+        );
+    }
+
+    #[test]
+    fn the_card_says_how_many_windows_it_is_listing() {
+        // 8b's header band reads `6 windows open`. Mutation this catches: a
+        // count taken from something other than the rows drawn -- the readout
+        // is the only thing on the card that says the list is complete.
+        let ctx = styled_context();
+        let mut draft = card_on(vec![
+            listed_window_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
+            listed_window_at("SAP Logon 760", "saplogon.exe", 22),
+            listed_window_at("Slack - #payments-oncall", "slack.exe", 33),
+        ]);
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            listed.strings().contains(&"3 windows open"),
+            "the header band is not counting the rows: {:?}",
+            listed.strings()
+        );
+    }
+
+    #[test]
+    fn a_row_another_item_already_targets_wears_8bs_chip() {
+        // 8b puts `already a target` on the row some other login has claimed,
+        // and this build really can know it: the binding is a custom field, so
+        // the vault window can read every item's `AppMatch::process` and hand
+        // the list down (`EditDraft::offer_bound_processes`). Mutation this
+        // catches: drawing the chip from the row alone, which would put it on
+        // every row or on none.
+        let ctx = styled_context();
+        let mut draft = card_on(vec![
+            listed_window_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
+            listed_window_at("SAP Logon 760", "saplogon.exe", 22),
+        ]);
+        draft.offer_bound_processes(&[item_bound_to("other-item", "ledgerline.exe")], None);
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        assert_eq!(
+            listed.rects_of(PICKER_TAKEN_CHIP).len(),
+            1,
+            "expected the chip on exactly the claimed row; painted: {:?}",
+            listed.strings()
+        );
+    }
+
+    /// A vault item bound to `process`, built through `vault_bridge`'s own
+    /// writer so the field this test reads back is the field the app writes.
+    fn item_bound_to(id: &str, process: &str) -> VaultItem {
+        let mut m = chrome();
+        m.process = process.to_string();
+        let bare = VaultItem {
+            id: id.to_string(),
+            name: format!("login {id}"),
+            fields: Vec::new(),
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        };
+        crate::vault_bridge::with_app_match(&bare, &m)
+    }
+
+    #[test]
+    fn the_match_band_reports_the_rule_rather_than_offering_one() {
+        // 8b's band offers three radios; this build has two rules and no
+        // choice, so the band REPORTS which one applies (see
+        // `app_window_picker`'s departures). What must be true is that the
+        // report follows the row: an ordinary window is matched by its process
+        // name, and only a hosted frame is matched by its title.
+        let ctx = styled_context();
+        let mut hosted = listed_window_at("Speedtest by Ookla", "Speedtest.exe", 77);
+        hosted.hosted = true;
+        let mut draft = card_on(vec![
+            listed_window_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
+            hosted,
+        ]);
+
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            listed.strings().contains(&PICKER_MATCH_NONE),
+            "the band said something about a row nobody had chosen: {:?}",
+            listed.strings()
+        );
+
+        let ordinary = listed.rect_of("Ledgerline - Invoices");
+        let _ = frame(&ctx, &mut draft, &click(ordinary.center()));
+        let (_, on_ordinary) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            on_ordinary.strings().contains(&PICKER_RULE_PROCESS)
+                && on_ordinary.strings().contains(&PICKER_RULE_PROCESS_NOTE),
+            "an ordinary window was not reported as matched by its process: {:?}",
+            on_ordinary.strings()
+        );
+        assert!(
+            !on_ordinary.strings().contains(&PICKER_RULE_HOSTED),
+            "an ordinary window was offered a title match `match_engine` would never make"
+        );
+
+        let store = on_ordinary.rect_of("Speedtest by Ookla");
+        let _ = frame(&ctx, &mut draft, &click(store.center()));
+        let (_, on_store) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            on_store.strings().contains(&PICKER_RULE_HOSTED)
+                && on_store.strings().contains(&PICKER_RULE_HOSTED_NOTE),
+            "a hosted frame was not reported as matched by its title: {:?}",
+            on_store.strings()
         );
     }
 
@@ -16039,6 +17076,351 @@ mod sequence_builder_tests {
             );
         }
         let _ = open;
+    }
+
+    // -- design 8b's card, measured off the frame it painted ----------------
+    //
+    // These live here rather than beside the picker's behaviour tests because
+    // this is the harness that keeps the RECTS -- their fills, their strokes
+    // and their corner radii. A design claim held only by the presence of a
+    // galley is the claim that stayed true all through `boxes_around`'s own
+    // bug: the words were right and there was no box round them.
+
+    /// A draft with 8b's card open on `rows`.
+    fn picker_draft(item: &VaultItem, rows: Vec<AppWindowRow>) -> EditDraft {
+        let mut draft = draft_for(item, "{USERNAME}{TAB}{PASSWORD}");
+        let app = draft.app.as_mut().expect("draft_for binds an app");
+        app.set_picking(true);
+        app.windows = rows;
+        draft
+    }
+
+    fn window_row_at(title: &str, exe: &str, hwnd: isize) -> AppWindowRow {
+        AppWindowRow {
+            title: title.to_string(),
+            exe_name: exe.to_string(),
+            exe_path: format!(r"C:\Deskwarden Test\Picked\{exe}"),
+            hosted: false,
+            pid: 4242,
+            hwnd,
+        }
+    }
+
+    /// The card's own outline: white, `1px #d7d3d3`, radius 12. Asserts it is
+    /// the ONLY such box, so the rows below can be found by "inside it".
+    fn picker_card(painted: &Painted) -> PaintedRect {
+        let found: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| {
+                r.fill == theme::CARD
+                    && r.stroke == theme::BORDER_STRONG
+                    && r.radius == egui::CornerRadius::same(PICKER_CARD_RADIUS)
+            })
+            .collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "expected exactly one 8b card (white, #d7d3d3, radius {PICKER_CARD_RADIUS}), found {}",
+            found.len()
+        );
+        found[0]
+    }
+
+    /// **8b's card, as a card**: its outline, its three `1px #eae7e7` seams,
+    /// and the tinted band under the rows.
+    ///
+    /// Measured rather than asserted from the constants, because every one of
+    /// these could be spelled correctly in a `const` and then laid out
+    /// somewhere else -- which is what a card drawn as four unrelated frames
+    /// looks like. The card is found by its own chrome (white, `#d7d3d3`,
+    /// radius 12 -- 8b's `border: 1px solid #d7d3d3; border-radius: 12px`) and
+    /// everything else has to be INSIDE it.
+    #[test]
+    fn the_window_picker_is_8bs_card() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = picker_draft(
+            &item,
+            vec![window_row_at("Ledgerline - Invoices", "Ledgerline.exe", 11)],
+        );
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+
+        let card = picker_card(&painted);
+        let title = painted.rect_of(PICKER_TITLE);
+        let add = painted.rect_of(PICKER_ADD);
+        assert!(
+            card.rect.contains_rect(title) && card.rect.contains_rect(add),
+            "the card's outline does not contain its own header and footer, so what was found \
+             is a box beside the card rather than the card"
+        );
+
+        // 8b's header band is `padding: 14px 18px`: the title's ink starts 18
+        // in from the card's edge, and 14 down from its top. Ink, not box --
+        // a galley's box is ascent plus descent and the design's padding is
+        // measured to the text's own left edge, so the horizontal claim is
+        // exact and the vertical one is asserted as a floor.
+        assert!(
+            (title.left() - card.rect.left() - f32::from(PICKER_BAND_PAD_X)).abs() <= 1.0,
+            "the header's title starts {} in from the card, not 8b's {PICKER_BAND_PAD_X}",
+            title.left() - card.rect.left()
+        );
+        assert!(
+            title.top() - card.rect.top() >= f32::from(PICKER_BAND_PAD_Y) - 1.0,
+            "the header band is tighter than 8b's {PICKER_BAND_PAD_Y}px"
+        );
+
+        // Three seams: header/list, list/`Match this window by`, and
+        // band/footer. Each spans the card, which is 8b's `overflow: hidden`
+        // -- a rule inset from the edge reads as a divider inside a box rather
+        // than as the edge of a band.
+        let seams: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| {
+                r.fill == theme::HAIRLINE && r.rect.height() <= 1.5 && card.rect.contains_rect(r.rect)
+            })
+            .collect();
+        assert_eq!(
+            seams.len(),
+            3,
+            "8b's card has three `1px #eae7e7` seams (under the header, over the match band, \
+             over the footer); this one painted {}",
+            seams.len()
+        );
+        for seam in &seams {
+            assert!(
+                (seam.rect.width() - card.rect.width()).abs() <= 2.0,
+                "a seam is {} wide inside a card {} wide, so it is inset rather than full-bleed",
+                seam.rect.width(),
+                card.rect.width()
+            );
+        }
+
+        // 8b's `Match this window by` band is `background: #fbfaf9`.
+        let caption = painted.rect_of(PICKER_MATCH_CAPTION);
+        let tinted: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| r.fill == theme::CARD_TINT && r.rect.contains_rect(caption))
+            .collect();
+        assert_eq!(
+            tinted.len(),
+            1,
+            "the match band is not on 8b's #fbfaf9 ground; boxes round its caption: {}",
+            tinted.len()
+        );
+    }
+
+    /// **One row, to 8b's numbers**: `padding: 9px 10px`, `gap: 11px`,
+    /// `border-radius: 8px`, a `28x28` tile at `border-radius: 7px`, a `1px`
+    /// label gap, and `gap: 2px` between rows.
+    ///
+    /// Every number is read off the painted frame -- the tile from the box
+    /// `theme::avatar` stroked, the paddings from where that box sits inside
+    /// the row, the label gap from the two galleys. The row's height is
+    /// checked against its own contents rather than against a constant,
+    /// because the column of two lines can be taller than the tile and 8b's
+    /// padding is what has to survive either way.
+    #[test]
+    fn a_row_in_the_window_picker_is_8bs_row() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = picker_draft(
+            &item,
+            vec![
+                window_row_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
+                window_row_at("SAP Logon 760", "saplogon.exe", 22),
+            ],
+        );
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let card = picker_card(&painted);
+
+        // The tile: `theme::avatar`'s stroked box, 28 square at radius 7,
+        // which is 8b's `width: 28px; height: 28px; border-radius: 7px`.
+        let tiles: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| {
+                card.rect.contains_rect(r.rect)
+                    && (r.rect.width() - PICKER_TILE).abs() <= 0.6
+                    && (r.rect.height() - PICKER_TILE).abs() <= 0.6
+            })
+            .collect();
+        assert_eq!(tiles.len(), 2, "expected one monogram tile per row, found {}", tiles.len());
+        for tile in &tiles {
+            assert_eq!(
+                tile.radius,
+                theme::avatar_corner_radius(PICKER_TILE),
+                "the tile is not 8b's 7-point radius"
+            );
+            assert_eq!(tile.stroke, theme::HAIRLINE, "an unselected tile is edged #eae7e7");
+        }
+        let tile = tiles[0];
+
+        // The row box round it: 8b's `border-radius: 8px`.
+        let rows: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| {
+                r.radius == egui::CornerRadius::same(PICKER_ROW_RADIUS)
+                    && r.rect.contains_rect(tile.rect)
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "the first row has {} boxes round its tile", rows.len());
+        let row = rows[0].rect;
+
+        // `padding: 10px` plus the row's own `1px` border, which is what the
+        // painted rectangle is (see [`PICKER_BORDER`]) -- the same arithmetic
+        // a browser does for 8b's content-box row.
+        assert!(
+            (tile.rect.left() - row.left() - f32::from(PICKER_ROW_PAD_X) - PICKER_BORDER).abs()
+                <= 0.6,
+            "the tile sits {} in from the row's edge, not 8b's {PICKER_ROW_PAD_X} plus its border",
+            tile.rect.left() - row.left()
+        );
+
+        let title = painted.rect_of("Ledgerline - Invoices");
+        let sub = painted.rect_of("Ledgerline.exe");
+        assert!(
+            (title.left() - tile.rect.right() - PICKER_ROW_GAP_X).abs() <= 1.0,
+            "the label column starts {} after the tile, not 8b's gap of {PICKER_ROW_GAP_X}",
+            title.left() - tile.rect.right()
+        );
+        assert!(
+            (sub.top() - title.bottom() - PICKER_LABEL_GAP_Y).abs() <= 0.6,
+            "the two lines are {} apart, not 8b's {PICKER_LABEL_GAP_Y}",
+            sub.top() - title.bottom()
+        );
+
+        // `padding: 9px` top and bottom, round whichever is taller -- the tile
+        // or the two lines.
+        let content = PICKER_TILE.max(sub.bottom() - title.top());
+        let box_height = content + 2.0 * (f32::from(PICKER_ROW_PAD_Y) + PICKER_BORDER);
+        assert!(
+            (row.height() - box_height).abs() <= 1.0,
+            "the row is {} tall round {content} of content, where 8b's `padding: 9px` and its \
+             1px border make {box_height}",
+            row.height()
+        );
+        // And the tile and the two lines share one mid line, which is 8b's
+        // `align-items: center`. The regression this is here for drew the
+        // column from the CENTRE of the tile downward, so the row came out 62
+        // points tall round 28 points of content.
+        assert!(
+            ((tile.rect.center().y) - (title.top() + sub.bottom()) / 2.0).abs() <= 1.0,
+            "the tile is centred at {} and the label column at {}",
+            tile.rect.center().y,
+            (title.top() + sub.bottom()) / 2.0
+        );
+
+        // `gap: 2px` down the list.
+        let second_tile = tiles[1];
+        let second: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| {
+                r.radius == egui::CornerRadius::same(PICKER_ROW_RADIUS)
+                    && r.rect.contains_rect(second_tile.rect)
+            })
+            .collect();
+        assert_eq!(second.len(), 1);
+        assert!(
+            (second[0].rect.top() - row.bottom() - PICKER_LIST_GAP_Y).abs() <= 0.6,
+            "the rows are {} apart, not 8b's {PICKER_LIST_GAP_Y}",
+            second[0].rect.top() - row.bottom()
+        );
+    }
+
+    /// **The staged row wears 8b's wash**: `background: #eef2fc; border: 1px
+    /// solid #b8c7ea`, its tile edged in the same blue, and the `\u{21b5}`
+    /// keycap in its trailing slot.
+    ///
+    /// The positive control is in the same frame: the row that is NOT staged
+    /// is still on white with a transparent edge, so a wash painted on every
+    /// row would fail here rather than read as a design that had been applied.
+    #[test]
+    fn the_staged_row_wears_8bs_wash() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = picker_draft(
+            &item,
+            vec![
+                window_row_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
+                window_row_at("SAP Logon 760", "saplogon.exe", 22),
+            ],
+        );
+        draft.app.as_mut().unwrap().picked = Some(11);
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let card = picker_card(&painted);
+
+        let washed: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| r.fill == theme::BLUE_WASH && card.rect.contains_rect(r.rect))
+            .collect();
+        assert_eq!(
+            washed.len(),
+            1,
+            "expected exactly the staged row to be washed #eef2fc, found {}",
+            washed.len()
+        );
+        assert_eq!(washed[0].stroke, theme::BLUE_EDGE, "the washed row is not edged #b8c7ea");
+        assert_eq!(
+            washed[0].radius,
+            egui::CornerRadius::same(PICKER_ROW_RADIUS),
+            "the washed row is not 8b's 8-point row"
+        );
+        assert!(
+            washed[0].rect.contains_rect(painted.rect_of("Ledgerline - Invoices")),
+            "the wash is on a row other than the one that was staged"
+        );
+
+        // Its tile takes the same edge, which `theme::avatar` calls
+        // `emphasized` -- 8b's `border: 1px solid #b8c7ea` on the tile.
+        let blue_tiles: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| {
+                r.stroke == theme::BLUE_EDGE && (r.rect.width() - PICKER_TILE).abs() <= 0.6
+            })
+            .collect();
+        assert_eq!(blue_tiles.len(), 1, "the staged row's tile did not take the selection's edge");
+
+        // The `↵` keycap: `background: #1b3fa0; border-radius: 5px`, inside
+        // the washed row. Drawn rather than typed, so what is asserted is the
+        // cap and not a glyph (see `theme::paint_return_keycap`).
+        let caps: Vec<PaintedRect> = painted
+            .rects
+            .iter()
+            .copied()
+            .filter(|r| r.fill == theme::BLUE && washed[0].rect.contains_rect(r.rect))
+            .collect();
+        assert_eq!(caps.len(), 1, "the staged row carries no `↵` keycap");
+        assert_eq!(
+            caps[0].radius,
+            egui::CornerRadius::same(5),
+            "the keycap is not 8b's `border-radius: 5px`"
+        );
+        assert!(
+            (washed[0].rect.right()
+                - caps[0].rect.right()
+                - f32::from(PICKER_ROW_PAD_X)
+                - PICKER_BORDER)
+                .abs()
+                <= 0.6,
+            "the keycap is {} from the row's right edge, not 8b's {PICKER_ROW_PAD_X} plus the \
+             row's border",
+            washed[0].rect.right() - caps[0].rect.right()
+        );
     }
 }
 
