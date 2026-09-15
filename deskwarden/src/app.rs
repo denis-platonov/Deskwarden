@@ -9927,8 +9927,14 @@ mod generate_flow_tests {
     struct GeneratedKindRequest;
     impl GeneratedKindRequest {
         fn default_request() -> GenerateRequest {
-            crate::generate_prompt::GeneratedKind::Characters
-                .recipe(crate::generate_prompt::GeneratedKind::Characters.default_size())
+            // Built through `GenerateForm`, which is what the card itself sends:
+            // the recipe is now the kind AND the four options the newer 3d
+            // draws, and a request assembled from the kind alone would be this
+            // test asking for something the card never asks for.
+            crate::generate_prompt::GenerateForm::new(
+                crate::generate_prompt::GeneratedKind::Characters,
+            )
+            .request()
         }
     }
 

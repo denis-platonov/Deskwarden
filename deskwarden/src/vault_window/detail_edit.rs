@@ -1222,6 +1222,23 @@ impl Section {
             _ => "",
         }
     }
+
+    /// **The chip 8a puts beside a card's title**, or `None`.
+    ///
+    /// One card has one: `One-time code` carries `2FA`, in 8a's own
+    /// `font-size: 10px; color: #605d5d; background: #f3f2f2; border-radius:
+    /// 5px; padding: 2px 6px`. The owner: "pill missing".
+    ///
+    /// A chip and not a [`Self::note`]: the note is prose explaining the card
+    /// (`where this login is offered`) and is set as prose; this is a tag,
+    /// and 8a draws it as one. Two cards saying different kinds of thing in
+    /// one treatment is how a card title ends up meaning nothing.
+    pub fn chip(self) -> Option<&'static str> {
+        match self {
+            Section::OneTimeCode => Some(TWO_FACTOR_CHIP),
+            _ => None,
+        }
+    }
 }
 
 /// One field that has moved since the form opened: what to call it, and which
@@ -1593,6 +1610,26 @@ mod char_classes {
                 Self::Special => "!@#",
             }
         }
+
+        /// The word for the class, for a control that has room to print
+        /// **both**.
+        ///
+        /// [`Self::label`]'s doc argues that the characters beat the word, and
+        /// it still does where only one of the two fits -- which is this
+        /// card's chip row. Design 3d's newer generator panel draws each class
+        /// as a tile carrying a name and its sample side by side, so there it
+        /// is not a choice between them, and a tile reading `A-Z` alone would
+        /// leave the reader to work out whether the neighbouring `0-9` meant
+        /// digits or a range. The two live together here so the word and the
+        /// sample for one class can never be looked up from two places.
+        pub fn name(self) -> &'static str {
+            match self {
+                Self::Uppercase => "Uppercase",
+                Self::Lowercase => "Lowercase",
+                Self::Number => "Digits",
+                Self::Special => "Symbols",
+            }
+        }
     }
 
     /// Which classes the next password may draw from. **Never none of them.**
@@ -1894,7 +1931,13 @@ const MAX_WORDS: u32 = 20;
 /// the password has room for; [`EditDraft::generator_request`] clamps against
 /// the length as well, for the case where the user lowers the length
 /// afterwards.
-const MAX_MIN_CLASS: u32 = 4;
+///
+/// `pub` because design 3d's bare-Win32 card
+/// (`crate::generate_prompt::MAX_MIN_NUMBER`) draws the same stepper against
+/// the same route and needs the same bound. Exported rather than restated
+/// there: two copies of "4" that have to agree is the defect shape this
+/// codebase keeps finding.
+pub const MAX_MIN_CLASS: u32 = 4;
 
 impl Default for EditDraft {
     /// A blank **login** draft. `ItemKind` has no `Default` of its own on
@@ -3913,13 +3956,22 @@ pub fn assignable_folders(folders: &[Folder]) -> Vec<&Folder> {
     folders.iter().filter(|folder| !sidebar::is_virtual_folder(folder)).collect()
 }
 
-/// The label above the login form's TOTP seed box.
+/// The label beside the login form's TOTP seed box: 8a's own word.
 ///
-/// It says **key**, not "code": the box holds the shared secret the
-/// authenticator is built from, and a user who pastes a six-digit code into a
-/// box labelled "TOTP" has broken their own two-factor login until they
-/// notice.
-pub const TOTP_LABEL: &str = "Authenticator key (TOTP)";
+/// **One word, and the qualification moved.** It read `Authenticator key
+/// (TOTP)`, on the argument that a user who pastes a six-digit CODE into a
+/// box labelled `TOTP` has broken their own two-factor login until they
+/// notice. That argument is sound and the label was the wrong place for
+/// it: 8a captions this row `Authenticator`, the owner asked for "just
+/// Authenticator one word", and a label column 130 points wide cannot hold
+/// a parenthetical anyway.
+///
+/// **The warning is not lost** -- `TOTP_HINT`, the sentence under the box,
+/// says it in full and in more words than a caption ever could: "an
+/// otpauth:// link, or the base32 key a site shows beside its QR code. Not
+/// a code." That is where a user about to paste the wrong thing is
+/// looking.
+pub const TOTP_LABEL: &str = "Authenticator";
 
 /// What the box is for, in the words the user would have been given by the
 /// site they are setting up.
@@ -7510,6 +7562,50 @@ fn edit_header(
 /// agree, with the verb the tooltip has room for and the menu entry does not.
 const ICON_BADGE_HINT: &str = "Icon actions for this item";
 
+/// 8a's tag on the `One-time code` card's title band.
+const TWO_FACTOR_CHIP: &str = "2FA";
+
+/// 8a's chip metrics: `font-size: 10px; border-radius: 5px; padding: 2px 6px`.
+const CHIP_PX: f32 = 10.0;
+const CHIP_RADIUS: u8 = 5;
+const CHIP_PAD_X: f32 = 6.0;
+const CHIP_PAD_Y: f32 = 2.0;
+
+/// Paints [`Section::chip`] immediately after `title`.
+///
+/// **Painted from here rather than added inside the band**, and that is
+/// deliberate rather than convenient: `theme::section_card_header_at` answers
+/// with the title's rectangle precisely so a caller can hang something off
+/// it, and a chip added INSIDE the band would have to be threaded through
+/// that helper as a third kind of content -- after the note and the `Changed`
+/// mark -- for one card.
+///
+/// It costs the band no height: the chip is `CHIP_PX` plus two points of
+/// padding a side, which is smaller than the caption it sits beside, and it
+/// is centred on that caption's own box.
+fn paint_section_chip(ui: &egui::Ui, title: egui::Rect, text: &str) {
+    let font = egui::FontId::new(CHIP_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, theme::TEXT_MUTED);
+    let size = egui::vec2(
+        galley.size().x + CHIP_PAD_X * 2.0,
+        galley.size().y + CHIP_PAD_Y * 2.0,
+    );
+    // 8a's `gap: 10px` between the title and what follows it, which is the
+    // same gap `theme::SECTION_HEADER_GAP` puts before the note on the two
+    // cards that have one.
+    let at = egui::pos2(
+        title.right() + theme::SECTION_HEADER_GAP,
+        title.center().y - size.y / 2.0,
+    );
+    let rect = egui::Rect::from_min_size(at, size);
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(CHIP_RADIUS), theme::CANVAS);
+    ui.painter().galley(
+        egui::pos2(rect.left() + CHIP_PAD_X, rect.top() + CHIP_PAD_Y),
+        galley,
+        theme::TEXT_MUTED,
+    );
+}
+
 /// One card of design 8a's grid: its title band, its body, and the gap to the
 /// next card.
 ///
@@ -7538,7 +7634,12 @@ fn section<R>(
         // reason that function's doc gives. Both bands read the same width so
         // the title and the rows under it start on one vertical line.
         let pad_x = theme::section_card_pad_x(ui.available_width());
-        theme::section_card_header_at(ui, pad_x, section.title(kind), section.note(), changed);
+        let title =
+            theme::section_card_header_at(ui, pad_x, section.title(kind), section.note(), changed);
+        // 8a's tag, beside the title it qualifies. See `Section::chip`.
+        if let Some(chip) = section.chip() {
+            paint_section_chip(ui, title, chip);
+        }
         theme::section_card_body_at(ui, pad_x, add)
     });
     if wanted == Some(section) {
@@ -9221,24 +9322,34 @@ pub fn draw_detail_edit(
                             if creating {
                                 theme::section_disabled_text_field(ui, TOTP_CREATE_NOTICE);
                             } else if !has_seed {
-                                // **The empty state: a greyed box saying so,
-                                // and one button.**
+                                // **The empty state is ONE BUTTON**, and the
+                                // owner has now cut it down twice: first from
+                                // an editable box with a placeholder (cut off
+                                // -- the hint was longer than a 130-point
+                                // label column leaves room for), then from a
+                                // greyed box saying `No one-time code yet`
+                                // with the button beside it. "Just add button
+                                // nothing else."
                                 //
-                                // It was an editable box with a placeholder,
-                                // on the argument that typing a seed into it
-                                // IS adding the second factor. The owner saw
-                                // it cut off -- the hint is longer than the
-                                // room a 130-point label column leaves -- and
-                                // asked for the button instead. The button is
-                                // the honest door anyway: a seed is scanned
-                                // or pasted from a page the user is looking
-                                // at, and the modal behind it does both.
-                                row_with_buttons(ui, &[TOTP_ADD_BUTTON], |ui, room| {
-                                    theme::section_disabled_text_field_within(
-                                        ui,
-                                        TOTP_EMPTY_NOTE,
-                                        room,
-                                    );
+                                // A greyed box is a control that is not one:
+                                // it says "a value goes here" about a value
+                                // that cannot be typed here, next to the
+                                // button that really is the way in. The
+                                // caption in the label column already says
+                                // what the row is for, and the card's own
+                                // title says it again.
+                                //
+                                // Right-aligned, which is where the owner
+                                // asked for it -- "show button Add or
+                                // something to the right" -- and is what the
+                                // measurement does with no field to share the
+                                // line with.
+                                let width = theme::row_button_width(ui, TOTP_ADD_BUTTON);
+                                let slack = ui.available_width() - width;
+                                ui.horizontal(|ui| {
+                                    if slack > 0.0 {
+                                        ui.add_space(slack);
+                                    }
                                     if theme::row_button(ui, TOTP_ADD_BUTTON).clicked() {
                                         action = EditAction::AddTotp;
                                     }
@@ -9275,10 +9386,17 @@ pub fn draw_detail_edit(
                                     },
                                 );
                             }
-                            ui.add_space(4.0);
-                            ui.label(
-                                RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT),
-                            );
+                            // **The sentence explains a BOX**, so it is
+                            // drawn where there is one. On an empty row it
+                            // was the "nothing else" the owner asked to be
+                            // rid of: a paragraph about what to paste, under
+                            // a row with nothing to paste into.
+                            if has_seed || creating {
+                                ui.add_space(4.0);
+                                ui.label(
+                                    RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT),
+                                );
+                            }
                         });
                     },
                 );
@@ -22096,15 +22214,21 @@ mod edit_pane_layout_tests {
         // **The CAPTION stays and the value goes**, which is the one-time
         // code card's own shape now: it is drawn on every login (see the
         // card), so what a Remove takes away is the seed and the Remove
-        // itself, not the row. The empty box says what belongs in it.
-        assert!(
-            after.strings().contains(&TOTP_EMPTY_NOTE),
-            "the emptied row is not saying it has no code: {:?}",
-            after.strings()
-        );
+        // itself, not the row.
+        //
+        // What is left is ONE BUTTON. This asserted a greyed `No one-time
+        // code yet` beside it until the owner cut that too -- "just add
+        // button nothing else" -- so the note's absence is now half the
+        // claim rather than a string that quietly stopped being painted.
         assert!(
             after.strings().contains(&TOTP_ADD_BUTTON),
             "the emptied row offers no way to add one back: {:?}",
+            after.strings()
+        );
+        assert!(
+            !after.strings().contains(&TOTP_EMPTY_NOTE),
+            "the emptied row is drawing a greyed box beside the button that is the real \
+             way in: {:?}",
             after.strings()
         );
         assert!(

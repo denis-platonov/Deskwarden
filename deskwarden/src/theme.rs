@@ -6833,20 +6833,38 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     (response, outer)
 }
 
+/// The toggle pill's box: the design's 40×22 (section 3e's settings rows).
+///
+/// **Named rather than written at the two paint sites**, because this switch
+/// is now drawn twice over: in egui by [`toggle_pill`] below, and in GDI by
+/// `crate::generate_prompt`'s *Avoid look-alikes* row, which is a bare-Win32
+/// card and cannot call an `egui::Ui` painter at all. A second copy of "40 by
+/// 22, radius 11, knob 9" in that card would be a second switch that has to
+/// agree with this one; these three constants are the agreement.
+pub const TOGGLE_W: f32 = 40.0;
+pub const TOGGLE_H: f32 = 22.0;
+
+/// The knob's radius. Two points inside the track's own half-height, which is
+/// what leaves the design's one-point rim of track showing above and below it.
+pub const TOGGLE_KNOB_R: f32 = 9.0;
+
 /// The design's 40×22 toggle pill (section 3e's settings rows). Paints only;
 /// the caller owns the click handling on whatever element contains it.
 pub fn toggle_pill(ui: &mut Ui, on: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(TOGGLE_W, TOGGLE_H), Sense::hover());
     let track = if on { BLUE } else { TOGGLE_OFF };
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(11), track);
+        .rect_filled(rect, CornerRadius::same((TOGGLE_H / 2.0) as u8), track);
+    // The knob's centre sits half a track-height in from the end it is at, so
+    // the circle is tangent to the pill's rounded cap.
+    let inset = TOGGLE_H / 2.0;
     let knob_x = if on {
-        rect.max.x - 11.0
+        rect.max.x - inset
     } else {
-        rect.min.x + 11.0
+        rect.min.x + inset
     };
     ui.painter()
-        .circle_filled(Pos2::new(knob_x, rect.center().y), 9.0, Color32::WHITE);
+        .circle_filled(Pos2::new(knob_x, rect.center().y), TOGGLE_KNOB_R, Color32::WHITE);
 }
 
 /// [`toggle_pill`]'s greyed twin, for a switch a master switch has turned
@@ -6864,16 +6882,17 @@ pub fn toggle_pill(ui: &mut Ui, on: bool) {
 /// against it. The design has no disabled variant of this control, so this is
 /// assembled from its parts.
 pub fn toggle_pill_disabled(ui: &mut Ui, on: bool) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(40.0, 22.0), Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(TOGGLE_W, TOGGLE_H), Sense::hover());
     ui.painter()
-        .rect_filled(rect, CornerRadius::same(11), HAIRLINE);
+        .rect_filled(rect, CornerRadius::same((TOGGLE_H / 2.0) as u8), HAIRLINE);
+    let inset = TOGGLE_H / 2.0;
     let knob_x = if on {
-        rect.max.x - 11.0
+        rect.max.x - inset
     } else {
-        rect.min.x + 11.0
+        rect.min.x + inset
     };
     ui.painter()
-        .circle_filled(Pos2::new(knob_x, rect.center().y), 9.0, CANVAS);
+        .circle_filled(Pos2::new(knob_x, rect.center().y), TOGGLE_KNOB_R, CANVAS);
 }
 
 /// A full-width hairline separator in the card hairline color (egui's

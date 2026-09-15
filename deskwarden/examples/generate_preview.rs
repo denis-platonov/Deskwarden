@@ -8,12 +8,19 @@
 //! ```
 //!
 //! **Every Win32 call is the real one.** The window, the capture exclusion, the
-//! message pump, the owner-drawn segmented run and buttons, the tinted value
-//! line, the strength badge and the footer band are the code the daemon ships,
-//! so what this shows is what the user sees -- which is design 3d's panel, at
-//! 3d's own numbers. What is a fixture is only the *generator*: a local function that
-//! builds a plausible-looking string, so nothing here reaches `bw serve`, the
-//! network, the real vault or the user's `%APPDATA%`.
+//! message pump, the owner-drawn segmented run and buttons, the length slider,
+//! the character-class tiles, the minimum-digits stepper, the look-alikes
+//! switch, the tinted value line, the strength badge and the footer band are
+//! the code the daemon ships, so what this shows is what the user sees -- which
+//! is design 3d's panel, at 3d's own numbers. What is a fixture is only the
+//! *generator*: a local function that builds a plausible-looking string, so
+//! nothing here reaches `bw serve`, the network, the real vault or the user's
+//! `%APPDATA%`.
+//!
+//! **The 3d this draws is the owner's newer rendered image, not
+//! `docs/design/Deskwarden.dc.html`'s `id="3d"`,** which is an older version of
+//! the card. `crate::generate_prompt`'s module doc lists what differs and why
+//! the design file is left alone.
 //!
 //! `--capturable` stubs exactly one seam -- `GenerateCalls::protect` -- so the
 //! window can be screenshotted. The shipped one excludes it from screen
@@ -55,9 +62,10 @@ static FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 
 /// **A made-up password, built here and never asked of anything.**
 ///
-/// It honours the request's own size and alphabet so the card's readout and its
-/// value line agree -- a preview whose "6 chars" produced twenty of them would
-/// be showing a card that does not exist.
+/// It honours the request's own size and alphabet so the card's controls and
+/// its value line agree -- a preview whose slider said 6 and produced twenty
+/// would be showing a card that does not exist, and one that ignored the class
+/// tiles would make them look broken.
 ///
 /// The bytes come from `std::time`, not from a cryptographic source, and that
 /// is deliberate: nothing this produces is ever saved, and a preview that
@@ -89,14 +97,38 @@ fn fixture_generator(request: &GenerateRequest) -> Result<Zeroizing<String>, Str
             Ok(Zeroizing::new(out))
         }
         GenerateRequest::Password(recipe) => {
-            let alphabet: &[u8] = if recipe.uppercase || recipe.lowercase {
-                b"abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%^&*"
-            } else {
-                b"0123456789"
-            };
+            // Built from the classes the recipe actually asks for, so
+            // unticking *Symbols* on the card visibly removes them from the
+            // next value. The ambiguous characters (`O`, `0`, `l`, `1`, `I`)
+            // are in the pools and taken back out when the switch asks for it,
+            // which is what makes that control visible in a preview at all.
+            let mut alphabet = String::new();
+            if recipe.uppercase {
+                alphabet.push_str("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+            }
+            if recipe.lowercase {
+                alphabet.push_str("abcdefghijklmnopqrstuvwxyz");
+            }
+            if recipe.number {
+                alphabet.push_str("0123456789");
+            }
+            if recipe.special {
+                alphabet.push_str("!@#$%^&*");
+            }
+            if recipe.avoid_ambiguous {
+                alphabet.retain(|c| !"O0lI1".contains(c));
+            }
+            // A recipe with no classes at all cannot be built by the card --
+            // `CharClasses` makes it unrepresentable -- but a fixture that
+            // divided by zero on one would be a preview that crashed instead
+            // of saying so.
+            let alphabet: Vec<char> = alphabet.chars().collect();
+            if alphabet.is_empty() {
+                return Err("preview: the request asked for no characters at all".to_string());
+            }
             let mut out = String::new();
             for i in 0..recipe.length as usize {
-                out.push(alphabet[(seed + i * 17) % alphabet.len()] as char);
+                out.push(alphabet[(seed + i * 17) % alphabet.len()]);
             }
             Ok(Zeroizing::new(out))
         }

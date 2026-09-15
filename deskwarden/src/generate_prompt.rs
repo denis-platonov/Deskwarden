@@ -45,12 +45,46 @@
 //! `Option<Zeroizing<String>>` its one public entry point already returned when
 //! it was an egui card.
 //!
+//! # WHICH 3d THIS CARD IS: the image, not the design file
+//!
+//! **`docs/design/Deskwarden.dc.html`'s `id="3d"` is an older version of this
+//! card, and this module does not follow it.** The owner supplied a newer 3d as
+//! a rendered image, and the image is the source of truth; where the two
+//! disagree, the image wins and the disagreement is stated in the code rather
+//! than resolved silently. The design file is left alone -- correcting the
+//! markup would put a second, unreviewed drawing of this card in the repository
+//! beside the one that was actually approved.
+//!
+//! What the newer 3d changes, and where each change is argued:
+//!
+//! * The segmented run is `Password / Passphrase / PIN` with the FIRST cell
+//!   filled, not `Words / Letters / PIN` with the first filled. See
+//!   [`GeneratedKind`], which is reordered and relabelled to match.
+//! * The re-roll is a **button** with a refresh glyph and a boxed `CTRL+R`,
+//!   not a bare `CTRL+R NEW` run. See [`GENERATE_REGENERATE_LABEL`].
+//! * The size readout is gone; in its place is a `Length` row with the value
+//!   right-aligned, a slider under it and its bounds under that. See
+//!   [`GeneratedKind::size_label`] and [`Layout::slider`].
+//! * A `Characters` block of four checkbox tiles, a minimum-digits stepper and
+//!   an *Avoid look-alikes* switch are new. See [`GenerateForm::classes`],
+//!   [`GenerateForm::min_number`] and [`GenerateForm::avoid_ambiguous`].
+//!
+//! **The paragraph the older pass wrote here -- "3d's `20 chars` is a readout,
+//! and the generator with every dial on it is the vault window's card" -- is
+//! superseded by that image.** It is kept, struck through, at
+//! [`GenerateForm::resize`], because the reasoning it rested on (this is a
+//! frameless always-on-top surface, so every control on it is a control the
+//! user cannot scroll away from) is still true and still shapes how the new
+//! ones behave: none of them opens a popup, none of them needs a text caret,
+//! and every one of them is dead rather than absent when it does not apply.
+//!
 //! # The card IS design 3d's panel, and not 3d's whole artboard
 //!
 //! 3d draws a white 470px page -- `border: 1px solid #dedbd9; border-radius:
 //! 10px; padding: 22px` -- carrying a `New password` caption over a focused,
 //! blue-haloed field (`height: 38px; border: 1px solid #1b3fa0; box-shadow: 0 0
-//! 0 3px #dbe4f7`), and under those the generator panel.
+//! 0 3px #dbe4f7`), and under those the generator panel. The newer image draws
+//! the same page, and adds the Deskwarden shield at the field's right-hand end.
 //!
 //! **The page and the field are the APPLICATION's.** They are the password box
 //! the user is standing in, drawn so the artboard shows what the overlay is
@@ -72,12 +106,22 @@
 //! does take focus is ringed in, so the design's focus treatment is on the card
 //! wherever there is something focusable to put it on.
 //!
+//! **Re-examined against the newer image, and kept.** The image gives the field
+//! a shield mark at its right-hand end, which is the only new thing in it --
+//! and a mark inside a field this card does not own is not a reason to start
+//! owning the field. The newer panel is also half as tall again as the old one,
+//! so a card that drew the page too would carry its dead field a couple of
+//! hundred pixels above the live one rather than roughly over it. The shield is
+//! on this card already, at its top left, where it says whose window this is;
+//! that is the job the image's mark is doing inside a page this window is not.
+//!
 //! Everything inside the panel is 3d's, at 3d's numbers, and the departures are
 //! each argued where they are made: the header ([`layout`]), the width
 //! ([`WIDTH`]), the button height ([`BUTTON_H`]), the primary button's words
-//! ([`GENERATE_SAVE_LABEL`]), the middle chip's ([`GeneratedKind`]), the size
-//! readout's ([`GeneratedKind::unit`]) and the missing length control
-//! ([`GenerateForm::resize`]).
+//! ([`GENERATE_SAVE_LABEL`]), the length row's caption
+//! ([`GeneratedKind::size_label`]), the class tiles' samples ([`Layout::tiles`])
+//! and the three blocks that go dead rather than away when the selected kind
+//! has no use for them ([`GenerateForm::classes_live`]).
 //!
 //! # The generator is the caller's
 //!
@@ -108,29 +152,45 @@ pub type Generator<'a> =
 
 /// Which kind of secret design 3d asks for.
 ///
-/// # This is Words / Characters / PIN, with the middle one renamed
+/// # This is Password / Passphrase / PIN, and all three are honest
 ///
-/// The design draws a three-way *Words / Letters / PIN* against a backend that
-/// has two request types. It resolves once the two axes are separated: the
-/// **request type** is a two-way ([`crate::vault_bridge::PassphraseRecipe`]
-/// against [`crate::vault_bridge::PasswordRecipe`]) and the **alphabet** is
-/// what makes three of them. [`Self::Words`] is the passphrase;
-/// [`Self::Characters`] and [`Self::Pin`] are both `PasswordRecipe`, differing
-/// only in which character classes they turn on.
+/// The newer image draws a three-way *Password / Passphrase / PIN* against a
+/// backend that has two request types. It resolves the way the older pass
+/// resolved the older labels, by separating two axes: the **request type** is a
+/// two-way ([`crate::vault_bridge::PassphraseRecipe`] against
+/// [`crate::vault_bridge::PasswordRecipe`]) and the **alphabet** is what makes
+/// three of them. [`Self::Words`] is the passphrase; [`Self::Characters`] and
+/// [`Self::Pin`] are both `PasswordRecipe`, differing only in which character
+/// classes they turn on.
 ///
-/// **The middle one is called *Characters*, not *Letters*, because that is what
-/// it is.** This card has no character-class switches (see [`layout`]) and so
-/// the general-purpose choice is the crate's own
-/// [`crate::vault_bridge::PasswordRecipe::default`] -- all four classes, digits
-/// and symbols included. A chip reading "Letters" over a password containing
-/// `7` and `!` would be the card lying about its own output.
+/// **PIN is expressible, and it was checked rather than assumed.** It is a
+/// `PasswordRecipe` with `number` on and the other three off, and the route
+/// honours it: the silent substitution of `uppercase + lowercase + number`
+/// documented on [`crate::vault_bridge::GenerateRequest::query`] fires only
+/// when *all four* classes arrive false. One class on comes back as that class.
+/// So the third cell is drawn, and it produces digits.
+///
+/// # The labels and the order both changed
+///
+/// The older 3d drew `Words / Letters / PIN` with `Words` filled. The newer
+/// image draws `Password / Passphrase / PIN` with the **first** cell filled,
+/// and the card opens on [`Self::Characters`] -- so `Characters` moves to the
+/// front of [`Self::ALL`], which is the order the run is drawn in, the order
+/// Tab walks it, and the order the control ids are assigned in.
+///
+/// The old pass argued the middle cell could not be called *Letters* because
+/// the card had no class switches and so always sent all four classes; a chip
+/// reading "Letters" over a password containing `7` and `!` would have been the
+/// card lying about its own output. **That is now moot twice over**: the label
+/// is `Password`, and the card does have the switches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeneratedKind {
+    /// A character password, whose alphabet is [`GenerateForm::classes`].
+    /// **First**, because the image fills the first cell and the card opens on
+    /// this one.
+    Characters,
     /// A word passphrase: [`crate::vault_bridge::PassphraseRecipe`].
     Words,
-    /// The default character password: every class on, which is what
-    /// "inherits the defaults" means here.
-    Characters,
     /// Digits only -- a `PasswordRecipe` with one class on.
     ///
     /// **Representable, and it survives the round trip.** The route substitutes
@@ -140,30 +200,37 @@ pub enum GeneratedKind {
 }
 
 impl GeneratedKind {
-    /// Every kind, in the order the segmented run draws them.
-    pub const ALL: [Self; 3] = [Self::Words, Self::Characters, Self::Pin];
+    /// Every kind, in the order the segmented run draws them -- which the newer
+    /// image sets as `Password / Passphrase / PIN`.
+    pub const ALL: [Self; 3] = [Self::Characters, Self::Words, Self::Pin];
 
-    /// The chip's label.
+    /// The cell's label, as the newer image prints it.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Words => "Words",
-            Self::Characters => "Characters",
+            Self::Characters => "Password",
+            Self::Words => "Passphrase",
             Self::Pin => "PIN",
         }
     }
 
-    /// What the size readout counts, and **it is read off the kind rather than
-    /// fixed**.
+    /// The caption over the size row, and **it is read off the kind rather
+    /// than fixed**.
     ///
-    /// The word is 3d's own -- its readout says `20 chars` -- but which word is
-    /// not. The design prints that same `chars` while *Words* is selected,
-    /// which does not cohere: a four-word passphrase is not twenty of anything
-    /// the user chose. The recipe sets `words` for a passphrase and `length`
-    /// for a password, so the readout has to say which.
-    pub fn unit(self) -> &'static str {
+    /// The word is 3d's own -- the image's row says `Length` -- but which word
+    /// is not. The image was drawn with *Password* selected, and printing that
+    /// same `Length` beside a passphrase's `4` does not cohere: what a
+    /// passphrase has four of is words, and its recipe field is literally
+    /// `words` where the password's is `length`. The row has to say which, for
+    /// the reason the old `20 chars` readout had to.
+    ///
+    /// This replaces that readout and its `unit`: the image moves the number
+    /// out of the control row into a row of its own, with the unit in the
+    /// caption on the left and the bare value on the right, so there is no
+    /// longer a `20 chars` run for anything to be a unit of.
+    pub fn size_label(self) -> &'static str {
         match self {
-            Self::Words => "words",
-            Self::Characters | Self::Pin => "chars",
+            Self::Characters | Self::Pin => "Length",
+            Self::Words => "Words",
         }
     }
 
@@ -175,6 +242,11 @@ impl GeneratedKind {
     /// that could reach 4 digits would be a card that visibly says one thing
     /// and silently produces another. **A four-digit PIN is therefore not
     /// offered at all**, rather than offered and quietly turned into five.
+    ///
+    /// **`Characters` is the pair the newer image prints under its slider**,
+    /// `8` and `64`, which this table already held before the image arrived.
+    /// The other two kinds have no drawn bounds to agree with, so theirs stay
+    /// as the route and taste set them.
     pub fn bounds(self) -> (u32, u32) {
         match self {
             Self::Words => (3, 10),
@@ -199,11 +271,46 @@ impl GeneratedKind {
         }
     }
 
-    /// The request this kind makes at `size`, **clamped into [`Self::bounds`]
-    /// first** so no caller can build a recipe the route would silently
-    /// rewrite.
-    pub fn recipe(self, size: u32) -> GenerateRequest {
+    /// The request this kind makes at `size` with these options, **clamped
+    /// into [`Self::bounds`] first** so no caller can build a recipe the route
+    /// would silently rewrite.
+    ///
+    /// # Which arguments each kind reads, and which it ignores
+    ///
+    /// The card's controls are a superset of any one kind's, because the window
+    /// is a fixed shape and its controls are created once (see [`layout`]). So
+    /// this is where "ignores" is made explicit rather than left to whichever
+    /// control happened to be drawn dead:
+    ///
+    /// * [`Self::Characters`] reads all three. This is the kind the image was
+    ///   drawn with, and the whole of its `Characters` block.
+    /// * [`Self::Words`] reads none of them: a passphrase's recipe has no
+    ///   character classes, no `minNumber` and no `ambiguous` field to put them
+    ///   in. The card draws those three blocks dead while it is selected.
+    /// * [`Self::Pin`] reads none of them either, but for the opposite reason:
+    ///   *digits only* is what the word PIN means, so the classes are the
+    ///   kind's rather than the user's. The card draws the tiles dead **and
+    ///   showing digits alone**, so the block is never a set of ticks the
+    ///   request is ignoring.
+    ///
+    /// **`min_number` is made coherent with its class here**, exactly as
+    /// `vault_window::detail_edit::EditDraft::generator_request` does it and
+    /// for the same reason: `minNumber: 1` beside `number: false` is a
+    /// contradiction the route resolves in a direction the user did not pick.
+    /// A class that is off sends `0` whatever the stepper holds -- and the
+    /// stepper keeps its number, so switching the class back on restores what
+    /// the user chose rather than a zero they never typed. The minimum is
+    /// capped at the clamped size as well, for the user who sets it and *then*
+    /// shortens the password.
+    pub fn recipe(
+        self,
+        size: u32,
+        classes: &crate::vault_window::detail_edit::CharClasses,
+        min_number: u32,
+        avoid_ambiguous: bool,
+    ) -> GenerateRequest {
         use crate::vault_bridge::{PassphraseRecipe, PasswordRecipe};
+        use crate::vault_window::detail_edit::CharClass;
         let (low, high) = self.bounds();
         let size = size.clamp(low, high);
         match self {
@@ -211,10 +318,36 @@ impl GeneratedKind {
                 words: size,
                 ..PassphraseRecipe::default()
             }),
-            Self::Characters => GenerateRequest::Password(PasswordRecipe {
-                length: size,
-                ..PasswordRecipe::default()
-            }),
+            Self::Characters => {
+                let number = classes.is_on(CharClass::Number);
+                let special = classes.is_on(CharClass::Special);
+                GenerateRequest::Password(PasswordRecipe {
+                    length: size,
+                    uppercase: classes.is_on(CharClass::Uppercase),
+                    lowercase: classes.is_on(CharClass::Lowercase),
+                    number,
+                    special,
+                    min_number: if number {
+                        min_number.min(MAX_MIN_NUMBER).min(size)
+                    } else {
+                        0
+                    },
+                    // **The card has no control for this one**, so it is the
+                    // crate's default, zeroed with its class exactly as
+                    // `min_number` is. The image draws a stepper for digits
+                    // and none for symbols, and inventing a second stepper the
+                    // design does not have would be this card growing a
+                    // control of its own.
+                    min_special: if special {
+                        PasswordRecipe::default()
+                            .min_special
+                            .min(size.saturating_sub(min_number.min(size)))
+                    } else {
+                        0
+                    },
+                    avoid_ambiguous,
+                })
+            }
             Self::Pin => GenerateRequest::Password(PasswordRecipe {
                 length: size,
                 uppercase: false,
@@ -232,12 +365,28 @@ impl GeneratedKind {
                 // exists so a human can tell `O` from `0` and `l` from `1`.
                 // With no letters in the alphabet there is nothing to confuse
                 // them with, so all it would do is delete two of the ten digits
-                // from a six-character secret.
+                // from a six-character secret. The card draws the switch dead
+                // while PIN is selected, so it is not a control showing "on"
+                // over a request that says otherwise.
                 avoid_ambiguous: false,
             }),
         }
     }
 }
+
+/// The most digits the card will let a user **demand**.
+///
+/// This app's number, not the route's -- nothing in `bw serve`'s
+/// `GenerateCommand` caps `minNumber`. It is the vault window's own
+/// [`crate::vault_window::detail_edit::MAX_MIN_CLASS`] rather than a 4 written
+/// out again here: the two cards draw the same stepper against the same route,
+/// and two copies of the bound would be two chances to disagree about it.
+///
+/// Deliberately far below every [`GeneratedKind::bounds`] floor, so the stepper
+/// can never on its own ask for more digits than the password has room for.
+/// [`GeneratedKind::recipe`] clamps against the size as well, for the user who
+/// raises this and *then* shortens the password.
+pub const MAX_MIN_NUMBER: u32 = crate::vault_window::detail_edit::MAX_MIN_CLASS;
 
 /// Where the card's one round-trip has got to.
 ///
@@ -260,20 +409,58 @@ pub enum ValueState {
     Failed(String),
 }
 
-/// The card's whole state: what to ask for, how much of it, and where the
-/// asking has got to.
+/// The card's whole state: what to ask for, how much of it, out of which
+/// alphabet, and where the asking has got to.
+///
+/// # Every field is one of the newer 3d's controls, and nothing else is
+///
+/// The newer image draws six controls over three request options, and this
+/// struct is exactly those: [`Self::kind`] is the run, [`Self::size`] is the
+/// slider, [`Self::classes`] is the four tiles, [`Self::min_number`] is the
+/// stepper and [`Self::avoid_ambiguous`] is the switch. Each of the last three
+/// is the same thing `vault_window::detail_edit::GeneratorDraft` holds for the
+/// vault window's own copy of this card -- and `classes` is *literally* that
+/// type, not a copy of it, so the all-off request the route silently rewrites
+/// is unrepresentable here for the reason it is unrepresentable there.
+///
+/// **It is still a `GenerateForm` and not a `GeneratorDraft`.** The draft
+/// carries the passphrase's separator, its capitalisation, its
+/// `includeNumber`, an options disclosure, a modal flag and a plaintext
+/// `preview` of the candidate -- view state for an egui card, and in the
+/// preview's case a live secret. This card's whole premise is that no secret
+/// crosses the seam (see the module doc), so the type `run_with` deals in
+/// holds the controls the image draws and nothing that could carry a password.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateForm {
     kind: GeneratedKind,
     size: u32,
+    classes: crate::vault_window::detail_edit::CharClasses,
+    min_number: u32,
+    avoid_ambiguous: bool,
     state: ValueState,
 }
 
 impl GenerateForm {
-    /// A card that has just opened: `kind` at its default size, already
-    /// generating.
+    /// A card that has just opened: `kind` at its default size, with the
+    /// crate's own default recipe behind it, already generating.
+    ///
+    /// **The alphabet, the minimum and the switch are
+    /// [`crate::vault_bridge::PasswordRecipe::default`]'s** rather than
+    /// numbers chosen here -- all four classes, one digit demanded,
+    /// look-alikes avoided -- which is what the image draws and what the vault
+    /// window's `GeneratorDraft::default` starts from. A card that opened at a
+    /// weaker recipe than the crate's default would be handing out weaker
+    /// passwords on the daemon's commonest path.
     pub fn new(kind: GeneratedKind) -> Self {
-        Self { kind, size: kind.default_size(), state: ValueState::InFlight }
+        let recipe = crate::vault_bridge::PasswordRecipe::default();
+        Self {
+            kind,
+            size: kind.default_size(),
+            classes: crate::vault_window::detail_edit::CharClasses::default(),
+            min_number: recipe.min_number,
+            avoid_ambiguous: recipe.avoid_ambiguous,
+            state: ValueState::InFlight,
+        }
     }
 
     /// What the card is asking for.
@@ -284,6 +471,86 @@ impl GenerateForm {
     /// How many words or characters.
     pub fn size(&self) -> u32 {
         self.size
+    }
+
+    /// The size range the slider spans, which is the selected kind's.
+    pub fn bounds(&self) -> (u32, u32) {
+        self.kind.bounds()
+    }
+
+    /// **The classes the user set**, which is what the request is built from
+    /// and what the tiles edit.
+    pub fn classes(&self) -> &crate::vault_window::detail_edit::CharClasses {
+        &self.classes
+    }
+
+    /// **The classes the tiles DRAW**, which is not always the ones the user
+    /// set.
+    ///
+    /// While [`GeneratedKind::Pin`] is selected the request is digits and
+    /// nothing else, whatever the user last ticked -- so tiles drawn from
+    /// [`Self::classes`] would show four ticks over a six-digit PIN. This
+    /// answers digits-only for `Pin`, and the stored set for the other two
+    /// kinds; the tiles are dead for both of those, so the passphrase shows the
+    /// set that comes back the moment the user returns to *Password* rather
+    /// than a set it is not using.
+    ///
+    /// Built by switching the other three classes off a default rather than by
+    /// naming the fields, which nothing outside `char_classes` can do -- and
+    /// which is the point: each `set` here leaves at least one class on, so
+    /// even this construction cannot reach the all-off value the route rewrites.
+    pub fn shown_classes(&self) -> crate::vault_window::detail_edit::CharClasses {
+        use crate::vault_window::detail_edit::{CharClass, CharClasses};
+        if self.kind != GeneratedKind::Pin {
+            return self.classes.clone();
+        }
+        let mut digits = CharClasses::default();
+        for class in [CharClass::Uppercase, CharClass::Lowercase, CharClass::Special] {
+            let _ = digits.set(class, false);
+        }
+        digits
+    }
+
+    /// How many digits the password must contain at least.
+    pub fn min_number(&self) -> u32 {
+        self.min_number
+    }
+
+    /// Whether look-alike characters are left out.
+    pub fn avoid_ambiguous(&self) -> bool {
+        self.avoid_ambiguous
+    }
+
+    /// **Whether the `Characters` block is in play**, which is the one thing
+    /// that varies about this card's shape -- and it varies by going grey, not
+    /// by going away.
+    ///
+    /// The window is a fixed size with its controls created once (see
+    /// [`layout`]), so a block that disappeared for two of the three kinds
+    /// would mean a card that resizes under the user on a frameless
+    /// always-on-top surface, and a Tab order that changes length as they walk
+    /// it. Grey instead: the tiles, the stepper and the switch are all drawn
+    /// dead while the selected kind does not read them, which is the same
+    /// answer `theme::toggle_pill_disabled` gives and the same one this card
+    /// already gives *Save* with no password behind it.
+    ///
+    /// In flight counts as not live for the reason every other control's does:
+    /// the answer to an outstanding request is the answer to the recipe that
+    /// was sent.
+    pub fn classes_live(&self) -> bool {
+        !self.in_flight() && self.kind == GeneratedKind::Characters
+    }
+
+    /// Whether the minimum-digits stepper is in play.
+    ///
+    /// [`Self::classes_live`] **and** the digits class being on: `minNumber`
+    /// beside `number: false` is the contradiction
+    /// [`GeneratedKind::recipe`] zeroes, and a live stepper over a number the
+    /// request is about to discard would be the card offering a choice it does
+    /// not send.
+    pub fn min_number_live(&self) -> bool {
+        use crate::vault_window::detail_edit::CharClass;
+        self.classes_live() && self.classes.is_on(CharClass::Number)
     }
 
     /// Where the round-trip has got to.
@@ -306,15 +573,23 @@ impl GenerateForm {
         matches!(self.state, ValueState::Ready)
     }
 
-    /// The size readout, live and labelled by kind: "4 words", "20
-    /// characters".
-    pub fn readout(&self) -> String {
-        format!("{} {}", self.size, self.kind.unit())
+    /// The size row's caption -- `Length`, or `Words` for a passphrase -- and
+    /// the value that sits right-aligned opposite it.
+    ///
+    /// **This replaces the old `readout`'s `20 chars`.** The newer image splits
+    /// that one run into a labelled row, so the two halves are returned
+    /// together here rather than composed at the paint site: a caption drawn
+    /// from the kind and a number drawn from the size are two reads of one
+    /// state, and a card that got them from two places could print `Words` over
+    /// `20`.
+    pub fn size_row(&self) -> (&'static str, String) {
+        (self.kind.size_label(), self.size.to_string())
     }
 
-    /// The request the card would send right now.
+    /// The request the card would send right now: the kind, the size, and --
+    /// for a character password -- every dial the newer image draws.
     pub fn request(&self) -> GenerateRequest {
-        self.kind.recipe(self.size)
+        self.kind.recipe(self.size, &self.classes, self.min_number, self.avoid_ambiguous)
     }
 
     /// Starts a request, and **answers `false` and changes nothing if one is
@@ -323,8 +598,9 @@ impl GenerateForm {
     /// This is the whole of "no second generate runs concurrently", and it is a
     /// refusal in the one function that can enter [`ValueState::InFlight`]
     /// rather than a disabled button. Every path that regenerates (the
-    /// `CTRL+R NEW` control, the chord itself, changing kind, changing size)
-    /// goes through here.
+    /// *Regenerate* button, the `CTRL+R` chord itself, changing kind, moving
+    /// the slider, ticking a class tile, stepping the minimum, flipping the
+    /// look-alikes switch) goes through here.
     pub fn begin(&mut self) -> bool {
         if self.in_flight() {
             return false;
@@ -354,6 +630,15 @@ impl GenerateForm {
     /// paths use: the answer to an outstanding request is the answer to the
     /// recipe that was sent, and pinning it onto whichever chip the user
     /// clicked in the meantime would be the card mislabelling its own output.
+    /// **The size resets to the new kind's default; nothing else does.** 20
+    /// characters and 20 words are wildly different requests, so the size
+    /// cannot carry across -- that is
+    /// `vault_window::detail_edit::GeneratorDraft`'s own argument for keeping
+    /// `length` and `words` in separate fields. The classes, the minimum and
+    /// the switch *do* carry across, which is the same module's
+    /// `switching_kind_keeps_the_generator_settings`: a user who turned symbols
+    /// off for a site that rejects them must not be asked twice because they
+    /// looked at the passphrase cell in between.
     pub fn choose(&mut self, kind: GeneratedKind) -> bool {
         if self.in_flight() || kind == self.kind {
             return false;
@@ -363,8 +648,46 @@ impl GenerateForm {
         self.begin()
     }
 
+    /// Sets the size to `size`, clamped into [`GeneratedKind::bounds`], and
+    /// starts a request. Answers whether anything moved.
+    ///
+    /// **The slider's own path.** A slider states a value rather than nudging
+    /// one, and going through [`Self::resize`] would mean the window module
+    /// working out a delta from a number the form already owns.
+    pub fn set_size(&mut self, size: u32) -> bool {
+        if self.in_flight() {
+            return false;
+        }
+        let (low, high) = self.kind.bounds();
+        let next = size.clamp(low, high);
+        if next == self.size {
+            return false;
+        }
+        self.size = next;
+        self.begin()
+    }
+
     /// Moves the size by `delta`, within [`GeneratedKind::bounds`], and starts
     /// a request. Answers whether anything moved.
+    ///
+    /// # The paragraph this used to carry, and why it is struck through
+    ///
+    /// > ~~**Nothing on 3d's card posts this.** The design's `20 chars` is a
+    /// > readout, and the generator with every dial on it is the vault window's
+    /// > own copy of 3d. This is the fill path's card, which leads with one
+    /// > fresh password at the crate's default size.~~
+    ///
+    /// **Superseded by the newer 3d**, which draws a slider, four class tiles,
+    /// a minimum-digits stepper and a look-alikes switch on this card. The
+    /// reading was a reasonable one of the older artboard and it is simply not
+    /// what the owner asked for; it is kept rather than deleted because the
+    /// bounds table it justified ([`GeneratedKind::bounds`]) and the clamping
+    /// it justified are both still here and still load-bearing.
+    ///
+    /// This is now the **keyboard's** path onto the slider: the arrow keys,
+    /// which the message pump routes here because `IsDialogMessageW` eats them
+    /// before the control could ever see a `WM_KEYDOWN`. The pointer's path is
+    /// [`Self::set_size`].
     pub fn resize(&mut self, delta: i32) -> bool {
         if self.in_flight() {
             return false;
@@ -379,11 +702,9 @@ impl GenerateForm {
         self.begin()
     }
 
-    /// Whether moving the size by `delta` would do anything.
-    ///
-    /// **Nothing on 3d's card reads this**, because 3d's card has no length
-    /// control -- see [`layout`]. It is the predicate a control would be drawn
-    /// dead by, kept beside [`Self::resize`] because the two are one rule.
+    /// Whether moving the size by `delta` would do anything -- the predicate a
+    /// slider at one end of its travel is drawn against, kept beside
+    /// [`Self::resize`] because the two are one rule.
     pub fn can_resize(&self, delta: i32) -> bool {
         let (low, high) = self.kind.bounds();
         !self.in_flight()
@@ -392,6 +713,65 @@ impl GenerateForm {
                 -1 => self.size > low,
                 _ => false,
             }
+    }
+
+    /// Flips one character-class tile and starts a request. Answers whether
+    /// anything moved.
+    ///
+    /// **Refused three ways, and only one of them is this function's.**
+    /// [`Self::classes_live`] refuses while a request is outstanding or while
+    /// the selected kind does not read the classes at all; `CharClasses::toggle`
+    /// refuses to switch off the last class standing, which is the invariant
+    /// that keeps the all-off request -- the one `bw serve` silently rewrites
+    /// into a three-class password -- off the wire. Neither refusal is restated
+    /// here.
+    pub fn toggle_class(&mut self, class: crate::vault_window::detail_edit::CharClass) -> bool {
+        if !self.classes_live() || !self.classes.toggle(class) {
+            return false;
+        }
+        self.begin()
+    }
+
+    /// Steps the minimum-digits number by `delta`, within `0..=`
+    /// [`MAX_MIN_NUMBER`], and starts a request. Answers whether anything moved.
+    pub fn step_min_number(&mut self, delta: i32) -> bool {
+        if !self.min_number_live() {
+            return false;
+        }
+        let next = (i64::from(self.min_number) + i64::from(delta))
+            .clamp(0, i64::from(MAX_MIN_NUMBER)) as u32;
+        if next == self.min_number {
+            return false;
+        }
+        self.min_number = next;
+        self.begin()
+    }
+
+    /// Whether stepping the minimum by `delta` would do anything -- the
+    /// predicate each of the stepper's two buttons is drawn dead by at its own
+    /// end of the range.
+    pub fn can_step_min_number(&self, delta: i32) -> bool {
+        self.min_number_live()
+            && match delta.signum() {
+                1 => self.min_number < MAX_MIN_NUMBER,
+                -1 => self.min_number > 0,
+                _ => false,
+            }
+    }
+
+    /// Flips the *Avoid look-alikes* switch and starts a request. Answers
+    /// whether anything moved.
+    ///
+    /// Live on exactly [`Self::classes_live`]: a passphrase's recipe has no
+    /// `ambiguous` field, and a PIN's is forced off by
+    /// [`GeneratedKind::recipe`] because with no letters in the alphabet there
+    /// is nothing for a `0` to be confused with.
+    pub fn toggle_avoid_ambiguous(&mut self) -> bool {
+        if !self.classes_live() {
+            return false;
+        }
+        self.avoid_ambiguous = !self.avoid_ambiguous;
+        self.begin()
     }
 }
 
@@ -405,23 +785,38 @@ pub enum Event {
     Cancel,
     /// The window went away underneath us. Treated exactly as `Cancel`.
     Closed,
-    /// The `CTRL+R NEW` control, or the chord it prints: ask again with the
-    /// settings that are showing.
+    /// The *Regenerate* button, or the `CTRL+R` chord it prints: ask again with
+    /// the settings that are showing.
     Regenerate,
     /// *Copy*: put the password on the clipboard, and keep the card up.
     Copy,
-    /// *Save to vault*, or Enter: hand the password back to design 3c.
+    /// *Fill & save to vault*, or Enter: hand the password back to design 3c.
     Save,
     /// One of the three cells of the kind run.
     Choose(GeneratedKind),
-    /// Move the size by `+1` or `-1`.
+    /// Move the size by `+1` or `-1`: the slider's **arrow keys**.
     ///
-    /// **No control on 3d's card posts this.** The design's `20 chars` is a
-    /// readout, and the generator with every dial on it is the vault window's
-    /// own copy of 3d -- see [`layout`]. It stays on the seam because the
-    /// clamping and the bounds table it drives are what keep
-    /// [`GeneratedKind::recipe`] from sending the route a size it would rewrite.
+    /// Distinct from [`Self::Size`] because that is what the slider's arrows
+    /// are -- a nudge from wherever the value is -- and turning one into the
+    /// other would mean the window module reading the size out of the form to
+    /// add one to it. The clamping and the bounds table are
+    /// [`GenerateForm::resize`]'s either way.
     Resize(i32),
+    /// **Set the size outright: the slider's pointer.**
+    ///
+    /// Posted on the button going UP and not on every move of the drag.
+    /// `GenerateCalls::fill` blocks the pump on a round trip, so a drag that
+    /// posted per move would be dozens of blocking round trips and a frozen
+    /// window -- the defect `GeneratorDraft::asked` exists to defer in the
+    /// vault window's copy of this card. The handle follows the pointer all the
+    /// way; only the request waits for the release.
+    Size(u32),
+    /// One of the four character-class tiles was ticked or unticked.
+    ToggleClass(crate::vault_window::detail_edit::CharClass),
+    /// The minimum-digits stepper's `-` or `+`.
+    StepMinNumber(i32),
+    /// The *Avoid look-alikes* switch.
+    ToggleAvoidAmbiguous,
 }
 
 /// How [`run_with`] finished.
@@ -531,6 +926,26 @@ pub fn run_with(calls: &GenerateCalls, app_name: &str, generate: &Generator<'_>)
                     refresh(calls, window, &mut form, generate);
                 }
             }
+            Event::Size(size) => {
+                if form.set_size(size) {
+                    refresh(calls, window, &mut form, generate);
+                }
+            }
+            Event::ToggleClass(class) => {
+                if form.toggle_class(class) {
+                    refresh(calls, window, &mut form, generate);
+                }
+            }
+            Event::StepMinNumber(delta) => {
+                if form.step_min_number(delta) {
+                    refresh(calls, window, &mut form, generate);
+                }
+            }
+            Event::ToggleAvoidAmbiguous => {
+                if form.toggle_avoid_ambiguous() {
+                    refresh(calls, window, &mut form, generate);
+                }
+            }
             Event::Copy => {
                 // Refused without a password, for the reason `Save` is: an
                 // empty copy would clear whatever the user already had on the
@@ -602,30 +1017,57 @@ pub const GENERATE_CAPTION: &str = "GENERATED";
 /// this path can type into the window behind the card. What it can do is put
 /// the password into design 3c, which saves it, and onto the clipboard, which
 /// is how it reaches the field.
+///
+/// **Re-checked against the newer image, which still says `Fill & save to
+/// vault`, and kept.** Nothing about the path changed: `handle_no_match` still
+/// holds no injector, so the missing word is still the difference between a
+/// button that describes what happens and one that does not.
 pub const GENERATE_SAVE_LABEL: &str = "Save to vault";
 
 /// 3d's clipboard button -- the one control here that gets the password into
 /// the app the user is actually looking at.
 pub const GENERATE_COPY_LABEL: &str = "Copy";
 
-/// 3d's regenerate control: the chord and the verb in one monospace run,
-/// `CTRL+R NEW`, at the right-hand end of the control row.
+/// 3d's regenerate control, at the right-hand end of the control row.
 ///
-/// Upper case for [`GENERATE_CAPTION`]'s reason -- the design prints `NEW`, not
-/// a `New` some style rule shouts.
-pub const GENERATE_NEW_LABEL: &str = "NEW";
+/// **The older 3d drew a bare `CTRL+R NEW` monospace run and the newer image
+/// draws a button**: an outlined pill carrying a refresh glyph, the word
+/// *Regenerate*, and `CTRL+R` in a box of its own. So this is now a sentence
+/// case verb rather than a shouted `NEW`, and [`REGENERATE_SHORTCUT`] is the
+/// chip beside it rather than half of one run -- which is why the composed
+/// `regenerate_hint()` the old card painted is gone: there is no longer one run
+/// to compose.
+///
+/// The older pass noted that making the run a control cost the design nothing.
+/// The newer image makes it a control outright, so the note is now simply what
+/// the design says.
+pub const GENERATE_REGENERATE_LABEL: &str = "Regenerate";
 
-/// The chord half of that run.
+/// The chord, drawn as its own boxed chip inside the *Regenerate* button
+/// through [`crate::win32_draw::draw_hint_chip`] -- the crate's one keyboard
+/// hint chip, so this card cannot draw a second-looking one.
 pub const REGENERATE_SHORTCUT: &str = "CTRL+R";
 
-/// The two, composed, and **the run the control actually paints**.
+/// The newer image's caption over the four class tiles.
 ///
-/// A function rather than a third constant holding the same words a third
-/// time: the card draws exactly this, and a test that reads it is reading what
-/// is on screen rather than a copy of it.
-pub fn regenerate_hint() -> String {
-    format!("{REGENERATE_SHORTCUT} {GENERATE_NEW_LABEL}")
-}
+/// The length row above it has no constant of its own, because its word varies
+/// by kind: see [`GeneratedKind::size_label`] and [`GenerateForm::size_row`].
+/// This one does not vary -- the tiles are the password's alphabet whatever
+/// else is selected, and are drawn dead rather than relabelled when they are
+/// not in play.
+pub const GENERATE_CLASSES_CAPTION: &str = "Characters";
+
+/// The minimum-digits row's question, as the newer image words it.
+pub const GENERATE_MIN_NUMBER_LABEL: &str = "At least this many digits";
+
+/// The look-alikes row's label and the sample under it.
+///
+/// The sample is the image's own `0 O · 1 l I` -- the four characters the
+/// route's `ambiguous` flag actually removes, shown as the pairs they are
+/// confused with rather than described in a sentence. `\u{b7}` is the middle
+/// dot the image sets between the two pairs.
+pub const GENERATE_AVOID_LABEL: &str = "Avoid look-alikes";
+pub const GENERATE_AVOID_SAMPLE: &str = "0 O \u{b7} 1 l I";
 
 /// What the value line says while the round-trip is outstanding.
 ///
@@ -770,10 +1212,15 @@ const VALUE_H: i32 = 23;
 /// `theme::SEGMENT_TEXT_SIZE` plus `theme::SEGMENT_PADDING`, which is the
 /// crate's own segmented run and within two pixels of 3d's `padding: 5px 11px`.
 ///
-/// Not uniform, for `theme::segment_widths`' reason: "Characters" is more than
+/// Not uniform, for `theme::segment_widths`' reason: "Passphrase" is more than
 /// twice as wide as "PIN", and a run whose every cell is padded out to the
 /// longest label is a row of mostly empty boxes.
-const KIND_W: [i32; 3] = [58, 82, 44];
+///
+/// **Re-measured for the newer image's labels**, which are longer than the old
+/// ones: `Password` and `Passphrase` where the old run said `Words` and
+/// `Characters`. The whole run plus the *Regenerate* button has to fit one
+/// 352-pixel row, which `the_control_row_fits_the_body` is what proves.
+const KIND_W: [i32; 3] = [66, 78, 40];
 
 /// The one-pixel overlap that puts two adjacent cells' strokes on one column.
 /// `theme::SEGMENT_SEAM`, pinned by [`the_cards_dimensions_are_the_themes`].
@@ -786,13 +1233,81 @@ const SEGMENT_H: i32 = 28;
 /// its two footer buttons.
 const RADIUS: i32 = 7;
 
-/// The size readout's box: `20 chars`, `4 words`, `64 chars`. Eight characters
-/// of 12px prose, with room to spare, in a box whose width does not change when
-/// the text does.
-const READOUT_W: i32 = 56;
+/// The *Regenerate* button's box, at the right-hand end of the control row.
+///
+/// Wider than the `CTRL+R NEW` run it replaces, because the newer image puts
+/// three things inside it: a refresh glyph, the word, and `CTRL+R` in a
+/// bordered chip. Measured as slack rather than tight for [`SAVE_W`]'s reason
+/// -- `layout` is pure and cannot ask a device context how wide *Regenerate*
+/// came out in the user's own rendering.
+const REGENERATE_W: i32 = 156;
 
-/// The `CTRL+R NEW` run's box, at the right-hand end of the control row.
-const HINT_W: i32 = 72;
+/// The refresh glyph's diameter inside that button, and the gap between it and
+/// the word.
+const REFRESH_GLYPH: i32 = 12;
+const REFRESH_GAP: i32 = 6;
+
+/// The length row: its caption/value line, the slider under it, and the line of
+/// bounds under that.
+///
+/// The caption line is a 12px line box, the slider row is exactly the handle's
+/// diameter (the track is centred inside it), and the bounds line is an 11px
+/// one. The image's own three-line stack, at this app's type sizes.
+const LENGTH_LABEL_H: i32 = 18;
+const SLIDER_H: i32 = 16;
+const BOUND_H: i32 = 14;
+
+/// The slider's parts: the track's thickness, and the handle's radius.
+///
+/// The handle is [`SLIDER_H`]'s own half, so the row is exactly as tall as the
+/// handle and the track runs through its centre. The track is the design's
+/// hairline weight doubled -- a one-pixel rule under a sixteen-pixel handle
+/// reads as a scratch rather than as a track.
+const SLIDER_TRACK_H: i32 = 4;
+const SLIDER_HANDLE_R: i32 = SLIDER_H / 2;
+
+/// The caption over the class tiles, and the gap under it. The caption is the
+/// same 12px line box the length row's is.
+const CAPTION_H: i32 = 18;
+const CAPTION_GAP: i32 = 8;
+
+/// One class tile, and the gap between two of them.
+///
+/// Two columns of [`Layout::tiles`] across the body with one gap between, so
+/// the width is derived in [`layout`] rather than written here -- a tile width
+/// that did not add up to the body's would leave the right-hand column short
+/// of the margin or over it.
+const TILE_H: i32 = 32;
+const TILE_GAP: i32 = 8;
+
+/// The tick box inside a tile, and the gaps around what follows it: the class
+/// name, then its sample.
+const TILE_BOX: i32 = 14;
+const TILE_PAD_X: i32 = 9;
+const TILE_TEXT_GAP: i32 = 8;
+
+/// The minimum-digits stepper: two step buttons round a value cell, joined the
+/// way the kind run is.
+///
+/// **3e's segmented control again**, which is exactly what
+/// `prefs_ui::minutes_stepper` borrows for the Preferences window's own
+/// stepper: [`SEGMENT_H`] tall, [`RADIUS`] cornered, [`SEGMENT_SEAM`] joined,
+/// and drawn through the same `win32_draw::draw_segment_cell`. The value cell
+/// is narrower than that stepper's 56 because this one holds a single digit --
+/// `0` to [`MAX_MIN_NUMBER`] -- where minutes can run to three.
+const STEP_W: i32 = 28;
+const STEP_VALUE_W: i32 = 32;
+
+/// The *Avoid look-alikes* row: the label line, its sample under it, and the
+/// switch beside them both.
+///
+/// The switch is `theme::TOGGLE_W` by `theme::TOGGLE_H` -- the app's own 40×22,
+/// pinned by [`the_cards_dimensions_are_the_themes`] -- and the row is as tall
+/// as the taller of the two, which is the text stack.
+const AVOID_LABEL_H: i32 = 18;
+const AVOID_SAMPLE_H: i32 = 14;
+const TOGGLE_W: i32 = 40;
+const TOGGLE_H: i32 = 22;
 
 /// Button height.
 ///
@@ -872,10 +1387,42 @@ pub struct Layout {
     /// after the first starts one pixel inside its neighbour so the two strokes
     /// at a seam land on one column.
     pub kinds: [Box2; 3],
-    pub readout: Box2,
-    /// The `CTRL+R NEW` run, which is a control as well as a hint -- see
-    /// [`layout`].
-    pub hint: Box2,
+    /// The *Regenerate* button at the right-hand end of the control row: a
+    /// refresh glyph, the word, and the `CTRL+R` chip, in one outlined pill.
+    pub regenerate: Box2,
+    /// The length row's caption (`Length`, or `Words`) and the value opposite
+    /// it -- the two halves [`GenerateForm::size_row`] hands back.
+    pub length_label: Box2,
+    pub length_value: Box2,
+    /// The slider's own row. The track is centred in it and the handle is
+    /// exactly as tall as it, so this box is what the control window covers and
+    /// what a pointer x is mapped through.
+    pub slider: Box2,
+    /// The bounds under the slider's two ends: `8` at the left, `64` at the
+    /// right, both read off [`GeneratedKind::bounds`].
+    pub slider_low: Box2,
+    pub slider_high: Box2,
+    /// The `Characters` caption over the tiles.
+    pub classes_caption: Box2,
+    /// The four class tiles, in `CharClass::ALL` order, laid out **two by two**
+    /// -- the image's grid, index 0 and 1 on the first row.
+    ///
+    /// Each tile carries a tick box, the class's
+    /// `CharClass::name` and its `CharClass::label` as the small grey sample.
+    /// **The samples are the crate's own** (`A-Z`, `a-z`, `0-9`, `!@#`) and the
+    /// image's symbols sample reads `!@#$%`; the existing spelling is kept
+    /// rather than a second one introduced, because that constant is what the
+    /// vault window's own class chips print and two spellings of one character
+    /// set is two things that have to agree about what the set is.
+    pub tiles: [Box2; 4],
+    /// The minimum-digits row: the question on the left, and the joined
+    /// `- n +` stepper on the right, in `[minus, value, plus]` order.
+    pub min_label: Box2,
+    pub min_stepper: [Box2; 3],
+    /// The look-alikes row: the label, the sample under it, and the switch.
+    pub avoid_label: Box2,
+    pub avoid_sample: Box2,
+    pub avoid_toggle: Box2,
     pub save: Box2,
     pub copy: Box2,
 }
@@ -884,21 +1431,36 @@ pub struct Layout {
 ///
 /// The card has no rows, no modes and no second step, so nothing about it
 /// varies at runtime: the value line is [`VALUE_H`] tall whether it is showing
-/// a password, a "Generating..." or a failure sentence, and the readout's text
-/// changes inside a box whose width does not. The window is sized to this
+/// a password, a "Generating..." or a failure sentence, and the length value's
+/// text changes inside a box whose width does not. The window is sized to this
 /// content and to nothing else -- the way `picker_prompt`'s empty mode is sized
 /// to its own two offers -- rather than to a row count it does not have.
 ///
+/// **That survives the newer 3d's four extra blocks**, and it is the reason
+/// they are drawn dead rather than hidden when the selected kind has no use for
+/// them: see [`GenerateForm::classes_live`]. A card that grew and shrank as the
+/// user walked the kind run would be resizing a frameless always-on-top window
+/// under their pointer, and re-laying out its child controls while they had
+/// focus.
+///
 /// # What is 3d's, top to bottom
 ///
-/// The body is 3d's panel body at `padding: 14px` with `gap: 12px`: the caption
-/// row ([`Layout::caption`] and [`Layout::badge`]), the value
-/// ([`Layout::value`]), and the control row -- the joined `Words / Characters /
-/// PIN` run, the size readout, a spacer, and `CTRL+R NEW` at the far right.
+/// The body is 3d's panel body at `padding: 14px` with `gap: 12px`:
+///
+/// 1. The caption row ([`Layout::caption`] and [`Layout::badge`]).
+/// 2. The value ([`Layout::value`]).
+/// 3. The control row: the joined `Password / Passphrase / PIN` run, a spacer,
+///    and the *Regenerate* button at the far right.
+/// 4. The length row -- caption and value ([`Layout::length_label`]), the
+///    slider ([`Layout::slider`]), and its bounds.
+/// 5. The `Characters` caption over a two-by-two grid of class tiles.
+/// 6. The minimum-digits question and its stepper.
+/// 7. The look-alikes label, its sample, and the switch.
+///
 /// Then the footer band at `padding: 12px 14px` over its `1px solid #eae7e7`,
 /// holding the filled primary and the outlined `Copy`.
 ///
-/// # The two things 3d's panel does not have
+/// # The one thing 3d's panel does not have
 ///
 /// **A header.** 3d's panel begins at its caption row, because in the artboard
 /// the page above it carries the context -- the `New password` label, and the
@@ -909,20 +1471,16 @@ pub struct Layout {
 /// shield, the wordmark, and the card's title under them over 3d's own
 /// `border-bottom: 1px solid #eae7e7`. The window's ✕ sits on the lockup's line.
 ///
-/// **A length control.** 3d's `20 chars` is a readout and nothing else, and
-/// this card's is too: the full generator -- every character class, the length,
-/// the word count -- is the vault window's own 3d card
-/// (`vault_window::detail_edit`), reached from the item form. This is the fill
-/// path's card, which leads with one fresh password at the crate's default size.
-/// [`GenerateForm::resize`] survives in the decision layer because that is where
-/// the route's clamps live and where [`GeneratedKind::default_size`] is made
-/// honest; **no control on this card posts [`Event::Resize`]**.
+/// # The two things it used to not have, and now does
 ///
-/// **No character-class switches**, for the same reason and the older one: this
-/// surface is frameless, always-on-top, unscrollable and appears over whatever
-/// the user is doing. It inherits
-/// [`crate::vault_bridge::PasswordRecipe::default`] instead -- which, per
-/// [`GeneratedKind`], is also why the middle cell is not called "Letters".
+/// The older pass argued this card had **no length control and no
+/// character-class switches**, on the reading that 3d's `20 chars` was a
+/// readout and that the generator with every dial on it was the vault window's
+/// card. The newer image settles it the other way: both are here. The struck
+/// paragraph is kept at [`GenerateForm::resize`] rather than deleted, because
+/// the half of it that was about *this surface* -- frameless, always-on-top,
+/// unscrollable, over whatever the user is doing -- is why none of the new
+/// controls opens a popup, needs a caret, or changes the card's size.
 pub fn layout() -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
@@ -964,13 +1522,95 @@ pub fn layout() -> Layout {
             h: SEGMENT_H,
         },
     ];
-    let readout = Box2 { x: kinds[2].right() + ROW_GAP, y: row_y, w: READOUT_W, h: SEGMENT_H };
     // 3d puts the re-roll behind a `flex: 1` spacer, which is the row's right
-    // edge. Laid out from that edge inwards so the readout's text can change
-    // width without moving it.
-    let hint = Box2 { x: MARGIN_X + content_w - HINT_W, y: row_y, w: HINT_W, h: SEGMENT_H };
+    // edge. Laid out from that edge inwards, so the run's cells can be
+    // re-measured for a longer label without the button moving.
+    let regenerate =
+        Box2 { x: MARGIN_X + content_w - REGENERATE_W, y: row_y, w: REGENERATE_W, h: SEGMENT_H };
 
-    let footer_rule = Box2 { x: 0, y: row_y + SEGMENT_H + BODY_PAD, w: WIDTH, h: 1 };
+    // The length row: caption and value on one line, the slider under it, the
+    // bounds under that. The three are one block, so only the block is spaced
+    // from its neighbours by `BODY_GAP`.
+    let length_y = row_y + SEGMENT_H + BODY_GAP;
+    let length_label =
+        Box2 { x: MARGIN_X, y: length_y, w: content_w / 2, h: LENGTH_LABEL_H };
+    let length_value = Box2 {
+        x: MARGIN_X + content_w / 2,
+        y: length_y,
+        w: content_w - content_w / 2,
+        h: LENGTH_LABEL_H,
+    };
+    let slider =
+        Box2 { x: MARGIN_X, y: length_label.bottom() + 4, w: content_w, h: SLIDER_H };
+    // The bounds sit under the ENDS of the slider's travel, which is the
+    // handle's centre at each end rather than the control's own edge -- so each
+    // box is anchored on the same point the handle is.
+    let bound_w = 32;
+    let slider_low =
+        Box2 { x: slider.x, y: slider.bottom() + 2, w: bound_w, h: BOUND_H };
+    let slider_high =
+        Box2 { x: slider.right() - bound_w, y: slider_low.y, w: bound_w, h: BOUND_H };
+
+    let classes_caption = Box2 {
+        x: MARGIN_X,
+        y: slider_low.bottom() + BODY_GAP,
+        w: content_w,
+        h: CAPTION_H,
+    };
+    // Two by two. The width is derived from the body rather than written down,
+    // so the right-hand column always ends on the body's own right margin.
+    let tile_w = (content_w - TILE_GAP) / 2;
+    let tiles_y = classes_caption.bottom() + CAPTION_GAP;
+    let tile = |index: usize| Box2 {
+        x: MARGIN_X + (index % 2) as i32 * (tile_w + TILE_GAP),
+        y: tiles_y + (index / 2) as i32 * (TILE_H + TILE_GAP),
+        w: tile_w,
+        h: TILE_H,
+    };
+    let tiles = [tile(0), tile(1), tile(2), tile(3)];
+
+    let min_y = tiles[3].bottom() + BODY_GAP;
+    let stepper_w = STEP_W * 2 + STEP_VALUE_W - 2 * SEGMENT_SEAM;
+    let min_label = Box2 {
+        x: MARGIN_X,
+        y: min_y,
+        w: content_w - stepper_w - ROW_GAP,
+        h: SEGMENT_H,
+    };
+    // Joined exactly as the kind run is, and for the same reason: three cells
+    // of one control rather than three buttons with gaps.
+    let stepper_x = MARGIN_X + content_w - stepper_w;
+    let min_stepper = [
+        Box2 { x: stepper_x, y: min_y, w: STEP_W, h: SEGMENT_H },
+        Box2 {
+            x: stepper_x + STEP_W - SEGMENT_SEAM,
+            y: min_y,
+            w: STEP_VALUE_W,
+            h: SEGMENT_H,
+        },
+        Box2 {
+            x: stepper_x + STEP_W + STEP_VALUE_W - 2 * SEGMENT_SEAM,
+            y: min_y,
+            w: STEP_W,
+            h: SEGMENT_H,
+        },
+    ];
+
+    let avoid_y = min_y + SEGMENT_H + BODY_GAP;
+    let avoid_text_w = content_w - TOGGLE_W - ROW_GAP;
+    let avoid_label = Box2 { x: MARGIN_X, y: avoid_y, w: avoid_text_w, h: AVOID_LABEL_H };
+    let avoid_sample =
+        Box2 { x: MARGIN_X, y: avoid_label.bottom(), w: avoid_text_w, h: AVOID_SAMPLE_H };
+    // Centred on the two-line text stack beside it, which is what the image's
+    // `align-items: center` on that row comes to.
+    let avoid_toggle = Box2 {
+        x: MARGIN_X + content_w - TOGGLE_W,
+        y: avoid_y + (AVOID_LABEL_H + AVOID_SAMPLE_H - TOGGLE_H) / 2,
+        w: TOGGLE_W,
+        h: TOGGLE_H,
+    };
+
+    let footer_rule = Box2 { x: 0, y: avoid_sample.bottom() + BODY_PAD, w: WIDTH, h: 1 };
     let save =
         Box2 { x: MARGIN_X, y: footer_rule.bottom() + FOOTER_PAD_Y, w: SAVE_W, h: BUTTON_H };
     let copy = Box2 { x: save.right() + BUTTON_GAP, y: save.y, w: COPY_W, h: BUTTON_H };
@@ -993,11 +1633,63 @@ pub fn layout() -> Layout {
         badge,
         value,
         kinds,
-        readout,
-        hint,
+        regenerate,
+        length_label,
+        length_value,
+        slider,
+        slider_low,
+        slider_high,
+        classes_caption,
+        tiles,
+        min_label,
+        min_stepper,
+        avoid_label,
+        avoid_sample,
+        avoid_toggle,
         save,
         copy,
     }
+}
+
+/// **Where the slider's handle sits for `size`, and what a pointer at `x`
+/// means** -- the one place the two are derived, so a handle the user drags to
+/// the far right cannot land on a value the map reads back as something else.
+///
+/// The travel is the control's width less one handle diameter, and the handle's
+/// centre runs from `at.x + r` to `at.right() - r`: a handle whose centre could
+/// reach the box's own edge would be drawn half outside the control window and
+/// clipped away.
+///
+/// Pure, and in the decision half of this module rather than in `win32`, for
+/// [`layout`]'s reason -- a mapping that put the handle off the end of its
+/// track is worth asserting without opening a window.
+pub fn slider_handle_x(at: Box2, size: u32, bounds: (u32, u32)) -> i32 {
+    let (low, high) = bounds;
+    let span = high.saturating_sub(low);
+    let left = at.x + SLIDER_HANDLE_R;
+    let travel = (at.w - 2 * SLIDER_HANDLE_R).max(0);
+    if span == 0 {
+        return left;
+    }
+    let offset = i64::from(size.clamp(low, high) - low) * i64::from(travel) / i64::from(span);
+    left + offset as i32
+}
+
+/// [`slider_handle_x`] backwards: the size a pointer at `x` is asking for,
+/// clamped into `bounds`.
+pub fn slider_size_at(at: Box2, x: i32, bounds: (u32, u32)) -> u32 {
+    let (low, high) = bounds;
+    let travel = (at.w - 2 * SLIDER_HANDLE_R).max(0);
+    if travel == 0 || high <= low {
+        return low;
+    }
+    let span = i64::from(high - low);
+    let offset = i64::from((x - (at.x + SLIDER_HANDLE_R)).clamp(0, travel));
+    // Rounded to the nearest step rather than truncated, so the handle the user
+    // dropped is the value they get: truncation would make the right-hand half
+    // of every step read as the step below it.
+    let steps = (offset * span + i64::from(travel) / 2) / i64::from(travel);
+    low + steps.clamp(0, span) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,59 +1750,102 @@ static KEPT: std::sync::Mutex<Option<Zeroizing<String>>> = std::sync::Mutex::new
 mod win32 {
     use super::{
         Box2, Event, GenerateForm, GenerateWindow, GeneratedKind, Generator, ValueState, APP_NAME,
-        GENERATE_CAPTION, GENERATE_COPY_LABEL, GENERATE_FAILED_TEXT, GENERATE_LABEL,
-        GENERATE_PROMPT_TITLE, GENERATE_SAVE_LABEL, GENERATE_WORKING_TEXT, GONE, KEPT, PENDING,
-        SECRET, VIEW,
+        GENERATE_AVOID_LABEL, GENERATE_AVOID_SAMPLE, GENERATE_CAPTION, GENERATE_CLASSES_CAPTION,
+        GENERATE_COPY_LABEL, GENERATE_FAILED_TEXT, GENERATE_LABEL, GENERATE_MIN_NUMBER_LABEL,
+        GENERATE_PROMPT_TITLE, GENERATE_REGENERATE_LABEL, GENERATE_SAVE_LABEL,
+        GENERATE_WORKING_TEXT, GONE, KEPT, PENDING, REGENERATE_SHORTCUT, SECRET, VIEW,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
     use std::sync::{Mutex, OnceLock};
 
     use windows::core::{w, HSTRING, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse,
         EndPaint, FillRect, GetDC, GetDeviceCaps, GetStockObject, InvalidateRect, NULL_BRUSH,
-        ReleaseDC, RoundRect,
+        Polyline, ReleaseDC, RoundRect,
         SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, CLEARTYPE_QUALITY,
         DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
         DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
         LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetCapture, GetFocus, ReleaseCapture, SetCapture, SetFocus, VK_DOWN, VK_END, VK_HOME,
+        VK_LEFT, VK_RIGHT, VK_UP,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, PeekMessageW,
-        RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowDisplayAffinity,
+        GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW,
+        PeekMessageW, RegisterClassW, SendMessageW, SetForegroundWindow,
+        SetWindowDisplayAffinity,
         SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW,
         CS_VREDRAW, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW, WDA_EXCLUDEFROMCAPTURE,
         WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN,
-        WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_CHILD,
-        WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+        WM_LBUTTONUP, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW,
+        WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
+    use crate::vault_window::detail_edit::CharClass;
     use crate::win32_draw::{
-        draw_button_with_return, draw_card_lockup, draw_segment_cell, draw_text_utf16,
-        rgb, text_width_utf16, ButtonSkin,
+        draw_button_with_return, draw_card_lockup, draw_hint_chip, draw_segment_cell,
+        draw_text_utf16, rgb, text_width_utf16, ButtonSkin,
     };
 
-    /// The `CTRL+R NEW` run.
+    /// The *Regenerate* button.
     ///
-    /// **3d draws it as text and this card makes it a control**, which costs
-    /// the design nothing: it is painted as the bare monospace run the markup
-    /// declares, with no pill, no border and no fill, and all the control adds
-    /// is that the run can be clicked and tabbed to. A card whose only way to
-    /// ask again is a chord would be a card a user who arrived with the pointer
-    /// cannot re-roll -- and the vault window's copy of 3d made the same call
-    /// for the same reason.
-    const ID_NEW: usize = 101;
-    const ID_SAVE: usize = 104;
-    const ID_COPY: usize = 105;
-    /// Kind chip `i` is control `ID_KIND + i`. Above every other id, so a chip
-    /// id can never collide with one of the five above however many kinds
-    /// [`GeneratedKind::ALL`] grows to.
-    const ID_KIND: usize = 200;
+    /// The older 3d drew this as a bare `CTRL+R NEW` run and the older pass
+    /// made it a control anyway, on the argument that a card whose only way to
+    /// ask again is a chord is a card a user who arrived with the pointer
+    /// cannot re-roll. The newer image draws it as a button outright, so what
+    /// was a departure is now simply the design.
+    pub(super) const ID_NEW: usize = 101;
+    pub(super) const ID_SAVE: usize = 104;
+    pub(super) const ID_COPY: usize = 105;
+    /// The length slider. One control window covering [`super::Layout::slider`],
+    /// which is also the box a pointer x is mapped through -- see
+    /// [`super::slider_size_at`].
+    pub(super) const ID_SLIDER: usize = 106;
+    /// The minimum-digits stepper's two buttons. **The value between them is
+    /// not a control**: it is text, and a `BUTTON` under it would be a tab stop
+    /// that does nothing -- the same call the old size readout got.
+    pub(super) const ID_MIN_DOWN: usize = 107;
+    pub(super) const ID_MIN_UP: usize = 108;
+    /// The *Avoid look-alikes* switch.
+    pub(super) const ID_AVOID: usize = 109;
+    /// Kind cell `i` is control `ID_KIND + i`, and class tile `i` is
+    /// `ID_TILE + i`. Both are above every fixed id and far enough apart that
+    /// neither run can grow into the other.
+    pub(super) const ID_KIND: usize = 200;
+    pub(super) const ID_TILE: usize = 300;
+
+    /// **Every control the card creates, in the order it creates them** --
+    /// which is the order `IsDialogMessageW` then walks with Tab.
+    ///
+    /// One list, read by `open` and by
+    /// [`every_control_is_on_the_card_and_tab_walks_it_in_reading_order`]. The
+    /// creation order used to be written out inside `open`, where nothing
+    /// could check it against the card's own geometry; a Tab key that jumps
+    /// about a card whose controls have quadrupled is not a thing to find by
+    /// hand.
+    pub(super) fn tab_order(l: &super::Layout) -> Vec<(usize, Box2)> {
+        let mut order: Vec<(usize, Box2)> = Vec::new();
+        for (index, at) in l.kinds.iter().enumerate() {
+            order.push((ID_KIND + index, *at));
+        }
+        order.push((ID_NEW, l.regenerate));
+        order.push((ID_SLIDER, l.slider));
+        for (index, at) in l.tiles.iter().enumerate() {
+            order.push((ID_TILE + index, *at));
+        }
+        order.push((ID_MIN_DOWN, l.min_stepper[0]));
+        order.push((ID_MIN_UP, l.min_stepper[2]));
+        order.push((ID_AVOID, l.avoid_toggle));
+        order.push((ID_SAVE, l.save));
+        order.push((ID_COPY, l.copy));
+        order
+    }
 
     const CLASS_NAME: PCWSTR = w!("DeskwardenPasswordGenerator");
 
@@ -1129,6 +1864,18 @@ mod win32 {
 
     /// Which control the pointer is over, as a control id, or 0.
     static HOVERED: AtomicIsize = AtomicIsize::new(0);
+
+    /// **The size the slider's handle is being dragged to**, or `-1` when no
+    /// drag is in progress.
+    ///
+    /// Window-module view state and nothing more: the handle follows the
+    /// pointer every frame of the drag, and [`Event::Size`] is posted once, on
+    /// the button going up. `fill` blocks the pump on a round trip, so a drag
+    /// that posted per move would be a frozen window and dozens of generated
+    /// passwords nobody asked for -- see [`Event::Size`]'s own doc. Both the
+    /// slider and the parent's length value read this, so the number and the
+    /// handle can never disagree mid-drag.
+    static SLIDER_DRAG: AtomicI32 = AtomicI32::new(-1);
 
     /// The subclassed controls' original procedure. One slot for all of them:
     /// every control here is the same `BUTTON` class registered by the same
@@ -1204,16 +1951,28 @@ mod win32 {
         /// The password's face: monospace at 3d's `font-size: 17px`, so `l` and
         /// `1` are distinguishable in a value the user has to read off screen.
         value: HFONT,
-        /// The failure sentence and the size readout, which are prose and not a
-        /// secret. 3d's `font-size: 12px` on the readout.
+        /// The failure sentence and every row label on the card -- `Length`,
+        /// `Characters`, `At least this many digits`, `Avoid look-alikes`, and
+        /// each class tile's name. Prose, and never a secret. 3d's
+        /// `font-size: 12px`.
         prose: HFONT,
+        /// The small grey runs under and beside that prose: the slider's two
+        /// bounds, the class tiles' samples, and the look-alikes sample.
+        /// `theme::EYEBROW_PX`'s 11, which is the smallest size this card sets
+        /// anywhere -- a sixth type size on one card would be a card with no
+        /// type scale.
+        sample: HFONT,
         /// The strength badge: 3d's `font-size: 11px; font-weight: 600`.
         badge: HFONT,
         /// The footer's two buttons **and the three kind cells**, which 3d sets
         /// identically: `font-size: 12px; font-weight: 600`.
         button: HFONT,
-        /// `CTRL+R NEW`: 3d's `ui-monospace` at `font-size: 11px; font-weight:
-        /// 600`.
+        /// The `CTRL+R` chip inside *Regenerate*: monospace at
+        /// `theme::CHIP_TEXT_PX`, which is the size
+        /// [`crate::win32_draw::draw_hint_chip`] lays its box out for. The old
+        /// bare `CTRL+R NEW` run was 11px because it was body text; inside a
+        /// chip it is the chip's size, or the pill would not fit the run it is
+        /// drawn around.
         hint: HFONT,
     }
 
@@ -1225,9 +1984,10 @@ mod win32 {
                 title: font(BOLD, 15),
                 value: mono(super::VALUE_PX, FW_NORMAL.0 as i32),
                 prose: font(REGULAR, 12),
+                sample: font(REGULAR, crate::theme::EYEBROW_PX as i32),
                 badge: font(SEMIBOLD, crate::theme::EYEBROW_PX as i32),
                 button: font(SEMIBOLD, crate::theme::SEGMENT_TEXT_SIZE as i32),
-                hint: mono(crate::theme::EYEBROW_PX as i32, 600),
+                hint: mono(crate::theme::CHIP_TEXT_PX as i32, 600),
             }
         }
 
@@ -1238,6 +1998,7 @@ mod win32 {
                     self.title,
                     self.value,
                     self.prose,
+                    self.sample,
                     self.badge,
                     self.button,
                     self.hint,
@@ -1261,6 +2022,9 @@ mod win32 {
         register_fonts();
         GONE.store(false, Ordering::SeqCst);
         HOVERED.store(0, Ordering::SeqCst);
+        // A drag left set by a card that was not closed cleanly would park the
+        // new card's handle at the old card's value.
+        SLIDER_DRAG.store(-1, Ordering::SeqCst);
         if let Ok(mut slot) = APP_NAME.lock() {
             *slot = app_name.to_string();
         }
@@ -1369,22 +2133,14 @@ mod win32 {
         };
 
         // **Created in the order they are read**, because that is the order
-        // `IsDialogMessageW` then tabs through them: the three kind cells, the
-        // re-roll at the end of their row, and the footer's two answers. A
-        // creation order that did not match the card's own layout would be a
-        // Tab key that jumps about the card.
-        for (index, at) in l.kinds.iter().enumerate() {
-            let Some(control) = child(window, *at, ID_KIND + index, button_font) else {
-                return abandon(window);
-            };
-            subclass(control);
-        }
-        let controls: [(usize, Box2, HFONT); 3] = [
-            (ID_NEW, l.hint, hint_font),
-            (ID_SAVE, l.save, button_font),
-            (ID_COPY, l.copy, button_font),
-        ];
-        for (id, at, face) in controls {
+        // `IsDialogMessageW` then tabs through them -- see `tab_order`, which
+        // is that list and the one a test can check against the geometry.
+        //
+        // The face is the button's for every control but the re-roll, whose
+        // `CTRL+R` chip is monospace at the chip's own size; a control's own
+        // font only matters for the runs `paint_control` measures through it.
+        for (id, at) in tab_order(&l) {
+            let face = if id == ID_NEW { hint_font } else { button_font };
             let Some(control) = child(window, at, id, face) else {
                 return abandon(window);
             };
@@ -1463,6 +2219,34 @@ mod win32 {
                         && GetKeyState(VK_CONTROL.0 as i32) < 0
                     {
                         return Event::Regenerate;
+                    }
+                    // **The slider's arrow keys, and they have to be caught
+                    // here.** `IsDialogMessageW` treats the arrows as group
+                    // navigation between `BUTTON` controls and consumes them
+                    // before the control could ever see a `WM_KEYDOWN` of its
+                    // own -- so a slider that waited for one would be a tab
+                    // stop the keyboard can reach and cannot move. Read off the
+                    // focused window rather than tracked, exactly as Ctrl+R's
+                    // modifier is.
+                    if msg.message == WM_KEYDOWN && focus_is(top, ID_SLIDER) {
+                        let key = msg.wParam.0 as u16;
+                        if key == VK_LEFT.0 || key == VK_DOWN.0 {
+                            return Event::Resize(-1);
+                        }
+                        if key == VK_RIGHT.0 || key == VK_UP.0 {
+                            return Event::Resize(1);
+                        }
+                        // Home and End are the two ends of the travel, which a
+                        // slider has and a stepper does not -- 56 presses of
+                        // Right is not a way to reach 64.
+                        let form = view();
+                        let (low, high) = form.bounds();
+                        if key == VK_HOME.0 {
+                            return Event::Size(low);
+                        }
+                        if key == VK_END.0 {
+                            return Event::Size(high);
+                        }
                     }
                     if !IsDialogMessageW(top, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
@@ -1595,12 +2379,14 @@ mod win32 {
     }
 
     /// The card and every control on it. `show` changes what most of them draw
-    /// -- the run's selected cell, the re-roll's live state, both footer buttons
-    /// -- so invalidating the parent alone would leave the old ones on screen.
+    /// -- the run's selected cell, the re-roll's live state, the slider's
+    /// handle, whether the whole `Characters` block is grey, both footer
+    /// buttons -- so invalidating the parent alone would leave the old ones on
+    /// screen.
     fn repaint_all(window: HWND) {
         repaint(window);
         unsafe {
-            for id in [ID_NEW, ID_SAVE, ID_COPY] {
+            for id in [ID_NEW, ID_SLIDER, ID_MIN_DOWN, ID_MIN_UP, ID_AVOID, ID_SAVE, ID_COPY] {
                 if let Ok(control) = GetDlgItem(window, id as i32) {
                     repaint(control);
                 }
@@ -1609,6 +2395,25 @@ mod win32 {
                 if let Ok(control) = GetDlgItem(window, (ID_KIND + index) as i32) {
                     repaint(control);
                 }
+            }
+            for index in 0..CharClass::ALL.len() {
+                if let Ok(control) = GetDlgItem(window, (ID_TILE + index) as i32) {
+                    repaint(control);
+                }
+            }
+        }
+    }
+
+    /// Whether control `id` on `window` has the keyboard.
+    ///
+    /// One derivation, because the pump asks it about the slider and every
+    /// control's painter asks it about itself; two spellings of "is this
+    /// focused" is two answers that can disagree about where the ring goes.
+    fn focus_is(window: HWND, id: usize) -> bool {
+        unsafe {
+            match GetDlgItem(window, id as i32) {
+                Ok(control) => GetFocus() == control,
+                Err(_) => false,
             }
         }
     }
@@ -1676,6 +2481,359 @@ mod win32 {
             };
             RegisterClassW(&class);
         });
+    }
+
+    /// **Everything on the newer 3d's body that is text rather than a
+    /// control**: the length row's caption and value, the slider's two bounds,
+    /// the `Characters` caption, the minimum-digits question and the value cell
+    /// between its two buttons, and the look-alikes label with its sample.
+    ///
+    /// Painted by the parent for the reason the old size readout was: they are
+    /// runs of text, and a `BUTTON` under one would be a tab stop that does
+    /// nothing.
+    ///
+    /// **Each run is greyed by the same predicate its control is**, so a block
+    /// the request is not reading is a block whose label says so too -- a live
+    /// black `At least this many digits` over a dead stepper would be the card
+    /// offering a choice it is about to discard.
+    fn paint_body_labels(hdc: HDC, l: &super::Layout, fonts: &Fonts, form: &GenerateForm) {
+        use crate::theme::{INK, TEXT_FAINT, TEXT_GHOST};
+        let right = DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX;
+
+        // The length row. The number follows a drag in progress rather than the
+        // committed size -- see `SLIDER_DRAG`.
+        let (caption, committed) = form.size_row();
+        let shown = dragging().map(|size| size.to_string()).unwrap_or(committed);
+        let size_ink = if form.in_flight() { TEXT_GHOST } else { INK };
+        text(hdc, fonts.prose, l.length_label, caption, size_ink);
+        text_in(hdc, fonts.button, dev(l.length_value), &shown, size_ink, right);
+
+        // The slider's bounds, read off the kind's own table so they change
+        // with the run above them.
+        let (low, high) = form.bounds();
+        text(hdc, fonts.sample, l.slider_low, &low.to_string(), TEXT_FAINT);
+        text_in(hdc, fonts.sample, dev(l.slider_high), &high.to_string(), TEXT_FAINT, right);
+
+        let classes_ink = if form.classes_live() { INK } else { TEXT_GHOST };
+        text(hdc, fonts.prose, l.classes_caption, GENERATE_CLASSES_CAPTION, classes_ink);
+
+        let min_ink = if form.min_number_live() { INK } else { TEXT_GHOST };
+        text(hdc, fonts.prose, l.min_label, GENERATE_MIN_NUMBER_LABEL, min_ink);
+        // The stepper's middle cell: one cell of a joined three, drawn through
+        // the same painter its two buttons are so the seams line up.
+        draw_segment_cell(
+            hdc,
+            dev(l.min_stepper[1]),
+            &form.min_number().to_string(),
+            fonts.button,
+            l.min_stepper.len(),
+            1,
+            false,
+            false,
+            form.min_number_live(),
+            scale(super::RADIUS),
+        );
+
+        text(hdc, fonts.prose, l.avoid_label, GENERATE_AVOID_LABEL, classes_ink);
+        text(
+            hdc,
+            fonts.sample,
+            l.avoid_sample,
+            GENERATE_AVOID_SAMPLE,
+            if form.classes_live() { TEXT_FAINT } else { TEXT_GHOST },
+        );
+    }
+
+    /// **The newer 3d's length slider**: a track, the part of it behind the
+    /// handle filled, and a round handle.
+    ///
+    /// `at` is the control's LOGICAL box and `rc` its device client rect. The
+    /// handle's position comes from [`super::slider_handle_x`], which is also
+    /// what [`super::slider_size_at`] inverts for the pointer -- one mapping,
+    /// so the handle the user drops and the value the card sends cannot be two
+    /// different numbers.
+    fn paint_slider(hdc: HDC, rc: RECT, at: Box2, form: &GenerateForm, hovered: bool, focused: bool) {
+        let live = !form.in_flight();
+        let size = dragging().unwrap_or(form.size());
+        let local = Box2 { x: 0, y: 0, w: at.w, h: at.h };
+        let centre_x = scale(super::slider_handle_x(local, size, form.bounds()));
+        let centre_y = rc.bottom / 2;
+        let track_h = scale(super::SLIDER_TRACK_H).max(2);
+        let r = scale(super::SLIDER_HANDLE_R).max(4);
+        let (done, todo, edge) = if live {
+            (crate::theme::BLUE, crate::theme::TOGGLE_OFF, crate::theme::BLUE)
+        } else {
+            (crate::theme::BORDER, crate::theme::HAIRLINE, crate::theme::BORDER)
+        };
+        let track = RECT {
+            left: rc.left + r,
+            top: centre_y - track_h / 2,
+            right: rc.right - r,
+            bottom: centre_y - track_h / 2 + track_h,
+        };
+        // The whole track, then the travelled part over it. Two fills rather
+        // than two abutting rectangles, so no seam can show at the handle.
+        rounded_dev(hdc, track, track_h / 2, todo, None);
+        if centre_x > track.left {
+            rounded_dev(hdc, RECT { right: centre_x, ..track }, track_h / 2, done, None);
+        }
+        // The ring is a wash UNDER the handle rather than an outline round it,
+        // which is what the `CTRL+R` run's focus treatment already does on this
+        // card: a round control gets a halo, not a box.
+        if focused {
+            circle(hdc, centre_x, centre_y, r + scale(3), crate::theme::FOCUS_RING, None);
+        }
+        let knob = if live && (hovered || dragging().is_some()) {
+            crate::theme::BLUE_WASH
+        } else {
+            crate::theme::CARD
+        };
+        circle(hdc, centre_x, centre_y, r, knob, Some(edge));
+    }
+
+    /// **One of the four character-class tiles**: a bordered box carrying a
+    /// tick box, the class's name and its sample.
+    ///
+    /// The tile is the whole control, so the tick box is painted rather than
+    /// being a `BUTTON` of its own -- the box, the name and the sample are one
+    /// target, which is what the image draws and what keeps the Tab order four
+    /// stops long rather than eight.
+    #[allow(clippy::too_many_arguments)]
+    fn paint_tile(
+        hdc: HDC,
+        rc: RECT,
+        class: CharClass,
+        on: bool,
+        live: bool,
+        hovered: bool,
+        fonts: &Fonts,
+    ) {
+        let (fill, edge) = if !live {
+            (crate::theme::CARD, crate::theme::HAIRLINE)
+        } else if on {
+            (crate::theme::BLUE_WASH, crate::theme::BLUE)
+        } else if hovered {
+            (crate::theme::CANVAS, crate::theme::BORDER)
+        } else {
+            (crate::theme::CARD, crate::theme::BORDER)
+        };
+        rounded_dev(hdc, rc, scale(super::RADIUS), fill, Some((scale(1).max(1), edge)));
+
+        let box_side = scale(super::TILE_BOX);
+        let left = rc.left + scale(super::TILE_PAD_X);
+        let top = rc.top + ((rc.bottom - rc.top) - box_side) / 2;
+        let tick_rect =
+            RECT { left, top, right: left + box_side, bottom: top + box_side };
+        let (tick_fill, tick_edge) = if !live {
+            (if on { crate::theme::BORDER } else { crate::theme::CARD }, crate::theme::HAIRLINE)
+        } else if on {
+            (crate::theme::BLUE, crate::theme::BLUE)
+        } else {
+            (crate::theme::CARD, crate::theme::BORDER)
+        };
+        rounded_dev(
+            hdc,
+            tick_rect,
+            scale(crate::theme::CHIP_RADIUS as i32),
+            tick_fill,
+            Some((scale(1).max(1), tick_edge)),
+        );
+        if on {
+            paint_tick(hdc, tick_rect, crate::theme::CARD);
+        }
+
+        let name_ink = if live { crate::theme::INK } else { crate::theme::TEXT_GHOST };
+        let sample_ink = if live { crate::theme::TEXT_FAINT } else { crate::theme::TEXT_GHOST };
+        let text_left = tick_rect.right + scale(super::TILE_TEXT_GAP);
+        // The name is measured so the sample can follow it, which is the
+        // image's `gap` between two runs rather than a second column: the
+        // names are four different widths and a fixed column would leave
+        // `Digits` marooned from its `0-9`.
+        let name = class.name();
+        let name_w = {
+            let chars: Vec<u16> = name.encode_utf16().collect();
+            text_width_utf16(hdc, fonts.prose, &chars)
+        };
+        text_in(
+            hdc,
+            fonts.prose,
+            RECT { left: text_left, right: rc.right, ..rc },
+            name,
+            name_ink,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+        let sample_left = text_left + name_w + scale(super::TILE_TEXT_GAP);
+        if sample_left < rc.right {
+            text_in(
+                hdc,
+                fonts.sample,
+                RECT { left: sample_left, right: rc.right - scale(super::TILE_PAD_X), ..rc },
+                class.label(),
+                sample_ink,
+                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+            );
+        }
+    }
+
+    /// The tick inside a checked box, drawn as two strokes for
+    /// [`paint_close_glyph`]'s reason: no bundled face carries a check mark at
+    /// this weight, and a face that had one would be a fifth family on the card.
+    fn paint_tick(hdc: HDC, at: RECT, colour: eframe::egui::Color32) {
+        unsafe {
+            use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
+            let pen = CreatePen(PS_SOLID, scale(2).max(1), rgb(colour));
+            let old = SelectObject(hdc, pen);
+            let w = at.right - at.left;
+            let h = at.bottom - at.top;
+            let _ = MoveToEx(hdc, at.left + w * 27 / 100, at.top + h * 52 / 100, None);
+            let _ = LineTo(hdc, at.left + w * 43 / 100, at.top + h * 70 / 100);
+            let _ = LineTo(hdc, at.left + w * 75 / 100, at.top + h * 30 / 100);
+            SelectObject(hdc, old);
+            let _ = DeleteObject(pen);
+        }
+    }
+
+    /// **The app's 40×22 switch, in GDI.**
+    ///
+    /// `theme::toggle_pill` is the egui one and cannot be called from here --
+    /// it takes a `Ui`. What is shared is the geometry and the palette:
+    /// `theme::TOGGLE_W`, `theme::TOGGLE_H`, `theme::TOGGLE_KNOB_R`,
+    /// `theme::BLUE` and `theme::TOGGLE_OFF`, which is why those three
+    /// measurements became constants rather than staying literals inside that
+    /// function. The disabled look is `theme::toggle_pill_disabled`'s, and for
+    /// its stated reason: the switch still shows its own state while dead,
+    /// because the value is the one that comes straight back.
+    fn paint_toggle(hdc: HDC, rc: RECT, on: bool, live: bool, focused: bool) {
+        let (track, knob) = if !live {
+            (crate::theme::HAIRLINE, crate::theme::CANVAS)
+        } else if on {
+            (crate::theme::BLUE, crate::theme::CARD)
+        } else {
+            (crate::theme::TOGGLE_OFF, crate::theme::CARD)
+        };
+        let radius = (rc.bottom - rc.top) / 2;
+        if focused {
+            rounded_dev(hdc, rc, radius, crate::theme::FOCUS_RING, None);
+        }
+        let inset = if focused { scale(2).max(1) } else { 0 };
+        let pill = RECT {
+            left: rc.left + inset,
+            top: rc.top + inset,
+            right: rc.right - inset,
+            bottom: rc.bottom - inset,
+        };
+        let pill_radius = (pill.bottom - pill.top) / 2;
+        rounded_dev(hdc, pill, pill_radius, track, None);
+        let centre_y = (pill.top + pill.bottom) / 2;
+        let centre_x = if on { pill.right - pill_radius } else { pill.left + pill_radius };
+        circle(
+            hdc,
+            centre_x,
+            centre_y,
+            scale(crate::theme::TOGGLE_KNOB_R as i32).max(2) - inset,
+            knob,
+            None,
+        );
+    }
+
+    /// **The newer 3d's `Regenerate` button**: a refresh glyph, the word, and
+    /// `CTRL+R` in its own box, inside one outlined pill.
+    ///
+    /// Composed here rather than added as a flag to
+    /// [`crate::win32_draw::draw_button_with_shortcut`], because what is new is
+    /// only the glyph in front of the label: the pill is that function's, the
+    /// chip is [`crate::win32_draw::draw_hint_chip`]'s, and the lane the chip
+    /// takes is [`crate::win32_draw::hint_chip_lane`]'s. Widening the shared
+    /// painter's signature for one card's glyph would put a parameter on every
+    /// other caller that none of them uses.
+    ///
+    /// The glyph and the label are centred **as one group** in what the chip
+    /// leaves, which is what `draw_button_with_return` does with its label and
+    /// return arrow on the footer's primary -- the same idiom, the other way
+    /// round.
+    fn paint_regenerate(hdc: HDC, rc: RECT, fonts: &Fonts, skin: ButtonSkin, live: bool) {
+        unsafe {
+            let brush = CreateSolidBrush(skin.fill);
+            let pen = CreatePen(PS_SOLID, scale(1).max(1), skin.border.unwrap_or(skin.fill));
+            let old_brush = SelectObject(hdc, brush);
+            let old_pen = SelectObject(hdc, pen);
+            let r = scale(super::RADIUS) * 2;
+            let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(brush);
+            let _ = DeleteObject(pen);
+        }
+
+        let dpi = DPI_PERCENT.load(Ordering::SeqCst);
+        let lane = draw_hint_chip(hdc, rc, REGENERATE_SHORTCUT, fonts.hint, dpi);
+        let label_right = rc.right - lane;
+        let glyph = scale(super::REFRESH_GLYPH);
+        let gap = scale(super::REFRESH_GAP);
+        let chars: Vec<u16> = GENERATE_REGENERATE_LABEL.encode_utf16().collect();
+        let label_w = text_width_utf16(hdc, fonts.button, &chars);
+        let total = glyph + gap + label_w;
+        let left = rc.left + ((label_right - rc.left) - total) / 2;
+        let ink = if live { crate::theme::BLUE_DEEP } else { crate::theme::TEXT_GHOST };
+        paint_refresh_glyph(
+            hdc,
+            POINT { x: left + glyph / 2, y: (rc.top + rc.bottom) / 2 },
+            glyph,
+            ink,
+        );
+        text_in(
+            hdc,
+            fonts.button,
+            RECT { left: left + glyph + gap, right: label_right, ..rc },
+            GENERATE_REGENERATE_LABEL,
+            ink,
+            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+        );
+    }
+
+    /// The refresh glyph: an open circle with an arrowhead on its free end.
+    ///
+    /// Drawn as a polyline rather than typed, for [`paint_close_glyph`]'s
+    /// reason -- no face this app ships carries U+21BB, and reaching for a
+    /// system symbol font would put a fifth family on the card. Kept local to
+    /// this module, as the close glyph is, because it is this card's one
+    /// pictogram; [`crate::win32_draw::draw_return_arrow`] lives in the shared
+    /// module because three cards draw it.
+    fn paint_refresh_glyph(hdc: HDC, centre: POINT, size: i32, colour: eframe::egui::Color32) {
+        let r = (size / 2).max(3);
+        // A three-quarter turn, open at the top right, which is where the
+        // arrowhead goes.
+        let start = -30.0_f64.to_radians();
+        let sweep = 280.0_f64.to_radians();
+        let steps = 20;
+        let mut points: Vec<POINT> = Vec::with_capacity(steps + 1);
+        for step in 0..=steps {
+            let angle = start + sweep * (step as f64) / (steps as f64);
+            points.push(POINT {
+                x: centre.x + (r as f64 * angle.cos()).round() as i32,
+                // Screen y grows downward, so the arc is drawn with the sine
+                // negated -- otherwise the opening would be at the bottom.
+                y: centre.y - (r as f64 * angle.sin()).round() as i32,
+            });
+        }
+        unsafe {
+            let pen = CreatePen(PS_SOLID, scale(2).max(1), rgb(colour));
+            let old = SelectObject(hdc, pen);
+            let _ = Polyline(hdc, &points);
+            // The arrowhead, on the arc's own starting point: two short strokes
+            // back along the tangent.
+            if let Some(tip) = points.first().copied() {
+                let head = (r / 2).max(2);
+                let barbs = [
+                    POINT { x: tip.x - head, y: tip.y },
+                    tip,
+                    POINT { x: tip.x, y: tip.y + head },
+                ];
+                let _ = Polyline(hdc, &barbs);
+            }
+            SelectObject(hdc, old);
+            let _ = DeleteObject(pen);
+        }
     }
 
     /// One child control. It is created with **no text**: every label on this
@@ -1835,6 +2993,37 @@ mod win32 {
             }
             return;
         }
+        if id == ID_MIN_DOWN || id == ID_MIN_UP {
+            let delta = if id == ID_MIN_UP { 1 } else { -1 };
+            if form.can_step_min_number(delta) {
+                set_pending(Event::StepMinNumber(delta));
+            }
+            return;
+        }
+        if id == ID_AVOID {
+            if form.classes_live() {
+                set_pending(Event::ToggleAvoidAmbiguous);
+            }
+            return;
+        }
+        if id == ID_SLIDER {
+            // **Nothing.** The slider does not answer `BN_CLICKED` at all: its
+            // own procedure handles the pointer and posts `Event::Size` on the
+            // button going up, and the space bar `IsDialogMessage` turns into a
+            // click on a `BUTTON` has no value to name.
+            return;
+        }
+        if id >= ID_TILE {
+            if let Some(class) = CharClass::ALL.get(id - ID_TILE).copied() {
+                // Live, AND not the last class standing -- the refusal
+                // `CharClasses::set` makes, asked here so the tile that is
+                // drawn dead is the tile that does nothing.
+                if form.classes_live() && !form.classes().is_last_on(class) {
+                    set_pending(Event::ToggleClass(class));
+                }
+            }
+            return;
+        }
         if id >= ID_KIND {
             if let Some(kind) = GeneratedKind::ALL.get(id - ID_KIND).copied() {
                 if !form.in_flight() {
@@ -1860,6 +3049,41 @@ mod win32 {
                 paint_control(control, id as usize);
                 LRESULT(0)
             }
+            // **The slider's pointer, and only the slider's.** Every other
+            // control here is answered by the original `BUTTON` procedure,
+            // which is what gives them focus on press, the pressed look, and
+            // `BN_CLICKED` on release. A slider has none of those: it has a
+            // value that follows the pointer, so its three mouse messages are
+            // handled outright and the value is posted once, on the release.
+            // See `SLIDER_DRAG` for why the release and not every move.
+            WM_LBUTTONDOWN if id as usize == ID_SLIDER => {
+                if !view().in_flight() {
+                    // The original procedure would have done this; it is not
+                    // running for this message, and a slider the pointer moves
+                    // without giving the keyboard would leave the focus ring
+                    // somewhere else on the card.
+                    let _ = SetFocus(control);
+                    let _ = SetCapture(control);
+                    drag_to(control, lparam);
+                }
+                LRESULT(0)
+            }
+            WM_MOUSEMOVE if id as usize == ID_SLIDER && GetCapture() == control => {
+                drag_to(control, lparam);
+                LRESULT(0)
+            }
+            WM_LBUTTONUP if id as usize == ID_SLIDER => {
+                let _ = ReleaseCapture();
+                // Taken rather than read, so a release that arrives twice --
+                // or one with no press behind it -- cannot post a second
+                // request for a drag that already ended.
+                let dropped = SLIDER_DRAG.swap(-1, Ordering::SeqCst);
+                if dropped >= 0 {
+                    set_pending(Event::Size(dropped as u32));
+                }
+                repaint_all(parent_of(control));
+                LRESULT(0)
+            }
             WM_MOUSEMOVE => {
                 if HOVERED.swap(id, Ordering::SeqCst) != id {
                     repaint(control);
@@ -1883,6 +3107,58 @@ mod win32 {
                     )
                 }
             }
+        }
+    }
+
+    /// The card the control belongs to. `GetParent` rather than a stored
+    /// handle: the slider needs it to repaint the length value the parent
+    /// paints, and a second copy of the window handle in a static is a second
+    /// thing `close` would have to clear.
+    fn parent_of(control: HWND) -> HWND {
+        unsafe { windows::Win32::UI::WindowsAndMessaging::GetParent(control).unwrap_or(control) }
+    }
+
+    /// Moves the drag to the pointer's x and repaints the handle **and the
+    /// number the parent draws**.
+    ///
+    /// Both, because they are two views of one value: a handle that moved
+    /// under a `20` that did not would be the card showing the user two
+    /// different answers to what they are doing.
+    fn drag_to(control: HWND, lparam: LPARAM) {
+        let x = (lparam.0 & 0xffff) as i16 as i32;
+        let form = view();
+        let at = control_box(ID_SLIDER, &super::layout());
+        // The control's own client coordinates, so the box is at the origin --
+        // and unscaled first, because `super::slider_size_at` is pure logical
+        // arithmetic and this `x` came from Windows in device pixels.
+        let local = Box2 { x: 0, y: 0, w: at.w, h: at.h };
+        let size = super::slider_size_at(local, unscale(x), form.bounds());
+        if SLIDER_DRAG.swap(size as i32, Ordering::SeqCst) != size as i32 {
+            repaint(control);
+            repaint(parent_of(control));
+        }
+    }
+
+    /// The size a drag in progress is pointing at, or `None`.
+    fn dragging() -> Option<u32> {
+        let held = SLIDER_DRAG.load(Ordering::SeqCst);
+        if held < 0 {
+            None
+        } else {
+            Some(held as u32)
+        }
+    }
+
+    /// [`scale`] backwards: a device measurement in logical pixels.
+    ///
+    /// Guarded against a zero percentage, which `open` cannot produce -- it
+    /// falls back to 100 -- but which a static read before any `open` could.
+    fn unscale(v: i32) -> i32 {
+        let percent = DPI_PERCENT.load(Ordering::SeqCst);
+        if percent <= 0 {
+            v
+        } else {
+            v * 100 / percent
         }
     }
 
@@ -2015,10 +3291,7 @@ mod win32 {
                     }
                 }
 
-                // 3d's `20 chars`, painted by the parent rather than being a
-                // control of its own: it is text, and a `BUTTON` under it would
-                // be a tab stop that does nothing.
-                text(mem, fonts.prose, l.readout, &form.readout(), crate::theme::TEXT_FAINT);
+                paint_body_labels(mem, &l, fonts, &form);
             }
 
             paint_close_glyph(mem, l.close_glyph);
@@ -2206,37 +3479,104 @@ mod win32 {
                         dpi,
                     );
                 } else if id == ID_NEW {
-                    // 3d's `CTRL+R NEW`: a bare monospace run in `#14307a` at
-                    // the right-hand end of the control row, with no pill, no
-                    // border and no fill round it. The focus ring is the one
-                    // thing here 3d does not print, and it is a wash BEHIND the
-                    // run rather than an outline round it -- so a keyboard user
-                    // can see where they are without the hint growing a box it
-                    // is not supposed to have.
-                    if focused {
+                    // The newer 3d's `Regenerate` button: an outlined pill
+                    // carrying a refresh glyph, the word, and `CTRL+R` in a
+                    // chip. The focus ring is drawn the footer buttons' way --
+                    // a wash behind a pill that then shrinks by two -- because
+                    // this is a pill now, where the run it replaced was bare
+                    // text and took a halo instead.
+                    let skin = ButtonSkin::secondary();
+                    let skin = if !live {
+                        skin.disabled()
+                    } else if hovered {
+                        skin.hovered()
+                    } else {
+                        skin
+                    };
+                    let pill = if focused {
                         rounded(
                             mem,
                             Box2 { x: 0, y: 0, w: at.w, h: at.h },
-                            crate::theme::CHIP_RADIUS as i32,
+                            super::RADIUS + 1,
                             crate::theme::FOCUS_RING,
                             None,
                         );
-                    }
-                    let colour = if !live {
-                        crate::theme::TEXT_GHOST
-                    } else if hovered {
-                        crate::theme::BLUE
+                        RECT {
+                            left: whole.left + 2,
+                            top: whole.top + 2,
+                            right: whole.right - 2,
+                            bottom: whole.bottom - 2,
+                        }
                     } else {
-                        crate::theme::BLUE_DEEP
+                        whole
                     };
-                    text_in(
+                    paint_regenerate(mem, pill, fonts, skin, live);
+                } else if id == ID_SLIDER {
+                    paint_slider(mem, whole, at, &form, hovered, focused);
+                } else if id == ID_MIN_DOWN || id == ID_MIN_UP {
+                    // The stepper's two ends, drawn as cells 0 and 2 of the
+                    // joined three whose middle the parent paints.
+                    let index = if id == ID_MIN_UP { 2 } else { 0 };
+                    draw_segment_cell(
                         mem,
-                        fonts.hint,
                         whole,
-                        &super::regenerate_hint(),
-                        colour,
-                        DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
+                        // **ASCII `-`, not U+2212.** The image sets a typographic
+                        // minus; no face this app bundles is known to carry one,
+                        // and a missing glyph on a stepper is an empty box where
+                        // the control's whole meaning is. The `+` beside it is
+                        // ASCII either way, so this also keeps the pair one
+                        // width apart rather than two different runs.
+                        if id == ID_MIN_UP { "+" } else { "-" },
+                        fonts.button,
+                        l.min_stepper.len(),
+                        index,
+                        false,
+                        hovered && live,
+                        live,
+                        scale(super::RADIUS),
                     );
+                    if focused {
+                        outline(
+                            mem,
+                            Box2 { x: 1, y: 1, w: at.w - 2, h: at.h - 2 },
+                            super::RADIUS - 1,
+                            2,
+                            crate::theme::FOCUS_RING,
+                        );
+                    }
+                } else if id == ID_AVOID {
+                    paint_toggle(mem, whole, form.avoid_ambiguous(), live, focused);
+                } else if id >= ID_TILE {
+                    let index = id.saturating_sub(ID_TILE).min(CharClass::ALL.len() - 1);
+                    let class = CharClass::ALL[index];
+                    // Drawn from `shown_classes`, not from the stored set: a
+                    // PIN's tiles show digits alone however the user last left
+                    // them, because digits alone is what the request says.
+                    //
+                    // `live` here is `enabled`'s, which is false for the LAST
+                    // class still on -- so that tile greys while staying
+                    // ticked. `CharClasses::set` refuses to switch it off, and
+                    // `detail_edit`'s own chips make the same refusal visible
+                    // rather than merely safe: a tile that looked live and did
+                    // nothing when clicked would be worse than a grey one.
+                    paint_tile(
+                        mem,
+                        whole,
+                        class,
+                        form.shown_classes().is_on(class),
+                        live,
+                        hovered && live,
+                        fonts,
+                    );
+                    if focused {
+                        outline(
+                            mem,
+                            Box2 { x: 1, y: 1, w: at.w - 2, h: at.h - 2 },
+                            super::RADIUS - 1,
+                            2,
+                            crate::theme::FOCUS_RING,
+                        );
+                    }
                 } else {
                     // One cell of 3d's joined run.
                     let index = id.saturating_sub(ID_KIND).min(GeneratedKind::ALL.len() - 1);
@@ -2280,7 +3620,7 @@ mod win32 {
     /// The logical box control `id` was given. The card's own [`super::layout`],
     /// so the ring a control draws for itself can never be a second opinion
     /// about how big it is.
-    fn control_box(id: usize, l: &super::Layout) -> Box2 {
+    pub(super) fn control_box(id: usize, l: &super::Layout) -> Box2 {
         if id == ID_SAVE {
             return l.save;
         }
@@ -2288,7 +3628,23 @@ mod win32 {
             return l.copy;
         }
         if id == ID_NEW {
-            return l.hint;
+            return l.regenerate;
+        }
+        if id == ID_SLIDER {
+            return l.slider;
+        }
+        if id == ID_MIN_DOWN {
+            return l.min_stepper[0];
+        }
+        if id == ID_MIN_UP {
+            return l.min_stepper[2];
+        }
+        if id == ID_AVOID {
+            return l.avoid_toggle;
+        }
+        if id >= ID_TILE {
+            let index = id.saturating_sub(ID_TILE).min(l.tiles.len() - 1);
+            return l.tiles[index];
         }
         let index = id.saturating_sub(ID_KIND).min(l.kinds.len() - 1);
         l.kinds[index]
@@ -2297,12 +3653,25 @@ mod win32 {
     /// Whether control `id` is live for this form state. **The same predicate
     /// [`clicked`] refuses on**, so a control that is drawn dead is a control
     /// that does nothing, and neither is a copy of the other.
-    fn enabled(id: usize, form: &GenerateForm) -> bool {
+    pub(super) fn enabled(id: usize, form: &GenerateForm) -> bool {
         if id == ID_SAVE || id == ID_COPY {
-            form.ready()
-        } else {
-            !form.in_flight()
+            return form.ready();
         }
+        if id == ID_MIN_DOWN {
+            return form.can_step_min_number(-1);
+        }
+        if id == ID_MIN_UP {
+            return form.can_step_min_number(1);
+        }
+        if id == ID_AVOID {
+            return form.classes_live();
+        }
+        if id >= ID_TILE {
+            let index = id.saturating_sub(ID_TILE).min(CharClass::ALL.len() - 1);
+            let class = CharClass::ALL[index];
+            return form.classes_live() && !form.classes().is_last_on(class);
+        }
+        !form.in_flight()
     }
 
     /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
@@ -2379,6 +3748,63 @@ mod win32 {
                 r,
                 r,
             );
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(brush);
+            let _ = DeleteObject(pen);
+        }
+    }
+
+    /// [`rounded`] for a rectangle that is **already in device pixels** -- and
+    /// whose radius and stroke are too.
+    ///
+    /// A sibling rather than a flag, because the two are used from different
+    /// places for different reasons: `rounded` takes what `layout` produced,
+    /// and this takes what `GetClientRect` handed back or what a painter
+    /// computed inside one. Handing a device rect to `rounded` is the defect
+    /// the focus-ring comment on the footer buttons already records -- it would
+    /// scale it a second time.
+    fn rounded_dev(
+        hdc: HDC,
+        rc: RECT,
+        radius: i32,
+        fill_colour: eframe::egui::Color32,
+        border: Option<(i32, eframe::egui::Color32)>,
+    ) {
+        unsafe {
+            let brush = CreateSolidBrush(rgb(fill_colour));
+            let (width, colour) = border.unwrap_or((1, fill_colour));
+            let pen = CreatePen(PS_SOLID, width.max(1), rgb(colour));
+            let old_brush = SelectObject(hdc, brush);
+            let old_pen = SelectObject(hdc, pen);
+            let r = radius.max(0) * 2;
+            let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(brush);
+            let _ = DeleteObject(pen);
+        }
+    }
+
+    /// A filled circle in DEVICE pixels, optionally stroked -- the slider's
+    /// handle, the switch's knob, and the halo behind either.
+    ///
+    /// `border: None` fills with no visible outline, which is what a halo is;
+    /// `Some(colour)` is the handle's own edge.
+    fn circle(
+        hdc: HDC,
+        cx: i32,
+        cy: i32,
+        r: i32,
+        fill_colour: eframe::egui::Color32,
+        border: Option<eframe::egui::Color32>,
+    ) {
+        unsafe {
+            let brush = CreateSolidBrush(rgb(fill_colour));
+            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(border.unwrap_or(fill_colour)));
+            let old_brush = SelectObject(hdc, brush);
+            let old_pen = SelectObject(hdc, pen);
+            let _ = Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
             SelectObject(hdc, old_brush);
             SelectObject(hdc, old_pen);
             let _ = DeleteObject(brush);
@@ -2506,6 +3932,30 @@ mod win32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::vault_window::detail_edit::{CharClass, CharClasses};
+
+    /// The recipe `kind` makes at `size` **from a freshly opened card's
+    /// options** -- all four classes, the crate's own minimum, look-alikes
+    /// avoided.
+    ///
+    /// A helper rather than four arguments at every call site, because what
+    /// nearly every test below means by "the recipe this kind names" is the one
+    /// the card actually opens on: `GenerateForm::new` starts from
+    /// `PasswordRecipe::default()`, and a test that passed something else would
+    /// be asserting about a card that does not exist.
+    fn recipe(kind: GeneratedKind, size: u32) -> GenerateRequest {
+        let defaults = crate::vault_bridge::PasswordRecipe::default();
+        kind.recipe(size, &CharClasses::default(), defaults.min_number, defaults.avoid_ambiguous)
+    }
+
+    /// A settled card of `kind`, ready to be driven by the option methods --
+    /// which every one of them refuses on while a request is outstanding.
+    fn settled(kind: GeneratedKind) -> GenerateForm {
+        let mut form = GenerateForm::new(kind);
+        form.finish(None);
+        form
+    }
 
     /// A generator that answers the same fixture every time. A `fn` pointer's
     /// worth of behaviour, so nothing here reaches a vault, a network or `bw`.
@@ -2766,12 +4216,254 @@ mod tests {
         assert_eq!(
             asked,
             vec![
-                GeneratedKind::Characters.recipe(GeneratedKind::Characters.default_size()),
-                GeneratedKind::Words.recipe(GeneratedKind::Words.default_size()),
-                GeneratedKind::Words.recipe(GeneratedKind::Words.default_size() + 1),
+                recipe(GeneratedKind::Characters, GeneratedKind::Characters.default_size()),
+                recipe(GeneratedKind::Words, GeneratedKind::Words.default_size()),
+                recipe(GeneratedKind::Words, GeneratedKind::Words.default_size() + 1),
             ],
             "the card asked for the wrong recipes, or asked again for a chip that did not change"
         );
+    }
+
+    /// **Every one of the newer 3d's controls asks for a new password, and each
+    /// asks for exactly what it changed.**
+    ///
+    /// Driven through [`run_with`] with no window, no vault and no clipboard,
+    /// which is what the seam exists for: this is the whole wiring of the four
+    /// new controls -- slider, class tile, minimum stepper, look-alikes switch
+    /// -- checked against the requests that actually went out.
+    #[test]
+    fn every_new_control_asks_for_the_recipe_it_changed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        static ASKED: std::sync::Mutex<Vec<GenerateRequest>> = std::sync::Mutex::new(Vec::new());
+        STEP.store(0, Ordering::SeqCst);
+        if let Ok(mut asked) = ASKED.lock() {
+            asked.clear();
+        }
+        let calls = GenerateCalls {
+            next: |_| match STEP.fetch_add(1, Ordering::SeqCst) {
+                0 => Event::Size(32),
+                1 => Event::ToggleClass(CharClass::Special),
+                2 => Event::StepMinNumber(1),
+                3 => Event::ToggleAvoidAmbiguous,
+                _ => Event::Cancel,
+            },
+            fill: |_, request, _| {
+                if let Ok(mut asked) = ASKED.lock() {
+                    asked.push(request.clone());
+                }
+                None
+            },
+            ..inert()
+        };
+        let _ = run_with(&calls, "Ledgerline", &ok_generator);
+        let asked = ASKED.lock().unwrap().clone();
+        let password = |request: &GenerateRequest| match request {
+            GenerateRequest::Password(recipe) => recipe.clone(),
+            other => panic!("the card asked for {other:?} with *Password* selected"),
+        };
+        assert_eq!(asked.len(), 5, "one opening request and one per control; got {}", asked.len());
+
+        let opening = password(&asked[0]);
+        assert_eq!(opening.length, 20);
+        assert!(opening.special, "the card did not open on the crate's own default recipe");
+        assert_eq!(opening.min_number, 1);
+        assert!(opening.avoid_ambiguous);
+
+        assert_eq!(password(&asked[1]).length, 32, "the slider's value did not reach the wire");
+        assert!(!password(&asked[2]).special, "unticking *Symbols* did not reach the wire");
+        assert_eq!(
+            password(&asked[3]).min_number,
+            2,
+            "stepping the minimum-digits control did not reach the wire"
+        );
+        assert!(
+            !password(&asked[4]).avoid_ambiguous,
+            "flipping the look-alikes switch did not reach the wire"
+        );
+        // And the changes accumulate rather than each resetting the others:
+        // the last request carries all four.
+        let last = password(&asked[4]);
+        assert_eq!((last.length, last.special, last.min_number), (32, false, 2));
+    }
+
+    /// **A control the selected kind does not read is a control that does
+    /// nothing** -- and the refusal is the form's, not the button's.
+    ///
+    /// The card is one fixed shape (see [`layout`]), so the `Characters` block
+    /// stays on screen while *Passphrase* or *PIN* is selected. If those
+    /// controls still moved the form, a user could change an alphabet the
+    /// request does not contain and watch the card re-roll for no visible
+    /// reason.
+    #[test]
+    fn the_character_options_do_nothing_for_a_kind_that_does_not_read_them() {
+        for kind in [GeneratedKind::Words, GeneratedKind::Pin] {
+            let mut form = settled(kind);
+            assert!(!form.classes_live(), "{kind:?} left the class tiles live");
+            assert!(!form.min_number_live(), "{kind:?} left the minimum-digits stepper live");
+            assert!(!form.toggle_class(CharClass::Special), "{kind:?} let a class tile move");
+            assert!(!form.step_min_number(1), "{kind:?} let the minimum-digits stepper move");
+            assert!(!form.toggle_avoid_ambiguous(), "{kind:?} let the look-alikes switch move");
+            assert!(form.ready(), "a refused control still started a request");
+        }
+
+        // And the slider is live for all three, because every kind has a size.
+        for kind in GeneratedKind::ALL {
+            let mut form = settled(kind);
+            let (_, high) = kind.bounds();
+            assert!(form.set_size(high), "{kind:?} refused the slider");
+        }
+    }
+
+    /// **A PIN's tiles show digits and nothing else, whatever the user last
+    /// ticked.**
+    ///
+    /// The tiles are drawn from `shown_classes` rather than from the stored
+    /// set, because [`GeneratedKind::recipe`] sends digits alone for a PIN --
+    /// four ticks over a six-digit secret would be the card describing a recipe
+    /// it is not sending.
+    #[test]
+    fn a_pins_tiles_show_the_alphabet_a_pin_actually_uses() {
+        let mut form = settled(GeneratedKind::Characters);
+        // All four on, which is what the card opens with.
+        for class in CharClass::ALL {
+            assert!(form.shown_classes().is_on(class), "{class:?} was not on at the default");
+        }
+        assert!(form.choose(GeneratedKind::Pin));
+        form.finish(None);
+        let shown = form.shown_classes();
+        assert!(shown.is_on(CharClass::Number), "a PIN's tiles do not show digits");
+        for class in [CharClass::Uppercase, CharClass::Lowercase, CharClass::Special] {
+            assert!(!shown.is_on(class), "a PIN's tiles show {class:?}, which a PIN does not use");
+        }
+        // The stored set is untouched, so returning to *Password* restores what
+        // the user had rather than the PIN's.
+        assert!(form.choose(GeneratedKind::Characters));
+        form.finish(None);
+        for class in CharClass::ALL {
+            assert!(
+                form.shown_classes().is_on(class),
+                "{class:?} was lost by a trip through the PIN cell"
+            );
+        }
+    }
+
+    /// **The last class standing cannot be switched off**, which is the whole
+    /// reason this card holds a `CharClasses` rather than four booleans: an
+    /// all-off request comes back from `bw serve` as a three-class password
+    /// with no error at all.
+    #[test]
+    fn the_card_cannot_switch_off_its_last_character_class() {
+        let mut form = settled(GeneratedKind::Characters);
+        // Switch three off, one at a time, settling between each.
+        for class in [CharClass::Uppercase, CharClass::Number, CharClass::Special] {
+            assert!(form.toggle_class(class), "{class:?} refused to switch off");
+            form.finish(None);
+        }
+        assert!(
+            form.classes().is_last_on(CharClass::Lowercase),
+            "control: three classes were switched off and a fourth is not the last one standing"
+        );
+        assert!(
+            !form.toggle_class(CharClass::Lowercase),
+            "the card switched off its last character class, which `bw serve` answers by \
+             silently substituting uppercase + lowercase + number"
+        );
+        match form.request() {
+            GenerateRequest::Password(recipe) => assert!(
+                recipe.uppercase || recipe.lowercase || recipe.number || recipe.special,
+                "an all-off recipe reached the wire"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **The minimum-digits number is made coherent with its class**, in the
+    /// recipe rather than in the widget.
+    ///
+    /// `minNumber: 1` beside `number: false` is a contradiction, and the route
+    /// resolves it in a direction the user did not pick. The number is kept on
+    /// the form so switching digits back on restores what they chose -- the
+    /// same argument `theme::toggle_pill_disabled` makes for still showing its
+    /// state.
+    #[test]
+    fn the_minimum_digits_number_goes_to_zero_with_its_own_class() {
+        let mut form = settled(GeneratedKind::Characters);
+        assert!(form.step_min_number(1));
+        form.finish(None);
+        assert_eq!(form.min_number(), 2);
+
+        assert!(form.toggle_class(CharClass::Number));
+        form.finish(None);
+        match form.request() {
+            GenerateRequest::Password(recipe) => {
+                assert!(!recipe.number);
+                assert_eq!(
+                    recipe.min_number, 0,
+                    "the request demanded digits from an alphabet it had just excluded"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(form.min_number(), 2, "the stepper forgot the number the user chose");
+        assert!(!form.min_number_live(), "the stepper is live over a number nothing sends");
+
+        assert!(form.toggle_class(CharClass::Number));
+        form.finish(None);
+        match form.request() {
+            GenerateRequest::Password(recipe) => assert_eq!(
+                recipe.min_number, 2,
+                "switching digits back on did not restore the minimum the user set"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **The minimum-digits stepper stops at both ends**, and the bound is the
+    /// vault window's own rather than a second copy of it.
+    #[test]
+    fn the_minimum_digits_stepper_stops_at_both_ends() {
+        assert_eq!(
+            MAX_MIN_NUMBER,
+            crate::vault_window::detail_edit::MAX_MIN_CLASS,
+            "the two cards that draw this stepper against the same route disagree about its \
+             upper bound"
+        );
+        let mut form = settled(GeneratedKind::Characters);
+        for _ in 0..50 {
+            if !form.step_min_number(1) {
+                break;
+            }
+            form.finish(None);
+        }
+        assert_eq!(form.min_number(), MAX_MIN_NUMBER, "the stepper ran past its own ceiling");
+        assert!(!form.can_step_min_number(1), "`+` is still offered at the ceiling");
+        for _ in 0..50 {
+            if !form.step_min_number(-1) {
+                break;
+            }
+            form.finish(None);
+        }
+        assert_eq!(form.min_number(), 0, "the stepper ran past zero");
+        assert!(!form.can_step_min_number(-1), "`-` is still offered at zero");
+
+        // And it can never ask for more digits than the password has room for,
+        // even at the shortest size the card offers.
+        let mut form = settled(GeneratedKind::Characters);
+        for _ in 0..MAX_MIN_NUMBER {
+            form.step_min_number(1);
+            form.finish(None);
+        }
+        form.set_size(GeneratedKind::Characters.bounds().0);
+        match form.request() {
+            GenerateRequest::Password(recipe) => assert!(
+                recipe.min_number + recipe.min_special <= recipe.length,
+                "the request demands {} of a {}-character password",
+                recipe.min_number + recipe.min_special,
+                recipe.length
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 
     // ---- the form ----------------------------------------------------------
@@ -2794,13 +4486,12 @@ mod tests {
 
     /// **The size stops at the bounds, whichever way it is driven.**
     ///
-    /// No control on 3d's card posts [`Event::Resize`] -- the design's `20
-    /// chars` is a readout and the full generator is the vault window's (see
-    /// [`layout`]) -- so this is a claim about the decision layer rather than
-    /// about a stepper. It stays because the bounds table is what makes
-    /// [`GeneratedKind::default_size`] and [`GeneratedKind::recipe`]'s clamp
-    /// honest, and because the seam is still the only thing that could move the
-    /// size at all.
+    /// Written when nothing on the card posted [`Event::Resize`] at all -- the
+    /// older 3d had no length control -- and now the newer 3d's slider drives
+    /// exactly this, by its arrow keys. The claim is unchanged and the reason
+    /// it mattered then is the reason it matters more now: the bounds table is
+    /// what makes [`GeneratedKind::default_size`] and [`GeneratedKind::recipe`]'s
+    /// clamp honest against a route that silently raises a too-small size.
     #[test]
     fn the_size_stays_inside_the_bounds_however_it_is_driven() {
         let mut checked = 0;
@@ -2829,49 +4520,88 @@ mod tests {
         assert_eq!(checked, GeneratedKind::ALL.len());
     }
 
+    /// **The length row's caption is the kind's, and its value is the bare
+    /// number.**
+    ///
+    /// This used to assert `20 chars` off `GenerateForm::readout`. The newer 3d
+    /// splits that run into a labelled row -- caption on the left, value
+    /// right-aligned -- so the claim is re-targeted onto
+    /// [`GenerateForm::size_row`], which hands back both halves at once. The
+    /// half that did not change is the one that mattered: the word is read off
+    /// the kind, because `Length` over a passphrase's `4` is the same
+    /// incoherence `20 chars` over four words was.
     #[test]
-    fn the_size_readout_is_labelled_by_the_kind() {
+    fn the_size_rows_caption_is_labelled_by_the_kind() {
         let mut form = GenerateForm::new(GeneratedKind::Characters);
-        assert_eq!(form.readout(), "20 chars", "3d's own readout, in the state 3d draws");
+        assert_eq!(
+            form.size_row(),
+            ("Length", "20".to_string()),
+            "the image's own row, in the state the image draws"
+        );
         form.finish(None);
         form.choose(GeneratedKind::Words);
         assert_eq!(
-            form.readout(),
-            "4 words",
-            "the readout counts characters while a passphrase is selected"
+            form.size_row(),
+            ("Words", "4".to_string()),
+            "the row says `Length` over a number of words"
         );
         form.finish(None);
         form.choose(GeneratedKind::Pin);
-        assert_eq!(form.readout(), "6 chars");
+        assert_eq!(form.size_row(), ("Length", "6".to_string()));
     }
 
     #[test]
     fn each_kind_asks_for_the_recipe_it_names() {
         use crate::vault_bridge::GenerateRequest;
-        match GeneratedKind::Words.recipe(6) {
-            GenerateRequest::Passphrase(recipe) => assert_eq!(recipe.words, 6),
-            other => panic!("Words asked for {other:?}"),
+        match recipe(GeneratedKind::Words, 6) {
+            GenerateRequest::Passphrase(r) => assert_eq!(r.words, 6),
+            other => panic!("Passphrase asked for {other:?}"),
         }
-        let characters = match GeneratedKind::Characters.recipe(24) {
-            GenerateRequest::Password(recipe) => recipe,
-            other => panic!("Characters asked for {other:?}"),
+        let characters = match recipe(GeneratedKind::Characters, 24) {
+            GenerateRequest::Password(r) => r,
+            other => panic!("Password asked for {other:?}"),
         };
         assert_eq!(characters.length, 24);
         assert!(
             characters.uppercase && characters.lowercase && characters.number
                 && characters.special,
-            "the general-purpose chip is called *Characters* precisely because every class is \
-             on; a chip reading `Letters` over a password containing `7` and `!` would be the \
-             card lying about its own output"
+            "a freshly opened card's *Password* cell does not ask for the crate's own default \
+             alphabet, which is every class"
         );
-        let pin = match GeneratedKind::Pin.recipe(6) {
-            GenerateRequest::Password(recipe) => recipe,
+        let pin = match recipe(GeneratedKind::Pin, 6) {
+            GenerateRequest::Password(r) => r,
             other => panic!("PIN asked for {other:?}"),
         };
         assert_eq!(pin.length, 6);
         assert!(pin.number && !pin.uppercase && !pin.lowercase && !pin.special);
         assert_eq!(pin.min_special, 0, "a PIN asked for a special character it had excluded");
         assert!(!pin.avoid_ambiguous, "a digits-only alphabet has nothing to disambiguate");
+    }
+
+    /// **PIN ignores the card's class tiles, and says so in the request.**
+    ///
+    /// Checked rather than assumed, because the whole third cell rests on it:
+    /// `bw serve` substitutes `uppercase + lowercase + number` only when all
+    /// four classes arrive false, so one class on is honoured and a digits-only
+    /// PIN is expressible. The tiles are drawn dead and digits-only while it is
+    /// selected (see `a_pins_tiles_show_the_alphabet_a_pin_actually_uses`), and
+    /// this is the other half: whatever the stored set says, the recipe is
+    /// digits.
+    #[test]
+    fn a_pin_is_digits_whatever_the_class_tiles_hold() {
+        let mut every_class = CharClasses::default();
+        // Lowercase only -- the most different from a PIN a valid set can be.
+        for class in [CharClass::Uppercase, CharClass::Number, CharClass::Special] {
+            assert!(every_class.set(class, false));
+        }
+        match GeneratedKind::Pin.recipe(8, &every_class, 4, true) {
+            GenerateRequest::Password(r) => {
+                assert!(r.number && !r.lowercase && !r.uppercase && !r.special);
+                assert_eq!(r.min_number, 0);
+                assert!(!r.avoid_ambiguous);
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     /// **No size the card offers is one the route would silently raise.**
@@ -2892,7 +4622,7 @@ mod tests {
                 "{kind:?} opens at a size outside its own bounds"
             );
             for size in [low, kind.default_size(), high] {
-                match kind.recipe(size) {
+                match recipe(kind, size) {
                     GenerateRequest::Passphrase(recipe) => {
                         assert!(recipe.words >= 3, "{kind:?} at {size} would be raised to 3 words");
                     }
@@ -2914,18 +4644,26 @@ mod tests {
     #[test]
     fn a_recipe_outside_the_bounds_is_clamped_rather_than_sent() {
         use crate::vault_bridge::GenerateRequest;
-        match GeneratedKind::Pin.recipe(1) {
-            GenerateRequest::Password(recipe) => {
-                assert_eq!(recipe.length, GeneratedKind::Pin.bounds().0)
+        match recipe(GeneratedKind::Pin, 1) {
+            GenerateRequest::Password(r) => {
+                assert_eq!(r.length, GeneratedKind::Pin.bounds().0)
             }
             other => panic!("{other:?}"),
         }
-        match GeneratedKind::Words.recipe(9999) {
-            GenerateRequest::Passphrase(recipe) => {
-                assert_eq!(recipe.words, GeneratedKind::Words.bounds().1)
+        match recipe(GeneratedKind::Words, 9999) {
+            GenerateRequest::Passphrase(r) => {
+                assert_eq!(r.words, GeneratedKind::Words.bounds().1)
             }
             other => panic!("{other:?}"),
         }
+        // And the slider cannot put one there either, however it is driven.
+        let mut form = settled(GeneratedKind::Characters);
+        let (low, high) = GeneratedKind::Characters.bounds();
+        assert!(form.set_size(9999));
+        assert_eq!(form.size(), high, "the slider was allowed past its own upper bound");
+        form.finish(None);
+        assert!(form.set_size(0));
+        assert_eq!(form.size(), low, "the slider was allowed below its own lower bound");
     }
 
     // ---- geometry ----------------------------------------------------------
@@ -3008,33 +4746,133 @@ mod tests {
         }
         assert_eq!(l.kinds[0].x, MARGIN_X, "the run does not start at the body's own inset");
         assert!(
-            l.kinds[2].right() < l.readout.x,
-            "the kind run has grown into the size readout: the run ends at {} and the readout \
-             starts at {}",
+            l.kinds[2].right() + ROW_GAP <= l.regenerate.x,
+            "the kind run has grown into the *Regenerate* button: the run ends at {} and the \
+             button starts at {}, with 3d's `gap: 10px` to fit between them",
             l.kinds[2].right(),
-            l.readout.x
+            l.regenerate.x
         );
         assert_eq!(
-            l.readout.x - l.kinds[2].right(),
-            ROW_GAP,
-            "3d sets `gap: 10px` across the control row"
-        );
-        assert!(
-            l.readout.right() <= l.hint.x,
-            "the readout runs under the `CTRL+R NEW` hint"
-        );
-        assert_eq!(
-            l.hint.right(),
+            l.regenerate.right(),
             l.window.right() - MARGIN_X,
             "3d puts the re-roll behind a spacer, at the row's right edge"
         );
         for cell in l.kinds {
-            assert_eq!(cell.y, l.readout.y, "the run and the readout are on different rows");
+            assert_eq!(cell.y, l.regenerate.y, "the run and the re-roll are on different rows");
             assert_eq!(cell.h, SEGMENT_H);
-            assert_eq!(cell.h, l.hint.h, "the hint is not the control row's own height");
+            assert_eq!(cell.h, l.regenerate.h, "the re-roll is not the control row's own height");
         }
 
-        assert!(l.kinds[0].bottom() <= l.footer_rule.y);
+        // The length row: caption opposite value, slider under both, bounds
+        // under the slider's two ends.
+        assert!(l.kinds[0].bottom() <= l.length_label.y);
+        assert_eq!(l.length_label.y, l.length_value.y, "the caption and its value are not a row");
+        assert!(
+            l.length_label.right() <= l.length_value.x,
+            "the length caption runs under its own value"
+        );
+        assert_eq!(
+            l.length_value.right(),
+            l.window.right() - MARGIN_X,
+            "the length value is not right-aligned on the body's own margin"
+        );
+        assert!(l.length_label.bottom() <= l.slider.y);
+        assert_eq!(l.slider.x, MARGIN_X, "the slider does not start at the body's own inset");
+        assert_eq!(
+            l.slider.right(),
+            l.window.right() - MARGIN_X,
+            "the slider is not the full width of the body it sits in"
+        );
+        assert!(l.slider.bottom() <= l.slider_low.y);
+        assert_eq!(l.slider_low.y, l.slider_high.y, "the two bounds are on different lines");
+        assert_eq!(l.slider_low.x, l.slider.x, "the low bound is not under the slider's left end");
+        assert_eq!(
+            l.slider_high.right(),
+            l.slider.right(),
+            "the high bound is not under the slider's right end"
+        );
+        assert!(l.slider_low.right() <= l.slider_high.x, "the two bounds overlap");
+
+        // The class tiles: two rows of two, filling the body exactly.
+        assert!(l.slider_low.bottom() <= l.classes_caption.y);
+        assert!(l.classes_caption.bottom() <= l.tiles[0].y);
+        assert_eq!(l.tiles[0].x, MARGIN_X, "the tile grid does not start at the body's inset");
+        assert_eq!(l.tiles[0].y, l.tiles[1].y, "the grid's first row is not a row");
+        assert_eq!(l.tiles[2].y, l.tiles[3].y, "the grid's second row is not a row");
+        assert_eq!(l.tiles[0].x, l.tiles[2].x, "the grid's first column is not a column");
+        assert_eq!(l.tiles[1].x, l.tiles[3].x, "the grid's second column is not a column");
+        assert_eq!(
+            l.tiles[1].x - l.tiles[0].right(),
+            TILE_GAP,
+            "the two tile columns are not one gap apart"
+        );
+        assert_eq!(
+            l.tiles[3].y - l.tiles[1].bottom(),
+            TILE_GAP,
+            "the two tile rows are not one gap apart"
+        );
+        assert!(
+            l.tiles[1].right() <= l.window.right() - MARGIN_X,
+            "the right-hand tile column has crossed the card's right margin"
+        );
+        for tile in l.tiles {
+            assert_eq!(tile.h, TILE_H);
+            assert!(
+                tile.w > TILE_PAD_X + TILE_BOX + TILE_TEXT_GAP,
+                "a tile is narrower than the tick box and the padding round it"
+            );
+        }
+
+        // The minimum-digits row, and its joined stepper.
+        assert!(l.tiles[3].bottom() <= l.min_label.y);
+        for pair in l.min_stepper.windows(2) {
+            assert_eq!(
+                pair[1].x,
+                pair[0].right() - SEGMENT_SEAM,
+                "the stepper's cells are {} apart, so it is three buttons rather than one \
+                 control with seams",
+                pair[1].x - pair[0].right()
+            );
+        }
+        assert!(
+            l.min_label.right() + ROW_GAP <= l.min_stepper[0].x,
+            "the minimum-digits question runs into its own stepper"
+        );
+        assert_eq!(
+            l.min_stepper[2].right(),
+            l.window.right() - MARGIN_X,
+            "the stepper is not right-aligned on the body's own margin"
+        );
+        for cell in l.min_stepper {
+            assert_eq!(cell.y, l.min_label.y, "the stepper and its question are on different rows");
+            assert_eq!(cell.h, SEGMENT_H, "the stepper is not 3e's segmented-control height");
+        }
+
+        // The look-alikes row: label over sample, switch beside both.
+        assert!(l.min_stepper[0].bottom() <= l.avoid_label.y);
+        assert_eq!(l.avoid_label.x, MARGIN_X);
+        assert_eq!(
+            l.avoid_sample.y,
+            l.avoid_label.bottom(),
+            "the sample is not directly under the label it belongs to"
+        );
+        assert!(
+            l.avoid_label.right() <= l.avoid_toggle.x,
+            "the look-alikes label runs under its own switch"
+        );
+        assert!(l.avoid_sample.right() <= l.avoid_toggle.x, "the sample runs under the switch");
+        assert_eq!(
+            l.avoid_toggle.right(),
+            l.window.right() - MARGIN_X,
+            "the switch is not right-aligned on the body's own margin"
+        );
+        assert!(
+            l.avoid_toggle.y >= l.avoid_label.y
+                && l.avoid_toggle.bottom() <= l.avoid_sample.bottom(),
+            "the switch is not vertically inside the two-line stack it is centred on"
+        );
+
+        assert!(l.avoid_sample.bottom() <= l.footer_rule.y);
         assert_eq!(
             l.footer.y,
             l.footer_rule.bottom(),
@@ -3115,8 +4953,16 @@ mod tests {
         );
         assert_eq!(l.value.y - l.caption.bottom(), BODY_GAP);
         assert_eq!(l.kinds[0].y - l.value.bottom(), BODY_GAP);
+        // The newer 3d's four extra blocks are spaced by the same `gap: 12px`,
+        // each measured from the bottom of the block above it rather than from
+        // the last line inside it -- so the length row's three lines are one
+        // block, and so are the look-alikes label and its sample.
+        assert_eq!(l.length_label.y - l.kinds[0].bottom(), BODY_GAP);
+        assert_eq!(l.classes_caption.y - l.slider_low.bottom(), BODY_GAP);
+        assert_eq!(l.min_label.y - l.tiles[3].bottom(), BODY_GAP);
+        assert_eq!(l.avoid_label.y - l.min_stepper[0].bottom(), BODY_GAP);
         assert_eq!(
-            l.footer_rule.y - l.kinds[0].bottom(),
+            l.footer_rule.y - l.avoid_sample.bottom(),
             BODY_PAD,
             "the body does not close at 3d's own padding"
         );
@@ -3162,6 +5008,214 @@ mod tests {
             2 * crate::theme::PILL_PAD_X as i32 + 38,
             "the badge is not its widest label inside 3d's `padding: 2px 8px`"
         );
+        assert_eq!(
+            (TOGGLE_W, TOGGLE_H),
+            (crate::theme::TOGGLE_W as i32, crate::theme::TOGGLE_H as i32),
+            "the look-alikes switch is not the app's own 40x22 -- `theme::toggle_pill` draws the \
+             egui copy of this control and the two have to be one switch"
+        );
+        assert_eq!(
+            SLIDER_HANDLE_R * 2,
+            SLIDER_H,
+            "the slider's row is not exactly its handle's diameter, so the handle is either \
+             clipped by its own control or floating in dead space"
+        );
+    }
+
+    /// **The control row fits the body.**
+    ///
+    /// The newer image's labels are longer than the older one's -- `Password`
+    /// and `Passphrase` where it said `Words` and `Characters` -- and the
+    /// re-roll beside them grew from a bare run into a button with a glyph and
+    /// a chip in it. `layout` is pure and cannot measure a label, so
+    /// [`KIND_W`] and [`REGENERATE_W`] are chosen numbers; this is what keeps
+    /// the row from silently overflowing a card that cannot scroll.
+    #[test]
+    fn the_control_row_fits_the_body() {
+        let l = layout();
+        let body = WIDTH - 2 * MARGIN_X;
+        let run: i32 = KIND_W.iter().sum::<i32>() - 2 * SEGMENT_SEAM;
+        assert_eq!(
+            l.kinds[2].right() - l.kinds[0].x,
+            run,
+            "control: the run's drawn width is not the sum of its cells"
+        );
+        assert!(
+            run + ROW_GAP + REGENERATE_W <= body,
+            "the kind run ({run}) and the *Regenerate* button ({REGENERATE_W}) with 3d's \
+             `gap: 10px` between them need {} of a {body}-pixel body",
+            run + ROW_GAP + REGENERATE_W
+        );
+        // The button has to hold its three parts: the glyph, the word, and the
+        // `CTRL+R` chip. Slack, because none of the three can be measured here
+        // -- but a button narrower than the chip alone would clip the chip the
+        // shared painter clamps rather than the label.
+        let chip = 2 * crate::theme::CHIP_PAD_X as i32
+            + REGENERATE_SHORTCUT.len() as i32 * crate::theme::CHIP_TEXT_PX as i32;
+        assert!(
+            REGENERATE_W > REFRESH_GLYPH + REFRESH_GAP + chip,
+            "the *Regenerate* button is {REGENERATE_W} wide, which leaves nothing for its label \
+             beside a refresh glyph and a `{REGENERATE_SHORTCUT}` chip"
+        );
+    }
+
+    /// **The slider's handle and the pointer read the same scale.**
+    ///
+    /// One mapping in two directions: [`slider_handle_x`] places the handle and
+    /// [`slider_size_at`] reads a pointer back. If they disagreed, a user would
+    /// drop the handle on one number and the card would send another -- and on
+    /// this card "another" is the length of the password going into their
+    /// vault.
+    #[test]
+    fn the_sliders_handle_and_its_pointer_agree_about_every_value() {
+        let at = layout().slider;
+        let mut checked = 0;
+        for kind in GeneratedKind::ALL {
+            let bounds = kind.bounds();
+            let (low, high) = bounds;
+            for size in low..=high {
+                let x = slider_handle_x(at, size, bounds);
+                assert_eq!(
+                    slider_size_at(at, x, bounds),
+                    size,
+                    "{kind:?}: the handle for {size} sits at {x}, which reads back as something \
+                     else -- so the value the user drops is not the value the card sends"
+                );
+                checked += 1;
+            }
+            // The two ends land ON the ends of the travel, not near them: a
+            // handle whose centre could reach the control's own edge would be
+            // drawn half outside the window that clips it.
+            assert_eq!(
+                slider_handle_x(at, low, bounds),
+                at.x + SLIDER_HANDLE_R,
+                "{kind:?}'s minimum does not park the handle at the track's left end"
+            );
+            assert_eq!(
+                slider_handle_x(at, high, bounds),
+                at.right() - SLIDER_HANDLE_R,
+                "{kind:?}'s maximum does not park the handle at the track's right end"
+            );
+        }
+        assert!(checked > 60, "control: only {checked} sizes were swept");
+
+        // A pointer outside the control is clamped rather than wrapped, which
+        // is what a drag that leaves the window is.
+        let bounds = GeneratedKind::Characters.bounds();
+        assert_eq!(slider_size_at(at, at.x - 9999, bounds), bounds.0);
+        assert_eq!(slider_size_at(at, at.right() + 9999, bounds), bounds.1);
+    }
+
+    /// **Every control the card creates is on the card, and Tab walks them in
+    /// reading order.**
+    ///
+    /// The card went from six controls to thirteen, and the order they are
+    /// created in *is* the order `IsDialogMessageW` tabs through them. Nothing
+    /// about a Win32 window enforces that it matches the geometry, and a Tab
+    /// key that jumped from the slider to the footer and back up to a tile is
+    /// not a thing anyone finds by reading `open`.
+    #[test]
+    fn every_control_is_on_the_card_and_tab_walks_it_in_reading_order() {
+        let l = layout();
+        let order = win32::tab_order(&l);
+        assert_eq!(
+            order.len(),
+            GeneratedKind::ALL.len() + 1 + 1 + CharClass::ALL.len() + 2 + 1 + 2,
+            "the card creates a different number of controls than it has: three kind cells, the \
+             re-roll, the slider, four class tiles, the stepper's two buttons, the switch, and \
+             the footer's two answers"
+        );
+
+        let mut seen: Vec<usize> = Vec::new();
+        for (id, at) in &order {
+            assert!(!seen.contains(id), "control id {id} is created twice");
+            seen.push(*id);
+            assert_eq!(
+                win32::control_box(*id, &l),
+                *at,
+                "control {id} is created at one rectangle and paints itself at another, so its \
+                 focus ring is drawn somewhere it is not"
+            );
+            assert!(
+                at.x >= 0 && at.y >= 0 && at.right() <= l.window.right()
+                    && at.bottom() <= l.window.bottom(),
+                "control {id} at {at:?} falls off a window that neither scrolls nor resizes"
+            );
+        }
+
+        for pair in order.windows(2) {
+            let (before, after) = (pair[0].1, pair[1].1);
+            let same_row = after.y == before.y;
+            assert!(
+                if same_row { after.x >= before.x } else { after.y > before.y },
+                "Tab goes from {:?} to {:?}, which is backwards or upwards on the card",
+                pair[0].0,
+                pair[1].0
+            );
+        }
+    }
+
+    /// **A control that is drawn dead is a control that does nothing**, and
+    /// neither half is a copy of the other: `win32::enabled` decides the grey,
+    /// and the same predicates on [`GenerateForm`] decide the refusal.
+    ///
+    /// Swept over every kind and every state, because the card is one fixed
+    /// shape and what varies is exactly which of its thirteen controls are in
+    /// play.
+    #[test]
+    fn a_control_drawn_dead_is_a_control_that_refuses() {
+        let l = layout();
+        let mut checked = 0;
+        for kind in GeneratedKind::ALL {
+            for settle in [false, true] {
+                let mut form = GenerateForm::new(kind);
+                if settle {
+                    form.finish(None);
+                }
+                for (id, _) in win32::tab_order(&l) {
+                    let live = win32::enabled(id, &form);
+                    let mut driven = form.clone();
+                    let moved = if id == win32::ID_SAVE || id == win32::ID_COPY {
+                        // Neither posts a request; `run_with` refuses both on
+                        // `ready`, which is what `enabled` answers for them.
+                        driven.ready()
+                    } else if id == win32::ID_NEW {
+                        driven.begin()
+                    } else if id == win32::ID_SLIDER {
+                        // The slider's own end of the travel is not a dead
+                        // control -- it is a live one with nowhere further to
+                        // go -- so it is driven towards the middle.
+                        driven.set_size(kind.default_size() + 1)
+                    } else if id == win32::ID_MIN_DOWN {
+                        driven.step_min_number(-1)
+                    } else if id == win32::ID_MIN_UP {
+                        driven.step_min_number(1)
+                    } else if id == win32::ID_AVOID {
+                        driven.toggle_avoid_ambiguous()
+                    } else if id >= win32::ID_TILE {
+                        driven.toggle_class(CharClass::ALL[id - win32::ID_TILE])
+                    } else {
+                        // A kind cell: the selected one is live and refuses
+                        // only because it is already chosen, so drive a
+                        // different one through it.
+                        let other = GeneratedKind::ALL
+                            .into_iter()
+                            .find(|candidate| *candidate != kind)
+                            .expect("three kinds");
+                        driven.choose(other)
+                    };
+                    if !live {
+                        assert!(
+                            !moved,
+                            "{kind:?} (settled: {settle}): control {id} is drawn dead and still \
+                             moved the form"
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, GeneratedKind::ALL.len() * 2 * win32::tab_order(&l).len());
     }
 
     /// **The card says every one of its own words**, and each of them is a
@@ -3178,26 +5232,42 @@ mod tests {
         );
         assert_eq!(GENERATE_COPY_LABEL, "Copy");
         assert_eq!(
-            regenerate_hint(),
-            "CTRL+R NEW",
-            "the re-roll does not print 3d's own run, which is the chord and the verb together"
+            GENERATE_REGENERATE_LABEL, "Regenerate",
+            "the newer 3d draws a *Regenerate* button where the older one drew a bare `CTRL+R \
+             NEW` run; the composed run this used to assert is gone with it"
         );
         assert_eq!(REGENERATE_SHORTCUT, "CTRL+R");
-        assert_eq!(GENERATE_NEW_LABEL, "NEW");
+        assert_eq!(GENERATE_CLASSES_CAPTION, "Characters");
+        assert_eq!(GENERATE_MIN_NUMBER_LABEL, "At least this many digits");
+        assert_eq!(GENERATE_AVOID_LABEL, "Avoid look-alikes");
+        assert_eq!(
+            GENERATE_AVOID_SAMPLE, "0 O \u{b7} 1 l I",
+            "the sample is the image's own two pairs, not a sentence about them"
+        );
         for kind in GeneratedKind::ALL {
             assert!(!kind.label().is_empty());
         }
         assert_eq!(
             GeneratedKind::ALL.map(|k| k.label()),
-            ["Words", "Characters", "PIN"],
-            "the cells are drawn in `ALL` order and the card's three offers are these three"
+            ["Password", "Passphrase", "PIN"],
+            "the cells are drawn in `ALL` order, and the newer 3d's three offers are these three \
+             in this order -- with the FIRST one filled, which is the one the card opens on"
         );
-        // 3d's readout reads `20 chars`, and this is the card in the state 3d
-        // draws: `Characters` at its default size.
+        for class in CharClass::ALL {
+            assert!(!class.name().is_empty(), "a class tile has no word for itself");
+            assert!(!class.label().is_empty(), "a class tile has no sample");
+        }
         assert_eq!(
-            GenerateForm::new(GeneratedKind::Characters).readout(),
-            "20 chars",
-            "the card's readout is not the one 3d prints"
+            CharClass::ALL.map(|c| c.name()),
+            ["Uppercase", "Lowercase", "Digits", "Symbols"],
+            "the tiles are drawn in `CharClass::ALL` order, which is the image's reading order"
+        );
+        // The image's own length row, in the state the image draws: *Password*
+        // selected at its default size.
+        assert_eq!(
+            GenerateForm::new(GeneratedKind::Characters).size_row(),
+            ("Length", "20".to_string()),
+            "the card's length row is not the one the image prints"
         );
     }
 
