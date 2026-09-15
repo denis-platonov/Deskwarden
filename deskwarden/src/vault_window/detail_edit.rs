@@ -3764,6 +3764,20 @@ pub enum EditAction {
     CopyUsername,
     /// See [`Self::CopyUsername`].
     CopyPassword,
+    /// **The `One-time code` card's `Add` or `Replace by scanning`.**
+    ///
+    /// Both raise this and the window answers both the same way: it opens
+    /// `totp_add`, the modal that scans a QR off the screen or takes a pasted
+    /// key. The READ pane's own clock button already sets the same flag, so
+    /// the two panes open one modal rather than two that drift.
+    ///
+    /// **It writes the ITEM, not the draft**, which is the arrangement the
+    /// icon menu already has and is safe for the same reason:
+    /// `EditDraft::apply_to` clones whatever the item holds AT SAVE TIME, so
+    /// a seed added while the form is open survives the Save that follows it.
+    /// The form has no way to scan a screen itself -- the modal pumps its own
+    /// message loop -- so this could not be answered here in any case.
+    AddTotp,
 }
 
 /// The folders this form may actually move an item **into**: the folder list
@@ -3816,6 +3830,26 @@ pub const TOTP_HINT: &str =
 /// treatment and same wording pattern as [`FIELDS_CREATE_NOTICE`]; offering
 /// it needs a `vault_bridge` change.
 pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
+
+/// 8a's `Replace by scanning`, and the `Add` that stands in its place on a
+/// record with no second factor yet.
+///
+/// Both open the same modal -- `totp_add`, which scans a QR off the screen or
+/// takes a pasted key -- because they are the same act on a card that either
+/// has a seed or does not. The words differ because replacing something is
+/// not the same promise as adding it.
+///
+/// **No scan-frame icon on the Replace**, which 8a draws. This app has no
+/// 12-point scan glyph and inventing one for a single button is the kind of
+/// drawing `kind_mark` refuses elsewhere; the word says the whole thing.
+pub const TOTP_REPLACE_BUTTON: &str = "Replace by scanning";
+pub const TOTP_ADD_BUTTON: &str = "Add";
+
+/// What the `One-time code` card's greyed box says when the item has no seed.
+///
+/// Short, because it shares its line with a button: the sentence under the
+/// row still spells out what a seed is.
+pub const TOTP_EMPTY_NOTE: &str = "No one-time code yet";
 
 /// What the `One-time code` card's box says when the item has no seed.
 ///
@@ -7921,10 +7955,6 @@ pub fn draw_detail_edit(
             // `custom_fields_block`'s removal is deferred: the rows below
             // hold `&mut` into the very boxes `hide_slot` empties.
             let mut hide: Option<Slot> = None;
-            // The other half of the same deferral: a card whose body reveals
-            // a slot cannot call `reveal_slot` while it still holds a `&mut`
-            // into the draft. See `hide`, and the `One-time code` card below.
-            let mut add: Option<Slot> = None;
 
             // Which card a `Changed` mark goes on, off the list taken once at
             // the top of the frame.
@@ -8538,62 +8568,87 @@ pub fn draw_detail_edit(
                     changed(Section::OneTimeCode),
                     wanted,
                     |ui| {
-                        if slot_row(
-                            ui,
-                            Slot::Totp.label(),
-                            // Only a row that HAS something can be removed.
-                            has_seed && removable(Slot::Totp),
-                            |ui| {
-                                if creating {
-                                    theme::section_disabled_text_field(ui, TOTP_CREATE_NOTICE);
-                                } else if !has_seed {
-                                    // The empty state, and it is the same box
-                                    // the filled one is -- typing or pasting
-                                    // a seed into it IS adding the second
-                                    // factor, so the card needs no separate
-                                    // Add control. Revealed on the first
-                                    // keystroke so the draft starts carrying
-                                    // the slot; `reveal_slot` is idempotent.
-                                    if theme::section_hinted_field(
+                        // **The row's own buttons, on the row**, which is
+                        // 8a: `Replace by scanning` and `Remove` sit at the
+                        // right-hand end of the seed's line, not in the label
+                        // cell. The owner: "if no code just show button Add
+                        // or something to the right and call that modal with
+                        // everything, once added - show replace and remove as
+                        // per design".
+                        //
+                        // `slot_row`'s chip is therefore not asked for: it
+                        // would put a second Remove in the label column.
+                        theme::section_row(ui, Slot::Totp.label(), |ui| {
+                            if creating {
+                                theme::section_disabled_text_field(ui, TOTP_CREATE_NOTICE);
+                            } else if !has_seed {
+                                // **The empty state: a greyed box saying so,
+                                // and one button.**
+                                //
+                                // It was an editable box with a placeholder,
+                                // on the argument that typing a seed into it
+                                // IS adding the second factor. The owner saw
+                                // it cut off -- the hint is longer than the
+                                // room a 130-point label column leaves -- and
+                                // asked for the button instead. The button is
+                                // the honest door anyway: a seed is scanned
+                                // or pasted from a page the user is looking
+                                // at, and the modal behind it does both.
+                                row_with_buttons(ui, &[TOTP_ADD_BUTTON], |ui, room| {
+                                    theme::section_disabled_text_field_within(
                                         ui,
-                                        &mut draft.totp,
-                                        TOTP_EMPTY_HINT,
-                                    )
-                                    .changed()
-                                    {
-                                        add = Some(Slot::Totp);
-                                    }
-                                } else {
-                                    // Masked, like the password and for the
-                                    // same reason: it is a secret, and this
-                                    // form may be open in front of other
-                                    // people. `password_field` is the crate's
-                                    // one masked box -- reaching for a plain
-                                    // `text_field` here is the mutation
-                                    // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
-                                    // exists to catch.
-                                    theme::section_password_field(
-                                        ui,
-                                        &mut draft.totp,
-                                        &mut draft.reveal_totp,
+                                        TOTP_EMPTY_NOTE,
+                                        room,
                                     );
-                                }
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT),
+                                    if theme::row_button(ui, TOTP_ADD_BUTTON).clicked() {
+                                        action = EditAction::AddTotp;
+                                    }
+                                });
+                            } else {
+                                // Masked, like the password was and for the
+                                // reason the password no longer is: this one
+                                // is not being typed. `password_field` is the
+                                // crate's one masked box -- reaching for a
+                                // plain `text_field` here is the mutation
+                                // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
+                                // exists to catch.
+                                row_with_buttons(
+                                    ui,
+                                    &[TOTP_REPLACE_BUTTON, SLOT_REMOVE_BUTTON],
+                                    |ui, room| {
+                                        theme::section_password_field_within(
+                                            ui,
+                                            &mut draft.totp,
+                                            &mut draft.reveal_totp,
+                                            room,
+                                        );
+                                        if theme::row_button(ui, TOTP_REPLACE_BUTTON).clicked() {
+                                            action = EditAction::AddTotp;
+                                        }
+                                        // 8a's `color: #8c3c33` on this one
+                                        // and this one only -- see
+                                        // `theme::row_button_danger`.
+                                        if theme::row_button_danger(ui, SLOT_REMOVE_BUTTON)
+                                            .clicked()
+                                        {
+                                            hide = Some(Slot::Totp);
+                                        }
+                                    },
                                 );
-                            },
-                        ) {
-                            hide = Some(Slot::Totp);
-                        }
+                            }
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT),
+                            );
+                        });
                     },
                 );
             }
-            // The deferred reveal, for `hide`'s reason exactly: `reveal_slot`
-            // takes a `&mut` the card's body is still holding.
-            if let Some(slot) = add {
-                draft.reveal_slot(slot);
-            }
+            // **The deferred reveal is gone with the box that needed it.**
+            // The `One-time code` card's empty state is a greyed note and an
+            // `Add` button now, so nothing on that card types into the draft
+            // and nothing has to reveal a slot from inside a body holding a
+            // `&mut` into it. See the card.
             // **The deferred Remove**, applied once for every card that can
             // ask for one -- see `hide` above. `hide_slot` empties the box as
             // well as taking the row away, which is why it cannot run while a
@@ -20661,13 +20716,23 @@ mod edit_pane_layout_tests {
         // card), so what a Remove takes away is the seed and the Remove
         // itself, not the row. The empty box says what belongs in it.
         assert!(
-            after.strings().contains(&TOTP_EMPTY_HINT),
-            "the emptied row is not offering a box to paste a new seed into: {:?}",
+            after.strings().contains(&TOTP_EMPTY_NOTE),
+            "the emptied row is not saying it has no code: {:?}",
+            after.strings()
+        );
+        assert!(
+            after.strings().contains(&TOTP_ADD_BUTTON),
+            "the emptied row offers no way to add one back: {:?}",
             after.strings()
         );
         assert!(
             !after.strings().contains(&SLOT_REMOVE_BUTTON),
             "an emptied row still offers a Remove, which would remove nothing: {:?}",
+            after.strings()
+        );
+        assert!(
+            !after.strings().contains(&TOTP_REPLACE_BUTTON),
+            "an emptied row still offers a Replace, which has nothing to replace: {:?}",
             after.strings()
         );
         // ...and the way back is the box itself, not the Add menu: see

@@ -2482,22 +2482,44 @@ fn primary_button_with_metrics(
 /// ↵ glyph's ink is roughly half its em box, so the arrow is drawn at 5px
 /// rather than the 6.5 it used before, which read as heavier than the
 /// design's at the same nominal size.
-const RETURN_GLYPH_SIZE: f32 = 5.0;
+///
+/// Public because the GDI renderer draws the same glyph at the same extent --
+/// see [`return_arrow_segments`].
+pub const RETURN_GLYPH_SIZE: f32 = 5.0;
 
-/// The ↵ return glyph, drawn: down the right side, along the bottom, arrowhead
-/// pointing left. Every part scales with `size` -- the arrowhead barbs used
-/// to be a fixed 3.2px, so shrinking the glyph left them oversized.
-fn paint_return_arrow(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
-    let stroke = Stroke::new(1.0, color);
+/// **The four strokes the ↵ glyph is made of**, as segments around `center`:
+/// down the right side, along the bottom, then the arrowhead's two barbs.
+///
+/// Pure geometry with no painter in it, and `pub`, for the reason
+/// [`quadrant_outlines`] is both: design 3d's `Fill & save to vault ↵` is
+/// drawn by `crate::win32_draw::draw_button_with_return` in GDI, which cannot
+/// call into egui, and a second copy of this shape is a second ↵ to keep in
+/// step. It is a vector on both sides rather than a character because **no face
+/// this app ships carries U+21B5** -- neither Archivo nor egui's fallbacks, and
+/// the GDI side would have to bet on the OS monospace having it.
+///
+/// Every part scales with `size` -- the arrowhead barbs used to be a fixed
+/// 3.2px, so shrinking the glyph left them oversized.
+pub fn return_arrow_segments(center: Pos2, size: f32) -> [[Pos2; 2]; 4] {
     let half = size / 2.0;
     let barb = size * 0.5;
     let right_top = Pos2::new(center.x + half, center.y - half);
     let corner = Pos2::new(center.x + half, center.y + half * 0.7);
     let left = Pos2::new(center.x - half, center.y + half * 0.7);
-    painter.line_segment([right_top, corner], stroke);
-    painter.line_segment([corner, left], stroke);
-    painter.line_segment([left, Pos2::new(left.x + barb, left.y - barb)], stroke);
-    painter.line_segment([left, Pos2::new(left.x + barb, left.y + barb)], stroke);
+    [
+        [right_top, corner],
+        [corner, left],
+        [left, Pos2::new(left.x + barb, left.y - barb)],
+        [left, Pos2::new(left.x + barb, left.y + barb)],
+    ]
+}
+
+/// The ↵ return glyph, drawn from [`return_arrow_segments`].
+fn paint_return_arrow(painter: &egui::Painter, center: Pos2, size: f32, color: Color32) {
+    let stroke = Stroke::new(1.0, color);
+    for [from, to] in return_arrow_segments(center, size) {
+        painter.line_segment([from, to], stroke);
+    }
 }
 
 /// The outlined secondary button ("Not now", "Cancel", "Copy").
@@ -2983,8 +3005,13 @@ fn segment_galley(ui: &Ui, label: &str, color: Color32) -> Arc<egui::Galley> {
 }
 
 /// The cell label's size: 12px, the same as the Preferences window's other
-/// in-card controls.
-const SEGMENT_TEXT_SIZE: f32 = 12.0;
+/// in-card controls -- and design 3d's own `font-size: 12px` on the
+/// `Words / Letters / PIN` run.
+///
+/// Public for the reason [`SEGMENT_HEIGHT`] and [`SEGMENT_SEAM`] are: the GDI
+/// renderer draws the same run and cannot call into egui, so
+/// `crate::win32_draw::draw_segment_cell` reads this rather than restating it.
+pub const SEGMENT_TEXT_SIZE: f32 = 12.0;
 
 // ---------------------------------------------------------------------------
 // The dropdown: the multiple-choice control for a set a run cannot hold
@@ -3599,6 +3626,27 @@ pub fn number_box_enabled(ui: &mut Ui, enabled: bool, value: egui::DragValue<'_>
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
     response
+}
+
+/// [`row_button`] in the destructive ink.
+///
+/// §8a gives the one-time code's `Remove` the same box as `Replace by
+/// scanning` beside it and `color: #8c3c33` -- [`DANGER_INK`], which is this
+/// app's word for exactly that. The BOX is unchanged: a red-filled button
+/// there would outweigh the row it sits on, and the design does not ask for
+/// one.
+pub fn row_button_danger(ui: &mut Ui, label: &str) -> Response {
+    ui.scope(|ui| {
+        ui.spacing_mut().button_padding = ROW_BUTTON_PADDING;
+        ui.add(
+            egui::Button::new(RichText::new(label).size(ROW_BUTTON_TEXT_SIZE).color(DANGER_INK))
+                .fill(CARD)
+                .stroke(Stroke::new(1.0, BORDER_STRONG))
+                .corner_radius(CornerRadius::same(7))
+                .min_size(Vec2::new(0.0, ROW_BUTTON_HEIGHT_2B)),
+        )
+    })
+    .inner
 }
 
 pub fn row_button(ui: &mut Ui, label: &str) -> Response {
@@ -6502,6 +6550,20 @@ pub fn disabled_text_field(ui: &mut Ui, text: &str) -> Rect {
 /// is the same height as the rows it can.
 pub fn section_disabled_text_field(ui: &mut Ui, text: &str) -> Rect {
     disabled_field_box(ui, text, 10.0, SECTION_FIELD_HEIGHT, SECTION_FIELD_PX)
+}
+
+/// [`section_disabled_text_field`] told how much of its row is its own.
+///
+/// §8a's rows are a field followed by buttons, and a greyed one is no
+/// different: the `One-time code` card's empty state is a box saying there is
+/// no code yet with an `Add` beside it. See [`section_text_field_within`],
+/// whose reason is the same.
+pub fn section_disabled_text_field_within(ui: &mut Ui, text: &str, room: f32) -> Rect {
+    ui.scope(|ui| {
+        ui.set_max_width(room);
+        disabled_field_box(ui, text, 10.0, SECTION_FIELD_HEIGHT, SECTION_FIELD_PX)
+    })
+    .inner
 }
 
 /// [`password_field`]'s box while an attempt is in flight: [`masked_readout`]

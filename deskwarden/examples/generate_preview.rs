@@ -8,9 +8,10 @@
 //! ```
 //!
 //! **Every Win32 call is the real one.** The window, the capture exclusion, the
-//! message pump, the owner-drawn chips and buttons, the value box and the
-//! footer are the code the daemon ships, so what this shows is what the user
-//! sees. What is a fixture is only the *generator*: a local function that
+//! message pump, the owner-drawn segmented run and buttons, the tinted value
+//! line, the strength badge and the footer band are the code the daemon ships,
+//! so what this shows is what the user sees -- which is design 3d's panel, at
+//! 3d's own numbers. What is a fixture is only the *generator*: a local function that
 //! builds a plausible-looking string, so nothing here reaches `bw serve`, the
 //! network, the real vault or the user's `%APPDATA%`.
 //!
@@ -55,8 +56,8 @@ static FAILING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::n
 /// **A made-up password, built here and never asked of anything.**
 ///
 /// It honours the request's own size and alphabet so the card's readout and its
-/// value box agree -- a preview whose "6 characters" produced twenty of them
-/// would be showing a card that does not exist.
+/// value line agree -- a preview whose "6 chars" produced twenty of them would
+/// be showing a card that does not exist.
 ///
 /// The bytes come from `std::time`, not from a cryptographic source, and that
 /// is deliberate: nothing this produces is ever saved, and a preview that

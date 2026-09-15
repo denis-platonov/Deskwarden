@@ -751,6 +751,259 @@ pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32)
     }
 }
 
+/// **How wide a UTF-16 run is in `font`, in DEVICE pixels.**
+///
+/// The generated password reaches `crate::generate_prompt` as a
+/// `Zeroizing<Vec<u16>>` and is painted there in coloured runs -- design 3d
+/// tints the characters of its value that are not lowercase letters -- so that
+/// card has to know where each run begins without ever turning the secret back
+/// into a `String`. This is that measurement, made on the buffer the card
+/// already holds, beside the one [`draw_hint_chip`] makes for its chip.
+///
+/// Answers 0 for an empty run and 0 for a measurement GDI refused: a run drawn
+/// at the wrong offset is a cosmetic fault, and a repaint is not worth failing
+/// over one. The font is selected and selected back out, as everything in this
+/// module is.
+pub fn text_width_utf16(hdc: HDC, font: HFONT, chars: &[u16]) -> i32 {
+    if chars.is_empty() {
+        return 0;
+    }
+    unsafe {
+        let old = SelectObject(hdc, font);
+        let mut size = SIZE::default();
+        let measured = GetTextExtentPoint32W(hdc, chars, &mut size).as_bool();
+        SelectObject(hdc, old);
+        if measured {
+            size.cx
+        } else {
+            0
+        }
+    }
+}
+
+/// **One cell of a joined segmented run**, in GDI: what
+/// `crate::theme::segmented_control` paints, for a card that cannot call into
+/// egui.
+///
+/// `rect` is the cell in DEVICE pixels, `index` and `count` say where it sits
+/// in the run, and `radius` is the run's corner radius in DEVICE pixels.
+/// Colours are that control's own -- the selected cell is [`crate::theme::BLUE`]
+/// behind white **with its own fill for an edge** (a grey hairline drawn round
+/// a blue cell reads as a ring hanging off the end of the pill), hover is
+/// [`crate::theme::CANVAS`], and everything else is [`crate::theme::CARD`]
+/// inside [`crate::theme::BORDER`].
+///
+/// `live == false` is `theme::segmented_control_disabled`'s reading, and for
+/// its reason: the answer in force stays identifiable in
+/// [`crate::theme::BLUE_WASH`] rather than being greyed like the rest, because
+/// a run that greyed every cell identically would tell the reader they have no
+/// answer at all when what is true is that they have this one and cannot change
+/// it right now. A flag here rather than a second function, which is the shape
+/// `theme` chose: in GDI the two differ in nothing but the colour triple.
+///
+/// # The rounding belongs to the run, not the cell
+///
+/// `theme`'s `segment_corners` says it first: the first cell rounds its left
+/// corners, the last rounds its right ones, and everything between is square,
+/// which is what makes the interior edges read as seams rather than as gaps
+/// between separate buttons. GDI has no per-corner radius, so a cell that must
+/// be square at one end is drawn as a `RoundRect` whose rounded end **hangs
+/// off that end**, where the caller's own clip removes it -- each cell here is
+/// its own child window painted into a bitmap of exactly its client size.
+///
+/// That overhang takes the cell's border with it, so the seam would vanish:
+/// every cell but the first therefore draws the one-pixel column at its left
+/// edge itself. Once per seam rather than twice, by the right-hand cell of the
+/// pair, which is also the cell whose colour should win -- a selected cell
+/// swallows its own seam exactly as `segmented_control`'s blue edge does.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_segment_cell(
+    hdc: HDC,
+    rect: RECT,
+    label: &str,
+    font: HFONT,
+    count: usize,
+    index: usize,
+    selected: bool,
+    hovered: bool,
+    live: bool,
+    radius: i32,
+) {
+    let (fill, ink, edge) = if !live {
+        let fill = if selected { crate::theme::BLUE_WASH } else { crate::theme::CARD };
+        (fill, crate::theme::TEXT_GHOST, crate::theme::BORDER)
+    } else if selected {
+        (crate::theme::BLUE, crate::theme::CARD, crate::theme::BLUE)
+    } else if hovered {
+        (crate::theme::CANVAS, crate::theme::INK, crate::theme::BORDER)
+    } else {
+        (crate::theme::CARD, crate::theme::INK, crate::theme::BORDER)
+    };
+    let first = index == 0;
+    let last = index + 1 >= count;
+    unsafe {
+        let brush = CreateSolidBrush(rgb(fill));
+        let pen = CreatePen(PS_SOLID, 1, rgb(edge));
+        let old_brush = SelectObject(hdc, brush);
+        let old_pen = SelectObject(hdc, pen);
+        // Twice the radius, so no part of a rounded end can fall back inside
+        // the cell however the caller scaled it.
+        let over = radius * 2;
+        let left = if first { rect.left } else { rect.left - over };
+        let right = if last { rect.right } else { rect.right + over };
+        let _ = RoundRect(hdc, left, rect.top, right, rect.bottom, radius * 2, radius * 2);
+        if !first {
+            // The seam this cell owns: one device column, in this cell's own
+            // edge colour, at the left edge the overhang just took away.
+            let _ = RoundRect(hdc, rect.left, rect.top, rect.left + 1, rect.bottom, 0, 0);
+        }
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, rgb(ink));
+        let old_font = SelectObject(hdc, font);
+        let mut rc = rect;
+        draw_text(hdc, label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old_font);
+    }
+}
+
+/// **The design's `\u{21b5}`, drawn rather than typed**, centred on `center` at
+/// `size` device pixels across and stroked `stroke` wide.
+///
+/// The four segments are `crate::theme::return_arrow_segments`' own, so this
+/// is the glyph `theme::primary_button` already paints and not a second one.
+/// It is a vector on both sides because no face this app ships carries
+/// U+21B5 -- see that function.
+pub fn draw_return_arrow(hdc: HDC, center: POINT, size: i32, colour: COLORREF, stroke: i32) {
+    let segments = crate::theme::return_arrow_segments(
+        eframe::egui::Pos2::new(center.x as f32, center.y as f32),
+        size as f32,
+    );
+    unsafe {
+        let pen = CreatePen(PS_SOLID, stroke.max(1), colour);
+        let old = SelectObject(hdc, pen);
+        for [from, to] in segments {
+            let points = [
+                POINT { x: from.x.round() as i32, y: from.y.round() as i32 },
+                POINT { x: to.x.round() as i32, y: to.y.round() as i32 },
+            ];
+            let _ = Polyline(hdc, &points);
+        }
+        SelectObject(hdc, old);
+        let _ = DeleteObject(pen);
+    }
+}
+
+/// `over` at `alpha` over `under`, in GDI's packed BGR.
+///
+/// The design's in-button shortcut is the button's own ink at
+/// `opacity: 0.8`, and a GDI button has no alpha to give it: the run is drawn
+/// in the colour that opacity would have produced against the fill behind it.
+fn blend(over: COLORREF, under: COLORREF, alpha: f32) -> COLORREF {
+    let mix = |shift: u32| {
+        let a = ((over.0 >> shift) & 0xff) as f32;
+        let b = ((under.0 >> shift) & 0xff) as f32;
+        (((a * alpha + b * (1.0 - alpha)).round() as u32).min(255)) << shift
+    };
+    COLORREF(mix(0) | mix(8) | mix(16))
+}
+
+/// Paint one button whose keyboard shortcut is a **bare run inside it** rather
+/// than a bordered chip.
+///
+/// Design 3d's footer -- and 8a's, which `theme::section_footer_primary_button`
+/// draws in egui -- sets that shortcut as `font-size: 10px; opacity: 0.8`
+/// beside the label with a gap and **no box at all**.
+/// [`crate::theme::SECTION_FOOTER_CHIP_PX`],
+/// [`crate::theme::SECTION_FOOTER_CHIP_GAP`] and
+/// [`crate::theme::SECTION_FOOTER_CHIP_OPACITY`] exist precisely because that
+/// is a different object from [`draw_hint_chip`]'s bordered pill: "same idea,
+/// different object", in those constants' own words. So this is a second
+/// painter beside [`draw_button_with_shortcut`] rather than a flag on it.
+///
+/// The run 3d puts there is `\u{21b5}` and nothing else, so this takes a
+/// `bool` rather than a string: there is no other glyph to pass, and the one
+/// there is cannot be typed -- see [`draw_return_arrow`].
+///
+/// `with_return == false` is exactly [`draw_button`]: the pill with its label
+/// centred, which is what 3d's `Copy` is.
+///
+/// Every GDI object created here is restored and deleted before returning, as
+/// in [`draw_button_with_shortcut`] -- this runs in the daemon's repaint path.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_button_with_return(
+    hdc: HDC,
+    rect: RECT,
+    label: &str,
+    font: HFONT,
+    skin: ButtonSkin,
+    radius: i32,
+    with_return: bool,
+    scale: i32,
+) {
+    unsafe {
+        let brush = CreateSolidBrush(skin.fill);
+        let pen = match skin.border {
+            Some(colour) => CreatePen(PS_SOLID, 1, colour),
+            None => CreatePen(PS_SOLID, 1, skin.fill),
+        };
+        let old_brush = SelectObject(hdc, brush);
+        let old_pen = SelectObject(hdc, pen);
+        let _ =
+            RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, skin.text);
+        let old_font = SelectObject(hdc, font);
+        if !with_return {
+            let mut rc = rect;
+            draw_text(hdc, label, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(hdc, old_font);
+            return;
+        }
+        let px = |v: f32| ((v * scale as f32) / 100.0).round() as i32;
+        let glyph = px(crate::theme::RETURN_GLYPH_SIZE);
+        let gap = px(crate::theme::SECTION_FOOTER_CHIP_GAP);
+        let chars: Vec<u16> = label.encode_utf16().collect();
+        let mut size = SIZE::default();
+        // A measurement GDI refused leaves the label at zero width, which
+        // centres the glyph alone rather than losing the button.
+        let label_w = if !chars.is_empty()
+            && GetTextExtentPoint32W(hdc, &chars, &mut size).as_bool()
+        {
+            size.cx
+        } else {
+            0
+        };
+        // The pair is centred as one group, which is what 3d's `display: flex;
+        // align-items: center; gap: 8px` inside a button that hugs its content
+        // comes to.
+        let total = label_w + gap + glyph;
+        let left = rect.left + ((rect.right - rect.left) - total) / 2;
+        let mut rc = RECT { left, right: left + label_w, ..rect };
+        draw_text(hdc, label, &mut rc, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(hdc, old_font);
+        draw_return_arrow(
+            hdc,
+            POINT {
+                x: left + label_w + gap + glyph / 2,
+                y: (rect.top + rect.bottom) / 2,
+            },
+            glyph,
+            blend(skin.text, skin.fill, crate::theme::SECTION_FOOTER_CHIP_OPACITY),
+            px(1.0),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The brand lockup
 //
@@ -1408,13 +1661,13 @@ mod tests {
              cut is in the wrong place and this pin is scanning the wrong text"
         );
         // The needle is `draw_text(` and no longer `DrawTextW(`: this file's
-        // five runs now go through the wrapper, and the raw call survives in
+        // runs all go through the wrapper, and the raw call survives in
         // exactly one place -- inside that wrapper -- which is what
         // `the_crate_calls_draw_text_w_in_exactly_one_place` pins.
         let drawn = code.matches(concat!("draw_", "text(")).count();
         assert_eq!(
-            drawn, 6,
-            "control: win32_draw.rs draws text in five places -- a button label, a keyboard-hint chip, a row's two lines, and the brand lockup's wordmark -- and declares the wrapper itself, which is the sixth match. It now has {drawn}, so the counts below no longer mean what this pin says they mean"
+            drawn, 9,
+            "control: win32_draw.rs draws text in eight places -- a button label, a keyboard-hint chip, a row's two lines, the brand lockup's wordmark, a segmented cell's label, and the two branches of the footer button that carries a return glyph -- and declares the wrapper itself, which is the ninth match. It now has {drawn}, so the counts below no longer mean what this pin says they mean"
         );
 
         assert_eq!(
@@ -1637,6 +1890,61 @@ mod tests {
              now goes through `win32_draw::draw_text`, so no other module needs the raw call in \
              scope -- and leaving it imported is an invitation to the crash above"
         );
+    }
+
+    /// **The in-button shortcut is drawn at the colour its opacity would
+    /// have produced**, because a GDI button has no alpha channel to give it.
+    ///
+    /// The two ends are what pin it: fully opaque is the ink untouched, and
+    /// fully transparent is the fill -- a blend that leaned either way would
+    /// show up as a shortcut that had either no opacity at all or no ink.
+    #[test]
+    fn the_in_button_shortcut_blends_toward_the_fill_it_sits_on() {
+        let ink = rgb(crate::theme::CARD);
+        let fill = rgb(crate::theme::BLUE);
+        assert_eq!(blend(ink, fill, 1.0), ink, "an opaque run is not the ink itself");
+        assert_eq!(blend(ink, fill, 0.0), fill, "a transparent run is not the fill itself");
+        let eighty = blend(ink, fill, crate::theme::SECTION_FOOTER_CHIP_OPACITY);
+        assert_ne!(eighty, ink, "the design's 0.8 left the ink untouched");
+        assert_ne!(eighty, fill, "the design's 0.8 left nothing of the ink");
+        // Per channel, and strictly between the two, so a blend that packed
+        // the channels wrong cannot pass by landing on some third colour.
+        for shift in [0u32, 8, 16] {
+            let (a, b) = ((ink.0 >> shift) & 0xff, (fill.0 >> shift) & 0xff);
+            let mixed = (eighty.0 >> shift) & 0xff;
+            let (low, high) = (a.min(b), a.max(b));
+            assert!(
+                (low..=high).contains(&mixed),
+                "channel {shift} blended to {mixed}, outside {low}..={high}"
+            );
+        }
+    }
+
+    /// **The \u{21b5} is four strokes and it is the theme's four**, not a second
+    /// glyph drawn beside the egui one. Pinned through the geometry both
+    /// renderers read, which is the only part of it a test can see without a
+    /// device context.
+    #[test]
+    fn the_return_glyph_is_the_one_shape_both_renderers_draw() {
+        let segments = crate::theme::return_arrow_segments(
+            eframe::egui::Pos2::new(0.0, 0.0),
+            crate::theme::RETURN_GLYPH_SIZE,
+        );
+        assert_eq!(segments.len(), 4, "the return arrow is not four strokes");
+        let size = crate::theme::RETURN_GLYPH_SIZE;
+        for [from, to] in segments {
+            for point in [from, to] {
+                assert!(
+                    point.x.abs() <= size && point.y.abs() <= size,
+                    "{point:?} is outside the glyph's own extent of {size}"
+                );
+            }
+        }
+        // The arrowhead's two barbs start at the same point -- the left end of
+        // the stem -- which is what makes it an arrowhead rather than two
+        // strokes hanging in the air.
+        assert_eq!(segments[2][0], segments[3][0], "the barbs do not meet the stem");
+        assert_eq!(segments[1][1], segments[2][0], "the stem does not reach the barbs");
     }
 
     #[test]

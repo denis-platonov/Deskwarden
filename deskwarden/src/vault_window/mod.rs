@@ -5264,6 +5264,13 @@ pub fn build_frame_with_search(
                                     );
                                 }
                             }
+                            // **The one-time code card's Add / Replace**,
+                            // answered by the flag the READ pane's own clock
+                            // button sets -- one modal for the two panes. See
+                            // `EditAction::AddTotp`.
+                            EditAction::AddTotp => {
+                                add_totp_asked = true;
+                            }
                             // **The pencil badge's icon menu, handed straight
                             // to the row menu's own arms.** The read pane's
                             // kebab used to do exactly this and the reason is
@@ -5659,6 +5666,16 @@ pub fn build_frame_with_search(
                                     crate::clipboard::copy_secret(text);
                                 }
                             }
+                            // Unreachable: the create form's `One-time code`
+                            // row is the greyed `TOTP_CREATE_NOTICE` and
+                            // carries no button, because there is no saved
+                            // item for a scanned seed to be written to.
+                            // Spelled out rather than caught by a `_ =>`, as
+                            // every other arm of this match is.
+                            EditAction::AddTotp => log::warn!(
+                                "the create form asked to scan a one-time code for an item \
+                                 that does not exist yet"
+                            ),
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
