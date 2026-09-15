@@ -8033,67 +8033,89 @@ pub const CHANGED_TONE: PillTone = PillTone {
 /// about, and a `Weak` painted in the brand's own blue would be praise.
 pub fn strength_meter(ui: &mut Ui, filled: usize, word: &str, characters: usize) {
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = STRENGTH_BAR_GAP;
-        let full = filled >= STRENGTH_BARS;
-        for bar in 0..STRENGTH_BARS {
-            let (rect, _) =
-                ui.allocate_exact_size(Vec2::new(STRENGTH_BAR.x, STRENGTH_BAR.y), Sense::hover());
-            // Centred on the row rather than sitting on its baseline: these
-            // are 4 points tall beside a 12-point line, and left to egui they
-            // would hang off the top of it.
-            let bar_rect = Rect::from_center_size(
-                Pos2::new(rect.center().x, rect.center().y),
-                STRENGTH_BAR,
-            );
-            ui.painter().rect_filled(
-                bar_rect,
-                CornerRadius::same((STRENGTH_BAR.y / 2.0) as u8),
-                if bar < filled { BLUE } else { TOGGLE_OFF },
-            );
-        }
-        ui.add_space(STRENGTH_WORD_GAP - STRENGTH_BAR_GAP);
-        let ink = if full { BLUE_DEEP } else { TEXT_FAINT };
-        let face = FontId::new(
-            12.0,
-            if full { FontFamily::Name(SEMIBOLD.into()) } else { FontFamily::Proportional },
-        );
-        // **The count is dropped before the word is.**
-        //
-        // 8a's readout is `Strong \u{b7} 20 characters` on a card with 850
-        // points to spend. This one sits in a section row's control column,
-        // which is around 200 points in the shipped detail pane once a
-        // 130-point label column and four 26-point bars are off it -- and an
-        // unwrapped label in a horizontal row does not shrink, it runs past
-        // the card's edge. That is exactly what it did on the first render of
-        // this meter.
-        //
-        // So the row is measured and the LENGTH goes first. The word is the
-        // rating; the count is context for it, and "Strong" alone still says
-        // the thing the user needs. Truncating instead would produce
-        // `Strong \u{b7} 20 char\u{2026}`, which spends the width on the half
-        // that matters least.
-        let counted = if characters == 1 {
-            "1 character".to_string()
-        } else {
-            format!("{characters} characters")
-        };
-        let long = format!("{word} \u{b7} {counted}");
-        let room = ui.available_width();
-        let fits = |text: &str| {
-            ui.painter().layout_no_wrap(text.to_string(), face.clone(), ink).size().x <= room
-        };
-        let text = if fits(&long) { long } else { word.to_string() };
-        // Still elided if even the word does not fit -- a 40-point column is
-        // not a width this row can be honest in, and a galley running under
-        // the card's border is worse than an ellipsis.
-        let styled = if full {
-            semibold(text, 12.0).color(ink)
-        } else {
-            RichText::new(text).size(12.0).color(ink)
-        };
-        let galley = truncated_galley(ui, styled, room, TextStyle::Body);
-        ui.add(egui::Label::new(galley));
+        strength_meter_inline(ui, filled, word, characters);
     });
+}
+
+/// [`strength_meter`] **for a caller that is already in a row.**
+///
+/// The credentials card puts 8a's history link at the far right of this
+/// same line, and it could not while the meter wrapped itself: a nested
+/// `ui.horizontal` inside a `horizontal_wrapped` takes the whole remaining
+/// width as its own, so everything after it wrapped to the next line
+/// however the spacing was netted off. Measured twice, both times with the
+/// rating at y=368 and the link at y=394 -- the owner: "should be same
+/// line and history not below".
+///
+/// So the row belongs to the CALLER, and this lays the meter into it. The
+/// wrapping form above is kept for the callers that want a line of their
+/// own, and is now one call rather than a second copy of the body.
+pub fn strength_meter_inline(ui: &mut Ui, filled: usize, word: &str, characters: usize) {
+    // The bars' own gap, put back afterwards: the row may be the
+    // caller's, and a caller that carries on adding to it must not inherit
+    // a three-point spacing meant for four 26-point bars.
+    let restore = ui.spacing().item_spacing.x;
+    ui.spacing_mut().item_spacing.x = STRENGTH_BAR_GAP;
+    let full = filled >= STRENGTH_BARS;
+    for bar in 0..STRENGTH_BARS {
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(STRENGTH_BAR.x, STRENGTH_BAR.y), Sense::hover());
+        // Centred on the row rather than sitting on its baseline: these
+        // are 4 points tall beside a 12-point line, and left to egui they
+        // would hang off the top of it.
+        let bar_rect = Rect::from_center_size(
+            Pos2::new(rect.center().x, rect.center().y),
+            STRENGTH_BAR,
+        );
+        ui.painter().rect_filled(
+            bar_rect,
+            CornerRadius::same((STRENGTH_BAR.y / 2.0) as u8),
+            if bar < filled { BLUE } else { TOGGLE_OFF },
+        );
+    }
+    ui.add_space(STRENGTH_WORD_GAP - STRENGTH_BAR_GAP);
+    let ink = if full { BLUE_DEEP } else { TEXT_FAINT };
+    let face = FontId::new(
+        12.0,
+        if full { FontFamily::Name(SEMIBOLD.into()) } else { FontFamily::Proportional },
+    );
+    // **The count is dropped before the word is.**
+    //
+    // 8a's readout is `Strong \u{b7} 20 characters` on a card with 850
+    // points to spend. This one sits in a section row's control column,
+    // which is around 200 points in the shipped detail pane once a
+    // 130-point label column and four 26-point bars are off it -- and an
+    // unwrapped label in a horizontal row does not shrink, it runs past
+    // the card's edge. That is exactly what it did on the first render of
+    // this meter.
+    //
+    // So the row is measured and the LENGTH goes first. The word is the
+    // rating; the count is context for it, and "Strong" alone still says
+    // the thing the user needs. Truncating instead would produce
+    // `Strong \u{b7} 20 char\u{2026}`, which spends the width on the half
+    // that matters least.
+    let counted = if characters == 1 {
+        "1 character".to_string()
+    } else {
+        format!("{characters} characters")
+    };
+    let long = format!("{word} \u{b7} {counted}");
+    let room = ui.available_width();
+    let fits = |text: &str| {
+        ui.painter().layout_no_wrap(text.to_string(), face.clone(), ink).size().x <= room
+    };
+    let text = if fits(&long) { long } else { word.to_string() };
+    // Still elided if even the word does not fit -- a 40-point column is
+    // not a width this row can be honest in, and a galley running under
+    // the card's border is worse than an ellipsis.
+    let styled = if full {
+        semibold(text, 12.0).color(ink)
+    } else {
+        RichText::new(text).size(12.0).color(ink)
+    };
+    let galley = truncated_galley(ui, styled, room, TextStyle::Body);
+    ui.add(egui::Label::new(galley));
+    ui.spacing_mut().item_spacing.x = restore;
 }
 
 /// How many bars [`strength_meter`] draws. §8a's four, which is also how many

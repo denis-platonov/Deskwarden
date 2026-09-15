@@ -4226,39 +4226,58 @@ fn history_truncation(hidden: usize) -> String {
 /// **8a's `Password history (3)`, pushed to the right of the strength
 /// line.**
 ///
-/// Split out of [`history_block`] when the owner asked for it there: "Pass
-/// history should be on same line as pass strong but on the right". 8a draws
-/// exactly that -- the bars, the rating, the change pill, a `flex: 1` and
-/// then this -- and the argument that used to sit here for putting it on its
-/// own line was about the shipped pane's 200-point control column, which is
-/// no longer the width this form is edited at.
+/// Split out of [`history_block`] when the owner asked for it there:
+/// "Pass history should be on same line as pass strong but on the right".
+/// 8a draws exactly that -- the bars, the rating, a `flex: 1` and then
+/// this -- and the argument that used to sit here for putting it on its
+/// own line was about the shipped pane's 200-point control column, which
+/// is not the width this form is edited at.
 ///
-/// **Right-aligned by measuring, not by a `right_to_left` scope**, for the
-/// title strip's reason: the run has to be able to give up its place. The row
-/// is wrapped, so on a column too narrow to hold the meter and the link it
-/// drops to the next line rather than being pushed off the card.
+/// **Allocated and PAINTED, not added.** Two attempts to place it with
+/// `add_space` in the wrapped row both put it on a line of its own -- "should
+/// be same line and history not below" -- because `theme::strength_meter`
+/// is itself a `ui.horizontal`, and a nested row inside a wrapped one
+/// reports back the whole width it was offered rather than the little it
+/// used. So there is no slack left for an `add_space` to spend, however
+/// the spacing is netted off.
 ///
-/// Answers whether it was clicked; the open flag is the caller's, because the
-/// list it opens is drawn on the caller's own line below.
+/// Taking the rest of the line as one rect and painting the run at its
+/// right edge sidesteps the question: it is the same idiom the footer's
+/// standing note uses, and the same one this file already reaches for
+/// wherever a run has to sit against an edge rather than follow a cursor.
+/// The click is sensed on the run's own rect, so the whole line is not a
+/// target.
+///
+/// Withheld when the line is too narrow to hold it, which is the wrap the
+/// old arrangement got for free: a link painted into a rect narrower than
+/// itself would run back over the rating.
 fn history_link(ui: &mut egui::Ui, count: usize) -> bool {
     // 8a's own three values for this run -- `font-size: 12px; font-weight:
-    // 600; color: #14307a` -- rather than `link_label`'s body-weight `BLUE`.
-    // `#14307a` is `theme::BLUE_DEEP`, which is already what the password
+    // 600; color: #14307a` -- rather than `link_label`'s body-weight
+    // `BLUE`. `#14307a` is `theme::BLUE_DEEP`, which is what the password
     // box's own `Show` was set in, so the card's clickable runs match. The
     // owner: "Password history is a link not as per design".
-    //
-    // Laid here and handed to `link_galley`, because that is the only way to
-    // give a link a weight: `link_label` takes a size and sets the rest.
     let galley = ui.painter().layout_no_wrap(
         history_button(count),
         egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
         theme::BLUE_DEEP,
     );
     let room = ui.available_width();
-    if room >= galley.size().x {
-        ui.add_space(room - galley.size().x);
+    if room < galley.size().x {
+        return false;
     }
-    theme::link_galley(ui, galley).clicked()
+    let (lane, _) = ui.allocate_exact_size(
+        egui::vec2(room, galley.size().y),
+        egui::Sense::hover(),
+    );
+    let at = egui::pos2(lane.right() - galley.size().x, lane.top());
+    let run = egui::Rect::from_min_size(at, galley.size());
+    let response = ui.interact(run, ui.id().with("password-history"), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().galley(at, galley, theme::BLUE_DEEP);
+    response.clicked()
 }
 
 /// The previous passwords themselves, under the link that opens them.
@@ -8110,10 +8129,33 @@ pub fn draw_detail_edit(
                         // both drops the link to the next line instead of
                         // pushing it off the card.
                         if !draft.password.is_empty() || !history.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
+                            // **`horizontal`, NOT `horizontal_wrapped`**, and
+                            // that is the whole of why the link finally sits
+                            // on this line. A wrapped row wraps on a widget's
+                            // RESERVED width, and the link reserves the rest
+                            // of the line so it can paint itself against the
+                            // right edge -- so the wrapped row put it on a
+                            // line of its own every time, at y=394 against
+                            // the rating's 368, however the spacing was
+                            // netted off. The owner, twice: "should be same
+                            // line and history not below".
+                            //
+                            // Safe unwrapped, which is the thing every other
+                            // row on this form is careful about: the meter
+                            // truncates itself to the room it is given
+                            // (`strength_meter_inline`, and its own comment
+                            // about dropping the count before the word), and
+                            // the link withholds itself when the rest of the
+                            // line is narrower than it is. Neither can push
+                            // the card past the pane.
+                            ui.horizontal(|ui| {
                                 if !draft.password.is_empty() {
                                     let rating = password_strength::rate(&draft.password);
-                                    theme::strength_meter(
+                                    // The INLINE form: the row is this
+                                    // closure's, because the history link
+                                    // shares it. See
+                                    // `theme::strength_meter_inline`.
+                                    theme::strength_meter_inline(
                                         ui,
                                         strength_bars(rating),
                                         rating.label(),
