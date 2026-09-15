@@ -4198,9 +4198,28 @@ fn paint_close_mark(ui: &Ui, rect: Rect, response: &Response, ink: CloseInk) {
 /// widgets in a layout. A card that knows the rectangle its header occupies --
 /// which is every modal in this crate -- wants [`modal_dismiss_mark`].
 pub fn close_glyph(ui: &mut Ui) -> Response {
+    close_glyph_titled(ui, CLOSE_MARK_TOOLTIP)
+}
+
+/// [`close_glyph`] **under a caption of the caller's own.**
+///
+/// The same two strokes, the same [`CLOSE_MARK_HIT`] target, the same ghost
+/// ink darkening to ink on hover -- only the hover sentence differs, and it
+/// has to, because the mark is no longer only a card's dismiss. Design 8a's
+/// `Autofill targets` row puts a ✕ at the end of EVERY website and every app
+/// binding, and "Dismiss" over one row of a list names the card rather than
+/// the row the click would take away. A ✕ that removes something the user
+/// typed and cannot then find again is exactly the control that has to say
+/// what it removes.
+///
+/// The caption is the one thing the mark cannot draw: [`paint_close_mark`]
+/// paints two line segments and no glyph, so a reader has nothing to read.
+/// See `detail_edit`'s `WEBSITE_REMOVE_BUTTON` and `APP_REMOVE_BUTTON`, which
+/// are the two sentences this form hands it.
+pub fn close_glyph_titled(ui: &mut Ui, tooltip: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(CLOSE_MARK_HIT), Sense::click());
     paint_close_mark(ui, rect, &response, CloseInk::OnCard);
-    response.on_hover_text(CLOSE_MARK_TOOLTIP)
+    response.on_hover_text(tooltip.to_string())
 }
 
 /// The dismiss ✕ pinned to the right-hand end of `line`, which is the

@@ -241,6 +241,68 @@ impl AppIdentityCache {
         path: &str,
         process: &'a str,
     ) -> AppLabel<'a> {
+        self.label_impl(ctx, path, process, true)
+    }
+
+    /// [`Self::label`] for a path the caller already knows names a real
+    /// program on this machine -- **with the typing debounce switched off.**
+    ///
+    /// # Why the debounce cannot simply be left on
+    ///
+    /// [`Self::settling`] is ONE slot. It exists for the path BOX on the edit
+    /// form: the user types `C:\Prog`, `C:\Progr`, ... and each keystroke is a
+    /// different key, so without a debounce every keystroke would spawn a
+    /// probe thread for a path that does not exist yet. One slot is the right
+    /// shape for one box.
+    ///
+    /// It is the wrong shape for a LIST. Design 8b's window picker asks about
+    /// every open window in the same frame; each call finds the slot holding
+    /// the previous row's path, replaces it, and resets `since` -- so on the
+    /// next frame row 1 finds row N's path in the slot and replaces it again.
+    /// Nothing ever reaches [`Self::SETTLE`], no entry is ever inserted, and
+    /// the picker draws monograms for ever. That is not a hypothetical: it is
+    /// what `label` does, unchanged, the first time it is called in a loop.
+    ///
+    /// # Why skipping it is safe here
+    ///
+    /// The debounce guards against probing a path the user is half way
+    /// through typing. These paths are not typed: they are
+    /// `window_list::list_windows`'s own `exe_path`, read off a process that
+    /// is running right now, and the list is re-enumerated only when the card
+    /// opens or Refresh is clicked (see `AppMatchDraft::windows`). So the
+    /// worst case is one probe thread per open window, once, and every one of
+    /// them opens a file that is provably there.
+    ///
+    /// **It is the same cache, the same worker, the same
+    /// [`display_name`] ordering and the same [`load_icon`].** The edit form
+    /// draws the bound app's icon through `label` and the picker's rows
+    /// through this on the very same [`AppIdentityCache`], so an app named
+    /// and drawn in one place is named and drawn identically in the other,
+    /// and a path probed for the picker is already answered when the binding
+    /// is made from it.
+    pub fn known_label<'a>(
+        &'a mut self,
+        ctx: &egui::Context,
+        path: &str,
+        process: &'a str,
+    ) -> AppLabel<'a> {
+        self.label_impl(ctx, path, process, false)
+    }
+
+    /// The body of [`Self::label`] and [`Self::known_label`].
+    ///
+    /// `debounce` is the ONLY difference between them, and it is one branch
+    /// rather than two copies of the probe-once rule: the read-out of a
+    /// pending entry, the promotion to `Ready` on the UI thread, the icon
+    /// load that is attempted exactly once and the placeholder ordering are
+    /// all properties of the cache rather than of who asked.
+    fn label_impl<'a>(
+        &'a mut self,
+        ctx: &egui::Context,
+        path: &str,
+        process: &'a str,
+        debounce: bool,
+    ) -> AppLabel<'a> {
         if path.is_empty() {
             return AppLabel { name: process, icon: None, pending: false };
         }
@@ -256,17 +318,28 @@ impl AppIdentityCache {
             // it is what half a typed path looks like -- so no thread, no
             // entry, and no settle either.
             if let Some(name) = file_name_of(path) {
-                if self.settling.as_ref().map(|s| s.path.as_str()) != Some(path) {
+                // The un-debounced caller probes on the spot and never looks
+                // at `settling` -- neither to read it nor to overwrite it, so
+                // a list drawn in the same frame as a half-typed path box
+                // does not knock that box's debounce over. See
+                // [`Self::known_label`].
+                if !debounce {
+                    self.entries.insert(
+                        path.to_string(),
+                        Entry::Pending { rx: spawn_probe(path), placeholder: name.to_string() },
+                    );
+                } else if self.settling.as_ref().map(|s| s.path.as_str()) != Some(path) {
                     self.settling = Some(Settling {
                         path: path.to_string(),
                         since: Instant::now(),
                         placeholder: name.to_string(),
                     });
                 }
-                let settled = self
-                    .settling
-                    .as_ref()
-                    .is_some_and(|s| s.since.elapsed() >= Self::SETTLE);
+                let settled = debounce
+                    && self
+                        .settling
+                        .as_ref()
+                        .is_some_and(|s| s.since.elapsed() >= Self::SETTLE);
                 if settled {
                     let placeholder = match self.settling.take() {
                         Some(s) => s.placeholder,
@@ -1092,6 +1165,75 @@ mod tests {
             typed.len(),
             cache.probed()
         );
+    }
+
+    /// **A LIST of paths never resolves through the debounced door, and
+    /// always does through [`AppIdentityCache::known_label`].**
+    ///
+    /// The measurement `known_label` exists for. [`Settling`] is one slot,
+    /// which is the right shape for one text box and the wrong shape for
+    /// design 8b's window picker: each row's call finds the slot holding the
+    /// previous row's path and replaces it, resetting `since`, so however
+    /// many frames pass nothing ever reaches [`AppIdentityCache::SETTLE`] and
+    /// every row draws a monogram for ever.
+    ///
+    /// **Time really passes here**, a settle's worth per round, which is what
+    /// stops the first half being the vacuous claim that nothing resolves in
+    /// zero milliseconds. Three rounds over three paths: were the debounce
+    /// per-path rather than one slot, round two would probe all three.
+    ///
+    /// The paths name nothing on disk, so the workers the second half starts
+    /// find no file, read no version resource and load no texture -- what is
+    /// counted is that they were STARTED, which is the whole difference
+    /// between the two doors.
+    #[test]
+    fn a_list_of_paths_resolves_through_the_known_door_and_never_through_the_debounced_one() {
+        let ctx = ctx();
+        let paths = [
+            r"C:\Deskwarden Test\A\a.exe",
+            r"C:\Deskwarden Test\B\b.exe",
+            r"C:\Deskwarden Test\C\c.exe",
+        ];
+
+        let mut debounced = AppIdentityCache::default();
+        for _ in 0..3 {
+            std::thread::sleep(AppIdentityCache::SETTLE + Duration::from_millis(20));
+            for path in paths {
+                let label = debounced.label(&ctx, path, "fallback.exe");
+                // ...and every row still has something to paint while it
+                // waits, which is what makes the failure silent rather than
+                // blank -- the picker would draw these file names for ever.
+                assert_eq!(label.name, file_name_of(path).expect("a file name"));
+            }
+        }
+        assert_eq!(
+            debounced.probed(),
+            0,
+            "the debounced door resolved {} of {} paths in a list, so `known_label` is \
+             solving a problem that does not exist",
+            debounced.probed(),
+            paths.len()
+        );
+
+        let mut known = AppIdentityCache::default();
+        for path in paths {
+            let _ = known.known_label(&ctx, path, "fallback.exe");
+        }
+        assert_eq!(
+            known.probed(),
+            paths.len(),
+            "the un-debounced door started {} lookups for {} rows -- a picker asking through \
+             it would still draw monograms",
+            known.probed(),
+            paths.len()
+        );
+
+        // ...and asking again does not start a second round: the entry is in
+        // the map from the first call, which is the rule `label` keeps too.
+        for path in paths {
+            let _ = known.known_label(&ctx, path, "fallback.exe");
+        }
+        assert_eq!(known.probed(), paths.len(), "a known path was looked up more than once");
     }
 
     #[test]

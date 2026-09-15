@@ -227,6 +227,134 @@ pub struct SshKeyDraft {
     pub reveal_private_key: bool,
 }
 
+/// Bitwarden's per-URI **match type**, as the wire spells it and as design
+/// 8a's `Base domain \u{25be}` dropdown offers it.
+///
+/// The six numbers are Bitwarden's own and are transcribed rather than
+/// invented: `0` base domain, `1` host, `2` starts with, `3` exact, `4`
+/// regular expression, `5` never. They are what every other Bitwarden client
+/// writes into `uris[].match`, and the absence of the key -- or an explicit
+/// `null`, which is what Bitwarden's own template sends -- means "use
+/// whichever default the client is configured with", which is
+/// [`Self::Default`] here.
+///
+/// **[`Self::Unrecognised`] is the safety catch, and it is the reason this is
+/// an enumeration and not an `Option<u8>`.** A `match` this build cannot name
+/// -- a seventh type a later Bitwarden adds, a string where a number was
+/// expected, an object -- must survive an edit of the item's NAME untouched.
+/// It is never offered in the dropdown, it reads as
+/// [`UNRECOGNISED_MATCH_LABEL`] in the closed control, and
+/// [`UriDraft::to_entry`] writes nothing over it: the value goes back exactly
+/// as it arrived, inside the `other` map it arrived in. Moving away from it is
+/// possible (the user picks a real row) and moving back is not, which is the
+/// honest shape -- this build cannot reconstruct a value it could not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UriMatchChoice {
+    /// No `match` key at all, or `"match": null`.
+    Default,
+    /// `0`.
+    BaseDomain,
+    /// `1`.
+    Host,
+    /// `2`.
+    StartsWith,
+    /// `3`.
+    Exact,
+    /// `4`.
+    RegularExpression,
+    /// `5`.
+    Never,
+    /// Something else entirely. See the type's doc.
+    Unrecognised,
+}
+
+/// What the closed combo shows for a [`UriMatchChoice::Unrecognised`] value.
+///
+/// It says the value is there and that this app is not the one that set it,
+/// rather than reading blank -- a control whose closed state is empty reads as
+/// one that failed to load, which is [`BRAND_UNSET`]'s own argument.
+pub const UNRECOGNISED_MATCH_LABEL: &str = "Set in another app";
+
+impl UriMatchChoice {
+    /// The rows the dropdown offers, in Bitwarden's own order with `Default`
+    /// first.
+    ///
+    /// [`Self::Unrecognised`] is deliberately not in it; see the type's doc.
+    /// A slice rather than a second `match` at the draw site, for the reason
+    /// `CARD_BRANDS` gives: a hand-written list beside an enumeration is the
+    /// "two enumerations that must agree" defect, and the one that drifts
+    /// offers a spelling no other client writes.
+    pub const OFFERED: [Self; 7] = [
+        Self::Default,
+        Self::BaseDomain,
+        Self::Host,
+        Self::StartsWith,
+        Self::Exact,
+        Self::RegularExpression,
+        Self::Never,
+    ];
+
+    /// The word the control shows. Bitwarden's own wording for five of them;
+    /// `Default` is this app's word for the absent key, said as what it does
+    /// rather than as what is missing.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::BaseDomain => "Base domain",
+            Self::Host => "Host",
+            Self::StartsWith => "Starts with",
+            Self::Exact => "Exact",
+            Self::RegularExpression => "Regular expression",
+            Self::Never => "Never",
+            Self::Unrecognised => UNRECOGNISED_MATCH_LABEL,
+        }
+    }
+
+    /// What `uris[].match` held, read.
+    ///
+    /// `None` -- the key is absent -- and `null` are the same state, because
+    /// they are the same state to Bitwarden. Everything else that is not one
+    /// of the six numbers is [`Self::Unrecognised`], **including a number
+    /// outside the range**: `7` is not "near enough to 5".
+    pub fn from_wire(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            None => Self::Default,
+            Some(serde_json::Value::Null) => Self::Default,
+            Some(serde_json::Value::Number(n)) => match n.as_u64() {
+                Some(0) => Self::BaseDomain,
+                Some(1) => Self::Host,
+                Some(2) => Self::StartsWith,
+                Some(3) => Self::Exact,
+                Some(4) => Self::RegularExpression,
+                Some(5) => Self::Never,
+                _ => Self::Unrecognised,
+            },
+            Some(_) => Self::Unrecognised,
+        }
+    }
+
+    /// The value to write for this choice, or `None` for a choice that is
+    /// spelled by the key's ABSENCE.
+    ///
+    /// [`Self::Unrecognised`] answers `None` too, and that is not the same
+    /// "remove the key": nothing ever asks it, because [`UriDraft::to_entry`]
+    /// only writes when the choice has CHANGED and the user cannot select
+    /// this one. The arm exists so the function is total rather than
+    /// panicking on a state the type admits.
+    pub fn to_wire(self) -> Option<serde_json::Value> {
+        let n: u64 = match self {
+            Self::BaseDomain => 0,
+            Self::Host => 1,
+            Self::StartsWith => 2,
+            Self::Exact => 3,
+            Self::RegularExpression => 4,
+            Self::Never => 5,
+            Self::Default | Self::Unrecognised => return None,
+        };
+        Some(serde_json::Value::Number(n.into()))
+    }
+}
+
 /// One element of `login.uris`, as the edit form holds it.
 ///
 /// **The unmodelled half of a URI entry rides [`Self::original`]**, and
@@ -238,24 +366,58 @@ pub struct SshKeyDraft {
 /// form gain a URI editor without becoming the defect
 /// `vault_bridge::uri_entry_extras_survive_a_round_trip` exists to prevent.
 ///
-/// **The match type is preserved and not exposed**, deliberately, and the
-/// argument is not that it was easier. Nothing in this build reads it: the
-/// autofill path matches on the foreground *window* (`match_engine`,
-/// [`AppMatchDraft`]), the icon loader (`favicon::icon_domain_for`) and the
-/// read pane's AUTOFILL TARGETS card both take `login.uris.first()` and
-/// nothing else, and no expression in this crate names `match` at all. A
-/// dropdown here would therefore promise that Deskwarden behaves differently
-/// depending on what it is set to, when Deskwarden behaves identically --
-/// the "succeeds and ignores you" shape `generator_request`'s doc and
-/// [`EditDraft::may_unfile`] both refuse to ship. What the other Bitwarden
-/// clients set is theirs, it survives every save this form makes, and the
-/// block says so on screen ([`WEBSITE_MATCH_NOTE`]) rather than leaving its
-/// absence to be guessed at. The day something in this crate honours `match`
-/// is the day it earns an editor.
+/// # The match type now HAS an editor, and the refusal it replaces
+///
+/// This doc used to end "the day something in this crate honours `match` is
+/// the day it earns an editor", and the card drew [`WEBSITE_MATCH_NOTE`]
+/// instead of a control. Both halves of that argument were sound and one of
+/// them was answering the wrong question.
+///
+/// The sound half: **nothing in Deskwarden reads `match`.** That is still
+/// true. The autofill path matches on the foreground *window*
+/// (`match_engine`, [`AppMatchDraft`]); the icon loader
+/// (`favicon::icon_domain_for`) and the read pane's AUTOFILL TARGETS card
+/// both take `login.uris.first()` and nothing else. No expression in this
+/// crate names `match`, and none is added by this pass.
+///
+/// The half that was answering the wrong question: the rule this file
+/// enforces everywhere -- `AppMatch::trigger`, 8a's `On field focus`, 8a's
+/// `Require Windows Hello` -- is that a control must not persist a value
+/// **nobody** reads. `match` is not that. It is a Bitwarden vault field with
+/// a published meaning, and the user's own browser extension acts on it every
+/// time it decides whether to offer this login on a page. The refusal did not
+/// make that setting safe; it made it **invisible**, on the one screen in
+/// this app whose job is to show what a record holds. A user who had set
+/// `Exact` in the extension could read a sentence promising the value was
+/// kept and could not find out what the value was.
+///
+/// So the editor is offered, and the two things that made the refusal
+/// defensible are kept as invariants instead of as an absence:
+///
+/// * **Absent stays absent.** [`UriMatchChoice::Default`] is a first-class
+///   state of the control, not a stand-in for "0". A row nobody touched goes
+///   back to the vault byte for byte -- [`Self::to_entry`] writes the key only
+///   when the choice DIFFERS from the one that arrived, so a `null` stays
+///   `null`, an absent key stays absent, and a `4` this build has a name for
+///   is re-written as `4` and not as the enumeration's discriminant.
+/// * **A value this build cannot name is never rewritten.** See
+///   [`UriMatchChoice::Unrecognised`].
+///
+/// [`WEBSITE_MATCH_NOTE`] stays on the card and says something different now:
+/// not that the value is preserved, but WHO reads it -- because a control
+/// whose effect is entirely in another program is a control that has to say
+/// so.
 #[derive(Debug, Clone)]
 pub struct UriDraft {
     /// The URI itself, exactly as the box holds it.
     pub uri: String,
+    /// Bitwarden's per-URI match type for this row, as the combo holds it.
+    ///
+    /// Read off [`Self::original`]'s `other` map on the way in and written
+    /// back into a copy of it on the way out; see [`UriMatchChoice`] for the
+    /// round-trip rule and [`Self::to_entry`] for the one line that enforces
+    /// it.
+    pub match_choice: UriMatchChoice,
     /// This row's identity, for the same reason [`FieldDraft::row_id`] is
     /// that one's: removing a row shifts every index below it, and an
     /// `id_salt` built from the index hands each of those rows its
@@ -269,19 +431,49 @@ pub struct UriDraft {
     original: Option<UriEntry>,
 }
 
+/// The key `uris[].match` really is on the wire, spelled once.
+///
+/// Three places read or write it -- [`UriMatchChoice::from_wire`]'s two
+/// callers and [`UriDraft::to_entry`] -- and a string literal repeated at
+/// three sites is three chances to read one key and write another, which on
+/// this field would look exactly like a setting that will not stick.
+const URI_MATCH_KEY: &str = "match";
+
 impl UriDraft {
     /// Reads one entry off a login.
     fn from_entry(entry: &UriEntry) -> Self {
         Self {
             uri: entry.uri.clone().unwrap_or_default(),
+            match_choice: UriMatchChoice::from_wire(entry.other.get(URI_MATCH_KEY)),
             row_id: next_field_row_id(),
             original: Some(entry.clone()),
         }
     }
 
     /// A blank row, for [`WEBSITE_ADD_BUTTON`].
+    ///
+    /// [`UriMatchChoice::Default`], which is the key's absence -- so a row
+    /// the user adds and never touches the dropdown on arrives at the vault
+    /// as `{"uri": "..."}` and nothing else, exactly as it did before this
+    /// control existed.
     fn new() -> Self {
-        Self { uri: String::new(), row_id: next_field_row_id(), original: None }
+        Self {
+            uri: String::new(),
+            match_choice: UriMatchChoice::Default,
+            row_id: next_field_row_id(),
+            original: None,
+        }
+    }
+
+    /// The match type this row ARRIVED carrying.
+    ///
+    /// The comparison [`Self::to_entry`] makes, as a method rather than as an
+    /// expression at the one call site, because it is also exactly what a
+    /// test has to ask to say "this row is untouched".
+    fn arrived_match(&self) -> UriMatchChoice {
+        UriMatchChoice::from_wire(
+            self.original.as_ref().and_then(|e| e.other.get(URI_MATCH_KEY)),
+        )
     }
 
     /// This row's widget identity. See [`Self::row_id`].
@@ -311,10 +503,33 @@ impl UriDraft {
     /// what arrived -- so an untouched save is byte for byte what was read.
     fn to_entry(&self) -> UriEntry {
         let original = self.original.as_ref();
-        UriEntry {
-            uri: edited(original.and_then(|e| e.uri.as_deref()), &self.uri),
-            other: original.map(|e| e.other.clone()).unwrap_or_default(),
+        let mut other = original.map(|e| e.other.clone()).unwrap_or_default();
+        // **Written only when it CHANGED**, and that one condition is the
+        // whole round-trip guarantee.
+        //
+        // Writing unconditionally would be correct for the six named values
+        // and wrong for all three of the others: a `null` would be rewritten
+        // as an absent key, an absent key on a row whose choice reads
+        // `Default` would stay absent only by luck of `to_wire`, and an
+        // `Unrecognised` value would be DELETED by a `to_wire` that has no
+        // way to spell it. Comparing against what arrived makes every one of
+        // those the same case -- nobody touched it, so nobody writes it --
+        // and leaves exactly one thing to get right, which is the value the
+        // user really picked.
+        if self.match_choice != self.arrived_match() {
+            match self.match_choice.to_wire() {
+                Some(value) => {
+                    other.insert(URI_MATCH_KEY.to_string(), value);
+                }
+                // `Default` is spelled by the key not being there. This is
+                // the one removal this form makes, and it is reachable only
+                // by a user who picked `Default` over something else.
+                None => {
+                    other.remove(URI_MATCH_KEY);
+                }
+            }
         }
+        UriEntry { uri: edited(original.and_then(|e| e.uri.as_deref()), &self.uri), other }
     }
 }
 
@@ -650,6 +865,23 @@ pub struct AppMatchDraft {
     /// [`AppMatch::trigger`] and
     /// `an_edit_carries_the_stored_trigger_through_untouched`.
     pub trigger: TriggerMode,
+    /// Whether the binding was made from 8b's picker **during this editing
+    /// session**, which is what draws 8a's highlighted row.
+    ///
+    /// 8a's third `Native apps` row wears a blue wash, a blue edge and a
+    /// second line reading `just added from the picker`. This is the only
+    /// state a one-binding record has that the treatment can honestly mean:
+    /// the row was not there a moment ago, the user put it there, and the
+    /// second line says what was recorded off the window they pointed at --
+    /// which is the one fact about a fresh binding that is not visible
+    /// anywhere else on the row (see [`app_fresh_note`]).
+    ///
+    /// **Not part of the binding, and deliberately not part of the digest.**
+    /// It is set by [`Self::choose_window`] and cleared by
+    /// [`Self::set_path`]; `to_match` does not read it, so it cannot make a
+    /// draft dirty, cannot be saved, and is gone the next time the form is
+    /// opened -- which is exactly what "just added" has to mean.
+    pub just_picked: bool,
     /// Whether the running-window list is open.
     pub picking: bool,
     /// The rows that list is showing.
@@ -803,6 +1035,7 @@ impl AppMatchDraft {
             path: String::new(),
             args: String::new(),
             trigger: NEW_BINDING_TRIGGER,
+            just_picked: false,
             picking: false,
             windows: Vec::new(),
             picked: None,
@@ -848,6 +1081,9 @@ impl AppMatchDraft {
             path: m.path.clone(),
             args: m.args.clone(),
             trigger: m.trigger,
+            // An binding READ off an item was not added in this session,
+            // however recently it was really made.
+            just_picked: false,
             picking: false,
             windows: Vec::new(),
             picked: None,
@@ -948,6 +1184,10 @@ impl AppMatchDraft {
     /// and leaving the flag set would leave a title that is matched on but no
     /// longer describes anything.
     pub fn set_path(&mut self, path: &str) {
+        // Typing or browsing to a path is not "just added from the picker",
+        // whatever the picker did a moment ago -- and the note the highlight
+        // carries is about a WINDOW, which this gesture never saw.
+        self.just_picked = false;
         self.path = path.to_string();
         if let Some(name) = app_identity::file_name_of(path) {
             self.process = name.to_string();
@@ -973,6 +1213,8 @@ impl AppMatchDraft {
         self.title = if row.hosted { row.title.clone() } else { String::new() };
         self.path = row.exe_path.clone();
         self.bound = true;
+        // 8a's highlighted row. See [`Self::just_picked`].
+        self.just_picked = true;
         self.close_picker();
     }
 
@@ -2720,7 +2962,11 @@ impl EditDraft {
         // row IS something the user would lose to a silent Cancel.
         let _ = write!(sketch, "uris\u{0}{}\u{0}", uris.len());
         for entry in uris {
-            let _ = write!(sketch, "{}\u{0}", entry.uri);
+            // The match type as well as the box, because changing only the
+            // dropdown is a real edit that a save really writes -- and a
+            // digest blind to it would leave the footer reading "no changes"
+            // over a form whose Save is about to rewrite the user's vault.
+            let _ = write!(sketch, "{}\u{0}{:?}\u{0}", entry.uri, entry.match_choice);
         }
         close(ChangeUnit::Uris, &mut sketch);
 
@@ -4045,19 +4291,34 @@ pub const WEBSITE_FIRST_NOTE: &str =
 
 /// The note under the websites block, in every state.
 ///
-/// See [`UriDraft`] for why the per-URI match type has no editor here. Said
-/// on screen rather than left to be discovered, because "my match setting
-/// vanished" and "my match setting is untouched" look identical from a form
-/// that says nothing.
+/// **It no longer says the match type is untouched, because it no longer is
+/// -- the row carries an editor for it now (see [`UriMatchChoice`]).** What
+/// it says instead is the fact that editor cannot say for itself: the value
+/// has no effect in THIS program. A dropdown whose whole consequence happens
+/// in another application is one a user will otherwise test by setting it and
+/// watching Deskwarden behave identically, and conclude is broken.
 pub const WEBSITE_MATCH_NOTE: &str =
-    "Match detection set in other Bitwarden apps is kept exactly as it is.";
+    "Match detection is used by the Bitwarden browser extension when it offers this login on \
+     a page. Deskwarden itself matches on the app window in front of you.";
 
-/// The button that appends a blank website row.
-pub const WEBSITE_ADD_BUTTON: &str = "Add a website\u{2026}";
-
-/// The button that takes one website row away.
+/// 8a's `+ Add website`: a blue link under the rows, not a button.
 ///
-/// A button and not "clear the box and it goes": clearing a row that ARRIVED
+/// The words are the design's. It appends a blank row -- see
+/// [`UriDraft::new`] -- and the leading `+` is part of the label rather than
+/// a drawn mark, which is what 8a sets: a plus glyph the bundled face really
+/// carries, on the same line as the words it belongs to.
+pub const WEBSITE_ADD_BUTTON: &str = "+ Add website";
+
+/// What the ✕ at the end of a website row says on hover.
+///
+/// **It used to be a chip with these words ON it, in the row's label cell,
+/// and 8a puts a `\u{2715}` at the far right of the row instead.** The
+/// sentence survives the move because the mark cannot carry it:
+/// `theme::close_glyph_titled` paints two line segments and no glyph, so
+/// there is nothing for a reader to read, and a ✕ that deletes something the
+/// user typed is the last control that should be unlabelled.
+///
+/// A control and not "clear the box and it goes": clearing a row that ARRIVED
 /// leaves its unmodelled keys in place on purpose (see
 /// [`UriDraft::survives`]), so emptying the box is not the same gesture as
 /// removing the entry and must not look like it.
@@ -4538,6 +4799,180 @@ fn history_list(ui: &mut egui::Ui, dates: &[String]) {
     ui.label(RichText::new(HISTORY_READ_ONLY_NOTE).size(11.0).color(theme::TEXT_FAINT));
 }
 
+// ---------------------------------------------------------------------------
+// Design 8a's `Autofill targets` row.
+//
+// What 8a draws, and what this card draws instead of it, is recorded on each
+// of the two blocks below (`websites_block` and `app_block`). These are the
+// measurements the two share, so the websites and the native app really do
+// read as one column of rows rather than as two blocks that happen to be
+// stacked:
+//
+// * a row is `field(flex: 1)`, a `150px` dropdown, and a `\u{2715}`, at
+//   `gap: 10px`;
+// * under the rows, a `12px` blue link, left-aligned to the field column.
+//
+// The one departure, and it is forced by width:
+//
+// * **The trailing controls drop to a LINE OF THEIR OWN when the field would
+//   be squeezed below [`TARGET_FIELD_FLOOR`].** 8a is a 640-point artboard
+//   and this card's body is about 254 at `settings::MIN_VAULT_WINDOW_SIZE`; a
+//   row that kept the dropdown and the mark on the line there would leave the
+//   URL box around 78 points, which is `https://app.l\u{2026}` and nothing
+//   more. See [`target_field_room`], which is where that decision is made and
+//   therefore where it can be tested, and [`target_row`], which draws it.
+// ---------------------------------------------------------------------------
+
+/// 8a's `gap: 10px` between a row's field and the controls after it.
+const TARGET_ROW_GAP: f32 = 10.0;
+
+/// 8a's `width: 150px` match dropdown, and the number really has to be 150.
+///
+/// egui's `ComboBox::width` is a MINIMUM on the inner run, not a cap: the
+/// button lays its selected text at `TextStyle::Button`, takes
+/// `max(galley + icon, width - 2 * button_padding)`, and then the frame adds
+/// the padding back. `Regular expression` -- the longest row
+/// [`UriMatchChoice::OFFERED`] carries -- lays at about 110 points, so at a
+/// 132-point setting the control comes out around 136 and overruns the width
+/// [`website_row_trailing`] reserved for it. At 150 the minimum binds for
+/// every row, so the control is the same width whatever is selected, which is
+/// also what keeps a column of them looking like a column.
+const MATCH_COMBO_WIDTH: f32 = 150.0;
+
+/// The narrowest a row's field may be squeezed to before the controls that
+/// follow it drop onto a line of their own.
+///
+/// 120 points is about `https://app.ledgerl\u{2026}` at
+/// [`theme::SECTION_FIELD_PX`] -- enough of a host name to tell two of the
+/// user's own websites apart, which is the least a box has to do to be worth
+/// keeping on the line.
+const TARGET_FIELD_FLOOR: f32 = 120.0;
+
+/// The point or two a row keeps back from the field, so an exactly-fitting
+/// line cannot overrun by egui's own rounding.
+///
+/// Not superstition: [`target_row`] hands the field `full - trailing` and then
+/// adds controls whose widths were measured to the same total, and a layout
+/// that lands a tenth of a point over pushes the card out and inflates every
+/// `available_width()` measured after it -- `aae9429`'s defect, reached by
+/// arithmetic rather than by an unwrapped row.
+const TARGET_ROW_SLACK: f32 = 2.0;
+
+/// 8a's `+ Add website` / `+ Pick a running window`: `font-size: 12px`.
+const TARGET_LINK_PX: f32 = 12.0;
+
+/// The 11px grey the card sets its notes and its in-row facts in.
+const TARGET_NOTE_PX: f32 = 11.0;
+
+/// How much of a row the FIELD may take, given the row's whole width, the
+/// width of everything that follows the field on it, and the narrowest the
+/// field is worth keeping on the line at.
+///
+/// **A pure function, and that is the point**: the drop decision is the one
+/// piece of this row's layout that changes with the pane, and a decision
+/// reachable only through an egui closure is a decision no test can call --
+/// this file's standing rule. `full` means "take the whole line", which is
+/// what sends the controls under it; see [`target_row`].
+///
+/// `floor` is a parameter rather than [`TARGET_FIELD_FLOOR`] outright because
+/// the two rows on this card do not need the same width. A website box holds
+/// one run and 120 points of it is a readable host name. The `Native apps`
+/// box holds TWO -- the app's name and its executable in a chip inside the
+/// same box (see [`app_name_field`]) -- so its floor is what those two really
+/// measure, and a shared 120 would have kept the row on one line and silently
+/// dropped the chip, which is the element the design is most about.
+fn target_field_room(full: f32, trailing: f32, floor: f32) -> f32 {
+    let left = full - trailing;
+    if left >= floor {
+        left
+    } else {
+        full
+    }
+}
+
+/// One §8a row: a field, and the controls that follow it -- **beside it, or on
+/// a line of their own** when [`target_field_room`] says the line cannot be
+/// shared.
+///
+/// # Why this is two explicit rows and not one `horizontal_wrapped`
+///
+/// It WAS one, and the measurement is worth keeping. `ui.horizontal_wrapped`
+/// puts the `Ui` into `TextWrapMode::Wrap`, and egui's `ComboBox` reads that:
+/// it lays its selected text against `ui.available_width()`, which after a
+/// field that has just taken the whole line is nothing. Measured on a 298pt
+/// pane with three websites on the card: the first row's dropdown painted no
+/// text at all, and the row it did claim pushed the card body out far enough
+/// that the SECOND row saw `theme::section_rows_fit` answer differently from
+/// the first -- one card, two layouts, and by the third row the ✕ was painted
+/// at x = 557 on a 298-point pane.
+///
+/// So the wrap is decided by arithmetic, up front, and drawn as two rows that
+/// each know their own width. That is also what makes the decision testable:
+/// [`target_field_room`] is a pure function over two numbers.
+///
+/// `trailing_width` is what the caller's controls will really occupy,
+/// measured by the caller (`website_row_trailing`, or `picker_chip_width`
+/// plus the mark) rather than estimated here.
+fn target_row<R>(
+    ui: &mut egui::Ui,
+    trailing_width: f32,
+    floor: f32,
+    field: impl FnOnce(&mut egui::Ui, f32),
+    trailing: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let full = ui.available_width();
+    let room = target_field_room(full, trailing_width, floor);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.x = TARGET_ROW_GAP;
+        if room < full {
+            ui.horizontal(|ui| {
+                field(ui, room);
+                trailing(ui)
+            })
+            .inner
+        } else {
+            field(ui, full);
+            ui.add_space(TARGET_ROW_GAP / 2.0);
+            ui.horizontal(|ui| trailing(ui)).inner
+        }
+    })
+    .inner
+}
+
+/// What follows the field on a websites row: the match dropdown, the ✕, and
+/// the two gaps before them.
+///
+/// Derived rather than written as a number so the wrap point moves with the
+/// controls; see [`target_field_room`].
+fn website_row_trailing() -> f32 {
+    MATCH_COMBO_WIDTH + theme::CLOSE_MARK_HIT + TARGET_ROW_GAP * 2.0 + TARGET_ROW_SLACK
+}
+
+/// 8a's match dropdown for one website row.
+///
+/// `from_id_salt` on the row's own [`UriDraft::row_id`] and not on its index,
+/// for that field's own reason: removing a row shifts every index below it,
+/// and an index-keyed combo would hand each of those rows its predecessor's
+/// open/shut state on the next frame.
+///
+/// `selected_text` is [`UriMatchChoice::label`] in every state, including
+/// [`UriMatchChoice::Unrecognised`] -- a value this build cannot name is
+/// SHOWN as one it cannot name, rather than reading blank.
+fn website_match_combo(ui: &mut egui::Ui, row_id: u64, choice: &mut UriMatchChoice) {
+    egui::ComboBox::from_id_salt(("website-match", row_id))
+        .selected_text(choice.label())
+        .width(MATCH_COMBO_WIDTH)
+        .show_ui(ui, |ui| {
+            // Derived from the enumeration, never written out here. See
+            // [`UriMatchChoice::OFFERED`].
+            for offered in UriMatchChoice::OFFERED {
+                if ui.selectable_label(*choice == offered, offered.label()).clicked() {
+                    *choice = offered;
+                }
+            }
+        });
+}
+
 fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     if creating {
         // Through `theme::section_row`, with the caption in the label column
@@ -4566,36 +5001,45 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
         ui.scope_builder(
             egui::UiBuilder::new().id(egui::Id::new(("login-uri", entry.row_id()))),
             |ui| {
-                // **The Remove is in the row's LABEL CELL, not under the
-                // box**, and that is `slot_row`'s own argument applied to this
-                // list: the button used to cost a whole 32-point row per
-                // website, so a login reached three ways spent a hundred
-                // points on three copies of one word. 8a puts its own remove
-                // -- a ✕ -- ON the row, in line with the field; the label cell
-                // is where this form has room for one, and it keeps the
-                // caption a caption instead of turning it into a button's
-                // label.
+                // **8a's row, in full: the box, the match dropdown, and a ✕ at
+                // the far right -- all on the line the caption names.**
                 //
-                // Through the same row as every other card, because this card
-                // was the last one that was not. With `Item`, `Login
-                // credentials` and the per-kind bodies all in §8a's label
-                // column, an `Autofill targets` card still stacking its
-                // captions was the whole reported defect over again, one card
-                // further down the form -- and this time on the card directly
-                // under the one it least resembles.
-                if row_with_chip(
-                    ui,
-                    &website_label(i),
-                    Some(WEBSITE_REMOVE_BUTTON),
-                    |ui| {
-                        theme::section_text_field(ui, &mut entry.uri, false);
-                    },
-                ) {
-                    remove = Some(i);
-                }
+                // The Remove was a chip in the row's LABEL CELL, which was
+                // this form's answer before there was a row idiom that could
+                // hold anything after the field. It cost nothing and it was
+                // in the wrong place: a control that takes the row away sat
+                // under the word that names the row, on the left, where the
+                // eye reads captions.
+                //
+                // Through `theme::section_row` like every other card, because
+                // that is where the caption's treatment lives -- see
+                // `row_with_chip`'s doc for the argument, which is unchanged;
+                // what has gone is the chip it used to put in the cell.
+                let row_id = entry.row_id();
+                theme::section_row(ui, &website_label(i), |ui| {
+                    // Through `target_row`, which is where the row decides
+                    // whether the dropdown and the mark can share the line
+                    // with the box or have to drop under it. See that
+                    // function for why it is not a `horizontal_wrapped`.
+                    let choice = &mut entry.match_choice;
+                    let uri = &mut entry.uri;
+                    target_row(
+                        ui,
+                        website_row_trailing(),
+                        TARGET_FIELD_FLOOR,
+                        |ui, room| {
+                            theme::section_text_field_within(ui, uri, false, room);
+                        },
+                        |ui| {
+                            website_match_combo(ui, row_id, choice);
+                            if theme::close_glyph_titled(ui, WEBSITE_REMOVE_BUTTON).clicked() {
+                                remove = Some(i);
+                            }
+                        },
+                    );
+                });
             },
         );
-        ui.add_space(theme::BLOCK_GAP);
     }
     if let Some(i) = remove {
         uris.remove(i);
@@ -4605,20 +5049,33 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     // noise; over three it is the only thing on screen that says which box
     // the rest of the app acts on.
     if uris.len() > 1 {
-        ui.label(RichText::new(WEBSITE_FIRST_NOTE).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(WEBSITE_FIRST_NOTE).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
         ui.add_space(6.0);
     }
-    // **Wrapped, not `horizontal`.** Same reason as the custom-fields and
-    // generator rows above: an unwrapped row does not shrink to fit, it
-    // pushes the card past the pane and inflates every `available_width()`
-    // measured after it.
-    ui.horizontal_wrapped(|ui| {
-        if theme::secondary_button(ui, WEBSITE_ADD_BUTTON).clicked() {
-            uris.push(UriDraft::new());
-        }
+    // **8a's link, in 8a's place: under the rows, left-aligned to the FIELD
+    // column rather than to the card's edge.**
+    //
+    // Through `theme::section_row` with an EMPTY caption, which is that
+    // function's own idiom for "a row that belongs to the one above it" (it
+    // is how the generator sits under the password box). In the wide arm the
+    // empty label cell is what indents the link to the field column; in the
+    // stacked arm there is no cell and the link simply follows the last row,
+    // which is where it would have been anyway.
+    //
+    // A link and not `theme::secondary_button`: 8a draws `+ Add website` as
+    // blue type, and the control it replaced was a 32-point outlined button
+    // on a line of its own.
+    let mut add = false;
+    theme::section_row(ui, "", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            add = theme::link_label(ui, WEBSITE_ADD_BUTTON, TARGET_LINK_PX).clicked();
+        });
     });
+    if add {
+        uris.push(UriDraft::new());
+    }
     ui.add_space(4.0);
-    ui.label(RichText::new(WEBSITE_MATCH_NOTE).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(WEBSITE_MATCH_NOTE).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
 }
 
 /// The custom fields, as rows of name, value and Remove.
@@ -4803,6 +5260,81 @@ const APP_ARGS_HINT: &str = "Passed to the program when Deskwarden opens it \u{2
 const APP_ARGS_STORE_APP: &str = APP_PATH_STORE_APP;
 
 const APP_WINDOW_LABEL: &str = "Window title";
+
+/// 8a's `+ Pick a running window`, verbatim.
+///
+/// It was `Choose a running app\u{2026}` -- a 32-point outlined button -- and
+/// it is now the design's blue link under the row, beside
+/// [`APP_PICK_HINT`]. The words change with the control because the design
+/// names the thing it opens (8b's card is a list of WINDOWS, and always was;
+/// the old caption said "app", which is what the window is a window of).
+pub const APP_PICK_LINK: &str = "+ Pick a running window";
+
+/// The grey run after the link. 8a says `or type a process name`.
+///
+/// **This card does not say that, because you cannot.** The box below is a
+/// program FILE -- a full image path -- and `AppMatchDraft::set_path` derives
+/// the process name from its last component. A hint inviting a process name
+/// would invite `ledgerline.exe`, which lands in the path box, fails
+/// `AppMatch::launchable_path`'s file-name tie-back, and leaves a binding
+/// that matches but cannot be opened. So the hint points at the row that
+/// really takes typing.
+pub const APP_PICK_HINT: &str = "or set the program file below";
+
+/// What the ✕ at the end of the app row says on hover -- and the words the
+/// control it replaced had ON it.
+///
+/// The gesture is unchanged and is still STAGED: it sets
+/// [`AppMatchDraft::bound`] false, the block then draws
+/// [`APP_REMOVED_NOTICE`] and an Undo, and nothing reaches the vault until
+/// Save. What changed is where it sits -- 8a puts the mark at the far right
+/// of the row it removes, where the websites above it now carry theirs --
+/// and that it is a mark rather than a caption, which is why the sentence
+/// has to survive as the hover text (`theme::close_glyph_titled` paints two
+/// line segments and no glyph).
+pub const APP_REMOVE_BUTTON: &str = "Remove app match";
+
+/// 8a's `30px` monogram tile at the head of a `Native apps` row.
+///
+/// Two points larger than 8b's picker tile, which is the design's own
+/// difference: the card's row is taller than a list row. Drawn by
+/// `theme::avatar` / `theme::avatar_artwork_tile` like every other tile in
+/// this app, so an app's icon here is the same artwork, in the same box, as
+/// the one 8b's picker draws for the window it was chosen from.
+const APP_TILE: f32 = 30.0;
+
+/// The program-file row's own button.
+///
+/// Spelled once so the tests cannot measure a control the form no longer
+/// draws under the name they were written with -- the same reason the test
+/// module keeps a `BROWSE` beside it.
+pub const APP_BROWSE_BUTTON: &str = "Browse\u{2026}";
+
+/// 8a's highlighted row: `border-radius: 8px`, a `1px` edge, `padding: 8px
+/// 10px`.
+///
+/// The padding is spent in every state, not only the highlighted one -- a row
+/// that GAINED ten points of inset when it was picked would move the two rows
+/// under it, which is `picker_row`'s own argument for giving every row the
+/// same box and drawing only the colours conditionally.
+const APP_ROW_RADIUS: u8 = 8;
+const APP_ROW_BORDER: f32 = 1.0;
+const APP_ROW_PAD_X: i8 = 10;
+const APP_ROW_PAD_Y: i8 = 8;
+
+/// The gap between the app's name and the executable chip **inside** the same
+/// box, which 8a spells as a `\u{2007}` between two runs.
+const APP_EXE_CHIP_GAP: f32 = 8.0;
+
+/// `theme::disabled_field_box`'s own left inset, which this file has to know
+/// because it paints a second run inside a box that function laid out.
+///
+/// Named here rather than reached for as a literal at the one call site: it
+/// is the number that decides whether the executable chip sits ON the name or
+/// after it, and `the_app_row_names_the_app_and_its_executable` measures the
+/// two against each other rather than against this -- so a drift shows up as
+/// an overlap rather than as a silently wrong constant.
+const APP_FIELD_INSET: f32 = 10.0;
 
 /// The button that creates a binding on an item that has none.
 ///
@@ -5597,6 +6129,31 @@ pub fn sequence_warning(sequence: &str, source: &ResolveSource<'_>) -> Option<St
 // * **The card takes the pane's width, not 8b's 560.** 560 is the artboard's
 //   measure; the detail pane floors at 298 (`MIN_PANE_WIDTH`), so every band
 //   below sets itself to `available_width` and the footer wraps.
+// * **The tile carries the app's REAL ICON when one has been resolved**,
+//   and 8b's monogram only until then. 8b draws letters on every row, which
+//   is the artboard's stand-in for artwork it had no way to fetch; the owner
+//   asked for the icons, and this app already extracts one --
+//   `app_identity::load_icon` over `icon::extract_small_icon`, behind the
+//   `AppIdentityCache` the app block above already holds. So the picker asks
+//   THAT cache (see `AppIdentityCache::known_label`, which exists because one
+//   debounce slot cannot serve a list) rather than growing a second one, and
+//   an icon resolved here is already answered when the binding is made from
+//   the row.
+//
+//   **The monogram is not a spinner.** `known_label` answers `pending` while
+//   its worker is out and the row simply draws the letters `theme::initials`
+//   gives it -- the same tile, the same size, the same edge, only different
+//   contents (`theme::avatar_artwork_tile`). Nothing blocks, nothing flickers
+//   through a placeholder of a different shape, and a row whose executable
+//   carries no icon at all keeps its letters for ever rather than leaving a
+//   hole.
+//
+//   **A refused row keeps its monogram whatever the cache answers.** Its
+//   `exe_path` is `ApplicationFrameHost.exe` -- that is the whole reason it is
+//   refused -- so the icon the cache would hand back is the host frame's, and
+//   painting it would put Windows' own mark on a row whose subtitle says this
+//   build cannot tell which app it is.
+//
 // * **The monogram tile carries no fill.** 8b fills it `#f3f2f2` (selected,
 //   `#ffffff`); `theme::avatar` -- the app's ONE monogram tile, at 8b's own
 //   28 points, 7-point radius, `HAIRLINE`/`BLUE_EDGE` edge and
@@ -5804,7 +6361,7 @@ fn picker_count(n: usize) -> String {
     }
 }
 
-/// 8b's card, opened by `Choose a running app\u{2026}` on the app block.
+/// 8b's card, opened by [`APP_PICK_LINK`] on the app row.
 ///
 /// Every number it draws is in the block above; what is here is the assembly
 /// and the one thing 8b cannot show, which is that the card's answer is
@@ -5814,7 +6371,11 @@ fn picker_count(n: usize) -> String {
 /// `Add target` button, which only makes sense if the two are different
 /// moments -- and it is why the row-click tests below assert on `picked`
 /// where they used to assert on `process`.
-fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
+fn app_window_picker(
+    ui: &mut egui::Ui,
+    app: &mut AppMatchDraft,
+    apps: &mut AppIdentityCache,
+) {
     // The `\u{21b5}` keycap on the washed row is an affordance, so Return is
     // wired to the same act as `Add target`. Guarded on nothing having
     // keyboard focus: the form is a column of text boxes, and Return typed
@@ -5839,7 +6400,7 @@ fn app_window_picker(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
 
             picker_header(ui, app.windows.len());
             picker_rule(ui);
-            picker_rows(ui, app);
+            picker_rows(ui, app, apps);
             picker_rule(ui);
             picker_match_band(ui, app);
             picker_rule(ui);
@@ -5895,7 +6456,28 @@ fn picker_rule(ui: &mut egui::Ui) {
 
 /// 8b's list band. Writes the staged row straight onto the draft; nothing
 /// here binds anything.
-fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
+fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft, apps: &mut AppIdentityCache) {
+    // **Every row's icon, asked for BEFORE the band is laid out and copied
+    // out of the cache**, so the borrow of `apps` is over before the rows
+    // take `app` -- and so that one `request_repaint_after` covers the whole
+    // list rather than one per row still out.
+    //
+    // `known_label` and not `label`: the cache's debounce is one slot, and a
+    // list that asked through the debouncing door would knock its own
+    // previous row out of it on every call and never resolve anything. See
+    // `AppIdentityCache::known_label`, which is where that is argued.
+    let mut icons: Vec<Option<egui::TextureHandle>> = Vec::with_capacity(app.windows.len());
+    let mut pending = false;
+    for row in &app.windows {
+        let label = apps.known_label(ui.ctx(), &row.exe_path, &row.exe_name);
+        pending |= label.pending;
+        icons.push(label.icon.cloned());
+    }
+    if pending {
+        // A channel is not input, and egui does not repaint for one.
+        ui.ctx().request_repaint_after(AppIdentityCache::POLL_INTERVAL);
+    }
+
     let mut clicked: Option<isize> = None;
     egui::Frame::new().inner_margin(Margin::same(PICKER_LIST_PAD)).show(ui, |ui| {
         ui.set_width(ui.available_width());
@@ -5905,10 +6487,10 @@ fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = PICKER_LIST_GAP_Y;
-                for row in &app.windows {
+                for (row, icon) in app.windows.iter().zip(icons.iter()) {
                     let selected = app.picked == Some(row.hwnd);
                     let taken = app.taken.iter().any(|p| p == &row.exe_name.to_lowercase());
-                    if picker_row(ui, row, selected, taken) {
+                    if picker_row(ui, row, selected, taken, icon.as_ref()) {
                         clicked = Some(row.hwnd);
                     }
                 }
@@ -5925,7 +6507,18 @@ fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft) {
 }
 
 /// One 8b row. Returns true when it was clicked and may be staged.
-fn picker_row(ui: &mut egui::Ui, row: &AppWindowRow, selected: bool, taken: bool) -> bool {
+///
+/// `icon` is the executable's own artwork if the shared
+/// [`AppIdentityCache`] has answered for it yet, and `None` while it is out
+/// or for a file that carries none -- in which case the row draws 8b's
+/// monogram. See the departures block above for why that is not a spinner.
+fn picker_row(
+    ui: &mut egui::Ui,
+    row: &AppWindowRow,
+    selected: bool,
+    taken: bool,
+    icon: Option<&egui::TextureHandle>,
+) -> bool {
     let refusal = window_row_refusal(row);
     // 8b's `opacity: 0.5` on a row that cannot be taken, applied to every ink
     // and edge the row draws rather than to the words alone: a full-strength
@@ -5952,7 +6545,19 @@ fn picker_row(ui: &mut egui::Ui, row: &AppWindowRow, selected: bool, taken: bool
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing.x = PICKER_ROW_GAP_X;
             ui.horizontal(|ui| {
-                theme::avatar(ui, &theme::initials(&row.title), PICKER_TILE, selected);
+                // The icon, or 8b's letters. A refused row never gets the
+                // icon: see the departures block -- its `exe_path` is the
+                // host frame's, so the artwork would name the wrong app on
+                // the one row that says it cannot name the app at all.
+                match icon.filter(|_| refusal.is_none()) {
+                    Some(texture) => {
+                        let tile = theme::avatar_artwork_tile(ui, PICKER_TILE, selected);
+                        theme::avatar_image(ui, tile, texture, selected);
+                    }
+                    None => {
+                        theme::avatar(ui, &theme::initials(&row.title), PICKER_TILE, selected)
+                    }
+                }
                 // The trailing chip is measured BEFORE the label column is
                 // laid out, because 8b's column is `flex: 1`: what the two
                 // lines get is what the chip leaves.
@@ -6902,44 +7507,284 @@ fn app_add_block(ui: &mut egui::Ui) -> bool {
 /// a function that still asked for a palette it never showed would be the next
 /// reader's fifteen minutes.
 ///
-/// # What 8a's `Native apps` row draws that this does not
+/// # 8a's `Native apps` rows, and what this block draws instead
 ///
 /// 8a draws each app as one line: a 30-point monogram tile, a box holding the
 /// app's name with its executable in a mono chip (`Ledgerline Desktop
 /// \u{2007}ledgerline.exe`), a 150-point dropdown reading `Process name` or
 /// `Process + title`, and a `\u{2715}`; under the rows, `+ Pick a running
-/// window` beside `or type a process name`. This block draws the app's name
-/// and icon, then its window title, program file, arguments and a Remove --
-/// and the two differences are recorded here rather than left to be found:
+/// window` beside `or type a process name`. That row is now what
+/// [`app_target_row`] draws, tile and chip and mark included. Four departures
+/// are left, and each is recorded where it is made rather than here:
 ///
-/// * **There is no match-mode dropdown because there is no match mode.**
-///   [`AppMatch`] carries a process and, for a hosted frame only, a title;
-///   which of the two the matcher uses is decided by
-///   [`AppMatch::hosted`] and not by a setting (see
-///   [`AppMatchDraft::choose_window`], the one writer of `title`). A
-///   dropdown offering `Process + title` on an unhosted app would set a value
-///   `match_engine` never reads -- the drawn-and-dead control this file
-///   refuses everywhere.
-/// * **The program file and arguments are drawn and 8a's row has no room
-///   for them**, because 8a's binding is a process name and this app's is a
-///   launchable path: the read pane's open-the-matched-app action
+/// * **One row, not three.** The record holds one binding. See
+///   [`app_target_row`].
+/// * **The dropdown is a read-out.** There is no match mode to set. See
+///   [`app_rule_label`].
+/// * **`or type a process name` says `or set the program file below`**,
+///   because a process name typed into the box below is a path that cannot be
+///   opened. See [`APP_PICK_HINT`].
+/// * **The program file and arguments get rows of their own, and 8a's row has
+///   no place for them**, because 8a's binding is a process name and this
+///   app's is a launchable path: the read pane's open-the-matched-app action
 ///   (`detail::OPEN_APP_CHORD`) starts the program from
-///   [`AppMatch::launchable_path`] when it is not running, and a row that
-///   could not say WHICH program would be a row that could not do that.
+///   [`AppMatch::launchable_path`] when it is not running, and a card that
+///   could not say WHICH program would be a card that could not do that.
+/// Which of `match_engine`'s two rules this binding will really be matched
+/// by, in 8b's own words.
 ///
-/// `+ Pick a running window` is `Choose a running app\u{2026}` below, and
-/// `or type a process name` is the program-file box itself.
+/// **It is a READ-OUT and not a choice, which is this card's largest
+/// departure from 8a.** 8a draws a `150px` dropdown here offering `Process
+/// name` and `Process + title`. `match_engine` has no such setting: it keeps
+/// two tables, `by_process` and `by_title`, and
+/// `MatchEngine::lookup_parts` decides which one a window may consult FROM
+/// THE WINDOW -- a frame owned by `ApplicationFrameHost.exe` is looked up by
+/// its title and everything else by its executable name. `AppMatch::hosted`
+/// records which case the picked window was, `AppMatchDraft::choose_window`
+/// is the only thing that ever writes it, and `AppMatch::to_match` blanks a
+/// title that is not hosted so an unhosted one can never be filed as a
+/// needle at all.
+///
+/// So a dropdown here could write nothing the engine reads. Setting `Process
+/// + title` on an ordinary desktop app would persist a value that changes
+/// nothing, which is the "succeeds and ignores you" control this file refuses
+/// everywhere (`AppMatch::trigger`, 8a's `On field focus`, 8a's `Require
+/// Windows Hello`). The row shows the rule instead, in the slot the dropdown
+/// occupies, drawn as a CHIP -- with no caret, because a caret is the one
+/// mark that promises a control opens.
+///
+/// The same two strings 8b's `Match this window by` band uses, and not a
+/// second spelling of them: one vocabulary for one fact, across the card and
+/// the picker that fills it.
+fn app_rule_label(hosted: bool) -> &'static str {
+    if hosted {
+        PICKER_RULE_HOSTED
+    } else {
+        PICKER_RULE_PROCESS
+    }
+}
+
+/// 8a's second line on the highlighted row, in the terms this build can
+/// honestly use.
+///
+/// 8a writes `Window title contains "ledgerline" \u{2014} just added from the
+/// picker`. **`contains` is wrong**: `MatchEngine::rebuild` files the title as
+/// a key and `lookup_parts` reads `by_title.get(&title.to_lowercase())`, which
+/// is an exact, whole-string, case-insensitive match. A note promising a
+/// substring rule would send a user off to shorten their title to a fragment
+/// and lose the binding, so the note says what the engine does.
+///
+/// And it is drawn for BOTH kinds of binding rather than only the hosted one,
+/// because the fact it carries -- what was recorded off the window you just
+/// pointed at -- is the one thing a fresh binding shows nowhere else: an
+/// ordinary app's row names the program, not the executable the match is
+/// keyed on.
+fn app_fresh_note(app: &AppMatchDraft) -> String {
+    if app.hosted && !app.title.is_empty() {
+        format!("Window title is \"{}\" \u{2014} just added from the picker", app.title)
+    } else {
+        format!("Matched by {} \u{2014} just added from the picker", app.process)
+    }
+}
+
+/// 8a's `Native apps` box: the app's NAME with its executable in a small grey
+/// monospace chip inside the same box, after it.
+///
+/// **Greyed, because it is a read-out.** The name is
+/// `app_identity::display_name`'s answer -- the executable's own
+/// `FileDescription`, or its `ProductName`, or failing both its file name --
+/// and nothing the user could type here would change what the binding
+/// matches. `theme::section_disabled_text_field_within` is this form's idiom
+/// for exactly that (the `Item` card's `Type`, a create form's website): the
+/// row is real, the box is the same box, and only the ink says it is not
+/// yours to fill in. What IS editable is the program file, one row down,
+/// which is where [`APP_PICK_HINT`] points.
+///
+/// The chip is **skipped rather than clipped** when the box is too narrow to
+/// hold both runs. A monospace fragment ending mid-name is worse than no
+/// fragment: the executable is the value the binding is keyed on, and half of
+/// one reads as the whole of a different one.
+fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
+    let rect = theme::section_disabled_text_field_within(ui, name, room);
+    if exe.is_empty() {
+        return;
+    }
+    let name_width = app_name_run_width(ui, name);
+    let galley = picker_chip_galley_mono(ui, exe);
+    let left = rect.left() + APP_FIELD_INSET + name_width + APP_EXE_CHIP_GAP;
+    let width = galley.size().x + PICKER_CHIP_PAD_X * 2.0;
+    if left + width > rect.right() - APP_FIELD_INSET {
+        return;
+    }
+    let chip = egui::Rect::from_min_size(
+        egui::pos2(left, rect.center().y - (galley.size().y + PICKER_CHIP_PAD_Y * 2.0) / 2.0),
+        egui::vec2(width, galley.size().y + PICKER_CHIP_PAD_Y * 2.0),
+    );
+    ui.painter().rect_filled(chip, CornerRadius::same(PICKER_CHIP_RADIUS), theme::CANVAS);
+    ui.painter().galley(
+        egui::pos2(chip.left() + PICKER_CHIP_PAD_X, chip.top() + PICKER_CHIP_PAD_Y),
+        galley,
+        theme::TEXT_GHOST,
+    );
+}
+
+/// The width of the name run inside [`app_name_field`]'s box.
+///
+/// The same face and size `theme::disabled_field_box` lays it in, so this
+/// measures the run that will really be drawn rather than a second guess at
+/// it -- which is what lets [`app_name_field_want`] be a floor rather than an
+/// estimate.
+fn app_name_run_width(ui: &egui::Ui, name: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(
+            name.to_string(),
+            egui::FontId::new(theme::SECTION_FIELD_PX, egui::FontFamily::Proportional),
+            theme::TEXT_GHOST,
+        )
+        .size()
+        .x
+}
+
+/// The width [`app_name_field`] needs before it will draw the executable
+/// chip, and therefore the floor the `Native apps` row keeps its line at.
+///
+/// Both insets, both runs and the gap between them -- the same arithmetic the
+/// drawing does, so a row that is given this much really does paint the chip
+/// and a row given a point less really does not. Without it the row shared
+/// its line with the match chip and the ✕ on every pane wide enough for
+/// [`TARGET_FIELD_FLOOR`], and silently dropped the executable: measured on a
+/// 560-point pane, the box came out 146 points against the 187 that `Google
+/// Chrome` plus `chrome.exe` needs.
+fn app_name_field_want(ui: &egui::Ui, name: &str, exe: &str) -> f32 {
+    if exe.is_empty() {
+        return TARGET_FIELD_FLOOR;
+    }
+    APP_FIELD_INSET
+        + app_name_run_width(ui, name)
+        + APP_EXE_CHIP_GAP
+        + picker_chip_galley_mono(ui, exe).size().x
+        + PICKER_CHIP_PAD_X * 2.0
+        + APP_FIELD_INSET
+}
+
+/// The executable chip's galley: 8a's `ui-monospace` at 11px in
+/// [`theme::TEXT_GHOST`], which is 8b's row subtitle one card over.
+fn picker_chip_galley_mono(ui: &egui::Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::new(PICKER_SUB_PX, egui::FontFamily::Monospace),
+        theme::TEXT_GHOST,
+    )
+}
+
+/// 8a's `Native apps` row: tile, name-and-executable box, match-rule chip,
+/// ✕ -- and, when the binding was just made from 8b's picker, the design's
+/// blue wash and its second line.
+///
+/// Returns `true` on the frame the ✕ was clicked.
+///
+/// # 8a draws THREE of these and this record can hold ONE
+///
+/// Not a simplification: the model has no second slot to draw.
+/// `AppMatch` is one struct in one custom field, `deskwarden:app-match`;
+/// `vault_bridge::extract_app_match` takes `fields.iter().find(...)` -- the
+/// FIRST field with that name and no other -- and `with_app_match` replaces
+/// that one field in place. `MatchEngine::rebuild` is handed one
+/// `(item_id, AppMatch)` per item, and both its tables are keyed the other
+/// way round (process, or title, to item), so a second binding on one record
+/// would have nowhere to be read from and nowhere to be stored.
+///
+/// So the card draws the one row the record really has. Three rows here would
+/// be a list whose second and third entries Save silently dropped -- the
+/// `NewItem`-shaped defect the `One-time code` card's create notice and the
+/// websites block's both exist to avoid, except that this one would look like
+/// it had worked until the next sync.
+fn app_target_row(
+    ui: &mut egui::Ui,
+    app: &mut AppMatchDraft,
+    name: &str,
+    icon: Option<&egui::TextureHandle>,
+) -> bool {
+    let fresh = app.just_picked;
+    let mut remove = false;
+    let rule = app_rule_label(app.hosted);
+    egui::Frame::new()
+        // 8a's `background: #eef2fc; border: 1px solid #b8c7ea` on the row it
+        // highlights, and the same box drawn in nothing on the row it does
+        // not -- see [`APP_ROW_RADIUS`] for why the box is always there.
+        .fill(if fresh { theme::BLUE_WASH } else { egui::Color32::TRANSPARENT })
+        .stroke(Stroke::new(
+            APP_ROW_BORDER,
+            if fresh { theme::BLUE_EDGE } else { egui::Color32::TRANSPARENT },
+        ))
+        .corner_radius(CornerRadius::same(APP_ROW_RADIUS))
+        .inner_margin(Margin::symmetric(APP_ROW_PAD_X, APP_ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = TARGET_ROW_GAP;
+                // The tile, and the icon in it when one has arrived. The
+                // monogram is not a placeholder that gets swapped for a
+                // "real" tile -- it is the SAME tile, at the same size, with
+                // the same edge, and only the contents differ. See
+                // `theme::avatar_artwork_tile`.
+                match icon {
+                    Some(texture) => {
+                        let tile = theme::avatar_artwork_tile(ui, APP_TILE, fresh);
+                        theme::avatar_image(ui, tile, texture, fresh);
+                    }
+                    None => theme::avatar(ui, &theme::initials(name), APP_TILE, fresh),
+                }
+                // The tile is outside the row proper, exactly as 8a draws it,
+                // so what `target_row` divides up is what is left after it.
+                let trailing = picker_chip_width(ui, rule)
+                    + theme::CLOSE_MARK_HIT
+                    + TARGET_ROW_GAP * 2.0
+                    + TARGET_ROW_SLACK;
+                let process = app.process.clone();
+                let floor = app_name_field_want(ui, name, &process);
+                remove = target_row(
+                    ui,
+                    trailing,
+                    floor,
+                    |ui, room| app_name_field(ui, name, &process, room),
+                    |ui| {
+                        picker_chip(ui, rule, theme::TEXT_FAINT);
+                        theme::close_glyph_titled(ui, APP_REMOVE_BUTTON).clicked()
+                    },
+                );
+            });
+            if fresh {
+                // 8a sets the fresh row's own title in `#14307a`; this app
+                // draws its name in a greyed READ-OUT box (see
+                // [`app_name_field`]), which has no ink of its own to lend
+                // the highlight. The blue lands on the line that is new
+                // instead, which is also the line the highlight is about.
+                ui.add_space(TARGET_ROW_GAP / 2.0);
+                ui.label(
+                    RichText::new(app_fresh_note(app))
+                        .size(TARGET_NOTE_PX)
+                        .color(theme::BLUE_DEEP),
+                );
+            }
+        });
+    remove
+}
+
 fn app_block(
     ui: &mut egui::Ui,
     app: &mut AppMatchDraft,
     apps: &mut AppIdentityCache,
 ) -> Option<EditAction> {
     let mut action = None;
-    // No rule and no leading space -- see [`app_add_block`]'s doc; the card
-    // this now sits in is the division that used to be drawn here.
-    theme::field_label(ui, APP_BLOCK_HEADING);
 
     if !app.bound {
+        // No rule and no leading space -- see [`app_add_block`]'s doc; the
+        // card this now sits in is the division that used to be drawn here.
+        // Stacked rather than in the label column, because this state is not
+        // a ROW: it is a sentence and an Undo standing in for the row that
+        // was there.
+        theme::field_label(ui, APP_BLOCK_HEADING);
         ui.label(RichText::new(APP_REMOVED_NOTICE).size(12.0).color(theme::TEXT_FAINT));
         ui.add_space(6.0);
         if theme::secondary_button(ui, "Undo remove").clicked() {
@@ -6950,7 +7795,11 @@ fn app_block(
 
     // Resolved ONCE per path by the cache, off this thread, and copied out
     // here so the borrow of `apps` (and of `app.process`) ends before the
-    // boxes below take `app` mutably.
+    // rows below take `app` mutably.
+    //
+    // `label` and not `known_label`: this path is the one the user TYPES
+    // into, which is the case the cache's debounce exists for. The picker's
+    // rows take the other door. See `AppIdentityCache::known_label`.
     let (name, icon, pending) = {
         let label = apps.label(ui.ctx(), &app.path, &app.process);
         (label.name.to_string(), label.icon.cloned(), label.pending)
@@ -6959,112 +7808,121 @@ fn app_block(
         // A channel is not input, and egui does not repaint for one.
         ui.ctx().request_repaint_after(AppIdentityCache::POLL_INTERVAL);
     }
-    ui.horizontal(|ui| {
-        if let Some(texture) = &icon {
-            ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(18.0, 18.0)));
-        }
-        // The APP's name -- "Google Chrome", not "chrome.exe". See
-        // `app_identity`.
-        ui.label(theme::semibold(name, 14.0).color(theme::INK));
+
+    // **8a's `Native apps` row, in the label column every other card on this
+    // form draws.** The caption is this app's `Matched app` and not 8a's
+    // `Native apps`: the read pane has called the card MATCHED APP since the
+    // feature shipped, and two words for one thing on two panes is worse than
+    // departing from the design's noun. See [`APP_BLOCK_HEADING`].
+    let mut remove = false;
+    theme::section_row(ui, APP_BLOCK_HEADING, |ui| {
+        remove = app_target_row(ui, app, &name, icon.as_ref());
     });
-    ui.add_space(8.0);
+
+    // **8a's `+ Pick a running window`, with its grey run beside it**, in an
+    // empty-caption row so the link sits under the field column rather than
+    // under the caption -- `websites_block`'s `+ Add website` idiom, one row
+    // down, because they are the same element of the same design.
+    let mut pick = false;
+    theme::section_row(ui, "", |ui| {
+        // Wrapped: the link and the hint are two runs that must be allowed to
+        // fall onto two lines on a 298-point pane rather than push the card
+        // out (`aae9429`).
+        ui.horizontal_wrapped(|ui| {
+            pick = theme::link_label(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked();
+            ui.label(
+                RichText::new(APP_PICK_HINT).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT),
+            );
+        });
+    });
+    if pick {
+        let opening = !app.picking;
+        // Through `set_picking`, not a bare assignment: it is what clears the
+        // staged row and the `already a target` list, so a second opening of
+        // 8b's card starts with nothing selected.
+        app.set_picking(opening);
+        if opening {
+            // Enumerated on OPEN, never per frame.
+            app.windows = running_app_rows();
+        }
+    }
+
+    if app.picking {
+        ui.add_space(6.0);
+        app_window_picker(ui, app, apps);
+    }
 
     if app.hosted && !app.title.is_empty() {
         // Read-only, because it is not a setting: it is what the frame was
         // called when the app was captured, and it is the only thing that can
         // identify a suspended Store app. Typing over it would be typing a new
         // identity for something that is not there to check it against.
-        theme::disabled_field_label(ui, APP_WINDOW_LABEL);
-        theme::section_disabled_text_field(ui, &app.title);
-        ui.add_space(10.0);
+        theme::section_row(ui, APP_WINDOW_LABEL, |ui| {
+            theme::section_disabled_text_field(ui, &app.title);
+        });
     }
 
-    theme::field_label(ui, APP_PATH_LABEL);
+    // **The program file, which 8a's row has no place for.** 8a's binding is
+    // a process name; this app's is a launchable path, because the read
+    // pane's open-the-matched-app action (`detail::OPEN_APP_CHORD`) starts
+    // the program from `AppMatch::launchable_path` when it is not running,
+    // and a card that could not say WHICH program would be a card that could
+    // not do that. So it keeps a row of its own, with its Browse under the
+    // box rather than beside it -- see the comment on the editable arm.
     let path_row = app_path_row(app.hosted);
-    match path_row {
-        AppPathRow::Editable => {
-            if theme::section_text_field(ui, &mut app.path, false).changed() {
-                // `process` is re-derived on every keystroke, which is what
-                // keeps `launchable_path`'s file-name tie-back satisfiable --
-                // see `AppMatchDraft::set_path`.
-                let typed = app.path.clone();
-                app.set_path(&typed);
+    theme::section_row(ui, APP_PATH_LABEL, |ui| {
+        match path_row {
+            AppPathRow::Editable => {
+                // **The box takes the whole line and Browse goes UNDER it**,
+                // which is the one row on this card that does not offer its
+                // control the line. The reason is measured rather than
+                // stylistic: a full Windows program path is the longest
+                // string this form holds --
+                // `C:\Deskwarden Test\Chrome\chrome.exe` lays at 257 points
+                // at `theme::SECTION_FIELD_PX` -- and the card body is about
+                // 254 at `settings::MIN_VAULT_WINDOW_SIZE`. There is no width
+                // at which a button on that line leaves the path readable, so
+                // `target_row`'s floor would send it below on every pane the
+                // app can be resized to anyway.
+                if theme::section_text_field(ui, &mut app.path, false).changed() {
+                    // `process` is re-derived on every keystroke, which is
+                    // what keeps `launchable_path`'s file-name tie-back
+                    // satisfiable -- see `AppMatchDraft::set_path`.
+                    let typed = app.path.clone();
+                    app.set_path(&typed);
+                }
+                ui.add_space(TARGET_ROW_GAP / 2.0);
+                // **`theme::row_button`, not `theme::secondary_button`.** It
+                // used to stand beside `Choose a running app\u{2026}` and the
+                // two had to agree about height and face -- which is what
+                // `the_two_app_path_buttons_are_set_in_one_face` was written
+                // to hold. That neighbour is gone (it is [`APP_PICK_LINK`]
+                // now), and the control this one sits under is a
+                // `theme::SECTION_FIELD_HEIGHT` box: 28 points, which is
+                // `ROW_BUTTON_HEIGHT_2B`, where `secondary_button` is 32.
+                ui.horizontal(|ui| {
+                    if theme::row_button(ui, APP_BROWSE_BUTTON).clicked() {
+                        action = Some(EditAction::PickAppFile);
+                    }
+                });
             }
-        }
-        AppPathRow::NotApplicable(text) => {
-            theme::section_disabled_text_field(ui, text);
-        }
-    }
-    ui.add_space(6.0);
-
-    // **Wrapped, not `horizontal`** -- the same reason the generator row, the
-    // websites block and the keystroke chip row all are: an unwrapped row does
-    // not shrink to fit, it pushes the card past the pane and inflates every
-    // `available_width()` measured after it. That is `aae9429`'s defect, and
-    // this row is one of the narrower escapes from it: "Choose a running
-    // app..." is the longest button caption on the whole form.
-    ui.horizontal_wrapped(|ui| {
-        if theme::secondary_button(ui, "Choose a running app\u{2026}").clicked() {
-            let opening = !app.picking;
-            // Through `set_picking`, not a bare assignment: it is what clears
-            // the staged row and the `already a target` list, so a second
-            // opening of 8b's card starts with nothing selected.
-            app.set_picking(opening);
-            if opening {
-                // Enumerated on OPEN, never per frame.
-                app.windows = running_app_rows();
+            AppPathRow::NotApplicable(text) => {
+                // A Store app is not started by path, so there is nothing to
+                // browse for either -- the button is not drawn at all rather
+                // than drawn greyed, which is what the `add_enabled_ui` it
+                // replaces did. A row whose only control is inert is a row
+                // with no control.
+                theme::section_disabled_text_field(ui, text);
             }
-        }
-        // **Browse comes from the theme, and that is the point.**
-        //
-        // It was a bare `egui::Button` sitting immediately beside a
-        // `theme::secondary_button`, and the two are not the same control.
-        // `theme::apply` gives `TextStyle::Button` Archivo *Regular* at 13pt
-        // and sets no height floor, while `theme::secondary_button` is
-        // `theme::semibold(_, 13.0)` with `min_size(0, BUTTON_HEIGHT)` -- so
-        // the pair drew at two different weights, and Browse came out short of
-        // its neighbour's 32pt, its bottom edge stopping several points above
-        // it. The fill, the stroke and the 7pt radius already agreed (the
-        // visuals in `theme::apply` set `inactive` to `CARD` / `BORDER_STRONG`
-        // / radius 7), which is precisely why the mismatch was easy to miss:
-        // it read as emphasis rather than as two spellings of one control.
-        //
-        // This is the footer's own defect restated one row up. See
-        // `draw_detail_edit`'s action strip, where Save was a bare `Button`
-        // beside a themed Cancel for the same reason and the user reported it
-        // as "one bold and not bold now for some reason" -- pinned there by
-        // `each_footer_button_is_set_in_a_face_the_theme_names`, and pinned here by
-        // `the_two_app_path_buttons_are_set_in_one_face`.
-        //
-        // `add_enabled_ui` around the theme's own button rather than a new
-        // `theme::secondary_button_enabled`: that is exactly the body
-        // `theme::primary_button_enabled` runs (see its doc), so the disabled
-        // fade is egui's same `Style::disabled` and `theme` does not gain a
-        // second outlined-button spelling for a later design change to move
-        // only half of.
-        let editable = matches!(path_row, AppPathRow::Editable);
-        if ui
-            .add_enabled_ui(editable, |ui| theme::secondary_button(ui, "Browse\u{2026}"))
-            .inner
-            .clicked()
-        {
-            action = Some(EditAction::PickAppFile);
         }
     });
 
-    if app.picking {
-        ui.add_space(6.0);
-        app_window_picker(ui, app);
-    }
-
     if let Some(warning) = app_path_warning(&app.to_match()) {
         ui.add_space(4.0);
-        ui.label(RichText::new(warning).size(11.0).color(theme::TEXT_FAINT));
+        ui.label(RichText::new(warning).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
     }
-    ui.add_space(10.0);
 
-    theme::field_label(ui, APP_ARGS_LABEL);
-    match path_row {
+    theme::section_row(ui, APP_ARGS_LABEL, |ui| match path_row {
         AppPathRow::Editable => {
             theme::section_text_field(ui, &mut app.args, false);
         }
@@ -7074,9 +7932,9 @@ fn app_block(
         AppPathRow::NotApplicable(_) => {
             theme::section_disabled_text_field(ui, APP_ARGS_STORE_APP);
         }
-    }
+    });
     ui.add_space(4.0);
-    ui.label(RichText::new(APP_ARGS_HINT).size(11.0).color(theme::TEXT_FAINT));
+    ui.label(RichText::new(APP_ARGS_HINT).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
     ui.add_space(10.0);
 
     // **No autofill control here, deliberately.** What a matched foreground
@@ -7100,16 +7958,22 @@ fn app_block(
     // being shown the keystroke palette on the way past. `draw_detail_edit`
     // calls `app_sequence_block` directly now.
 
+    // **The Remove is 8a's ✕ on the row now**, not a `Remove app match`
+    // button under the block -- see [`APP_REMOVE_BUTTON`]. Applied HERE, after
+    // every row has been drawn, rather than inside the row's own closure:
+    // clearing `bound` mid-frame would take the rows below out from under a
+    // layout that has already measured them. Same deferral, and the same
+    // reason, as `websites_block`'s pending removal.
+    //
     // Staged, not immediate: unlike the read pane's card -- which writes
     // straight through because there is no Save to wait for -- this is one
     // change among several on a form the user can still Cancel. Nothing is
     // written until Save, and `AppMatchDraft::bound` keeps the fields so the
     // block can still say what is going.
-    if theme::secondary_button(ui, "Remove app match").clicked() {
+    if remove {
         app.bound = false;
         app.close_picker();
     }
-    ui.add_space(10.0);
 
     action
 }
@@ -9477,9 +10341,9 @@ pub fn draw_detail_edit(
             // sequence with nothing to type it into is not a setting waiting
             // to be used, it is a card about a feature the item does not have
             // -- and the card would sit there, titled and empty, on every
-            // unbound login in the vault. The `Remove app match` on the card
-            // above takes this one away with it, which is the honest reading
-            // of what Remove did.
+            // unbound login in the vault. The ✕ on the card above
+            // ([`APP_REMOVE_BUTTON`]) takes this one away with it, which is
+            // the honest reading of what Remove did.
             //
             // 8a's other two rows on this card are NOT drawn, and the reasons
             // are the same shape as `Section`'s two missing cards:
@@ -13104,11 +13968,64 @@ mod generator_row_tests {
     #[derive(Default)]
     struct Painted {
         texts: Vec<(String, Rect)>,
+        /// Every shape that is not a galley, named and boxed.
+        ///
+        /// Added when design 8a turned this card's two Remove controls into
+        /// `\u{2715}` marks; see [`Painted::close_marks`], which is the only
+        /// reader. Borrowed from `edit_pane_layout_tests::Painted::marks`,
+        /// which holds the same thing for the same reason one level up. See
+        /// [`detail::shape_ink::ink_of`] for what counts as drawn.
+        marks: Vec<(&'static str, Rect)>,
     }
 
     impl Painted {
         fn strings(&self) -> Vec<&str> {
             self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        /// The ✕ marks this frame painted, one rect each, top to bottom.
+        ///
+        /// **A ✕ has no text to be found by.** `theme::close_glyph_titled`
+        /// draws two crossing `Shape::LineSegment`s and hangs its caption on
+        /// the hover, because neither the bundled Archivo faces nor egui's
+        /// fallback stack carry U+2715 (`theme::close_glyph`'s own doc records
+        /// the measurement). So `rects_of(WEBSITE_REMOVE_BUTTON)` -- which is
+        /// how every remove assertion in this file used to find the control --
+        /// can no longer see one at all, and a harness that recorded only
+        /// galleys would report the mark as missing whether it was drawn or
+        /// not.
+        ///
+        /// Found by geometry instead: both arms are diagonals of ONE square,
+        /// so both report the same visual bounding box, `theme::CLOSE_MARK_SPAN`
+        /// on a side before the stroke expands it. Grouped by that box and
+        /// asserted in PAIRS, which is what makes "one arm is half a ✕" a
+        /// failure here rather than an extra mark -- the same check
+        /// `theme`'s own `the_header_band_carries_a_dismiss_mark` makes.
+        fn close_marks(&self) -> Vec<Rect> {
+            // Eighths of a point, so two arms drawn at one centre land in one
+            // bucket and two marks 16 points apart never do.
+            let key = |r: &Rect| ((r.center().y * 8.0) as i64, (r.center().x * 8.0) as i64);
+            let mut by_centre: std::collections::BTreeMap<(i64, i64), Vec<Rect>> =
+                std::collections::BTreeMap::new();
+            for (kind, rect) in &self.marks {
+                let square = (rect.width() - rect.height()).abs() < 0.01;
+                let sized = rect.width() >= theme::CLOSE_MARK_SPAN
+                    && rect.width() <= theme::CLOSE_MARK_SPAN + 3.0;
+                if *kind == "a line" && square && sized {
+                    by_centre.entry(key(rect)).or_default().push(*rect);
+                }
+            }
+            let mut marks = Vec::new();
+            for (at, arms) in by_centre {
+                assert_eq!(
+                    arms.len(),
+                    2,
+                    "the mark near {at:?} is drawn with {} arm(s); a ✕ is exactly two",
+                    arms.len()
+                );
+                marks.push(arms[0]);
+            }
+            marks
         }
 
         fn rects_of(&self, label: &str) -> Vec<Rect> {
@@ -13174,7 +14091,14 @@ mod generator_row_tests {
                     walk(shape, painted);
                 }
             }
-            _ => {}
+            // NOT `_ => {}`, which discarded every shape that draws ink
+            // without laying a glyph -- including the ✕ that takes a row
+            // away. See [`Painted::marks`].
+            other => {
+                if let Some(mark) = detail::shape_ink::ink_of(other) {
+                    painted.marks.push(mark);
+                }
+            }
         }
     }
 
@@ -13203,15 +14127,62 @@ mod generator_row_tests {
         events: &[egui::Event],
     ) -> (EditAction, Painted) {
         let mut apps = AppIdentityCache::default();
+        frame_knowing(ctx, draft, &mut apps, events)
+    }
+
+    /// [`frame`] on a machine whose identity cache has already answered.
+    ///
+    /// A second helper rather than a wider `frame`, because every other test
+    /// in this module is about a form drawn against a COLD cache -- which is
+    /// the state the app block's placeholder assertions are written for --
+    /// and threading a parameter through all of them would be noise.
+    ///
+    /// The cache is the caller's so it survives between frames, which a
+    /// resolved answer has to: `frame`'s own is rebuilt every call, so a
+    /// seeded name would be gone by the second one.
+    fn frame_knowing(
+        ctx: &egui::Context,
+        draft: &mut EditDraft,
+        apps: &mut AppIdentityCache,
+        events: &[egui::Event],
+    ) -> (EditAction, Painted) {
+        let apps = apps;
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(events), |ui| {
-            action = draw_detail_edit(ui, draft, &[], false, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
+            action = draw_detail_edit(ui, draft, &[], false, apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
             walk(&clipped.shape, &mut painted);
         }
         (action, painted)
+    }
+
+    /// The ✕ that takes away the row captioned `label`.
+    ///
+    /// **The caption and the mark are on the same line, and that is the whole
+    /// of the lookup.** `theme::section_row` paints the caption in the label
+    /// cell and the row's controls beside it, so the mark belonging to a row
+    /// is the close mark nearest that caption's own middle -- which is also
+    /// exactly what a reader uses to tell two ✕s apart.
+    ///
+    /// Not `rect_of`: a ✕ paints no glyph at all. See
+    /// [`Painted::close_marks`].
+    fn close_mark_on_row(painted: &Painted, label: &str) -> Rect {
+        let caption = painted.rect_of(label);
+        let marks = painted.close_marks();
+        assert!(
+            !marks.is_empty(),
+            "the form painted no ✕ at all, so there is no {label:?} row mark to find"
+        );
+        marks
+            .into_iter()
+            .min_by(|a, b| {
+                (a.center().y - caption.center().y)
+                    .abs()
+                    .total_cmp(&(b.center().y - caption.center().y).abs())
+            })
+            .expect("the list was checked non-empty above")
     }
 
     /// A full press-and-release, which is what egui needs before it will report
@@ -14005,6 +14976,197 @@ mod generator_row_tests {
         draft
     }
 
+    /// A 2x2 texture. What every icon assertion in this file claims is that
+    /// artwork is drawn AT ALL and that the letters give way to it, never
+    /// what is in it -- so the smallest image egui will hold is the honest
+    /// fixture.
+    fn test_icon(ctx: &egui::Context) -> egui::TextureHandle {
+        ctx.load_texture(
+            "test-app-icon",
+            egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]),
+            egui::TextureOptions::default(),
+        )
+    }
+
+    /// **8a's `Native apps` row draws the app's name, its executable, and --
+    /// once the cache has answered -- its icon in place of the monogram.**
+    ///
+    /// Three claims in one test because they are one row, and because the
+    /// icon claim is only meaningful against the monogram it replaces: "no
+    /// `GC` is painted" is equally true of a row that drew nothing at all, so
+    /// the SAME draft is rendered against a cold cache and a warm one and the
+    /// two are required to differ. That is the shape every mutation here has
+    /// to survive -- `match icon { Some(..) => monogram, None => monogram }`
+    /// fails the warm half, and deleting the tile fails the cold one.
+    ///
+    /// The executable is asserted because it is the value the binding is
+    /// really keyed on (`MatchEngine::by_process`) and the name is not: the
+    /// fixture is called `Google Chrome`, matches on `chrome.exe`, and is
+    /// launched from `chrome_proxy.exe`, so a row that printed any one of
+    /// the three where another belongs is caught.
+    #[test]
+    fn the_app_row_draws_the_name_the_executable_and_the_icon_that_replaces_the_monogram() {
+        let ctx = styled_context();
+        let path = chrome().path;
+        // `theme::avatar` is handed `theme::initials(name)`, so this is the
+        // monogram the row draws while it has no artwork.
+        let monogram = theme::initials("Google Chrome");
+        assert_eq!(monogram, "GC", "the fixture's monogram is not what this test looks for");
+
+        // Cold, except for the NAME -- so the only difference between the two
+        // halves is the icon, and the name assertions below are not really
+        // assertions about the probe having run.
+        let mut cold = AppIdentityCache::default();
+        cold.seed_ready(&path, "Google Chrome", None);
+        let mut draft = app_draft(&chrome());
+        let _ = frame_knowing(&ctx, &mut draft, &mut cold, &[]);
+        let (_, without) = frame_knowing(&ctx, &mut draft, &mut cold, &[]);
+        let strings = without.strings();
+        assert!(
+            strings.contains(&"Google Chrome"),
+            "the row is not named after the app -- `app_identity` resolved a name and the row \
+             drew something else: {strings:?}"
+        );
+        assert!(
+            strings.contains(&"chrome.exe"),
+            "the row does not carry the executable the binding is MATCHED on, which is the one \
+             fact the app's own name cannot give: {strings:?}"
+        );
+        assert!(
+            strings.contains(&monogram.as_str()),
+            "a row with no icon yet draws no monogram either, so its tile is empty: {strings:?}"
+        );
+
+        let mut warm = AppIdentityCache::default();
+        warm.seed_ready(&path, "Google Chrome", Some(test_icon(&ctx)));
+        let mut draft = app_draft(&chrome());
+        let _ = frame_knowing(&ctx, &mut draft, &mut warm, &[]);
+        let (_, with) = frame_knowing(&ctx, &mut draft, &mut warm, &[]);
+        let strings = with.strings();
+        assert!(
+            !strings.contains(&monogram.as_str()),
+            "the row still draws its {monogram:?} monogram over an icon that has arrived: \
+             {strings:?}"
+        );
+        assert!(
+            strings.contains(&"Google Chrome") && strings.contains(&"chrome.exe"),
+            "the icon arriving took the row's words with it: {strings:?}"
+        );
+    }
+
+    /// **8b's picker rows draw the real app icon, and the monogram until it
+    /// arrives.**
+    ///
+    /// The owner's ask for this pass, and the same two-state shape as the
+    /// test above for the same reason. The rows are put on the draft directly
+    /// rather than enumerated: `running_app_rows` walks the REAL desktop, so
+    /// a test that opened the picker for real would assert about whatever
+    /// happened to be running on the machine.
+    ///
+    /// What it also pins is that the picker asks the SHARED cache: the entry
+    /// is seeded through the same `AppIdentityCache` the app block above
+    /// reads, so a picker that grew a second icon cache of its own would draw
+    /// letters here and pass nothing.
+    #[test]
+    fn the_window_picker_draws_each_rows_icon_and_its_monogram_until_one_arrives() {
+        let ctx = styled_context();
+        let row = AppWindowRow {
+            title: "Ledgerline Desktop".to_string(),
+            exe_name: "ledgerline.exe".to_string(),
+            // Deliberately a path that does not exist, so nothing here depends
+            // on what is installed -- the cache is told the answer instead.
+            exe_path: r"C:\Deskwarden Test\Ledgerline\ledgerline.exe".to_string(),
+            hosted: false,
+            pid: 4242,
+            hwnd: 0x1234,
+        };
+        // The picker tiles are lettered from the WINDOW title, which is
+        // `picker_row`'s own `theme::initials(&row.title)`.
+        let monogram = theme::initials(&row.title);
+        assert_eq!(monogram, "LD", "the fixture's monogram is not what this test looks for");
+
+        let opened = |apps: &mut AppIdentityCache| -> Vec<String> {
+            let mut draft = app_draft(&chrome());
+            {
+                let app = draft.app.as_mut().expect("the fixture is bound");
+                app.picking = true;
+                app.windows = vec![row.clone()];
+            }
+            let _ = frame_knowing(&ctx, &mut draft, apps, &[]);
+            let (_, painted) = frame_knowing(&ctx, &mut draft, apps, &[]);
+            painted.strings().into_iter().map(str::to_string).collect()
+        };
+
+        let mut cold = AppIdentityCache::default();
+        let without = opened(&mut cold);
+        // The premise: the card really is open, so every claim below is about
+        // its rows rather than about a card that never appeared.
+        assert!(
+            without.iter().any(|s| s == PICKER_TITLE),
+            "8b's card is not drawn, so this test asserts nothing: {without:?}"
+        );
+        assert!(
+            without.iter().any(|s| s == &monogram),
+            "a row whose icon has not arrived draws no monogram, so its tile is empty: \
+             {without:?}"
+        );
+
+        let mut warm = AppIdentityCache::default();
+        warm.seed_ready(&row.exe_path, "Ledgerline Desktop", Some(test_icon(&ctx)));
+        let with = opened(&mut warm);
+        assert!(
+            !with.iter().any(|s| s == &monogram),
+            "the picker still draws its {monogram:?} monogram over an icon it has: {with:?}"
+        );
+        // ...and the row is otherwise the same row: its executable is still
+        // the subtitle 8b sets, so the icon did not arrive by replacing the
+        // whole row with something else.
+        assert!(
+            with.iter().any(|s| s == &row.exe_name),
+            "the icon arriving took the row's executable with it: {with:?}"
+        );
+    }
+
+    /// **A binding just made from the picker says what was recorded off the
+    /// window**, in the terms `match_engine` really uses.
+    ///
+    /// 8a's highlighted row carries a second line and this is it. Driven
+    /// through `choose_window` rather than by setting `just_picked` by hand,
+    /// so the test covers the wiring as well as the wording -- a `Add target`
+    /// that bound the row without marking it fresh draws no line at all.
+    #[test]
+    fn a_binding_taken_from_the_picker_says_what_it_recorded_and_a_read_one_does_not() {
+        let ctx = styled_context();
+        let row = AppWindowRow {
+            title: "Ledgerline Desktop".to_string(),
+            exe_name: "ledgerline.exe".to_string(),
+            exe_path: r"C:\Deskwarden Test\Ledgerline\ledgerline.exe".to_string(),
+            hosted: false,
+            pid: 4242,
+            hwnd: 0x1234,
+        };
+        let mut draft = app_draft(&chrome());
+        draft.app.as_mut().expect("bound").choose_window(&row);
+        let note = app_fresh_note(draft.app.as_ref().expect("bound"));
+
+        let (_, painted) = frame(&ctx, &mut draft, &[]);
+        assert!(
+            painted.strings().contains(&note.as_str()),
+            "a binding just taken from the picker does not say so: {:?}",
+            painted.strings()
+        );
+
+        // ...and a binding READ off an item does not, however recently it was
+        // really made. Without this half, a note drawn unconditionally passes.
+        let mut opened = app_draft(&chrome());
+        let (_, cold) = frame(&ctx, &mut opened, &[]);
+        assert!(
+            !cold.strings().iter().any(|s| s.contains("just added from the picker")),
+            "a binding read off an item claims to have just been added: {:?}",
+            cold.strings()
+        );
+    }
+
     fn chrome() -> AppMatch {
         AppMatch {
             process: "chrome.exe".to_string(),
@@ -14067,36 +15229,63 @@ mod generator_row_tests {
         let mut draft = app_draft(&chrome());
         let (_, painted) = frame(&ctx, &mut draft, &[]);
         let strings = painted.strings();
+        // **Re-targeted at 8a's row.** Two of the six captions this loop was
+        // written with are gone as CAPTIONS and not as controls: `Choose a
+        // running app\u{2026}` is now the design's blue link
+        // [`APP_PICK_LINK`], and `Remove app match` is now the ✕ at the end
+        // of the row, whose words survive only as its hover text -- so the
+        // mark is asserted below, by geometry, because it paints no glyph.
         for needle in [
             APP_BLOCK_HEADING,
             APP_PATH_LABEL,
             APP_ARGS_LABEL,
-            "Browse\u{2026}",
-            "Choose a running app\u{2026}",
-            "Remove app match",
+            APP_BROWSE_BUTTON,
+            APP_PICK_LINK,
+            APP_PICK_HINT,
         ] {
             assert!(strings.contains(&needle), "the app block is missing {needle:?}: {strings:?}");
         }
-        // The app's NAME, not the raw path, is the heading of the block; the
-        // lookup has not answered yet on the frame after the first, so this is
-        // the file name -- which is what `app_identity` promises as its
+        assert_eq!(
+            painted.close_marks().len(),
+            1,
+            "a bound item with no websites draws {} ✕ marks; 8a's row carries exactly one, \
+             and it is the only way left to remove the binding: {strings:?}",
+            painted.close_marks().len()
+        );
+        // The app's NAME, not the raw path, fills the row's box; the lookup
+        // has not answered yet on the frame after the first, so this is the
+        // file name -- which is what `app_identity` promises as its
         // placeholder and its last fallback both.
         //
-        // **The PATH's file name, and that is the assertion.** The mutation this
-        // catches is `apps.label(ui.ctx(), &app.process, &app.process)`: the
-        // identity lookup fed the match's process name where the image path
-        // belongs. It probes a bare relative name, so `FileDescription` never
-        // resolves and `SHGetFileInfoW` never finds an icon -- the block shows
-        // `chrome.exe` for ever and is never able to say "Google Chrome". Every
-        // test in this file passed under it while the fixture's path and
-        // process agreed.
+        // **The PATH's file name, and that is the assertion.** The mutation
+        // this catches is `apps.label(ui.ctx(), &app.process, &app.process)`:
+        // the identity lookup fed the match's process name where the image
+        // path belongs. It probes a bare relative name, so `FileDescription`
+        // never resolves and `SHGetFileInfoW` never finds an icon -- the row
+        // shows `chrome.exe` for ever and is never able to say "Google
+        // Chrome". Every test in this file passed under it while the
+        // fixture's path and process agreed.
+        //
+        // **The second half used to be `!strings.contains("chrome.exe")`, and
+        // that premise is gone.** It rested on the block drawing exactly one
+        // name; 8a's row draws TWO runs -- the app's name, and its executable
+        // in a chip inside the same box (see [`app_name_field`]) -- and
+        // `chrome.exe` is now correctly on screen as the second of them. What
+        // replaces it says which run is which, by where they are painted:
+        // the name leads and the chip follows it inside the same box. Under
+        // the mutation above both runs would read `chrome.exe` and `rect_of`
+        // would find two, which fails before the ordering is even reached.
+        let name = painted.rect_of("chrome_proxy.exe");
+        let chip = painted.rect_of("chrome.exe");
         assert!(
-            strings.contains(&"chrome_proxy.exe"),
-            "the app block is not named after the program file it is bound to: {strings:?}"
+            name.right() <= chip.left(),
+            "the app's name is painted at {name:?} and its executable chip at {chip:?} -- the \
+             row has them the wrong way round, or on top of each other"
         );
         assert!(
-            !strings.contains(&"chrome.exe"),
-            "the app block is named after `process`, not after the path: {strings:?}"
+            (name.center().y - chip.center().y).abs() < 2.0,
+            "the executable chip at {chip:?} is not on the name's own line ({name:?}), so it \
+             is not inside the box 8a puts it in"
         );
     }
 
@@ -14135,7 +15324,14 @@ mod generator_row_tests {
         // ... and it is the ADD state, not the edit block drawn over an empty
         // draft. This is what keeps `the_form_draws_an_app_block_for_a_bound_item`
         // meaningful: a block drawn unconditionally fails here.
-        for absent in [APP_PATH_LABEL, APP_ARGS_LABEL, "Remove app match", "Browse\u{2026}"] {
+        // ...and it draws no ✕ either, which is the control the bound state
+        // is removed by: an add control that also offered a remove would be
+        // the edit block over an empty draft.
+        assert!(
+            painted.close_marks().is_empty(),
+            "an item with no binding draws a ✕ for a row it does not have"
+        );
+        for absent in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_PICK_LINK, APP_BROWSE_BUTTON] {
             assert!(
                 !strings.contains(&absent),
                 "the editing control {absent:?} is drawn for an item bound to nothing: \
@@ -14172,14 +15368,22 @@ mod generator_row_tests {
         assert!(app.windows.is_empty(), "Add enumerated the desktop's windows");
 
         let strings = after.strings();
+        // The block's ✕, which is what `Remove app match` became -- see
+        // `the_form_draws_an_app_block_for_a_bound_item`.
+        assert_eq!(
+            after.close_marks().len(),
+            1,
+            "the block the Add opened draws {} ✕ marks, not the one 8a's row carries",
+            after.close_marks().len()
+        );
         let mut checked = 0;
         for needle in [
             APP_BLOCK_HEADING,
             APP_PATH_LABEL,
             APP_ARGS_LABEL,
-            "Browse\u{2026}",
-            "Choose a running app\u{2026}",
-            "Remove app match",
+            APP_BROWSE_BUTTON,
+            APP_PICK_LINK,
+            APP_PICK_HINT,
         ] {
             checked += 1;
             assert!(
@@ -14242,7 +15446,7 @@ mod generator_row_tests {
         // ...and the state below really is the block, not the add control
         // again, which would make this a second copy of the first state.
         assert!(
-            after_add.strings().contains(&"Remove app match"),
+            after_add.strings().contains(&APP_PICK_LINK),
             "the second state is not the opened block: {:?}",
             after_add.strings()
         );
@@ -14419,7 +15623,11 @@ mod generator_row_tests {
         let mut draft = app_draft(&chrome());
         let (_, painted) = frame(&ctx, &mut draft, &[]);
 
-        let _ = frame(&ctx, &mut draft, &click(painted.rect_of("Remove app match").center()));
+        let _ = frame(
+            &ctx,
+            &mut draft,
+            &click(close_mark_on_row(&painted, APP_BLOCK_HEADING).center()),
+        );
         assert!(!draft.app.as_ref().unwrap().bound, "Remove did not stage a removal");
         // A frame LATER: the block above was laid out before the click was
         // processed, so the frame that carries the click still paints the
@@ -14464,8 +15672,11 @@ mod generator_row_tests {
             strings.contains(&APP_BLOCK_HEADING),
             "the app block is not drawn, so this test asserts nothing: {strings:?}"
         );
-        assert!(
-            strings.contains(&"Remove app match"),
+        // The Remove, which is 8a's ✕ now and paints no glyph -- so the
+        // premise is asserted on the mark rather than on a caption.
+        assert_eq!(
+            painted.close_marks().len(),
+            1,
             "the app block is not drawn, so this test asserts nothing: {strings:?}"
         );
 
@@ -14522,19 +15733,29 @@ mod generator_row_tests {
             "",
             "a Store binding saved arguments the user could neither see nor clear"
         );
-        assert!(strings.contains(&"Remove app match"), "Remove is gone: {strings:?}");
+        assert_eq!(
+            painted.close_marks().len(),
+            1,
+            "Remove is gone -- 8a's ✕ is the only control that takes a binding away: \
+             {strings:?}"
+        );
         // The word the user must never see.
         assert!(
             !strings.iter().any(|s| s.to_lowercase().contains("hosted")),
             "the mechanism reached the screen: {strings:?}"
         );
 
-        // Browse is drawn but refuses: clicking it asks for nothing.
-        let (action, _) = frame(&ctx, &mut draft, &click(painted.rect_of("Browse\u{2026}").center()));
-        assert_ne!(
-            action,
-            EditAction::PickAppFile,
-            "a Store binding offered a file dialog whose answer it could not use"
+        // **Browse is not drawn at all, where it used to be drawn greyed.**
+        // The premise the old assertion rested on -- "it is there, and
+        // clicking it asks for nothing" -- is gone with the `add_enabled_ui`
+        // that greyed it: a Store app is not started by path, so there is
+        // nothing to browse FOR, and 8a's row has one control per thing the
+        // row can really do. Asserted as an absence, which is the stronger
+        // claim: a button that is drawn and inert still invites the click.
+        assert!(
+            !strings.contains(&APP_BROWSE_BUTTON),
+            "a Store binding draws a file-dialog button whose answer it could not use: \
+             {strings:?}"
         );
 
         // ...and Remove still works, which is the half of the requirement a
@@ -14543,7 +15764,7 @@ mod generator_row_tests {
         // the live control that is left, and it dies to exactly that mutation.
         let (_, painted) = frame(&ctx, &mut draft, &[]);
         assert!(draft.app.as_ref().unwrap().bound, "the premise: it starts bound");
-        let remove = painted.rect_of("Remove app match");
+        let remove = close_mark_on_row(&painted, APP_BLOCK_HEADING);
         let _ = frame(&ctx, &mut draft, &click(remove.center()));
         assert!(
             !draft.app.as_ref().unwrap().bound,
@@ -14574,7 +15795,7 @@ mod generator_row_tests {
             "the desktop was enumerated before anyone asked"
         );
 
-        let open = painted.rect_of("Choose a running app\u{2026}");
+        let open = painted.rect_of(APP_PICK_LINK);
         let (_, listed) = frame(&ctx, &mut draft, &click(open.center()));
         assert!(draft.app.as_ref().unwrap().picking, "the picker did not open");
         for expected in [PICKER_TITLE, PICKER_ADD, PICKER_REFRESH, PICKER_MATCH_CAPTION] {
@@ -17564,6 +18785,22 @@ mod edit_pane_layout_tests {
     use detail::shape_ink::{glyph_ink, ink_of};
     use eframe::egui::{Pos2, Rect, Vec2};
 
+    /// The one ✕ the frame painted, or a failure saying how many there were.
+    ///
+    /// For the tests whose fixture has exactly one removable row: a lookup
+    /// that took the first of several would quietly click the wrong one.
+    fn only_close_mark(painted: &Painted) -> Rect {
+        let marks = painted.close_marks();
+        assert_eq!(
+            marks.len(),
+            1,
+            "expected exactly one ✕ on the form, found {}; painted: {:?}",
+            marks.len(),
+            painted.strings()
+        );
+        marks[0]
+    }
+
     /// The narrowest the detail pane can be, derived from the three constants
     /// that produce it (900 - 212 - 390 = 298pt) rather than written out --
     /// same derivation, and same reason, as `detail.rs`'s `MIN_PANE`.
@@ -17712,6 +18949,51 @@ mod edit_pane_layout_tests {
                 self.strings()
             );
             found[0].clone()
+        }
+
+        /// The ✕ marks this frame painted, one rect each, top to bottom.
+        ///
+        /// **A ✕ has no text to be found by.** `theme::close_glyph_titled`
+        /// draws two crossing `Shape::LineSegment`s and hangs its caption on
+        /// the hover, because neither the bundled Archivo faces nor egui's
+        /// fallback stack carry U+2715 (`theme::close_glyph`'s own doc records
+        /// the measurement). So `rects_of(WEBSITE_REMOVE_BUTTON)` -- which is
+        /// how every remove assertion in this file used to find the control --
+        /// can no longer see one at all, and a harness that recorded only
+        /// galleys would report the mark as missing whether it was drawn or
+        /// not.
+        ///
+        /// Found by geometry instead: both arms are diagonals of ONE square,
+        /// so both report the same visual bounding box, `theme::CLOSE_MARK_SPAN`
+        /// on a side before the stroke expands it. Grouped by that box and
+        /// asserted in PAIRS, which is what makes "one arm is half a ✕" a
+        /// failure here rather than an extra mark -- the same check
+        /// `theme`'s own `the_header_band_carries_a_dismiss_mark` makes.
+        fn close_marks(&self) -> Vec<Rect> {
+            // Eighths of a point, so two arms drawn at one centre land in one
+            // bucket and two marks 16 points apart never do.
+            let key = |r: &Rect| ((r.center().y * 8.0) as i64, (r.center().x * 8.0) as i64);
+            let mut by_centre: std::collections::BTreeMap<(i64, i64), Vec<Rect>> =
+                std::collections::BTreeMap::new();
+            for (kind, rect) in &self.marks {
+                let square = (rect.width() - rect.height()).abs() < 0.01;
+                let sized = rect.width() >= theme::CLOSE_MARK_SPAN
+                    && rect.width() <= theme::CLOSE_MARK_SPAN + 3.0;
+                if *kind == "a line" && square && sized {
+                    by_centre.entry(key(rect)).or_default().push(*rect);
+                }
+            }
+            let mut marks = Vec::new();
+            for (at, arms) in by_centre {
+                assert_eq!(
+                    arms.len(),
+                    2,
+                    "the mark near {at:?} is drawn with {} arm(s); a ✕ is exactly two",
+                    arms.len()
+                );
+                marks.push(arms[0]);
+            }
+            marks
         }
 
         /// The smallest painted rectangle enclosing `inner`: the FRAME a
@@ -19018,7 +20300,7 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// **The app block's two path buttons are set in ONE face, at one height.**
+    /// **The program-file row's Browse is the theme's own row button.**
     ///
     /// [`each_footer_button_is_set_in_a_face_the_theme_names`]'s defect, found a second
     /// time one row up. "Browse..." was a bare `egui::Button` standing
@@ -19042,62 +20324,113 @@ mod edit_pane_layout_tests {
     /// footer test's reason: they must match each other, AND the face they
     /// share must be the theme's semibold, positively named, so regressing
     /// "Choose a running app..." to a bare button too could not satisfy it.
+    ///
+    /// # The pair this test was named for no longer exists
+    ///
+    /// It compared `Browse\u{2026}` against `Choose a running app\u{2026}`,
+    /// which stood side by side on a row of their own. Design 8a has no such
+    /// row: the picker's control is a blue link under the app row
+    /// ([`APP_PICK_LINK`], asserted by
+    /// [`the_pick_a_window_link_is_a_link_and_not_a_button`]) and Browse has
+    /// moved onto the program-file row, under the box it fills in -- see
+    /// `app_block` for why under and not beside.
+    ///
+    /// **So the comparison half is gone and the POSITIVE half is what
+    /// survives**, pointed at the control Browse really is now. That is not a
+    /// weaker test: the defect being guarded against was never "these two
+    /// disagree", it was "one of them is a bare `egui::Button` in egui's
+    /// default face at no height floor". [`theme::row_button`] is the theme's
+    /// control for a widget that sits beside a
+    /// [`theme::SECTION_FIELD_HEIGHT`] box -- both are 28 -- and a bare
+    /// button on that line is the same mismatch pointed the other way.
     #[test]
-    fn the_two_app_path_buttons_are_set_in_one_face() {
+    fn the_program_file_rows_browse_is_the_themes_row_button() {
         let ctx = styled_context(ROOMY_PANE);
         // `tallest_draft` carries a bound, non-hosted app match, which is the
-        // state that draws the path row editable and both of its buttons.
+        // state that draws the path row editable and its button with it.
         let mut draft = tallest_draft();
         let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
         let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
 
-        let expected = egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+        // `theme::row_button`'s own `ROW_BUTTON_TEXT_SIZE` and the
+        // proportional family it sets, which is what `theme::apply`'s default
+        // `TextStyle::Button` is NOT at (13pt).
+        let expected = egui::FontId::new(12.0, egui::FontFamily::Proportional);
         let browse = painted.font_of(BROWSE);
-        let choose = painted.font_of(CHOOSE_RUNNING_APP);
-        assert_eq!(
-            browse, choose,
-            "{BROWSE:?} is laid out in {browse:?} beside {CHOOSE_RUNNING_APP:?}'s {choose:?} -- \
-             the app block's two buttons come from different font stacks, which is the footer's \
-             own defect one row up"
-        );
         assert_eq!(
             browse, expected,
-            "{BROWSE:?} is laid out in {browse:?}, which is not the theme's semibold \
-             ({expected:?}) -- both buttons agreeing on egui's default face would satisfy the \
-             check above while taking BOTH of them out of the design system"
+            "{BROWSE:?} is laid out in {browse:?}, which is not `theme::row_button`'s face \
+             ({expected:?}) -- a bare `egui::Button` beside the path box is the footer's own \
+             defect one row up"
         );
 
-        // ... and the frames they paint are the same height, which is the
-        // half of the report the face check cannot see.
-        for label in [BROWSE, CHOOSE_RUNNING_APP] {
-            let frame_rect = painted.frame_around(painted.rect_of(label));
-            assert!(
-                (frame_rect.height() - theme::BUTTON_HEIGHT).abs() <= 0.5,
-                "{label:?} paints a {}pt-tall frame, not theme::BUTTON_HEIGHT ({}) -- a button \
-                 with no height floor sits short of the themed one beside it",
-                frame_rect.height(),
-                theme::BUTTON_HEIGHT
-            );
-        }
+        // ... and the frame it paints is the row button's own height, which is
+        // the half of the report the face check cannot see -- and which is
+        // also the height of the box it now sits beside.
+        let frame_rect = painted.frame_around(painted.rect_of(BROWSE));
+        assert!(
+            (frame_rect.height() - theme::ROW_BUTTON_HEIGHT_2B).abs() <= 0.5,
+            "{BROWSE:?} paints a {}pt-tall frame, not theme::ROW_BUTTON_HEIGHT_2B ({}) -- a \
+             button with no height floor sits short of the box beside it",
+            frame_rect.height(),
+            theme::ROW_BUTTON_HEIGHT_2B
+        );
     }
 
-    /// **Both app-path buttons are reachable at the app's MINIMUM width, and
-    /// legible as themselves.**
+    /// **8a's `+ Pick a running window` is a LINK, not the outlined button it
+    /// replaced.**
     ///
-    /// The cost side of the fix above. `theme::secondary_button` is wider than
-    /// the bare `egui::Button` it replaced, and "Choose a running app..." is
-    /// the longest button caption on this form -- so the row it shares with
-    /// Browse is one of the narrower escapes from `aae9429`, where an
-    /// unwrapped `ui.horizontal` pushed the card out past a 298pt pane and
-    /// inflated every `available_width()` measured after it. That is why the
-    /// row is `horizontal_wrapped`, and this is the assertion that says so.
+    /// The other half of the split above, and the reason that one could give
+    /// its comparison up: the control is still asserted, by the two things
+    /// that say it is a link -- `theme::link_label`'s [`theme::BLUE`] and the
+    /// 12pt the design sets its links in -- rather than by the button
+    /// measurements it no longer has. A regression to
+    /// `theme::secondary_button` is 13pt semibold in [`theme::INK`] and fails
+    /// both.
+    #[test]
+    fn the_pick_a_window_link_is_a_link_and_not_a_button() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = tallest_draft();
+        let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+
+        assert_eq!(
+            painted.font_of(APP_PICK_LINK),
+            egui::FontId::new(TARGET_LINK_PX, egui::FontFamily::Proportional),
+            "{APP_PICK_LINK:?} is not set at the size 8a sets its links in"
+        );
+        let ink = painted
+            .inks
+            .iter()
+            .find(|(t, _)| t == APP_PICK_LINK)
+            .map(|(_, c)| *c)
+            .expect("the link was found above, so it has an ink");
+        assert_eq!(
+            ink,
+            theme::BLUE,
+            "{APP_PICK_LINK:?} is painted {ink:?}, not `theme::link_label`'s blue -- a run the \
+             user has no reason to think is clickable"
+        );
+    }
+
+    /// **Both of the app card's own controls are reachable at the app's
+    /// MINIMUM width, and legible as themselves.**
+    ///
+    /// The cost side of the fix above. The two used to stand side by side on
+    /// one row, which was the narrowest escape on this form from `aae9429` --
+    /// an unwrapped `ui.horizontal` pushing the card out past a 298pt pane and
+    /// inflating every `available_width()` measured after it. Design 8a
+    /// separates them ([`APP_PICK_LINK`] under the app row, Browse under the
+    /// path box) and neither shares a line with anything now, so the shape of
+    /// the risk has changed -- but not its existence: both still sit in a card
+    /// body of about 254 points, and both still have to be reachable there.
     ///
     /// Both halves, for [`assert_reachable`]'s reason: the rect must be inside
     /// the pane, and the glyphs really drawn must be the whole caption --
-    /// a "Choose a running\u{2026}" elided down to fit is in bounds and says
+    /// a "+ Pick a running\u{2026}" elided down to fit is in bounds and says
     /// nothing.
     #[test]
-    fn both_app_path_buttons_are_reachable_at_the_apps_minimum_width() {
+    fn both_app_path_controls_are_reachable_at_the_apps_minimum_width() {
         let pane = egui::vec2(MIN_PANE_WIDTH, 2400.0);
         let ctx = styled_context(pane);
         let mut draft = tallest_draft();
@@ -19105,7 +20438,13 @@ mod edit_pane_layout_tests {
         let painted = frame(&ctx, pane, &mut draft, true, &[]);
         let bounds = Rect::from_min_size(Pos2::ZERO, pane);
 
-        for label in [BROWSE, CHOOSE_RUNNING_APP] {
+        // `CHOOSE_RUNNING_APP` was the second of the two and is gone; the
+        // control that replaced it is [`APP_PICK_LINK`], on a row of its own,
+        // and it is exactly as able to run off the edge of a 298pt pane as
+        // the button was. Browse is the one that has MOVED -- onto the
+        // program-file row, where it now shares a line with a text box, which
+        // is the narrower escape from `aae9429` of the two.
+        for label in [BROWSE, APP_PICK_LINK] {
             let rect = painted.rect_of(label);
             assert!(
                 bounds.contains_rect(rect),
@@ -19122,12 +20461,14 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// The app block's two path-row button captions, spelled once so the two
-    /// tests above cannot measure a control the form no longer draws under
-    /// the name they were written with.
-    const BROWSE: &str = "Browse\u{2026}";
-    /// See [`BROWSE`].
-    const CHOOSE_RUNNING_APP: &str = "Choose a running app\u{2026}";
+    /// The program-file row's button caption, taken from the form's own
+    /// constant so the tests above cannot measure a control the form no
+    /// longer draws under the name they were written with.
+    ///
+    /// **`CHOOSE_RUNNING_APP` used to sit beside it and is gone**: that
+    /// control is [`APP_PICK_LINK`] now, which the form exports for the same
+    /// reason, so there is nothing left for a second local spelling to do.
+    const BROWSE: &str = APP_BROWSE_BUTTON;
 
     /// **A Save that cannot be pressed does not look like one that can.**
     ///
@@ -21594,24 +22935,51 @@ mod edit_pane_layout_tests {
 
         // Three boxes, three removes -- a block that drew one Remove for the
         // whole list would leave two of the three entries undeletable.
-        let removes = painted.rects_of(WEBSITE_REMOVE_BUTTON);
+        //
+        // **Counted as ✕ MARKS, not as galleys.** 8a puts the remove at the
+        // far right of each row as a `\u{2715}`, and
+        // `theme::close_glyph_titled` draws it as two line segments with its
+        // caption on the hover -- so `rects_of(WEBSITE_REMOVE_BUTTON)` finds
+        // nothing whether three are drawn or none are. The fixture has no app
+        // binding, so every mark on the form belongs to a website row.
+        let removes = painted.close_marks();
         assert_eq!(
             removes.len(),
             3,
-            "three websites drew {} remove controls; painted: {:?}",
+            "three websites drew {} remove marks; painted: {:?}",
             removes.len(),
             painted.strings()
         );
         for rect in &removes {
             assert!(
                 within_pane(*rect, pane),
-                "a {WEBSITE_REMOVE_BUTTON:?} is painted at x = {}..{} on a {}pt-wide pane",
+                "a {WEBSITE_REMOVE_BUTTON:?} mark is painted at x = {}..{} on a {}pt-wide pane",
                 rect.left(),
                 rect.right(),
                 pane.x
             );
         }
-        assert_inside("the add-a-website button", WEBSITE_ADD_BUTTON, pane, &painted);
+        // Three dropdowns too, one per row, **each showing its OWN row's
+        // value**. The match type is per-URI on the wire
+        // ([`UriMatchChoice`]), and `login_with_websites` gives row `i` a
+        // `"match": i` for exactly this: a single control over the list, or
+        // three controls all reading the first row's value, would draw one
+        // label three times and fail here.
+        let mut dropdowns = 0;
+        for (i, entry) in draft.uris.iter().enumerate() {
+            dropdowns += 1;
+            let shown = entry.match_choice.label();
+            assert_eq!(
+                painted.rects_of(shown).len(),
+                1,
+                "website {i}'s dropdown should be the only one reading {shown:?}; painted: \
+                 {:?}",
+                painted.strings()
+            );
+            assert_inside(&format!("website {i}'s match dropdown"), shown, pane, &painted);
+        }
+        assert_eq!(dropdowns, 3, "the dropdown loop asserted about nothing");
+        assert_inside("the add-a-website link", WEBSITE_ADD_BUTTON, pane, &painted);
         assert_inside("the match-type note", WEBSITE_MATCH_NOTE, pane, &painted);
     }
 
@@ -21686,8 +23054,11 @@ mod edit_pane_layout_tests {
         );
 
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
-        let removes = painted.rects_of(WEBSITE_REMOVE_BUTTON);
-        assert_eq!(removes.len(), 4, "four rows must draw four removes");
+        // `close_marks` answers top to bottom, so `[1]` is the SECOND row's
+        // mark -- which is what makes "the middle row" a claim this test can
+        // make at all. See [`Painted::close_marks`].
+        let removes = painted.close_marks();
+        assert_eq!(removes.len(), 4, "four rows must draw four remove marks");
         let _ = frame(&ctx, pane, &mut draft, false, &click(removes[1].center()));
 
         let left: Vec<&str> = draft.uris.iter().map(|u| u.uri.as_str()).collect();
@@ -22344,8 +23715,10 @@ mod edit_pane_layout_tests {
         let after = frame(&ctx, pane, &mut draft, false, &[]);
         assert_inside("the websites block's own Add", WEBSITE_ADD_BUTTON, pane, &after);
 
-        // ...and taking that row away takes the block with it.
-        let remove = after.rect_of(WEBSITE_REMOVE_BUTTON).center();
+        // ...and taking that row away takes the block with it. The Remove is
+        // 8a's ✕ now and paints no glyph, so it is found by geometry -- see
+        // [`Painted::close_marks`].
+        let remove = only_close_mark(&after).center();
         let _ = frame(&ctx, pane, &mut draft, false, &click(remove));
         assert!(!draft.shows(Slot::Websites), "the emptied websites block is still on the form");
         // **Not back on the `Add\u{2026}` menu** -- see `has_its_own_door`. The
@@ -25018,6 +26391,118 @@ mod website_tests {
         );
     }
 
+    /// **Every shape a `match` can really arrive in survives a row nobody
+    /// touched -- byte for byte, including the ones this build has no name
+    /// for.**
+    ///
+    /// The invariant the websites row's new dropdown rests on. Asserted on
+    /// the JSON VALUE rather than on [`UriMatchChoice`], because the
+    /// enumeration cannot see the difference that matters: `null` and an
+    /// absent key are both [`UriMatchChoice::Default`], and rewriting either
+    /// as the other is a diff on every save of an item nobody edited.
+    ///
+    /// The last three rows are the ones that would be lost by an
+    /// `Option<u8>` model. `7` is what a Bitwarden that adds a seventh match
+    /// type writes; a string and an object are what a malformed or a
+    /// future-shaped field looks like. All three must come back out exactly
+    /// as they went in -- see [`UriMatchChoice::Unrecognised`].
+    #[test]
+    fn every_shape_a_match_can_arrive_in_survives_a_row_nobody_touched() {
+        let shapes: [(&str, Option<serde_json::Value>); 8] = [
+            ("an absent key", None),
+            ("an explicit null", Some(serde_json::json!(null))),
+            ("base domain", Some(serde_json::json!(0))),
+            ("exact", Some(serde_json::json!(3))),
+            ("never", Some(serde_json::json!(5))),
+            ("a seventh match type", Some(serde_json::json!(7))),
+            ("a string", Some(serde_json::json!("domain"))),
+            ("an object", Some(serde_json::json!({"kind": "domain"}))),
+        ];
+        let mut checked = 0;
+        for (what, value) in shapes {
+            checked += 1;
+            let mut other = serde_json::Map::new();
+            if let Some(value) = value.clone() {
+                other.insert(URI_MATCH_KEY.to_string(), value);
+            }
+            let entry = UriEntry { uri: Some("https://ledgerline.example".to_string()), other };
+            let written = UriDraft::from_entry(&entry).to_entry();
+            assert_eq!(
+                written.other.get(URI_MATCH_KEY).cloned(),
+                value,
+                "{what} did not survive a website row nobody touched"
+            );
+        }
+        assert_eq!(checked, 8, "the loop visited nothing, so it asserted nothing");
+    }
+
+    /// **Picking a match type writes it; picking `Default` takes the key
+    /// away.**
+    ///
+    /// The two transitions the dropdown has to get right, and the second is
+    /// the one an `Option<u8>` gets wrong: `Default` is not `0`, it is the
+    /// key's ABSENCE, which is what tells the Bitwarden extension to fall
+    /// back to the user's own preference. `UriMatchChoice::to_wire` answering
+    /// `None` is only half of it -- [`UriDraft::to_entry`] has to REMOVE a
+    /// key that is already there.
+    ///
+    /// The third row is left alone in the same save, so the removal is shown
+    /// to be the row's own and not the block's.
+    #[test]
+    fn choosing_a_match_type_writes_it_and_choosing_default_removes_the_key() {
+        let item = login_with_three_websites();
+        let mut draft = EditDraft::from_item(&item);
+        // The premises, so neither move below is a no-op that would pass
+        // against a `to_entry` that wrote nothing at all.
+        assert_eq!(draft.uris[0].match_choice, UriMatchChoice::BaseDomain);
+        assert_eq!(draft.uris[1].match_choice, UriMatchChoice::Exact);
+        assert_eq!(draft.uris[2].match_choice, UriMatchChoice::Default);
+
+        draft.uris[0].match_choice = UriMatchChoice::StartsWith;
+        draft.uris[1].match_choice = UriMatchChoice::Default;
+
+        let after = seen(&draft.apply_to(&item));
+        assert_eq!(
+            after[0].1,
+            Some(serde_json::json!(2)),
+            "picking `Starts with` did not reach the entry"
+        );
+        assert_eq!(
+            after[1].1, None,
+            "picking `Default` left a `match` key behind, so the entry still overrides the \
+             user's own setting in every other Bitwarden client"
+        );
+        assert_eq!(
+            after[2].1,
+            Some(serde_json::json!(null)),
+            "a row nobody touched was rewritten by its neighbours being edited"
+        );
+    }
+
+    /// **Changing only the dropdown makes the form dirty.**
+    ///
+    /// A save really rewrites the entry, so a digest blind to the control
+    /// would leave the footer reading "no changes" over a form whose Save is
+    /// about to change the user's vault -- and would let Cancel throw the
+    /// choice away without the confirmation every other edit on this form
+    /// gets. See `EditDraft::content_digest`.
+    ///
+    /// Paired in both directions for `card_bank_tests`' reason: a form that
+    /// reported itself dirty on every frame would satisfy the second half
+    /// alone.
+    #[test]
+    fn changing_only_the_match_type_registers_as_a_change() {
+        let item = login_with_three_websites();
+        let mut draft = EditDraft::from_item(&item);
+        assert!(!draft.is_dirty(), "an edit form opened dirty");
+        draft.uris[0].match_choice = UriMatchChoice::Never;
+        assert!(
+            draft.is_dirty(),
+            "the match dropdown is not part of the draft's content digest, so the change it \
+             writes is one Cancel throws away silently"
+        );
+    }
+
     /// **An untouched save is byte for byte what was read, uris included.**
     ///
     /// Asked of the SERIALISED item rather than of the struct, because that
@@ -25596,5 +27081,257 @@ mod sparse_form_tests {
         let after = serde_json::to_value(draft.apply_to(&item)).expect("serialises");
         assert_eq!(after["identity"], before["identity"], "a rename disturbed the identity");
         assert_eq!(after["name"], serde_json::json!("Anna Novak"));
+    }
+}
+
+/// **Design 8a's `Autofill targets` row, in the parts that are decisions
+/// rather than drawing.**
+///
+/// Every one of these is reachable without an `egui::Ui`, which is this
+/// file's standing rule: a decision reachable only through a closure is a
+/// decision no test can call. What the paint tests in
+/// `generator_row_tests` and `edit_pane_layout_tests` add on top is that the
+/// drawing really obeys them.
+#[cfg(test)]
+mod autofill_card_tests {
+    use super::*;
+
+    /// **The field keeps the line while it can, and gives it up rather than
+    /// be squeezed below [`TARGET_FIELD_FLOOR`].**
+    ///
+    /// The one piece of the row's layout that changes with the pane. The two
+    /// interesting inputs are measured rather than invented: the card body is
+    /// about 264 points at `settings::MIN_VAULT_WINDOW_SIZE` and about 470 on
+    /// a roomy pane, and [`website_row_trailing`] is what the dropdown and
+    /// the ✕ really occupy.
+    ///
+    /// The wrap is expressed as "the field takes the WHOLE row", which is
+    /// what makes `horizontal_wrapped` put the controls on the next line --
+    /// so the assertion is on the number, not on a boolean that would have to
+    /// be believed.
+    #[test]
+    fn the_rows_trailing_controls_wrap_rather_than_squeeze_the_field() {
+        let trailing = website_row_trailing();
+        assert!(
+            trailing > 0.0,
+            "the trailing controls occupy nothing, so this test cannot tell the two arms apart"
+        );
+
+        // Roomy: the field takes what is left and the controls sit beside it.
+        let roomy = 470.0;
+        assert!(
+            roomy - trailing >= TARGET_FIELD_FLOOR,
+            "the roomy case is not roomy enough to exercise the shared-line arm"
+        );
+        assert_eq!(
+            target_field_room(roomy, trailing, TARGET_FIELD_FLOOR),
+            roomy - trailing,
+            "a row with room to spare did not leave the trailing controls their width"
+        );
+
+        // Narrow: the card body at the app's minimum window width.
+        let narrow = 264.0;
+        assert!(
+            narrow - trailing < TARGET_FIELD_FLOOR,
+            "the narrow case still leaves the field {}pt, so it does not exercise the wrap",
+            narrow - trailing
+        );
+        assert_eq!(
+            target_field_room(narrow, trailing, TARGET_FIELD_FLOOR),
+            narrow,
+            "a row too narrow to share gave the field less than the whole line, so the trailing \
+             controls sit beside a box too short to read a host name in"
+        );
+
+        // The boundary, exactly: the floor is reachable, so the arm is not
+        // chosen by a strict comparison that skips it.
+        assert_eq!(
+            target_field_room(TARGET_FIELD_FLOOR + trailing, trailing, TARGET_FIELD_FLOOR),
+            TARGET_FIELD_FLOOR
+        );
+
+        // **And the floor is the caller's, which is the whole reason it is a
+        // parameter.** The same roomy row that shares its line for a website
+        // box takes the whole line for the `Native apps` box, because that
+        // one has to hold the app's name AND its executable chip -- see
+        // [`app_name_field_want`]. A shared 120 is what silently dropped the
+        // chip on a 560-point pane.
+        let two_runs = roomy - trailing + 1.0;
+        assert_eq!(
+            target_field_room(roomy, trailing, two_runs),
+            roomy,
+            "a field whose contents need more than the line has left was squeezed anyway"
+        );
+    }
+
+    /// **The match-rule read-out names the rule `match_engine` will really
+    /// use, and there are only the two.**
+    ///
+    /// 8a draws a dropdown here offering `Process name` and `Process +
+    /// title`. This card draws a chip, because which rule applies is decided
+    /// by the WINDOW and not by a setting -- see [`app_rule_label`]. What is
+    /// asserted is the tie-back: the two strings are 8b's band's own, so the
+    /// card and the picker that fills it cannot come to describe one fact in
+    /// two vocabularies.
+    #[test]
+    fn the_match_rule_readout_uses_the_pickers_own_two_words() {
+        assert_eq!(app_rule_label(false), PICKER_RULE_PROCESS);
+        assert_eq!(app_rule_label(true), PICKER_RULE_HOSTED);
+        assert_ne!(
+            app_rule_label(false),
+            app_rule_label(true),
+            "both rules read the same, so the row cannot say which one applies"
+        );
+    }
+
+    /// **The `just added from the picker` line says EXACT, because the engine
+    /// matches exactly.**
+    ///
+    /// 8a writes `Window title contains "ledgerline"`. `MatchEngine::rebuild`
+    /// files the title as a key and `lookup_parts` reads
+    /// `by_title.get(&title.to_lowercase())` -- a whole-string,
+    /// case-insensitive match -- so a note promising a substring rule would
+    /// send a user off to shorten their title to a fragment and lose the
+    /// binding.
+    ///
+    /// Asserted as an absence of the wrong word as well as a presence of the
+    /// title, because "contains" is the spelling a later edit would most
+    /// naturally reach for.
+    #[test]
+    fn the_fresh_binding_note_does_not_promise_a_substring_match() {
+        let mut hosted = AppMatchDraft::unbound();
+        hosted.choose_window(&AppWindowRow {
+            title: "Speedtest by Ookla".to_string(),
+            exe_name: "ApplicationFrameHost.exe".to_string(),
+            exe_path: r"C:\Windows\System32\ApplicationFrameHost.exe".to_string(),
+            hosted: true,
+            pid: 7,
+            hwnd: 0x7,
+        });
+        let note = app_fresh_note(&hosted);
+        assert!(
+            note.contains("Speedtest by Ookla"),
+            "a hosted binding's note does not name the title it was recorded from: {note:?}"
+        );
+        assert!(
+            !note.to_lowercase().contains("contains"),
+            "the note promises a substring rule the matcher does not implement: {note:?}"
+        );
+
+        // An ordinary app has no matchable title at all, so its note names
+        // the executable instead -- which is the fact its row does not carry
+        // anywhere else (the box is the app's NAME).
+        let mut plain = AppMatchDraft::unbound();
+        plain.choose_window(&AppWindowRow {
+            title: "Ledgerline Desktop".to_string(),
+            exe_name: "ledgerline.exe".to_string(),
+            exe_path: r"C:\Apps\ledgerline.exe".to_string(),
+            hosted: false,
+            pid: 8,
+            hwnd: 0x8,
+        });
+        let note = app_fresh_note(&plain);
+        assert!(
+            note.contains("ledgerline.exe"),
+            "an unhosted binding's note does not name the executable it matches on: {note:?}"
+        );
+        assert!(
+            !note.contains("Ledgerline Desktop"),
+            "an unhosted binding's note names a title `to_match` blanks, so it describes a rule \
+             the engine will never apply: {note:?}"
+        );
+    }
+
+    /// **A binding is `just_picked` only for the session that picked it, and
+    /// typing over the path ends that.**
+    ///
+    /// The flag is what draws 8a's highlighted row, and every one of these is
+    /// a way "just added" could come to mean something else. The last is the
+    /// one a reader would not predict: `set_path` is called on every
+    /// keystroke in the program-file box, and a highlight that survived it
+    /// would sit over a row the user has since re-pointed by hand.
+    #[test]
+    fn a_binding_is_freshly_picked_only_until_something_else_happens_to_it() {
+        let row = AppWindowRow {
+            title: "Ledgerline Desktop".to_string(),
+            exe_name: "ledgerline.exe".to_string(),
+            exe_path: r"C:\Apps\ledgerline.exe".to_string(),
+            hosted: false,
+            pid: 8,
+            hwnd: 0x8,
+        };
+
+        assert!(!AppMatchDraft::unbound().just_picked, "a blank draft opened highlighted");
+        assert!(
+            !AppMatchDraft::from_match(&AppMatch::for_process("ledgerline.exe", TriggerMode::Prompt))
+                .just_picked,
+            "a binding read off an item claims to have just been added"
+        );
+
+        let mut app = AppMatchDraft::unbound();
+        app.choose_window(&row);
+        assert!(app.just_picked, "taking a row from the picker did not mark the binding fresh");
+
+        app.set_path(r"C:\Apps\other.exe");
+        assert!(
+            !app.just_picked,
+            "typing a program file left the row claiming it came from the picker"
+        );
+
+        // ...and the flag is not part of the binding: nothing about the saved
+        // match changes with it, which is what keeps it out of the draft's
+        // dirtiness digest.
+        let mut fresh = AppMatchDraft::unbound();
+        fresh.choose_window(&row);
+        let mut stale = AppMatchDraft::unbound();
+        stale.choose_window(&row);
+        stale.just_picked = false;
+        assert_eq!(
+            fresh.to_match(),
+            stale.to_match(),
+            "the highlight reached `AppMatch`, so it would be written to the user's vault"
+        );
+    }
+
+    /// **The match dropdown offers Bitwarden's six types and `Default`, and
+    /// never the one this build cannot name.**
+    ///
+    /// The list is what the user sees; the numbers are what the wire carries.
+    /// Asserted together because the failure that matters is a row whose
+    /// label and value have come apart -- `Host` writing `0` would set every
+    /// such login to base-domain matching in the extension, silently, and
+    /// look perfectly correct on this form.
+    #[test]
+    fn the_match_dropdown_offers_bitwardens_own_six_and_the_absent_key() {
+        let offered: Vec<(&str, Option<serde_json::Value>)> =
+            UriMatchChoice::OFFERED.iter().map(|c| (c.label(), c.to_wire())).collect();
+        assert_eq!(
+            offered,
+            vec![
+                ("Default", None),
+                ("Base domain", Some(serde_json::json!(0))),
+                ("Host", Some(serde_json::json!(1))),
+                ("Starts with", Some(serde_json::json!(2))),
+                ("Exact", Some(serde_json::json!(3))),
+                ("Regular expression", Some(serde_json::json!(4))),
+                ("Never", Some(serde_json::json!(5))),
+            ]
+        );
+        assert!(
+            !UriMatchChoice::OFFERED.contains(&UriMatchChoice::Unrecognised),
+            "the dropdown offers a value this build cannot write, so picking it would DELETE \
+             the one the user already had"
+        );
+        // ...and every offered row round-trips through the reader, so the
+        // control cannot select a state it would then fail to recognise on
+        // the next opening of the form.
+        for choice in UriMatchChoice::OFFERED {
+            assert_eq!(
+                UriMatchChoice::from_wire(choice.to_wire().as_ref()),
+                choice,
+                "{:?} does not read back as itself",
+                choice
+            );
+        }
     }
 }
