@@ -2826,7 +2826,10 @@ impl EditDraft {
         if creating {
             return Vec::new();
         }
-        Slot::all_for(self.kind).into_iter().filter(|slot| !self.shows(*slot)).collect()
+        Slot::all_for(self.kind)
+            .into_iter()
+            .filter(|slot| !self.shows(*slot) && !has_its_own_door(*slot))
+            .collect()
     }
 
     /// Puts `slot`'s row on screen, ready to type into.
@@ -3814,6 +3817,14 @@ pub const TOTP_HINT: &str =
 /// it needs a `vault_bridge` change.
 pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved.";
 
+/// What the `One-time code` card's box says when the item has no seed.
+///
+/// The card is drawn on every login now (see it for why), so its empty state
+/// has to say what belongs in the box rather than leaving a blank one under a
+/// heading. The wording is `TOTP_HINT`'s subject in one line -- the sentence
+/// under the box still spells it out in full.
+pub const TOTP_EMPTY_HINT: &str = "Paste an otpauth:// link or a base32 key";
+
 /// The label above the login's first website box.
 ///
 /// **The read pane's word for the same thing**, and not a new one: the
@@ -4083,6 +4094,28 @@ fn row_with_chip<R>(
     clicked
 }
 
+/// **Slots the form offers a way in to without the `Add\u{2026}` menu**, and
+/// which the menu therefore must not offer a second time.
+///
+/// Both are a login's, and both became doors of their own at the owner's
+/// direction -- "remove Add... - that will be separate TOTP block":
+///
+/// * [`Slot::Totp`]: the `One-time code` card is drawn on every login now,
+///   with a box to paste a seed into. Typing in it IS adding the slot.
+/// * [`Slot::Websites`]: `Autofill targets` draws its block whether or not
+///   the login has a website, and that block ends in `Add a website\u{2026}`.
+///
+/// **Stated as a list rather than by deleting the menu**, because the menu
+/// is the only way in for the kinds that have no such door -- a card's
+/// brand, an identity's title. Deleting it took those away, which is what
+/// `every_add_menu_chip_is_reachable_at_the_apps_minimum_width` caught.
+/// For a login the list is now empty and `slot_add_block` returns before it
+/// paints anything, which is the same outcome by a route that does not
+/// break the other five kinds.
+fn has_its_own_door(slot: Slot) -> bool {
+    matches!(slot, Slot::Totp | Slot::Websites)
+}
+
 /// **The Add control, and the list of rows it reveals.**
 ///
 /// The second half of the owner's ask -- "the rest should be Add - select
@@ -4190,50 +4223,53 @@ fn history_truncation(hidden: usize) -> String {
 /// every item, until the first save that replaces a password -- gets no
 /// control at all rather than one reading `Password history (0)`, which is a
 /// button that opens onto nothing.
-fn history_block(ui: &mut egui::Ui, open: &mut bool, dates: &[String]) {
+/// **8a's `Password history (3)`, pushed to the right of the strength
+/// line.**
+///
+/// Split out of [`history_block`] when the owner asked for it there: "Pass
+/// history should be on same line as pass strong but on the right". 8a draws
+/// exactly that -- the bars, the rating, the change pill, a `flex: 1` and
+/// then this -- and the argument that used to sit here for putting it on its
+/// own line was about the shipped pane's 200-point control column, which is
+/// no longer the width this form is edited at.
+///
+/// **Right-aligned by measuring, not by a `right_to_left` scope**, for the
+/// title strip's reason: the run has to be able to give up its place. The row
+/// is wrapped, so on a column too narrow to hold the meter and the link it
+/// drops to the next line rather than being pushed off the card.
+///
+/// Answers whether it was clicked; the open flag is the caller's, because the
+/// list it opens is drawn on the caller's own line below.
+fn history_link(ui: &mut egui::Ui, count: usize) -> bool {
+    // 8a's own three values for this run -- `font-size: 12px; font-weight:
+    // 600; color: #14307a` -- rather than `link_label`'s body-weight `BLUE`.
+    // `#14307a` is `theme::BLUE_DEEP`, which is already what the password
+    // box's own `Show` was set in, so the card's clickable runs match. The
+    // owner: "Password history is a link not as per design".
+    //
+    // Laid here and handed to `link_galley`, because that is the only way to
+    // give a link a weight: `link_label` takes a size and sets the rest.
+    let galley = ui.painter().layout_no_wrap(
+        history_button(count),
+        egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::BLUE_DEEP,
+    );
+    let room = ui.available_width();
+    if room >= galley.size().x {
+        ui.add_space(room - galley.size().x);
+    }
+    theme::link_galley(ui, galley).clicked()
+}
+
+/// The previous passwords themselves, under the link that opens them.
+///
+/// **The link is not drawn here any more.** It moved onto the strength
+/// line -- see [`history_link`] -- so this is the list alone, and the
+/// caller draws it only while its own `history_open` is set.
+fn history_list(ui: &mut egui::Ui, dates: &[String]) {
     if dates.is_empty() {
         return;
     }
-    // **Wrapped, not `horizontal`.** Same reason as every other multi-control
-    // row on this form: an unwrapped row does not shrink to fit, it pushes the
-    // card past the pane and inflates every `available_width()` after it.
-    ui.horizontal_wrapped(|ui| {
-        // **A link, which is what 8a draws**: `font-size: 12px; font-weight:
-        // 600; color: #14307a`, with no box round it. It was a
-        // `selectable_label` -- egui's own toggle chrome, a tinted rectangle
-        // when open -- which is a control this design has nowhere. The owner:
-        // "Password history should be a link as per design".
-        //
-        // `theme::link_label` rather than a blue `RichText` written here: it
-        // is what every other hand-painted clickable in this app is, down to
-        // the pointing hand and the `selectable(false)` that keeps a press
-        // from being taken for a drag-select. The open state is no longer
-        // painted ON the control, and does not need to be -- the list it
-        // opens is directly underneath it.
-        // 8a's own three values for this run -- `font-size: 12px;
-        // font-weight: 600; color: #14307a` -- rather than `link_label`'s
-        // body-weight `BLUE`. `#14307a` is `theme::BLUE_DEEP`, which is
-        // already what the password box's own `Show` is set in, so the two
-        // clickable runs on this card match. The owner: "Password history is
-        // a link not as per design".
-        //
-        // Laid here and handed to `link_galley`, because that is the only
-        // way to give a link a weight: `link_label` takes a size and sets
-        // the rest itself.
-        let caption = history_button(dates.len());
-        let galley = ui.painter().layout_no_wrap(
-            caption,
-            egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-            theme::BLUE_DEEP,
-        );
-        if theme::link_galley(ui, galley).clicked() {
-            *open = !*open;
-        }
-    });
-    if !*open {
-        return;
-    }
-    ui.add_space(6.0);
     // `MAX_HISTORY_ROWS` is the read pane's cap, taken from the read pane
     // rather than chosen again here: two screens over one list must not
     // disagree about where it stops. Unreachable against today's backend --
@@ -6526,14 +6562,16 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
         // gives: the number is still the user's, it comes straight back when
         // the class does, and a control that vanished would look like a
         // setting that had been forgotten rather than one that is waiting.
-        ui.add_enabled(
+        theme::number_box_enabled(
+            ui,
             generator.classes.is_on(CharClass::Number),
             egui::DragValue::new(&mut generator.min_number)
                 .range(0..=MAX_MIN_CLASS)
                 .prefix("min ")
                 .suffix(" digits"),
         );
-        ui.add_enabled(
+        theme::number_box_enabled(
+            ui,
             generator.classes.is_on(CharClass::Special),
             egui::DragValue::new(&mut generator.min_special)
                 .range(0..=MAX_MIN_CLASS)
@@ -7864,6 +7902,10 @@ pub fn draw_detail_edit(
             // `custom_fields_block`'s removal is deferred: the rows below
             // hold `&mut` into the very boxes `hide_slot` empties.
             let mut hide: Option<Slot> = None;
+            // The other half of the same deferral: a card whose body reveals
+            // a slot cannot call `reveal_slot` while it still holds a `&mut`
+            // into the draft. See `hide`, and the `One-time code` card below.
+            let mut add: Option<Slot> = None;
 
             // Which card a `Changed` mark goes on, off the list taken once at
             // the top of the frame.
@@ -8061,14 +8103,27 @@ pub fn draw_detail_edit(
                         // for `""`, and a create form that opened by telling
                         // the user their blank password is weak would be
                         // scolding them for not having typed yet.
-                        if !draft.password.is_empty() {
-                            let rating = password_strength::rate(&draft.password);
-                            theme::strength_meter(
-                                ui,
-                                strength_bars(rating),
-                                rating.label(),
-                                draft.password.chars().count(),
-                            );
+                        // **8a's whole strength line, including the
+                        // history link at its far right** -- the owner: "Pass
+                        // history should be on same line as pass strong but
+                        // on the right". Wrapped, so a column too narrow for
+                        // both drops the link to the next line instead of
+                        // pushing it off the card.
+                        if !draft.password.is_empty() || !history.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                if !draft.password.is_empty() {
+                                    let rating = password_strength::rate(&draft.password);
+                                    theme::strength_meter(
+                                        ui,
+                                        strength_bars(rating),
+                                        rating.label(),
+                                        draft.password.chars().count(),
+                                    );
+                                }
+                                if !history.is_empty() && history_link(ui, history.len()) {
+                                    draft.history_open = !draft.history_open;
+                                }
+                            });
                         }
                     });
                     // **The generator's recipe row used to be here, and is
@@ -8086,26 +8141,18 @@ pub fn draw_detail_edit(
                     // things that act on its VALUE, and a recipe for a
                     // password that does not exist yet is neither.
 
-                    // **§8a's `Password history (3)`, in the control column
-                    // under the password row.**
-                    //
-                    // 8a puts it at the far right of the strength-meter line,
-                    // inside the password row itself. It cannot go there here:
-                    // that line is a four-bar meter, a rating and a count in a
-                    // control column around 200 points wide, and
-                    // `strength_meter` already drops its own character count
-                    // to fit. What is kept from 8a is the part that is not
-                    // furniture -- the same column, the same caption, the same
-                    // count in it.
+                    // **The LIST the link above opens**, and only the list:
+                    // the link itself is on the strength line now, where 8a
+                    // draws it and where the owner asked for it.
                     //
                     // An empty-labelled row, so it starts at the control
                     // column and not at the CARD's left edge, which is where
                     // the label column is: a block under `Password` and level
                     // with it reads as another field's worth of chrome rather
                     // than as this password's own history.
-                    if !history.is_empty() {
-                                theme::section_row(ui, "", |ui| {
-                            history_block(ui, &mut draft.history_open, &history);
+                    if draft.history_open && !history.is_empty() {
+                        theme::section_row(ui, "", |ui| {
+                            history_list(ui, &history);
                         });
                     }
 
@@ -8388,16 +8435,19 @@ pub fn draw_detail_edit(
             // **Immediately under the kind's own rows, inside the card they
             // belong to.** The Add control names the rows this item has not
             // filled in, so it belongs at the end of the rows it is talking
-            // about -- not below the custom-fields and matched-app cards,
-            // which are about different things and carry their own Adds.
+            // about.
             //
-            // A slot it reveals may well belong to a LATER card -- `Website`
-            // is on `Autofill targets`, the seed is on `One-time code` -- and
-            // that is not a flaw in the placement: the menu lists the rows
-            // this KIND could have, which is a statement about the kind, and
-            // the row appears in whichever card it is a row of. 8a has no
-            // equivalent control to copy, because 8a draws one fully-populated
-            // record and never shows the sparse case this menu exists for.
+            // **For a LOGIN it is now always empty, and draws nothing.** The
+            // owner: "remove Add... - that will be separate TOTP block". Both
+            // slots it used to offer a login have a door of their own -- the
+            // `One-time code` card is drawn whether or not the item has a
+            // seed, and `Autofill targets` draws its `Add a website\u{2026}`
+            // whether or not it has one -- so `addable_slots` withholds both
+            // and this block returns before it paints. It is still here, and
+            // still drawn, for the kinds that have no such door: a card's
+            // brand, an identity's title. Removing it outright took those
+            // away, which is what `every_add_menu_chip_is_reachable_at_the_
+            // apps_minimum_width` caught.
             if let Some(slot) = slot_add_block(ui, &mut draft.add_menu_open, &addable) {
                 draft.reveal_slot(slot);
             }
@@ -8424,7 +8474,21 @@ pub fn draw_detail_edit(
             // -- without reading either. `Replace by scanning` names a QR
             // scanner this build does not have. What is kept is the part a
             // user can act on: the seed itself, and 8a's `Remove`.
-            if showing(Slot::Totp) {
+            // **Drawn whether or not the item has a seed**, which is 8a: the
+            // design's column carries `One-time code` on every record, and the
+            // owner asked for it twice -- "TOTP should be separate block and
+            // not part of password etc", then "I dont see TOTP block as per
+            // design" on an item that has none.
+            //
+            // It used to be gated on `showing(Slot::Totp)`, so an item with no
+            // second factor had no such card and the only way to add one was
+            // the `Add\u{2026}` menu on the credentials card -- a door on the
+            // wrong card, which is the other half of why that menu is gone.
+            // The empty state is the row itself, with a box to paste a seed
+            // into: the card says what this record's second factor IS, and
+            // "none yet" is an answer to that question.
+            if matches!(body, FormBody::Login) {
+                let has_seed = showing(Slot::Totp);
                 section(
                     ui,
                     kind,
@@ -8435,10 +8499,28 @@ pub fn draw_detail_edit(
                         if slot_row(
                             ui,
                             Slot::Totp.label(),
-                            removable(Slot::Totp),
+                            // Only a row that HAS something can be removed.
+                            has_seed && removable(Slot::Totp),
                             |ui| {
                                 if creating {
                                     theme::section_disabled_text_field(ui, TOTP_CREATE_NOTICE);
+                                } else if !has_seed {
+                                    // The empty state, and it is the same box
+                                    // the filled one is -- typing or pasting
+                                    // a seed into it IS adding the second
+                                    // factor, so the card needs no separate
+                                    // Add control. Revealed on the first
+                                    // keystroke so the draft starts carrying
+                                    // the slot; `reveal_slot` is idempotent.
+                                    if theme::section_hinted_field(
+                                        ui,
+                                        &mut draft.totp,
+                                        TOTP_EMPTY_HINT,
+                                    )
+                                    .changed()
+                                    {
+                                        add = Some(Slot::Totp);
+                                    }
                                 } else {
                                     // Masked, like the password and for the
                                     // same reason: it is a secret, and this
@@ -8464,6 +8546,11 @@ pub fn draw_detail_edit(
                         }
                     },
                 );
+            }
+            // The deferred reveal, for `hide`'s reason exactly: `reveal_slot`
+            // takes a `&mut` the card's body is still holding.
+            if let Some(slot) = add {
+                draft.reveal_slot(slot);
             }
             // **The deferred Remove**, applied once for every card that can
             // ask for one -- see `hide` above. `hide_slot` empties the box as
@@ -8499,9 +8586,17 @@ pub fn draw_detail_edit(
                 // has none of its own: removing the last website is what takes
                 // the block away, which is handled below. See
                 // [`Slot::Websites`].
-                if showing(Slot::Websites) {
-                    websites_block(ui, &mut draft.uris, creating);
-                    }
+                // **Drawn whether or not the login has a website.** The
+                // block ends in `Add a website\u{2026}`, so an empty one is
+                // the door -- and it has to be, now that the `Add\u{2026}`
+                // menu no longer offers the slot. Gated on `showing`, a
+                // login with no website had no way to gain one at all:
+                // `a_login_with_no_website_offers_one_through_the_add_menu`
+                // caught exactly that.
+                //
+                // The block carries its own Remove per row, so the slot has
+                // none of its own -- see [`Slot::Websites`].
+                websites_block(ui, &mut draft.uris, creating);
                 match draft.app.as_mut() {
                     Some(app) => {
                         if let Some(requested) = app_block(ui, app, apps) {
@@ -9064,13 +9159,15 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
         // which is on screen. The ranges are the route's own clamps; a box
         // that offered 1 would come back as 5.
         if generator.passphrase {
-            ui.add(
+            theme::number_box(
+                ui,
                 egui::DragValue::new(&mut generator.words)
                     .range(MIN_WORDS..=MAX_WORDS)
                     .suffix(" words"),
             );
         } else {
-            ui.add(
+            theme::number_box(
+                ui,
                 egui::DragValue::new(&mut generator.length)
                     .range(MIN_LENGTH..=MAX_LENGTH)
                     .suffix(" chars"),
@@ -18813,9 +18910,18 @@ mod edit_pane_layout_tests {
                 // pass every assertion above, which is what it did before
                 // this block existed.
                 let hidden = expected_hidden(kind, creating);
+                // **`has_its_own_door` is the third term.** A row is hidden
+                // from an empty draft when the kind has it, it is not always
+                // shown, AND the form does not draw it somewhere of its own --
+                // which a login's one-time code and websites now are. Without
+                // this the census claims a login hides rows that are on
+                // screen, which is how it failed when those two gained doors.
+                let has_hideable = Slot::all_for(kind)
+                    .iter()
+                    .any(|s| !s.always_shown() && !has_its_own_door(*s));
                 assert_eq!(
                     hidden.is_empty(),
-                    creating || Slot::all_for(kind).iter().all(|s| s.always_shown()),
+                    creating || !has_hideable,
                     "{kind:?} (creating: {creating}) expects {} hidden rows, which does not \
                      match what the kind actually has",
                     hidden.len()
@@ -20258,9 +20364,24 @@ mod edit_pane_layout_tests {
                     slot
                 );
             }
-            // ...and the control that reaches them is on screen, so "hidden"
-            // means "behind the Add" and not "gone".
-            assert_inside("the add control", SLOT_ADD_BUTTON, pane, &painted);
+            // ...and a way to reach them is on screen, so "hidden" means
+            // "behind a door" and not "gone".
+            //
+            // **Which door depends on the kind now.** A login's two
+            // hideable rows have doors of their own -- the `One-time code`
+            // card is drawn on every login and `Autofill targets` always
+            // offers `Add a website\u{2026}` -- so `has_its_own_door`
+            // withholds both from the `Add\u{2026}` menu and that menu draws
+            // nothing at all. Every other kind still reaches its optional
+            // rows through the menu, and that is what this asserts for
+            // them. Asserting `SLOT_ADD_BUTTON` unconditionally is what
+            // failed when the login gained its doors.
+            let door = if matches!(kind, ItemKind::Login) {
+                WEBSITE_ADD_BUTTON
+            } else {
+                SLOT_ADD_BUTTON
+            };
+            assert_inside("the add control", door, pane, &painted);
         }
         assert_eq!(kinds, 3, "the kind loop asserted about {kinds} kinds, not 3");
         assert_eq!(skipped, 2, "the skip count moved, so the loop is covering something else");
@@ -20493,14 +20614,24 @@ mod edit_pane_layout_tests {
         assert!(!draft.shows(Slot::Totp), "Remove left the row on the form");
         assert!(draft.totp.is_empty(), "Remove hid the row and kept the seed on the draft");
         let after = frame(&ctx, pane, &mut draft, false, &[]);
+        // **The CAPTION stays and the value goes**, which is the one-time
+        // code card's own shape now: it is drawn on every login (see the
+        // card), so what a Remove takes away is the seed and the Remove
+        // itself, not the row. The empty box says what belongs in it.
         assert!(
-            !after.strings().contains(&TOTP_LABEL),
-            "the removed row is still painted: {:?}",
+            after.strings().contains(&TOTP_EMPTY_HINT),
+            "the emptied row is not offering a box to paste a new seed into: {:?}",
             after.strings()
         );
-        // ...and it is back in the Add menu, so the removal is not a
-        // one-way door.
-        assert!(draft.addable_slots(false).contains(&Slot::Totp));
+        assert!(
+            !after.strings().contains(&SLOT_REMOVE_BUTTON),
+            "an emptied row still offers a Remove, which would remove nothing: {:?}",
+            after.strings()
+        );
+        // ...and the way back is the box itself, not the Add menu: see
+        // `has_its_own_door`, which withholds the slot from that list
+        // precisely because the card is always on screen to take a new seed.
+        assert!(!draft.addable_slots(false).contains(&Slot::Totp));
     }
 
     /// **A floor row has no Remove.**
@@ -20566,10 +20697,18 @@ mod edit_pane_layout_tests {
         assert_eq!(kinds, CREATABLE_KINDS.len(), "the kind loop asserted about nothing");
     }
 
-    /// **A login with no website reaches one through the Add menu**, which is
-    /// the whole of the zero case the note test above stops short of.
+    /// **A login with no website reaches one on the card it belongs to**,
+    /// which is the whole of the zero case the note test above stops short of.
+    ///
+    /// It used to reach it through the `Add\u{2026}` menu on the credentials
+    /// card -- a door on a card the row is not on. The owner took that menu
+    /// off a login ("remove Add... - that will be separate TOTP block"), so
+    /// `Autofill targets` draws its block whether or not the login has a
+    /// website and the block's own `Add a website\u{2026}` is the door. Same
+    /// claim, one card over: a login with none can gain one, and the row it
+    /// gains has a box in it rather than being a heading.
     #[test]
-    fn a_login_with_no_website_offers_one_through_the_add_menu() {
+    fn a_login_with_no_website_offers_one_on_the_autofill_card() {
         let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
         let ctx = styled_context(pane);
         let item = login_with_websites(0);
@@ -20577,16 +20716,15 @@ mod edit_pane_layout_tests {
         assert!(draft.uris.is_empty(), "the fixture carries a website");
 
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
-        let shut = frame(&ctx, pane, &mut draft, false, &[]);
+        let empty = frame(&ctx, pane, &mut draft, false, &[]);
         assert!(
-            !shut.strings().contains(&WEBSITE_ADD_BUTTON),
-            "a login with no website is drawing the websites block"
+            empty.strings().contains(&WEBSITE_ADD_BUTTON),
+            "a login with no website is not offering one at all: {:?}",
+            empty.strings()
         );
 
-        let _ = frame(&ctx, pane, &mut draft, false, &click(shut.rect_of(SLOT_ADD_BUTTON).center()));
-        let open = frame(&ctx, pane, &mut draft, false, &[]);
-        let chip = *open.rects_of(WEBSITE_LABEL).last().expect("a Website chip");
-        let _ = frame(&ctx, pane, &mut draft, false, &click(chip.center()));
+        let at = empty.rect_of(WEBSITE_ADD_BUTTON).center();
+        let _ = frame(&ctx, pane, &mut draft, false, &click(at));
 
         // Revealed WITH a box to type in, not just a heading.
         assert_eq!(draft.uris.len(), 1, "the revealed block has no row to type into");
@@ -20597,7 +20735,17 @@ mod edit_pane_layout_tests {
         let remove = after.rect_of(WEBSITE_REMOVE_BUTTON).center();
         let _ = frame(&ctx, pane, &mut draft, false, &click(remove));
         assert!(!draft.shows(Slot::Websites), "the emptied websites block is still on the form");
-        assert!(draft.addable_slots(false).contains(&Slot::Websites));
+        // **Not back on the `Add\u{2026}` menu** -- see `has_its_own_door`. The
+        // block is drawn empty, so the way back is the `Add a website\u{2026}`
+        // that is still on screen, which is the stronger claim anyway: the
+        // menu could offer the slot while the card drew nothing.
+        assert!(!draft.addable_slots(false).contains(&Slot::Websites));
+        let emptied = frame(&ctx, pane, &mut draft, false, &[]);
+        assert!(
+            emptied.strings().contains(&WEBSITE_ADD_BUTTON),
+            "removing the last website took the way back with it: {:?}",
+            emptied.strings()
+        );
     }
 
     /// **The open Add menu is reachable at the app's minimum window size, at
@@ -23587,14 +23735,22 @@ mod sparse_form_tests {
         assert!(floor(ItemKind::Unknown(9)).is_empty());
     }
 
-    /// **A shown row and an addable row are the two halves of one list.**
+    /// **A shown row, an addable row and a row with a door of its own are the
+    /// three parts of one list.**
     ///
-    /// Neither can gain or lose a row without the other losing or gaining it,
-    /// which is what makes "the menu offers what is missing" true by
-    /// construction rather than by a second walk. Asked in several states,
-    /// because the interesting one is after a reveal.
+    /// It was TWO parts, and the third is `has_its_own_door`: a slot the form
+    /// offers a way in to somewhere other than the `Add\u{2026}` menu, and
+    /// which the menu therefore must not offer a second time. A login's
+    /// one-time code and its websites are both that now -- see that function,
+    /// and the owner's "remove Add... - that will be separate TOTP block".
+    ///
+    /// The invariant is unchanged in what it is FOR: no row may fall through
+    /// every list, and none may be in two at once. That is what makes "the
+    /// menu offers what is missing" true by construction rather than by a
+    /// second walk. Asked in several states, because the interesting one is
+    /// after a reveal.
     #[test]
-    fn the_shown_and_addable_rows_partition_the_kinds_rows() {
+    fn every_row_is_shown_addable_or_has_a_door_of_its_own() {
         for kind in CREATABLE_KINDS {
             for creating in [true, false] {
                 let mut draft = EditDraft::empty_of(kind);
@@ -23604,15 +23760,35 @@ mod sparse_form_tests {
                             draft.reveal_slot(slot);
                         }
                     }
-                    let mut both = draft.shown_slots(creating);
-                    both.extend(draft.addable_slots(creating));
+                    let shown = draft.shown_slots(creating);
+                    let addable = draft.addable_slots(creating);
+                    let mut both = shown.clone();
+                    both.extend(addable.iter().copied());
+                    // The third part, and only where it is really the reason:
+                    // a slot with a door of its own that the draft is ALREADY
+                    // showing is in `shown` and must not be counted twice.
+                    both.extend(
+                        Slot::all_for(kind)
+                            .into_iter()
+                            .filter(|slot| has_its_own_door(*slot) && !shown.contains(slot)),
+                    );
                     both.sort_unstable();
                     let mut all = Slot::all_for(kind);
                     all.sort_unstable();
                     assert_eq!(
                         both, all,
-                        "{kind:?} (creating: {creating}, stage {stage}) has a row that is \
-                         neither shown nor addable, or is both"
+                        "{kind:?} (creating: {creating}, stage {stage}) has a row that is in \
+                         none of the three lists, or in two of them"
+                    );
+                    // And the menu never offers a row that has a door: that is
+                    // the whole of what `has_its_own_door` is for, and without
+                    // this the filter could be deleted and the partition above
+                    // would still hold.
+                    assert!(
+                        !addable.iter().any(|slot| has_its_own_door(*slot)),
+                        "{kind:?} (creating: {creating}, stage {stage}): the Add menu is \
+                         offering {addable:?}, which includes a row the form already lets \
+                         the user reach somewhere else"
                     );
                 }
             }

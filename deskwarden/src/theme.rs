@@ -3563,6 +3563,38 @@ pub const HEADER_BUTTON_HEIGHT: f32 = 34.0;
 ///
 /// Regular weight, not [`semibold`]: the design gives these no `font-weight`,
 /// unlike the 600 it sets explicitly on the header pair.
+/// A `DragValue` **that does not claim to be a drag handle.**
+///
+/// egui sets `CursorIcon::ResizeHorizontal` on a hovered `DragValue` -- the
+/// two-headed arrow a window edge wears. On the generator card that is three
+/// number boxes (`chars`, `min digits`, `min symbols`) all telling the user
+/// they are about to resize something. The owner: "for modal cursor changes
+/// to arrows on hover - chars, min and max fields".
+///
+/// [`CursorIcon::Text`] instead, which is what `field_box` sets on every
+/// other box in this app and is the true one here: a click opens these for
+/// typing. Dragging still works and is still discoverable the way it always
+/// was, by dragging.
+///
+/// Set AFTER the widget, because the cursor is last-writer-wins within a
+/// frame and the `DragValue`'s own call happens inside `ui.add`.
+pub fn number_box(ui: &mut Ui, value: egui::DragValue<'_>) -> Response {
+    let response = ui.add(value);
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+    response
+}
+
+/// [`number_box`], greyed when `enabled` is false.
+pub fn number_box_enabled(ui: &mut Ui, enabled: bool, value: egui::DragValue<'_>) -> Response {
+    let response = ui.add_enabled(enabled, value);
+    if enabled && response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+    }
+    response
+}
+
 pub fn row_button(ui: &mut Ui, label: &str) -> Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding = ROW_BUTTON_PADDING;
@@ -6102,6 +6134,16 @@ pub fn text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
 /// fill, the border, the radius, the focus halo, the 10-point inset -- is
 /// [`field_box`]'s, so a row box is visibly the same control as the name box
 /// above it, four points shorter.
+/// A row field **with a placeholder in it**, at the section card's metrics.
+///
+/// [`hinted_field`]'s shape one size down, for the `One-time code` card's
+/// empty state: the card is drawn on every login now, and an empty box with
+/// nothing in it says nothing about what belongs there. See
+/// `detail_edit`'s one-time-code card.
+pub fn section_hinted_field(ui: &mut Ui, value: &mut String, hint: &str) -> Response {
+    field_box(ui, value, FieldShape { hint, ..FieldShape::section(ui) }).0
+}
+
 pub fn section_text_field(ui: &mut Ui, value: &mut String, password: bool) -> Response {
     section_text_field_within(ui, value, password, ui.available_width())
 }
