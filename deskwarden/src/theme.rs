@@ -3563,25 +3563,31 @@ pub const HEADER_BUTTON_HEIGHT: f32 = 34.0;
 ///
 /// Regular weight, not [`semibold`]: the design gives these no `font-weight`,
 /// unlike the 600 it sets explicitly on the header pair.
-/// A `DragValue` **that does not claim to be a drag handle.**
+/// A `DragValue` wearing the cursor a NUMBER wears.
 ///
 /// egui sets `CursorIcon::ResizeHorizontal` on a hovered `DragValue` -- the
-/// two-headed arrow a window edge wears. On the generator card that is three
-/// number boxes (`chars`, `min digits`, `min symbols`) all telling the user
-/// they are about to resize something. The owner: "for modal cursor changes
-/// to arrows on hover - chars, min and max fields".
+/// left-right arrow a window edge wears -- and on the generator card that is
+/// three number boxes (`chars`, `min digits`, `min symbols`) each telling the
+/// user they are about to resize something. The owner: "for modal cursor
+/// changes to arrows on hover - chars, min and max fields", and then, on what
+/// it should be instead: "most common is arrows up' + BS + 'down and you can drag your
+/// mouse as well as click - that how you show it is number".
 ///
-/// [`CursorIcon::Text`] instead, which is what `field_box` sets on every
-/// other box in this app and is the true one here: a click opens these for
-/// typing. Dragging still works and is still discoverable the way it always
-/// was, by dragging.
+/// **[`CursorIcon::ResizeVertical`], and it is not a decoration.** egui's own
+/// drag arithmetic is `delta_points = mdelta.x - mdelta.y`, commented
+/// "Increase to the right and up" -- so a `DragValue` really does answer a
+/// vertical drag, and the up-down arrow is the true cursor for it rather than
+/// a prettier lie. (`CursorIcon::Text` was tried first, on the argument that a
+/// click opens these for typing. It is what `field_box` sets on every other
+/// box in this app, and it is the wrong one here: it says "a run of text",
+/// which is exactly what a number box is not.)
 ///
 /// Set AFTER the widget, because the cursor is last-writer-wins within a
 /// frame and the `DragValue`'s own call happens inside `ui.add`.
 pub fn number_box(ui: &mut Ui, value: egui::DragValue<'_>) -> Response {
     let response = ui.add(value);
     if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
     response
 }
@@ -3590,7 +3596,7 @@ pub fn number_box(ui: &mut Ui, value: egui::DragValue<'_>) -> Response {
 pub fn number_box_enabled(ui: &mut Ui, enabled: bool, value: egui::DragValue<'_>) -> Response {
     let response = ui.add_enabled(enabled, value);
     if enabled && response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
+        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
     response
 }
