@@ -5369,11 +5369,22 @@ const APP_FIELD_INSET: f32 = 10.0;
 /// whose place in the row this takes while nothing is bound.
 pub const APP_ADD_BUTTON: &str = "+ Add an app\u{2026}";
 
-/// What the block says while the item is bound to nothing.
+/// What the block used to say while the item is bound to nothing.
 ///
-/// Says what a binding IS rather than naming the mechanism, the same way
+/// **No longer drawn.** The owner took it off: "remove Nothing is bound yet to
+/// match with web if nothing" -- the unbound WEBSITES row above it offers a
+/// `+ ` link and no prose, and two empty rows of one card explaining
+/// themselves differently is the card reading as two components. See
+/// [`app_add_block`].
+///
+/// Kept, because a run this form must NOT paint is worth naming once: it is
+/// what `a_form_with_no_binding_offers_the_control_that_makes_one` asserts the
+/// absence of, and an absence asserted against a literal is an absence that
+/// stops meaning anything the moment the literal is edited.
+///
+/// It said what a binding IS rather than naming the mechanism, the same way
 /// [`AppPathRow`]'s Store-app row refuses the word "hosted": the user's
-/// question here is "what would this do for me", not "what field is unset".
+/// question there is "what would this do for me", not "what field is unset".
 pub const APP_NONE_NOTICE: &str =
     "Nothing is bound yet. Point this item at a program and Deskwarden can open it and type \
      into it.";
@@ -6320,6 +6331,13 @@ const PICKER_ROWS_SHOWN: f32 = 6.0;
 /// are taller than its tile simply shows a little less of the seventh row.
 const PICKER_ROW_HEIGHT_EST: f32 = PICKER_TILE + 2.0 * PICKER_ROW_PAD_Y as f32;
 
+/// The list's viewport: [`PICKER_ROWS_SHOWN`] rows and the gaps between them.
+///
+/// Both the `max_height` and the `min_scrolled_height` of the scroll area, so
+/// the card is the same size wherever on the form it is opened -- see
+/// [`picker_rows`] for what the floor is protecting against.
+const PICKER_VIEWPORT: f32 = PICKER_ROWS_SHOWN * (PICKER_ROW_HEIGHT_EST + PICKER_LIST_GAP_Y);
+
 /// 8b's `Match this window by`, `text-transform: uppercase` already applied,
 /// with its `letter-spacing: 0.1em` -- 1.1 points at 11px, which is what
 /// `theme::letterspaced` wants, `RichText` having no em to give it.
@@ -6404,6 +6422,16 @@ fn app_window_picker(
     // into one of them must stay that box's.
     let entered = ui.input(|i| i.key_pressed(egui::Key::Enter))
         && ui.memory(|m| m.focused().is_none());
+    // **Escape leaves the picker**, which is what every other dismissable
+    // surface in this app does and what this one did not: the card covered the
+    // form with no keyboard way out, and its only door was the `Cancel` button.
+    // The owner: "Esc not working in it".
+    //
+    // Guarded on nothing having focus, exactly as Return above is: egui gives
+    // Escape to a focused text box to abandon its edit, and a card that took
+    // the key first would make that impossible while it is open.
+    let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape))
+        && ui.memory(|m| m.focused().is_none());
 
     let mut add = false;
     let mut cancel = false;
@@ -6420,22 +6448,24 @@ fn app_window_picker(
             // is a padding one of them owns.
             ui.spacing_mut().item_spacing.y = 0.0;
 
-            picker_header(ui, app.windows.len());
+            let dismissed = picker_header(ui);
             picker_rule(ui);
             picker_rows(ui, app, apps);
             picker_rule(ui);
             picker_match_band(ui, app);
             picker_rule(ui);
-            let pressed = picker_footer(ui, app.picked_row().is_some());
+            let pressed = picker_footer(ui, app.picked_row().is_some(), app.windows.len());
             add = pressed.0;
-            cancel = pressed.1;
+            // The header's mark and the footer's button are one act: both
+            // leave the card with nothing bound.
+            cancel = dismissed || pressed.1;
             refresh = pressed.2;
         });
 
     if refresh {
         app.windows = running_app_rows();
     }
-    if cancel {
+    if cancel || escaped {
         app.close_picker();
     }
     // Last, and cloned first, so the borrow of `app.windows` is over before
@@ -6447,23 +6477,29 @@ fn app_window_picker(
     }
 }
 
-/// 8b's header band: the card's heading, and how many rows are under it.
-fn picker_header(ui: &mut egui::Ui, count: usize) {
-    egui::Frame::new()
+/// 8b's header band: the card's heading, and the \u{2715} that leaves it.
+///
+/// **The count is not here**, though 8b puts it here and this card used to.
+/// The owner moved it: "17 windows open message move to the bottom right
+/// corner", which is [`picker_footer`]'s far end -- beside `Refresh`, which is
+/// the control the number is actually about. What takes its place is the
+/// dismiss mark, because the card had no \u{2715} at all ("no X button") and
+/// the header's right-hand end is where every other card in this app puts one.
+fn picker_header(ui: &mut egui::Ui) -> bool {
+    let band = egui::Frame::new()
         .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_BAND_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(theme::extrabold(PICKER_TITLE, PICKER_TITLE_PX).color(theme::INK));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        RichText::new(picker_count(count))
-                            .size(PICKER_COUNT_PX)
-                            .color(theme::TEXT_GHOST),
-                    );
-                });
             });
-        });
+        })
+        .response
+        .rect;
+    // Pinned to the band rather than added to the row, so the title's line is
+    // laid out exactly as it was -- see `theme::modal_dismiss_mark`, which
+    // does not allocate.
+    theme::modal_dismiss_mark(ui, band, theme::CloseInk::OnCard).clicked()
 }
 
 /// One of the card's `1px solid #eae7e7` seams, drawn full-bleed.
@@ -6505,7 +6541,26 @@ fn picker_rows(ui: &mut egui::Ui, app: &mut AppMatchDraft, apps: &mut AppIdentit
         ui.set_width(ui.available_width());
         egui::ScrollArea::vertical()
             .id_salt("edit-app-window-picker")
-            .max_height(PICKER_ROWS_SHOWN * (PICKER_ROW_HEIGHT_EST + PICKER_LIST_GAP_Y))
+            .max_height(PICKER_VIEWPORT)
+            // **The floor matters more than the ceiling here**, and without it
+            // this card was a different size depending on where on the form it
+            // opened.
+            //
+            // egui sizes a `ScrollArea` as `available.at_most(max_size)` and
+            // then lifts it to `min_scrolled_size` -- whose default is 64. This
+            // one is nested inside the FORM's scroll area, so `available` is
+            // whatever was left of the form's viewport below the app row: open
+            // the picker near the bottom of a short window and the six-row list
+            // collapsed to that 64-point floor. The owner, with seventeen
+            // windows enumerated and one and a half of them on screen: "picker
+            // is tiny - make it higher as per design".
+            //
+            // Floor and ceiling are the same number, so the list is exactly
+            // [`PICKER_ROWS_SHOWN`] rows whenever there are more than that many
+            // windows -- and `auto_shrink` still takes it down to the content
+            // when there are fewer, which is why a floor cannot leave a short
+            // list sitting in empty space.
+            .min_scrolled_height(PICKER_VIEWPORT)
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = PICKER_LIST_GAP_Y;
@@ -6781,12 +6836,20 @@ fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
 }
 
 /// 8b's footer. Answers `(add, cancel, refresh)`.
-fn picker_footer(ui: &mut egui::Ui, staged: bool) -> (bool, bool, bool) {
+fn picker_footer(ui: &mut egui::Ui, staged: bool, count: usize) -> (bool, bool, bool) {
     let mut pressed = (false, false, false);
     egui::Frame::new()
         .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_FOOTER_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // The band's own right edge, read before anything is in it.
+            // `set_width` above sets the max as well as the min, so this is the
+            // line the count is pushed to -- and NOT `available_width` measured
+            // inside the row below, which in a wrapping layout answers the wrap
+            // width rather than what is left of the current line: pushed by
+            // that, the count claimed 380 points of nothing and took the card
+            // out to 1072 on a 690-point pane.
+            let line_right = ui.max_rect().right();
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = PICKER_FOOTER_GAP;
                 // `primary_button_enabled`, because there is a state in which
@@ -6800,6 +6863,51 @@ fn picker_footer(ui: &mut egui::Ui, staged: bool) -> (bool, bool, bool) {
                     RichText::new(PICKER_FOOTER_NOTE)
                         .size(PICKER_COUNT_PX)
                         .color(theme::TEXT_GHOST),
+                );
+                // **The count, at the band's far right** -- 8b's header number,
+                // moved here at the owner's word ("17 windows open message move
+                // to the bottom right corner"). It belongs beside `Refresh`
+                // anyway: the number is what that button changes.
+                //
+                // Pushed with a measured space rather than a `right_to_left`
+                // layout, because this row WRAPS -- on a narrow card the three
+                // buttons and the note already take two lines, and a
+                // right-aligned child inside a wrapping row is laid against the
+                // row's full width rather than the line's, which puts it back
+                // on line one over whatever is there. Measured against what is
+                // left of the current line, the count goes flush right when
+                // there is room and simply follows the note when there is not.
+                //
+                // **Laid, allocated and painted here rather than added as a
+                // label**, because a label in a wrapping row is re-laid against
+                // the row's own wrap width: pushed with `add_space` it came out
+                // as a galley 645 points wide starting back at the band's left
+                // edge, which is neither where the arithmetic put it nor
+                // anything a test can read. A finished galley painted into a
+                // rectangle this row allocated is exactly as wide as its text
+                // and sits where it is put.
+                let run = picker_count(count);
+                let galley = ui.painter().layout_no_wrap(
+                    run,
+                    egui::FontId::new(PICKER_COUNT_PX, egui::FontFamily::Proportional),
+                    theme::TEXT_GHOST,
+                );
+                // The cursor is already past the gap egui puts between two
+                // widgets, so the gap is not subtracted a second time.
+                let room = line_right - ui.cursor().min.x;
+                let size = galley.size();
+                // The whole of what is left of the line when the count fits on
+                // it, so the run lands against the band's right-hand end; just
+                // the run when it does not, so a narrow card wraps it under the
+                // note instead of reserving a lane it cannot fill.
+                let (cell, _) = ui.allocate_exact_size(
+                    egui::vec2(if room > size.x { room } else { size.x }, size.y),
+                    egui::Sense::hover(),
+                );
+                ui.painter().galley(
+                    egui::pos2(cell.right() - size.x, cell.top()),
+                    galley,
+                    theme::TEXT_GHOST,
                 );
             });
         });
@@ -7523,8 +7631,6 @@ fn app_add_block(ui: &mut egui::Ui) -> bool {
     // the item happened to be bound.
     let mut add = false;
     theme::section_row(ui, APP_BLOCK_HEADING, |ui| {
-        ui.label(RichText::new(APP_NONE_NOTICE).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
-        ui.add_space(6.0);
         // Wrapped for `websites_block`'s reason: a run that cannot fall to a
         // second line pushes the card out on a 298-point pane.
         ui.horizontal_wrapped(|ui| {
@@ -15457,7 +15563,12 @@ mod generator_row_tests {
         let (_, painted) = frame(&ctx, &mut draft, &[]);
         let strings = painted.strings();
         let mut checked = 0;
-        for needle in [APP_BLOCK_HEADING, APP_NONE_NOTICE, APP_ADD_BUTTON] {
+        // The caption and the link, and nothing else on the row. The sentence
+        // that used to stand between them is gone at the owner's word --
+        // "remove Nothing is bound yet to match with web if nothing" -- so the
+        // unbound app row says exactly what the unbound websites row says,
+        // which is a `+ ` link and no prose. See `app_add_block`.
+        for needle in [APP_BLOCK_HEADING, APP_ADD_BUTTON] {
             checked += 1;
             assert!(
                 strings.contains(&needle),
@@ -15465,7 +15576,12 @@ mod generator_row_tests {
                  make one from the edit form: {strings:?}"
             );
         }
-        assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
+        assert_eq!(checked, 2, "the loop visited nothing, so it asserted nothing");
+        assert!(
+            !strings.contains(&APP_NONE_NOTICE),
+            "the unbound app row is back to explaining itself in prose, which the websites \
+             row above it does not do: {strings:?}"
+        );
 
         // ... and it is the ADD state, not the edit block drawn over an empty
         // draft. This is what keeps `the_form_draws_an_app_block_for_a_bound_item`
@@ -18611,6 +18727,186 @@ mod sequence_builder_tests {
             found.len()
         );
         found[0]
+    }
+
+    /// **The list keeps its six rows however little room the form has left.**
+    ///
+    /// egui sizes a `ScrollArea` as `available.at_most(max_size)` and then
+    /// lifts it to `min_scrolled_size`, whose default is 64. This card's list
+    /// is nested inside the FORM's scroll area, so `available` is whatever was
+    /// left of the form's viewport below the app row -- open the picker near
+    /// the bottom of a short window and six rows collapsed to that 64-point
+    /// floor. The owner, with seventeen windows enumerated and one and a half
+    /// of them on screen: "picker is tiny - make it higher as per design".
+    ///
+    /// **Asserted as "the same card at every viewport height"**, rather than
+    /// against an absolute number, because the number is the sum of five bands
+    /// and a test that wrote it down would be re-derived rather than read the
+    /// next time one of them changes. What has to be true is that the card
+    /// does not depend on where it opened.
+    ///
+    /// Drawn through `app_window_picker` inside a `ScrollArea` of the given
+    /// height rather than through the whole form, because the form would
+    /// scroll the card out of the frame entirely at the heights that matter --
+    /// and it is the nesting, not the form, that this is about.
+    #[test]
+    fn the_window_pickers_list_does_not_shrink_to_the_room_left_below_it() {
+        let item = item();
+        let mut heights = Vec::new();
+        for viewport in [200.0f32, 400.0, 2000.0] {
+            let pane = egui::vec2(PANE.x, viewport);
+            let ctx = styled_context(pane);
+            let rows: Vec<AppWindowRow> = (0..17)
+                .map(|i| window_row_at(&format!("Window {i}"), "Some.exe", 100 + i))
+                .collect();
+            let mut draft = picker_draft(&item, rows);
+            let mut apps = AppIdentityCache::default();
+            let mut run = || {
+                let output = ctx.run_ui(raw_input(pane, &[]), |ui| {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        let app = draft.app.as_mut().expect("picker_draft binds an app");
+                        app_window_picker(ui, app, &mut apps);
+                    });
+                });
+                let mut painted = Painted::default();
+                for clipped in &output.shapes {
+                    walk(&clipped.shape, &mut painted);
+                }
+                painted
+            };
+            let _ = run();
+            heights.push((viewport, picker_card(&run()).rect.height()));
+        }
+        let (_, roomy) = *heights.last().expect("three viewports were measured");
+        for (viewport, height) in &heights {
+            assert!(
+                (height - roomy).abs() <= 1.0,
+                "in a {viewport}pt viewport the card is {height}pt, against {roomy}pt where \
+                 there is room for it -- the list is collapsing into whatever the form has \
+                 left below the app row: {heights:?}"
+            );
+        }
+        // The premise: seventeen rows really are more than the viewport holds,
+        // so the card above was the SCROLLING case and not a short list that
+        // happened to fit at every height.
+        assert!(
+            roomy > PICKER_VIEWPORT,
+            "the card is {roomy}pt, which is not even one viewport ({PICKER_VIEWPORT}pt) tall \
+             -- the fixture is not exercising a list that has to scroll"
+        );
+    }
+
+    /// **Escape leaves the picker, and so does the \u{2715} in its header.**
+    ///
+    /// The card covered the form with no keyboard way out and no dismiss mark:
+    /// its only door was the `Cancel` button. The owner: "Esc not working in
+    /// it and no X button".
+    ///
+    /// Both doors in one test, because they are one act -- `close_picker`,
+    /// with nothing bound -- and because the mark is painted as strokes rather
+    /// than as a glyph, so the only honest assertion about it is that pressing
+    /// where it is closes the card.
+    ///
+    /// **And the negative control on each**: the same frame with no key and no
+    /// click leaves the picker open, so neither half can pass against a card
+    /// that closes itself.
+    #[test]
+    fn the_picker_closes_on_escape_and_on_its_dismiss_mark() {
+        let item = item();
+        let rows = vec![window_row_at("Ledgerline - Invoices", "Ledgerline.exe", 11)];
+
+        // --- the control: nothing pressed, the card stays ------------------
+        let ctx = styled_context(PANE);
+        let mut draft = picker_draft(&item, rows.clone());
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        assert!(
+            draft.app.as_ref().is_some_and(|a| a.picking),
+            "the picker shut with nothing pressed, so neither door below is asserting anything"
+        );
+
+        // --- Escape --------------------------------------------------------
+        let escape = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &escape);
+        assert!(
+            draft.app.as_ref().is_some_and(|a| !a.picking),
+            "Escape did not close the picker"
+        );
+        assert!(
+            draft.app.as_ref().is_some_and(|a| a.picked.is_none()),
+            "Escape staged a window on the way out; leaving is not choosing"
+        );
+
+        // --- the header's mark ---------------------------------------------
+        // Its position, from the card the control frame painted: the mark is
+        // pinned `MODAL_CLOSE_INSET` in from the card's right edge, on the
+        // title's own line.
+        let card = picker_card(&painted).rect;
+        let title = painted.rect_of(PICKER_TITLE);
+        let mark = Pos2::new(
+            card.right() - theme::MODAL_CLOSE_INSET - theme::CLOSE_MARK_HIT / 2.0,
+            title.center().y,
+        );
+        let mut clicked = picker_draft(&item, rows);
+        let _ = frame(&ctx, PANE, &mut clicked, &item, &live_code(), &[]);
+        for event in click(mark) {
+            let _ = frame(&ctx, PANE, &mut clicked, &item, &live_code(), &[event]);
+        }
+        assert!(
+            clicked.app.as_ref().is_some_and(|a| !a.picking),
+            "a click at {mark:?} -- the right-hand end of the card's header band -- did not \
+             close the picker, so there is no \u{2715} there"
+        );
+    }
+
+    /// **The window count is in the footer's bottom-right corner, not the
+    /// header.**
+    ///
+    /// 8b puts it in the header beside the title; the owner moved it: "17
+    /// windows open message move to the bottom right corner". It belongs
+    /// beside `Refresh` anyway, which is the control the number is about.
+    ///
+    /// Three claims, and the third is the one a careless push gets wrong: the
+    /// run is below the list, it is right of `Refresh`, and it is flush with
+    /// the band's right-hand end rather than merely somewhere after the note.
+    #[test]
+    fn the_window_count_sits_at_the_footers_right_hand_end() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let rows: Vec<AppWindowRow> = (0..4)
+            .map(|i| window_row_at(&format!("Window {i}"), "Some.exe", 100 + i))
+            .collect();
+        let mut draft = picker_draft(&item, rows);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+
+        let card = picker_card(&painted).rect;
+        let count = painted.rect_of(&picker_count(4));
+        let refresh = painted.rect_of(PICKER_REFRESH);
+        let title = painted.rect_of(PICKER_TITLE);
+
+        assert!(
+            count.top() > refresh.top() - 4.0 && count.left() > refresh.right(),
+            "the count is at {count:?}, which is not after {PICKER_REFRESH:?} at {refresh:?} \
+             on the footer's line"
+        );
+        assert!(
+            count.top() > title.bottom(),
+            "the count is still on the header's line, at {count:?} against a title at {title:?}"
+        );
+        assert!(
+            (card.right() - f32::from(PICKER_BAND_PAD_X) - count.right()).abs() <= 2.0,
+            "the count ends at {} and the footer band's right-hand end is at {} -- it is \
+             sitting after the note rather than pushed to the corner",
+            count.right(),
+            card.right() - f32::from(PICKER_BAND_PAD_X)
+        );
     }
 
     /// **8b's card, as a card**: its outline, its three `1px #eae7e7` seams,
@@ -23155,29 +23451,31 @@ mod edit_pane_layout_tests {
                     let _ = frame(&ctx, pane, &mut draft, true, &[]);
                 }
                 let after = frame(&ctx, pane, &mut draft, true, &[]);
-                // The button AND the notice above it, on one frame: the
-                // sentence that says what the button is for is useless where
-                // it cannot be read, which is the state `aae9429` shipped.
+                // The link AND the caption beside it, on one frame: a
+                // control whose row nothing names is as useless as one that
+                // cannot be read at all, which is the state `aae9429` shipped.
+                // (It was the notice sentence that was paired here until the
+                // row lost it; the caption is what names the control now.)
                 let shown = |label: &str| {
                     after
                         .rects_of(label)
                         .iter()
                         .any(|r| bounds.contains_rect(*r) && within_pane(*r, pane))
                 };
-                if shown(APP_ADD_BUTTON) && shown(APP_NONE_NOTICE) {
+                if shown(APP_ADD_BUTTON) && shown(APP_BLOCK_HEADING) {
                     reached = Some(after);
                     break;
                 }
             }
             let after = reached.unwrap_or_else(|| {
                 panic!(
-                    "the Add an app button and its notice were never both fully on a {}x{} \
+                    "the Add an app link and its caption were never both fully on a {}x{} \
                      pane at any scroll position",
                     pane.x, pane.y
                 )
             });
-            assert_inside("the Add an app button", APP_ADD_BUTTON, pane, &after);
-            assert_inside("the unbound notice", APP_NONE_NOTICE, pane, &after);
+            assert_inside("the Add an app link", APP_ADD_BUTTON, pane, &after);
+            assert_inside("the row's caption", APP_BLOCK_HEADING, pane, &after);
             // The action strip did not come with it.
             assert_inside("Save", SAVE, pane, &after);
         }
