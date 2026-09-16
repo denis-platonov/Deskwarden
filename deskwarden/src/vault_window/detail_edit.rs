@@ -5077,11 +5077,12 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     //
     // A link and not `theme::secondary_button`: 8a draws `+ Add website` as
     // blue type, and the control it replaced was a 32-point outlined button
-    // on a line of its own.
+    // on a line of its own. `theme::action_link` and not `link_label` because
+    // the design sets this one in `font-weight: 600` -- see that function.
     let mut add = false;
     theme::section_row(ui, "", |ui| {
         ui.horizontal_wrapped(|ui| {
-            add = theme::link_label(ui, WEBSITE_ADD_BUTTON, TARGET_LINK_PX).clicked();
+            add = theme::action_link(ui, WEBSITE_ADD_BUTTON, TARGET_LINK_PX).clicked();
         });
     });
     if add {
@@ -5349,7 +5350,7 @@ const APP_EXE_CHIP_GAP: f32 = 8.0;
 /// an overlap rather than as a silently wrong constant.
 const APP_FIELD_INSET: f32 = 10.0;
 
-/// The button that creates a binding on an item that has none.
+/// The link that creates a binding on an item that has none.
 ///
 /// **This is the control the form was missing.** Until it existed the app block
 /// was drawn only inside `if let Some(app) = draft.app.as_mut()`, so the one
@@ -5358,7 +5359,15 @@ const APP_FIELD_INSET: f32 = 10.0;
 /// bind an item was the tray's "Add app..." picker
 /// (`picker_ui::run_picker`), a different window that writes straight to the
 /// vault, so on the edit form the feature was simply absent.
-pub const APP_ADD_BUTTON: &str = "Add an app\u{2026}";
+///
+/// **A `+ ` link, and not the outlined button it was.** 8a's `Autofill
+/// targets` card has exactly two controls that add a row -- `+ Add website`
+/// and `+ Pick a running window` -- and draws both as blue `font-weight: 600`
+/// type; the owner, with the card beside the design: "add app is link as well
+/// to match the design". This one is the same gesture in the same card, so it
+/// is the same element. See [`theme::action_link`] and [`APP_PICK_LINK`],
+/// whose place in the row this takes while nothing is bound.
+pub const APP_ADD_BUTTON: &str = "+ Add an app\u{2026}";
 
 /// What the block says while the item is bound to nothing.
 ///
@@ -7504,10 +7513,25 @@ pub(crate) fn palette_button(label: &str) -> egui::Button<'static> {
 /// feature shipped, and two words for one thing on two panes is worse than
 /// departing from the design's noun.
 fn app_add_block(ui: &mut egui::Ui) -> bool {
-    theme::field_label(ui, APP_BLOCK_HEADING);
-    ui.label(RichText::new(APP_NONE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
-    ui.add_space(6.0);
-    theme::secondary_button(ui, APP_ADD_BUTTON).clicked()
+    // **The card's row idiom, not a column of its own.** The caption goes in
+    // the label column where every other row on this form puts one, and the
+    // notice and the link go in the field column -- which is the shape 8a
+    // draws for `Native apps` and the shape the BOUND arm of this block
+    // already had. Written as a `field_label` and a loose button, the unbound
+    // arm was the one place on the card where a caption sat over its content
+    // instead of beside it, so the card changed layout depending on whether
+    // the item happened to be bound.
+    let mut add = false;
+    theme::section_row(ui, APP_BLOCK_HEADING, |ui| {
+        ui.label(RichText::new(APP_NONE_NOTICE).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+        ui.add_space(6.0);
+        // Wrapped for `websites_block`'s reason: a run that cannot fall to a
+        // second line pushes the card out on a 298-point pane.
+        ui.horizontal_wrapped(|ui| {
+            add = theme::action_link(ui, APP_ADD_BUTTON, TARGET_LINK_PX).clicked();
+        });
+    });
+    add
 }
 
 /// The app TARGET block -- which program this item is bound to. Returns an
@@ -7842,7 +7866,7 @@ fn app_block(
         // fall onto two lines on a 298-point pane rather than push the card
         // out (`aae9429`).
         ui.horizontal_wrapped(|ui| {
-            pick = theme::link_label(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked();
+            pick = theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked();
             ui.label(
                 RichText::new(APP_PICK_HINT).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT),
             );
@@ -8832,8 +8856,51 @@ fn form_combo(
     ui: &mut egui::Ui,
     id_salt: impl std::hash::Hash + std::fmt::Debug,
 ) -> egui::ComboBox {
-    ui.spacing_mut().scroll = egui::style::ScrollStyle::default();
-    egui::ComboBox::from_id_salt(id_salt)
+    // **8a's `height: 34px`, which is what the boxes beside it are**, and the
+    // second reason this helper exists.
+    //
+    // egui sizes a combo's button from `interact_size`, which this theme sets
+    // to 20 -- so a chooser between two `SECTION_FIELD_HEIGHT` boxes came out
+    // shorter than both AND sitting lower than both, because a short widget in
+    // an `Align::Center` row is centred on a line the taller boxes set.
+    // Measured on the websites row: the URL box at 538..566 and the match
+    // chooser at 543..569. The owner, with that row screenshotted: "fields are
+    // not aligned".
+    //
+    // `folder_combo` had already found this once ("render as per design -
+    // should be same height") and fixed it on itself; the website chooser,
+    // written later, did not inherit the fix. It does now -- which is the
+    // whole argument for one door.
+    ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
+    egui::ComboBox::from_id_salt(id_salt).popup_style(form_popup_style())
+}
+
+/// **The one line that takes the gutter back off a drop-down**, applied to the
+/// POPUP's style and not to the `Ui` the combo was added to -- and that
+/// distinction is the whole of why the first fix did not take.
+///
+/// `ComboBox` builds its list with `Popup::menu(..).style(popup_style)`, and a
+/// `Popup` takes the CONTEXT's style rather than the style of the `Ui` the
+/// button sits in. So `ui.spacing_mut().scroll = ..` inside [`form_combo`]
+/// changed the button and nothing else: the list went on inheriting the form's
+/// 24-point lane from the context, and the owner reported the bar still there
+/// after it had been "fixed". `popup_style` is the hook egui provides for
+/// exactly this.
+///
+/// A named function rather than a closure inside [`form_combo`] so the reset
+/// can be asserted at all. A `StyleModifier` is an opaque `Arc<dyn Fn>` once it
+/// is inside a `ComboBox`, and the popup is drawn in a layer this file's
+/// harness does not collect -- so the only reachable proof that the gutter
+/// comes off is to apply the modifier to a `Style` that HAS one and look.
+///
+/// Put back to egui's own default, which is what every list in this app that
+/// has NOT asked for a gutter gets -- `theme::apply` sets no `ScrollStyle`,
+/// and `scrollbar_in_gutter` is a per-surface opt-in a drop-down never took.
+/// The rest of the context's style is untouched: this writes one field.
+fn form_popup_style() -> egui::style::StyleModifier {
+    egui::style::StyleModifier::new(|style| {
+        style.spacing.scroll = egui::style::ScrollStyle::default();
+    })
 }
 
 /// The folder chooser, drawn identically in both arms of the `ITEM` card.
@@ -8854,27 +8921,8 @@ fn folder_combo(
     // belonging to nothing. Unresolvable now falls through to "No folder",
     // which is at least a state the sidebar agrees exists.
     let assignable = assignable_folders(folders);
-    // **8a's `height: 34px`, which is what the two cells beside it are.**
-    //
-    // egui sizes a combo's button from `interact_size`, which this theme sets
-    // to 20 -- so the `ITEM` card's three cells were a 30-point chooser
-    // between two 34-point boxes. The owner, with the row screenshotted:
-    // "render as per design - should be same height".
-    ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
-    // **The form's scroll settings do not belong in this popup.**
-    //
-    // `draw_detail_edit` scopes `theme::scrollbar_in_gutter(ui, FORM_PAD_X)`
-    // over the whole card column so the form's own bar sits in a 24-point
-    // lane. Those are `Style::spacing.scroll` values, so every `Ui` under
-    // that scope inherits them -- including the one egui builds for a combo
-    // box's drop-down, which is a `ScrollArea` of its own. A list of three
-    // folders was therefore drawn with a 24-point lane and a bar down it:
-    // the owner's "Folder has scroll in dropdown".
-    //
-    // Put back to egui's own default, which is what every list in this app
-    // that has NOT asked for a gutter gets: `theme::apply` sets no
-    // `ScrollStyle` of its own -- `scrollbar_in_gutter` is a per-surface
-    // opt-in, and this surface did not opt in.
+    // The row's height and the drop-down's scroll lane are both `form_combo`'s
+    // now, and both were found here first -- see it for the two measurements.
     form_combo(ui, "edit-folder")
         // The cell's full width in the grid arm, which is what makes three
         // controls of three different natural widths read as a row. egui's
@@ -10401,6 +10449,18 @@ pub fn draw_detail_edit(
                 // The block carries its own Remove per row, so the slot has
                 // none of its own -- see [`Slot::Websites`].
                 websites_block(ui, &mut draft.uris, creating);
+                // **8a's one hairline on this card falls out of the rows**,
+                // between the websites group and the native-apps group: the
+                // design's `border-bottom: 1px solid #f3f2f2` on the websites
+                // cell. `theme::section_row` takes a rule above itself unless
+                // it is the body's first, and each website is its own row
+                // inside its own `scope_builder` -- so the websites stack
+                // ruleless, as one cell, and the `Matched app` row below them
+                // draws the one line. Both arms below go through that row for
+                // exactly this reason; the unbound one used to draw a loose
+                // `field_label` instead, and the hairline was missing on
+                // every item with no binding. The owner: "should be separator
+                // between web and native".
                 match draft.app.as_mut() {
                     Some(app) => {
                         if let Some(requested) = app_block(ui, app, apps) {
@@ -20867,40 +20927,69 @@ mod edit_pane_layout_tests {
         );
     }
 
-    /// **8a's `+ Pick a running window` is a LINK, not the outlined button it
-    /// replaced.**
+    /// **8a's `+ ` links are LINKS, in the design's own weight and blue** --
+    /// not the outlined buttons two of them replaced.
     ///
     /// The other half of the split above, and the reason that one could give
-    /// its comparison up: the control is still asserted, by the two things
-    /// that say it is a link -- `theme::link_label`'s [`theme::BLUE`] and the
-    /// 12pt the design sets its links in -- rather than by the button
-    /// measurements it no longer has. A regression to
-    /// `theme::secondary_button` is 13pt semibold in [`theme::INK`] and fails
-    /// both.
+    /// its comparison up: the control is still asserted, by the three things
+    /// that say it is this design's link -- the 12pt it sets links in, its
+    /// `font-weight: 600`, and its `color: #14307a` -- rather than by button
+    /// measurements the control no longer has. A regression to
+    /// `theme::secondary_button` is 13pt in [`theme::INK`] and fails two of
+    /// the three.
+    ///
+    /// **All three of the card's adders, in one test**, because the defect
+    /// they were reported for was precisely that they had drifted apart:
+    /// `+ Add website` and `+ Pick a running window` were
+    /// `theme::link_label`'s regular weight and lighter [`theme::BLUE`] ("not
+    /// bold as per design"), and `Add an app\u{2026}` was an outlined button
+    /// while the other two were type ("add app is link as well to match the
+    /// design"). One assertion over the set is what stops the next one being
+    /// added in whatever the nearest helper happened to be.
     #[test]
-    fn the_pick_a_window_link_is_a_link_and_not_a_button() {
+    fn the_cards_add_links_are_links_and_not_buttons() {
         let ctx = styled_context(ROOMY_PANE);
+        // The BOUND form, which is where `+ Pick a running window` is drawn.
         let mut draft = tallest_draft();
         let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
-        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+        let bound = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
+        // A SAVED item with a website and no binding, which is where the
+        // other two are: `tallest_draft` is a create, and a create offers
+        // neither a website row nor an app -- both say "once this item has
+        // been saved" instead.
+        let item = login_with_websites(1);
+        let mut saved = EditDraft::from_item(&item);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, ROOMY_PANE, &mut saved, false, &[], Some(&item), &totp);
+        let unbound = frame_for(&ctx, ROOMY_PANE, &mut saved, false, &[], Some(&item), &totp);
 
-        assert_eq!(
-            painted.font_of(APP_PICK_LINK),
-            egui::FontId::new(TARGET_LINK_PX, egui::FontFamily::Proportional),
-            "{APP_PICK_LINK:?} is not set at the size 8a sets its links in"
-        );
-        let ink = painted
-            .inks
-            .iter()
-            .find(|(t, _)| t == APP_PICK_LINK)
-            .map(|(_, c)| *c)
-            .expect("the link was found above, so it has an ink");
-        assert_eq!(
-            ink,
-            theme::BLUE,
-            "{APP_PICK_LINK:?} is painted {ink:?}, not `theme::link_label`'s blue -- a run the \
-             user has no reason to think is clickable"
-        );
+        for (link, painted) in [
+            (WEBSITE_ADD_BUTTON, &unbound),
+            (APP_PICK_LINK, &bound),
+            (APP_ADD_BUTTON, &unbound),
+        ] {
+            assert_eq!(
+                painted.font_of(link),
+                egui::FontId::new(
+                    TARGET_LINK_PX,
+                    egui::FontFamily::Name(theme::SEMIBOLD.into())
+                ),
+                "{link:?} is not set the way 8a sets its links -- `font-size: 12px; \
+                 font-weight: 600`"
+            );
+            let ink = painted
+                .inks
+                .iter()
+                .find(|(t, _)| t == link)
+                .map(|(_, c)| *c)
+                .expect("the link was found above, so it has an ink");
+            assert_eq!(
+                ink,
+                theme::BLUE_DEEP,
+                "{link:?} is painted {ink:?}, not the design's `color: #14307a` -- either a \
+                 run the user has no reason to think is clickable, or a second blue on one card"
+            );
+        }
     }
 
     /// **Both of the app card's own controls are reachable at the app's
@@ -25647,7 +25736,136 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// **The folder drop-down does not inherit the FORM's scroll gutter.**
+    /// **A website's match chooser is the same box as the field beside it**,
+    /// top and bottom.
+    ///
+    /// egui sizes a `ComboBox`'s button from `interact_size.y`, which this
+    /// theme sets to 20 -- so a chooser dropped beside a
+    /// `theme::SECTION_FIELD_HEIGHT` box comes out SHORTER than it, and,
+    /// because `Ui::horizontal` centres, sitting LOWER than it too. Measured
+    /// before the fix: the URL box at 538..566 and the chooser at 543..569,
+    /// two points short and five points down. The owner, with that row
+    /// screenshotted: "fields are not aligned".
+    ///
+    /// `folder_combo` had already found and fixed this on itself; the website
+    /// chooser, written later, did not inherit it. The height now belongs to
+    /// `form_combo`, which every combo on this form is built through -- so
+    /// this is asserted on the WEBSITE row deliberately, as the one that was
+    /// wrong, rather than on the folder row that was always right.
+    ///
+    /// Both edges, not just the height: a box of the right height in the
+    /// wrong place is the half of the report a height check cannot see.
+    #[test]
+    fn a_websites_match_chooser_is_the_same_box_as_its_field() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        // Found through the ink each box holds, so neither is identified by a
+        // coordinate this test would then be asserting against itself.
+        // The smallest box round each run that is a CONTROL and not the
+        // text's own layout rect: `frame_around` alone answers the latter for
+        // a text field, whose galley carries a tight box of its own.
+        let box_round = |run: &str| -> Rect {
+            let ink = painted.rect_of(run);
+            let mut found: Vec<Rect> = painted
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|r| r.contains_rect(ink) && r.height() >= theme::SECTION_FIELD_HEIGHT - 0.5)
+                .collect();
+            found.sort_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())));
+            *found.first().unwrap_or_else(|| panic!("no control box round {run:?}"))
+        };
+        let field = box_round("https://site0.example");
+        let chooser = box_round(UriMatchChoice::BaseDomain.label());
+
+        assert!(
+            (chooser.top() - field.top()).abs() <= 0.5
+                && (chooser.bottom() - field.bottom()).abs() <= 0.5,
+            "the match chooser is {:?} and the website box beside it is {:?} -- one row, two \
+             boxes, and they do not line up",
+            chooser,
+            field
+        );
+        assert!(
+            (field.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5,
+            "the premise failed: the website box is {}pt and not theme::SECTION_FIELD_HEIGHT, \
+             so the chooser above was compared against the wrong thing",
+            field.height()
+        );
+    }
+
+    /// **One hairline on the autofill card: between the websites and the
+    /// native app, and nowhere else.**
+    ///
+    /// 8a draws `Autofill targets` as two cells -- a column of website boxes
+    /// with `+ Add website` under them, then the app rows with their own link
+    /// -- separated by a single `border-bottom: 1px solid #f3f2f2`, with no
+    /// line between two websites. The owner: "should be separator between web
+    /// and native".
+    ///
+    /// **It falls out of `theme::section_row`'s own rule** and is asserted
+    /// here rather than at a call site, because the mechanism is indirect
+    /// enough to be broken by a change that looks unrelated: each website is a
+    /// row inside its own `scope_builder`, so each has its own body state,
+    /// thinks it is that body's first row, and takes no rule -- which is what
+    /// makes the group read as one cell. The single line is then the
+    /// `Matched app` row's.
+    ///
+    /// **The UNBOUND arm**, which is the one that was wrong: it drew a loose
+    /// `theme::field_label` instead of a row, so the card had no line at all
+    /// on any item with no binding.
+    ///
+    /// Two websites, so a build that rules between them fails here rather
+    /// than passing on a card that has only one.
+    #[test]
+    fn the_autofill_card_rules_between_its_two_groups_and_not_inside_them() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(2);
+        let mut draft = EditDraft::from_item(&item);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        // The card's span: from its title to the next card's.
+        let top = painted
+            .rect_of(&Section::Autofill.title(ItemKind::Login).to_uppercase())
+            .bottom();
+        let bottom = painted.rect_of(FIELDS_CARD_TITLE).top();
+        let rules: Vec<f32> = painted
+            .rects
+            .iter()
+            .filter(|(r, c)| {
+                r.height() <= 1.5 && r.top() > top && r.bottom() < bottom && *c == theme::CANVAS
+            })
+            .map(|(r, _)| r.top())
+            .collect();
+        assert_eq!(
+            rules.len(),
+            1,
+            "the autofill card draws {} hairlines between its title and the next card's, not \
+             the design's one: {rules:?}",
+            rules.len()
+        );
+
+        // ...and it is between the groups, not inside either.
+        let last_website = painted.rect_of(WEBSITE_ADD_BUTTON).bottom();
+        let app = painted.rect_of(APP_BLOCK_HEADING).top();
+        assert!(
+            rules[0] > last_website && rules[0] < app,
+            "the card's one hairline is at y = {}, which is not between the websites group \
+             (ending at {last_website}) and the native app group (starting at {app})",
+            rules[0]
+        );
+    }
+
+    /// **A drop-down on this form does not inherit the FORM's scroll gutter.**
     ///
     /// `draw_detail_edit` scopes `theme::scrollbar_in_gutter` over the whole
     /// card column so its own bar sits in a 24-point lane. Those are
@@ -25655,37 +25873,44 @@ mod edit_pane_layout_tests {
     /// inherits them -- including the one egui builds for a combo box's
     /// drop-down, which is a `ScrollArea` of its own. A list of five folders
     /// was drawn with a 24-point lane and a bar down it: the owner's "Folder
-    /// has scroll in dropdown".
+    /// has scroll in dropdown", and then, on the website match chooser,
+    /// "scroll not needed here for just one record".
     ///
-    /// Asserted on the spacing `folder_combo` leaves behind rather than on
-    /// the painted popup, because a popup is drawn in a layer this harness
-    /// does not collect -- and because the lane is the cause, where the bar
-    /// is only the symptom.
+    /// **Asserted on the POPUP's style and not on the parent `Ui`'s**, which
+    /// is the correction the first fix needed. Resetting `ui.spacing_mut()`
+    /// inside `form_combo` passed a test written against that same `Ui` and
+    /// changed nothing on screen, because `Popup::menu(..).style(..)` builds
+    /// from the CONTEXT's style -- so the list went on inheriting the lane
+    /// and the owner reported the bar still there. What has to be true is
+    /// that [`form_popup_style`] takes the gutter off a style that has one;
+    /// the popup itself is drawn in a layer this harness does not collect.
     #[test]
-    fn the_folder_chooser_does_not_inherit_the_forms_scroll_gutter() {
+    fn a_drop_down_on_this_form_does_not_inherit_its_scroll_gutter() {
+        // A style carrying the form's own lane, exactly as `draw_detail_edit`
+        // leaves it for everything drawn under that scope.
         let ctx = styled_context(Vec2::new(WIDE_PANE_WIDTH, 800.0));
-        let mut draft = full_login_draft();
-        let mut seen = None;
+        let mut gutter = None;
         let _ = ctx.run_ui(raw_input(Vec2::new(WIDE_PANE_WIDTH, 800.0), &[]), |ui| {
-            // The form's own lane, exactly as `draw_detail_edit` sets it.
             theme::scrollbar_in_gutter(ui, f32::from(FORM_PAD_X));
-            assert!(
-                ui.spacing().scroll.floating_allocated_width > 0.0,
-                "the premise failed: the gutter was not applied, so the assertion below \
-                 would pass against a build that still inherited it"
-            );
-            folder_combo(ui, &mut draft, &[], true);
-            seen = Some(ui.spacing().scroll);
+            gutter = Some((*ui.style().clone()).clone());
         });
-        let left = seen.expect("the form drew");
+        let mut style = gutter.expect("the form drew");
+        assert!(
+            style.spacing.scroll.floating_allocated_width > 0.0,
+            "the premise failed: the gutter was not applied, so the assertion below \
+             would pass against a build that still inherited it"
+        );
+
+        form_popup_style().apply(&mut style);
+
         let plain = egui::style::ScrollStyle::default();
         assert_eq!(
-            left.floating_allocated_width, plain.floating_allocated_width,
-            "the folder chooser left the form's {}pt scroll lane on its own `Ui`, so the \
-             drop-down under it reserves one too",
-            left.floating_allocated_width
+            style.spacing.scroll.floating_allocated_width, plain.floating_allocated_width,
+            "a drop-down opened from this form keeps the form's {}pt scroll lane, so it \
+             reserves one however short its list is",
+            style.spacing.scroll.floating_allocated_width
         );
-        assert_eq!(left.bar_width, plain.bar_width);
+        assert_eq!(style.spacing.scroll.bar_width, plain.bar_width);
     }
 
     /// **Two rows of a card are separated by a full-bleed hairline**, the way

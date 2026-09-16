@@ -3714,6 +3714,29 @@ pub fn link_label(ui: &mut Ui, text: &str, size: f32) -> Response {
     link_widget(ui, egui::Label::new(RichText::new(text).size(size).color(BLUE)))
 }
 
+/// 8a's `+ Add website` / `+ Pick a running window`: the same link, in the
+/// design's **`font-weight: 600` and `color: #14307a`**.
+///
+/// Both runs are written that way in `Deskwarden.dc.html` -- `font-size: 12px;
+/// font-weight: 600; color: #14307a` -- and this app drew them in
+/// [`link_label`]'s regular weight and [`BLUE`], which is a lighter blue. The
+/// owner, with the card's two links screenshotted beside the design: "not bold
+/// as per design", and "add app is link as well to match the design".
+///
+/// A second door rather than a weight argument on [`link_label`], because the
+/// difference is not decoration: these two are the only links on the form that
+/// ADD a row, and the design sets them apart from the ordinary blue of a
+/// website that merely opens ([`link_label`]'s one other caller on the read
+/// pane). One name per treatment keeps that distinction where a reader can
+/// see it.
+///
+/// The colour is [`BLUE_DEEP`], which is `#14307a` exactly, and the weight is
+/// [`semibold`]'s named family -- egui has no weight axis, so 600 is a face
+/// and not a flag. See [`font_definitions`].
+pub fn action_link(ui: &mut Ui, text: &str, size: f32) -> Response {
+    link_widget(ui, egui::Label::new(semibold(text, size).color(BLUE_DEEP)))
+}
+
 /// The same link, from text the caller has **already laid out**.
 ///
 /// A `Galley` rather than a `&str` because the one other link on this app's
