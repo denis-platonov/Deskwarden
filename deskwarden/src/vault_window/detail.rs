@@ -198,9 +198,21 @@ pub(crate) const BODY_PAD_Y: i8 = 18;
 const CARD_GAP: f32 = 14.0;
 /// A card's `padding: 11px 16px` heading and `padding: 13px 16px` rows -- one
 /// horizontal padding, two vertical ones.
-const CARD_PAD_X: i8 = 16;
+/// `pub(crate)` for [`ROW_PAD_Y`]'s reason, one axis over: the EDIT form's
+/// previous-password rows are these bands, so the distance from the card's
+/// edge to a date on that form is this number and not the form's own
+/// `theme::section_card_pad_x`. The test that pins it says so by reading this.
+pub(crate) const CARD_PAD_X: i8 = 16;
 const CARD_HEADING_PAD_Y: i8 = 11;
-const ROW_PAD_Y: i8 = 13;
+/// `pub(crate)` so the EDIT form can **cancel** it. That form draws this
+/// pane's previous-password rows through [`history_rows`], and one of these
+/// rows is a *band*: a `Frame` that pays its own `13px 16px` and is sensed
+/// from outside it, so the hover tint and the hit area are the whole row. The
+/// edit form's card body has already paid the same 13 points
+/// (`theme::SECTION_CARD_PAD_Y`, which is this number read across), so a band
+/// dropped into it is padded twice. `theme::section_row_bleed` subtracts this
+/// constant rather than a same-valued one of its own.
+pub(crate) const ROW_PAD_Y: i8 = 13;
 /// `font-size: 12px; font-weight: 700; letter-spacing: 0.06em` on a card's
 /// heading, in points (0.06em x 12px).
 /// 8a's `One-time code` card, in this pane's own capitals.
@@ -4201,7 +4213,7 @@ pub fn draw_detail_read(
         .any(|entry| masked_row_visible(entry.password.as_str()))
     {
         card(ui, "PREVIOUS PASSWORDS", |ui| {
-            history_rows(ui, &history, reveal, &mut action);
+            history_rows(ui, &history, &mut reveal.password_history, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -8319,35 +8331,30 @@ pub fn history_label(last_used_date: Option<&str>) -> String {
     }
 }
 
-/// **When each of this item's previous passwords stopped being the current
-/// one, newest first, as the EDIT form needs it.**
+/// **How many of an item's previous passwords will actually be DRAWN**, which
+/// is what the EDIT form's `Password history (3)` caption counts.
 ///
-/// The edit form surfaces the same history this pane draws -- design 8a puts
-/// `Password history (3)` on its `Login credentials` card, and the form's own
-/// footer already promises that saving a new password "will be added to
-/// history" -- so there are now two screens showing one list, and the wording
-/// of a date is exactly the kind of thing that ends up spelled two ways.
-/// [`history_label`] lives here because this pane wrote it; this function is
-/// how the other one asks for it.
+/// Not `password_history(item).len()`: an entry whose password is empty draws
+/// no row at all (see [`masked_row_visible`]), here or on the edit form, and a
+/// caption taken off the raw array would be a second answer to "how many
+/// previous passwords has this item got" -- one number in the caption and a
+/// different number of rows behind it.
 ///
-/// **Dates and nothing else.** The entries themselves are
-/// `Zeroizing<String>` plaintext passwords, and the edit form has no use for
-/// them: it draws the list read-only, masked, with no reveal and no copy (see
-/// `detail_edit::history_block` for that argument). Handing it a
-/// `Vec<PasswordHistoryEntry>` would put every old password of the item on the
-/// other side of a module boundary for no drawing that needs one, and the
-/// vector would be rebuilt on every frame of an open form.
-///
-/// Filtered by [`masked_row_visible`], the same gate this pane's own card is
-/// drawn behind: an entry whose password is empty draws no row here and must
-/// not be counted there, or the two screens would disagree about how many
-/// previous passwords an item has.
-pub fn password_history_dates(item: &VaultItem) -> Vec<String> {
-    password_history(item)
+/// **It is what is left of `password_history_dates`, whose premise expired.**
+/// That function handed the edit form a `Vec<String>` of dates and argued that
+/// the entries themselves must not cross the module boundary because the form
+/// "draws the list read-only, masked, with no reveal and no copy". The form
+/// now draws that list through [`history_rows`] -- this pane's rows, this
+/// pane's reveal, this pane's copy -- so it holds the entries for exactly the
+/// reason this pane holds them, and the two screens say the same words about a
+/// date by running the same [`history_label`] rather than by having one screen
+/// precompute strings for the other. What the form still cannot get from a row
+/// it has not drawn yet is the count on the shut caption, so that is this.
+pub fn visible_history_count(history: &[PasswordHistoryEntry]) -> usize {
+    history
         .iter()
         .filter(|entry| masked_row_visible(entry.password.as_str()))
-        .map(|entry| history_label(entry.last_used_date.as_deref()))
-        .collect()
+        .count()
 }
 
 /// The PREVIOUS PASSWORDS rows: one masked row per entry, each driven by its
@@ -8363,10 +8370,36 @@ pub fn password_history_dates(item: &VaultItem) -> Vec<String> {
 ///
 /// The copy action carries the row's INDEX, not its value -- see
 /// [`DetailAction::CopyPasswordHistory`].
-fn history_rows(
+///
+/// **`pub(crate)`, because the EDIT form draws these rows too.** It used to
+/// draw a second list of its own -- dates beside a fixed run of dots, no
+/// reveal, no copy -- and the owner, shown it: "not sure how to use this",
+/// then "make it reveal and copy like read pane". One renderer rather than two
+/// is the whole of the answer: a second implementation is what let one screen
+/// keep a mask that could not be lifted while the other had an eye on every
+/// row.
+///
+/// Two things had to give for one renderer to serve both, and neither is
+/// cosmetic:
+///
+/// * **The flags are an array, not a [`RevealState`].** This pane owns a
+///   `RevealState` because it has five masked rows; the edit form has exactly
+///   these, and handing it the other four flags would be handing it state it
+///   must not have. The parameter is now the one field that was ever read
+///   here, so the form stores `[bool; MAX_HISTORY_ROWS]` on its draft and the
+///   two panes drive one renderer from the same shape.
+/// * **It still reports a [`DetailAction`], and the edit form translates.**
+///   The form's own vocabulary is `EditAction`; it passes a local
+///   `DetailAction`, reads the index straight back out of it and re-reports it
+///   as `EditAction::CopyPasswordHistory`. Parameterising the renderer over
+///   the action type was the alternative and it buys nothing: the only variant
+///   this function can produce is `CopyPasswordHistory(index)`, so the generic
+///   would be one type parameter threaded through `masked_row`, `copy_row` and
+///   `row_impl` to spell one `if let` at the single call site that needs it.
+pub(crate) fn history_rows(
     ui: &mut egui::Ui,
     history: &[PasswordHistoryEntry],
-    reveal: &mut RevealState,
+    reveal: &mut [bool; MAX_HISTORY_ROWS],
     action: &mut DetailAction,
 ) {
     // **`owed`, not `index > 0`.** An entry whose password is empty draws no
@@ -8386,7 +8419,7 @@ fn history_rows(
             ui,
             &history_label(entry.last_used_date.as_deref()),
             entry.password.as_str(),
-            &mut reveal.password_history[index],
+            &mut reveal[index],
             action,
             DetailAction::CopyPasswordHistory(index),
             MaskedFace::default(),
@@ -20940,18 +20973,26 @@ mod tests {
         item
     }
 
-    /// **What the EDIT form is handed, and what it is not.**
+    /// **What the EDIT form's caption counts, and what it must not.**
     ///
-    /// `password_history_dates` exists so the two screens over one list say
-    /// the same words about a date, and so the form never gets the passwords
-    /// themselves. Both halves are asserted: the dates come back in
-    /// `history_label`'s own wording, and an entry whose password is empty is
-    /// not among them -- that entry draws no row on this pane either (see
-    /// `masked_row_visible`), and a count the form drew from a different rule
-    /// would be a second answer to "how many previous passwords has this item
-    /// got".
+    /// Retargeted from `the_edit_forms_history_is_this_panes_dates_and_nothing
+    /// _else`, whose subject was `password_history_dates` -- the function that
+    /// handed the form a `Vec<String>` of dates precisely so the form would
+    /// never hold a previous password. **That premise is gone**: the form
+    /// draws `history_rows`, this pane's own renderer, so it holds the entries
+    /// for the reason this pane does and the two screens share a date's
+    /// wording by sharing `history_label` rather than by one precomputing for
+    /// the other. Half of the old claim went with it; the half that survives
+    /// is the filter, and it is the half that could still go wrong silently.
+    ///
+    /// An entry whose password is empty draws no row on either pane (see
+    /// `masked_row_visible`), so a caption that counted it would promise a row
+    /// the list does not have -- two answers to "how many previous passwords
+    /// has this item got", one in `Password history (3)` and a different one
+    /// behind it. [`visible_history_count`] is that one rule, and this pins
+    /// it.
     #[test]
-    fn the_edit_forms_history_is_this_panes_dates_and_nothing_else() {
+    fn the_edit_forms_history_count_leaves_out_the_rows_neither_pane_draws() {
         let mut item = a_login_with_history(2);
         // A third entry that this pane refuses to draw.
         let history = item
@@ -20961,27 +21002,27 @@ mod tests {
             .expect("the fixture has a history");
         history.push(serde_json::json!({ "password": "", "lastUsedDate": null }));
 
-        let dates = password_history_dates(&item);
+        let entries = password_history(&item);
         assert_eq!(
-            dates.len(),
-            2,
-            "the empty entry was counted, so the form and this pane disagree about how many \
-             previous passwords the item has: {dates:?}"
+            entries.len(),
+            3,
+            "the fixture did not take the undrawable entry, so the count below would be a \
+             measurement of nothing: {entries:?}"
         );
-        let expected = history_label(Some(&super::test_clock::days_ago(
-            super::test_clock::HISTORY_AGE_DAYS,
-        )));
-        assert!(
-            dates.iter().all(|when| *when == expected),
-            "the form is handed a different wording from this pane's own rows: {dates:?} \
-             against {expected:?}"
+        assert_eq!(
+            visible_history_count(&entries),
+            2,
+            "the empty entry was counted, so the form's caption and the rows behind it \
+             disagree about how many previous passwords the item has"
         );
         // The positive control on the filter: an item with nothing drawable
-        // hands back nothing at all, which is what makes the count above a
+        // counts nothing at all, which is what makes the 2 above a
         // measurement rather than a coincidence.
-        assert!(
-            password_history_dates(&a_login()).is_empty(),
-            "an item with no history handed the form a non-empty list"
+        assert_eq!(
+            visible_history_count(&password_history(&a_login())),
+            0,
+            "an item with no history got a non-zero count, so the form would draw a \
+             `Password history (n)` link onto an empty list"
         );
     }
 

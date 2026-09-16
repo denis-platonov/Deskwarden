@@ -1800,6 +1800,30 @@ pub struct EditDraft {
     /// three rows of it under the password box spends the card's best space on
     /// the past. See [`history_block`].
     pub history_open: bool,
+    /// Which of the open list's rows have had their eye clicked -- **one flag
+    /// per row**.
+    ///
+    /// **View state**, on the draft and excluded from [`Self::content_digest`]
+    /// for [`Self::add_menu_open`]'s reason, and here the argument is even
+    /// shorter than it is there: the form never writes the password history at
+    /// all, so a revealed row cannot be a change to the item under any
+    /// reading.
+    ///
+    /// It has to live across frames for the reason
+    /// [`detail::RevealState`]'s doc gives in full: a flag owned by the draw
+    /// closure is dropped when the frame ends, and the next frame paints the
+    /// value masked again -- a toggle that visibly does nothing, a bug this
+    /// very file shipped once.
+    ///
+    /// **A fixed-size array of eight, and both halves are taken from
+    /// [`detail::RevealState::password_history`] rather than decided again**:
+    /// one flag per row, because a shared `bool` would reveal every previous
+    /// password of the item at one click; and an array rather than a `Vec`,
+    /// because that is the shape [`detail::history_rows`] takes, so the read
+    /// pane and this form drive one renderer off one type. [`EditDraft`] is
+    /// not `Copy` and does not need to be -- the array is here to match the
+    /// renderer, not to keep a bound.
+    pub history_reveal: [bool; detail::MAX_HISTORY_ROWS],
 }
 
 /// The four character classes, in a wrapper that **cannot hold all four off**.
@@ -2212,6 +2236,7 @@ impl Default for EditDraft {
             revealed: std::collections::BTreeSet::new(),
             add_menu_open: false,
             history_open: false,
+            history_reveal: [false; detail::MAX_HISTORY_ROWS],
         }
         // A blank form has nothing to lose, and `is_dirty` has to say so from
         // the first frame. Every other constructor routes through this one or
@@ -2421,6 +2446,13 @@ impl EditDraft {
             revealed: std::collections::BTreeSet::new(),
             add_menu_open: false,
             history_open: false,
+            // **Every row masked, whatever the item carries.** The read pane
+            // opens the same rows masked (`RevealState::default()`), and a
+            // form that opened with every previous password of the item in the
+            // clear would be the standing liability the old read-only refusal
+            // was written about. The reveal is per row and it is the user's
+            // click.
+            history_reveal: [false; detail::MAX_HISTORY_ROWS],
         }
         // **What the item HAS is what the form shows.** See [`Slot`].
         .reveal_what_is_filled()
@@ -2845,6 +2877,10 @@ impl EditDraft {
             revealed: _,
             add_menu_open: _,
             history_open: _,
+            // View state too, and the clearest case of it on the struct: the
+            // form never writes the password history, so a row the user
+            // revealed cannot be a change to the item under any reading.
+            history_reveal: _,
         } = self;
         let CardDraft {
             cardholder_name,
@@ -4157,6 +4193,30 @@ pub enum EditAction {
     CopyUsername,
     /// See [`Self::CopyUsername`].
     CopyPassword,
+    /// **One PREVIOUS PASSWORDS row's `Copy`**, identified by its index into
+    /// `vault_bridge::password_history(item)`.
+    ///
+    /// The index and not the value, for the reason
+    /// [`Self::CopyUsername`] carries neither and one more that is specific to
+    /// this row. The shared reason: a `String` here would stop `EditAction`
+    /// being `Copy`, which every arm of two exhaustive matches in
+    /// `vault_window::mod` relies on. The specific one is
+    /// `detail::DetailAction::CopyPasswordHistory`'s own: a previous password
+    /// IS a password, this enum is built by the render pass and lives for the
+    /// frame, and the caller already holds the item -- so the
+    /// `Zeroizing<String>` is read back out of the item rather than given a
+    /// second, non-zeroizing home in here.
+    ///
+    /// **Answered off the ITEM and not the draft**, which is the one place
+    /// this differs from the two rows above it. The history is the single
+    /// thing on this card that is not being edited: the form never holds it,
+    /// never writes it, and the entry the current password becomes on save is
+    /// added by the server. Reading a draft field for it would be reading a
+    /// field that does not exist.
+    ///
+    /// Behind the same re-prompt, against the same item, as every other copy
+    /// on either pane.
+    CopyPasswordHistory(usize),
     /// **The `One-time code` card's `Add` or `Replace by scanning`.**
     ///
     /// Both raise this and the window answers both the same way: it opens
@@ -4625,26 +4685,6 @@ pub fn history_button(count: usize) -> String {
     format!("Password history ({count})")
 }
 
-/// What the open list says under its rows.
-///
-/// **Because the list withholds the passwords themselves**, and a list of
-/// dates beside eight bullets each is a thing a user will otherwise go looking
-/// for a reveal on. It says where the reveal is instead.
-pub const HISTORY_READ_ONLY_NOTE: &str =
-    "Shown here read-only. Close this form to reveal or copy a previous password.";
-
-/// How the list says it is not showing everything.
-///
-/// Stated and never silent, exactly as the read pane's own card states it: a
-/// previous password quietly omitted is indistinguishable from one the user
-/// never had.
-fn history_truncation(hidden: usize) -> String {
-    format!(
-        "{hidden} older {} not shown here.",
-        if hidden == 1 { "password is" } else { "passwords are" }
-    )
-}
-
 /// **The credentials card's password history: §8a's `Password history (3)`,
 /// and the list behind it.**
 ///
@@ -4655,15 +4695,23 @@ fn history_truncation(hidden: usize) -> String {
 /// current password to a history the form would not then show. This closes
 /// that loop on the screen that makes the promise.
 ///
-/// **Read-only, masked, with no reveal and no copy, and that is a decision
-/// rather than an omission.** This is the one screen in the app whose whole
-/// purpose is to CHANGE the password; an old password in the clear on it has
-/// no use here that the read pane -- one Cancel away, with a per-row reveal
-/// and a copy shortcut already built -- does not serve better, and it is a
-/// standing liability on a form a user leaves open while they work. What the
-/// form needs from the history is the shape of it: how many, and when. That is
-/// what [`detail::password_history_dates`] hands over, and it hands over
-/// nothing else, so this block never holds a previous password at all.
+/// **It reveals and copies, and the refusal that used to stand here is
+/// gone.** This block shipped drawing dates beside a fixed run of dots, under
+/// a note reading "Shown here read-only. Close this form to reveal or copy a
+/// previous password." -- and a doc paragraph arguing that a reveal here would
+/// be a standing liability on a form the user leaves open. The owner, shown
+/// it: "not sure how to use this", then "make it reveal and copy like read
+/// pane". The argument had in any case expired on its own premises: the form
+/// has clipboard routes now (`Copy` on the username and the password rows,
+/// behind the same re-prompt the read pane's take) and it does not mask the
+/// password box at all, so "close this form to reveal" pointed at a stricter
+/// screen that no longer existed.
+///
+/// So there is no second list any more. The rows are
+/// [`detail::history_rows`] -- the read pane's own renderer, its own per-row
+/// eye, its own `Copy` -- drawn through [`theme::section_row_bleed`], which
+/// is what lets a band-shaped row live inside this card's padded body. See
+/// that function for the two paddings it cancels and the measurement.
 ///
 /// **A disclosure, shut by default**, for the two reasons this form's other
 /// two disclosures already give: a popup is a state no test and no screenshot
@@ -4729,74 +4777,6 @@ fn history_link(ui: &mut egui::Ui, count: usize) -> bool {
     }
     ui.painter().galley(at, galley, theme::BLUE_DEEP);
     response.clicked()
-}
-
-/// The previous passwords themselves, under the link that opens them.
-///
-/// **The link is not drawn here any more.** It moved onto the strength
-/// line -- see [`history_link`] -- so this is the list alone, and the
-/// caller draws it only while its own `history_open` is set.
-fn history_list(ui: &mut egui::Ui, dates: &[String]) {
-    if dates.is_empty() {
-        return;
-    }
-    // `MAX_HISTORY_ROWS` is the read pane's cap, taken from the read pane
-    // rather than chosen again here: two screens over one list must not
-    // disagree about where it stops. Unreachable against today's backend --
-    // Bitwarden's own `adjustPasswordHistoryLength` slices every save to five
-    // -- which is exactly why the truncation is stated rather than commented.
-    // **The dates get a column of their own, measured off the widest of
-    // them.** `4d ago` and `1y 102d ago` are thirty points apart, and three
-    // rows of masks each starting somewhere different read as three unrelated
-    // lines rather than as one list -- which is what the first render of this
-    // block showed. Measured rather than fixed: the wording is
-    // `relative_time::ago`'s, it is unbounded at the year end, and a literal
-    // here would be a number that only held until an item had a four-year-old
-    // password on it.
-    let face = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-    let column = dates
-        .iter()
-        .take(detail::MAX_HISTORY_ROWS)
-        .map(|when| {
-            ui.painter().layout_no_wrap(when.clone(), face.clone(), theme::TEXT_MUTED).size().x
-        })
-        .fold(0.0f32, f32::max);
-    for (index, when) in dates.iter().take(detail::MAX_HISTORY_ROWS).enumerate() {
-        if index > 0 {
-            ui.add_space(4.0);
-        }
-        ui.horizontal_wrapped(|ui| {
-            // The date leads, because the date is what identifies one previous
-            // password among five -- the same argument `detail::history_label`
-            // makes for putting it in that pane's label column.
-            let galley = ui.painter().layout_no_wrap(
-                when.clone(),
-                face.clone(),
-                theme::TEXT_MUTED,
-            );
-            // Clamped to what the row actually has: the control column is
-            // around 200 points in the shipped pane, and a cell allocated
-            // wider than the row would push the mask off the card rather than
-            // wrap it.
-            let (cell, _) = ui.allocate_exact_size(
-                egui::vec2(column.min(ui.available_width()), galley.size().y),
-                egui::Sense::hover(),
-            );
-            ui.painter().galley(cell.min, galley, theme::TEXT_MUTED);
-            // The same mask the keystroke builder draws, in the ghost ink
-            // rather than an accent: a mask is not a value, and colouring it
-            // like one would offer the eye something to read that is not
-            // there.
-            ui.label(RichText::new(SECRET_MASK).size(12.0).color(theme::TEXT_GHOST));
-        });
-    }
-    let hidden = dates.len().saturating_sub(detail::MAX_HISTORY_ROWS);
-    if hidden > 0 {
-        ui.add_space(4.0);
-        ui.label(RichText::new(history_truncation(hidden)).size(11.0).color(theme::TEXT_FAINT));
-    }
-    ui.add_space(6.0);
-    ui.label(RichText::new(HISTORY_READ_ONLY_NOTE).size(11.0).color(theme::TEXT_FAINT));
 }
 
 // ---------------------------------------------------------------------------
@@ -9105,7 +9085,21 @@ pub fn draw_detail_edit(
     // card is inside three nested closures by the time it needs this, and
     // `password_history` walks and clones the whole array. Empty on a CREATE,
     // where there is no item; `history_block` then draws nothing.
-    let history = item.map(detail::password_history_dates).unwrap_or_default();
+    //
+    // **The ENTRIES now, where this used to take `password_history_dates`'
+    // strings.** That function existed to keep the plaintext previous
+    // passwords on the read pane's side of the module boundary, on the ground
+    // that this form drew them masked with no reveal and no copy. It does not
+    // any more -- the rows here are `detail::history_rows`, the same renderer
+    // the read pane draws -- so the form needs what the renderer needs. See
+    // `history_block`.
+    let history = item.map(crate::vault_bridge::password_history).unwrap_or_default();
+    // **The count in `Password history (3)`, and the gate on the control.**
+    // Not `history.len()`: an entry whose password is empty draws no row on
+    // either pane, and a caption counting it would promise a row the list does
+    // not have. `detail::visible_history_count` is the one rule, asked rather
+    // than restated.
+    let history_count = detail::visible_history_count(&history);
 
     // **Which of the kind's rows this form is drawing, and which are behind
     // the Add control.** Both computed here, off the draft, before anything
@@ -9762,7 +9756,7 @@ pub fn draw_detail_edit(
                         // on the right". Wrapped, so a column too narrow for
                         // both drops the link to the next line instead of
                         // pushing it off the card.
-                        if !draft.password.is_empty() || !history.is_empty() {
+                        if !draft.password.is_empty() || history_count > 0 {
                             // **`horizontal`, NOT `horizontal_wrapped`**, and
                             // that is the whole of why the link finally sits
                             // on this line. A wrapped row wraps on a widget's
@@ -9796,7 +9790,7 @@ pub fn draw_detail_edit(
                                         draft.password.chars().count(),
                                     );
                                 }
-                                if !history.is_empty() && history_link(ui, history.len()) {
+                                if history_count > 0 && history_link(ui, history_count) {
                                     draft.history_open = !draft.history_open;
                                 }
                             });
@@ -9821,14 +9815,45 @@ pub fn draw_detail_edit(
                     // the link itself is on the strength line now, where 8a
                     // draws it and where the owner asked for it.
                     //
-                    // An empty-labelled row, so it starts at the control
-                    // column and not at the CARD's left edge, which is where
-                    // the label column is: a block under `Password` and level
-                    // with it reads as another field's worth of chrome rather
-                    // than as this password's own history.
-                    if draft.history_open && !history.is_empty() {
-                        theme::section_row(ui, "", |ui| {
-                            history_list(ui, &history);
+                    // **`detail::history_rows`, the READ pane's own rows** --
+                    // its label column, its per-row reveal eye, its `Copy`
+                    // target and its stated truncation -- rather than a second
+                    // list of this file's own. The owner, shown the second
+                    // list: "not sure how to use this", then "make it reveal
+                    // and copy like read pane". One renderer is what makes
+                    // that true and keeps it true; see `history_block`.
+                    //
+                    // **A full-bleed band, not a `section_row`.** It used to
+                    // be an empty-labelled `section_row`, which starts at the
+                    // control column -- right for a block of chrome hanging
+                    // off the password box, wrong for a LIST OF ROWS. These
+                    // are bands: each one senses and tints its whole width,
+                    // edge to edge across the card, exactly as the same rows
+                    // do one click away. `theme::section_row_bleed` is what
+                    // reconciles a band with this card's padded body, and it
+                    // cancels the two paddings by subtraction -- see it for
+                    // which two and why eyeballing them was not an option.
+                    if draft.history_open && history_count > 0 {
+                        theme::section_row_bleed(ui, detail::ROW_PAD_Y, |ui| {
+                            // **The bridge between the two panes'
+                            // vocabularies.** `history_rows` reports a
+                            // `DetailAction` because it is the read pane's,
+                            // and this form answers in `EditAction`; the
+                            // translation is one `if let` over a local,
+                            // because the only variant the renderer can
+                            // produce is this one. What crosses is the row's
+                            // INDEX and never the password -- see
+                            // `EditAction::CopyPasswordHistory`.
+                            let mut copied = detail::DetailAction::None;
+                            detail::history_rows(
+                                ui,
+                                &history,
+                                &mut draft.history_reveal,
+                                &mut copied,
+                            );
+                            if let detail::DetailAction::CopyPasswordHistory(index) = copied {
+                                action = EditAction::CopyPasswordHistory(index);
+                            }
                         });
                     }
 
@@ -19454,8 +19479,27 @@ mod edit_pane_layout_tests {
         }
     }
 
+    /// The date each of this fixture's rows is labelled with, in row order --
+    /// [`detail::history_label`]'s own wording, asked rather than written out.
+    ///
+    /// Written out it would be a second spelling of the thing the two panes
+    /// now share by construction, and it would rot the day
+    /// `relative_time::ago_days` reworded a year.
+    fn history_dates(item: &VaultItem) -> Vec<String> {
+        crate::vault_bridge::password_history(item)
+            .iter()
+            .map(|entry| detail::history_label(entry.last_used_date.as_deref()))
+            .collect()
+    }
+
     /// §8a's `Password history (3)` is on the credentials card, and the list
     /// behind it is shut.
+    ///
+    /// **The "shut" half is asserted against the DATES now.** It used to be
+    /// asserted against `HISTORY_READ_ONLY_NOTE`, the sentence the old
+    /// read-only list printed under its rows; that sentence is gone (see
+    /// [`history_block`]) and the dates are what the rows themselves paint, so
+    /// this asks about the list rather than about its footnote.
     #[test]
     fn the_credentials_card_says_how_many_previous_passwords_there_are() {
         let item = item_with_history(3);
@@ -19470,22 +19514,57 @@ mod edit_pane_layout_tests {
             "the credentials card does not say how many previous passwords there are: {:?}",
             painted.strings()
         );
-        assert!(
-            !painted.strings().contains(&HISTORY_READ_ONLY_NOTE),
-            "the shut list drew its contents anyway"
-        );
+        let dates = history_dates(&item);
+        assert!(!dates.is_empty(), "the fixture lost its history, so the absence below is vacuous");
+        for when in &dates {
+            assert!(
+                !painted.strings().iter().any(|s| *s == when.as_str()),
+                "the shut list drew its {when:?} row anyway: {:?}",
+                painted.strings()
+            );
+        }
     }
 
     /// Opening it lists every entry, each with the date it stopped being the
     /// current password.
+    ///
+    /// **And each with a reveal eye, which is the half this test gained.** It
+    /// used to assert that the open list printed `HISTORY_READ_ONLY_NOTE` --
+    /// "Close this form to reveal or copy a previous password." -- because
+    /// there was nothing on the rows to assert about instead. There is now:
+    /// the rows are `detail::history_rows`, so each one carries the same eye
+    /// the read pane's does. Counted by DIFFERENCE against the same form with
+    /// the list shut, because the form paints paths of its own (the combo
+    /// boxes' carets) and an absolute count would be pinning a number that
+    /// belongs to another control -- the same technique
+    /// `detail.rs`'s `the_previous_password_rows_fit_the_narrowest_pane`
+    /// uses for the identical reason.
     #[test]
     fn opening_the_password_history_lists_every_entry_with_its_date() {
         let item = item_with_history(3);
-        let mut draft = EditDraft::from_item(&item);
-        draft.history_open = true;
+        let dates = history_dates(&item);
         for width in [WIDE_PANE_WIDTH, MIN_PANE_WIDTH] {
             let pane = Vec2::new(width, 2400.0);
             let ctx = styled_context(pane);
+            let paths = |open: bool| -> usize {
+                let mut draft = EditDraft::from_item(&item);
+                draft.history_open = open;
+                frame_for(
+                    &ctx,
+                    pane,
+                    &mut draft,
+                    false,
+                    &[],
+                    Some(&item),
+                    &detail::TotpState::NoSecret,
+                )
+                .marks
+                .iter()
+                .filter(|(kind, _)| *kind == "a path")
+                .count()
+            };
+            let mut draft = EditDraft::from_item(&item);
+            draft.history_open = true;
             let painted = frame_for(
                 &ctx,
                 pane,
@@ -19496,34 +19575,48 @@ mod edit_pane_layout_tests {
                 &detail::TotpState::NoSecret,
             );
             let strings = painted.strings();
-            for when in detail::password_history_dates(&item) {
+            for when in &dates {
                 assert!(
-                    strings.iter().any(|s| *s == when),
+                    strings.iter().any(|s| *s == when.as_str()),
                     "the {width}pt form's open history is missing its {when:?} row: {strings:?}"
                 );
             }
-            assert!(
-                strings.contains(&HISTORY_READ_ONLY_NOTE),
-                "the {width}pt open list does not say where the reveal is: {strings:?}"
+            let eyes = paths(true) - paths(false);
+            assert_eq!(
+                eyes, 3,
+                "the {width}pt open list contributes {eyes} reveal eyes, not one per row -- \
+                 the owner asked for the read pane's reveal here and there is no other \
+                 control on these rows that could stand in for it"
             );
         }
     }
 
-    /// **The one assertion this feature must never lose.**
+    /// **A previous password is painted only by its OWN row's eye.**
     ///
-    /// The list is read-only and masked: it shows when, not what. A reveal
-    /// added here for symmetry with the read pane would put every old password
-    /// of an item on the one screen a user leaves open while they work, and
-    /// nothing else in this module would notice -- a revealed row is a
-    /// perfectly ordinary-looking label.
+    /// Retargeted from `a_previous_password_is_never_painted_on_the_edit_form`,
+    /// which asserted that no old password reached this screen in any state.
+    /// **That premise is deliberately gone**: the owner asked for the read
+    /// pane's reveal here ("make it reveal and copy like read pane"), so the
+    /// absolute refusal would now be a test against the feature. What replaces
+    /// it is the strictly weaker claim that is still worth everything -- the
+    /// rows open MASKED and one eye reveals exactly one row.
     ///
-    /// Asked in both states and at both widths, because "shut" is not a
-    /// defence: the block returns early on a shut list today, and a later
-    /// refactor that drew the rows and hid them behind a clip would still be
-    /// painting them.
+    /// The indexing is the load-bearing half, and it is the same slip
+    /// `detail::history_rows`' own doc records being made for real on the read
+    /// pane: `masked_row` takes a `&mut bool`, and handing it the neighbour's
+    /// is a single-token error that renders perfectly. Here it would put a
+    /// previous password on screen that the user did not ask to see. So each
+    /// flag is set alone and the others are asserted still masked.
+    ///
+    /// The default half is asked in both disclosure states and at both widths,
+    /// because "shut" is not a defence: the block returns early on a shut list
+    /// today, and a later refactor that drew the rows and hid them behind a
+    /// clip would still be painting them.
     #[test]
-    fn a_previous_password_is_never_painted_on_the_edit_form() {
+    fn a_previous_password_is_painted_only_when_its_own_row_is_revealed() {
         let item = item_with_history(3);
+        // THE DEFAULT. Nothing revealed, so nothing in the clear -- which is
+        // `RevealState::default()`'s rule on the read pane, kept here.
         for open in [false, true] {
             for width in [WIDE_PANE_WIDTH, MIN_PANE_WIDTH] {
                 let mut draft = EditDraft::from_item(&item);
@@ -19542,12 +19635,338 @@ mod edit_pane_layout_tests {
                 for old in OLD_PASSWORDS {
                     assert!(
                         !painted.strings().iter().any(|s| s.contains(old)),
-                        "a previous password was painted on the edit form (open={open}, \
-                         width={width}): {:?}",
+                        "a previous password was painted on an edit form nobody had clicked \
+                         an eye on (open={open}, width={width}): {:?}",
                         painted.strings()
                     );
                 }
             }
+        }
+
+        // ONE ROW AT A TIME. The fixture's three entries carry three
+        // different passwords (see `OLD_PASSWORDS`), which is what makes a
+        // flag wired to the wrong row visible here rather than a coincidence.
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        for row in 0..OLD_PASSWORDS.len() {
+            let mut draft = EditDraft::from_item(&item);
+            draft.history_open = true;
+            draft.history_reveal[row] = true;
+            let painted = frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &[],
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            let shown = |needle: &str| painted.strings().iter().any(|s| s.contains(needle));
+            assert!(
+                shown(OLD_PASSWORDS[row]),
+                "history_reveal[{row}] did not reveal row {row} ({:?}), so the assertions \
+                 below would pass against a form with no reveal at all: {:?}",
+                OLD_PASSWORDS[row],
+                painted.strings()
+            );
+            for (other, password) in OLD_PASSWORDS.iter().enumerate() {
+                if other == row {
+                    continue;
+                }
+                assert!(
+                    !shown(password),
+                    "history_reveal[{row}] also revealed row {other} ({password:?}) -- the \
+                     rows share a flag, or one of them reads its neighbour's: {:?}",
+                    painted.strings()
+                );
+            }
+        }
+    }
+
+    /// Every 1-point [`theme::CANVAS`] line this frame drew, top to bottom --
+    /// the card row rules, which are the only thing in this app painted that
+    /// way.
+    fn rules(painted: &Painted) -> Vec<Rect> {
+        let mut found: Vec<Rect> = painted
+            .rects
+            .iter()
+            .filter(|(r, c)| *c == theme::CANVAS && r.height() < 2.0)
+            .map(|(r, _)| *r)
+            .collect();
+        found.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        found
+    }
+
+    /// **The list is drawn as the read pane's BANDS, and the two paddings that
+    /// would have been paid twice are cancelled.**
+    ///
+    /// Three claims, all off the painted frame, all at both widths.
+    ///
+    /// **1. Full bleed.** A `masked_row` is a band: `detail::row_impl` senses
+    /// a frame from outside its own `13px 16px`, so the hit area and the hover
+    /// tint are the whole row, edge to edge across the card. The rules between
+    /// these rows are therefore asserted to span exactly what this card's
+    /// OTHER rules span -- the one above the password row, drawn by
+    /// `theme::section_row_rule`. Measured at the app's 298-point minimum:
+    /// every rule on the card, the history's included, runs 0..274. Against
+    /// the card's own painted fill rather than against a sibling rule was
+    /// tried and rejected: that card's fill is 278.8 there, because the
+    /// password row's `Generate`/`Copy` pair overhangs the body to 266.8 and
+    /// egui unions a child's rect into its parent's, so the fill is 4.8 points
+    /// wider than every rule and every sibling card on the same pane. The
+    /// rules are the honest reference.
+    ///
+    /// **2. The horizontal padding is the READ pane's, paid once.** The date
+    /// starts `detail::CARD_PAD_X` inside the band, and nothing else: 16 at
+    /// 298 (card edge 0), 40 at 700 (card edge 24). Paid twice it would be
+    /// `pad_x + 16` -- 28 and 32 -- and the rows would not line up with a
+    /// thing on the card.
+    ///
+    /// **3. The vertical padding is paid once too**, which is the half no
+    /// absolute number states cleanly. `theme::section_row_rule` already
+    /// spends `SECTION_CARD_PAD_Y` below itself and a band spends `ROW_PAD_Y`
+    /// above itself, and those are the same 13 points twice. So the drop from
+    /// the rule ABOVE the block to the first row's ink is asserted equal to
+    /// the drop from a rule BETWEEN two history rows to the row under it --
+    /// 20.5 points in both cases at 298 (13 of band padding plus the 7.5 that
+    /// centres a 13-point run in a 28-point content box). Double-padded, the
+    /// first would be 33.5 and the second 20.5.
+    #[test]
+    fn the_open_history_is_drawn_as_the_read_panes_bands() {
+        let item = item_with_history(3);
+        let dates = history_dates(&item);
+        for width in [WIDE_PANE_WIDTH, MIN_PANE_WIDTH] {
+            let pane = Vec2::new(width, 2400.0);
+            let ctx = styled_context(pane);
+            let mut draft = EditDraft::from_item(&item);
+            draft.history_open = true;
+            let painted = frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &[],
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            let rows: Vec<Rect> = dates.iter().map(|when| painted.rect_of(when)).collect();
+            let drawn = rules(&painted);
+            // The rule immediately above the first row, and the one between
+            // the first two -- found by position rather than by index, so a
+            // rule added elsewhere on the card does not silently re-aim this.
+            let above = |y: f32| -> Rect {
+                *drawn
+                    .iter()
+                    .filter(|r| r.bottom() <= y)
+                    .next_back()
+                    .unwrap_or_else(|| panic!("no rule above y = {y} at {width}pt: {drawn:?}"))
+            };
+            let opening = above(rows[0].top());
+            let between = above(rows[1].top());
+            assert!(
+                between.top() > rows[0].top(),
+                "the rule found between rows 0 and 1 at {width}pt sits above row 0, so the \
+                 two drops compared below are the same one: {drawn:?}"
+            );
+
+            // 1. Full bleed -- the same span as this card's other rules.
+            //    `opening` is `section_row_rule`'s; the history's own are
+            //    `theme::row_rule`'s, drawn by `detail::history_rows`.
+            assert_eq!(
+                (between.left(), between.right()),
+                (opening.left(), opening.right()),
+                "a history row's rule at {width}pt does not span what this card's other \
+                 rules span, so the rows are not bands: {drawn:?}"
+            );
+
+            // 2. One horizontal padding, and it is the read pane's.
+            for (index, row) in rows.iter().enumerate() {
+                assert!(
+                    (row.left() - (between.left() + f32::from(detail::CARD_PAD_X))).abs() < 0.01,
+                    "history row {index} starts {}pt inside the card at {width}pt, not the \
+                     read pane's own {}pt -- the band is being padded by the card body as \
+                     well as by itself",
+                    row.left() - between.left(),
+                    detail::CARD_PAD_X
+                );
+            }
+
+            // 3. One vertical padding. See the doc above for both numbers.
+            let opening_drop = rows[0].top() - opening.bottom();
+            let between_drop = rows[1].top() - between.bottom();
+            assert!(
+                (opening_drop - between_drop).abs() < 0.01,
+                "the first history row sits {opening_drop}pt under the rule that opens the \
+                 block while the second sits {between_drop}pt under its own at {width}pt -- \
+                 the block is paying the card body's row padding on top of the band's"
+            );
+        }
+    }
+
+    /// **Clicking a row's eye reveals THAT row**, and the flag it sets
+    /// survives the frame.
+    ///
+    /// The flag half is why this is asked of the draft rather than of the
+    /// pixels: a reveal owned by the draw closure is dropped when the frame
+    /// ends and the next frame paints the value masked again -- a toggle that
+    /// visibly does nothing, which `detail::RevealState`'s doc records this
+    /// very file shipping once. `EditDraft::history_reveal` is where it lives
+    /// so that cannot come back.
+    ///
+    /// The eye is found by geometry because it has no text to be found by:
+    /// `theme::eye_toggle` draws a path and a circle. The one path whose
+    /// vertical centre is the row's and whose ink is in the right-hand half of
+    /// the card is that row's eye -- measured at 700pt, the three eyes paint
+    /// at x = 636.9..655.2 on rows centred at y = 425, 480 and 535.
+    #[test]
+    fn clicking_a_rows_eye_reveals_that_row_and_only_that_row() {
+        let item = item_with_history(3);
+        let dates = history_dates(&item);
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        for row in 0..dates.len() {
+            let mut draft = EditDraft::from_item(&item);
+            draft.history_open = true;
+            let painted = frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &[],
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            let band = painted.rect_of(&dates[row]);
+            let eyes: Vec<Rect> = painted
+                .marks
+                .iter()
+                .filter(|(kind, ink)| {
+                    *kind == "a path"
+                        && ink.center().y > band.top() - 10.0
+                        && ink.center().y < band.bottom() + 10.0
+                        && ink.center().x > WIDE_PANE_WIDTH / 2.0
+                })
+                .map(|(_, ink)| *ink)
+                .collect();
+            assert_eq!(
+                eyes.len(),
+                1,
+                "expected one reveal eye on history row {row}, found {}: {:?}",
+                eyes.len(),
+                painted.marks
+            );
+            let _ = frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &click(eyes[0].center()),
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            assert!(
+                draft.history_reveal[row],
+                "clicking row {row}'s eye did not set its flag, so the reveal would be gone \
+                 again next frame"
+            );
+            // **The NEXT frame, with no input.** The frame that handles the
+            // click has already laid the row out masked by the time egui
+            // hands the eye its click, so asserting on it would be asking the
+            // wrong frame -- and it is the frame after that would go on
+            // painting dots if the flag did not live on the draft.
+            let painted = frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &[],
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            assert!(
+                painted.strings().iter().any(|s| s.contains(OLD_PASSWORDS[row])),
+                "row {row}'s eye was clicked and its password is still not on screen: {:?}",
+                painted.strings()
+            );
+            for (other, password) in OLD_PASSWORDS.iter().enumerate() {
+                assert_eq!(
+                    draft.history_reveal[other],
+                    other == row,
+                    "clicking row {row}'s eye also toggled row {other} ({password:?})"
+                );
+            }
+        }
+    }
+
+    /// **Clicking a row copies THAT row's previous password**, by index.
+    ///
+    /// The whole band copies on click -- `detail::copy_row` senses the tile
+    /// and registers the eye after it, so the eye gets its own click and every
+    /// other pixel of the row is the copy target. That is the read pane's
+    /// behaviour, unchanged, and it is half of what the owner asked for:
+    /// "make it reveal and copy like read pane".
+    ///
+    /// **The index is the load-bearing part, and it is pinned with the value
+    /// beside it.** `EditAction::CopyPasswordHistory` carries an index into
+    /// `vault_bridge::password_history(item)` and never the password, so a
+    /// renderer that reported its neighbour's index would put a different old
+    /// password on the clipboard and nothing about the action would look
+    /// wrong. The fixture's three entries carry three DIFFERENT passwords (see
+    /// [`OLD_PASSWORDS`]), so the index is resolved here the way
+    /// `vault_window::mod` resolves it and checked against the row that was
+    /// clicked.
+    #[test]
+    fn clicking_a_history_row_copies_that_rows_previous_password() {
+        let item = item_with_history(3);
+        let dates = history_dates(&item);
+        let entries = crate::vault_bridge::password_history(&item);
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        for row in 0..dates.len() {
+            let mut draft = EditDraft::from_item(&item);
+            draft.history_open = true;
+            let (idle, painted) = acting_frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &[],
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            assert_eq!(
+                idle,
+                EditAction::None,
+                "the form reported an action on a frame with no input at all, so the click \
+                 below proves nothing"
+            );
+            // The date's own run, which is inside the band and nowhere near
+            // the eye at the far right.
+            let at = painted.rect_of(&dates[row]).center();
+            let (clicked, _) = acting_frame_for(
+                &ctx,
+                pane,
+                &mut draft,
+                false,
+                &click(at),
+                Some(&item),
+                &detail::TotpState::NoSecret,
+            );
+            let EditAction::CopyPasswordHistory(index) = clicked else {
+                panic!("clicking history row {row} reported {clicked:?}, not a copy of it");
+            };
+            assert_eq!(
+                entries[index].password.as_str(),
+                OLD_PASSWORDS[row],
+                "clicking history row {row} asked for index {index}, which is a DIFFERENT \
+                 previous password -- the clipboard would get {:?} instead of {:?}",
+                entries[index].password.as_str(),
+                OLD_PASSWORDS[row]
+            );
+            assert!(
+                !draft.history_reveal[row],
+                "clicking the body of row {row} toggled its reveal as well as copying it"
+            );
         }
     }
 
@@ -19574,6 +19993,13 @@ mod edit_pane_layout_tests {
     /// Unreachable against today's backend -- Bitwarden slices every save to
     /// five entries -- which is exactly why it would rot unnoticed if the
     /// truncation were left to a comment.
+    ///
+    /// **The wording is the READ pane's now**, not this file's own
+    /// `history_truncation`, which went with the second list it belonged to.
+    /// Matched on its opening clause rather than in full because the read
+    /// pane's sentence goes on to name the Bitwarden web vault, and pinning
+    /// that half here would be a second copy of a sentence this change exists
+    /// to stop having two of. The count is the part this test is about.
     #[test]
     fn a_history_longer_than_the_cap_is_cut_and_says_so() {
         let over = detail::MAX_HISTORY_ROWS + 2;
@@ -19590,7 +20016,10 @@ mod edit_pane_layout_tests {
             painted.strings()
         );
         assert!(
-            painted.strings().contains(&history_truncation(2).as_str()),
+            painted
+                .strings()
+                .iter()
+                .any(|s| s.starts_with("2 older passwords are not shown here")),
             "an over-long history was cut silently: {:?}",
             painted.strings()
         );

@@ -5270,6 +5270,63 @@ pub fn build_frame_with_search(
                                     );
                                 }
                             }
+                            // **A previous password's Copy, read off the
+                            // ITEM** -- and that is the one thing this does
+                            // differently from the two rows above.
+                            //
+                            // Those read the DRAFT because the form may be
+                            // showing something the user has just typed. A
+                            // previous password is not draft state at all:
+                            // `EditDraft` never holds the history, never
+                            // writes it, and the entry the current password
+                            // becomes on save is added by the server. The only
+                            // copy of the value is in the item, which is the
+                            // same place the READ pane's own
+                            // `DetailAction::CopyPasswordHistory` arm resolves
+                            // it from -- one list, one lookup, one index.
+                            //
+                            // The action carries the row INDEX and not the
+                            // password, for that arm's reason: a previous
+                            // password is a password, and an action built by
+                            // the render pass must not be where a second,
+                            // non-zeroizing copy of one lives.
+                            //
+                            // Behind the same re-prompt as the two arms above,
+                            // against the same item. A copy that costs a
+                            // master password from one pane and nothing from
+                            // the other teaches the user which door is
+                            // cheaper -- and this row is one click from the
+                            // read pane's identical one.
+                            EditAction::CopyPasswordHistory(index) => {
+                                let allowed = selected_item.as_ref().is_none_or(|item| {
+                                    matches!(
+                                        crate::reprompt::permit(
+                                            &reprompt_gate,
+                                            crate::vault_bridge::reprompt_protected(item),
+                                            &mut reprompt_proof,
+                                            Instant::now(),
+                                            || (),
+                                        ),
+                                        crate::reprompt::Outcome::Done(())
+                                    )
+                                });
+                                if !allowed {
+                                    detail::note_refused(
+                                        ui.ctx(),
+                                        crate::reprompt::refusal_text(false),
+                                    );
+                                } else if let Some(item) = &selected_item {
+                                    match crate::vault_bridge::password_history(item).get(index) {
+                                        Some(entry) => {
+                                            crate::clipboard::copy_secret(&entry.password);
+                                        }
+                                        None => log::warn!(
+                                            "copy requested for history row {index}, which no \
+                                             longer exists on this item"
+                                        ),
+                                    }
+                                }
+                            }
                             // **The one-time code card's Add / Replace**,
                             // answered by the flag the READ pane's own clock
                             // button sets -- one modal for the two panes. See
@@ -5672,6 +5729,18 @@ pub fn build_frame_with_search(
                                     crate::clipboard::copy_secret(text);
                                 }
                             }
+                            // Unreachable: a create has no saved item, so
+                            // there is no password history for the credentials
+                            // card to draw -- `draw_detail_edit`'s `history`
+                            // binding is empty without one, and the control
+                            // itself is withheld rather than drawn reading
+                            // `Password history (0)`. Spelled out rather than
+                            // caught by a `_ =>`, as every other arm of this
+                            // match is.
+                            EditAction::CopyPasswordHistory(_) => log::warn!(
+                                "the create form asked to copy a previous password of an item \
+                                 that does not exist yet"
+                            ),
                             // Unreachable: the create form's `One-time code`
                             // row is the greyed `TOTP_CREATE_NOTICE` and
                             // carries no button, because there is no saved
@@ -27028,7 +27097,14 @@ mod preferences_modal_wiring_tests {
             // the wrong-id case -- and every one of those rules is gone from
             // the crate rather than moved, because the delete confirmation
             // is a modal now and a modal has no clock in it.
-            modules, 67,
+            // 68 as of the edit form's password-history rows, which added
+            // `mod edit_history_copy_wiring` -- the source guard that the
+            // form's `Copy` on a previous password takes the same re-prompt
+            // the read pane's identical row takes, and resolves the row out
+            // of the ITEM rather than the draft. Guarded rather than driven
+            // because that arm lives inside `run`'s per-frame closure, which
+            // nothing in this crate can call.
+            modules, 68,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -39684,6 +39760,134 @@ mod detail_slide_arming_tests {
             source.contains(sets),
             "`row_opened` is no longer passed to `draw_item_list`, so nothing sets the flag \
              the row-click arming site reads"
+        );
+    }
+}
+
+#[cfg(test)]
+mod edit_history_copy_wiring {
+    //! **The edit form's previous-password `Copy` is answered exactly like
+    //! every other copy in this window: behind the re-prompt, off the ITEM,
+    //! by index.**
+    //!
+    //! A source guard rather than a behavioural test, for this module's
+    //! standing reason: the arm lives inside `run`'s per-frame closure, which
+    //! needs a window, a backend handle and an event loop, so nothing in this
+    //! crate can call it. `permit_detail_action` exists as a callable seam for
+    //! the READ pane's copies; the edit form's are written inline beside the
+    //! draft they read, and `EditAction::CopyUsername`'s arm has been that way
+    //! since it was added. What can still be checked, and is what actually
+    //! goes wrong, is the text of the arm itself -- a copy that skipped the
+    //! gate would work perfectly and cost nothing, which is precisely the
+    //! failure that teaches a user which door is cheaper.
+    //!
+    //! EVERY NEEDLE IS SPLIT ACROSS TWO LITERALS, for the reason
+    //! `reveal_state_placement_tests` sets out at length: `include_str!`
+    //! pulls this module in too, so a needle written as one literal is always
+    //! present in the source -- inside the const that defines it -- and the
+    //! occurrence counts below would be measuring themselves.
+
+    /// The head of the arm this module is about.
+    const ARM: &str = concat!("EditAction::CopyPasswordHistory(", "index) => {");
+    /// The head of the arm immediately after it, which bounds the slice. A
+    /// fixed byte window was rejected for `arm_pins_its_row`'s reason: the
+    /// arm carries several hundred bytes of comment, and a window wide enough
+    /// for that reaches its neighbour.
+    const NEXT_ARM: &str = concat!("EditAction::AddTotp", " => {");
+    /// The gate, spelled as the two arms above this one spell it.
+    const GATE: &str = concat!("crate::reprompt::", "permit(");
+    /// **The ITEM's flag**, which is the thing being proved about -- a gate
+    /// asked about the wrong item is a gate that never fires.
+    const FLAG: &str = concat!("crate::vault_bridge::reprompt_", "protected(item)");
+    /// A refused prompt has to SAY so. Falling through silently is the other
+    /// way this arm could be wrong and still compile.
+    const REFUSAL: &str = concat!("crate::reprompt::", "refusal_text(false)");
+    /// How the value is resolved: by index, out of the item's own history.
+    /// **Shared verbatim with the read pane's arm**, which is why the count
+    /// below is two.
+    const LOOKUP: &str =
+        concat!("crate::vault_bridge::password_", "history(item).get(index)");
+    /// What this arm must NOT read. The draft has no password history on it
+    /// at all -- see `EditAction::CopyPasswordHistory` -- so a `draft.` in
+    /// here is an arm reaching for a field that does not exist or, worse, for
+    /// the current password.
+    const DRAFT: &str = concat!("draft", ".");
+
+    fn source() -> &'static str {
+        include_str!("mod.rs")
+    }
+
+    /// The arm's own text, bounded by the arm that follows it.
+    fn arm() -> &'static str {
+        let source = source();
+        let at = source.find(ARM).unwrap_or_else(|| {
+            panic!(
+                "no {ARM:?} in this file -- the edit form's history copy was renamed or \
+                 deleted, and this guard is now aimed at nothing"
+            )
+        });
+        assert_eq!(
+            source.matches(ARM).count(),
+            1,
+            "{ARM:?} appears more than once, so the slice below may be a different arm's"
+        );
+        let end = source[at..].find(NEXT_ARM).unwrap_or_else(|| {
+            panic!(
+                "{ARM:?} is not followed by {NEXT_ARM:?} -- the arms were reordered and this \
+                 slice no longer ends where the arm does"
+            )
+        });
+        &source[at..at + end]
+    }
+
+    #[test]
+    fn the_edit_forms_history_copy_takes_the_same_re_prompt_the_rest_do() {
+        let arm = arm();
+        for needle in [GATE, FLAG, REFUSAL] {
+            assert!(
+                arm.contains(needle),
+                "the edit form's history copy does not go through {needle:?}, so a previous \
+                 password leaves a reprompt-protected item for the clipboard without the \
+                 master password the read pane's identical row costs. The arm: {arm:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn it_resolves_the_row_out_of_the_item_and_never_out_of_the_draft() {
+        let arm = arm();
+        assert!(
+            arm.contains(LOOKUP),
+            "the edit form's history copy does not resolve its row with {LOOKUP:?}: {arm:?}"
+        );
+        assert!(
+            !arm.contains(DRAFT),
+            "the edit form's history copy reads the DRAFT. A previous password is not draft \
+             state -- the form never holds the history -- so whatever this reaches for is \
+             either nothing or the password being typed: {arm:?}"
+        );
+    }
+
+    /// **Both panes resolve a history row the same way.** The read pane's arm
+    /// and the edit form's are the only two occurrences of [`LOOKUP`] in this
+    /// file, and one of them is this arm's -- so neither screen can drift into
+    /// a lookup of its own that indexes something else.
+    #[test]
+    fn the_two_panes_read_one_history_by_one_index() {
+        assert_eq!(
+            source().matches(LOOKUP).count(),
+            2,
+            "{LOOKUP:?} is not written exactly twice in this file -- the read pane's history \
+             copy and the edit form's are meant to be the same lookup, and a third (or a \
+             missing) one means one of the screens resolves its row differently"
+        );
+    }
+
+    #[test]
+    fn the_needles_are_searched_against_this_files_real_source() {
+        assert!(
+            source().contains(concat!("fn permit_detail_", "action(")),
+            "include_str! is not reading this module's own source"
         );
     }
 }

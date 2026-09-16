@@ -3144,7 +3144,9 @@ impl Fixtures {
         // `--all` walk, and a flag left set decides the next surface.
         let history_draft = EditDraft::from_item(&edit_login);
         assert_eq!(
-            detail::password_history_dates(&edit_login).len(),
+            detail::visible_history_count(&deskwarden::vault_bridge::password_history(
+                &edit_login
+            )),
             3,
             "the 8a fixture lost its password history, so the history shot is a picture of a \
              card with no control on it"

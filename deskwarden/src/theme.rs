@@ -7841,15 +7841,41 @@ pub fn section_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 
 /// [`section_card_body`] at a stated horizontal padding. See
 /// [`section_card_header_at`] for why the padding is the caller's to state.
-/// Where [`section_card_body_at`] leaves what [`section_row`] needs to know
-/// about the band it is being added to: the card's horizontal padding, and
-/// whether anything has been drawn in this body yet.
+/// What [`section_card_body_at`] leaves behind for the rows added to it.
 ///
 /// Carried through `Ui::data` rather than through a parameter because every
 /// row on this form is written as `theme::section_row(ui, ..)` in a closure
 /// that is handed one `Ui` and nothing else -- threading a second argument
 /// through would touch every row of every kind to say something none of them
 /// decides.
+#[derive(Clone, Copy)]
+struct SectionBody {
+    /// The card's horizontal padding, which its rules are drawn full bleed
+    /// across and which [`section_row_bleed`] cancels.
+    pad_x: i8,
+    /// Whether nothing has been drawn in this body yet, so the next row knows
+    /// it owes no rule above itself.
+    first: bool,
+    /// **The card's own left and right edge, read before a single row has been
+    /// added.**
+    ///
+    /// Not derivable later, and that is the whole reason it is recorded here.
+    /// egui's `Region::expand_to_include_rect` unions a child's rect into the
+    /// parent's `max_rect`, so one control that overhangs its row widens the
+    /// body for everything added after it: measured on the credentials card at
+    /// the app's 298-point minimum, the password row's `Generate`/`Copy` pair
+    /// ends at x = 266.8 where the body's content box ends at 262, and every
+    /// `available_width()` asked afterwards is 4.8 points too big. A band that
+    /// cancelled `pad_x` off THAT reached 278.8 on a card whose edge is 274 --
+    /// which then widened the card, and the cards below it to 297.7 on a
+    /// 298-point pane. This is the un-grown number, taken at the one moment
+    /// nothing has had a chance to grow it.
+    ///
+    /// The same distinction, and the same defect, `detail::row_content_width`
+    /// documents at length one file over.
+    card: egui::Rangef,
+}
+
 fn section_body_state(ui: &Ui) -> egui::Id {
     ui.id().with("section-body")
 }
@@ -7865,7 +7891,17 @@ fn section_body_state(ui: &Ui) -> egui::Id {
 /// Padded above and below by [`SECTION_CARD_PAD_Y`], which is the read pane's
 /// `ROW_PAD_Y`: two rows separated this way stand exactly as far apart as two
 /// of that pane's bands do.
-fn section_row_rule(ui: &mut Ui, pad_x: i8) {
+///
+/// **Painted across [`SectionBody::card`], not across `available_width`
+/// widened by `pad_x`.** Those are the same number only while no row on the
+/// card has overhung its content box, and one does: measured on the
+/// credentials card at the app's 298-point minimum, the password row's
+/// `Generate`/`Copy` pair ends at x = 266.8 against a content box that ends at
+/// 262, so every rule drawn after that row ran to 278.8 on a card whose edge
+/// is at 274 -- a grey hairline sticking 4.8 points out of the card's rounded
+/// border, onto the canvas. Invisible until a row was added below the password
+/// row for it to separate. See [`SectionBody::card`].
+fn section_row_rule(ui: &mut Ui, state: SectionBody) {
     // **One allocation, with the line painted down its middle** -- and its
     // height spent NET of the `item_spacing` egui puts on either side of it.
     //
@@ -7882,12 +7918,11 @@ fn section_row_rule(ui: &mut Ui, pad_x: i8) {
     let slack = (f32::from(SECTION_CARD_PAD_Y) - ui.spacing().item_spacing.y).max(0.0);
     let (band, _) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 2.0 * slack + 1.0), Sense::hover());
-    let line = Rect::from_min_size(Pos2::new(band.left(), band.center().y - 0.5), Vec2::new(band.width(), 1.0));
-    ui.painter().rect_filled(
-        line.expand2(Vec2::new(f32::from(pad_x), 0.0)),
-        CornerRadius::ZERO,
-        CANVAS,
+    let line = Rect::from_x_y_ranges(
+        state.card,
+        egui::Rangef::new(band.center().y - 0.5, band.center().y + 0.5),
     );
+    ui.painter().rect_filled(line, CornerRadius::ZERO, CANVAS);
 }
 
 pub fn section_card_body_at<R>(ui: &mut Ui, pad_x: i8, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -7898,7 +7933,14 @@ pub fn section_card_body_at<R>(ui: &mut Ui, pad_x: i8, add: impl FnOnce(&mut Ui)
             // and a body that remembered last frame's rows would open with a
             // rule over its first one.
             let id = section_body_state(ui);
-            ui.data_mut(|data| data.insert_temp(id, (pad_x, true)));
+            // **`card` is read HERE and nowhere later**, before `add` has put
+            // a single widget in this body -- see [`SectionBody::card`] for
+            // the measurement that makes the timing load-bearing.
+            let card = egui::Rangef::new(
+                ui.max_rect().left() - f32::from(pad_x),
+                ui.max_rect().right() + f32::from(pad_x),
+            );
+            ui.data_mut(|data| data.insert_temp(id, SectionBody { pad_x, first: true, card }));
             // **The style's own spacing, handed back inside the body.**
             //
             // [`section_card`] zeroes `item_spacing` so the card's three
@@ -7972,6 +8014,93 @@ pub fn section_row_aside<R>(
     section_row_impl(ui, label, Some(aside), add)
 }
 
+/// **A row of the READ pane's bands, inside this card's padded body.**
+///
+/// The read pane's rows are bands: `detail::row_impl` senses a `Frame` that
+/// pays its own `padding: 13px 16px` from OUTSIDE, so the hit area and the
+/// hover tint are the whole row, edge to edge across the card
+/// (`detail::card` carries no inner margin at all -- its rows do). This card
+/// is built the other way round: [`section_card_body_at`] pads the body once
+/// and its rows sit inside that padding with none of their own. Dropping a
+/// band into the body therefore pads it **twice** -- `pad_x + 16` at each end
+/// horizontally, `SECTION_CARD_PAD_Y + band_pad_y` at each end vertically --
+/// and leaves its tint stopping short of the card's edge on all four sides.
+///
+/// This cancels both by subtraction, never by eye:
+///
+/// * **Horizontally, the bands are laid in [`SectionBody::card`]** -- the
+///   card's own span, recorded by the body before a single row was added to
+///   it. Not `available_width() + 2 * pad_x`, which is the obvious spelling
+///   and is wrong by however much some earlier row on the card overhangs; that
+///   field's doc has the measurement and the 297.7-point card it produced on a
+///   298-point pane.
+/// * **Vertically, `band_pad_y`** -- the padding the CALLER's bands carry, and
+///   the one number the theme cannot know (`detail::ROW_PAD_Y`). With it
+///   cancelled the block occupies exactly its ink, so it stands against the
+///   rows above and below it exactly as an unpadded [`section_row`] does: the
+///   rule's own [`SECTION_CARD_PAD_Y`] above it, the body's below, once each
+///   rather than twice.
+///
+/// **The clip rect is narrowed to the card's span as well, and that is not
+/// tidiness.** `detail::row_content_width` measures a row against
+/// `ui.clip_rect().right()` rather than `available_width` -- deliberately, and
+/// its doc gives the measurement: on the read pane the scroll viewport already
+/// stops at the cards' edge. On this form it does not; the card column is
+/// inset from the pane. Without this the bands would lay themselves out to the
+/// pane's edge and right-align their reveal eyes outside the card, which is
+/// the exact defect that doc records being fixed once already.
+///
+/// It takes the rule above itself and advances the body's first-row state
+/// exactly as [`section_row`] does, so a band counts as a row of this card for
+/// separator purposes.
+pub fn section_row_bleed<R>(ui: &mut Ui, band_pad_y: i8, add: impl FnOnce(&mut Ui) -> R) -> R {
+    let id = section_body_state(ui);
+    let state = ui.data(|data| data.get_temp::<SectionBody>(id));
+    if let Some(state) = state {
+        if !state.first {
+            section_row_rule(ui, state);
+        }
+        ui.data_mut(|data| data.insert_temp(id, SectionBody { first: false, ..state }));
+    }
+    // Not inside a section card body at all: there is nothing to cancel, no
+    // rule to draw, and the band is already the width it was given.
+    let Some(SectionBody { pad_x, card, .. }) = state else {
+        return add(ui);
+    };
+    egui::Frame::new()
+        // **The negative margin is what keeps the cancellation local.** The
+        // `Frame` allocates `content_rect + outer_margin`, so the block the
+        // BODY sees is the card-wide band shrunk back by `pad_x` at each end
+        // and by `band_pad_y` at each end -- exactly the box an ordinary row
+        // would have occupied. Without it the body's own `max_rect` would be
+        // widened by the band, and every row added after this one would
+        // inherit the overhang.
+        .outer_margin(Margin {
+            left: -pad_x,
+            right: -pad_x,
+            top: -band_pad_y,
+            bottom: -band_pad_y,
+        })
+        .show(ui, |ui| {
+            let lane = Rect::from_x_y_ranges(card, ui.max_rect().y_range());
+            ui.scope_builder(egui::UiBuilder::new().max_rect(lane), |ui| {
+                ui.set_width(lane.width());
+                // **Flush, the way `detail::card` stacks its own rows.**
+                // [`section_card_body_at`] hands the style's `item_spacing`
+                // back to its children, and eight points between a band and
+                // the hairline under it is eight points the read pane's
+                // identical list does not have.
+                ui.spacing_mut().item_spacing = Vec2::ZERO;
+                let clip =
+                    Rect::from_x_y_ranges(card, ui.clip_rect().y_range());
+                ui.set_clip_rect(ui.clip_rect().intersect(clip));
+                add(ui)
+            })
+            .inner
+        })
+        .inner
+}
+
 /// Both rows above, in one body.
 ///
 /// `aside` is an `Option` rather than a no-op closure so that the plain row
@@ -7994,11 +8123,11 @@ fn section_row_impl<R>(
     // `if`, so the first one DRAWN is not the first one written. See
     // `section_body_state`.
     let id = section_body_state(ui);
-    if let Some((pad_x, first)) = ui.data(|data| data.get_temp::<(i8, bool)>(id)) {
-        if !first {
-            section_row_rule(ui, pad_x);
+    if let Some(state) = ui.data(|data| data.get_temp::<SectionBody>(id)) {
+        if !state.first {
+            section_row_rule(ui, state);
         }
-        ui.data_mut(|data| data.insert_temp(id, (pad_x, false)));
+        ui.data_mut(|data| data.insert_temp(id, SectionBody { first: false, ..state }));
     }
     if !section_rows_fit(ui) {
         // An EMPTY label is a row that belongs to the one above it -- the
