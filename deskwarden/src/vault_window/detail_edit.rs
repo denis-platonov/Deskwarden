@@ -3228,6 +3228,39 @@ impl EditDraft {
     /// [`Slot::Websites`] gets its first empty row here, because a block
     /// revealed with no rows in it is a heading and an Add button -- the user
     /// asked for a website, and what they should get is a box.
+    /// **Adopts a one-time code written to the item while this form was
+    /// open**, so the draft agrees with the record again.
+    ///
+    /// The `One-time code` card's `Add` and `Replace by scanning` open
+    /// `totp_add`, which writes the SEED TO THE ITEM and not to this draft --
+    /// it has to, because the form cannot scan a screen and the modal pumps
+    /// its own message loop. That left two defects, and the second is the one
+    /// that matters:
+    ///
+    /// * the row went on drawing its empty state, because it reads the DRAFT;
+    /// * and Save would have **wiped the seed that had just been written**.
+    ///   `apply_to` sets `login.totp = edited_secret(current, &self.totp)`,
+    ///   and `edited` reads an empty draft against an item that HAS a value
+    ///   as "the user cleared it". The comment beside that line already
+    ///   warned of exactly this shape; nothing had been able to reach it
+    ///   before, because until the card grew its buttons no seed could arrive
+    ///   while the form was up.
+    ///
+    /// So the window calls this on the way back from a successful write. The
+    /// slot is revealed as well as filled: a row the draft is carrying a
+    /// value for must be on screen, or the next Save clears it for the same
+    /// reason.
+    ///
+    /// **Not `is_dirty`.** The value came FROM the record, so the form has no
+    /// unsaved change to report -- `change_digests` compares against the item
+    /// it is handed, which now holds the same seed.
+    pub fn adopt_totp(&mut self, seed: &str) {
+        self.totp = seed.to_string();
+        if !self.totp.is_empty() {
+            self.reveal_slot(Slot::Totp);
+        }
+    }
+
     pub fn reveal_slot(&mut self, slot: Slot) {
         if !Slot::all_for(self.kind).contains(&slot) {
             return;
@@ -4939,7 +4972,7 @@ fn website_row_trailing() -> f32 {
 /// [`UriMatchChoice::Unrecognised`] -- a value this build cannot name is
 /// SHOWN as one it cannot name, rather than reading blank.
 fn website_match_combo(ui: &mut egui::Ui, row_id: u64, choice: &mut UriMatchChoice) {
-    egui::ComboBox::from_id_salt(("website-match", row_id))
+    form_combo(ui, ("website-match", row_id))
         .selected_text(choice.label())
         .width(MATCH_COMBO_WIDTH)
         .show_ui(ui, |ui| {
@@ -8104,7 +8137,7 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     if generator.passphrase {
         theme::field_label(ui, "Between words");
         ui.horizontal_wrapped(|ui| {
-            egui::ComboBox::from_id_salt("generator-separator")
+            form_combo(ui, "generator-separator")
                 .selected_text(generator.separator.label())
                 .width(150.0)
                 .show_ui(ui, |ui| {
@@ -8774,6 +8807,35 @@ fn row_with_buttons(ui: &mut egui::Ui, buttons: &[&str], add: impl FnOnce(&mut e
 /// ellipsis, which is not a field the user can work in.
 const FIELD_FLOOR: f32 = 140.0;
 
+/// **Every `ComboBox` on this form is built here**, and the reason is a bug
+/// that has now been found twice.
+///
+/// `draw_detail_edit` scopes `theme::scrollbar_in_gutter` over the whole card
+/// column so the FORM's own bar sits in a 24-point lane. Those are
+/// `Style::spacing.scroll` values, so every `Ui` under that scope inherits
+/// them -- including the one egui builds for a combo's drop-down, which is a
+/// `ScrollArea` of its own. The list is then drawn with a 24-point lane and a
+/// bar down it however short it is: the owner reported it on the folder
+/// chooser ("Folder has scroll in dropdown"), the fix was made there, and the
+/// website match chooser -- written later -- inherited the same defect and
+/// the same report ("scroll not needed here for just one record").
+///
+/// A helper rather than a fifth copy of the one line, because the line is
+/// invisible at the call site: a combo added without it looks perfectly
+/// correct and is wrong only when the pointer opens it.
+///
+/// Put back to egui's own default, which is what every list in this app that
+/// has NOT asked for a gutter gets -- `theme::apply` sets no `ScrollStyle`,
+/// and `scrollbar_in_gutter` is a per-surface opt-in this surface did not
+/// take.
+fn form_combo(
+    ui: &mut egui::Ui,
+    id_salt: impl std::hash::Hash + std::fmt::Debug,
+) -> egui::ComboBox {
+    ui.spacing_mut().scroll = egui::style::ScrollStyle::default();
+    egui::ComboBox::from_id_salt(id_salt)
+}
+
 /// The folder chooser, drawn identically in both arms of the `ITEM` card.
 ///
 /// Lifted out when the card grew a grid: the control was written inline in
@@ -8813,8 +8875,7 @@ fn folder_combo(
     // that has NOT asked for a gutter gets: `theme::apply` sets no
     // `ScrollStyle` of its own -- `scrollbar_in_gutter` is a per-surface
     // opt-in, and this surface did not opt in.
-    ui.spacing_mut().scroll = egui::style::ScrollStyle::default();
-    egui::ComboBox::from_id_salt("edit-folder")
+    form_combo(ui, "edit-folder")
         // The cell's full width in the grid arm, which is what makes three
         // controls of three different natural widths read as a row. egui's
         // combo is otherwise as wide as its longest option.
@@ -9909,7 +9970,7 @@ pub fn draw_detail_edit(
                         // resolved `CardBrand`, so a brand this build does not
                         // know -- one a newer client wrote -- is still SHOWN
                         // rather than silently reading as blank.
-                        egui::ComboBox::from_id_salt("card-brand")
+                        form_combo(ui, "card-brand")
                             .selected_text(if card.brand.is_empty() {
                                 BRAND_UNSET
                             } else {
@@ -24414,6 +24475,66 @@ mod edit_pane_layout_tests {
     /// draft -- the state design 8a is about, and the one `empty_of` cannot
     /// give: a create form hides the websites block, the seed and the custom
     /// fields behind "can be added once this item has been saved".
+    /// **A seed written while the form was open survives the Save.**
+    ///
+    /// The `One-time code` card's `Add` opens `totp_add`, which writes the
+    /// seed to the ITEM -- it has to, because this form cannot scan a
+    /// screen. The draft was built when Edit was pressed and knows nothing
+    /// of it, and `apply_to` sets `login.totp = edited_secret(current,
+    /// &self.totp)`: an empty draft against an item that HAS a value reads
+    /// as "the user cleared it". So the next Save wiped the code that had
+    /// just been added.
+    ///
+    /// The owner saw the visible half -- "clicked add - added the code from
+    /// the modal - still empty once returned to edit screen". This pins the
+    /// half that loses data.
+    ///
+    /// **Both directions, and the negative is the point**: without
+    /// `adopt_totp` the same Save really does clear the seed, so a build
+    /// that dropped the call fails here rather than passing an assertion
+    /// about a value nothing had put at risk.
+    #[test]
+    fn a_code_added_while_the_form_is_open_is_not_wiped_by_the_save() {
+        const SEED: &str = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
+        // The record as it was when Edit was pressed: no second factor.
+        let before = a_login();
+        assert!(
+            !crate::vault_window::totp_add::item_has_code(&before),
+            "the fixture already carries a code, so the draft below would not be empty"
+        );
+        let draft = EditDraft::from_item(&before);
+        assert!(draft.totp.is_empty(), "the draft picked up a seed the fixture has not");
+
+        // ...and as the modal left it, a moment later.
+        let mut after = before.clone();
+        after.login.as_mut().expect("the fixture is a login").totp =
+            Some(zeroize::Zeroizing::new(SEED.to_string()));
+
+        // The negative control, which is the defect: the stale draft reads
+        // as a clear against the record that now has one.
+        let wiped = draft.apply_to(&after);
+        assert!(
+            wiped.login.as_ref().and_then(|l| l.totp.as_deref()).is_none(),
+            "a stale draft no longer clears the seed, so the adoption below is asserting \
+             about a value that was never at risk"
+        );
+
+        // And the fix: the window hands the seed to the draft on the way
+        // back from the write.
+        let mut told = EditDraft::from_item(&before);
+        told.adopt_totp(SEED);
+        let saved = told.apply_to(&after);
+        assert_eq!(
+            saved.login.as_ref().and_then(|l| l.totp.as_deref()).map(|t| t.as_str()),
+            Some(SEED),
+            "the Save dropped the one-time code the modal had just written"
+        );
+        // The row has to be ON the form as well as in the draft: a slot the
+        // draft carries a value for but does not show is cleared by the
+        // very next Save, for the same reason.
+        assert!(told.shows(Slot::Totp), "the adopted seed is not on screen");
+    }
+
     fn a_login() -> VaultItem {
         serde_json::from_str(
             r#"{"id":"grid-1","type":1,"name":"Ledgerline","fields":[],

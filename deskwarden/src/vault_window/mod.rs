@@ -6487,7 +6487,10 @@ pub fn build_frame_with_search(
                     // appear or vanish under the user mid-form -- a sync
                     // landing while the form is up must not turn a "Save code"
                     // into a "Replace code" between the reading and the press.
-                    item.login.as_ref().is_some_and(|login| login.totp.is_some()),
+                    //
+                    // The VALUE and not the key -- see `item_has_code`,
+                    // which is where that distinction is argued and asserted.
+                    totp_add::item_has_code(item),
                 ));
             }
         }
@@ -6682,6 +6685,34 @@ pub fn build_frame_with_search(
                             // would make that suite's exactly-once counts
                             // meaningless rather than merely wrong.
                             Ok(written) => {
+                                // **An open edit form is told**, or its next
+                                // Save clears the seed this write just made.
+                                //
+                                // The form reads its own draft, which was
+                                // built when Edit was pressed and knows
+                                // nothing of a modal that wrote to the ITEM
+                                // afterwards -- so the row kept drawing its
+                                // empty state, and `apply_to` would have read
+                                // that empty draft as "the user cleared it".
+                                // The owner saw the first half ("clicked add
+                                // - added the code from the modal - still
+                                // empty once returned to edit screen"); the
+                                // second half is the one that loses data.
+                                //
+                                // Matched on the mode rather than set
+                                // unconditionally: `Create` has no saved item
+                                // for this modal to have been opened from,
+                                // and every other mode has no draft.
+                                if let DetailMode::Edit(draft) = &mut mode {
+                                    if selected_id.as_deref() == Some(updated.id.as_str()) {
+                                        let seed = written
+                                            .login
+                                            .as_ref()
+                                            .and_then(|login| login.totp.as_deref())
+                                            .map_or("", |totp| totp.as_str());
+                                        draft.adopt_totp(seed);
+                                    }
+                                }
                                 if let Some(pos) = items.iter().position(|i| i.id == updated.id) {
                                     items[pos] = written;
                                 }

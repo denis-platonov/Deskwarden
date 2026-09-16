@@ -1522,6 +1522,31 @@ pub fn can_save(reading: &Reading) -> bool {
 
 /// The submit button's face: [`REPLACE_LABEL`] when there is a code to
 /// destroy, [`SAVE_LABEL`] when there is not.
+/// **Whether `item` really carries a one-time code**, which is what
+/// [`REPLACE_WARNING`] and [`submit_label`] are about.
+///
+/// The VALUE, not the key. `login.totp.is_some()` answers true for a record
+/// carrying `totp: ""` -- a field Bitwarden leaves behind when a code is
+/// removed -- so the card told the owner "this record already has a one-time
+/// code" and offered to replace it on a login that had none. There is nothing
+/// to replace and nothing to lose, and saying there is makes the one warning
+/// in this card that guards an unrecoverable secret the one warning a user
+/// learns to scroll past.
+///
+/// Trimmed, because whitespace is not a code either and a seed is base32 or
+/// an `otpauth://` link: neither has meaningful leading space.
+///
+/// A function rather than the expression at the call site, so the two panes
+/// that open this card cannot come to disagree about what "already has one"
+/// means -- and so it can be asserted without a window.
+pub fn item_has_code(item: &crate::vault_bridge::VaultItem) -> bool {
+    item.login
+        .as_ref()
+        .and_then(|login| login.totp.as_deref())
+        .is_some_and(|totp| !totp.trim().is_empty())
+}
+
+
 pub fn submit_label(already_has_code: bool) -> &'static str {
     if already_has_code {
         REPLACE_LABEL
@@ -10586,5 +10611,48 @@ mod tests {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod item_has_code_tests {
+    /// **A record whose `totp` key is present but EMPTY has no code.**
+    ///
+    /// The owner, on a login with no second factor: "message is misleading -
+    /// there is no TOTP for this creds". The card was asked
+    /// `login.totp.is_some()`, and Bitwarden leaves the key behind with an
+    /// empty value when a code is removed -- so the card offered to replace
+    /// a secret that was not there, under a warning that the old one could
+    /// not be recovered.
+    ///
+    /// All four shapes, because the interesting two are the ones an
+    /// `is_some()` gets wrong and a naive `is_empty()` still gets wrong.
+    #[test]
+    fn only_a_record_with_a_seed_in_it_already_has_a_code() {
+        let item = |totp: &str| -> crate::vault_bridge::VaultItem {
+            serde_json::from_str(&format!(
+                r#"{{"id":"i","type":1,"name":"n","fields":[],"login":{{{totp}}}}}"#
+            ))
+            .expect("the fixture is valid item JSON")
+        };
+        assert!(
+            !super::item_has_code(&item("")),
+            "a login with no `totp` key at all was said to have a code"
+        );
+        assert!(
+            !super::item_has_code(&item(r#""totp":"""#)),
+            "a login whose `totp` is the empty string was said to have a code -- this is \
+             the shape Bitwarden leaves behind when a code is removed"
+        );
+        assert!(
+            !super::item_has_code(&item(r#""totp":"   ""#)),
+            "a login whose `totp` is whitespace was said to have a code; neither base32 \
+             nor an otpauth:// link is made of spaces"
+        );
+        assert!(
+            super::item_has_code(&item(r#""totp":"JBSWY3DPEHPK3PXP""#)),
+            "the control failed: a login that really carries a seed was said to have none, \
+             so the three refusals above are not about the seed"
+        );
     }
 }
