@@ -6707,27 +6707,45 @@ pub fn disabled_password_field(ui: &mut Ui) -> Rect {
 /// and claude.exe - not on the same line".
 pub const FIELD_TEXT_NUDGE: f32 = 0.09;
 
-/// **The baseline of a laid run, measured from the galley's own top.**
+/// **The middle of a laid run's INK, measured from the galley's own top.**
 ///
 /// What "on the same line" means for two runs set in different faces at
-/// different sizes -- and the reason centring their BOXES is not it. A box is
-/// the font's ascent plus its descent, and two faces divide that differently:
-/// the edit form's `Native apps` row sets the app's name in 14px Archivo and
-/// its executable in 11px Consolas, and with the two boxes centred on one line
-/// the mono run's ink still sat visibly above the other's. The owner, after a
-/// first fix that aligned the boxes: "*.exe is still positioned higher".
+/// different sizes. It took three goes to get here, and the two wrong answers
+/// are worth keeping because each is the obvious one:
 ///
-/// `Glyph::pos` is documented as "baseline position, relative to the row", and
-/// is the same for every character of one `TextFormat` -- so the first glyph
-/// answers for the run. A galley with no glyphs at all (an empty string) has no
-/// baseline; its own height is returned, which puts a caller's run where an
-/// un-nudged one would have gone.
-pub fn baseline_of(galley: &egui::Galley) -> f32 {
-    galley
-        .rows
-        .first()
-        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
-        .unwrap_or_else(|| galley.size().y)
+/// * **Centre the BOXES.** A galley's box is the font's ascent plus its
+///   descent, and two faces divide that differently -- the edit form's
+///   `Native apps` row sets the app's name in 14px Archivo and its executable
+///   in 11px Consolas. With the boxes centred the mono ink sat visibly above
+///   the name's: "*.exe is still positioned higher".
+/// * **Share a BASELINE.** Typographically correct for one size, and wrong
+///   here: hung from the name's baseline, the smaller run has less ink above
+///   the line and the same little below it, so its visual mass falls. "now it
+///   is lower".
+///
+/// The answer between them is the ink itself. `Glyph::pos` is the baseline
+/// (documented as "baseline position, relative to the row") and
+/// `uv_rect.offset` / `uv_rect.size` are the drawn glyph's own box in points,
+/// so the union over a run's glyphs is exactly what a reader sees. Glyphs that
+/// draw nothing -- the space between two words -- are skipped, or every run
+/// with a space in it would be measured against a blank.
+///
+/// A run with no ink at all has no middle; half its box is returned, which is
+/// where a caller centring on it would have put things anyway.
+pub fn ink_middle_of(galley: &egui::Galley) -> f32 {
+    let mut top = f32::INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for row in &galley.rows {
+        for glyph in &row.glyphs {
+            if glyph.uv_rect.is_nothing() {
+                continue;
+            }
+            let at = row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+            top = top.min(at);
+            bottom = bottom.max(at + glyph.uv_rect.size.y);
+        }
+    }
+    if top.is_finite() { (top + bottom) / 2.0 } else { galley.size().y / 2.0 }
 }
 
 fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32, height: f32, font_px: f32) -> Rect {
