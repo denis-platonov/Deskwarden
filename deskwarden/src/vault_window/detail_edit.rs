@@ -6381,6 +6381,81 @@ const PICKER_ROW_HEIGHT_EST: f32 = PICKER_TILE + 2.0 * PICKER_ROW_PAD_Y as f32;
 /// [`picker_rows`] for what the floor is protecting against.
 const PICKER_VIEWPORT: f32 = PICKER_ROWS_SHOWN * (PICKER_ROW_HEIGHT_EST + PICKER_LIST_GAP_Y);
 
+/// How wide 8b's card is when it floats.
+///
+/// It used to be as wide as the form column it was drawn inside, which is how
+/// an inline card gets its width and is not a width at all -- the same card
+/// was 690 points on a wide window and 250 on a narrow one. Floating, it needs
+/// a number: this is 8b's own card against its mock's gutters, clamped to the
+/// window at [`picker_card_width`] so it cannot be wider than what is behind
+/// it.
+const PICKER_CARD_WIDTH: f32 = 560.0;
+
+/// What of [`PICKER_CARD_WIDTH`] this window can actually show, leaving the
+/// scrim visible at either side so the card reads as something ON the window
+/// rather than as the window.
+fn picker_card_width(ctx: &egui::Context) -> f32 {
+    const GUTTER: f32 = 24.0;
+    // `content_rect`, which is what `theme::modal_scrim` lays the scrim over
+    // -- the window minus whatever chrome egui is drawing round it.
+    PICKER_CARD_WIDTH.min((ctx.content_rect().width() - 2.0 * GUTTER).max(240.0))
+}
+
+/// The height of the header band the card is dragged by -- its padding above
+/// and below the title, and the title.
+///
+/// Deliberately a little SHORT of the band rather than a little over: a handle
+/// that reached past the seam would swallow presses on the first row of the
+/// list, and the rows are what this card is for.
+const PICKER_HEADER_HEIGHT: f32 = 2.0 * PICKER_BAND_PAD_Y as f32 + PICKER_TITLE_PX;
+
+/// **8b's card, floating over the window** -- centred, on top, and over a
+/// scrim, which is what every other card in this app that asks a question
+/// does.
+///
+/// It was drawn INLINE, in the form's own column under the app row, and that
+/// is where its two worst defects came from: it took its width from whatever
+/// column it happened to be in, and its list took its height from whatever was
+/// left of the form's scroll viewport below it (see [`picker_rows`]). It also
+/// meant the card could be scrolled half off the screen while it was the only
+/// thing the user was being asked about. The owner: "that popup should be like
+/// the rest of popups on top and centered".
+///
+/// `theme::movable_modal` is the same door `delete_modal`, `icon_modal` and
+/// `folder_modal` come through -- `Order::Foreground`, anchored centre-centre,
+/// offset by whatever the header has been dragged by. The card inside it is
+/// unchanged: 8b's chrome is its own and is NOT `theme::modal_card`'s coloured
+/// header and two-button footer, because 8b draws a header with a dismiss mark
+/// and a footer with three.
+fn app_window_overlay(
+    ctx: &egui::Context,
+    app: &mut AppMatchDraft,
+    apps: &mut AppIdentityCache,
+) {
+    // **The scrim's id is a LITERAL and not a constant**, and that is not
+    // style: `item_list::MODAL_SCRIM_AREAS` is kept honest by a walk over this
+    // crate's sources looking for exactly this declaration, and that list is
+    // what answers "is a modal up" -- which keeps the item list's arrow keys
+    // from steering the selection behind an open card, and keeps the read pane
+    // from painting a second copy of the copy toast over one. A scrim spelled
+    // through a constant is one the walk cannot see.
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("app-window-picker-scrim")));
+    let width = picker_card_width(ctx);
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("app-window-picker"))).show(ctx, |ui| {
+        // **First, before the header draws.** egui hit-tests clicks and drags
+        // separately but not independently: registered after the band, the
+        // drag strip would lie over the dismiss mark and swallow its click.
+        // See `theme::modal_drag_handle`.
+        theme::modal_drag_handle(ui, PICKER_HEADER_HEIGHT);
+        // An `Area` has no width of its own, so the card is given one here
+        // rather than reading `available_width` -- which is infinite in a
+        // floating layer, and would lay every band of the card against
+        // infinity.
+        ui.set_width(width);
+        app_window_picker(ui, app, apps);
+    });
+}
+
 /// 8b's `Match this window by`, `text-transform: uppercase` already applied,
 /// with its `letter-spacing: 0.1em` -- 1.1 points at 11px, which is what
 /// `theme::letterspaced` wants, `RichText` having no em to give it.
@@ -6407,15 +6482,21 @@ const PICKER_RULE_PROCESS_NOTE: &str = "every window this program opens";
 const PICKER_RULE_HOSTED: &str = "Process and window title";
 const PICKER_RULE_HOSTED_NOTE: &str = "a Store app has no other name to match";
 
-/// The footer's three controls and its note.
+/// The footer's three controls.
 ///
-/// `Add target` and `Cancel` are 8b's own words. `Refresh` is the third,
-/// and the note is not 8b's `Refreshes as windows open` -- see the departures
-/// above.
+/// `Add target` and `Cancel` are 8b's own words; `Refresh` is the third.
+///
+/// **There is no footer note any more.** It read `Refresh to catch windows
+/// opened since` -- a hint for the button beside it -- and the far end of this
+/// band is now where the window count lives, at the owner's word ("17 windows
+/// open message move to the bottom right corner"). On the card's own 560
+/// points the two do not both fit: three buttons, the sentence and the count
+/// come to more than the band, so the count wrapped onto a line of its own and
+/// was not in the corner at all. The count is the better of the two there --
+/// it is what `Refresh` changes, which is what the sentence was trying to say.
 const PICKER_ADD: &str = "Add target";
 const PICKER_CANCEL: &str = "Cancel";
 const PICKER_REFRESH: &str = "Refresh";
-const PICKER_FOOTER_NOTE: &str = "Refresh to catch windows opened since";
 const PICKER_FOOTER_GAP: f32 = 9.0;
 
 /// What the list says when the desktop offered nothing.
@@ -6902,11 +6983,6 @@ fn picker_footer(ui: &mut egui::Ui, staged: bool, count: usize) -> (bool, bool, 
                 pressed.0 = theme::primary_button_enabled(ui, PICKER_ADD, None, staged).clicked();
                 pressed.1 = theme::secondary_button(ui, PICKER_CANCEL).clicked();
                 pressed.2 = theme::secondary_button(ui, PICKER_REFRESH).clicked();
-                ui.label(
-                    RichText::new(PICKER_FOOTER_NOTE)
-                        .size(PICKER_COUNT_PX)
-                        .color(theme::TEXT_GHOST),
-                );
                 // **The count, at the band's far right** -- 8b's header number,
                 // moved here at the owner's word ("17 windows open message move
                 // to the bottom right corner"). It belongs beside `Refresh`
@@ -8052,8 +8128,11 @@ fn app_block(
     }
 
     if app.picking {
-        ui.add_space(6.0);
-        app_window_picker(ui, app, apps);
+        // **Over the window, not in this column** -- see `app_window_overlay`.
+        // Drawn from here because this is where the state that opens it lives;
+        // an `Area` is its own layer, so where in the frame it is declared does
+        // not decide what it is painted over.
+        app_window_overlay(ui.ctx(), app, apps);
     }
 
     if app.hosted && !app.title.is_empty() {
@@ -14432,9 +14511,29 @@ mod generator_row_tests {
         }
     }
 
+    thread_local! {
+        /// **A clock that advances a tenth of a second per frame**, so the
+        /// modal layers these tests read are fully opaque.
+        ///
+        /// `egui::Area` fades in over `animation_time` by multiplying the whole
+        /// layer's opacity, and a headless context's clock does not advance on
+        /// its own -- so 8b's card, which floats in an `Area` now, was painted
+        /// at about a fifth of its colours for ever. `icon_modal`'s harness has
+        /// the same clock for the same reason.
+        ///
+        /// Thread-local because the harness gives each test its own thread and
+        /// its own context; all that is asked of the number is that it goes up.
+        static CLOCK: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    }
+
     fn raw_input(events: &[egui::Event]) -> egui::RawInput {
+        let time = CLOCK.with(|clock| {
+            clock.set(clock.get() + 0.1);
+            clock.get()
+        });
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, BODY)),
+            time: Some(time),
             events: events.to_vec(),
             ..Default::default()
         }
@@ -16151,8 +16250,13 @@ mod generator_row_tests {
         );
 
         let open = painted.rect_of(APP_PICK_LINK);
-        let (_, listed) = frame(&ctx, &mut draft, &click(open.center()));
+        let _ = frame(&ctx, &mut draft, &click(open.center()));
         assert!(draft.app.as_ref().unwrap().picking, "the picker did not open");
+        // Two more frames before the card is READ: it floats in an anchored
+        // `Area`, which paints nothing on the pass it first appears and fades
+        // in on the next. See `card_on`.
+        let _ = frame(&ctx, &mut draft, &[]);
+        let (_, listed) = frame(&ctx, &mut draft, &[]);
         for expected in [PICKER_TITLE, PICKER_ADD, PICKER_REFRESH, PICKER_MATCH_CAPTION] {
             assert!(
                 listed.strings().contains(&expected),
@@ -16223,14 +16327,25 @@ mod generator_row_tests {
         }
     }
 
-    /// Opens 8b's card on `rows`, which is what every test below starts from.
-    fn card_on(rows: Vec<AppWindowRow>) -> EditDraft {
+    /// Opens 8b's card on `rows`, which is what every test below starts from,
+    /// and **runs it to a settled state**.
+    ///
+    /// Two idle frames, and each one is a different rule. The card floats in an
+    /// anchored `Area` now, and an anchored area paints nothing on the pass it
+    /// is first shown -- egui has no size to centre it by until it has laid it
+    /// out once. Then it FADES IN, by multiplying the whole layer's opacity, so
+    /// the pass after that paints it at about a fifth of its colours. Every
+    /// test below reads the third frame or later. See `app_window_overlay` and
+    /// this module's `CLOCK`.
+    fn card_on(ctx: &egui::Context, rows: Vec<AppWindowRow>) -> EditDraft {
         let mut draft = app_draft(&chrome());
         {
             let app = draft.app.as_mut().unwrap();
             app.set_picking(true);
             app.windows = rows;
         }
+        let _ = frame(ctx, &mut draft, &[]);
+        let _ = frame(ctx, &mut draft, &[]);
         draft
     }
 
@@ -16256,7 +16371,7 @@ mod generator_row_tests {
         // write leaves every row inert, and dropping `choose_window` behind
         // `Add target` leaves the card unable to answer.
         let ctx = styled_context();
-        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+        let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         let row = listed.rect_of("Ledgerline - Invoices");
@@ -16291,7 +16406,7 @@ mod generator_row_tests {
         // `primary_button_enabled`, which would draw a live blue button whose
         // click does nothing.
         let ctx = styled_context();
-        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+        let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         let _ = frame(&ctx, &mut draft, &click(listed.rect_of(PICKER_ADD).center()));
@@ -16311,7 +16426,7 @@ mod generator_row_tests {
         // without it the chip would be decoration. Mutation this catches:
         // dropping the `entered` branch in `app_window_picker`.
         let ctx = styled_context();
-        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+        let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         let _ = frame(&ctx, &mut draft, &click(listed.rect_of("Ledgerline - Invoices").center()));
@@ -16327,7 +16442,7 @@ mod generator_row_tests {
         // The positive control for the test above: a Return wired to "add the
         // first row" would pass that one and this is what notices.
         let ctx = styled_context();
-        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+        let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let _ = frame(&ctx, &mut draft, &[]);
         let _ = frame(&ctx, &mut draft, &press_return());
@@ -16343,7 +16458,7 @@ mod generator_row_tests {
         // staged row would be the worst of both: the card shut, the item
         // re-pointed, and nothing on screen having said so.
         let ctx = styled_context();
-        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+        let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         let _ = frame(&ctx, &mut draft, &click(listed.rect_of("Ledgerline - Invoices").center()));
@@ -16362,7 +16477,7 @@ mod generator_row_tests {
         // at the end of the list -- on whatever row happened to be first --
         // would satisfy the staging test above.
         let ctx = styled_context();
-        let mut draft = card_on(vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
+        let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         let row = listed.rect_of("Ledgerline - Invoices");
@@ -16388,7 +16503,7 @@ mod generator_row_tests {
         // refusal one step earlier.
         let ctx = styled_context();
         let mut draft =
-            card_on(vec![listed_window("Speedtest by Ookla", "ApplicationFrameHost.exe")]);
+            card_on(&ctx, vec![listed_window("Speedtest by Ookla", "ApplicationFrameHost.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         let row = listed.rect_of("Speedtest by Ookla");
@@ -16414,7 +16529,7 @@ mod generator_row_tests {
         // hovering a row they cannot click.
         let ctx = styled_context();
         let mut draft =
-            card_on(vec![listed_window("Speedtest by Ookla", "ApplicationFrameHost.exe")]);
+            card_on(&ctx, vec![listed_window("Speedtest by Ookla", "ApplicationFrameHost.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
         let subtitle = format!("ApplicationFrameHost.exe \u{b7} {PICKER_REFUSAL_SHORT}");
@@ -16440,7 +16555,7 @@ mod generator_row_tests {
         // count taken from something other than the rows drawn -- the readout
         // is the only thing on the card that says the list is complete.
         let ctx = styled_context();
-        let mut draft = card_on(vec![
+        let mut draft = card_on(&ctx, vec![
             listed_window_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
             listed_window_at("SAP Logon 760", "saplogon.exe", 22),
             listed_window_at("Slack - #payments-oncall", "slack.exe", 33),
@@ -16463,7 +16578,7 @@ mod generator_row_tests {
         // catches: drawing the chip from the row alone, which would put it on
         // every row or on none.
         let ctx = styled_context();
-        let mut draft = card_on(vec![
+        let mut draft = card_on(&ctx, vec![
             listed_window_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
             listed_window_at("SAP Logon 760", "saplogon.exe", 22),
         ]);
@@ -16510,7 +16625,7 @@ mod generator_row_tests {
         let ctx = styled_context();
         let mut hosted = listed_window_at("Speedtest by Ookla", "Speedtest.exe", 77);
         hosted.hosted = true;
-        let mut draft = card_on(vec![
+        let mut draft = card_on(&ctx, vec![
             listed_window_at("Ledgerline - Invoices", "Ledgerline.exe", 11),
             hosted,
         ]);
@@ -17145,9 +17260,31 @@ mod sequence_builder_tests {
         }
     }
 
+    thread_local! {
+        /// **A clock that advances a tenth of a second per frame**, so the
+        /// modal layers these tests read are fully opaque.
+        ///
+        /// `egui::Area` fades in over `animation_time` by multiplying the
+        /// whole layer's opacity, and a headless context's clock does not
+        /// advance on its own -- so 8b's card was painted at alpha 0x3C for
+        /// ever and `picker_card` found no white box at all, however many
+        /// frames the test ran. `icon_modal`'s harness has the same clock for
+        /// the same reason; a tenth of a second is comfortably longer than the
+        /// animation, so a layer is solid one frame after it appears.
+        ///
+        /// Thread-local because the harness gives each test its own thread and
+        /// its own context; all that is asked of the number is that it goes up.
+        static CLOCK: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    }
+
     fn raw_input(pane: Vec2, events: &[egui::Event]) -> egui::RawInput {
+        let time = CLOCK.with(|clock| {
+            clock.set(clock.get() + 0.1);
+            clock.get()
+        });
         egui::RawInput {
             screen_rect: Some(Rect::from_min_size(Pos2::ZERO, pane)),
+            time: Some(time),
             events: events.to_vec(),
             ..Default::default()
         }
@@ -18822,6 +18959,54 @@ mod sequence_builder_tests {
         found[0]
     }
 
+    /// **8b's card floats over the window: centred, on top, and over a scrim.**
+    ///
+    /// It was drawn INLINE, in the form's own column under the app row, which
+    /// is where its two worst defects came from -- it took its width from
+    /// whatever column it happened to be in, and its list took its height from
+    /// whatever was left of the form's scroll viewport below it. It could also
+    /// be scrolled half off the screen while it was the only thing the user was
+    /// being asked about. The owner: "that popup should be like the rest of
+    /// popups on top and centered".
+    ///
+    /// Three claims, and each is a different half of "like the rest of them":
+    /// the scrim is up (which is also what `item_list::a_modal_is_up` reads),
+    /// the card is centred on the window, and it is NOT inside the form's own
+    /// card column -- a card that merely looked centred because the column
+    /// happened to be centred would pass the second claim alone.
+    #[test]
+    fn the_window_picker_floats_over_the_window_rather_than_inside_the_form() {
+        let item = item();
+        let ctx = styled_context(PANE);
+        let mut draft = picker_draft(&item, vec![window_row_at("W", "w.exe", 11)]);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+
+        assert!(
+            ctx.memory(|m| m.areas().visible_layer_ids().iter().any(|layer| {
+                layer.id == egui::Id::new("app-window-picker-scrim")
+            })),
+            "no scrim is up behind the card, so the window behind it is still live"
+        );
+
+        let card = picker_card(&painted).rect;
+        assert!(
+            (card.center().x - PANE.x / 2.0).abs() <= 1.0,
+            "the card is centred at x = {} on a {}-point window",
+            card.center().x,
+            PANE.x
+        );
+        // ...and it is over the WINDOW, not in the form's column. The card
+        // column is inset from the pane by the sidebar and the list, so a card
+        // laid inside it cannot reach the window's own centre.
+        assert!(
+            card.left() < crate::vault_window::SIDEBAR_WIDTH,
+            "the card starts at x = {}, which is inside the form's own column -- it is still              laid out by the pane it was opened from",
+            card.left()
+        );
+    }
+
     /// **The list keeps its six rows however little room the form has left.**
     ///
     /// egui sizes a `ScrollArea` as `available.at_most(max_size)` and then
@@ -18912,6 +19097,17 @@ mod sequence_builder_tests {
         // --- the control: nothing pressed, the card stays ------------------
         let ctx = styled_context(PANE);
         let mut draft = picker_draft(&item, rows.clone());
+        // **Two idle frames first**, and each one is a different rule.
+        //
+        // 8b's card is an anchored `Area` now, and an anchored area paints
+        // nothing on the pass it is first shown -- egui has no size to centre
+        // it by until it has laid it out once. Then it FADES IN, by
+        // multiplying the whole layer's opacity, so the pass after that paints
+        // the card at about a fifth of its colours. It is solid on the third,
+        // which is the one these assertions read. See `theme::movable_modal`
+        // and this module's `CLOCK`.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         assert!(
             draft.app.as_ref().is_some_and(|a| a.picking),
@@ -18977,6 +19173,17 @@ mod sequence_builder_tests {
             .collect();
         let mut draft = picker_draft(&item, rows);
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        // **Two idle frames first**, and each one is a different rule.
+        //
+        // 8b's card is an anchored `Area` now, and an anchored area paints
+        // nothing on the pass it is first shown -- egui has no size to centre
+        // it by until it has laid it out once. Then it FADES IN, by
+        // multiplying the whole layer's opacity, so the pass after that paints
+        // the card at about a fifth of its colours. It is solid on the third,
+        // which is the one these assertions read. See `theme::movable_modal`
+        // and this module's `CLOCK`.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
 
         let card = picker_card(&painted).rect;
@@ -19019,6 +19226,17 @@ mod sequence_builder_tests {
             &item,
             vec![window_row_at("Ledgerline - Invoices", "Ledgerline.exe", 11)],
         );
+        // **Two idle frames first**, and each one is a different rule.
+        //
+        // 8b's card is an anchored `Area` now, and an anchored area paints
+        // nothing on the pass it is first shown -- egui has no size to centre
+        // it by until it has laid it out once. Then it FADES IN, by
+        // multiplying the whole layer's opacity, so the pass after that paints
+        // the card at about a fifth of its colours. It is solid on the third,
+        // which is the one these assertions read. See `theme::movable_modal`
+        // and this module's `CLOCK`.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
 
         let card = picker_card(&painted);
@@ -19110,6 +19328,17 @@ mod sequence_builder_tests {
                 window_row_at("SAP Logon 760", "saplogon.exe", 22),
             ],
         );
+        // **Two idle frames first**, and each one is a different rule.
+        //
+        // 8b's card is an anchored `Area` now, and an anchored area paints
+        // nothing on the pass it is first shown -- egui has no size to centre
+        // it by until it has laid it out once. Then it FADES IN, by
+        // multiplying the whole layer's opacity, so the pass after that paints
+        // the card at about a fifth of its colours. It is solid on the third,
+        // which is the one these assertions read. See `theme::movable_modal`
+        // and this module's `CLOCK`.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let card = picker_card(&painted);
 
@@ -19231,6 +19460,17 @@ mod sequence_builder_tests {
             ],
         );
         draft.app.as_mut().unwrap().picked = Some(11);
+        // **Two idle frames first**, and each one is a different rule.
+        //
+        // 8b's card is an anchored `Area` now, and an anchored area paints
+        // nothing on the pass it is first shown -- egui has no size to centre
+        // it by until it has laid it out once. Then it FADES IN, by
+        // multiplying the whole layer's opacity, so the pass after that paints
+        // the card at about a fifth of its colours. It is solid on the third,
+        // which is the one these assertions read. See `theme::movable_modal`
+        // and this module's `CLOCK`.
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
+        let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let card = picker_card(&painted);
 

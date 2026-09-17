@@ -1304,6 +1304,7 @@ fn scroll_offset_id() -> egui::Id {
 /// the difference. `every_modal_scrim_in_the_crate_is_named_here` walks `src/`
 /// and fails if a modal is added with a scrim this list does not name.
 const MODAL_SCRIM_AREAS: &[&str] = &[
+    "app-window-picker-scrim",
     "delete-confirm-scrim",
     "detail-edit-discard-scrim",
     "folder-edit-scrim",
