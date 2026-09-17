@@ -1104,6 +1104,22 @@ impl AppMatchDraft {
         self.process.is_empty() && self.title.is_empty()
     }
 
+    /// **Nothing has been put into this binding at all** -- not a window, not
+    /// a path, not an argument.
+    ///
+    /// Stricter than [`Self::is_blank`], which asks only about the process and
+    /// the title, and the difference is the whole point of it: the add row's
+    /// `enter a path` door opens this block with an empty PATH BOX for the
+    /// user to type in, and a path typed there leaves `is_blank` true. So
+    /// `is_blank` cannot answer "may this block be taken away again" without
+    /// throwing away what was typed.
+    ///
+    /// See `app_block`, which asks it when the window picker closes with
+    /// nothing chosen.
+    pub fn is_untouched(&self) -> bool {
+        self.is_blank() && self.path.trim().is_empty() && self.args.trim().is_empty()
+    }
+
     pub fn from_match(m: &AppMatch) -> Self {
         Self {
             bound: true,
@@ -8244,6 +8260,30 @@ fn app_block(
         // an `Area` is its own layer, so where in the frame it is declared does
         // not decide what it is painted over.
         app_window_overlay(ui.ctx(), app, apps);
+        // **A picker closed with nothing chosen takes the block away with it.**
+        //
+        // `+ Pick a running window` on the add row makes the draft and opens
+        // 8b's card in one press -- so Cancel, Escape or the card's \u{2715}
+        // used to leave the block standing over an EMPTY binding: a `?` tile, a
+        // blank name box, a `Process name` chip and a \u{2715}, with `Program
+        // file` and `CLI arguments` under it. The owner, having done exactly
+        // that: "why paths shown when I clicked Pick and then closed it?".
+        //
+        // `bound = false` and not `draft.app = None`, because this function
+        // cannot see the item and the two origins want different things back:
+        // an item that never had a binding wants nothing, and one whose binding
+        // is staged for removal wants that removal kept. `bound = false` IS
+        // both -- it draws the add row either way (see the `!bound` arm above),
+        // and `app_match_edit` answers `Leave` for it against an item with no
+        // stored binding and `Remove` against one that has.
+        //
+        // `is_untouched` and not `is_blank`: the add row's other door opens
+        // this block for a path to be TYPED, and a path typed into it leaves
+        // `is_blank` true. Taking the block away on `is_blank` would throw that
+        // away the moment the user glanced at the picker.
+        if !app.picking && app.is_untouched() {
+            app.bound = false;
+        }
     }
 
     if app.hosted && !app.title.is_empty() {
@@ -26528,6 +26568,90 @@ mod edit_pane_layout_tests {
                 caption.center().y
             );
         }
+    }
+
+    const PATH_ALREADY_TYPED: &str = "C:\\Deskwarden Test\\App\\app.exe";
+
+    /// **Opening the picker from the add row and closing it leaves nothing
+    /// behind.**
+    ///
+    /// `+ Pick a running window` makes the draft and opens 8b's card in one
+    /// press, so Cancel used to leave the editing block standing over an EMPTY
+    /// binding -- a `?` tile, a blank name box, a `Process name` chip and a
+    /// mark, with `Program file` and `CLI arguments` under it. The owner,
+    /// having done exactly that: "why paths shown when I clicked Pick and then
+    /// closed it?".
+    ///
+    /// **And the negative control, which is the half that could lose work**:
+    /// the add row's OTHER door opens the same block for a path to be typed,
+    /// and a path typed there leaves `is_blank` true. So a build that took the
+    /// block away on `is_blank` rather than `is_untouched` would throw the
+    /// typed path away the moment the user glanced at the picker; that is
+    /// asserted here too, because the two cases differ by one word in one
+    /// predicate.
+    #[test]
+    fn a_picker_opened_from_the_add_row_and_cancelled_leaves_no_block() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let totp = detail::TotpState::NoSecret;
+
+        let mut draft = EditDraft::from_item(&item);
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let link = painted.rect_of(APP_PICK_LINK).center();
+        let _ = frame_for(&ctx, pane, &mut draft, false, &click(link), Some(&item), &totp);
+        assert!(
+            draft.app.as_ref().is_some_and(|a| a.picking),
+            "the premise failed: the Pick door did not open the card"
+        );
+        // **Closed from INSIDE a frame**, with Escape -- which is one of the
+        // card's three ways out and the only one this harness can press
+        // without hunting for a button in a floating layer. It matters that
+        // the close happens while the form is being drawn: the block is taken
+        // away by the same pass that sees the card go, so a test that flipped
+        // `picking` between frames would be asserting about a pass the form
+        // never runs.
+        let escape = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let _ = frame_for(&ctx, pane, &mut draft, false, &escape, Some(&item), &totp);
+        // A frame LATER, because the block is laid out ABOVE the card in the
+        // same pass: the frame that carries the Escape has already painted the
+        // block by the time the card reports that it closed.
+        let after = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        let strings = after.strings();
+        for gone in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON] {
+            assert!(
+                !strings.contains(&gone),
+                "a picker opened from the add row and closed left {gone:?} on the form, over \
+                 a binding nothing was ever chosen for: {strings:?}"
+            );
+        }
+        assert!(
+            strings.contains(&APP_ADD_PATH_LINK),
+            "the row did not go back to the add row: {strings:?}"
+        );
+
+        // ...and a path already typed is NOT thrown away by the same gesture.
+        let mut typed = EditDraft::from_item(&item);
+        let mut app = AppMatchDraft::unbound();
+        app.set_path(PATH_ALREADY_TYPED);
+        app.picking = true;
+        typed.app = Some(app);
+        let _ = frame_for(&ctx, pane, &mut typed, false, &[], Some(&item), &totp);
+        let _ = frame_for(&ctx, pane, &mut typed, false, &escape, Some(&item), &totp);
+        let kept = frame_for(&ctx, pane, &mut typed, false, &[], Some(&item), &totp);
+        assert!(
+            kept.strings().contains(&APP_PATH_LABEL),
+            "closing the picker threw away a path the user had already typed: {:?}",
+            kept.strings()
+        );
     }
 
     /// **The runs on a link row do not touch.**
