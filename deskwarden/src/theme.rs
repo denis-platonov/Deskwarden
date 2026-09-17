@@ -6707,6 +6707,29 @@ pub fn disabled_password_field(ui: &mut Ui) -> Rect {
 /// and claude.exe - not on the same line".
 pub const FIELD_TEXT_NUDGE: f32 = 0.09;
 
+/// **The baseline of a laid run, measured from the galley's own top.**
+///
+/// What "on the same line" means for two runs set in different faces at
+/// different sizes -- and the reason centring their BOXES is not it. A box is
+/// the font's ascent plus its descent, and two faces divide that differently:
+/// the edit form's `Native apps` row sets the app's name in 14px Archivo and
+/// its executable in 11px Consolas, and with the two boxes centred on one line
+/// the mono run's ink still sat visibly above the other's. The owner, after a
+/// first fix that aligned the boxes: "*.exe is still positioned higher".
+///
+/// `Glyph::pos` is documented as "baseline position, relative to the row", and
+/// is the same for every character of one `TextFormat` -- so the first glyph
+/// answers for the run. A galley with no glyphs at all (an empty string) has no
+/// baseline; its own height is returned, which puts a caller's run where an
+/// un-nudged one would have gone.
+pub fn baseline_of(galley: &egui::Galley) -> f32 {
+    galley
+        .rows
+        .first()
+        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
+        .unwrap_or_else(|| galley.size().y)
+}
+
 fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32, height: f32, font_px: f32) -> Rect {
     let (outer, _) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), height),

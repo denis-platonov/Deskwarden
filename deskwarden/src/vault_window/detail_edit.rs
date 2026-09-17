@@ -8042,18 +8042,29 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
     let name_width = name.size().x.min(text_room);
     let left = (rect.left() + APP_FIELD_INSET + name_width + APP_EXE_CHIP_GAP)
         .min(rect.right() - APP_FIELD_INSET - width);
-    // **Centred on the NAME's line, not on the box's middle.**
+    // **On the NAME's BASELINE**, which is what "on the same line" means for
+    // two runs set in different faces at different sizes.
     //
-    // `theme::disabled_field_box` drops its run by `theme::FIELD_TEXT_NUDGE`
-    // of the run's own height, because a field box is ascent-plus-descent tall
-    // and a geometrically centred line reads as sitting high. The chip was
-    // centred on the box instead, so the two runs on this one line were a point
-    // and a half apart -- the owner: "Claude and claude.exe - not on the same
-    // line". The nudge is read from the theme rather than repeated, so the two
-    // painters cannot come to disagree about it.
-    let middle = rect.center().y + name.size().y * theme::FIELD_TEXT_NUDGE;
-    let chip = egui::Rect::from_center_size(
-        egui::pos2(left + width / 2.0, middle),
+    // Two goes at this. `theme::disabled_field_box` drops its run by
+    // `theme::FIELD_TEXT_NUDGE` of the run's own height -- a field box is
+    // ascent-plus-descent tall and a geometrically centred line reads as
+    // sitting high -- and the chip was centred on the BOX, which put the two
+    // runs a point and a half apart. Centring the two BOXES on each other
+    // fixed that number and not the report: a box is the font's ascent plus
+    // its descent, 14px Archivo and 11px Consolas divide that differently, and
+    // the mono ink still sat above the name's. The owner: "*.exe is still
+    // positioned higher".
+    //
+    // So the two are hung from one line instead. Where
+    // `theme::disabled_field_box` puts the name's galley is arithmetic this
+    // function can repeat exactly -- it is the nudge above, on the same galley
+    // -- and `theme::baseline_of` says where in a galley its baseline falls.
+    let name_top = rect.center().y - name.size().y / 2.0
+        + name.size().y * theme::FIELD_TEXT_NUDGE;
+    let baseline = name_top + theme::baseline_of(&name);
+    let chip_text_top = baseline - theme::baseline_of(&galley);
+    let chip = egui::Rect::from_min_size(
+        egui::pos2(left, chip_text_top - PICKER_CHIP_PAD_Y),
         egui::vec2(width, galley.size().y + PICKER_CHIP_PAD_Y * 2.0),
     );
     // **White, where 8b's chip is grey**, and the inversion is the point: 8a
@@ -15971,10 +15982,19 @@ mod generator_row_tests {
             "the app's name is painted at {name:?} and its executable chip at {chip:?} -- the \
              row has them the wrong way round, or on top of each other"
         );
+        // **They share the line**, asked as a vertical overlap rather than as
+        // matching centres. The two runs are hung from one BASELINE (see
+        // `theme::baseline_of`), and because a galley's box is the font's
+        // ascent plus its descent -- 14px Archivo and 11px Consolas divide
+        // that differently -- two runs correctly on one line have boxes whose
+        // centres are three points apart. The exact claim is
+        // `the_executable_chip_stays_on_the_app_rows_line_at_every_width`,
+        // which reads the baselines this harness does not collect; what is
+        // asked here is what a reader would call being on the same line.
+        let overlap = name.bottom().min(chip.bottom()) - name.top().max(chip.top());
         assert!(
-            (name.center().y - chip.center().y).abs() < 2.0,
-            "the executable chip at {chip:?} is not on the name's own line ({name:?}), so it \
-             is not inside the box 8a puts it in"
+            overlap >= 0.8 * chip.height(),
+            "the executable chip at {chip:?} shares only {overlap} points of line with the              name at {name:?}, so it is not inside the box 8a puts it in"
         );
     }
 
@@ -19897,6 +19917,12 @@ mod edit_pane_layout_tests {
         /// overlap assertion is asked of the glyph positions egui really
         /// placed -- the same source `Painted::rendered` reads.
         glyphs: Vec<(String, Rect)>,
+
+        /// Every run's BASELINE, in the frame's own coordinates.
+        ///
+        /// Two runs are on one line when their baselines agree, and not when
+        /// their boxes do -- see `theme::baseline_of`.
+        baselines: Vec<(String, egui::FontId, f32)>,
         /// The FACE each run was laid out in, by run text.
         ///
         /// Neither `texts` nor `glyphs` can see a font: both answer in
@@ -20124,6 +20150,27 @@ mod edit_pane_layout_tests {
                         section.format.color
                     };
                     painted.inks.push((text.galley.text().to_string(), ink));
+                }
+                // ... and the run's BASELINE, which is the only honest way to
+                // ask whether two runs set in different faces are on one line:
+                // their boxes are each a font's ascent plus its descent, and
+                // two faces divide that differently. See `theme::baseline_of`,
+                // and `the_executable_chip_stays_on_the_app_rows_line_at_
+                // every_width`, which is the test that needs it.
+                // The face is recorded WITH the baseline rather than looked
+                // up by index in `fonts`: the two lists are pushed under
+                // different conditions, so a shape that satisfies one and not
+                // the other would slide every later pair out of step.
+                if let Some((row, section)) =
+                    text.galley.rows.first().zip(text.galley.job.sections.first())
+                {
+                    if let Some(glyph) = row.glyphs.first() {
+                        painted.baselines.push((
+                            text.galley.text().to_string(),
+                            section.format.font_id.clone(),
+                            text.pos.y + row.pos.y + glyph.pos.y,
+                        ));
+                    }
                 }
                 // ... and the box the ink really covers, **cut to the clip
                 // rect it was painted under**. See `Painted::glyphs`.
@@ -26850,16 +26897,30 @@ mod edit_pane_layout_tests {
                 .find(|((run, _), (_, font))| run == EXE && *font != mono)
                 .map(|((_, rect), _)| *rect)
                 .unwrap_or_else(|| panic!("the app row painted no name on a {width}-point pane"));
-            // **Half a point**, not two. The two runs are laid in different
-            // faces at different sizes, so their boxes differ in height and
-            // only their CENTRES can be compared -- but those centres must
-            // really agree: a point and a half of disagreement is what the
-            // owner saw and called "not on the same line".
+            // **Their BASELINES, not their boxes.** A galley's box is the
+            // font's ascent plus its descent, and 14px Archivo and 11px
+            // Consolas divide that differently -- so two boxes centred on one
+            // another still put the mono ink visibly higher, which is what the
+            // owner reported after exactly that fix: "*.exe is still positioned
+            // higher". Two runs are on one line when they hang from one line.
+            let baseline = |want_mono: bool| -> f32 {
+                painted
+                    .baselines
+                    .iter()
+                    .find(|(run, font, _)| run == EXE && (*font == mono) == want_mono)
+                    .map(|(_, _, y)| *y)
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "no {} {EXE:?} run on a {width}-point pane",
+                            if want_mono { "monospace" } else { "proportional" }
+                        )
+                    })
+            };
             assert!(
-                (chip[0].center().y - name.center().y).abs() <= 0.5,
-                "on a {width}-point pane the chip is centred at y = {} and the name at {} --                  they are not on one line",
-                chip[0].center().y,
-                name.center().y
+                (baseline(true) - baseline(false)).abs() <= 0.5,
+                "on a {width}-point pane the chip sits on baseline {} and the name on {} --                  they are not on one line",
+                baseline(true),
+                baseline(false)
             );
             // ...and the chip is a PILL: a box of its own, in a fill that is
             // not the fill of the greyed field it sits in. Painted in
