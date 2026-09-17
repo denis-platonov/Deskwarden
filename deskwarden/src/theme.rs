@@ -6618,9 +6618,38 @@ pub fn section_disabled_text_field(ui: &mut Ui, text: &str) -> Rect {
 /// no code yet with an `Add` beside it. See [`section_text_field_within`],
 /// whose reason is the same.
 pub fn section_disabled_text_field_within(ui: &mut Ui, text: &str, room: f32) -> Rect {
+    section_disabled_text_field_reserving(ui, text, room, 0.0)
+}
+
+/// [`section_disabled_text_field_within`], **keeping `reserve` points free at
+/// the box's right-hand end** for something the caller will paint there.
+///
+/// [`disabled_field_box`] truncates its run at the box's own text width, which
+/// is the right answer for a box holding one thing. The edit form's
+/// `Native apps` box holds TWO -- the app's name, and its executable in a grey
+/// chip after it -- and the chip is painted by the caller over the same box.
+/// Without the reservation the name truncates against the WHOLE box and the
+/// chip lands on top of its last few letters, which is why the caller used to
+/// drop the chip rather than draw it at all.
+///
+/// The reservation is added to the box's ordinary right inset, so a caller
+/// passes only the width of the thing it means to put there (and the gap
+/// before it), not the inset as well.
+pub fn section_disabled_text_field_reserving(
+    ui: &mut Ui,
+    text: &str,
+    room: f32,
+    reserve: f32,
+) -> Rect {
     ui.scope(|ui| {
         ui.set_max_width(room);
-        disabled_field_box(ui, text, 10.0, SECTION_FIELD_HEIGHT, SECTION_FIELD_PX)
+        disabled_field_box(
+            ui,
+            text,
+            10.0 + reserve.max(0.0),
+            SECTION_FIELD_HEIGHT,
+            SECTION_FIELD_PX,
+        )
     })
     .inner
 }

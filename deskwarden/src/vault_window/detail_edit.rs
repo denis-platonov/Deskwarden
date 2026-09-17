@@ -1505,9 +1505,18 @@ impl Section {
     /// under `Autofill targets` -- and the sentence does real work: it is the
     /// difference between a card a user reads as "addresses" and one they read
     /// as "when does this fire".
-    pub fn note(self) -> &'static str {
+    ///
+    /// **It depends on the kind, because 8a's sentence names a login.** A
+    /// secure note is not one, has no websites this app can store, and shows
+    /// only the matched-app row -- so the design's own words would be a card
+    /// describing something the record does not have. The owner, on a note:
+    /// "Does Secnote need Autofill targets?".
+    pub const fn note(self, kind: ItemKind) -> &'static str {
         match self {
-            Section::Autofill => "where this login is offered",
+            Section::Autofill => match kind {
+                ItemKind::Login => "where this login is offered",
+                _ => "which app this fills in",
+            },
             Section::FillRule => "what Deskwarden types",
             _ => "",
         }
@@ -7995,22 +8004,43 @@ fn app_fresh_note(app: &AppMatchDraft) -> String {
 /// yours to fill in. What IS editable is the program file, one row down,
 /// which is where [`APP_PICK_HINT`] points.
 ///
-/// The chip is **skipped rather than clipped** when the box is too narrow to
-/// hold both runs. A monospace fragment ending mid-name is worse than no
-/// fragment: the executable is the value the binding is keyed on, and half of
-/// one reads as the whole of a different one.
+/// **The chip is never dropped, and the NAME gives way instead.**
+///
+/// It used to be the other way round: the chip was skipped whenever the box
+/// was too narrow to hold both runs whole, on the argument that a monospace
+/// fragment ending mid-name reads as a different executable. The argument
+/// stands for a CLIPPED chip and not for a missing one, and what it produced
+/// was a row that quietly lost its executable at every width the app is
+/// really used at -- measured on a 460-point pane, the box came out 206 points
+/// against the 213 the pair wanted, so `ledgerline.exe` was simply absent. The
+/// owner, with 8a's row beside it: "not as per design - exe should be in pill
+/// and on the same line".
+///
+/// So the box reserves the chip's width at its right-hand end
+/// (`theme::section_disabled_text_field_reserving`) and the NAME is elided
+/// into what is left -- which is the run that survives elision, because a name
+/// is prose and an executable is a key. The chip follows the name's real
+/// painted width and is clamped to the box, so a short name keeps it beside
+/// the name and a long one pushes it to the inset and no further.
 fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
-    let rect = theme::section_disabled_text_field_within(ui, name, room);
     if exe.is_empty() {
+        theme::section_disabled_text_field_within(ui, name, room);
         return;
     }
-    let name_width = app_name_run_width(ui, name);
     let galley = picker_chip_galley_mono(ui, exe);
-    let left = rect.left() + APP_FIELD_INSET + name_width + APP_EXE_CHIP_GAP;
     let width = galley.size().x + PICKER_CHIP_PAD_X * 2.0;
-    if left + width > rect.right() - APP_FIELD_INSET {
-        return;
-    }
+    let rect = theme::section_disabled_text_field_reserving(
+        ui,
+        name,
+        room,
+        APP_EXE_CHIP_GAP + width,
+    );
+    // What `disabled_field_box` really had for the name, and therefore how
+    // wide the run it painted can be.
+    let text_room = (rect.width() - 2.0 * APP_FIELD_INSET - APP_EXE_CHIP_GAP - width).max(0.0);
+    let name_width = app_name_run_width(ui, name).min(text_room);
+    let left = (rect.left() + APP_FIELD_INSET + name_width + APP_EXE_CHIP_GAP)
+        .min(rect.right() - APP_FIELD_INSET - width);
     let chip = egui::Rect::from_min_size(
         egui::pos2(left, rect.center().y - (galley.size().y + PICKER_CHIP_PAD_Y * 2.0) / 2.0),
         egui::vec2(width, galley.size().y + PICKER_CHIP_PAD_Y * 2.0),
@@ -8938,7 +8968,13 @@ fn section<R>(
         // the title and the rows under it start on one vertical line.
         let pad_x = theme::section_card_pad_x(ui.available_width());
         let title =
-            theme::section_card_header_at(ui, pad_x, section.title(kind), section.note(), changed);
+            theme::section_card_header_at(
+                ui,
+                pad_x,
+                section.title(kind),
+                section.note(kind),
+                changed,
+            );
         // 8a's tag, beside the title it qualifies. See `Section::chip`.
         if let Some(chip) = section.chip() {
             paint_section_chip(ui, title, chip);
@@ -10850,7 +10886,27 @@ pub fn draw_detail_edit(
                 //
                 // The block carries its own Remove per row, so the slot has
                 // none of its own -- see [`Slot::Websites`].
-                websites_block(ui, &mut draft.uris, creating);
+                // **Only a login has websites**, and that is the model's rule
+                // rather than a layout choice: `login.uris` lives under the
+                // `login` object, `EditDraft::apply_to` writes `uris` in its
+                // `ItemKind::Login` arm and nowhere else, and
+                // `EditDraft::from_item` reads them through `item.login`. So a
+                // website added to a secure note, a card, an identity or an
+                // SSH key was accepted by the box, discarded by the Save, and
+                // gone the next time the item was opened -- a control that
+                // succeeds and does nothing, which this form refuses
+                // everywhere else (`AppMatch::trigger`, 8a's `On field focus`,
+                // the match-rule read-out on the card below).
+                //
+                // The owner, looking at a secure note: "Does Secnote need
+                // Autofill targets?". Half of it did not; the matched-app row
+                // below does, because a binding is a custom FIELD on the item
+                // and `key_sequence::field_palette` can type any item's custom
+                // fields -- a note holding a licence key, bound to the program
+                // that asks for it, is the case.
+                if kind == ItemKind::Login {
+                    websites_block(ui, &mut draft.uris, creating);
+                }
                 // **8a's one hairline on this card falls out of the rows**,
                 // between the websites group and the native-apps group: the
                 // design's `border-bottom: 1px solid #f3f2f2` on the websites
@@ -26651,6 +26707,145 @@ mod edit_pane_layout_tests {
             kept.strings().contains(&APP_PATH_LABEL),
             "closing the picker threw away a path the user had already typed: {:?}",
             kept.strings()
+        );
+    }
+
+    /// **The executable chip is on the name's line at every width the app can
+    /// be resized to**, and the name gives way for it rather than the other
+    /// way round.
+    ///
+    /// The chip used to be skipped whenever the box could not hold both runs
+    /// whole. That lost it at every width the app is really used at -- measured
+    /// on a 460-point pane, the box came out 206 points against the 213 the
+    /// pair wanted, so the executable was simply absent. The owner, with 8a's
+    /// row beside it: "not as per design - exe should be in pill and on the
+    /// same line".
+    ///
+    /// **Three widths, including the app's minimum**, because the old
+    /// behaviour passed at the widest one: a test that looked only at a roomy
+    /// pane would have said the chip was fine throughout.
+    ///
+    /// Both halves at each: the chip is painted, and it is on the name's line
+    /// rather than under it.
+    #[test]
+    fn the_executable_chip_stays_on_the_app_rows_line_at_every_width() {
+        const EXE: &str = "ledgerline.exe";
+        let mut widths = 0;
+        for width in [WIDE_PANE_WIDTH, 460.0, MIN_PANE_WIDTH] {
+            widths += 1;
+            let pane = Vec2::new(width, 2400.0);
+            let ctx = styled_context(pane);
+            let item = login_with_websites(1);
+            let mut draft = EditDraft::from_item(&item);
+            let mut app = AppMatchDraft::unbound();
+            app.process = EXE.to_string();
+            draft.app = Some(app);
+            let totp = detail::TotpState::NoSecret;
+            let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+            let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+            // The chip's own run: the MONOSPACE one. The row's name run reads
+            // the same string on this fixture -- `display_name` falls back to
+            // the file name when the executable is not on disk -- so the two
+            // are told apart by the face 8a sets each in, which is also the
+            // only thing that makes the chip a chip.
+            let mono = egui::FontId::new(PICKER_SUB_PX, egui::FontFamily::Monospace);
+            let chip: Vec<Rect> = painted
+                .texts
+                .iter()
+                .zip(painted.fonts.iter())
+                .filter(|((run, _), (_, font))| run == EXE && *font == mono)
+                .map(|((_, rect), _)| *rect)
+                .collect();
+            assert_eq!(
+                chip.len(),
+                1,
+                "on a {width}-point pane the app row paints {} monospace {EXE:?} chips, not \
+                 the one 8a draws inside the name box",
+                chip.len()
+            );
+
+            // ...and it is beside the name, not under it. The name is the
+            // proportional run of the same string.
+            let name = painted
+                .texts
+                .iter()
+                .zip(painted.fonts.iter())
+                .find(|((run, _), (_, font))| run == EXE && *font != mono)
+                .map(|((_, rect), _)| *rect)
+                .unwrap_or_else(|| panic!("the app row painted no name on a {width}-point pane"));
+            assert!(
+                (chip[0].center().y - name.center().y).abs() <= 2.0,
+                "on a {width}-point pane the chip is at {:?} and the name at {name:?} -- they \
+                 are not on one line",
+                chip[0]
+            );
+            assert!(
+                chip[0].left() >= name.right() - 0.5,
+                "on a {width}-point pane the chip at {:?} overlaps the name at {name:?}",
+                chip[0]
+            );
+        }
+        assert_eq!(widths, 3, "the loop visited nothing, so it asserted nothing");
+    }
+
+    /// **Only a login is offered websites.**
+    ///
+    /// `login.uris` lives under the `login` object: `EditDraft::apply_to`
+    /// writes `uris` in its `ItemKind::Login` arm and nowhere else, and
+    /// `EditDraft::from_item` reads them through `item.login`. So a website
+    /// added to a secure note was accepted by the box, discarded by the Save
+    /// and gone the next time the item was opened -- a control that succeeds
+    /// and does nothing. The owner, looking at a note: "Does Secnote need
+    /// Autofill targets?".
+    ///
+    /// **The matched-app row stays**, and that is the other half of the
+    /// answer: a binding is a custom FIELD on the item and
+    /// `key_sequence::field_palette` can type any item's custom fields, so a
+    /// note holding a licence key can be bound to the program that asks for
+    /// it. A build that took the whole card away from every non-login would
+    /// fail here.
+    #[test]
+    fn a_record_that_cannot_store_websites_is_not_offered_them() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let note: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"n","name":"Secnote","type":2,"fields":[],
+                "secureNote":{"type":0},"notes":"just some note here"}"#,
+        )
+        .expect("the fixture is valid item JSON");
+        let mut draft = EditDraft::from_item(&note);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&note), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&note), &totp);
+
+        let strings = painted.strings();
+        assert!(
+            !strings.contains(&WEBSITE_ADD_BUTTON),
+            "a secure note is offered {WEBSITE_ADD_BUTTON:?}, and a website typed there is \
+             thrown away by the Save: {strings:?}"
+        );
+        assert!(
+            strings.contains(&APP_BLOCK_HEADING) && strings.contains(&APP_PICK_LINK),
+            "the note lost the matched-app row as well, which it CAN store: {strings:?}"
+        );
+        // ...and the card does not describe it as a login.
+        assert!(
+            !strings.contains(&Section::Autofill.note(ItemKind::Login)),
+            "the card over a secure note still says {:?}: {strings:?}",
+            Section::Autofill.note(ItemKind::Login)
+        );
+
+        // The positive control: a LOGIN still gets both halves, so the gate
+        // above is about the kind and not about the card.
+        let login = login_with_websites(1);
+        let mut other = EditDraft::from_item(&login);
+        let _ = frame_for(&ctx, pane, &mut other, false, &[], Some(&login), &totp);
+        let both = frame_for(&ctx, pane, &mut other, false, &[], Some(&login), &totp);
+        assert!(
+            both.strings().contains(&WEBSITE_ADD_BUTTON),
+            "a login lost its websites too: {:?}",
+            both.strings()
         );
     }
 
