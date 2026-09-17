@@ -6692,6 +6692,21 @@ pub fn disabled_password_field(ui: &mut Ui) -> Rect {
 /// [`CANVAS`] instead of [`CARD`], [`BORDER`] instead of [`BORDER_STRONG`],
 /// [`TEXT_GHOST`] instead of the ambient body colour. Any one of them alone
 /// reads as a styling accident rather than as a control that is switched off.
+/// **How far a field's text sits below the geometric middle of its box**, as
+/// a fraction of the run's own height.
+///
+/// A row box is ascent-plus-descent tall and typical field text fills only the
+/// upper part of that, so a geometrically centred run reads as sitting high.
+/// Every box on this form nudges it down by this much.
+///
+/// Named because a SECOND painter now has to agree with it: the edit form's
+/// `Native apps` box holds the app's name, painted here, and its executable in
+/// a chip painted by the caller over the same box. Centring the chip on the box
+/// while the name sits `FIELD_TEXT_NUDGE` below it put the two runs a point and
+/// a half apart on one line -- the owner, with that row screenshotted: "Claude
+/// and claude.exe - not on the same line".
+pub const FIELD_TEXT_NUDGE: f32 = 0.09;
+
 fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32, height: f32, font_px: f32) -> Rect {
     let (outer, _) = ui.allocate_exact_size(
         Vec2::new(ui.available_width(), height),
@@ -6725,7 +6740,7 @@ fn disabled_field_box(ui: &mut Ui, text: &str, right_pad: f32, height: f32, font
     ui.painter().galley(
         Pos2::new(
             outer.min.x + 10.0,
-            outer.center().y - galley.size().y / 2.0 + galley.size().y * 0.09,
+            outer.center().y - galley.size().y / 2.0 + galley.size().y * FIELD_TEXT_NUDGE,
         ),
         galley,
         TEXT_GHOST,

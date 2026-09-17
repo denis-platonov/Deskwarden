@@ -8038,19 +8038,57 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
     // What `disabled_field_box` really had for the name, and therefore how
     // wide the run it painted can be.
     let text_room = (rect.width() - 2.0 * APP_FIELD_INSET - APP_EXE_CHIP_GAP - width).max(0.0);
-    let name_width = app_name_run_width(ui, name).min(text_room);
+    let name = app_name_run(ui, name);
+    let name_width = name.size().x.min(text_room);
     let left = (rect.left() + APP_FIELD_INSET + name_width + APP_EXE_CHIP_GAP)
         .min(rect.right() - APP_FIELD_INSET - width);
-    let chip = egui::Rect::from_min_size(
-        egui::pos2(left, rect.center().y - (galley.size().y + PICKER_CHIP_PAD_Y * 2.0) / 2.0),
+    // **Centred on the NAME's line, not on the box's middle.**
+    //
+    // `theme::disabled_field_box` drops its run by `theme::FIELD_TEXT_NUDGE`
+    // of the run's own height, because a field box is ascent-plus-descent tall
+    // and a geometrically centred line reads as sitting high. The chip was
+    // centred on the box instead, so the two runs on this one line were a point
+    // and a half apart -- the owner: "Claude and claude.exe - not on the same
+    // line". The nudge is read from the theme rather than repeated, so the two
+    // painters cannot come to disagree about it.
+    let middle = rect.center().y + name.size().y * theme::FIELD_TEXT_NUDGE;
+    let chip = egui::Rect::from_center_size(
+        egui::pos2(left + width / 2.0, middle),
         egui::vec2(width, galley.size().y + PICKER_CHIP_PAD_Y * 2.0),
     );
-    ui.painter().rect_filled(chip, CornerRadius::same(PICKER_CHIP_RADIUS), theme::CANVAS);
+    // **White, where 8b's chip is grey**, and the inversion is the point: 8a
+    // draws this chip in `#f3f2f2` inside a WHITE box, and this form's box is
+    // the greyed read-out treatment (`section_disabled_text_field_reserving`)
+    // whose fill is that same `theme::CANVAS`. Painted in the design's own
+    // colour the pill was invisible -- the owner, with the row screenshotted:
+    // "no pill for the latter". The hairline edge is what makes it read as a
+    // chip rather than as a gap in the box.
+    ui.painter().rect(
+        chip,
+        CornerRadius::same(PICKER_CHIP_RADIUS),
+        theme::CARD,
+        Stroke::new(1.0, theme::HAIRLINE),
+        egui::StrokeKind::Inside,
+    );
     ui.painter().galley(
         egui::pos2(chip.left() + PICKER_CHIP_PAD_X, chip.top() + PICKER_CHIP_PAD_Y),
         galley,
         theme::TEXT_GHOST,
     );
+}
+
+/// The name run inside [`app_name_field`]'s box, laid in the face and size
+/// `theme::disabled_field_box` will really lay it in.
+///
+/// The GALLEY and not just its width, because the chip beside it needs the
+/// run's height as well -- that is what `theme::FIELD_TEXT_NUDGE` is a
+/// fraction of.
+fn app_name_run(ui: &egui::Ui, name: &str) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        name.to_string(),
+        egui::FontId::new(theme::SECTION_FIELD_PX, egui::FontFamily::Proportional),
+        theme::TEXT_GHOST,
+    )
 }
 
 /// The width of the name run inside [`app_name_field`]'s box.
@@ -8060,14 +8098,7 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
 /// it -- which is what lets [`app_name_field_want`] be a floor rather than an
 /// estimate.
 fn app_name_run_width(ui: &egui::Ui, name: &str) -> f32 {
-    ui.painter()
-        .layout_no_wrap(
-            name.to_string(),
-            egui::FontId::new(theme::SECTION_FIELD_PX, egui::FontFamily::Proportional),
-            theme::TEXT_GHOST,
-        )
-        .size()
-        .x
+    app_name_run(ui, name).size().x
 }
 
 /// The width [`app_name_field`] needs before it will draw the executable
@@ -26819,11 +26850,33 @@ mod edit_pane_layout_tests {
                 .find(|((run, _), (_, font))| run == EXE && *font != mono)
                 .map(|((_, rect), _)| *rect)
                 .unwrap_or_else(|| panic!("the app row painted no name on a {width}-point pane"));
+            // **Half a point**, not two. The two runs are laid in different
+            // faces at different sizes, so their boxes differ in height and
+            // only their CENTRES can be compared -- but those centres must
+            // really agree: a point and a half of disagreement is what the
+            // owner saw and called "not on the same line".
             assert!(
-                (chip[0].center().y - name.center().y).abs() <= 2.0,
-                "on a {width}-point pane the chip is at {:?} and the name at {name:?} -- they \
-                 are not on one line",
-                chip[0]
+                (chip[0].center().y - name.center().y).abs() <= 0.5,
+                "on a {width}-point pane the chip is centred at y = {} and the name at {} --                  they are not on one line",
+                chip[0].center().y,
+                name.center().y
+            );
+            // ...and the chip is a PILL: a box of its own, in a fill that is
+            // not the fill of the greyed field it sits in. Painted in
+            // `theme::CANVAS` -- 8a's own colour for it, and also this form's
+            // greyed field fill -- it was invisible ("no pill for the latter").
+            let pill = painted
+                .rects
+                .iter()
+                .filter(|(r, _)| {
+                    r.contains_rect(chip[0])
+                        && r.width() <= chip[0].width() + 2.0 * PICKER_CHIP_PAD_X + 2.0
+                })
+                .map(|(_, fill)| *fill)
+                .collect::<Vec<_>>();
+            assert!(
+                pill.contains(&theme::CARD),
+                "on a {width}-point pane the chip has no box of its own standing out from the                  greyed field around it; boxes found: {pill:?}"
             );
             assert!(
                 chip[0].left() >= name.right() - 0.5,
