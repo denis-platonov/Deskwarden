@@ -8946,6 +8946,32 @@ fn paint_section_chip(ui: &egui::Ui, title: egui::Rect, text: &str) {
 /// rather than in the rail, because the rail is drawn in a panel BESIDE the
 /// scroll area and has no idea where any card is; the card knows its own
 /// rectangle, and `scroll_to_rect` is the only thing that needs it.
+/// **Whether this kind of record is offered autofill at all** -- 8a's
+/// `Autofill targets` card, and the `Fill rule` card that only means anything
+/// beside it.
+///
+/// A SECURE NOTE is not. Bitwarden's note carries a body and custom fields and
+/// nothing else: no username, no password, no one-time code, no websites. There
+/// is no credential for Deskwarden to put into a window, so a binding on one
+/// would be a rule about nothing. The owner: "BW only has custom fields for
+/// SecNotes - remove tagregts", and, with the matched-app row screenshotted,
+/// "same".
+///
+/// **The other non-login kinds keep it.** A card, an identity and an SSH key
+/// each carry structured values a sequence can be built from; the websites
+/// half is already withheld from them for its own reason (`login.uris` is a
+/// login's field -- see the `Autofill` card's body).
+///
+/// **Nothing is stranded by this.** A binding is a custom FIELD on the item,
+/// so a note that somehow carries one keeps it -- `app_match_edit` answers
+/// `Leave` for a draft with no app block -- and the READ pane draws its
+/// `MATCHED APP` card off `has_app_match_field` for every kind and offers the
+/// Remove there. That pane is where a binding this form cannot make would have
+/// to be cleared from in any case.
+const fn offers_autofill(kind: ItemKind) -> bool {
+    !matches!(kind, ItemKind::SecureNote)
+}
+
 fn section<R>(
     ui: &mut egui::Ui,
     kind: ItemKind,
@@ -10871,74 +10897,78 @@ pub fn draw_detail_edit(
             // field by field like this. See `sequence_source`.
             let palette = sequence_palette(draft, item);
             let source = sequence_source(&draft.username, &draft.password, item, totp);
-            section(ui, kind, Section::Autofill, changed(Section::Autofill), wanted, |ui| {
-                // **The block carries its own Remove per row**, so the slot
-                // has none of its own: removing the last website is what takes
-                // the block away, which is handled below. See
-                // [`Slot::Websites`].
-                // **Drawn whether or not the login has a website.** The
-                // block ends in `Add a website\u{2026}`, so an empty one is
-                // the door -- and it has to be, now that the `Add\u{2026}`
-                // menu no longer offers the slot. Gated on `showing`, a
-                // login with no website had no way to gain one at all:
-                // `a_login_with_no_website_offers_one_through_the_add_menu`
-                // caught exactly that.
-                //
-                // The block carries its own Remove per row, so the slot has
-                // none of its own -- see [`Slot::Websites`].
-                // **Only a login has websites**, and that is the model's rule
-                // rather than a layout choice: `login.uris` lives under the
-                // `login` object, `EditDraft::apply_to` writes `uris` in its
-                // `ItemKind::Login` arm and nowhere else, and
-                // `EditDraft::from_item` reads them through `item.login`. So a
-                // website added to a secure note, a card, an identity or an
-                // SSH key was accepted by the box, discarded by the Save, and
-                // gone the next time the item was opened -- a control that
-                // succeeds and does nothing, which this form refuses
-                // everywhere else (`AppMatch::trigger`, 8a's `On field focus`,
-                // the match-rule read-out on the card below).
-                //
-                // The owner, looking at a secure note: "Does Secnote need
-                // Autofill targets?". Half of it did not; the matched-app row
-                // below does, because a binding is a custom FIELD on the item
-                // and `key_sequence::field_palette` can type any item's custom
-                // fields -- a note holding a licence key, bound to the program
-                // that asks for it, is the case.
-                if kind == ItemKind::Login {
-                    websites_block(ui, &mut draft.uris, creating);
-                }
-                // **8a's one hairline on this card falls out of the rows**,
-                // between the websites group and the native-apps group: the
-                // design's `border-bottom: 1px solid #f3f2f2` on the websites
-                // cell. `theme::section_row` takes a rule above itself unless
-                // it is the body's first, and each website is its own row
-                // inside its own `scope_builder` -- so the websites stack
-                // ruleless, as one cell, and the `Matched app` row below them
-                // draws the one line. Both arms below go through that row for
-                // exactly this reason; the unbound one used to draw a loose
-                // `field_label` instead, and the hairline was missing on
-                // every item with no binding. The owner: "should be separator
-                // between web and native".
-                match draft.app.as_mut() {
-                    Some(app) => {
-                        if let Some(requested) = app_block(ui, app, apps) {
-                            action = requested;
+            // **Not every kind is offered this card** -- see
+            // `offers_autofill`, which is where the secure note is argued.
+            if offers_autofill(kind) {
+                section(ui, kind, Section::Autofill, changed(Section::Autofill), wanted, |ui| {
+                    // **The block carries its own Remove per row**, so the slot
+                    // has none of its own: removing the last website is what takes
+                    // the block away, which is handled below. See
+                    // [`Slot::Websites`].
+                    // **Drawn whether or not the login has a website.** The
+                    // block ends in `Add a website\u{2026}`, so an empty one is
+                    // the door -- and it has to be, now that the `Add\u{2026}`
+                    // menu no longer offers the slot. Gated on `showing`, a
+                    // login with no website had no way to gain one at all:
+                    // `a_login_with_no_website_offers_one_through_the_add_menu`
+                    // caught exactly that.
+                    //
+                    // The block carries its own Remove per row, so the slot has
+                    // none of its own -- see [`Slot::Websites`].
+                    // **Only a login has websites**, and that is the model's rule
+                    // rather than a layout choice: `login.uris` lives under the
+                    // `login` object, `EditDraft::apply_to` writes `uris` in its
+                    // `ItemKind::Login` arm and nowhere else, and
+                    // `EditDraft::from_item` reads them through `item.login`. So a
+                    // website added to a secure note, a card, an identity or an
+                    // SSH key was accepted by the box, discarded by the Save, and
+                    // gone the next time the item was opened -- a control that
+                    // succeeds and does nothing, which this form refuses
+                    // everywhere else (`AppMatch::trigger`, 8a's `On field focus`,
+                    // the match-rule read-out on the card below).
+                    //
+                    // The owner, looking at a secure note: "Does Secnote need
+                    // Autofill targets?". Half of it did not; the matched-app row
+                    // below does, because a binding is a custom FIELD on the item
+                    // and `key_sequence::field_palette` can type any item's custom
+                    // fields -- a note holding a licence key, bound to the program
+                    // that asks for it, is the case.
+                    if kind == ItemKind::Login {
+                        websites_block(ui, &mut draft.uris, creating);
+                    }
+                    // **8a's one hairline on this card falls out of the rows**,
+                    // between the websites group and the native-apps group: the
+                    // design's `border-bottom: 1px solid #f3f2f2` on the websites
+                    // cell. `theme::section_row` takes a rule above itself unless
+                    // it is the body's first, and each website is its own row
+                    // inside its own `scope_builder` -- so the websites stack
+                    // ruleless, as one cell, and the `Matched app` row below them
+                    // draws the one line. Both arms below go through that row for
+                    // exactly this reason; the unbound one used to draw a loose
+                    // `field_label` instead, and the hairline was missing on
+                    // every item with no binding. The owner: "should be separator
+                    // between web and native".
+                    match draft.app.as_mut() {
+                        Some(app) => {
+                            if let Some(requested) = app_block(ui, app, apps) {
+                                action = requested;
+                            }
+                        }
+                        // One assignment, and the block above draws it from the
+                        // next frame on. Nothing is written to the vault by this
+                        // click: the draft is blank until the user picks a
+                        // program, and `app_match_edit` leaves a blank draft
+                        // alone.
+                        None => {
+                            if let Some(choice) = app_add_block(ui) {
+                                let mut app = AppMatchDraft::unbound();
+                                open_new_binding(&mut app, choice);
+                                draft.app = Some(app);
+                            }
                         }
                     }
-                    // One assignment, and the block above draws it from the
-                    // next frame on. Nothing is written to the vault by this
-                    // click: the draft is blank until the user picks a
-                    // program, and `app_match_edit` leaves a blank draft
-                    // alone.
-                    None => {
-                        if let Some(choice) = app_add_block(ui) {
-                            let mut app = AppMatchDraft::unbound();
-                            open_new_binding(&mut app, choice);
-                            draft.app = Some(app);
-                        }
-                    }
-                }
-            });
+                });
+            }
 
             // **8a's `Fill rule` card**: what Deskwarden types once it has
             // matched, as against where it matches.
@@ -10966,7 +10996,10 @@ pub fn draw_detail_edit(
             //   with no setting behind either. There is no per-record Hello
             //   gate in this build and no per-record preflight flag; two
             //   switches that persist nothing are two controls that lie.
-            if draft.app.as_ref().is_some_and(|app| app.bound) {
+            // `offers_autofill` as well as the binding: the card it belongs
+            // beside is not drawn for a secure note, and a `Fill rule` standing
+            // alone would be a card about a rule with no target.
+            if offers_autofill(kind) && draft.app.as_ref().is_some_and(|app| app.bound) {
                 section(ui, kind, Section::FillRule, changed(Section::FillRule), wanted, |ui| {
                     if let Some(app) = draft.app.as_mut() {
                         if let Some(requested) = app_sequence_block(ui, app, &palette, &source) {
@@ -23106,8 +23139,15 @@ mod edit_pane_layout_tests {
         // one and is painted as it is written. The difference is the band's
         // `text-transform` and nothing else -- see
         // `theme::section_card_header`.
-        let mut expected =
-            vec![FIELDS_CARD_TITLE, APP_BLOCK_HEADING, APP_ADD_PATH_LINK, "Folder"];
+        let mut expected = vec![FIELDS_CARD_TITLE, "Folder"];
+        // **The autofill row, for every kind that is offered one.** A secure
+        // note is not: Bitwarden's note carries a body and custom fields and
+        // nothing else, so there is no credential for a binding to be about --
+        // see `offers_autofill`, which is asked here rather than matched on so
+        // this list cannot drift from the form's own decision.
+        if offers_autofill(kind) {
+            expected.extend([APP_BLOCK_HEADING, APP_ADD_PATH_LINK]);
+        }
         if creating {
             // `NewItem` has no `fields` payload, so the block says so instead
             // of offering boxes whose contents Save would discard. The notice
@@ -23234,8 +23274,13 @@ mod edit_pane_layout_tests {
                 let strings = painted.strings();
 
                 let expected = expected_controls(kind, creating);
+                // The floor is FOUR because a secure note is now offered
+                // exactly that -- its card title, its Folder, its Note and its
+                // custom-field control -- where every other kind is offered
+                // six or more. It is here to catch an expectation that has
+                // collapsed to nothing, not to describe any kind's shape.
                 assert!(
-                    expected.len() >= 6,
+                    expected.len() >= 4,
                     "{kind:?} expects only {} controls -- the expectation itself is empty",
                     expected.len()
                 );
@@ -26789,63 +26834,89 @@ mod edit_pane_layout_tests {
         assert_eq!(widths, 3, "the loop visited nothing, so it asserted nothing");
     }
 
-    /// **Only a login is offered websites.**
+    /// **Each kind is offered exactly the autofill it can use**, and there are
+    /// three answers rather than two.
     ///
-    /// `login.uris` lives under the `login` object: `EditDraft::apply_to`
-    /// writes `uris` in its `ItemKind::Login` arm and nowhere else, and
-    /// `EditDraft::from_item` reads them through `item.login`. So a website
-    /// added to a secure note was accepted by the box, discarded by the Save
-    /// and gone the next time the item was opened -- a control that succeeds
-    /// and does nothing. The owner, looking at a note: "Does Secnote need
-    /// Autofill targets?".
+    /// * A **login** gets both halves: websites and a matched app.
+    /// * A **card, identity or SSH key** gets the app and not the websites.
+    ///   `login.uris` lives under the `login` object -- `apply_to` writes
+    ///   `uris` in its `ItemKind::Login` arm and nowhere else, and `from_item`
+    ///   reads them through `item.login` -- so a website added to one was
+    ///   accepted by the box, discarded by the Save and gone the next time the
+    ///   item was opened. A control that succeeds and does nothing.
+    /// * A **secure note** gets neither. Bitwarden's note carries a body and
+    ///   custom fields and nothing else, so there is no credential for
+    ///   Deskwarden to put into a window and a binding on one would be a rule
+    ///   about nothing. The owner: "BW only has custom fields for SecNotes -
+    ///   remove tagregts".
     ///
-    /// **The matched-app row stays**, and that is the other half of the
-    /// answer: a binding is a custom FIELD on the item and
-    /// `key_sequence::field_palette` can type any item's custom fields, so a
-    /// note holding a licence key can be bound to the program that asks for
-    /// it. A build that took the whole card away from every non-login would
-    /// fail here.
+    /// All three in one test, because the middle answer is the one a build
+    /// gets wrong by over-correcting in either direction -- and each is the
+    /// other two's control.
     #[test]
-    fn a_record_that_cannot_store_websites_is_not_offered_them() {
+    fn each_kind_is_offered_the_autofill_it_can_actually_use() {
         let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
         let ctx = styled_context(pane);
+        let totp = detail::TotpState::NoSecret;
         let note: VaultItem = serde_json::from_str(
             r#"{"object":"item","id":"n","name":"Secnote","type":2,"fields":[],
                 "secureNote":{"type":0},"notes":"just some note here"}"#,
         )
-        .expect("the fixture is valid item JSON");
+        .expect("the note fixture is valid item JSON");
+        let card: VaultItem = serde_json::from_str(
+            r#"{"object":"item","id":"c","name":"Visa","type":3,"fields":[],
+                "card":{"brand":"Visa","number":"4111111111111111"}}"#,
+        )
+        .expect("the card fixture is valid item JSON");
+        let login = login_with_websites(1);
+
+        let mut checked = 0;
+        for (what, item, websites, app) in [
+            ("a login", &login, true, true),
+            ("a card", &card, false, true),
+            ("a secure note", &note, false, false),
+        ] {
+            checked += 1;
+            let mut draft = EditDraft::from_item(item);
+            let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(item), &totp);
+            let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(item), &totp);
+            let strings = painted.strings();
+
+            assert_eq!(
+                strings.contains(&WEBSITE_ADD_BUTTON),
+                websites,
+                "{what} offers {WEBSITE_ADD_BUTTON:?} = {} -- expected {websites}: {strings:?}",
+                strings.contains(&WEBSITE_ADD_BUTTON)
+            );
+            assert_eq!(
+                strings.contains(&APP_BLOCK_HEADING),
+                app,
+                "{what} offers {APP_BLOCK_HEADING:?} = {} -- expected {app}: {strings:?}",
+                strings.contains(&APP_BLOCK_HEADING)
+            );
+            // The card title goes with the last of its rows: a titled band
+            // with nothing under it is the "drawn and empty" state this form
+            // refuses everywhere.
+            let title = Section::Autofill.title(ItemKind::Login).to_uppercase();
+            assert_eq!(
+                strings.iter().any(|s| *s == title),
+                websites || app,
+                "{what} draws the {title:?} band but none of its rows, or the other way \
+                 round: {strings:?}"
+            );
+        }
+        assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
+
+        // ...and the note is not described as a login by a card it does not
+        // have. Asserted against the LOGIN's own subtitle, so the claim is
+        // about that sentence and not about any string this test invented.
         let mut draft = EditDraft::from_item(&note);
-        let totp = detail::TotpState::NoSecret;
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&note), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&note), &totp);
-
-        let strings = painted.strings();
         assert!(
-            !strings.contains(&WEBSITE_ADD_BUTTON),
-            "a secure note is offered {WEBSITE_ADD_BUTTON:?}, and a website typed there is \
-             thrown away by the Save: {strings:?}"
-        );
-        assert!(
-            strings.contains(&APP_BLOCK_HEADING) && strings.contains(&APP_PICK_LINK),
-            "the note lost the matched-app row as well, which it CAN store: {strings:?}"
-        );
-        // ...and the card does not describe it as a login.
-        assert!(
-            !strings.contains(&Section::Autofill.note(ItemKind::Login)),
-            "the card over a secure note still says {:?}: {strings:?}",
+            !painted.strings().contains(&Section::Autofill.note(ItemKind::Login)),
+            "the form over a secure note still says {:?}",
             Section::Autofill.note(ItemKind::Login)
-        );
-
-        // The positive control: a LOGIN still gets both halves, so the gate
-        // above is about the kind and not about the card.
-        let login = login_with_websites(1);
-        let mut other = EditDraft::from_item(&login);
-        let _ = frame_for(&ctx, pane, &mut other, false, &[], Some(&login), &totp);
-        let both = frame_for(&ctx, pane, &mut other, false, &[], Some(&login), &totp);
-        assert!(
-            both.strings().contains(&WEBSITE_ADD_BUTTON),
-            "a login lost its websites too: {:?}",
-            both.strings()
         );
     }
 
