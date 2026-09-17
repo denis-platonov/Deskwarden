@@ -8042,19 +8042,37 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
     let name_width = name.size().x.min(text_room);
     let left = (rect.left() + APP_FIELD_INSET + name_width + APP_EXE_CHIP_GAP)
         .min(rect.right() - APP_FIELD_INSET - width);
-    // **The two runs' INK is centred on one line** -- see
-    // `theme::ink_middle_of`, which is where the two wrong answers this went
-    // through are written down.
+    // **One line, taken off the two FACES rather than off the two words** --
+    // see `theme::face_ink_middle`, which is where the three wrong answers
+    // this went through are written down.
     //
     // Where `theme::disabled_field_box` puts the name's galley is arithmetic
     // this function can repeat exactly: it is `theme::FIELD_TEXT_NUDGE` of the
-    // run's own height, on the same galley.
+    // run's own height, on the same galley. The LINE inside that galley is the
+    // face's cap-height middle and not this particular name's ink middle,
+    // because a name with a descender in it would otherwise drag the pill
+    // down by a point and a half and a name without one would not.
+    let name_font = egui::FontId::new(theme::SECTION_FIELD_PX, egui::FontFamily::Proportional);
+    let chip_font = egui::FontId::new(PICKER_SUB_PX, egui::FontFamily::Monospace);
     let name_top = rect.center().y - name.size().y / 2.0
         + name.size().y * theme::FIELD_TEXT_NUDGE;
-    let middle = name_top + theme::ink_middle_of(&name);
-    let chip_text_top = middle - theme::ink_middle_of(&galley);
-    let chip = egui::Rect::from_min_size(
-        egui::pos2(left, chip_text_top - PICKER_CHIP_PAD_Y),
+    let middle = name_top + theme::face_ink_middle(ui, &name_font);
+    let chip_text_top = middle - theme::face_ink_middle(ui, &chip_font);
+    // **The pill is hung on the ink too, not wrapped round the galley.**
+    //
+    // A galley box is the font's ascent plus its descent, and Consolas spends
+    // more of that below the baseline than Archivo does -- so a pill built as
+    // `galley_top - pad .. galley_bottom + pad` came out with its own middle
+    // two and a half points below the field box's, and the pill read as
+    // sitting low in the box however well the two runs were aligned inside it.
+    // The owner, after the ink alignment: "still croocked".
+    //
+    // Centred on the same line the ink is, the pill lands within a third of a
+    // point of the field box's middle AND holds its run dead centre, because
+    // that run's ink IS that line. The height is unchanged: 8a's `padding: 2px
+    // 7px` round an 11px run.
+    let chip = egui::Rect::from_center_size(
+        egui::pos2(left + width / 2.0, middle),
         egui::vec2(width, galley.size().y + PICKER_CHIP_PAD_Y * 2.0),
     );
     // **White, where 8b's chip is grey**, and the inversion is the point: 8a
@@ -8071,8 +8089,12 @@ fn app_name_field(ui: &mut egui::Ui, name: &str, exe: &str, room: f32) {
         Stroke::new(1.0, theme::HAIRLINE),
         egui::StrokeKind::Inside,
     );
+    // The run at the line it was measured to, NOT at the pill's own top plus a
+    // padding: the pill is positioned by the ink and the ink is positioned by
+    // the name, so deriving one from the other would put the two back in a
+    // circle.
     ui.painter().galley(
-        egui::pos2(chip.left() + PICKER_CHIP_PAD_X, chip.top() + PICKER_CHIP_PAD_Y),
+        egui::pos2(chip.left() + PICKER_CHIP_PAD_X, chip_text_top),
         galley,
         theme::TEXT_GHOST,
     );
@@ -26860,16 +26882,26 @@ mod edit_pane_layout_tests {
     /// rather than under it.
     #[test]
     fn the_executable_chip_stays_on_the_app_rows_line_at_every_width() {
-        const EXE: &str = "ledgerline.exe";
-        let mut widths = 0;
-        for width in [WIDE_PANE_WIDTH, 460.0, MIN_PANE_WIDTH] {
-            widths += 1;
+        // **Two spellings, and the pair is the point.** `ledgerline.exe` has a
+        // descender in it and `vim.exe` has none, so a row hung off THIS run's
+        // ink rather than off its face puts the pill a point and a half lower
+        // for one than for the other -- which is the defect the owner reported
+        // as "still croocked" and which a single fixture cannot see. See
+        // `theme::face_ink_middle`.
+        let mut cases = 0;
+        for (exe, width) in [
+            ("ledgerline.exe", WIDE_PANE_WIDTH),
+            ("vim.exe", WIDE_PANE_WIDTH),
+            ("ledgerline.exe", 460.0),
+            ("ledgerline.exe", MIN_PANE_WIDTH),
+        ] {
+            cases += 1;
             let pane = Vec2::new(width, 2400.0);
             let ctx = styled_context(pane);
             let item = login_with_websites(1);
             let mut draft = EditDraft::from_item(&item);
             let mut app = AppMatchDraft::unbound();
-            app.process = EXE.to_string();
+            app.process = exe.to_string();
             draft.app = Some(app);
             let totp = detail::TotpState::NoSecret;
             let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
@@ -26885,13 +26917,13 @@ mod edit_pane_layout_tests {
                 .texts
                 .iter()
                 .zip(painted.fonts.iter())
-                .filter(|((run, _), (_, font))| run == EXE && *font == mono)
+                .filter(|((run, _), (_, font))| run == exe && *font == mono)
                 .map(|((_, rect), _)| *rect)
                 .collect();
             assert_eq!(
                 chip.len(),
                 1,
-                "on a {width}-point pane the app row paints {} monospace {EXE:?} chips, not \
+                "on a {width}-point pane the app row paints {} monospace {exe:?} chips, not \
                  the one 8a draws inside the name box",
                 chip.len()
             );
@@ -26902,7 +26934,7 @@ mod edit_pane_layout_tests {
                 .texts
                 .iter()
                 .zip(painted.fonts.iter())
-                .find(|((run, _), (_, font))| run == EXE && *font != mono)
+                .find(|((run, _), (_, font))| run == exe && *font != mono)
                 .map(|((_, rect), _)| *rect)
                 .unwrap_or_else(|| panic!("the app row painted no name on a {width}-point pane"));
             // **Their INK, not their boxes and not their baselines.** Both of
@@ -26919,11 +26951,11 @@ mod edit_pane_layout_tests {
                 painted
                     .ink_middles
                     .iter()
-                    .find(|(run, font, _)| run == EXE && (*font == mono) == want_mono)
+                    .find(|(run, font, _)| run == exe && (*font == mono) == want_mono)
                     .map(|(_, _, y)| *y)
                     .unwrap_or_else(|| {
                         panic!(
-                            "no {} {EXE:?} run on a {width}-point pane",
+                            "no {} {exe:?} run on a {width}-point pane",
                             if want_mono { "monospace" } else { "proportional" }
                         )
                     })
@@ -26938,18 +26970,44 @@ mod edit_pane_layout_tests {
             // not the fill of the greyed field it sits in. Painted in
             // `theme::CANVAS` -- 8a's own colour for it, and also this form's
             // greyed field fill -- it was invisible ("no pill for the latter").
-            let pill = painted
+            let pill: Vec<Rect> = painted
                 .rects
                 .iter()
-                .filter(|(r, _)| {
-                    r.contains_rect(chip[0])
+                .filter(|(r, fill)| {
+                    *fill == theme::CARD
+                        && r.contains_rect(chip[0])
                         && r.width() <= chip[0].width() + 2.0 * PICKER_CHIP_PAD_X + 2.0
                 })
-                .map(|(_, fill)| *fill)
-                .collect::<Vec<_>>();
+                .map(|(r, _)| *r)
+                .collect();
+            assert_eq!(
+                pill.len(),
+                1,
+                "on a {width}-point pane the chip has {} boxes of its own standing out from                  the greyed field around it, not the one 8a draws",
+                pill.len()
+            );
+
+            // **And the pill is straight in the field box it sits in.**
+            //
+            // The half a run alignment cannot see. A galley box is the font's
+            // ascent plus its descent and Consolas spends more of that below
+            // the baseline than Archivo does, so a pill wrapped round the
+            // galley sat two and a half points low however well the two runs
+            // agreed inside it -- the owner, after the ink alignment: "still
+            // croocked". Hung on the same line the ink is, the pill lands on
+            // the field box's middle.
+            let field = painted
+                .rects
+                .iter()
+                .filter(|(r, fill)| *fill == theme::CANVAS && r.contains_rect(pill[0]))
+                .map(|(r, _)| *r)
+                .min_by(|a, b| a.height().total_cmp(&b.height()))
+                .unwrap_or_else(|| panic!("no greyed field box round the chip at {width}pt"));
             assert!(
-                pill.contains(&theme::CARD),
-                "on a {width}-point pane the chip has no box of its own standing out from the                  greyed field around it; boxes found: {pill:?}"
+                (pill[0].center().y - field.center().y).abs() <= 1.0,
+                "on a {width}-point pane the pill is centred at y = {} in a field box centred                  at {} -- it sits crooked in its own box",
+                pill[0].center().y,
+                field.center().y
             );
             assert!(
                 chip[0].left() >= name.right() - 0.5,
@@ -26957,7 +27015,7 @@ mod edit_pane_layout_tests {
                 chip[0]
             );
         }
-        assert_eq!(widths, 3, "the loop visited nothing, so it asserted nothing");
+        assert_eq!(cases, 4, "the loop visited nothing, so it asserted nothing");
     }
 
     /// **Each kind is offered exactly the autofill it can use**, and there are

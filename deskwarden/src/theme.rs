@@ -6732,6 +6732,26 @@ pub const FIELD_TEXT_NUDGE: f32 = 0.09;
 ///
 /// A run with no ink at all has no middle; half its box is returned, which is
 /// where a caller centring on it would have put things anyway.
+/// **The middle of a FACE's ink on one line, measured from a galley's top and
+/// independent of what the run says.**
+///
+/// [`ink_middle_of`] answers about a STRING, which is right for asking where
+/// something was painted and wrong for deciding where to paint it: `ledgerline`
+/// has a descender and `Firefox` has none, so hanging a neighbour off the
+/// former's ink middle puts it one and a half points lower than off the
+/// latter's. A line that moves with the letters in it is not a line. The owner,
+/// with the pill hung off a name that had no descender and then one that did:
+/// "still croocked".
+///
+/// [`ASCENT_PROBE`] is a capital `X` -- no descender, full cap height -- so
+/// this is the face's cap-height middle, and two faces aligned on it read as
+/// being on one line whatever each of them happens to be spelling.
+pub fn face_ink_middle(ui: &Ui, font: &FontId) -> f32 {
+    let probe =
+        ui.painter().layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
+    ink_middle_of(&probe)
+}
+
 pub fn ink_middle_of(galley: &egui::Galley) -> f32 {
     let mut top = f32::INFINITY;
     let mut bottom = f32::NEG_INFINITY;
