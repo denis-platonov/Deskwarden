@@ -1026,6 +1026,38 @@ impl AppMatchDraft {
     /// [`Self::is_blank`], read by [`app_match_edit`] -- not a second `bool`
     /// here, because a second bool would be a state the block would then have
     /// to render differently and the two paths would diverge again.
+    /// **Takes a staged removal back to an EMPTY binding**, which is what the
+    /// removed row's `+ Pick a running window` / `enter a path` links do.
+    ///
+    /// The removed state used to draw a sentence and an `Undo remove`; it
+    /// draws the add row instead, so there has to be a way from "this binding
+    /// is going away on Save" to "nothing is bound, choose something". The
+    /// owner: "if removed it should just show Add again".
+    ///
+    /// **The identity is cleared and the FILL RULE is not.** Everything that
+    /// says WHICH program this is -- the process, the title, the path, the
+    /// arguments -- belongs to the binding that was just thrown away, and
+    /// leaving it behind would mean a user who removed Chrome and picked
+    /// Firefox saved Firefox with Chrome's command line. `sequence` is what
+    /// Deskwarden TYPES, it is drawn on a card of its own, and silently
+    /// emptying that card because a binding under it was replaced is a
+    /// surprise; the user can still change it there.
+    ///
+    /// Not `*self = unbound()`, for that reason and for `taken`: the list of
+    /// processes other items already claim was fetched once and is not this
+    /// gesture's to throw away.
+    pub fn rebind(&mut self) {
+        self.bound = true;
+        self.process.clear();
+        self.title.clear();
+        self.hosted = false;
+        self.path.clear();
+        self.args.clear();
+        self.just_picked = false;
+        self.picking = false;
+        self.picked = None;
+    }
+
     pub fn unbound() -> Self {
         Self {
             bound: true,
@@ -4874,6 +4906,39 @@ const TARGET_ROW_SLACK: f32 = 2.0;
 /// 8a's `+ Add website` / `+ Pick a running window`: `font-size: 12px`.
 const TARGET_LINK_PX: f32 = 12.0;
 
+/// The space between a `+ ` link and whatever stands beside it on its line --
+/// 8a's own `gap: 14px` on that row.
+///
+/// **Written down because this card's rows have NO horizontal spacing of their
+/// own.** `theme::section_card` zeroes `item_spacing` so its bands stack flush,
+/// and `section_card_body_at` restores only the `y`; every row that puts two
+/// things side by side sets its own `x` (`row_with_buttons` uses
+/// `ROW_BUTTON_GAP`, `target_row` uses `TARGET_ROW_GAP`). The link rows did
+/// not, so `+ Pick a running windoworenter a path` ran together with no space
+/// at all. The owner: "too close".
+const TARGET_LINK_GAP: f32 = 14.0;
+
+/// The grey run beside a `+ ` link, laid so it cannot be wrapped INSIDE a
+/// wrapping row.
+///
+/// **`TextWrapMode::Extend`, and it is the same trap `theme::action_link`
+/// records.** `horizontal_wrapped` puts the `Ui` into `Wrap`, and a `Label`
+/// that lays its own text there takes the whole remaining line as its layout
+/// width -- so `or set the program file below` came out as a two-line galley
+/// placed at the row's left edge, ON TOP of the link it was supposed to follow
+/// (measured at the app's minimum pane: the link at x 12..144 and the note at
+/// 12..265, sharing every point of the link's ink).
+///
+/// Laid unwrapped, the run has a real width, and the ROW's wrap can then do
+/// its job honestly: it fits beside the link or it goes to the next line
+/// whole, which is what the design draws either way.
+fn link_row_note(ui: &mut egui::Ui, text: &str) {
+    ui.add(
+        egui::Label::new(RichText::new(text).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT))
+            .wrap_mode(egui::TextWrapMode::Extend),
+    );
+}
+
 /// The 11px grey the card sets its notes and its in-row facts in.
 const TARGET_NOTE_PX: f32 = 11.0;
 
@@ -5307,9 +5372,9 @@ pub const APP_PICK_HINT: &str = "or set the program file below";
 /// control it replaced had ON it.
 ///
 /// The gesture is unchanged and is still STAGED: it sets
-/// [`AppMatchDraft::bound`] false, the block then draws
-/// [`APP_REMOVED_NOTICE`] and an Undo, and nothing reaches the vault until
-/// Save. What changed is where it sits -- 8a puts the mark at the far right
+/// [`AppMatchDraft::bound`] false, the block then draws the ADD row -- the
+/// same one an item with no binding shows -- and nothing reaches the vault
+/// until Save, so Cancel puts the binding back exactly as it was. What changed is where it sits -- 8a puts the mark at the far right
 /// of the row it removes, where the websites above it now carry theirs --
 /// and that it is a mark rather than a caption, which is why the sentence
 /// has to survive as the hover text (`theme::close_glyph_titled` paints two
@@ -5432,6 +5497,19 @@ pub const APP_NONE_NOTICE: &str =
     "Nothing is bound yet. Point this item at a program and Deskwarden can open it and type \
      into it.";
 
+/// What the removed state used to say, before it became the add row.
+///
+/// **No longer drawn, and `#[cfg(test)]` says so** -- a string the form paints
+/// nowhere has no business in the shipped binary. See `app_block`'s `!bound`
+/// arm: the removal is still staged and Cancel still puts the binding back, so
+/// what this sentence promised is intact; what has gone is the second way of
+/// saying it.
+///
+/// It survives at all because an absence asserted against a literal stops
+/// meaning anything the moment the literal is edited --
+/// `clicking_remove_stages_the_removal_rather_than_performing_it` reads it to
+/// say the removed row no longer explains itself in prose.
+#[cfg(test)]
 const APP_REMOVED_NOTICE: &str =
     "This app will stop filling from this item when you save. Undo, or Cancel the edit, to keep \
      it.";
@@ -7739,6 +7817,26 @@ pub(crate) fn palette_button(label: &str) -> egui::Button<'static> {
 /// apps`, this app has called it `Matched app` on the read pane since the
 /// feature shipped, and two words for one thing on two panes is worse than
 /// departing from the design's noun.
+/// What a press on one of [`app_add_block`]'s two links does, wherever the
+/// row was drawn.
+///
+/// Two callers now -- the item with no binding at all, and the item whose
+/// binding is staged for removal -- and they must not drift: a `Pick` that
+/// opened the card in one place and only made a draft in the other would be
+/// the same two words meaning two things on one form.
+fn open_new_binding(app: &mut AppMatchDraft, choice: AppAddChoice) {
+    // **`+ Pick a running window` opens the picker in the same click.** Making
+    // the draft and then leaving the user to find the same words again inside
+    // the block it reveals would be two presses for one decision they have
+    // already made.
+    if choice == AppAddChoice::Pick {
+        app.set_picking(true);
+        // Enumerated on OPEN, never per frame -- the same rule `app_block`'s
+        // own link follows.
+        app.windows = running_app_rows();
+    }
+}
+
 fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
     // **The card's row idiom, not a column of its own.** The caption goes in
     // the label column where every other row on this form puts one, and the
@@ -7760,6 +7858,7 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
         // 665). `interact_size.y` is the one dial a row's height floor reads,
         // which is the same dial `row_with_buttons` turns for the same reason.
         ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
+        ui.spacing_mut().item_spacing.x = TARGET_LINK_GAP;
         // Wrapped for `websites_block`'s reason: two links and the word
         // between them will not fit the control column at the app's minimum
         // pane, and a run that cannot fall to a second line pushes the card
@@ -7768,7 +7867,7 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
             if theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked() {
                 chose = Some(AppAddChoice::Pick);
             }
-            ui.label(RichText::new(APP_ADD_OR).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+            link_row_note(ui, APP_ADD_OR);
             if theme::action_link(ui, APP_ADD_PATH_LINK, TARGET_LINK_PX).clicked() {
                 chose = Some(AppAddChoice::Path);
             }
@@ -8059,16 +8158,27 @@ fn app_block(
     let mut action = None;
 
     if !app.bound {
-        // No rule and no leading space -- see [`app_add_block`]'s doc; the
-        // card this now sits in is the division that used to be drawn here.
-        // Stacked rather than in the label column, because this state is not
-        // a ROW: it is a sentence and an Undo standing in for the row that
-        // was there.
-        theme::field_label(ui, APP_BLOCK_HEADING);
-        ui.label(RichText::new(APP_REMOVED_NOTICE).size(12.0).color(theme::TEXT_FAINT));
-        ui.add_space(6.0);
-        if theme::secondary_button(ui, "Undo remove").clicked() {
-            app.bound = true;
+        // **A staged removal shows the ADD row**, which is the same row an
+        // item that never had a binding shows. The owner: "if removed it
+        // should just show Add again".
+        //
+        // It used to draw a sentence -- "This app will stop filling from this
+        // item when you save" -- and an `Undo remove` button, stacked rather
+        // than in the label column, which made it the one state of this card
+        // that was neither a row nor a card. Two states of one thing on one
+        // form, and the second of them had a control the first did not.
+        //
+        // **Nothing is lost by dropping the Undo.** The removal is still
+        // STAGED and still reaches the vault only on Save, so Cancel puts the
+        // binding back exactly as it was -- which is what `APP_REMOVE_BUTTON`
+        // has always promised and is what the sentence was really saying.
+        // What has gone is a second way to say it.
+        if let Some(choice) = app_add_block(ui) {
+            // Back to an empty binding rather than the removed one: see
+            // `AppMatchDraft::rebind`, which is where the difference between
+            // the identity and the fill rule is argued.
+            app.rebind();
+            open_new_binding(app, choice);
         }
         return action;
     }
@@ -8105,14 +8215,15 @@ fn app_block(
     // down, because they are the same element of the same design.
     let mut pick = false;
     theme::section_row(ui, "", |ui| {
+        // The same 14-point gap the row above it uses -- see
+        // [`TARGET_LINK_GAP`], and why this card's rows have to say so.
+        ui.spacing_mut().item_spacing.x = TARGET_LINK_GAP;
         // Wrapped: the link and the hint are two runs that must be allowed to
         // fall onto two lines on a 298-point pane rather than push the card
         // out (`aae9429`).
         ui.horizontal_wrapped(|ui| {
             pick = theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked();
-            ui.label(
-                RichText::new(APP_PICK_HINT).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT),
-            );
+            link_row_note(ui, APP_PICK_HINT);
         });
     });
     if pick {
@@ -10726,17 +10837,7 @@ pub fn draw_detail_edit(
                     None => {
                         if let Some(choice) = app_add_block(ui) {
                             let mut app = AppMatchDraft::unbound();
-                            // **`+ Pick a running window` opens the picker in
-                            // the same click.** Making the draft and then
-                            // leaving the user to find the same words again
-                            // inside the block it reveals would be two presses
-                            // for one decision they have already made.
-                            if choice == AppAddChoice::Pick {
-                                app.set_picking(true);
-                                // Enumerated on OPEN, never per frame -- the
-                                // same rule `app_block`'s own link follows.
-                                app.windows = running_app_rows();
-                            }
+                            open_new_binding(&mut app, choice);
                             draft.app = Some(app);
                         }
                     }
@@ -11945,7 +12046,6 @@ mod tests {
             app_path_warning(&AppMatch { path: r"..\x\chrome.exe".to_string(), ..chrome_match() })
                 .unwrap(),
             APP_ARGS_HINT,
-            APP_REMOVED_NOTICE,
             APP_ARGS_STORE_APP,
         ] {
             assert!(!text.to_lowercase().contains("hosted"), "{text:?}");
@@ -16087,13 +16187,23 @@ mod generator_row_tests {
         // processed, so the frame that carries the click still paints the
         // pre-click state.
         let (_, after) = frame(&ctx, &mut draft, &[]);
-        // Nothing has been written: the fields are still there, and the block
-        // says what is about to happen and offers the way back.
+        // Nothing has been written: the fields are still there, so Cancel
+        // puts the binding back exactly as it was.
         assert_eq!(draft.app.as_ref().unwrap().args, chrome().args);
+        // ...and what the row shows is the ADD row, not a sentence and an
+        // Undo -- the owner's "if removed it should just show Add again". The
+        // way back from here is Cancel, which is what the staging is for.
+        let strings = after.strings();
+        for needle in [APP_PICK_LINK, APP_ADD_PATH_LINK] {
+            assert!(
+                strings.contains(&needle),
+                "a removed binding does not offer {needle:?}, so the row it left behind is \
+                 not the add row: {strings:?}"
+            );
+        }
         assert!(
-            after.strings().contains(&"Undo remove"),
-            "a staged removal offers no way back: {:?}",
-            after.strings()
+            !strings.contains(&APP_REMOVED_NOTICE),
+            "the removed row still explains itself in prose: {strings:?}"
         );
     }
 
@@ -26418,6 +26528,47 @@ mod edit_pane_layout_tests {
                 caption.center().y
             );
         }
+    }
+
+    /// **The runs on a link row do not touch.**
+    ///
+    /// `theme::section_card` zeroes `item_spacing` so its bands stack flush and
+    /// `section_card_body_at` restores only the `y`, so every row on this card
+    /// that puts two things side by side has to set its own `x`
+    /// (`row_with_buttons` uses `ROW_BUTTON_GAP`, `target_row` uses
+    /// `TARGET_ROW_GAP`). The link rows did not, and painted
+    /// `+ Pick a running windoworenter a path` with no space at all. The
+    /// owner: "too close".
+    ///
+    /// Asserted as a real gap between the painted runs rather than as
+    /// `item_spacing`, because the spacing is a means: what was reported is two
+    /// words with nothing between them.
+    #[test]
+    fn the_runs_on_an_add_row_do_not_touch() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        let pick = painted.rect_of(APP_PICK_LINK);
+        let word = painted.rect_of(APP_ADD_OR);
+        let path = painted.rect_of(APP_ADD_PATH_LINK);
+        for (left, right) in [(pick, word), (word, path)] {
+            let gap = right.left() - left.right();
+            assert!(
+                gap >= TARGET_LINK_GAP - 1.0,
+                "two runs of the add row are {gap} apart, not 8a's {TARGET_LINK_GAP}:                  {left:?} then {right:?}"
+            );
+        }
+        // ...and they are still on ONE line, so the gap above was not bought
+        // by wrapping them apart.
+        assert!(
+            (path.center().y - pick.center().y).abs() <= 1.0,
+            "the row's two links are on different lines: {pick:?} and {path:?}"
+        );
     }
 
     /// **`+ Pick a running window` on the unbound row opens 8b's card.**
