@@ -4552,7 +4552,7 @@ pub const FIELDS_CREATE_NOTICE: &str =
 ///
 /// Short on purpose, and deliberately short of the four other Add captions on
 /// this form ([`FIELD_ADD_TEXT_BUTTON`], [`FIELD_ADD_HIDDEN_BUTTON`],
-/// [`APP_ADD_BUTTON`], [`WEBSITE_ADD_BUTTON`]): every one of those adds a NEW
+/// [`APP_ADD_PATH_LINK`], [`WEBSITE_ADD_BUTTON`]): every one of those adds a NEW
 /// thing -- a custom field the item type has no box for, an app binding,
 /// another website -- and this one reveals a row the item type already has
 /// and this item happens not to use. Two controls captioned "Add a field..."
@@ -5259,7 +5259,15 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
 pub const APP_BLOCK_HEADING: &str = "Matched app";
 
 const APP_PATH_LABEL: &str = "Program file";
-const APP_ARGS_LABEL: &str = "Command-line arguments";
+/// The arguments row's caption.
+///
+/// **`CLI` and not `Command-line`**, because the column is
+/// `theme::SECTION_LABEL_WIDTH` -- 130 points -- and `Command-line arguments`
+/// at 12pt does not fit on one line of it. It wrapped, and a two-line caption
+/// beside a one-line box is the one row on the card whose label column is
+/// taller than its control. The owner, with that row screenshotted: "CLI args
+/// so it fits into one line".
+const APP_ARGS_LABEL: &str = "CLI arguments";
 
 /// What the arguments box is for, said in the terms the user asked in.
 ///
@@ -5350,24 +5358,59 @@ const APP_EXE_CHIP_GAP: f32 = 8.0;
 /// an overlap rather than as a silently wrong constant.
 const APP_FIELD_INSET: f32 = 10.0;
 
-/// The link that creates a binding on an item that has none.
+/// The grey word between the unbound row's two links.
+const APP_ADD_OR: &str = "or";
+
+/// The unbound row's SECOND door: the one that opens the `Program file` box
+/// instead of 8b's card.
 ///
-/// **This is the control the form was missing.** Until it existed the app block
-/// was drawn only inside `if let Some(app) = draft.app.as_mut()`, so the one
-/// place a user goes to change what an item does -- Edit -- could edit a
+/// **There are two ways to bind an item and the empty row now offers both.**
+/// It offered one control, `+ Add an app\u{2026}`, which revealed the block
+/// and left the user to find the two doors inside it. The owner: "when add an
+/// app if we allow just enter file path - it should be like pick a running or
+/// enter path" -- so the row says what the choices are, in the words the bound
+/// row already uses for the first of them ([`APP_PICK_LINK`], verbatim).
+///
+/// `a path` and not `a process name`, for [`APP_PICK_HINT`]'s reason: the box
+/// this opens takes a program FILE, and a process name typed into it produces
+/// a binding that matches but cannot be opened.
+const APP_ADD_PATH_LINK: &str = "enter a path";
+
+/// What the unbound row used to offer, as one control.
+///
+/// **No longer drawn**, and the two links that replace it are
+/// [`APP_PICK_LINK`] and [`APP_ADD_PATH_LINK`]. It said `+ Add an app\u{2026}`,
+/// which revealed the block and left the user to discover inside it that there
+/// were two ways to bind an item; the row names both now. See
+/// [`app_add_block`], and [`APP_ADD_PATH_LINK`] for the owner's word on it.
+///
+/// Kept for the same reason [`APP_NONE_NOTICE`] is: it is the run
+/// `a_form_with_no_binding_offers_the_control_that_makes_one` asserts the
+/// absence of, and an absence asserted against a literal stops meaning
+/// anything the moment the literal is edited.
+///
+/// **It was the control this form was missing.** Until it existed the app
+/// block was drawn only inside `if let Some(app) = draft.app.as_mut()`, so the
+/// one place a user goes to change what an item does -- Edit -- could edit a
 /// binding and could remove a binding but could not make one. The only way to
-/// bind an item was the tray's "Add app..." picker
-/// (`picker_ui::run_picker`), a different window that writes straight to the
-/// vault, so on the edit form the feature was simply absent.
-///
-/// **A `+ ` link, and not the outlined button it was.** 8a's `Autofill
-/// targets` card has exactly two controls that add a row -- `+ Add website`
-/// and `+ Pick a running window` -- and draws both as blue `font-weight: 600`
-/// type; the owner, with the card beside the design: "add app is link as well
-/// to match the design". This one is the same gesture in the same card, so it
-/// is the same element. See [`theme::action_link`] and [`APP_PICK_LINK`],
-/// whose place in the row this takes while nothing is bound.
+/// bind an item was the tray's "Add app..." picker (`picker_ui::run_picker`),
+/// a different window that writes straight to the vault, so on the edit form
+/// the feature was simply absent.
 pub const APP_ADD_BUTTON: &str = "+ Add an app\u{2026}";
+
+/// Which of the unbound row's two links was pressed.
+///
+/// Both make the same empty draft; [`AppAddChoice::Pick`] additionally opens
+/// 8b's card over it. An enum rather than two bools so the caller cannot be
+/// handed both at once, which is a state neither link can produce.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AppAddChoice {
+    /// `+ Pick a running window`: make the draft and open the picker.
+    Pick,
+    /// `enter a path`: make the draft, and leave the `Program file` box to be
+    /// typed into.
+    Path,
+}
 
 /// What the block used to say while the item is bound to nothing.
 ///
@@ -7620,24 +7663,42 @@ pub(crate) fn palette_button(label: &str) -> egui::Button<'static> {
 /// apps`, this app has called it `Matched app` on the read pane since the
 /// feature shipped, and two words for one thing on two panes is worse than
 /// departing from the design's noun.
-fn app_add_block(ui: &mut egui::Ui) -> bool {
+fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
     // **The card's row idiom, not a column of its own.** The caption goes in
     // the label column where every other row on this form puts one, and the
-    // notice and the link go in the field column -- which is the shape 8a
-    // draws for `Native apps` and the shape the BOUND arm of this block
-    // already had. Written as a `field_label` and a loose button, the unbound
-    // arm was the one place on the card where a caption sat over its content
-    // instead of beside it, so the card changed layout depending on whether
-    // the item happened to be bound.
-    let mut add = false;
+    // links go in the field column -- which is the shape 8a draws for `Native
+    // apps` and the shape the BOUND arm of this block already had. Written as
+    // a `field_label` and a loose button, the unbound arm was the one place on
+    // the card where a caption sat over its content instead of beside it, so
+    // the card changed layout depending on whether the item happened to be
+    // bound.
+    let mut chose = None;
     theme::section_row(ui, APP_BLOCK_HEADING, |ui| {
-        // Wrapped for `websites_block`'s reason: a run that cannot fall to a
-        // second line pushes the card out on a 298-point pane.
+        // **The row's height is the field's**, so the links sit on the line
+        // the caption beside them is on.
+        //
+        // `theme::section_row` paints its caption optically centred against a
+        // `SECTION_FIELD_HEIGHT` box, and a bare link row is only as tall as
+        // its own galley -- so the caption sat five points BELOW the link it
+        // names ("should be on same line": caption ink at 672.5, link ink at
+        // 665). `interact_size.y` is the one dial a row's height floor reads,
+        // which is the same dial `row_with_buttons` turns for the same reason.
+        ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
+        // Wrapped for `websites_block`'s reason: two links and the word
+        // between them will not fit the control column at the app's minimum
+        // pane, and a run that cannot fall to a second line pushes the card
+        // out instead (`aae9429`).
         ui.horizontal_wrapped(|ui| {
-            add = theme::action_link(ui, APP_ADD_BUTTON, TARGET_LINK_PX).clicked();
+            if theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked() {
+                chose = Some(AppAddChoice::Pick);
+            }
+            ui.label(RichText::new(APP_ADD_OR).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+            if theme::action_link(ui, APP_ADD_PATH_LINK, TARGET_LINK_PX).clicked() {
+                chose = Some(AppAddChoice::Path);
+            }
         });
     });
-    add
+    chose
 }
 
 /// The app TARGET block -- which program this item is bound to. Returns an
@@ -8016,34 +8077,39 @@ fn app_block(
     theme::section_row(ui, APP_PATH_LABEL, |ui| {
         match path_row {
             AppPathRow::Editable => {
-                // **The box takes the whole line and Browse goes UNDER it**,
-                // which is the one row on this card that does not offer its
-                // control the line. The reason is measured rather than
-                // stylistic: a full Windows program path is the longest
-                // string this form holds --
-                // `C:\Deskwarden Test\Chrome\chrome.exe` lays at 257 points
-                // at `theme::SECTION_FIELD_PX` -- and the card body is about
-                // 254 at `settings::MIN_VAULT_WINDOW_SIZE`. There is no width
-                // at which a button on that line leaves the path readable, so
-                // `target_row`'s floor would send it below on every pane the
-                // app can be resized to anyway.
-                if theme::section_text_field(ui, &mut app.path, false).changed() {
-                    // `process` is re-derived on every keystroke, which is
-                    // what keeps `launchable_path`'s file-name tie-back
-                    // satisfiable -- see `AppMatchDraft::set_path`.
-                    let typed = app.path.clone();
-                    app.set_path(&typed);
-                }
-                ui.add_space(TARGET_ROW_GAP / 2.0);
-                // **`theme::row_button`, not `theme::secondary_button`.** It
-                // used to stand beside `Choose a running app\u{2026}` and the
-                // two had to agree about height and face -- which is what
-                // `the_two_app_path_buttons_are_set_in_one_face` was written
-                // to hold. That neighbour is gone (it is [`APP_PICK_LINK`]
-                // now), and the control this one sits under is a
-                // `theme::SECTION_FIELD_HEIGHT` box: 28 points, which is
-                // `ROW_BUTTON_HEIGHT_2B`, where `secondary_button` is 32.
-                ui.horizontal(|ui| {
+                // **Browse at the end of the line, the way every other button
+                // on this form sits.**
+                //
+                // It used to go UNDER the box, on the argument that a full
+                // Windows path is the longest string this form holds
+                // (`C:\Deskwarden Test\Chrome\chrome.exe` lays at 257 points
+                // at `theme::SECTION_FIELD_PX`) against a card body of about
+                // 254 at `settings::MIN_VAULT_WINDOW_SIZE`, so there is no
+                // width at which a button on that line leaves the whole path
+                // readable. True, and beside the point the owner made: "I'd do
+                // Browse in the end like the rest of buttons". Every other row
+                // on this form that has a button has it there, and a path box
+                // that scrolls its own text is a box, where a card with one
+                // button in a place of its own is a card that looks assembled
+                // from two designs.
+                //
+                // Through `row_with_buttons`, which is that idiom: the button
+                // is measured first so it lands flush right, the field takes
+                // exactly the remainder, and below `FIELD_FLOOR` the row wraps
+                // rather than pushing the card past the pane -- which is the
+                // narrow case the old comment was really about.
+                row_with_buttons(ui, &[APP_BROWSE_BUTTON], |ui, room| {
+                    if theme::section_text_field_within(ui, &mut app.path, false, room).changed() {
+                        // `process` is re-derived on every keystroke, which is
+                        // what keeps `launchable_path`'s file-name tie-back
+                        // satisfiable -- see `AppMatchDraft::set_path`.
+                        let typed = app.path.clone();
+                        app.set_path(&typed);
+                    }
+                    // **`theme::row_button`, not `theme::secondary_button`**:
+                    // the box beside it is `theme::SECTION_FIELD_HEIGHT`, 28
+                    // points, which is `ROW_BUTTON_HEIGHT_2B`, where
+                    // `secondary_button` is 32.
                     if theme::row_button(ui, APP_BROWSE_BUTTON).clicked() {
                         action = Some(EditAction::PickAppFile);
                     }
@@ -10579,8 +10645,20 @@ pub fn draw_detail_edit(
                     // program, and `app_match_edit` leaves a blank draft
                     // alone.
                     None => {
-                        if app_add_block(ui) {
-                            draft.app = Some(AppMatchDraft::unbound());
+                        if let Some(choice) = app_add_block(ui) {
+                            let mut app = AppMatchDraft::unbound();
+                            // **`+ Pick a running window` opens the picker in
+                            // the same click.** Making the draft and then
+                            // leaving the user to find the same words again
+                            // inside the block it reveals would be two presses
+                            // for one decision they have already made.
+                            if choice == AppAddChoice::Pick {
+                                app.set_picking(true);
+                                // Enumerated on OPEN, never per frame -- the
+                                // same rule `app_block`'s own link follows.
+                                app.windows = running_app_rows();
+                            }
+                            draft.app = Some(app);
                         }
                     }
                 }
@@ -15563,12 +15641,14 @@ mod generator_row_tests {
         let (_, painted) = frame(&ctx, &mut draft, &[]);
         let strings = painted.strings();
         let mut checked = 0;
-        // The caption and the link, and nothing else on the row. The sentence
-        // that used to stand between them is gone at the owner's word --
-        // "remove Nothing is bound yet to match with web if nothing" -- so the
-        // unbound app row says exactly what the unbound websites row says,
-        // which is a `+ ` link and no prose. See `app_add_block`.
-        for needle in [APP_BLOCK_HEADING, APP_ADD_BUTTON] {
+        // The caption and BOTH doors, and no prose between them. There are
+        // two ways to bind an item and the row names both -- the owner: "when
+        // add an app if we allow just enter file path - it should be like pick
+        // a running or enter path". The sentence that used to stand above them
+        // is gone for the same reason the websites row has none ("remove
+        // Nothing is bound yet to match with web if nothing"). See
+        // `app_add_block`.
+        for needle in [APP_BLOCK_HEADING, APP_PICK_LINK, APP_ADD_PATH_LINK] {
             checked += 1;
             assert!(
                 strings.contains(&needle),
@@ -15576,12 +15656,14 @@ mod generator_row_tests {
                  make one from the edit form: {strings:?}"
             );
         }
-        assert_eq!(checked, 2, "the loop visited nothing, so it asserted nothing");
-        assert!(
-            !strings.contains(&APP_NONE_NOTICE),
-            "the unbound app row is back to explaining itself in prose, which the websites \
-             row above it does not do: {strings:?}"
-        );
+        assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
+        for gone in [APP_NONE_NOTICE, APP_ADD_BUTTON] {
+            assert!(
+                !strings.contains(&gone),
+                "the unbound app row still draws {gone:?}, which the row it is modelled on \
+                 -- the unbound websites row -- has no equivalent of: {strings:?}"
+            );
+        }
 
         // ... and it is the ADD state, not the edit block drawn over an empty
         // draft. This is what keeps `the_form_draws_an_app_block_for_a_bound_item`
@@ -15593,7 +15675,11 @@ mod generator_row_tests {
             painted.close_marks().is_empty(),
             "an item with no binding draws a ✕ for a row it does not have"
         );
-        for absent in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_PICK_LINK, APP_BROWSE_BUTTON] {
+        // `APP_PICK_LINK` is NOT in this list, and that is the change: it is
+        // one of the two doors above. What must still be absent is the block's
+        // own editing furniture -- the boxes that edit a binding that does not
+        // exist yet.
+        for absent in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON, APP_PICK_HINT] {
             assert!(
                 !strings.contains(&absent),
                 "the editing control {absent:?} is drawn for an item bound to nothing: \
@@ -15613,7 +15699,12 @@ mod generator_row_tests {
         let mut draft = EditDraft::empty();
         draft.name = "Ledgerline".to_string();
         let (_, before) = frame(&ctx, &mut draft, &[]);
-        let button = before.rect_of(APP_ADD_BUTTON);
+        // **`enter a path`, deliberately.** The row's other door opens 8b's
+        // card, and opening it walks the real desktop (`running_app_rows` is
+        // an `EnumWindows`); this test is about the block the click reveals,
+        // and the two doors reveal the same one. The picker half is
+        // `the_pick_door_on_the_unbound_row_opens_the_card`.
+        let button = before.rect_of(APP_ADD_PATH_LINK);
 
         // Two frames: the click lands during the first, which has already
         // painted the add control by the time the button reports it. The
@@ -15656,8 +15747,8 @@ mod generator_row_tests {
         }
         assert_eq!(checked, 6, "the loop visited nothing, so it asserted nothing");
         assert!(
-            !strings.contains(&APP_ADD_BUTTON),
-            "the Add button is still drawn beside the block it opened: {strings:?}"
+            !strings.contains(&APP_ADD_PATH_LINK),
+            "the add row's second door is still drawn beside the block it opened: {strings:?}"
         );
     }
 
@@ -15670,7 +15761,7 @@ mod generator_row_tests {
         let mut draft = EditDraft::empty();
         draft.name = "Ledgerline".to_string();
         let (_, painted) = frame(&ctx, &mut draft, &[]);
-        let button = painted.rect_of(APP_ADD_BUTTON);
+        let button = painted.rect_of(APP_ADD_PATH_LINK);
         let miss = Pos2::new(button.center().x, button.bottom() + 60.0);
         assert!(
             !button.contains(miss),
@@ -15697,7 +15788,7 @@ mod generator_row_tests {
         let mut unbound = EditDraft::empty();
         unbound.name = "Ledgerline".to_string();
         let (_, before_add) = frame(&ctx, &mut unbound, &[]);
-        let button = before_add.rect_of(APP_ADD_BUTTON);
+        let button = before_add.rect_of(APP_ADD_PATH_LINK);
         // Two frames -- the block the click opened is drawn by the second.
         let _ = frame(&ctx, &mut unbound, &click(button.center()));
         let (_, after_add) = frame(&ctx, &mut unbound, &[]);
@@ -15705,10 +15796,12 @@ mod generator_row_tests {
             unbound.app.is_some(),
             "Add did not open the block, so the second state below is the first one again"
         );
-        // ...and the state below really is the block, not the add control
-        // again, which would make this a second copy of the first state.
+        // ...and the state below really is the block, not the add row again,
+        // which would make this a second copy of the first state. `APP_PICK_LINK`
+        // cannot say so any more -- both states draw it -- so the run that
+        // tells them apart is the block's own hint.
         assert!(
-            after_add.strings().contains(&APP_PICK_LINK),
+            after_add.strings().contains(&APP_PICK_HINT),
             "the second state is not the opened block: {:?}",
             after_add.strings()
         );
@@ -19489,7 +19582,7 @@ mod edit_pane_layout_tests {
         }
     }
 
-    fn walk(shape: &egui::Shape, painted: &mut Painted) {
+    fn walk(shape: &egui::Shape, clip: Rect, painted: &mut Painted) {
         match shape {
             egui::Shape::Text(text) => {
                 let rect = Rect::from_min_size(text.pos, text.galley.size());
@@ -19522,9 +19615,22 @@ mod edit_pane_layout_tests {
                     };
                     painted.inks.push((text.galley.text().to_string(), ink));
                 }
-                // ... and the box the ink really covers. See `Painted::glyphs`.
+                // ... and the box the ink really covers, **cut to the clip
+                // rect it was painted under**. See `Painted::glyphs`.
+                //
+                // A `TextEdit` lays its whole value and lets the clip rect cut
+                // it at the box's edge, so a path too long for its field has
+                // glyph positions running out past the button beside it while
+                // nothing of the sort is on screen. Recording those uncut is
+                // what made `no_two_runs_on_the_tallest_edit_form_overlap`
+                // report an overlap between a program path and the `Browse`
+                // button that clips it -- an assertion about a glyph nobody can
+                // see. Intersected, and dropped when nothing of it survives.
                 if let Some(ink) = glyph_ink(text) {
-                    painted.glyphs.push((text.galley.text().to_string(), ink));
+                    let shown = ink.intersect(clip);
+                    if shown.is_positive() {
+                        painted.glyphs.push((text.galley.text().to_string(), shown));
+                    }
                 }
             }
             egui::Shape::Rect(rect) => {
@@ -19537,7 +19643,7 @@ mod edit_pane_layout_tests {
             }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
-                    walk(shape, painted);
+                    walk(shape, clip, painted);
                 }
             }
             // NOT `_ => {}`. Everything else that draws ink is recorded by
@@ -19629,7 +19735,7 @@ mod edit_pane_layout_tests {
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
-            walk(&clipped.shape, &mut painted);
+            walk(&clipped.shape, clipped.clip_rect, &mut painted);
         }
         (action, painted)
     }
@@ -21262,7 +21368,7 @@ mod edit_pane_layout_tests {
         for (link, painted) in [
             (WEBSITE_ADD_BUTTON, &unbound),
             (APP_PICK_LINK, &bound),
-            (APP_ADD_BUTTON, &unbound),
+            (APP_ADD_PATH_LINK, &unbound),
         ] {
             assert_eq!(
                 painted.font_of(link),
@@ -22555,7 +22661,7 @@ mod edit_pane_layout_tests {
         // `text-transform` and nothing else -- see
         // `theme::section_card_header`.
         let mut expected =
-            vec![FIELDS_CARD_TITLE, APP_BLOCK_HEADING, APP_ADD_BUTTON, "Folder"];
+            vec![FIELDS_CARD_TITLE, APP_BLOCK_HEADING, APP_ADD_PATH_LINK, "Folder"];
         if creating {
             // `NewItem` has no `fields` payload, so the block says so instead
             // of offering boxes whose contents Save would discard. The notice
@@ -23414,7 +23520,7 @@ mod edit_pane_layout_tests {
                 // checked with `rects_of` and not `rect_of`, because egui
                 // culls a shape outside the screen rect and paints NOTHING.
                 assert!(
-                    !before.rects_of(APP_ADD_BUTTON).iter().any(|r| bounds.contains_rect(*r)),
+                    !before.rects_of(APP_ADD_PATH_LINK).iter().any(|r| bounds.contains_rect(*r)),
                     "the unbound form already fits a {}x{} pane, so this height is not \
                      exercising scrolling at all",
                     pane.x,
@@ -23462,7 +23568,7 @@ mod edit_pane_layout_tests {
                         .iter()
                         .any(|r| bounds.contains_rect(*r) && within_pane(*r, pane))
                 };
-                if shown(APP_ADD_BUTTON) && shown(APP_BLOCK_HEADING) {
+                if shown(APP_ADD_PATH_LINK) && shown(APP_BLOCK_HEADING) {
                     reached = Some(after);
                     break;
                 }
@@ -23474,7 +23580,7 @@ mod edit_pane_layout_tests {
                     pane.x, pane.y
                 )
             });
-            assert_inside("the Add an app link", APP_ADD_BUTTON, pane, &after);
+            assert_inside("the add row's path door", APP_ADD_PATH_LINK, pane, &after);
             assert_inside("the row's caption", APP_BLOCK_HEADING, pane, &after);
             // The action strip did not come with it.
             assert_inside("Save", SAVE, pane, &after);
@@ -26032,6 +26138,162 @@ mod edit_pane_layout_tests {
                 first.top()
             );
         }
+    }
+
+    /// **The unbound app row's links sit on the line its caption is on.**
+    ///
+    /// `theme::section_row` paints its caption optically centred against a
+    /// `theme::SECTION_FIELD_HEIGHT` box, because that is what is usually
+    /// beside it. A row whose control is a bare link is only as tall as the
+    /// link's own galley, so the caption sat five points BELOW the run it
+    /// names -- measured: `Matched app` ink at 672.5 against `+ Add an app`
+    /// at 665. The owner, with that row screenshotted: "should be on same
+    /// line".
+    ///
+    /// **Ink centres, not tops.** The caption is 12pt regular and the links
+    /// are 12pt semibold, so their boxes are different heights and their tops
+    /// would disagree by a point on a row that is perfectly aligned.
+    ///
+    /// Both links, because the row wraps: a build that centred the first and
+    /// let the second fall a line would pass a test that only looked at one.
+    #[test]
+    fn the_unbound_app_rows_links_are_on_its_captions_line() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        assert!(draft.app.is_none(), "the fixture is bound, so this row is not the add row");
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        let caption = painted.rect_of(APP_BLOCK_HEADING);
+        for link in [APP_PICK_LINK, APP_ADD_PATH_LINK] {
+            let run = painted.rect_of(link);
+            assert!(
+                (run.center().y - caption.center().y).abs() <= 1.5,
+                "{link:?} is centred at y = {} and {APP_BLOCK_HEADING:?} beside it at {} -- \
+                 the caption and the control it names are not on one line",
+                run.center().y,
+                caption.center().y
+            );
+        }
+    }
+
+    /// **`+ Pick a running window` on the unbound row opens 8b's card.**
+    ///
+    /// The row's two doors do different things -- that is the whole reason
+    /// there are two -- and `clicking_add_an_app_opens_the_same_block_an_
+    /// existing_binding_gets` deliberately takes the other one, because this
+    /// one walks the real desktop. So the difference is asserted here.
+    ///
+    /// **Both halves**: the picker is open, and the draft it opened over is
+    /// still blank, so a click and a Cancel writes nothing.
+    #[test]
+    fn the_pick_door_on_the_unbound_row_opens_the_card() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let link = painted.rect_of(APP_PICK_LINK).center();
+
+        let _ = frame_for(&ctx, pane, &mut draft, false, &click(link), Some(&item), &totp);
+        let app = draft.app.as_ref().expect("the Pick door made no draft binding");
+        assert!(app.picking, "the Pick door made a draft but did not open the picker over it");
+        assert!(app.is_blank(), "the Pick door invented a binding: {app:?}");
+    }
+
+    /// **`Browse` sits at the end of the `Program file` row**, where every
+    /// other button on this form sits.
+    ///
+    /// It used to go under the box, on the argument that a full Windows path
+    /// is longer than the card is wide at the app's minimum pane. True, and
+    /// beside the point: the owner, with that row screenshotted, "I'd do
+    /// Browse in the end like the rest of buttons". A card with one button in
+    /// a place of its own is a card that looks assembled from two designs.
+    ///
+    /// Three claims: the button is on the box's line, it is AFTER the box,
+    /// and it ends where the row's other buttons end -- flush with the card's
+    /// content edge, which is what `row_with_buttons` is for.
+    #[test]
+    fn browse_sits_at_the_end_of_the_program_file_row() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        draft.app = Some(AppMatchDraft::unbound());
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        let caption = painted.rect_of(APP_PATH_LABEL);
+        let browse = painted.rect_of(APP_BROWSE_BUTTON);
+        assert!(
+            (browse.center().y - caption.center().y).abs() <= 2.0,
+            "{APP_BROWSE_BUTTON:?} is centred at y = {} and its row's caption at {} -- the \
+             button is on a line of its own",
+            browse.center().y,
+            caption.center().y
+        );
+        // ...and flush right, with the card's other row buttons. The
+        // credentials card's LAST `Copy` is the comparison -- the password
+        // row's, which is the second of a pair and therefore the one whose
+        // right edge `row_with_buttons` really computes.
+        let last_copy = *painted
+            .rects_of(COPY_LABEL)
+            .last()
+            .expect("the credentials card draws a Copy on two rows");
+        assert!(
+            (browse.right() - last_copy.right()).abs() <= 1.0,
+            "{APP_BROWSE_BUTTON:?} ends at {} and the password row's {COPY_LABEL:?} at {} --              the two rows do not share a right-hand edge",
+            browse.right(),
+            last_copy.right()
+        );
+    }
+
+    /// **Every caption in a label column fits on one line of it.**
+    ///
+    /// `Command-line arguments` at 12pt is wider than
+    /// `theme::SECTION_LABEL_WIDTH`, so it wrapped -- a two-line caption
+    /// beside a one-line box, and the one row on the card whose label column
+    /// is taller than its control. The owner: "CLI args so it fits into one
+    /// line".
+    ///
+    /// **Every caption and not just that one**, because the column's width is
+    /// the constraint and the next caption written is as likely to overrun it.
+    /// Measured against the real laid galley, so it is the font's answer and
+    /// not an estimate.
+    #[test]
+    fn no_row_caption_is_wider_than_the_label_column() {
+        let ctx = styled_context(Vec2::new(WIDE_PANE_WIDTH, 800.0));
+        let captions = [
+            APP_BLOCK_HEADING,
+            APP_PATH_LABEL,
+            APP_ARGS_LABEL,
+            APP_WINDOW_LABEL,
+            WEBSITE_LABEL,
+            TOTP_LABEL,
+        ];
+        let _ = ctx.run_ui(raw_input(Vec2::new(WIDE_PANE_WIDTH, 800.0), &[]), |ui| {
+            for caption in captions {
+                let laid = ui.painter().layout_no_wrap(
+                    caption.to_string(),
+                    egui::FontId::new(12.0, egui::FontFamily::Proportional),
+                    theme::TEXT_FAINT,
+                );
+                assert!(
+                    laid.size().x <= theme::SECTION_LABEL_WIDTH,
+                    "{caption:?} lays at {}pt against a {}pt label column, so it wraps onto a \
+                     second line beside a one-line box",
+                    laid.size().x,
+                    theme::SECTION_LABEL_WIDTH
+                );
+            }
+        });
+        assert_eq!(captions.len(), 6, "the loop visited nothing, so it asserted nothing");
     }
 
     /// **A website's match chooser is the same box as the field beside it**,

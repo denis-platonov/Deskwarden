@@ -3734,7 +3734,24 @@ pub fn link_label(ui: &mut Ui, text: &str, size: f32) -> Response {
 /// [`semibold`]'s named family -- egui has no weight axis, so 600 is a face
 /// and not a flag. See [`font_definitions`].
 pub fn action_link(ui: &mut Ui, text: &str, size: f32) -> Response {
-    link_widget(ui, egui::Label::new(semibold(text, size).color(BLUE_DEEP)))
+    // **Laid here, no-wrap, and handed over finished** -- not given as a
+    // `RichText` for the `Label` to lay itself.
+    //
+    // Every one of these links sits in a `horizontal_wrapped` row, which puts
+    // the `Ui` into `TextWrapMode::Wrap`; a `Label` that lays its own text
+    // there takes the whole remaining line as its layout width, and its
+    // RESPONSE is that box. Measured on the unbound app row, whose two links
+    // sit side by side: both reported a rect starting at the row's left edge,
+    // the first one 132 points wide and the second 207 -- so a press anywhere
+    // after `+ Pick a running window`, including on the link beside it,
+    // activated the first. A finished galley is exactly as wide as its text,
+    // so the two links have the hit areas they look like they have.
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        FontId::new(size, FontFamily::Name(SEMIBOLD.into())),
+        BLUE_DEEP,
+    );
+    link_widget(ui, egui::Label::new(galley))
 }
 
 /// The same link, from text the caller has **already laid out**.
