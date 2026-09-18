@@ -1501,23 +1501,28 @@ impl Section {
 
     /// The line 8a sets beside the title in the same band, or nothing.
     ///
-    /// 8a carries one on two of its cards -- `where this login is offered`
-    /// under `Autofill targets` -- and the sentence does real work: it is the
-    /// difference between a card a user reads as "addresses" and one they read
-    /// as "when does this fire".
+    /// **ONE card carries one**, and it is `Autofill targets`: 8a's band there
+    /// reads `Autofill targets  where this login is offered`, and the sentence
+    /// does real work -- it is the difference between a card a user reads as
+    /// "addresses" and one they read as "when does this fire".
     ///
-    /// **It depends on the kind, because 8a's sentence names a login.** A
-    /// secure note is not one, has no websites this app can store, and shows
-    /// only the matched-app row -- so the design's own words would be a card
-    /// describing something the record does not have. The owner, on a note:
-    /// "Does Secnote need Autofill targets?".
+    /// `Fill rule` had one too (`what Deskwarden types`) and 8a's band does
+    /// not: the design's is the two words alone. The owner, pointing at it:
+    /// "remove". It was also the weaker of the two sentences -- the row under
+    /// it now draws the sequence as chips, so what Deskwarden types is on
+    /// screen rather than described.
+    ///
+    /// **The remaining one depends on the kind, because 8a's sentence names a
+    /// login.** A secure note is not one, has no websites this app can store,
+    /// and shows only the matched-app row -- so the design's own words would
+    /// be a card describing something the record does not have. The owner, on
+    /// a note: "Does Secnote need Autofill targets?".
     pub const fn note(self, kind: ItemKind) -> &'static str {
         match self {
             Section::Autofill => match kind {
                 ItemKind::Login => "where this login is offered",
                 _ => "which app this fills in",
             },
-            Section::FillRule => "what Deskwarden types",
             _ => "",
         }
     }
@@ -5631,10 +5636,24 @@ pub(crate) enum ChipTone {
 /// 8a's `font-size: 11px` on every chip in that row.
 const STEP_CHIP_PX: f32 = 11.0;
 
-/// `padding: 2px 7px` on the mono chips, `2px 8px` on the two washed ones.
-const STEP_CHIP_PAD_Y: f32 = 2.0;
-const STEP_CHIP_PAD_X_MONO: f32 = 7.0;
-const STEP_CHIP_PAD_X_WASH: f32 = 8.0;
+/// **One padding for all four**, where 8a writes `2px 7px` on its mono chips
+/// and `2px 8px` on its washed ones.
+///
+/// The owner: "make same pills but diff color so they look identical". The
+/// design's two-point difference is invisible in a picture and very visible in
+/// a row -- five pills in a line, two of them a point narrower and a point
+/// shorter than the others, reads as a mistake rather than as a distinction.
+/// The distinction 8a is drawing there is COLOUR, and that is kept exactly.
+const STEP_CHIP_PAD_X: f32 = 8.0;
+
+/// Taller than 8a's literal `2px`, at the owner's word: "Pills should be
+/// higher as per design". Two points of padding round an 11-point run is a
+/// box that hugs the letters; the design's pills read as pills.
+const STEP_CHIP_PAD_Y: f32 = 3.0;
+
+/// `border-radius: 6px`, 8a's own on the washed chips, given to all four for
+/// the reason the padding is.
+const STEP_CHIP_RADIUS: u8 = 6;
 
 /// `gap: 6px` between them.
 const STEP_CHIP_GAP: f32 = 6.0;
@@ -5644,70 +5663,78 @@ const STEP_CHIP_GAP: f32 = 6.0;
 const STEP_CHIP_TOTAL_PX: f32 = 12.0;
 const STEP_CHIP_TOTAL_INSET: f32 = 4.0;
 
-/// One of 8a's chips.
-pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone) {
-    let mono = matches!(tone, ChipTone::Key | ChipTone::Wait);
-    let (family, ink) = match tone {
-        ChipTone::Key => (egui::FontFamily::Monospace, theme::INK),
-        ChipTone::Wait => (egui::FontFamily::Monospace, theme::TEXT_FAINT),
-        ChipTone::Field => (egui::FontFamily::Name(theme::SEMIBOLD.into()), theme::BLUE_DEEP),
-        ChipTone::Secret => (egui::FontFamily::Name(theme::BOLD.into()), theme::DANGER_INK),
-    };
-    let galley =
-        ui.painter().layout_no_wrap(text.to_string(), egui::FontId::new(STEP_CHIP_PX, family), ink);
-    let pad_x = if mono { STEP_CHIP_PAD_X_MONO } else { STEP_CHIP_PAD_X_WASH };
-    let size = egui::vec2(
-        galley.size().x + pad_x * 2.0,
-        galley.size().y + STEP_CHIP_PAD_Y * 2.0,
-    );
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter();
+/// The face a chip of this tone is set in, and the three colours it wears:
+/// its fill, its edge, and its ink.
+fn chip_palette(tone: ChipTone) -> (egui::FontFamily, egui::Color32, egui::Color32, egui::Color32) {
     match tone {
-        // **The keycap's heavier bottom edge is painted as a second
-        // rectangle**, because a `Stroke` has one width for all four sides and
-        // 8a's `border-bottom-width: 2px` is the whole of what makes this read
-        // as a key rather than as a small box.
-        ChipTone::Key => {
-            painter.rect(
-                rect,
-                CornerRadius::same(5),
-                theme::CARD,
-                egui::Stroke::new(1.0, theme::BORDER_STRONG),
-                egui::StrokeKind::Inside,
-            );
-            painter.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + 1.0, rect.bottom() - 2.0),
-                    egui::pos2(rect.right() - 1.0, rect.bottom()),
-                ),
-                CornerRadius::same(2),
-                theme::BORDER_STRONG,
-            );
-        }
-        ChipTone::Wait => {
-            painter.rect_filled(rect, CornerRadius::same(5), theme::CANVAS);
-        }
-        ChipTone::Field => {
-            painter.rect(
-                rect,
-                CornerRadius::same(6),
-                theme::BLUE_WASH,
-                egui::Stroke::new(1.0, theme::BLUE_EDGE),
-                egui::StrokeKind::Inside,
-            );
-        }
-        ChipTone::Secret => {
-            painter.rect(
-                rect,
-                CornerRadius::same(6),
-                theme::DANGER_WASH,
-                egui::Stroke::new(1.0, theme::DANGER_EDGE),
-                egui::StrokeKind::Inside,
-            );
-        }
+        ChipTone::Key => (
+            egui::FontFamily::Monospace,
+            theme::CARD,
+            theme::BORDER_STRONG,
+            theme::INK,
+        ),
+        ChipTone::Wait => (
+            egui::FontFamily::Monospace,
+            theme::CANVAS,
+            theme::HAIRLINE,
+            theme::TEXT_FAINT,
+        ),
+        ChipTone::Field => (
+            egui::FontFamily::Name(theme::SEMIBOLD.into()),
+            theme::BLUE_WASH,
+            theme::BLUE_EDGE,
+            theme::BLUE_DEEP,
+        ),
+        ChipTone::Secret => (
+            egui::FontFamily::Name(theme::BOLD.into()),
+            theme::DANGER_WASH,
+            theme::DANGER_EDGE,
+            theme::DANGER_INK,
+        ),
     }
+}
+
+/// **The height every chip in the row shares.**
+///
+/// Taken from the tallest of the faces the row can use rather than from each
+/// chip's own run, which is what makes five pills in a line the same object in
+/// four colours: a mono `250 ms` and a semibold `Username` have different line
+/// boxes, and a height computed per chip would step up and down along the row.
+fn chip_height(ui: &egui::Ui) -> f32 {
+    let faces = [ChipTone::Key, ChipTone::Field, ChipTone::Secret, ChipTone::Wait];
+    let tallest = ui.ctx().fonts_mut(|f| {
+        faces
+            .iter()
+            .map(|tone| f.row_height(&egui::FontId::new(STEP_CHIP_PX, chip_palette(*tone).0)))
+            .fold(0.0_f32, f32::max)
+    });
+    tallest + STEP_CHIP_PAD_Y * 2.0
+}
+
+/// One of 8a's chips, at the row's shared [`chip_height`].
+pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone, height: f32) {
+    let (family, fill, edge, ink) = chip_palette(tone);
+    let font = egui::FontId::new(STEP_CHIP_PX, family);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), ink);
+    let size = egui::vec2(galley.size().x + STEP_CHIP_PAD_X * 2.0, height);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(STEP_CHIP_RADIUS),
+        fill,
+        egui::Stroke::new(1.0, edge),
+        egui::StrokeKind::Inside,
+    );
+    // **The FACE's ink centred in the pill**, not the galley box and not this
+    // particular word's ink -- the same rule the app row's executable chip
+    // arrived at, and for the same two reasons: a box is ascent plus descent
+    // and two faces divide that differently, and a line that moves with the
+    // letters on it is not a line. See `theme::face_ink_middle`.
     ui.painter().galley(
-        egui::pos2(rect.left() + pad_x, rect.top() + STEP_CHIP_PAD_Y),
+        egui::pos2(
+            rect.left() + STEP_CHIP_PAD_X,
+            rect.center().y - theme::face_ink_middle(ui, &font),
+        ),
         galley,
         ink,
     );
@@ -5715,6 +5742,7 @@ pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone) {
 
 /// 8a's readout: the sequence as chips, and what it costs in time after them.
 fn sequence_chip_row(ui: &mut egui::Ui, sequence: &str, source: &ResolveSource<'_>) {
+    let height = chip_height(ui);
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(STEP_CHIP_GAP, 4.0);
         for act in crate::vault_window::sequence_builder::acts(sequence) {
@@ -5736,8 +5764,8 @@ fn sequence_chip_row(ui: &mut egui::Ui, sequence: &str, source: &ResolveSource<'
             // is a compact read-out and takes the design's shorter, exact
             // form; see `Act::wait`.
             match act.wait {
-                Some(waited) => sequence_chip(ui, &duration_label(waited), tone),
-                None => sequence_chip(ui, &act.label, tone),
+                Some(waited) => sequence_chip(ui, &duration_label(waited), tone, height),
+                None => sequence_chip(ui, &act.label, tone, height),
             }
         }
         // 8a's `2.1 s`, after a four-point inset of its own. Only when it can
@@ -7697,8 +7725,16 @@ fn app_sequence_block(
     if !app.sequence_open {
         theme::section_row(ui, SEQUENCE_ROW_LABEL, |ui| {
             row_with_buttons(ui, &[SEQUENCE_EDIT_BUTTON], |ui, room| {
+                // **`set_width`, not `set_max_width`.** `row_with_buttons`
+                // measures the button, hands the field what is left, and
+                // expects the field to CLAIM it -- every other row on this
+                // form does, because `section_text_field_within` allocates a
+                // box that wide. A scope that only capped its width shrank to
+                // the chips, so `Edit sequence` started right after them and
+                // stopped forty points short of the `Copy` above it. The owner:
+                // "Edit Sequence more to the right as the rest of the buttons".
                 ui.scope(|ui| {
-                    ui.set_max_width(room);
+                    ui.set_width(room);
                     sequence_chip_row(ui, &app.sequence, source);
                 });
                 if theme::row_button(ui, SEQUENCE_EDIT_BUTTON).clicked() {
@@ -27594,6 +27630,36 @@ mod edit_pane_layout_tests {
         }
         assert_eq!(checked, 4, "the loop visited nothing, so it asserted nothing");
 
+        // **One pill in four colours.** The owner: "make same pills but diff
+        // color so they look identical". 8a writes `2px 7px` on its mono chips
+        // and `2px 8px` on its washed ones, and that two-point difference --
+        // invisible in a picture -- is five pills in a line with two of them a
+        // point narrower and a point shorter, which reads as a mistake rather
+        // than as a distinction. The distinction the design is drawing there is
+        // COLOUR, and that is what the loop above asserts.
+        let shape = chip("Username").0;
+        for run in ["Password", "250 ms", "Tab"] {
+            let other = chip(run).0;
+            assert!(
+                (other.height() - shape.height()).abs() <= 0.01
+                    && (other.top() - shape.top()).abs() <= 0.01,
+                "the {run:?} pill is {:?} against {shape:?} -- the row's pills are not one \
+                 object in four colours",
+                other
+            );
+        }
+        // ...and they are PILLS, not boxes hugging their letters: the owner's
+        // "Pills should be higher as per design". Asserted against the run
+        // inside, so this is about the padding rather than about a number that
+        // would have to be re-derived if the face changed.
+        let ink = *painted.rects_of("Username").last().expect("the chip was found above");
+        assert!(
+            shape.height() >= ink.height() + 4.0,
+            "the pill is {}pt round a {}pt run, which is a box and not a pill",
+            shape.height(),
+            ink.height()
+        );
+
         // ...and the shape: the caption in the label column, the button at the
         // end of the line with the chips, and no sentence saying what the
         // chips already say.
@@ -27609,6 +27675,23 @@ mod edit_pane_layout_tests {
         assert!(
             button.left() > first.right(),
             "{SEQUENCE_EDIT_BUTTON:?} is not after the chips"
+        );
+        // **Flush with every other row's button.** `row_with_buttons` measures
+        // the button, hands the field what is left and expects it to CLAIM it;
+        // a chip row that only capped its width shrank to the chips and left
+        // the button forty points short. The owner: "Edit Sequence more to the
+        // right as the rest of the buttons". Compared against the password
+        // row's `Copy`, which is the same idiom two cards up.
+        let copy = *painted
+            .rects_of(COPY_LABEL)
+            .last()
+            .expect("the credentials card draws a Copy");
+        assert!(
+            (button.right() - copy.right()).abs() <= 1.0,
+            "{SEQUENCE_EDIT_BUTTON:?} ends at {} and the password row's {COPY_LABEL:?} at {} \
+             -- the two rows do not share a right-hand edge",
+            button.right(),
+            copy.right()
         );
     }
 
