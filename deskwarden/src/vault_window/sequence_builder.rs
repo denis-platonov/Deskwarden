@@ -67,6 +67,16 @@ pub struct Act {
     /// Whether this act types a secret. Drives the bar's colour, and nothing
     /// else: the label of a secret act is the field's NAME, never its value.
     pub secret: bool,
+    /// **How long this act WAITS**, for the one kind that is a wait and
+    /// `None` for every other.
+    ///
+    /// Carried beside [`Self::label`] rather than parsed back out of it,
+    /// because the two are worded differently on purpose. `label` is
+    /// `key_sequence::wait_label` -- "Wait 0.3s", in the SECONDS the owner
+    /// asked to set waits in -- and 8a's compact chip is `250 ms`, which is
+    /// shorter and exact. A caller that needs the design's spelling needs the
+    /// number, not a re-reading of the sentence.
+    pub wait: Option<Duration>,
 }
 
 /// How two tokens of one typing run are joined in an act's label.
@@ -104,6 +114,7 @@ pub fn acts(sequence: &str) -> Vec<Act> {
                         kind: StepKind::Text,
                         label: token.chip_label(),
                         secret,
+                        wait: None,
                     });
                     typing = true;
                 }
@@ -115,14 +126,15 @@ pub fn acts(sequence: &str) -> Vec<Act> {
                     label.push_str(RUN_JOIN);
                 }
                 label.push_str(&token.chip_label());
-                acts.push(Act { kind: StepKind::Key, label, secret: false });
+                acts.push(Act { kind: StepKind::Key, label, secret: false, wait: None });
                 typing = false;
             }
-            Token::Delay(_) => {
+            Token::Delay(ms) => {
                 acts.push(Act {
                     kind: StepKind::Wait,
                     label: token.chip_label(),
                     secret: false,
+                    wait: Some(Duration::from_millis(u64::from(*ms))),
                 });
                 typing = false;
             }

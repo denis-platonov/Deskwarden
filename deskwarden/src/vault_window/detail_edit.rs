@@ -5592,7 +5592,177 @@ const APP_SEQUENCE_HINT: &str =
 pub(crate) const APP_SEQUENCE_DEFAULT_NOTICE: &str =
     "Default \u{2014} username, Tab, password. Add or remove a step to change it.";
 
-/// The builder's two captions.
+/// 8a's caption for the `Fill rule` card's first row.
+///
+/// `Sequence`, where this card used to write `Keystrokes` over the row as a
+/// `field_label`. The design puts it in the row's own 130-point label column
+/// like every other row on the form, and the word it puts there is this one.
+pub const SEQUENCE_ROW_LABEL: &str = "Sequence";
+
+/// 8a's control at the end of that row: `height: 30px; padding: 0 10px; border:
+/// 1px solid #d7d3d3; border-radius: 7px; font-size: 12px`, which is this
+/// app's `theme::row_button` exactly.
+pub const SEQUENCE_EDIT_BUTTON: &str = "Edit sequence";
+
+/// Which of 8a's four chip treatments a step wears.
+///
+/// The design draws the sequence as chips that are told apart by COLOUR rather
+/// than by a word: a key is a keycap, a field is the brand wash, a SECRET field
+/// is the danger wash, and a wait is plain grey. That is the whole readout --
+/// someone glancing at this row sees where the password is without reading a
+/// label -- so the four are spelled out here rather than being one chip with a
+/// colour argument at four call sites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChipTone {
+    /// `Ctrl+A`, `Tab`, `Enter`: mono, white, a 1px border whose BOTTOM is 2px
+    /// -- 8a's `border-bottom-width: 2px`, which is what makes it a keycap and
+    /// not a box.
+    Key,
+    /// `Username`: `color: #14307a; background: #eef2fc; border: 1px solid
+    /// #b8c7ea`.
+    Field,
+    /// `Password`: the same shape in the danger palette, `#8c3c33` on `#fdf3f2`
+    /// inside `#e8a9a2`, and 700 where the field chip is 600.
+    Secret,
+    /// `250 ms`: mono `#7d7979` on `#f3f2f2`, no border.
+    Wait,
+}
+
+/// 8a's `font-size: 11px` on every chip in that row.
+const STEP_CHIP_PX: f32 = 11.0;
+
+/// `padding: 2px 7px` on the mono chips, `2px 8px` on the two washed ones.
+const STEP_CHIP_PAD_Y: f32 = 2.0;
+const STEP_CHIP_PAD_X_MONO: f32 = 7.0;
+const STEP_CHIP_PAD_X_WASH: f32 = 8.0;
+
+/// `gap: 6px` between them.
+const STEP_CHIP_GAP: f32 = 6.0;
+
+/// The run after the chips: `font-size: 12px; color: #9b9797; padding-left:
+/// 4px`.
+const STEP_CHIP_TOTAL_PX: f32 = 12.0;
+const STEP_CHIP_TOTAL_INSET: f32 = 4.0;
+
+/// One of 8a's chips.
+pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone) {
+    let mono = matches!(tone, ChipTone::Key | ChipTone::Wait);
+    let (family, ink) = match tone {
+        ChipTone::Key => (egui::FontFamily::Monospace, theme::INK),
+        ChipTone::Wait => (egui::FontFamily::Monospace, theme::TEXT_FAINT),
+        ChipTone::Field => (egui::FontFamily::Name(theme::SEMIBOLD.into()), theme::BLUE_DEEP),
+        ChipTone::Secret => (egui::FontFamily::Name(theme::BOLD.into()), theme::DANGER_INK),
+    };
+    let galley =
+        ui.painter().layout_no_wrap(text.to_string(), egui::FontId::new(STEP_CHIP_PX, family), ink);
+    let pad_x = if mono { STEP_CHIP_PAD_X_MONO } else { STEP_CHIP_PAD_X_WASH };
+    let size = egui::vec2(
+        galley.size().x + pad_x * 2.0,
+        galley.size().y + STEP_CHIP_PAD_Y * 2.0,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    match tone {
+        // **The keycap's heavier bottom edge is painted as a second
+        // rectangle**, because a `Stroke` has one width for all four sides and
+        // 8a's `border-bottom-width: 2px` is the whole of what makes this read
+        // as a key rather than as a small box.
+        ChipTone::Key => {
+            painter.rect(
+                rect,
+                CornerRadius::same(5),
+                theme::CARD,
+                egui::Stroke::new(1.0, theme::BORDER_STRONG),
+                egui::StrokeKind::Inside,
+            );
+            painter.rect_filled(
+                egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 1.0, rect.bottom() - 2.0),
+                    egui::pos2(rect.right() - 1.0, rect.bottom()),
+                ),
+                CornerRadius::same(2),
+                theme::BORDER_STRONG,
+            );
+        }
+        ChipTone::Wait => {
+            painter.rect_filled(rect, CornerRadius::same(5), theme::CANVAS);
+        }
+        ChipTone::Field => {
+            painter.rect(
+                rect,
+                CornerRadius::same(6),
+                theme::BLUE_WASH,
+                egui::Stroke::new(1.0, theme::BLUE_EDGE),
+                egui::StrokeKind::Inside,
+            );
+        }
+        ChipTone::Secret => {
+            painter.rect(
+                rect,
+                CornerRadius::same(6),
+                theme::DANGER_WASH,
+                egui::Stroke::new(1.0, theme::DANGER_EDGE),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    ui.painter().galley(
+        egui::pos2(rect.left() + pad_x, rect.top() + STEP_CHIP_PAD_Y),
+        galley,
+        ink,
+    );
+}
+
+/// 8a's readout: the sequence as chips, and what it costs in time after them.
+fn sequence_chip_row(ui: &mut egui::Ui, sequence: &str, source: &ResolveSource<'_>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(STEP_CHIP_GAP, 4.0);
+        for act in crate::vault_window::sequence_builder::acts(sequence) {
+            let tone = match act.kind {
+                StepKind::Key => ChipTone::Key,
+                StepKind::Wait => ChipTone::Wait,
+                StepKind::Text if act.secret => ChipTone::Secret,
+                StepKind::Text => ChipTone::Field,
+                // A rate change types nothing and a raw run is a fragment
+                // this form cannot name; neither is an act `acts` emits, and
+                // both are here because the enum is shared with the builder's
+                // own list. Drawn as a wait -- grey, plain -- if one ever
+                // arrives, which is the treatment for "a step that is not
+                // about a value".
+                StepKind::Rate | StepKind::Raw => ChipTone::Wait,
+            };
+            // 8a spells a wait `250 ms`, where `Act::label` spells it in the
+            // seconds the owner asked to SET waits in ("Wait 0.3s"). The chip
+            // is a compact read-out and takes the design's shorter, exact
+            // form; see `Act::wait`.
+            match act.wait {
+                Some(waited) => sequence_chip(ui, &duration_label(waited), tone),
+                None => sequence_chip(ui, &act.label, tone),
+            }
+        }
+        // 8a's `2.1 s`, after a four-point inset of its own. Only when it can
+        // be worked out: a sequence the runner would refuse has no duration,
+        // and a made-up one beside chips that are real would be the worst kind
+        // of readout.
+        if let Some(total) = sequence_tally(sequence, source).map(|tally| tally.total) {
+            ui.add_space(STEP_CHIP_TOTAL_INSET - STEP_CHIP_GAP);
+            ui.label(
+                RichText::new(duration_label(total))
+                    .size(STEP_CHIP_TOTAL_PX)
+                    .color(theme::TEXT_GHOST),
+            );
+        }
+    });
+}
+
+/// The builder's own caption, and what this row's control used to say.
+///
+/// **`APP_SEQUENCE_OPEN` is no longer drawn.** 8a's row ends in
+/// [`SEQUENCE_EDIT_BUTTON`] -- `Edit sequence` -- where this card wrote
+/// `Change what it types...` on a button under a sentence. It is kept as the
+/// run this card must NOT paint any more: an absence asserted against a
+/// literal stops meaning anything the moment the literal is edited.
+#[cfg(test)]
 const APP_SEQUENCE_OPEN: &str = "Change what it types\u{2026}";
 const APP_SEQUENCE_CLOSE: &str = "Done";
 
@@ -7494,7 +7664,6 @@ fn app_sequence_block(
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
 ) -> Option<EditAction> {
-    theme::field_label(ui, APP_SEQUENCE_LABEL);
     let mut opened = None;
     let view = sequence_view(&app.sequence);
 
@@ -7511,39 +7680,53 @@ fn app_sequence_block(
         ui.add_space(4.0);
     }
 
-    // Shut, this is three lines: what would be typed, said in words, and the
-    // way in. See `AppMatchDraft::sequence_open`.
+    // **8a's row, and it is ONE row**: the caption in the 130-point label
+    // column, the sequence drawn as chips in the field column, and
+    // `Edit sequence` at the end of the line.
+    //
+    // It was a `field_label` over a sentence over a button -- three stacked
+    // lines in a card whose every other row is a caption beside a control, and
+    // the one place on this form where what a rule DOES was said in prose. 8a
+    // says it in colour instead: a key is a keycap, a field is the brand wash,
+    // a SECRET field is the danger wash, and a wait is plain grey, so the row
+    // answers "where is the password in this" without being read.
+    //
+    // Through `row_with_buttons` like every other row on this form that ends
+    // in a control, so `Edit sequence` lands flush with the `Copy` above it
+    // and the chips take exactly what is left.
     if !app.sequence_open {
-        ui.label(
-            RichText::new(sequence_summary(&app.sequence)).size(11.0).color(theme::TEXT_FAINT),
-        );
-        ui.add_space(4.0);
-        if theme::secondary_button(ui, APP_SEQUENCE_OPEN).clicked() {
-            // **On a saved item this opens design 4a's own screen**, and the
-            // block below is not drawn at all.
-            //
-            // The rule is one thing and had two editors: a three-column screen
-            // with a checks rail and a timing strip, and a small copy of it
-            // folded into this card. Two editors for one value is two places
-            // to fix a bug in and two chances for them to drift about what a
-            // step is -- so the card hands the job to the screen and keeps
-            // only what it is good at, which is saying in one line what will
-            // be typed.
-            //
-            // **A CREATE keeps the inline editor**, because the screen is
-            // built by `SequenceDraft::for_item` and a create has no item to
-            // build it from. The same rule this form applies to every other
-            // row that needs a saved record, and the reason the block below
-            // is still here rather than deleted.
-            if creating {
-                app.sequence_open = true;
-            } else {
-                opened = Some(EditAction::OpenSequenceBuilder);
-            }
-        }
-        ui.add_space(10.0);
+        theme::section_row(ui, SEQUENCE_ROW_LABEL, |ui| {
+            row_with_buttons(ui, &[SEQUENCE_EDIT_BUTTON], |ui, room| {
+                ui.scope(|ui| {
+                    ui.set_max_width(room);
+                    sequence_chip_row(ui, &app.sequence, source);
+                });
+                if theme::row_button(ui, SEQUENCE_EDIT_BUTTON).clicked() {
+                    // **On a saved item this opens design 4a's own screen.**
+                    //
+                    // The rule is one thing and had two editors: a three-column
+                    // screen with a checks rail and a timing strip, and a small
+                    // copy of it folded into this card. Two editors for one
+                    // value is two places to fix a bug in and two chances for
+                    // them to drift about what a step is.
+                    //
+                    // **A CREATE keeps the inline editor**, because the screen
+                    // is built by `SequenceDraft::for_item` and a create has no
+                    // item to build it from. The same rule this form applies to
+                    // every other row that needs a saved record, and the reason
+                    // the block below is still here rather than deleted.
+                    if creating {
+                        app.sequence_open = true;
+                    } else {
+                        opened = Some(EditAction::OpenSequenceBuilder);
+                    }
+                }
+            });
+        });
         return opened;
     }
+
+    theme::field_label(ui, APP_SEQUENCE_LABEL);
 
     ui.label(RichText::new(APP_SEQUENCE_HINT).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(6.0);
@@ -17809,7 +17992,7 @@ mod sequence_builder_tests {
         let ctx = styled_context(PANE);
         let mut saved = draft_for(&item, "");
         let shut = frame(&ctx, PANE, &mut saved, &item, &totp, &[]);
-        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
+        let at = shut.rect_of(SEQUENCE_EDIT_BUTTON).center();
         let (action, _) = frame_action(&ctx, PANE, &mut saved, &item, &totp, &click(at));
         assert_eq!(
             action,
@@ -17826,7 +18009,7 @@ mod sequence_builder_tests {
         let creating_ctx = styled_context(PANE);
         let mut creating = draft_for(&item, "");
         let shut = creating_frame_action(&creating_ctx, PANE, &mut creating, &totp, &[]).1;
-        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
+        let at = shut.rect_of(SEQUENCE_EDIT_BUTTON).center();
         let (action, _) =
             creating_frame_action(&creating_ctx, PANE, &mut creating, &totp, &click(at));
         assert_eq!(
@@ -17897,12 +18080,26 @@ mod sequence_builder_tests {
         let mut draft = draft_for(&item, "");
         let painted = frame(&ctx, PANE, &mut draft, &item, &detail::TotpState::NoSecret, &[]);
         let strings = painted.strings();
-        assert!(strings.contains(&APP_SEQUENCE_LABEL), "{strings:?}");
+        // 8a's row: the caption, the chips, and the way in. The card no
+        // longer writes `APP_SEQUENCE_LABEL` over the row nor says what it
+        // types in a SENTENCE -- both were replaced by the row itself, which
+        // says it in chips. See `app_sequence_block`.
+        assert!(strings.contains(&SEQUENCE_ROW_LABEL), "{strings:?}");
+        assert!(strings.contains(&SEQUENCE_EDIT_BUTTON), "there is no way in: {strings:?}");
+        for chip in ["Username", "Tab", "Password"] {
+            assert!(
+                strings.contains(&chip),
+                "the default sequence is not drawn as 8a's chips: {strings:?}"
+            );
+        }
         assert!(
-            strings.iter().any(|s| *s == sequence_summary("")),
-            "the block does not say what would be typed: {strings:?}"
+            !strings.iter().any(|s| *s == sequence_summary("")),
+            "the row still says in prose what the chips beside it say: {strings:?}"
         );
-        assert!(strings.contains(&APP_SEQUENCE_OPEN), "there is no way in: {strings:?}");
+        assert!(
+            !strings.contains(&APP_SEQUENCE_OPEN),
+            "the card still draws the button 8a's `Edit sequence` replaced: {strings:?}"
+        );
     }
 
     /// The palette really is on screen and really is the item's own: every
@@ -18522,7 +18719,7 @@ mod sequence_builder_tests {
         // The premise: the block really is shut.
         assert!(!draft.app.as_ref().unwrap().sequence_open, "the builder started open");
         assert!(
-            painted.strings().contains(&APP_SEQUENCE_OPEN),
+            painted.strings().contains(&SEQUENCE_EDIT_BUTTON),
             "the way into the builder is not on screen, so this is not the closed state"
         );
 
@@ -23239,7 +23436,7 @@ mod edit_pane_layout_tests {
         totp: &detail::TotpState,
     ) -> Painted {
         let shut = frame_for(ctx, pane, draft, true, &[], Some(item), totp);
-        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
+        let at = shut.rect_of(SEQUENCE_EDIT_BUTTON).center();
         let click = vec![
             egui::Event::PointerMoved(at),
             egui::Event::PointerButton {
@@ -26381,7 +26578,15 @@ mod edit_pane_layout_tests {
             "the shipped pane is too narrow for a label column, so this measures nothing"
         );
 
-        let caption = painted.rect_of(Slot::Username.label());
+        // **The FIRST `Username`**, which is the credentials row's caption.
+        // The `Fill rule` row draws the word a second time now, as one of 8a's
+        // chips in the sequence it types -- a different object in a different
+        // card, and the row this test is about is the one whose control is the
+        // box below.
+        let caption = *painted
+            .rects_of(Slot::Username.label())
+            .first()
+            .expect("the credentials card draws a Username caption");
         let field = field_around(&painted, "a.novak@ledgerline.com");
         let expected = theme::SECTION_LABEL_WIDTH + theme::SECTION_ROW_GAP;
         assert!(
@@ -27318,6 +27523,93 @@ mod edit_pane_layout_tests {
             );
         }
         assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
+    }
+
+    /// **The `Fill rule` row is 8a's chips, and the four tones are four
+    /// different things.**
+    ///
+    /// The design draws the sequence as chips told apart by COLOUR rather than
+    /// by a word: a key is a keycap (`border-bottom-width: 2px`, white), a
+    /// field is the brand wash (`#eef2fc` inside `#b8c7ea`), a SECRET field is
+    /// the danger wash (`#fdf3f2` inside `#e8a9a2`), and a wait is plain grey.
+    /// That IS the readout -- someone glancing at the row sees where the
+    /// password is without reading anything -- so a build that drew them all
+    /// alike would satisfy every string check and lose the whole point.
+    ///
+    /// The row used to be a `field_label` over a sentence over a button, which
+    /// is why this asserts the SHAPE as well: caption in the label column, the
+    /// chips beside it, `Edit sequence` flush at the end, and no prose.
+    #[test]
+    fn the_fill_rule_row_is_8as_chips_and_its_button() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        let mut app = AppMatchDraft::unbound();
+        app.process = "chrome.exe".to_string();
+        // One of each: a key, a field, a SECRET field and a wait.
+        // `{DELAY n}` is a pause; `{DELAY=n}` is a typing RATE and draws no
+        // chip at all. See `key_sequence`.
+        app.sequence = "{USERNAME}{TAB}{DELAY 250}{PASSWORD}".to_string();
+        draft.app = Some(app);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        // The chip round a run: the smallest painted box that contains it.
+        // **The LAST run with this text.** `Username` and `Password` are also
+        // captions on the credentials card two cards up, and the chips are
+        // painted after them.
+        let chip = |run: &str| -> (Rect, egui::Color32) {
+            let ink = *painted
+                .rects_of(run)
+                .last()
+                .unwrap_or_else(|| panic!("no {run:?} painted: {:?}", painted.strings()));
+            let mut found: Vec<(Rect, egui::Color32)> = painted
+                .rects
+                .iter()
+                .filter(|(r, _)| r.contains_rect(ink) && r.width() <= ink.width() + 24.0)
+                .map(|(r, fill)| (*r, *fill))
+                .collect();
+            found.sort_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())));
+            *found
+                .first()
+                .unwrap_or_else(|| panic!("no chip round {run:?}: {:?}", painted.strings()))
+        };
+
+        let mut checked = 0;
+        for (run, want) in [
+            ("Username", theme::BLUE_WASH),
+            ("Password", theme::DANGER_WASH),
+            ("250 ms", theme::CANVAS),
+            ("Tab", theme::CARD),
+        ] {
+            checked += 1;
+            let (_, fill) = chip(run);
+            assert_eq!(
+                fill, want,
+                "the {run:?} chip is filled {fill:?}, not 8a's {want:?} -- the four tones are \
+                 what say which step is which"
+            );
+        }
+        assert_eq!(checked, 4, "the loop visited nothing, so it asserted nothing");
+
+        // ...and the shape: the caption in the label column, the button at the
+        // end of the line with the chips, and no sentence saying what the
+        // chips already say.
+        let caption = painted.rect_of(SEQUENCE_ROW_LABEL);
+        let button = painted.rect_of(SEQUENCE_EDIT_BUTTON);
+        let first = chip("Username").0;
+        assert!(
+            (first.center().y - caption.center().y).abs() <= 3.0
+                && (button.center().y - caption.center().y).abs() <= 3.0,
+            "the row is stacked rather than laid beside its caption: caption {caption:?}, \
+             first chip {first:?}, button {button:?}"
+        );
+        assert!(
+            button.left() > first.right(),
+            "{SEQUENCE_EDIT_BUTTON:?} is not after the chips"
+        );
     }
 
     /// **The runs on a link row do not touch.**
