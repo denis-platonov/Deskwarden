@@ -5660,6 +5660,12 @@ const STEP_CHIP_GAP: f32 = 6.0;
 
 /// The run after the chips: `font-size: 12px; color: #9b9797; padding-left:
 /// 4px`.
+///
+/// The inset is the design's `padding-left`, which is what it says: a space
+/// BESIDE the row's own `gap: 6px`, so the run stands ten points off the last
+/// pill rather than six. Spent that way round here -- `add_space` after the
+/// gap egui has already inserted -- because netting it the other way is a
+/// negative space, which is no space at all.
 const STEP_CHIP_TOTAL_PX: f32 = 12.0;
 const STEP_CHIP_TOTAL_INSET: f32 = 4.0;
 
@@ -5773,11 +5779,28 @@ fn sequence_chip_row(ui: &mut egui::Ui, sequence: &str, source: &ResolveSource<'
         // and a made-up one beside chips that are real would be the worst kind
         // of readout.
         if let Some(total) = sequence_tally(sequence, source).map(|tally| tally.total) {
-            ui.add_space(STEP_CHIP_TOTAL_INSET - STEP_CHIP_GAP);
-            ui.label(
-                RichText::new(duration_label(total))
-                    .size(STEP_CHIP_TOTAL_PX)
-                    .color(theme::TEXT_GHOST),
+            // **Added to the row's gap, not netted out of it.** 8a's row is
+            // `gap: 6px` and this run carries `padding-left: 4px` ON TOP of
+            // it, so the space before `2.1 s` is ten points and not four --
+            // and `STEP_CHIP_TOTAL_INSET - STEP_CHIP_GAP` was NEGATIVE, which
+            // `add_space` cannot honour, so the total sat at the bare gap
+            // with nothing setting it apart from the chips. The owner: "check
+            // space in front of last x.x s".
+            ui.add_space(STEP_CHIP_TOTAL_INSET);
+            // **`TextWrapMode::Extend`, the trap this file has now recorded
+            // three times.** `horizontal_wrapped` puts the `Ui` into `Wrap`,
+            // and a `Label` that lays its own text there takes the whole
+            // remaining lane as its layout width -- so `310 ms` came out as a
+            // galley 342 points wide and two rows tall, starting back at the
+            // row's left edge on top of the first pill. Laid unwrapped the run
+            // has its own width, and the ROW's wrap can place it honestly.
+            ui.add(
+                egui::Label::new(
+                    RichText::new(duration_label(total))
+                        .size(STEP_CHIP_TOTAL_PX)
+                        .color(theme::TEXT_GHOST),
+                )
+                .wrap_mode(egui::TextWrapMode::Extend),
             );
         }
     });
@@ -27581,6 +27604,12 @@ mod edit_pane_layout_tests {
         let ctx = styled_context(pane);
         let item = login_with_websites(1);
         let mut draft = EditDraft::from_item(&item);
+        // Both values, so the sequence RESOLVES: the row draws what it costs
+        // only when the runner could really plan it, and a fixture with no
+        // password would be testing the chips against a row missing its last
+        // run.
+        draft.username = "a@b.com".to_string();
+        draft.password = "correct-horse".to_string();
         let mut app = AppMatchDraft::unbound();
         app.process = "chrome.exe".to_string();
         // One of each: a key, a field, a SECRET field and a wait.
@@ -27676,6 +27705,42 @@ mod edit_pane_layout_tests {
             button.left() > first.right(),
             "{SEQUENCE_EDIT_BUTTON:?} is not after the chips"
         );
+        // **Ten points before the total, not six.** 8a's row is `gap: 6px` and
+        // the `2.1 s` run carries `padding-left: 4px` ON TOP of it. Netted the
+        // other way the sum is negative, which `add_space` cannot honour, so
+        // the run sat at the bare gap with nothing setting it apart from the
+        // pills. The owner: "check space in front of last x.x s".
+        //
+        // Measured from the last PILL's box to the run's ink, which is the
+        // space a reader sees -- and which only exists at all because the run
+        // is laid `TextWrapMode::Extend`: inside a wrapping row a `Label` that
+        // lays its own text takes the whole remaining lane, and this one came
+        // out 342 points wide and two rows tall, starting back on top of the
+        // first pill.
+        // The run this row draws for the sequence's cost, asked of the same
+        // function the row asks -- so the test cannot drift from it by
+        // spelling a duration itself.
+        let sequence = draft.app.as_ref().expect("the fixture is bound").sequence.clone();
+        let source = ResolveSource {
+            username: &draft.username,
+            password: &draft.password,
+            custom: crate::key_sequence::custom_pairs(&item),
+            totp: &totp,
+        };
+        let cost = duration_label(
+            sequence_tally(&sequence, &source).expect("the fixture's sequence resolves").total,
+        );
+        let total = *painted
+            .rects_of(&cost)
+            .last()
+            .unwrap_or_else(|| panic!("the row draws no cost: {:?}", painted.strings()));
+        let last_pill = chip("Password").0;
+        let gap = total.left() - last_pill.right();
+        assert!(
+            (gap - (STEP_CHIP_GAP + STEP_CHIP_TOTAL_INSET)).abs() <= 1.0,
+            "the total stands {gap} from the last pill, not 8a's 6 + 4"
+        );
+
         // **Flush with every other row's button.** `row_with_buttons` measures
         // the button, hands the field what is left and expects it to CLAIM it;
         // a chip row that only capped its width shrank to the chips and left
