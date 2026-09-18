@@ -15,6 +15,77 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.25 - 2026-09-17
+
+### The edit form is design 8a's card grid
+
+0.15.24 drew this form at 8a's numbers. This one draws it in 8a's SHAPE: a
+column of titled cards -- `Item`, `Login credentials`, `One-time code`,
+`Autofill targets`, `Fill rule`, `Custom fields`, `Notes`, `History` -- each a
+band of rows, each row a caption in a 130-point column beside its control, with
+a full-bleed hairline between every two of them. It was one long stack of
+labels and boxes.
+
+The band at the top is the read pane's own strip, so Edit and read no longer
+look like two applications: the item's picture, its name in a box beside it,
+and a pencil badge overlapping the corner of the picture. Every icon action --
+refresh, choose, clear -- lives on that badge and nowhere else; they used to be
+spread across the result row's menu and the read pane's kebab, which is three
+places to look for one thing.
+
+### Login credentials are 8a's rows
+
+A field takes the line and its buttons sit at the end of it, flush with the
+card, with the field taking exactly what is left -- `Copy` on the username row,
+`Generate` and `Copy` on the password's. The password is always shown, because
+this is the edit form and a Show/Hide toggle on a box you are typing into is a
+control with nothing to protect. The strength meter and the `Password history`
+link share one line, which is where 8a puts them, and the history reveals and
+copies the way the read pane's does.
+
+**The generator moved into a card of its own** -- design 3d, with a length
+slider, character tiles, a minimum-digits stepper and a look-alikes toggle.
+Saving replaces the password; Cancel leaves what was there. It used to be a row
+of generator settings living under the password box, which is a rule about
+future passwords sitting where the current one is.
+
+### The one-time code and the autofill targets are their own cards
+
+The code is no longer half of the password row. It is `One-time code`, with
+8a's `2FA` chip in its title, and its own `Add` / `Replace by scanning` /
+`Remove` -- and the read pane grew the matching tile.
+
+`Autofill targets` holds the websites and the native app together, because
+that is the one sentence that covers both. A website row is a box, a
+match-type chooser and a `✕`; the app row is 8a's: a 30-point tile with the
+program's real icon, its name and its executable in a grey pill inside one
+box, the rule it will be matched by, and a `✕`.
+
+**Design 8b's window picker** opens from it -- a list of what is open right
+now, each row with the app's real icon, a staged selection, and a
+`Match this window by` band saying which rule the pick will really be matched
+by. It floats over the window like every other card in this app that asks a
+question: centred, on a scrim, dismissable with `Escape` or its `✕`.
+
+### Fixes
+
+* **A one-time code added from the card reached the form, and the next Save
+  kept it.** The card writes the seed to the ITEM, and the form's draft -- made
+  when Edit was pressed -- knew nothing of it: the row went on drawing its empty
+  state, and Save read that empty draft as "the user cleared it". A code added
+  and saved in one sitting was lost.
+* **The card stopped offering to replace a code that was not there.** It asked
+  whether the `totp` key existed; Bitwarden leaves it behind, empty, when a code
+  is removed. So the one warning in this app that guards an unrecoverable secret
+  was being shown when there was nothing to lose.
+* **A secure note is no longer offered autofill.** A note carries a body and
+  custom fields and nothing else, so there is no credential to put into a
+  window. Nor is any non-login offered websites: `uris` live under the `login`
+  object, so a website typed onto a card or an identity was accepted by the box
+  and discarded by the Save.
+* **Opening the window picker and closing it leaves nothing behind.** It used
+  to leave the app block standing over a binding nothing had been chosen for.
+
 ## 0.15.24 - 2026-09-13
 
 ### The edit form is drawn at design 8a's own numbers
