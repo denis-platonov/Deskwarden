@@ -539,21 +539,42 @@ pub fn fill_rule_visible(app_match: Option<&crate::app_match::AppMatch>) -> bool
 // The screen
 // ---------------------------------------------------------------------------
 
-/// The rails' width. 4a's are 260 and 280 against a 1040 canvas; one width for
-/// both keeps the steps column centred, which is what the picture reads as.
-const RAIL_WIDTH: f32 = 252.0;
+/// The checks rail's width: 4a's `grid-template-columns: 1fr 340px`.
+///
+/// **One rail and not two.** 4a puts what the rule belongs to -- the vault item
+/// and the app it may type into -- in a BAND across the full width under the
+/// header, not in a column beside the steps; this screen drew it as a second
+/// rail, which cost the steps 252 points and made a three-column picture out of
+/// a two-column design. See [`destination_band`].
+const RAIL_WIDTH: f32 = 340.0;
 
-/// The gap between the three columns.
+/// The gap between the two columns.
 const COLUMN_GAP: f32 = 16.0;
 
-/// The steps column's floor. Below this the rails are stacked under it
-/// instead: three columns whose middle one is narrower than the edit-form pane
-/// this screen exists to escape would be a worse version of the thing it
-/// replaces.
+/// The steps column's floor. Below this the rail is stacked under it instead:
+/// two columns whose first is narrower than the edit-form pane this screen
+/// exists to escape would be a worse version of the thing it replaces.
 const STEPS_FLOOR: f32 = 420.0;
 
-/// The header strip's height.
-const HEADER_HEIGHT: f32 = 56.0;
+/// The header strip's height: 4a's `height: 46px`.
+const HEADER_HEIGHT: f32 = 46.0;
+
+/// The band under it, and the steps column: 4a's `padding: 16px 20px`.
+const BAND_PAD_X: i8 = 20;
+const BAND_PAD_Y: i8 = 16;
+
+/// 4a's tiles in that band: `width: 34px; height: 34px`.
+const BAND_TILE: f32 = 34.0;
+
+/// `gap: 18px` between the band's three groups, `gap: 11px` between a tile and
+/// the words beside it.
+const BAND_GAP: f32 = 18.0;
+const BAND_TILE_GAP: f32 = 11.0;
+
+/// The rules either side of 4a's arrow: `width: 34px; height: 1px`, six points
+/// clear of the mark between them.
+const BAND_ARROW_RULE: f32 = 34.0;
+const BAND_ARROW_GAP: f32 = 6.0;
 
 pub const SCREEN_TITLE: &str = "Fill rule";
 pub const SAVE_LABEL: &str = "Save rule";
@@ -610,15 +631,16 @@ pub fn draw_sequence_builder(
     }
 
     egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // **Across the full width, under the header, exactly as 4a draws it.**
+        destination_band(ui, draft);
         egui::Frame::new().inner_margin(Margin::symmetric(16, 14)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let wide = ui.available_width() >= STEPS_FLOOR + (RAIL_WIDTH + COLUMN_GAP) * 2.0;
+            let wide = ui.available_width() >= STEPS_FLOOR + RAIL_WIDTH + COLUMN_GAP;
             if wide {
                 let total = ui.available_width();
-                let steps = total - (RAIL_WIDTH + COLUMN_GAP) * 2.0;
+                let steps = total - (RAIL_WIDTH + COLUMN_GAP);
                 ui.horizontal_top(|ui| {
-                    column(ui, RAIL_WIDTH, |ui| left_rail(ui, draft));
-                    ui.add_space(COLUMN_GAP);
                     column(ui, steps, |ui| steps_column(ui, draft, palette, source));
                     ui.add_space(COLUMN_GAP);
                     column(ui, RAIL_WIDTH, |ui| {
@@ -628,7 +650,6 @@ pub fn draw_sequence_builder(
                     });
                 });
             } else {
-                left_rail(ui, draft);
                 steps_column(ui, draft, palette, source);
                 if let Some(asked) = right_rail(ui, draft, source) {
                     action = asked;
@@ -694,66 +715,200 @@ fn header(ui: &mut egui::Ui, draft: &mut SequenceDraft) -> BuilderAction {
     action
 }
 
-/// 4a's left rail: what the rule belongs to, and what it is allowed to type
-/// into.
-fn left_rail(ui: &mut egui::Ui, draft: &SequenceDraft) {
-    theme::section_card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_card_header(ui, VAULT_ITEM_HEADING, "", false);
-        theme::section_card_body(ui, |ui| {
+/// **4a's band under the header: what the rule belongs to, what it may type
+/// into, and the warning that the two are the whole of it.**
+///
+/// A BAND and not a rail. It was drawn as a column of two cards beside the
+/// steps, which made a three-column picture out of a two-column design and cost
+/// the steps 252 points of the width they are the point of. 4a runs it across
+/// the full width -- `padding: 16px 20px`, the two tiles 34 square with an
+/// arrow between them, the amber notice pushed to the far end -- and gives the
+/// grid under it `1fr 340px`.
+///
+/// The arrow between the two halves is 4a's own: a 34-point rule, the mark, and
+/// another rule. It says the rule has a direction, which two cards stacked in a
+/// rail could not.
+fn destination_band(ui: &mut egui::Ui, draft: &SequenceDraft) {
+    egui::Frame::new()
+        .fill(theme::CARD)
+        .inner_margin(Margin::symmetric(BAND_PAD_X, BAND_PAD_Y))
+        .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                theme::avatar(ui, &draft.item_name, 30.0, false);
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(theme::semibold(draft.item_name.clone(), 13.0).color(theme::INK));
-                    if !draft.folder.is_empty() {
-                        ui.label(
-                            RichText::new(draft.folder.clone())
-                                .size(11.0)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                });
+            // Wrapped, because the band holds four things and the narrowest
+            // pane this app opens at cannot hold them on one line -- and a row
+            // that does not wrap pushes the card past the window instead of
+            // shrinking (`aae9429`).
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(BAND_GAP, 8.0);
+                band_subject(
+                    ui,
+                    VAULT_ITEM_HEADING,
+                    &draft.item_name,
+                    &draft.item_name,
+                    true,
+                    |ui| {
+                        if !draft.folder.is_empty() {
+                            ui.label(
+                                RichText::new(draft.folder.clone())
+                                    .size(11.0)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        }
+                    },
+                );
+                band_arrow(ui);
+                band_subject(
+                    ui,
+                    SENDS_TO_HEADING,
+                    &draft.app_name,
+                    &draft.app_name,
+                    false,
+                    |ui| {
+                        band_chip(ui, &draft.app.process);
+                        // Only when it is really part of the rule: a title
+                        // needle is read for a hosted window and ignored
+                        // otherwise, so printing one here on an ordinary
+                        // process would name a condition that does not apply.
+                        if draft.app.hosted && !draft.app.title.is_empty() {
+                            band_chip(ui, &draft.app.title);
+                        }
+                    },
+                );
+                // **Pushed to the far end**, which is where 4a's `flex: 1`
+                // spacer puts it -- and only when the line still has room for
+                // it, so a narrow window wraps it under the two subjects
+                // rather than reserving a lane it cannot fill.
+                let want = ui.available_width();
+                if want > 260.0 {
+                    ui.add_space(want - 260.0);
+                }
+                band_caution(ui, REFUSED_ELSEWHERE);
             });
         });
-    });
-    ui.add_space(theme::SECTION_GAP);
+    theme::hairline(ui);
+}
 
-    theme::section_card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_card_header(ui, SENDS_TO_HEADING, "", false);
-        theme::section_card_body(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+/// One half of [`destination_band`]: a tile, a caption in 4a's small capitals,
+/// and a name with whatever the caller puts beside it.
+///
+/// `accent` picks 4a's two tile treatments apart -- the vault item's is the
+/// brand wash (`background: #eef2fc; border: 1px solid #b8c7ea`) and the app's
+/// the plain grey one -- which is the only thing that says which end of the
+/// arrow is which when both names are words.
+fn band_subject(
+    ui: &mut egui::Ui,
+    caption: &str,
+    initials_of: &str,
+    name: &str,
+    accent: bool,
+    beside: impl FnOnce(&mut egui::Ui),
+) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = BAND_TILE_GAP;
+        theme::avatar(ui, &theme::initials(initials_of), BAND_TILE, accent);
+        ui.vertical(|ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.label(theme::letterspaced(
+                caption,
+                11.0,
+                theme::BOLD,
+                0.08,
+                theme::TEXT_GHOST,
+            ));
             ui.horizontal(|ui| {
-                theme::avatar(ui, &draft.app_name, 30.0, false);
-                ui.add_space(8.0);
-                ui.vertical(|ui| {
-                    ui.label(theme::semibold(draft.app_name.clone(), 13.0).color(theme::INK));
-                    ui.label(
-                        RichText::new(draft.app.process.clone())
-                            .size(11.0)
-                            .color(theme::TEXT_FAINT),
-                    );
-                    // Only when it is really part of the rule: a title needle
-                    // is read for a hosted window and ignored otherwise, so
-                    // printing one here on an ordinary process would name a
-                    // condition that does not apply.
-                    if draft.app.hosted && !draft.app.title.is_empty() {
-                        ui.label(
-                            RichText::new(draft.app.title.clone())
-                                .size(11.0)
-                                .color(theme::TEXT_FAINT),
-                        );
-                    }
-                });
+                ui.spacing_mut().item_spacing.x = 8.0;
+                ui.label(theme::bold(name, 14.0).color(theme::INK));
+                beside(ui);
             });
-            ui.add_space(8.0);
-            ui.label(RichText::new(REFUSED_ELSEWHERE).size(11.0).color(theme::TEXT_GHOST));
         });
     });
-    ui.add_space(theme::SECTION_GAP);
+}
+
+/// 4a's mono chip beside a name in the band: `font-size: 11px; background:
+/// #f3f2f2; border-radius: 5px; padding: 2px 7px`.
+fn band_chip(ui: &mut egui::Ui, text: &str) {
+    let galley = ui.painter().layout_no_wrap(
+        text.to_string(),
+        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+        theme::TEXT_SECONDARY,
+    );
+    let size = egui::vec2(galley.size().x + 14.0, galley.size().y + 4.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(5), theme::CANVAS);
+    ui.painter().galley(
+        egui::pos2(rect.left() + 7.0, rect.top() + 2.0),
+        galley,
+        theme::TEXT_SECONDARY,
+    );
+}
+
+/// 4a's `--->` between the two subjects: a rule, the mark, a rule.
+///
+/// Drawn rather than set, for this app's standing reason: the codepoints that
+/// would spell it are not in the bundled face, and a glyph that falls through
+/// to whatever the system has is a different arrow on every machine.
+fn band_arrow(ui: &mut egui::Ui) {
+    let width = BAND_ARROW_RULE * 2.0 + BAND_ARROW_GAP * 2.0 + ARROW_MARK;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, BAND_TILE), egui::Sense::hover());
+    let middle = rect.center().y;
+    let painter = ui.painter();
+    for left in [rect.left(), rect.right() - BAND_ARROW_RULE] {
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(left, middle - 0.5),
+                egui::vec2(BAND_ARROW_RULE, 1.0),
+            ),
+            CornerRadius::ZERO,
+            theme::BORDER,
+        );
+    }
+    // 4a's `M5 12h14` and `M13 6l6 6-6 6` in a 24-unit box, at `ARROW_MARK`.
+    let mark = egui::Rect::from_center_size(
+        egui::pos2(rect.center().x, middle),
+        egui::Vec2::splat(ARROW_MARK),
+    );
+    let unit = ARROW_MARK / 24.0;
+    let stroke = egui::Stroke::new(2.0 * unit, theme::TEXT_GHOST);
+    let at = |x: f32, y: f32| egui::pos2(mark.left() + x * unit, mark.top() + y * unit);
+    painter.line_segment([at(5.0, 12.0), at(19.0, 12.0)], stroke);
+    painter.add(egui::Shape::line(
+        vec![at(13.0, 6.0), at(19.0, 12.0), at(13.0, 18.0)],
+        stroke,
+    ));
+}
+
+/// The arrow mark's own box: 4a's `<svg width="16" height="16">`.
+const ARROW_MARK: f32 = 16.0;
+
+/// 4a's amber notice at the far end of the band: `padding: 7px 12px;
+/// border-radius: 8px; background: #fef6e7; border: 1px solid #f2d99b`, a
+/// 15-point mark, and the sentence in 12px `#7a4f05`.
+///
+/// Not `theme::form_card_caution`, which is 5a's full-bleed BAND in the danger
+/// palette: this is a pill inside a row, in the caution one.
+fn band_caution(ui: &mut egui::Ui, text: &str) {
+    let fill = ui.painter().add(egui::Shape::Noop);
+    let laid = egui::Frame::new()
+        .inner_margin(Margin::symmetric(12, 7))
+        .show(ui, |ui| {
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let (mark, _) =
+                    ui.allocate_exact_size(egui::Vec2::splat(15.0), egui::Sense::hover());
+                theme::paint_warning_glyph(ui.painter(), mark, theme::CAUTION_MARK);
+                ui.label(RichText::new(text).size(12.0).color(theme::CAUTION_INK));
+            });
+        });
+    ui.painter().set(
+        fill,
+        egui::epaint::RectShape::new(
+            laid.response.rect,
+            CornerRadius::same(8),
+            theme::CAUTION_WASH,
+            egui::Stroke::new(1.0, theme::CAUTION_EDGE),
+            egui::StrokeKind::Inside,
+        ),
+    );
 }
 
 /// 4a's middle column: the sequence, in whichever of its two views is up, and
