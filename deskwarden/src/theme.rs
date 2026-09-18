@@ -6841,6 +6841,27 @@ pub fn face_ink_middle(ui: &Ui, font: &FontId) -> f32 {
     ink_middle_of(&probe)
 }
 
+/// **How far above a box's geometric centre egui puts a face's ink** when it
+/// centres a galley in that box -- which is what `Ui::horizontal`, every
+/// `Button` and every `Label` in this app do.
+///
+/// A galley is centred by its BOX, and a face inks only the upper part of that
+/// box, so the ink lands `row_height / 2 - face_ink_middle` above the middle.
+/// For this app's 12-point proportional face that is one point, and one point
+/// is visible: a hand-painted run centred on the geometric middle sits a point
+/// below the caption and the button beside it, which is what the owner saw
+/// across a row of chips and called "not aligned vertically".
+///
+/// So a caller painting its own run asks for this and subtracts it, and its run
+/// lands on the line egui would have put it on. The alternative -- moving the
+/// BUTTONS to meet the hand-painted run -- is the wrong way round: they agree
+/// with every caption, label and menu item in the program, and the hand-painted
+/// run is the newcomer.
+pub fn line_lift(ui: &Ui, font: &FontId) -> f32 {
+    let row = ui.ctx().fonts_mut(|f| f.row_height(font));
+    row / 2.0 - face_ink_middle(ui, font)
+}
+
 pub fn ink_middle_of(galley: &egui::Galley) -> f32 {
     let mut top = f32::INFINITY;
     let mut bottom = f32::NEG_INFINITY;

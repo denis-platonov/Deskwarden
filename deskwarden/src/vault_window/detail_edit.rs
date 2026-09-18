@@ -5717,6 +5717,12 @@ fn chip_height(ui: &egui::Ui) -> f32 {
     tallest + STEP_CHIP_PAD_Y * 2.0
 }
 
+/// The face the row's own runs are set in -- its caption and its button --
+/// and therefore the face whose line the chips have to land on.
+fn chip_row_font() -> egui::FontId {
+    egui::FontId::new(STEP_CHIP_TOTAL_PX, egui::FontFamily::Proportional)
+}
+
 /// One of 8a's chips, at the row's shared [`chip_height`].
 pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone, height: f32) {
     let (family, fill, edge, ink) = chip_palette(tone);
@@ -5731,15 +5737,22 @@ pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone, heigh
         egui::Stroke::new(1.0, edge),
         egui::StrokeKind::Inside,
     );
-    // **The FACE's ink centred in the pill**, not the galley box and not this
-    // particular word's ink -- the same rule the app row's executable chip
-    // arrived at, and for the same two reasons: a box is ascent plus descent
-    // and two faces divide that differently, and a line that moves with the
-    // letters on it is not a line. See `theme::face_ink_middle`.
+    // **The FACE's ink on the ROW's line**, not the galley box, not this
+    // particular word's ink, and not the pill's geometric middle.
+    //
+    // `face_ink_middle` is what puts a mono `250 ms` and a semibold `Username`
+    // on one line with each other -- a box is ascent plus descent and two
+    // faces divide that differently. `line_lift` is what puts that line where
+    // the REST of the row already is: egui centres a galley by its box, and a
+    // face inks the upper part of that box, so everything egui lays sits a
+    // point above the geometric middle. Face-centred alone, the pills sat a
+    // point below the caption and the button beside them -- the owner: "check
+    // elements they feel like not aligned vertically".
     ui.painter().galley(
         egui::pos2(
             rect.left() + STEP_CHIP_PAD_X,
-            rect.center().y - theme::face_ink_middle(ui, &font),
+            rect.center().y - theme::face_ink_middle(ui, &font)
+                - theme::line_lift(ui, &chip_row_font()),
         ),
         galley,
         ink,
@@ -27677,6 +27690,49 @@ mod edit_pane_layout_tests {
                 other
             );
         }
+        // **And the pills sit on the ROW's line**, not a point below it.
+        //
+        // egui centres a galley by its BOX and a face inks the upper part of
+        // that box, so every caption, label and button in this program lands a
+        // point above the geometric middle. A hand-painted run centred on that
+        // middle is a point low -- which is what the owner saw here: "check
+        // elements they feel like not aligned vertically". Asserted against
+        // the caption and the button on the SAME row, because what matters is
+        // that the row reads as one line and not what the number is.
+        // **FACE lines, not ink middles.** The runs on this row are different
+        // words in three faces, and an ink middle moves with the letters in it
+        // -- `Sequence` has a `q` and `Tab` has nothing below the baseline, so
+        // two runs perfectly on one line have ink middles a point apart. What
+        // has to agree is where each FACE's line falls. See
+        // `theme::face_ink_middle`.
+        let line_of = |run: &str, font: egui::FontId| -> f32 {
+            let top = painted
+                .rects_of(run)
+                .last()
+                .copied()
+                .unwrap_or_else(|| panic!("no {run:?} on the row"))
+                .top();
+            let mut middle = 0.0;
+            let _ = ctx.run_ui(raw_input(pane, &[]), |ui| {
+                middle = theme::face_ink_middle(ui, &font);
+            });
+            top + middle
+        };
+        let caption_line = line_of(
+            SEQUENCE_ROW_LABEL,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        );
+        let mono = egui::FontId::new(STEP_CHIP_PX, egui::FontFamily::Monospace);
+        let semi =
+            egui::FontId::new(STEP_CHIP_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+        for (run, font) in [("Username", semi), ("Tab", mono.clone()), ("250 ms", mono)] {
+            let pill = line_of(run, font);
+            assert!(
+                (pill - caption_line).abs() <= 0.5,
+                "the {run:?} pill's line is {pill} and the row's caption sits on                  {caption_line} -- the row does not read as one line"
+            );
+        }
+
         // ...and they are PILLS, not boxes hugging their letters: the owner's
         // "Pills should be higher as per design". Asserted against the run
         // inside, so this is about the padding rather than about a number that
