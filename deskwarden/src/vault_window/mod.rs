@@ -536,7 +536,24 @@ enum DetailMode {
     /// has nothing to draw when nothing is selected. What it borrows from the
     /// two screens is only the LAYOUT -- it takes the item list's column as
     /// well as the pane's, because 4a is three columns and the pane is one.
-    Sequence(sequence_builder::SequenceDraft),
+    ///
+    /// **The second field is the edit form this screen was opened from**, or
+    /// `None` when it was opened from the read pane. 4a is reachable both
+    /// ways, and the two are not the same trip:
+    ///
+    /// * From the READ pane it is the only thing being edited, so its Save
+    ///   writes the binding to the vault and both its answers go back to Read.
+    /// * From the EDIT form it is one card of a form that is mid-edit, so its
+    ///   Save hands the sequence back to that form -- which still owns the
+    ///   write, and may be holding a dozen other unsaved changes -- and both
+    ///   answers go back to it. Parking the draft here rather than leaving it
+    ///   in `mode` is what keeps those changes: `mode` holds one thing at a
+    ///   time, and the alternative is to save the form for the user, which is
+    ///   a Save they did not ask for.
+    ///
+    /// Boxed because `EditDraft` is the largest thing this enum can carry and
+    /// every `DetailMode` in the program would otherwise be that size.
+    Sequence(sequence_builder::SequenceDraft, Option<Box<EditDraft>>),
 }
 
 /// One result from the background favicon loader: which item it was for,
@@ -3301,7 +3318,7 @@ pub fn build_frame_with_search(
         // the measurements -- and the pane alone is 298pt at the app's minimum
         // size, which is the whole reason this screen exists rather than
         // another block inside the edit form.
-        let on_sequence = matches!(mode, DetailMode::Sequence(_));
+        let on_sequence = matches!(mode, DetailMode::Sequence(..));
         let detail_pane_width = if show_sends || on_health || on_sequence {
             0.0
         } else {
@@ -4712,7 +4729,9 @@ pub fn build_frame_with_search(
                                             .unwrap_or_default(),
                                         &name,
                                     ) {
-                                        mode = DetailMode::Sequence(draft);
+                                        // No parked form: this is the read
+                                        // pane's route in. See the variant.
+                                        mode = DetailMode::Sequence(draft, None);
                                     } else {
                                         // Unreachable from the pane, which
                                         // draws no such control on an unbound
@@ -5481,6 +5500,76 @@ pub fn build_frame_with_search(
                                     draft.app.as_ref().map(|a| a.sequence.clone()).unwrap_or_default();
                                 generate_error = crate::scratch_window::rehearsal_notice(&sequence);
                             }
+                            // **4a, opened from the `Fill rule` card.** The
+                            // form is PARKED rather than saved or dropped:
+                            // whatever else the user has changed on it is
+                            // still theirs when the screen closes. See
+                            // `DetailMode::Sequence`.
+                            //
+                            // Seeded with the sequence the FORM holds, not the
+                            // one the item stores -- see
+                            // `SequenceDraft::continuing`. The two differ
+                            // exactly when the form has already changed the
+                            // rule, which is when getting this wrong would be
+                            // most visible.
+                            //
+                            // Nothing happens when the builder cannot be built
+                            // for this item: the card offers the control only
+                            // on a saved item with a parsed binding, so this is
+                            // the same unreachable shape the read pane's own
+                            // route logs, and it is logged the same way.
+                            EditAction::OpenSequenceBuilder => {
+                                let opened = selected_item.as_ref().and_then(|item| {
+                                    let name = crate::vault_bridge::extract_app_match(item)
+                                        .map(|m| {
+                                            let label = app_identities.label(
+                                                ui.ctx(),
+                                                detail::app_name_lookup_path(&m),
+                                                &m.process,
+                                            );
+                                            label.name.to_string()
+                                        })
+                                        .unwrap_or_default();
+                                    sequence_builder::SequenceDraft::for_item(
+                                        item,
+                                        sidebar::folder_name(
+                                            &folders,
+                                            item.folder_id.as_deref(),
+                                        )
+                                        .unwrap_or_default(),
+                                        &name,
+                                    )
+                                });
+                                match opened {
+                                    Some(builder) => {
+                                        let sequence = draft
+                                            .app
+                                            .as_ref()
+                                            .map(|app| app.sequence.clone())
+                                            .unwrap_or_default();
+                                        // **Cloned, not swapped out.** A
+                                        // `mem::replace` would want a
+                                        // throwaway `EditDraft` to leave
+                                        // behind, and the only constructor
+                                        // that makes one is `empty()` --
+                                        // which `the_kindless_constructor_
+                                        // survives_only_on_the_ctrl_n_path`
+                                        // pins to exactly one production use,
+                                        // for a good reason of its own. The
+                                        // original is dropped by the
+                                        // assignment on the next line.
+                                        let parked = draft.clone();
+                                        mode = DetailMode::Sequence(
+                                            builder.continuing(&sequence),
+                                            Some(Box::new(parked)),
+                                        );
+                                    }
+                                    None => log::warn!(
+                                        "the edit form asked for the sequence builder on an \
+                                         item with no parsed binding"
+                                    ),
+                                }
+                            }
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
@@ -5489,7 +5578,7 @@ pub fn build_frame_with_search(
                     // whole: `on_sequence` above zeroed the detail pane's
                     // width and kept the item list undrawn, so the three
                     // columns 4a asks for really are on screen.
-                    DetailMode::Sequence(draft) => {
+                    DetailMode::Sequence(draft, parked) => {
                         detail::forget_copy_toast(ui.ctx());
                         // The item's own fields, not a draft's: this screen
                         // edits the sequence and nothing else, so the values a
@@ -5518,6 +5607,21 @@ pub fn build_frame_with_search(
                         match sequence_builder::draw_sequence_builder(
                             ui, draft, &palette, &source,
                         ) {
+                            // **Opened from the edit form, this Save writes
+                            // nothing to the vault.** It hands the sequence
+                            // back to the form, which is still holding
+                            // whatever else the user has changed and still
+                            // owns the write. Writing here would be a Save of
+                            // the whole record that nobody asked for.
+                            sequence_builder::BuilderAction::Save if parked.is_some() => {
+                                let sequence = draft.sequence.clone();
+                                if let Some(mut form) = parked.take() {
+                                    if let Some(app) = form.app.as_mut() {
+                                        app.sequence = sequence;
+                                    }
+                                    mode = DetailMode::Edit(*form);
+                                }
+                            }
                             sequence_builder::BuilderAction::Save => {
                                 // The binding with ONE field replaced -- see
                                 // `SequenceDraft::saved`. Read before the
@@ -5573,7 +5677,14 @@ pub fn build_frame_with_search(
                                     crate::scratch_window::rehearsal_notice(&draft.sequence);
                             }
                             sequence_builder::BuilderAction::Discard => {
-                                mode = DetailMode::Read;
+                                // Back to whoever opened it, with the form's
+                                // own changes untouched -- Discard is about
+                                // this screen's sequence and says nothing
+                                // about the rest of the record.
+                                mode = match parked.take() {
+                                    Some(form) => DetailMode::Edit(*form),
+                                    None => DetailMode::Read,
+                                };
                             }
                             sequence_builder::BuilderAction::None => {}
                         }
@@ -5700,6 +5811,15 @@ pub fn build_frame_with_search(
                             // cannot be silently ignored by the other.
                             EditAction::Rehearse => log::warn!(
                                 "the create form asked to rehearse a sequence it does not draw"
+                            ),
+                            // Unreachable by construction: 4a is built by
+                            // `SequenceDraft::for_item` and a create has no
+                            // item, which is exactly why the `Fill rule` card
+                            // keeps its inline editor in this mode rather than
+                            // offering this control. See `app_sequence_block`.
+                            EditAction::OpenSequenceBuilder => log::warn!(
+                                "the create form asked for the sequence builder before the \
+                                 item exists"
                             ),
                             // Unreachable, for a reason of the same shape: the
                             // pencil badge's menu is `item_list::icon_menu`
@@ -26460,13 +26580,17 @@ mod copy_toast_wiring_tests {
     // pulls this module in too.
     const CLEARS: &str = concat!("detail::forget_copy_toast", "(ui.ctx());");
 
-    /// **4a's screen is the fourth route back into the read pane.** Discard
-    /// and a successful Save both put `DetailMode::Read` back, so a copy
-    /// confirmation left standing when the builder opened would reappear over
-    /// the pane the user returns to -- which is the whole of what this test is
-    /// about, and the reason a new mode has to join the list rather than be
-    /// excused from it.
-    const SEQUENCE: &str = concat!("DetailMode::Sequence(draft)", " => {");
+    /// **4a's screen is the fourth route back into the read pane.** Opened
+    /// from the read pane, Discard and a successful Save both put
+    /// `DetailMode::Read` back -- so a copy confirmation left standing when
+    /// the builder opened would reappear over the pane the user returns to,
+    /// which is the whole of what this test is about and the reason a new mode
+    /// has to join the list rather than be excused from it.
+    ///
+    /// Opened from the EDIT form the two answers go back to that form instead,
+    /// and the clearing matters just as much: the form is the other surface
+    /// this toast can be left standing over.
+    const SEQUENCE: &str = concat!("DetailMode::Sequence(draft, parked)", " => {");
     const EDIT: &str = concat!("DetailMode::Edit", "(draft) => {");
     const CREATE: &str = concat!("DetailMode::Create", "(draft) => {");
     /// The no-selection branch's anchor.

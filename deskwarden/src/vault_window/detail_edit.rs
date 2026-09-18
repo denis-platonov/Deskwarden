@@ -4307,6 +4307,25 @@ pub enum EditAction {
     /// Behind the same re-prompt, against the same item, as every other copy
     /// on either pane.
     CopyPasswordHistory(usize),
+    /// **The `Fill rule` card's `Change what it types\u{2026}`, on a saved
+    /// item.**
+    ///
+    /// Design 4a is a SCREEN -- three columns, a checks rail, a timing strip --
+    /// and this form is one narrow pane. It used to expand a small copy of the
+    /// builder inside the card, which meant two editors for one rule that had
+    /// to be kept saying the same thing; this hands the job to the real one.
+    ///
+    /// Carries nothing: the window holds the item, and
+    /// `sequence_builder::SequenceDraft::for_item` needs the item rather than
+    /// anything this form could pass. What the form DOES contribute is the
+    /// sequence it is currently holding, which the window seeds through
+    /// `SequenceDraft::continuing` -- see it for why the vault's copy would be
+    /// the wrong starting point.
+    ///
+    /// **Only on a saved item.** A create has no item for the builder to be
+    /// about, so the card keeps its inline editor in that mode; see
+    /// `app_sequence_block`.
+    OpenSequenceBuilder,
     /// **The `One-time code` card's `Add` or `Replace by scanning`.**
     ///
     /// Both raise this and the window answers both the same way: it opens
@@ -7471,10 +7490,12 @@ fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
 fn app_sequence_block(
     ui: &mut egui::Ui,
     app: &mut AppMatchDraft,
+    creating: bool,
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
 ) -> Option<EditAction> {
     theme::field_label(ui, APP_SEQUENCE_LABEL);
+    let mut opened = None;
     let view = sequence_view(&app.sequence);
 
     // **Above the fold, and before the block splits.** A sequence that the
@@ -7498,10 +7519,30 @@ fn app_sequence_block(
         );
         ui.add_space(4.0);
         if theme::secondary_button(ui, APP_SEQUENCE_OPEN).clicked() {
-            app.sequence_open = true;
+            // **On a saved item this opens design 4a's own screen**, and the
+            // block below is not drawn at all.
+            //
+            // The rule is one thing and had two editors: a three-column screen
+            // with a checks rail and a timing strip, and a small copy of it
+            // folded into this card. Two editors for one value is two places
+            // to fix a bug in and two chances for them to drift about what a
+            // step is -- so the card hands the job to the screen and keeps
+            // only what it is good at, which is saying in one line what will
+            // be typed.
+            //
+            // **A CREATE keeps the inline editor**, because the screen is
+            // built by `SequenceDraft::for_item` and a create has no item to
+            // build it from. The same rule this form applies to every other
+            // row that needs a saved record, and the reason the block below
+            // is still here rather than deleted.
+            if creating {
+                app.sequence_open = true;
+            } else {
+                opened = Some(EditAction::OpenSequenceBuilder);
+            }
         }
         ui.add_space(10.0);
-        return None;
+        return opened;
     }
 
     ui.label(RichText::new(APP_SEQUENCE_HINT).size(11.0).color(theme::TEXT_FAINT));
@@ -11056,7 +11097,9 @@ pub fn draw_detail_edit(
             if offers_autofill(kind) && draft.app.as_ref().is_some_and(|app| app.bound) {
                 section(ui, kind, Section::FillRule, changed(Section::FillRule), wanted, |ui| {
                     if let Some(app) = draft.app.as_mut() {
-                        if let Some(requested) = app_sequence_block(ui, app, &palette, &source) {
+                        if let Some(requested) =
+                            app_sequence_block(ui, app, creating, &palette, &source)
+                        {
                             action = requested;
                         }
                     }
@@ -17684,7 +17727,15 @@ mod sequence_builder_tests {
         ]
     }
 
-    /// Opens the builder, and answers with the frame drawn after it opened.
+    /// Opens the inline builder, and answers with the frame drawn after it
+    /// opened.
+    ///
+    /// **The flag, not the button.** `Change what it types...` opens design
+    /// 4a's own screen on a saved item and this inline block only on a CREATE,
+    /// where the screen cannot be built -- so a click here would be a test of
+    /// the door rather than of the block, and on the saved fixture every test
+    /// below uses it would open nothing at all. The door's two behaviours are
+    /// `the_fill_rule_cards_button_opens_the_screen_on_a_saved_item`'s.
     fn open_builder(
         ctx: &egui::Context,
         pane: Vec2,
@@ -17692,11 +17743,101 @@ mod sequence_builder_tests {
         item: &VaultItem,
         totp: &detail::TotpState,
     ) -> Painted {
-        let shut = frame(ctx, pane, draft, item, totp, &[]);
-        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
-        let _ = frame(ctx, pane, draft, item, totp, &click(at));
-        assert!(draft.app.as_ref().unwrap().sequence_open, "the builder did not open");
+        draft.app.as_mut().expect("the fixture is bound").sequence_open = true;
         frame(ctx, pane, draft, item, totp, &[])
+    }
+
+    /// [`frame_action`] in CREATE mode.
+    ///
+    /// The one thing the `Fill rule` card does differently in the two modes is
+    /// which editor its button opens, so a test of that needs both -- and
+    /// `frame_action` passes `creating: false` because every other test in
+    /// this module is about a saved record.
+    fn creating_frame_action(
+        ctx: &egui::Context,
+        pane: Vec2,
+        draft: &mut EditDraft,
+        totp: &detail::TotpState,
+        events: &[egui::Event],
+    ) -> (EditAction, Painted) {
+        let mut apps = AppIdentityCache::default();
+        let mut action = EditAction::None;
+        let output = ctx.run_ui(raw_input(pane, events), |ui| {
+            action = draw_detail_edit(
+                ui,
+                draft,
+                &[],
+                true,
+                &mut apps,
+                None,
+                0,
+                &crate::rest::organizations::Audience::Personal,
+                totp,
+                None,
+            );
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut painted);
+        }
+        (action, painted)
+    }
+
+    /// **The `Fill rule` card's button opens design 4a's SCREEN on a saved
+    /// item, and the inline block only on a create.**
+    ///
+    /// The rule is one thing and had two editors: 4a -- three columns, a
+    /// checks rail, a timing strip -- and a small copy of it folded into this
+    /// card. Two editors for one value is two places to fix a bug in and two
+    /// chances for them to drift about what a step is. The card hands the job
+    /// to the screen.
+    ///
+    /// **The create keeps the inline one, and that is not a compromise**:
+    /// `sequence_builder::SequenceDraft::for_item` builds the screen from an
+    /// ITEM, and a create has none. It is the same rule this form applies to
+    /// every other row that needs a saved record.
+    ///
+    /// Both arms in one test, because the difference between them IS the
+    /// behaviour -- and each is the other's control: a build that always
+    /// opened the screen, or always expanded the block, fails one half.
+    #[test]
+    fn the_fill_rule_cards_button_opens_the_screen_on_a_saved_item() {
+        let item = item();
+        let totp = detail::TotpState::NoSecret;
+
+        // -- saved: the button asks the window for 4a ---------------------
+        let ctx = styled_context(PANE);
+        let mut saved = draft_for(&item, "");
+        let shut = frame(&ctx, PANE, &mut saved, &item, &totp, &[]);
+        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
+        let (action, _) = frame_action(&ctx, PANE, &mut saved, &item, &totp, &click(at));
+        assert_eq!(
+            action,
+            EditAction::OpenSequenceBuilder,
+            "the card's button did not ask for the builder screen"
+        );
+        assert!(
+            !saved.app.as_ref().expect("the fixture is bound").sequence_open,
+            "the card expanded its inline editor as well, so the rule has two editors open \
+             at once"
+        );
+
+        // -- creating: there is no item, so the block opens in place -------
+        let creating_ctx = styled_context(PANE);
+        let mut creating = draft_for(&item, "");
+        let shut = creating_frame_action(&creating_ctx, PANE, &mut creating, &totp, &[]).1;
+        let at = shut.rect_of(APP_SEQUENCE_OPEN).center();
+        let (action, _) =
+            creating_frame_action(&creating_ctx, PANE, &mut creating, &totp, &click(at));
+        assert_eq!(
+            action,
+            EditAction::None,
+            "a create asked for a screen that cannot be built before the item exists"
+        );
+        assert!(
+            creating.app.as_ref().expect("the fixture is bound").sequence_open,
+            "a create's button opened nothing at all"
+        );
     }
 
     /// **4d's way in.** Mutation this catches: delete the button, or drop the

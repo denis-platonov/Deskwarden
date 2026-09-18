@@ -461,6 +461,25 @@ impl SequenceDraft {
         })
     }
 
+    /// **Starts this draft from the sequence the EDIT FORM is holding**,
+    /// rather than from the one the item stores.
+    ///
+    /// The two differ whenever the form has been open long enough to change
+    /// the rule and has not been saved -- and the builder opened from that
+    /// form has to continue the user's work, not reach behind it for the
+    /// vault's copy. `original` moves with it, so the screen opens reporting
+    /// no unsaved change of its own: what is unsaved belongs to the form the
+    /// user came from and will be saved by it.
+    ///
+    /// Consuming, so a caller cannot build one and forget to seed it.
+    #[must_use]
+    pub fn continuing(mut self, sequence: &str) -> Self {
+        self.sequence = sequence.to_string();
+        self.original = self.sequence.clone();
+        self.template_draft = self.sequence.clone();
+        self
+    }
+
     /// Whether the sequence has moved off what the item stores.
     pub fn changed(&self) -> bool {
         self.sequence != self.original
