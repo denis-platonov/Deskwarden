@@ -19938,6 +19938,15 @@ mod edit_pane_layout_tests {
         /// and not when they share a baseline. See `theme::ink_middle_of`,
         /// which records the two wrong answers that were tried first.
         ink_middles: Vec<(String, egui::FontId, f32)>,
+
+        /// Every run's INK and the CLIP RECT it was painted under.
+        ///
+        /// What says whether a glyph the layout placed is actually on the
+        /// glass: egui emits a run's shapes whatever its clip rect, so a
+        /// descender sliced off at the bottom of a box looks identical in
+        /// `texts` to one with room to spare. See
+        /// `no_field_in_this_form_cuts_the_tail_off_its_own_text`.
+        clipped_ink: Vec<(String, Rect, Rect)>,
         /// The FACE each run was laid out in, by run text.
         ///
         /// Neither `texts` nor `glyphs` can see a font: both answer in
@@ -20199,6 +20208,14 @@ mod edit_pane_layout_tests {
                             text.galley.text().to_string(),
                             section.format.font_id.clone(),
                             (top + bottom) / 2.0,
+                        ));
+                        painted.clipped_ink.push((
+                            text.galley.text().to_string(),
+                            Rect::from_min_max(
+                                Pos2::new(text.pos.x, top),
+                                Pos2::new(text.pos.x + text.galley.size().x, bottom),
+                            ),
+                            clip,
                         ));
                     }
                 }
@@ -27102,6 +27119,64 @@ mod edit_pane_layout_tests {
             "the form over a secure note still says {:?}",
             Section::Autofill.note(ItemKind::Login)
         );
+    }
+
+    /// **No field in this form cuts the tail off its own text.**
+    ///
+    /// `theme::field_box` sets a box's line height to the face's ASCENT, which
+    /// is what makes the caret the height of the letters and the run sit
+    /// optically centred -- and `ui.put` clips a `TextEdit` to the rect it is
+    /// given, so a rect one ascent tall ends AT the baseline and slices the
+    /// tail off every `g`, `p`, `y` and `j`. Barely visible in a 14-point row;
+    /// unmistakable in the edit band's 20-point name. The owner, with `Apple`
+    /// in it: "title cut off from the bottom".
+    ///
+    /// **Asked of the clip rect and not of the glyph positions**, which is the
+    /// only way to see this at all: egui emits a run's shapes whatever its clip
+    /// rect, so a sliced descender and a whole one are the same `texts` entry.
+    ///
+    /// Every box on the form at once, with a descender put in each of the ones
+    /// this test can fill -- the name, the username, a website -- because the
+    /// rule belongs to `field_box` and so does the defect: the name is where it
+    /// showed, not where it lived.
+    #[test]
+    fn no_field_in_this_form_cuts_the_tail_off_its_own_text() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        // A descender in every box this test can reach.
+        draft.name = "Apple".to_string();
+        draft.username = "peggy@example.com".to_string();
+        draft.uris[0].uri = "https://apply.example.com".to_string();
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        let mut checked = 0;
+        for run in ["Apple", "peggy@example.com", "https://apply.example.com"] {
+            let (_, ink, clip) = painted
+                .clipped_ink
+                .iter()
+                .find(|(text, _, _)| text == run)
+                .unwrap_or_else(|| panic!("{run:?} was not painted at all: {:?}", painted.strings()));
+            checked += 1;
+            assert!(
+                ink.bottom() <= clip.bottom() + 0.01,
+                "{run:?} inks down to y = {} under a clip rect that ends at {} -- the tail of                  its descenders is cut off",
+                ink.bottom(),
+                clip.bottom()
+            );
+            // ...and the top, which is the same mistake mirrored: a rect hung
+            // from the baseline rather than reaching up to the ascender.
+            assert!(
+                ink.top() >= clip.top() - 0.01,
+                "{run:?} inks up to y = {} under a clip rect that starts at {}",
+                ink.top(),
+                clip.top()
+            );
+        }
+        assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
     }
 
     /// **The runs on a link row do not touch.**

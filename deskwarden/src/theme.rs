@@ -6124,6 +6124,87 @@ pub fn search_field(
 ///
 /// Measured from the face rather than assumed: a ratio written out here
 /// would be one face's, and this app bundles four.
+/// A run reaching as high and as low as this app's text goes: a capital, an
+/// x-height letter, and every descender the Latin alphabet has.
+///
+/// Both ends matter. A probe of capitals alone would measure a line box that
+/// clips every `g`, and one of descenders alone would put the optical middle
+/// below where a sentence really sits.
+const INK_PROBE: &str = "Xxgpqyj";
+
+/// **How far a face's INK reaches below the top of a line box of
+/// `line_height`** -- the height a rectangle must have if it is to hold that
+/// face's deepest descender without cutting it.
+///
+/// Every number one might reason to instead of measuring this comes up short,
+/// and each was tried: the ascent ends AT the baseline; `row_height` is the
+/// declared line box and Archivo ExtraBold at 20 points inks a quarter-point
+/// past it; and ascent-plus-descent is wrong by a different amount again,
+/// because a row given a custom `line_height` does not put its baseline where
+/// the same face's default row does. The owner watched two of those go by:
+/// "title cut off from the bottom".
+///
+/// So the probe is laid exactly as the caller will lay its own run -- same
+/// face, same `line_height` -- and the deepest ink in it is measured.
+/// `Glyph::pos` is the baseline and `uv_rect.offset` / `uv_rect.size` are the
+/// drawn box in points, so this is what the rasteriser will really put on the
+/// glass. Glyphs that draw nothing are skipped.
+///
+/// Never less than `line_height`: a face with no descenders at all still needs
+/// its own line box.
+pub fn ink_depth_of(ctx: &egui::Context, font: &FontId, line_height: f32) -> f32 {
+    face_ink_at(ctx, font, line_height).1.max(line_height)
+}
+
+/// **Where a face's ink sits vertically in a line box of `line_height`**, as a
+/// distance from the row's top -- the number a caller places a box by if it
+/// wants that face optically centred rather than box-centred.
+///
+/// Measured off the same probe as [`ink_depth_of`] and for the same reason: a
+/// row given a custom `line_height` does not put its baseline where the face's
+/// default row does, so nothing here can be reasoned to from the metrics.
+pub fn line_ink_middle(ctx: &egui::Context, font: &FontId, line_height: f32) -> f32 {
+    let (top, bottom) = face_ink_at(ctx, font, line_height);
+    (top + bottom) / 2.0
+}
+
+/// The top and the bottom of [`INK_PROBE`]'s ink in a line box of
+/// `line_height`, both as distances from the row's top.
+///
+/// One probe, laid once, because [`ink_depth_of`] and [`line_ink_middle`] are
+/// two questions about the same measurement and a caller asking both must not
+/// be able to get answers from two different layouts.
+fn face_ink_at(ctx: &egui::Context, font: &FontId, line_height: f32) -> (f32, f32) {
+    ctx.fonts_mut(|f| {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap = egui::text::TextWrapping::no_max_width();
+        job.append(
+            INK_PROBE,
+            0.0,
+            egui::TextFormat {
+                line_height: Some(line_height),
+                font_id: font.clone(),
+                color: Color32::BLACK,
+                ..Default::default()
+            },
+        );
+        let galley = f.layout_job(job);
+        let mut top = f32::INFINITY;
+        let mut bottom = f32::NEG_INFINITY;
+        for row in &galley.rows {
+            for glyph in &row.glyphs {
+                if glyph.uv_rect.is_nothing() {
+                    continue;
+                }
+                let at = row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+                top = top.min(at);
+                bottom = bottom.max(at + glyph.uv_rect.size.y);
+            }
+        }
+        if top.is_finite() { (top, bottom) } else { (0.0, line_height) }
+    })
+}
+
 pub fn ascent_of(ctx: &egui::Context, font: &FontId) -> f32 {
     ctx.fonts_mut(|f| {
         let galley = f.layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
@@ -6210,11 +6291,19 @@ pub fn ink_drop(ctx: &egui::Context, font: &FontId, line_height: Option<f32>) ->
 // for: the caret then runs from the row's top to `cap` below it, which no
 // longer straddles the text at all.
 //
-// So the line stays the ascent, which is already this module's answer to the
-// same complaint one size down -- see `field_box`, where cutting the full row
-// (ascent plus descent) to the ascent is what fixed "cursor is huge". The
-// remaining overshoot is the accent band the face reserves, and it is the
-// price of egui tying the two together.
+// **And the clip rect is not the caller's anyway**, which is the correction
+// this note needed later. `TextEdit` clips to the rect its own GALLEY occupies
+// -- `text_clip_rect = inner_rect`, expanded by a point for the caret -- and
+// not to the rect `ui.put` hands it, so the line box is the only dial there
+// is. A line box of the bare ascent ends AT the baseline and slices the tail
+// off every `g`, `p`, `y` and `j`; the owner, with `Apple` in the 20-point
+// name box, "title cut off from the bottom".
+//
+// So the line is the ascent plus whatever the face really inks below it,
+// measured rather than reasoned to -- see `field_box` and `ink_depth_of`. The
+// caret straddles the text and reaches a descender's foot, which is what a
+// caret is; it is nothing like the full default row in a 38-point box that
+// "cursor is huge" was about.
 
 /// The character [`ascent_of`] measures.
 ///
@@ -6895,9 +6984,51 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     // is left behind -- see [`ascent_of`], which carries the measurements.
     let font = shape.font.clone();
     let ascent = ascent_of(ui.ctx(), &font);
-    let inner = Rect::from_center_size(
-        Pos2::new((outer.min.x + 10.0 + outer.max.x - right_pad) / 2.0, outer.center().y),
-        Vec2::new(outer.width() - 10.0 - right_pad, ascent),
+    // **...but the RECT it is put in reaches down past that line, or the
+    // descenders are cut off.**
+    //
+    // `ui.put` clips a `TextEdit` to the rect it is given, and a rect one
+    // ascent tall ends AT the baseline -- so the tail of every `g`, `p`, `y`
+    // and `j` in every box in this app was sliced off at the letter's foot.
+    // Hardly visible in a 14-point row and unmistakable in the edit band's
+    // 20-point name: the owner, with `Apple` in it, "title cut off from the
+    // bottom".
+    //
+    // The line box stays the ascent, which is what the caret is drawn at and
+    // the whole point of the paragraph above. What changes is the rect round
+    // it: one full row of the face, hung from the same top, so the text does
+    // not move by a point and the descender simply has somewhere to land.
+    // **...and the line box is the ascent plus whatever the face really inks
+    // below it, because a rect one ascent tall ends AT the baseline.**
+    //
+    // The tail of every `g`, `p`, `y` and `j` in every box in this app was
+    // being sliced off at the letter's foot. The owner, with `Apple` in the
+    // edit band's 20-point name box: "title cut off from the bottom".
+    //
+    // **And widening the RECT does not fix it**, which is the measurement that
+    // cost the most to find: `TextEdit` clips to the rect its own galley
+    // occupies (`text_clip_rect = inner_rect`, expanded by one point for the
+    // caret), not to the rect `ui.put` hands it. The clip follows the LINE
+    // BOX, so the line box is what has to grow.
+    //
+    // The caret grows with it -- it is drawn at the row's height -- from the
+    // ascent to the ascent plus the descender: 18 to 22 in the 38-point name
+    // box, about 13 to 16 in a 28-point row. That is still a caret plainly
+    // shorter than its box, which is what "cursor is huge" was about back when
+    // a 14-point value in a 38-point field drew one at the full default row.
+    //
+    // Both numbers are MEASURED off a probe laid at this very line height --
+    // see `ink_depth_of` and `line_ink_middle`, which record the three
+    // reasoned-to numbers that each came up short by a different amount.
+    let line = ink_depth_of(ui.ctx(), &font, ascent);
+    // Placed so the FACE's ink is centred in the box: the run sits optically
+    // centred whatever it happens to spell, where box-centring the row would
+    // put it high and centring THIS value's ink would move the box with the
+    // letters in it.
+    let top = outer.center().y - line_ink_middle(ui.ctx(), &font, line);
+    let inner = Rect::from_min_size(
+        Pos2::new(outer.min.x + 10.0, top),
+        Vec2::new(outer.width() - 10.0 - right_pad, line),
     );
     // The face is carried in through a layouter rather than `.font()`, which
     // takes a `FontId` and can express no line height -- the same reason
@@ -6926,7 +7057,7 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
             &shown,
             0.0,
             egui::TextFormat {
-                line_height: Some(ascent),
+                line_height: Some(line),
                 font_id: font.clone(),
                 color: ui.visuals().text_color(),
                 ..Default::default()
