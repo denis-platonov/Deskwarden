@@ -42,7 +42,7 @@ use crate::app_identity::AppIdentityCache;
 use crate::key_sequence::{self, FieldRef, ResolveSource, Token};
 use crate::theme;
 use crate::vault_window::detail_edit::{
-    self, sequence_tally, step_rows, ChipEdit, StepKind, StepRow,
+    self, sequence_tally, step_rows, StepKind, StepRow,
 };
 use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use std::time::Duration;
@@ -82,6 +82,13 @@ pub struct Act {
 
 /// How two tokens of one typing run are joined in an act's label.
 const RUN_JOIN: &str = " + ";
+
+/// A key's name as a keycap or an act's label spells it: a held modifier's
+/// chip label is `Shift+`, with the plus that the chip row reads as "and
+/// then", and a cap that said `Shift+` beside a `+` would say it twice.
+fn key_name(label: &str) -> &str {
+    label.trim_end_matches('+')
+}
 
 /// The acts `sequence` performs, in order.
 ///
@@ -123,7 +130,9 @@ pub fn acts(sequence: &str) -> Vec<Act> {
             Token::Key(_) => {
                 let mut label = String::new();
                 for m in held.drain(..) {
-                    label.push_str(&m);
+                    // `Shift+`, as the chip row spells a held modifier, is
+                    // `Shift` here: the join supplies the plus.
+                    label.push_str(key_name(&m));
                     label.push_str(RUN_JOIN);
                 }
                 label.push_str(&token.chip_label());
@@ -398,6 +407,211 @@ pub fn with_pause_after(sequence: &str, index: usize) -> String {
     key_sequence::render(&tokens)
 }
 
+// ---------------------------------------------------------------------------
+// The steps: what one row of 4a's list is, and how the list is edited
+// ---------------------------------------------------------------------------
+
+/// One row of the builder's list: a span of adjacent tokens the runner
+/// performs as one thing.
+///
+/// **A row is an ACT wherever the tokens make one**, which is what 4a draws:
+/// its first row is `Ctrl` + `A` -- a held modifier and the key it is held
+/// for -- in ONE row with a `+` between the caps. [`acts`] is that grouping:
+/// a run of adjacent text tokens is one act, a key with the modifiers before
+/// it is one, a wait is one. [`detail_edit::step_rows`] is one row per TOKEN,
+/// the grain the edit form's list is drawn at and edits at; this list edits
+/// at the act's grain, so dragging the password step moves
+/// `hello{PASSWORD}world` whole, because that is the one thing the user did
+/// and the one bar the timing strip would draw for it.
+///
+/// **Plus the tokens that are not acts**, each as its own row, because they
+/// are still in the string and still have to be seen, moved and removed: a
+/// `{DELAY=n}` rate change, a grouping character, a construct this build does
+/// not understand, and a modifier with no key directly after it. [`acts`]
+/// leaves those out because the timing strip has no bar for them; a list
+/// that left them out would be editing a string the user cannot see all of.
+/// `the_steps_that_are_acts_are_the_acts` holds the two groupings together
+/// where they overlap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    /// 1-based, as drawn.
+    pub number: usize,
+    pub kind: StepKind,
+    /// The token indices this row spans, contiguous. What a move or a
+    /// removal acts on.
+    pub tokens: std::ops::Range<usize>,
+    /// The token rows in it, in order: what each cap, pill and value is drawn
+    /// from. Never empty.
+    pub rows: Vec<StepRow>,
+    /// Whether any token in it types a secret.
+    pub secret: bool,
+}
+
+impl Step {
+    /// The far cell: the first row's, which on a text run is the rate every
+    /// token in the run types at, and the dash on everything else.
+    pub fn note(&self) -> &str {
+        &self.rows[0].note
+    }
+
+    /// What the row says beside its step: its rows' explanations, the
+    /// distinct ones, joined. A rate's, a secret's, a lone modifier's `held
+    /// for the next key` -- and NOT that one on `Shift + Tab`, where the key
+    /// it is held for is drawn beside it and the sentence would explain what
+    /// the row already shows.
+    pub fn aside(&self) -> String {
+        let mut parts: Vec<&str> = Vec::new();
+        for row in &self.rows {
+            if row.aside.is_empty() || parts.contains(&row.aside.as_str()) {
+                continue;
+            }
+            if self.rows.len() > 1 && row.aside == detail_edit::MODIFIER_NOTE {
+                continue;
+            }
+            parts.push(&row.aside);
+        }
+        parts.join(" \u{b7} ")
+    }
+
+    /// The step in words, for the chip that follows the pointer while it is
+    /// dragged: its rows' labels joined the way [`acts`] joins them.
+    pub fn label(&self) -> String {
+        self.rows.iter().map(|row| key_name(&row.label)).collect::<Vec<_>>().join(RUN_JOIN)
+    }
+
+    /// Whether this build knows every token in it.
+    pub fn understood(&self) -> bool {
+        self.rows.iter().all(|row| row.understood)
+    }
+}
+
+/// Where each of [`steps`]' rows begins and ends in the token list, by kind.
+///
+/// Pure over the tokens, so a move and a removal can find their spans without
+/// the values a drawn row needs.
+pub fn step_spans(tokens: &[Token]) -> Vec<(StepKind, std::ops::Range<usize>)> {
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < tokens.len() {
+        let start = i;
+        let kind = match &tokens[i] {
+            Token::Literal(_) | Token::Field(_) => {
+                while matches!(tokens.get(i), Some(Token::Literal(_) | Token::Field(_))) {
+                    i += 1;
+                }
+                StepKind::Text
+            }
+            Token::Modifier(_) => {
+                // Held for the key that follows, as `acts` holds it: the
+                // modifiers and that key are one row. With no key directly
+                // after them each modifier stands alone, and its row says so.
+                let mut j = i;
+                while matches!(tokens.get(j), Some(Token::Modifier(_))) {
+                    j += 1;
+                }
+                i = if matches!(tokens.get(j), Some(Token::Key(_))) { j + 1 } else { i + 1 };
+                StepKind::Key
+            }
+            Token::Key(_) => {
+                i += 1;
+                StepKind::Key
+            }
+            Token::Delay(_) => {
+                i += 1;
+                StepKind::Wait
+            }
+            Token::DelayRate(_) => {
+                i += 1;
+                StepKind::Rate
+            }
+            Token::Grouping(_) | Token::Unknown(_) => {
+                i += 1;
+                StepKind::Raw
+            }
+        };
+        spans.push((kind, start..i));
+    }
+    spans
+}
+
+/// The list for `sequence`, as drawn. `reveal` is the eye, as in
+/// [`detail_edit::step_rows`], which decides what every row in it says.
+pub fn steps(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Vec<Step> {
+    let rows = step_rows(sequence, source, reveal);
+    let tokens = detail_edit::sequence_view(sequence).tokens;
+    step_spans(&tokens)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (kind, span))| Step {
+            number: index + 1,
+            kind,
+            rows: rows[span.clone()].to_vec(),
+            secret: rows[span.clone()].iter().any(|row| row.secret),
+            tokens: span,
+        })
+        .collect()
+}
+
+/// `sequence` with step `from` moved so that it becomes step `to`, the other
+/// steps keeping their order. Every token in the step's span travels, which
+/// is what makes moving the password step move `hello{PASSWORD}world` whole
+/// and `Shift + Tab` move with its modifier.
+///
+/// **Answers the string AND where the step is in it as re-read**, because
+/// the two are not the same question. Two text steps put side by side become
+/// one -- the runner types adjacent text tokens as one run, so the list
+/// draws one row for them -- and a lone modifier put before a key joins it;
+/// so the list re-read from the answer can be shorter than `to` was counted
+/// against, and a selection that took `to` on trust pointed at the wrong
+/// row (measured: Delete after Alt+Down took the wait away instead of the
+/// key it had just moved). The index is found by rendered character offset
+/// rather than by token index, because re-parsing merges two adjacent
+/// literals into one token and shifts every index after them.
+///
+/// Out of range, or `from == to`, hands the input back UNCHANGED rather
+/// than re-rendered, with `from` -- `detail_edit::sequence_moved`'s rule,
+/// for its reason: a gesture that changes nothing must not re-spell a
+/// sequence this build merely carries.
+pub fn sequence_with_step_moved(sequence: &str, from: usize, to: usize) -> (String, usize) {
+    let tokens = key_sequence::effective_tokens(sequence);
+    let spans = step_spans(&tokens);
+    if from == to || from >= spans.len() || to >= spans.len() {
+        return (sequence.to_string(), from);
+    }
+    let mut order: Vec<usize> = (0..spans.len()).collect();
+    let moved = order.remove(from);
+    order.insert(to, moved);
+    let placed = |steps: &[usize]| -> Vec<Token> {
+        steps.iter().flat_map(|&step| tokens[spans[step].1.clone()].iter().cloned()).collect()
+    };
+    let offset = key_sequence::render(&placed(&order[..to])).len();
+    let stored = detail_edit::store(&placed(&order));
+    // Where that offset falls in the string as it will be read back: the
+    // step whose rendered start is the last at or before it.
+    let read_back = key_sequence::effective_tokens(&stored);
+    let mut at = 0;
+    let mut index = 0;
+    for (i, (_, span)) in step_spans(&read_back).iter().enumerate() {
+        if at > offset {
+            break;
+        }
+        index = i;
+        at += key_sequence::render(&read_back[span.clone()]).len();
+    }
+    (stored, index)
+}
+
+/// `sequence` with step `index` gone, every token of it. Out of range changes
+/// nothing. Taking the last step away stores the empty string, which is the
+/// default again -- `detail_edit::store`'s rule, for its reason.
+pub fn sequence_without_step(sequence: &str, index: usize) -> String {
+    let mut tokens = key_sequence::effective_tokens(sequence);
+    let spans = step_spans(&tokens);
+    let Some((_, span)) = spans.get(index) else { return sequence.to_string() };
+    tokens.drain(span.clone());
+    detail_edit::store(&tokens)
+}
+
 /// The checks' words. 4a's, where 4a has them.
 pub const FIELD_CHANGE_PASS: &str = "A field change happens before the secret is typed.";
 pub const FIELD_CHANGE_CAUTION: &str = "Nothing moves the cursor before the secret is typed.";
@@ -444,6 +658,11 @@ pub struct SequenceDraft {
     pub revealing: bool,
     pub literal_draft: String,
     pub wait_draft: String,
+    /// The step the keyboard acts on, by index into [`steps`]; `None` when
+    /// none is. Set by a click on a row and moved by the arrows -- see
+    /// `step_keys`. Not saved and not compared: a selection is not an edit,
+    /// and [`SequenceDraft::changed`] does not look at it.
+    pub selected: Option<usize>,
 }
 
 impl SequenceDraft {
@@ -471,6 +690,7 @@ impl SequenceDraft {
             revealing: false,
             literal_draft: String::new(),
             wait_draft: DEFAULT_WAIT_SECONDS.to_string(),
+            selected: None,
         })
     }
 
@@ -679,9 +899,6 @@ const STEP_TEXT_PX: f32 = 12.0;
 const STEP_WAIT_PX: f32 = 13.0;
 const STEP_RATE_PX: f32 = 11.0;
 
-/// Between the row's three move-and-remove controls, which 4a does not draw.
-const STEP_CONTROL_GAP: f32 = 6.0;
-
 pub const SCREEN_TITLE: &str = "Fill rule";
 pub const SAVE_LABEL: &str = "Save rule";
 pub const SAVE_BLOCKED_LABEL: &str = "Save (fix the template)";
@@ -794,7 +1011,8 @@ pub fn draw_sequence_builder(
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     destination_band(ui, draft, item_icon, app_icon.as_ref());
-                    ui.add_space(theme::SECTION_GAP);
+                    // No gap: 4a stacks the SEQUENCE band straight under
+                    // the destination band's rule.
                     steps_column(ui, draft, palette, source);
                 });
         },
@@ -924,13 +1142,14 @@ fn destination_band(
                 app.size(ui, ChipsGo::Beside).x,
                 app.size(ui, ChipsGo::Under).x,
             );
-            // 4a's `align-items: center`, which in egui means giving each
-            // line its height before anything is placed on it -- see
-            // [`centred_row`] for the measurement.
+            // Each line at its height before anything is placed on it -- see
+            // [`centred_row`] for the measurement -- and hung from the top,
+            // not centred: see [`hanging_row`] and [`BandSubject::draw`] for
+            // where 4a's `align-items: center` is kept and where it is not.
             match form {
                 BandForm::OneLine(chips_go) => {
                     let height = item.size(ui, ChipsGo::Beside).y.max(app.size(ui, chips_go).y);
-                    centred_row(ui, height, |ui| {
+                    hanging_row(ui, height, |ui| {
                         ui.spacing_mut().item_spacing.x = BAND_GAP;
                         item.draw(ui, ChipsGo::Beside);
                         band_arrow(ui);
@@ -941,7 +1160,7 @@ fn destination_band(
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = BAND_LINE_GAP;
                         item.draw(ui, ChipsGo::Beside);
-                        centred_row(ui, app.size(ui, chips_go).y, |ui| {
+                        hanging_row(ui, app.size(ui, chips_go).y, |ui| {
                             ui.spacing_mut().item_spacing.x = BAND_GAP;
                             band_arrow(ui);
                             app.draw(ui, chips_go);
@@ -1093,79 +1312,148 @@ impl BandSubject<'_> {
         SubjectMetrics { caption, name, beside, under }
     }
 
-    /// What the whole subject lays out as: the tile, its gap, and the column
-    /// beside it, as tall as the taller of the two.
+    /// What the whole subject lays out as: the tile row -- the tile, its gap
+    /// and the column's head, as tall as the taller of the two -- and, when
+    /// the chips have dropped under the name, the chips row hanging under it.
     fn size(&self, ui: &egui::Ui, go: ChipsGo) -> egui::Vec2 {
-        let column = self.metrics(ui, go).column();
-        egui::vec2(BAND_TILE + BAND_TILE_GAP + column.x, BAND_TILE.max(column.y))
+        let metrics = self.metrics(ui, go);
+        let head = metrics.head();
+        let row = egui::vec2(
+            BAND_TILE + BAND_TILE_GAP + head.x.max(metrics.under.x),
+            BAND_TILE.max(head.y),
+        );
+        let under = if metrics.under.y > 0.0 {
+            under_drop(row.y, head.y) + metrics.under.y
+        } else {
+            0.0
+        };
+        egui::vec2(row.x, row.y + under)
     }
 
+    /// **The tile is centred against the column's HEAD -- the caption and the
+    /// name's line -- and the chips hang under the two of them.**
+    ///
+    /// 4a's `align-items: center` centres the whole column on the tile, and
+    /// in 4a the whole column IS the head: 12 + 2 + 17 against a 34-point
+    /// tile, which puts the caption's ink three and a half points under the
+    /// tile's top. The chips-under form has no counterpart in 4a, and
+    /// centring its 50-point column on the tile put the caption's ink SIX
+    /// POINTS ABOVE the tile's top -- measured, `SENDS ONLY TO` at 186..194
+    /// over a tile starting at 192 -- which is the owner's "heading feels too
+    /// high". So the head is what the tile centres against, exactly as in
+    /// 4a, and the chips are a third line under it; the caption lands where
+    /// 4a's does whether or not anything hangs below.
     fn draw(&self, ui: &mut egui::Ui, go: ChipsGo) {
         let metrics = self.metrics(ui, go);
-        let column = metrics.column();
-        let size = egui::vec2(BAND_TILE + BAND_TILE_GAP + column.x, BAND_TILE.max(column.y));
-        // The subject's own row at its own size, and the column inside it at
-        // ITS own size: a `vertical` of unknown height dropped into a centred
-        // row is placed by the height egui guesses for it and grows downward
-        // from there, which is the tile a third of the way up its column
-        // that the probe found (the app's tile at 192..226 against a column
-        // running 192..245).
-        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-            ui.spacing_mut().item_spacing.x = BAND_TILE_GAP;
-            match self.icon {
-                Some(texture) => {
-                    let tile = theme::avatar_artwork_tile(ui, BAND_TILE, self.accent);
-                    theme::avatar_image(ui, tile, texture, self.accent);
-                }
-                None => theme::avatar(ui, &theme::initials(self.name), BAND_TILE, self.accent),
-            }
-            ui.allocate_ui_with_layout(column, egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.spacing_mut().item_spacing.y = BAND_COLUMN_GAP;
-                ui.add(egui::Label::new(self.caption_job()).extend());
-                let line = metrics.line();
-                ui.allocate_ui_with_layout(
-                    line,
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.x = BAND_NAME_GAP;
-                        ui.add(
-                            egui::Label::new(
-                                theme::bold(self.name, BAND_NAME_PX).color(theme::INK),
-                            )
-                            .extend(),
-                        );
-                        match (&self.beside, go) {
-                            (BandBeside::Folder(folder), _) if !folder.is_empty() => {
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(*folder)
-                                            .size(BAND_FOLDER_PX)
-                                            .color(theme::TEXT_FAINT),
-                                    )
-                                    .extend(),
-                                );
-                            }
-                            (BandBeside::Chips(chips), ChipsGo::Beside) => {
-                                for chip in *chips {
-                                    band_chip(ui, chip);
-                                }
-                            }
-                            _ => {}
+        let head = metrics.head();
+        let size = self.size(ui, go);
+        let row_height = BAND_TILE.max(head.y);
+        ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            // The tile row at its own size, and the head inside it at ITS own
+            // size: a `vertical` of unknown height dropped into a centred row
+            // is placed by the height egui guesses for it and grows downward
+            // from there (the tile a third of the way up its column that an
+            // earlier probe found).
+            ui.allocate_ui_with_layout(
+                egui::vec2(size.x, row_height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = BAND_TILE_GAP;
+                    match self.icon {
+                        Some(texture) => {
+                            let tile = theme::avatar_artwork_tile(ui, BAND_TILE, self.accent);
+                            theme::avatar_image(ui, tile, texture, self.accent);
                         }
-                    },
+                        None => {
+                            theme::avatar(ui, &theme::initials(self.name), BAND_TILE, self.accent)
+                        }
+                    }
+                    ui.allocate_ui_with_layout(
+                        head,
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.y = BAND_COLUMN_GAP;
+                            ui.add(egui::Label::new(self.caption_job()).extend());
+                            let (line, _) =
+                                ui.allocate_exact_size(metrics.line(), egui::Sense::hover());
+                            self.paint_name_line(ui, line, go);
+                        },
+                    );
+                },
+            );
+            if let (BandBeside::Chips(chips), ChipsGo::Under) = (&self.beside, go) {
+                ui.add_space(under_drop(row_height, head.y));
+                let (row, _) = ui.allocate_exact_size(
+                    egui::vec2(size.x, metrics.under.y),
+                    egui::Sense::hover(),
                 );
-                if let (BandBeside::Chips(chips), ChipsGo::Under) = (&self.beside, go) {
-                    ui.add_space(BAND_CHIPS_UNDER_GAP - BAND_COLUMN_GAP);
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = BAND_NAME_GAP;
-                        for chip in *chips {
-                            band_chip(ui, chip);
-                        }
-                    });
+                let mut x = row.left() + BAND_TILE + BAND_TILE_GAP;
+                for chip in *chips {
+                    x += paint_band_chip(ui, x, row.center().y, chip) + BAND_NAME_GAP;
                 }
-            });
+            }
         });
     }
+
+    /// **The name's line, painted, with everything on it hung from ONE
+    /// line: the cap-middle of the name.**
+    ///
+    /// The name, the folder and the chips were egui labels centred by their
+    /// boxes, and a box is ascent plus descent, which an 14-point bold face,
+    /// an 11-point regular one and an 11-point mono one divide three ways.
+    /// Measured: the name's cap-middle at 215 and the folder's at 216 -- the
+    /// two shared a BASELINE, which is right in running text and reads as a
+    /// slip beside a pill -- and the chip's letters at 223.5 inside a pill
+    /// centred on 226, two and a half points high, because the chip painted
+    /// its galley at its box's top. The owner: "folder and *.exe not
+    /// centered".
+    ///
+    /// Cap-middle rather than baseline, because it is the line this crate
+    /// already aligns faces on ([`theme::face_ink_middle`]: two faces
+    /// aligned on it read as being on one line whatever each is spelling)
+    /// and because a pill has no baseline to share -- its own middle is the
+    /// only line it can offer, and the name's cap-middle is where that
+    /// middle is put. The line's box is the tallest of the three; all three
+    /// inks centre on it.
+    fn paint_name_line(&self, ui: &egui::Ui, line: egui::Rect, go: ChipsGo) {
+        let middle = line.center().y;
+        let painter = ui.painter();
+        let name_font = Self::name_font();
+        let name = painter.layout_no_wrap(self.name.to_string(), name_font.clone(), theme::INK);
+        let mut x = line.left();
+        painter.galley(
+            egui::pos2(x, middle - theme::face_ink_middle(ui, &name_font)),
+            name.clone(),
+            theme::INK,
+        );
+        x += name.size().x + BAND_NAME_GAP;
+        match (&self.beside, go) {
+            (BandBeside::Folder(folder), _) if !folder.is_empty() => {
+                let font = egui::FontId::proportional(BAND_FOLDER_PX);
+                let galley = painter.layout_no_wrap(folder.to_string(), font.clone(), theme::TEXT_FAINT);
+                painter.galley(
+                    egui::pos2(x, middle - theme::face_ink_middle(ui, &font)),
+                    galley,
+                    theme::TEXT_FAINT,
+                );
+            }
+            (BandBeside::Chips(chips), ChipsGo::Beside) => {
+                for chip in *chips {
+                    x += paint_band_chip(ui, x, middle, chip) + BAND_NAME_GAP;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The space between the tile row's bottom and the chips hanging under it,
+/// so that the chips sit [`BAND_CHIPS_UNDER_GAP`] under the name's line
+/// wherever that line ended up inside the row: the head is centred in the
+/// row, so its bottom is half the row's slack above the row's bottom.
+fn under_drop(row_height: f32, head_height: f32) -> f32 {
+    (BAND_CHIPS_UNDER_GAP - (row_height - head_height) / 2.0).max(0.0)
 }
 
 /// [`BandSubject::metrics`]: the caption's galley, the name's, whatever sits
@@ -1184,15 +1472,11 @@ impl SubjectMetrics {
         egui::vec2(self.name.x + self.beside.x, self.name.y.max(self.beside.y))
     }
 
-    /// The column: caption over line over whatever is under, at 4a's `gap:
-    /// 2px` and [`BAND_CHIPS_UNDER_GAP`].
-    fn column(&self) -> egui::Vec2 {
+    /// The column's head: caption over line, at 4a's `gap: 2px`. What the
+    /// tile is centred against -- see [`BandSubject::draw`].
+    fn head(&self) -> egui::Vec2 {
         let line = self.line();
-        let under = if self.under.y > 0.0 { BAND_CHIPS_UNDER_GAP + self.under.y } else { 0.0 };
-        egui::vec2(
-            self.caption.x.max(line.x).max(self.under.x),
-            self.caption.y + BAND_COLUMN_GAP + line.y + under,
-        )
+        egui::vec2(self.caption.x.max(line.x), self.caption.y + BAND_COLUMN_GAP + line.y)
     }
 }
 
@@ -1213,6 +1497,20 @@ fn centred_row<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui
     .inner
 }
 
+/// A row of `height` whose children hang from its TOP. For the destination
+/// band, whose subjects are each a 34-point tile row with, sometimes, a chips
+/// row under it: hung from the top, the two tiles, the arrow and the two
+/// captions share one line whatever hangs under either subject, which
+/// centring would break the moment one subject grew a third line.
+fn hanging_row<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::left_to_right(egui::Align::Min),
+        add,
+    )
+    .inner
+}
+
 /// The size of `text` set in `font` on one line: what an `extend`ed label of
 /// it is laid out as.
 fn run_size(ui: &egui::Ui, text: &str, font: egui::FontId) -> egui::Vec2 {
@@ -1220,27 +1518,25 @@ fn run_size(ui: &egui::Ui, text: &str, font: egui::FontId) -> egui::Vec2 {
 }
 
 /// 4a's mono chip beside a name in the band: `font-size: 11px; background:
-/// #f3f2f2; border-radius: 5px; padding: 2px 7px`.
-fn band_chip(ui: &mut egui::Ui, text: &str) {
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        egui::FontId::new(BAND_CHIP_PX, egui::FontFamily::Monospace),
-        theme::TEXT_SECONDARY,
-    );
-    let size = egui::vec2(
-        galley.size().x + BAND_CHIP_PAD_X * 2.0,
-        galley.size().y + BAND_CHIP_PAD_Y * 2.0,
-    );
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+/// #f3f2f2; border-radius: 5px; padding: 2px 7px`. Painted with its left edge
+/// at `left` and its middle -- the pill's, and its letters' cap-middle -- on
+/// `middle`; answers its width. See [`BandSubject::paint_name_line`] for why
+/// the letters are put on the pill's middle rather than at its box's top.
+fn paint_band_chip(ui: &egui::Ui, left: f32, middle: f32, text: &str) -> f32 {
+    let font = egui::FontId::new(BAND_CHIP_PX, egui::FontFamily::Monospace);
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), theme::TEXT_SECONDARY);
+    let size = galley.size() + egui::vec2(BAND_CHIP_PAD_X * 2.0, BAND_CHIP_PAD_Y * 2.0);
+    let rect = egui::Rect::from_center_size(egui::pos2(left + size.x / 2.0, middle), size);
     ui.painter().rect_filled(rect, CornerRadius::same(BAND_CHIP_RADIUS), theme::CANVAS);
     ui.painter().galley(
-        egui::pos2(rect.left() + BAND_CHIP_PAD_X, rect.top() + BAND_CHIP_PAD_Y),
+        egui::pos2(rect.left() + BAND_CHIP_PAD_X, middle - theme::face_ink_middle(ui, &font)),
         galley,
         theme::TEXT_SECONDARY,
     );
+    size.x
 }
 
-/// What [`band_chip`] will allocate for `text`, for [`BandSubject::metrics`].
+/// What [`paint_band_chip`] paints for `text`, for [`BandSubject::metrics`].
 fn band_chip_size(ui: &egui::Ui, text: &str) -> egui::Vec2 {
     run_size(ui, text, egui::FontId::new(BAND_CHIP_PX, egui::FontFamily::Monospace))
         + egui::vec2(BAND_CHIP_PAD_X * 2.0, BAND_CHIP_PAD_Y * 2.0)
@@ -1293,30 +1589,39 @@ const ARROW_MARK: f32 = 16.0;
 
 /// 4a's middle column: the sequence, in whichever of its two views is up, and
 /// the palette that adds to it.
+///
+/// **The SEQUENCE band is a subheading and not a card.** It was drawn inside
+/// `theme::section_card` -- a white tile with a hairline round it and ten
+/// points of radius, whose top corners the band took -- and the owner:
+/// "Sequence is not a tile but a subheading with separator on gray
+/// background". 4a's band has `background: #fbfaf9` and `border-bottom: 1px
+/// solid #eae7e7` and nothing else, no border of its own and no radius, and
+/// the rows under it sit on the column's own ground at `padding: 16px 20px`.
+/// So the card is gone: the band, its rule, and the rows in a plain frame at
+/// the design's padding, stacked straight under the destination band's rule
+/// the way 4a stacks them.
 fn steps_column(
     ui: &mut egui::Ui,
     draft: &mut SequenceDraft,
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
 ) {
-    theme::section_card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        let summary = match sequence_tally(&draft.sequence, source) {
-            Some(tally) => detail_edit::tally_short(&tally),
-            None => detail_edit::TALLY_REFUSED.to_string(),
-        };
-        if let Some(wants_template) = sequence_band(ui, &summary, draft.template_view) {
-            // Seeded verbatim, every time the view is entered -- so a user
-            // who opens the template view and closes it again has changed
-            // nothing at all.
-            if wants_template {
-                draft.template_draft = draft.sequence.clone();
-            }
-            draft.template_view = wants_template;
+    let summary = match sequence_tally(&draft.sequence, source) {
+        Some(tally) => detail_edit::tally_short(&tally),
+        None => detail_edit::TALLY_REFUSED.to_string(),
+    };
+    if let Some(wants_template) = sequence_band(ui, &summary, draft.template_view) {
+        // Seeded verbatim, every time the view is entered -- so a user who
+        // opens the template view and closes it again has changed nothing at
+        // all.
+        if wants_template {
+            draft.template_draft = draft.sequence.clone();
         }
-        // At the band's `20`, not the section card's own 12: 4a's rows sit
-        // in `padding: 16px 20px`, under a band padded the same.
-        theme::section_card_body_at(ui, BAND_PAD_X, |ui| {
+        draft.template_view = wants_template;
+    }
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(BAND_PAD_X, BAND_PAD_Y))
+        .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 
@@ -1347,20 +1652,33 @@ fn steps_column(
                     &mut draft.sequence,
                     &mut draft.template_touched,
                     fault,
-                    source,
-                    |ui, rows| {
-                        let _ = step_list(ui, rows, false);
+                    |ui, sequence| {
+                        let _ = step_list(ui, &steps(sequence, source, false), None);
                     },
                 );
-            } else if let Some(edit) = step_list(
-                ui,
-                &step_rows(&draft.sequence, source, draft.revealing),
-                true,
-            ) {
-                draft.sequence = detail_edit::apply_chip_edit(&draft.sequence, edit);
+            } else {
+                let list = steps(&draft.sequence, source, draft.revealing);
+                let edit = step_list(ui, &list, Some(&mut draft.selected))
+                    .or_else(|| step_keys(ui, list.len(), &mut draft.selected));
+                match edit {
+                    Some(StepEdit::Move { from, to }) => {
+                        let (sequence, landed) = sequence_with_step_moved(&draft.sequence, from, to);
+                        draft.sequence = sequence;
+                        // The selection follows the step, so a second
+                        // Alt+Down moves the same one again -- to where it
+                        // IS, which after a merge is not `to`.
+                        draft.selected = Some(landed);
+                    }
+                    Some(StepEdit::Remove(index)) => {
+                        draft.sequence = sequence_without_step(&draft.sequence, index);
+                        draft.selected = None;
+                    }
+                    None => {}
+                }
+                ui.add_space(STEP_ROW_GAP);
+                ui.label(RichText::new(REORDER_HINT).size(11.0).color(theme::TEXT_FAINT));
             }
         });
-    });
     ui.add_space(theme::SECTION_GAP);
 
     // The palette belongs to the step list. In the template view the insert
@@ -1379,6 +1697,12 @@ fn steps_column(
     }
 }
 
+/// The line under the list that says how it is edited now that its rows carry
+/// no controls: the drag, and the keyboard's equivalent of it. See
+/// [`step_keys`] for why the keyboard half exists.
+pub const REORDER_HINT: &str = "Drag a step by its handle to reorder it. Select a step to remove it \
+                                with Delete, or move it with Alt+Up and Alt+Down.";
+
 /// **4a's SEQUENCE band**: the caption, the tally, and the view toggle at the
 /// far end. Answers the view the toggle asked for, or `None`.
 ///
@@ -1389,7 +1713,9 @@ fn steps_column(
 /// gap: 10px; border-bottom: 1px solid #eae7e7; background: #fbfaf9`, the
 /// caption `font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
 /// text-transform: uppercase; color: #605d5d`, the tally `font-size: 12px;
-/// color: #9b9797`, a `flex: 1` spacer, and the Steps/Template pill.
+/// color: #9b9797`, a `flex: 1` spacer, and the Steps/Template pill. No
+/// radius and no edge of its own: it is a strip, not a tile (see
+/// [`steps_column`]).
 ///
 /// The pill is [`detail_edit::view_toggle`] as it stands, which is already
 /// 4a's declaration (`border: 1px solid #d7d3d3; border-radius: 7px`, the
@@ -1409,15 +1735,6 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
     let mut wants = None;
     egui::Frame::new()
         .fill(theme::CARD_TINT)
-        // The card's own rounding on the two corners this band owns, and none
-        // on the two it shares with the rows: a square tint over a rounded
-        // card would show at both top corners.
-        .corner_radius(CornerRadius {
-            nw: theme::SECTION_CARD_RADIUS,
-            ne: theme::SECTION_CARD_RADIUS,
-            sw: 0,
-            se: 0,
-        })
         .inner_margin(Margin::symmetric(SEQUENCE_BAND_PAD_X, SEQUENCE_BAND_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1455,40 +1772,191 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
 // 4a's step rows
 // ---------------------------------------------------------------------------
 
-/// The step list as 4a draws it: one row per token, and the controls that
-/// move and remove it.
+/// What a step row puts on egui's drag-and-drop clipboard while its handle is
+/// held: which step is in the air. A named type for
+/// `item_list::DraggedItem`'s reason -- the payload store is keyed by type,
+/// and this is what lets the list tell its own drag from an item row's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DraggedStep {
+    from: usize,
+}
+
+/// An edit the list asked for, applied by [`steps_column`] after the list has
+/// drawn. `to` is the step's index once moved -- see
+/// [`sequence_with_step_moved`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StepEdit {
+    Move { from: usize, to: usize },
+    Remove(usize),
+}
+
+/// What a row's own surface reported this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowPress {
+    None,
+    /// The row was clicked, and is the selection now.
+    Select,
+    /// The context menu's entries.
+    Remove,
+    MoveUp,
+    MoveDown,
+}
+
+/// The step list as 4a draws it: one row per [`Step`], reordered by dragging a
+/// row's handle, and nothing else on the row.
 ///
 /// **The builder's own, and not [`detail_edit::sequence_steps`].** That list
 /// is drawn in the edit form's `Fill rule` card at a pane 298 points wide,
 /// and 4a's row does not fit there: the handle, the index, the 52-point kind
 /// chip, the three `gap: 12px` between them and the `padding: 11px 14px`
 /// round them come to 150 before a step is drawn, and that card's rows have
-/// about 200. One function drawing both would be two layouts behind an `if`,
-/// which is two idioms with one name -- so the form keeps its wrapped line,
-/// and this list is 4a's. The two share everything that is not geometry:
-/// [`detail_edit::step_rows`] decides what a row says, [`ChipEdit`] what its
-/// controls do, and [`detail_edit::apply_chip_edit`] what that does to the
-/// string.
+/// about 200. That list also keeps its `<` `>` `x`, because it is drawn for
+/// a CREATE, where the modal cannot open, and a row a pointer cannot drag on
+/// a form a pointer may not be at needs its buttons. One function drawing
+/// both would be two layouts behind an `if`, which is two idioms with one
+/// name. The two share everything that is not geometry or gesture:
+/// [`detail_edit::step_rows`] decides what a row says, and
+/// [`detail_edit::store`] what the string becomes.
 ///
-/// The owner, with the old rows on screen: "draggable tiles are also
-/// different in design". They were -- an index, a badge and the step's words
-/// on one wrapped line, with the note under it.
+/// **The `<` `>` `x` came off these rows at the owner's word** -- "remove
+/// controls from steps and make them draggable" -- and 4a's row has none: a
+/// drag handle, an index, a chip, the step, a far cell. What a row can no
+/// longer do with a button it does three other ways, all of them on the same
+/// [`StepEdit`]: the handle is dragged (the list's own `DragAndDrop`, see
+/// [`step_drop`]); the row is right-clicked, for a menu that moves or removes
+/// it; and the row is clicked to select it, after which the keyboard moves or
+/// removes it ([`step_keys`]). 4a offers no removal control at all -- its
+/// only way to take a step out is the template view -- and that is not enough
+/// on its own: a step the user cannot take away without editing the string
+/// by hand is a builder that has stopped building.
 ///
-/// `editable` is false in the template view, where the list is the read-out
-/// of what the string became rather than the thing being edited. Returns the
-/// one edit clicked, applied by the caller after the loop.
-fn step_list(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option<ChipEdit> {
+/// `selected` is `None` in the template view, where the list is the read-out
+/// of what the string became rather than the thing being edited: no handle
+/// drags, no row selects, no menu opens. Returns the one edit asked for,
+/// applied by the caller after the loop.
+fn step_list(
+    ui: &mut egui::Ui,
+    list: &[Step],
+    mut selected: Option<&mut Option<usize>>,
+) -> Option<StepEdit> {
     let mut edit = None;
+    let editable = selected.is_some();
+    let mut rects: Vec<egui::Rect> = Vec::with_capacity(list.len());
     ui.scope(|ui| {
         // 4a's `gap: 8px` between rows, in place of the body's spacing.
         ui.spacing_mut().item_spacing.y = STEP_ROW_GAP;
-        for row in rows {
-            if let Some(pressed) = step_row(ui, row, rows.len(), editable) {
-                edit = Some(pressed);
+        for (index, step) in list.iter().enumerate() {
+            let is_selected = selected.as_deref().copied().flatten() == Some(index);
+            let (rect, press) = step_row(ui, step, index, editable, is_selected);
+            rects.push(rect);
+            match press {
+                RowPress::None => {}
+                RowPress::Select => {
+                    if let Some(selected) = selected.as_deref_mut() {
+                        *selected = Some(index);
+                    }
+                }
+                RowPress::Remove => edit = Some(StepEdit::Remove(index)),
+                RowPress::MoveUp if index > 0 => {
+                    edit = Some(StepEdit::Move { from: index, to: index - 1 });
+                }
+                RowPress::MoveDown if index + 1 < list.len() => {
+                    edit = Some(StepEdit::Move { from: index, to: index + 1 });
+                }
+                RowPress::MoveUp | RowPress::MoveDown => {}
             }
         }
     });
+    if editable {
+        if let Some(dropped) = step_drop(ui, &rects) {
+            edit = Some(dropped);
+        }
+    }
     edit
+}
+
+/// **The drop half of the list, list-wide rather than row by row.** A
+/// pointer spends half of a drag over the 8-point gaps between rows, and a
+/// drop that landed in one would be lost by a per-row `dnd_release_payload`.
+/// So the slot is read off the rows' rects -- the number of rows whose middle
+/// the pointer is below -- the insertion line is painted in that gap, and on
+/// release the payload is taken and the move made. Released outside the
+/// list, the payload is left for egui to clear at the end of the pass, and
+/// nothing moves: a drop off the list is a drag the user abandoned, not a
+/// removal.
+fn step_drop(ui: &egui::Ui, rects: &[egui::Rect]) -> Option<StepEdit> {
+    let dragged = egui::DragAndDrop::payload::<DraggedStep>(ui.ctx())?;
+    let (first, last) = (rects.first()?, rects.last()?);
+    let list = first.union(*last).expand2(egui::vec2(0.0, STEP_ROW_GAP));
+    let pointer = ui.ctx().pointer_latest_pos()?;
+    if !list.contains(pointer) {
+        return None;
+    }
+    let slot = rects.iter().filter(|rect| rect.center().y < pointer.y).count();
+    let to = if slot > dragged.from { slot - 1 } else { slot };
+    if to != dragged.from {
+        let y = if slot == 0 {
+            first.top() - STEP_ROW_GAP / 2.0
+        } else if slot == rects.len() {
+            last.bottom() + STEP_ROW_GAP / 2.0
+        } else {
+            (rects[slot - 1].bottom() + rects[slot].top()) / 2.0
+        };
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(list.left(), y - STEP_DROP_LINE / 2.0),
+                egui::pos2(list.right(), y + STEP_DROP_LINE / 2.0),
+            ),
+            CornerRadius::same(1),
+            theme::BLUE,
+        );
+    }
+    if ui.ctx().input(|i| i.pointer.any_released()) {
+        egui::DragAndDrop::take_payload::<DraggedStep>(ui.ctx());
+        return (to != dragged.from).then_some(StepEdit::Move { from: dragged.from, to });
+    }
+    None
+}
+
+/// The insertion line's weight while a step is dragged over a gap.
+const STEP_DROP_LINE: f32 = 2.0;
+
+/// **The keyboard's half of reordering and removal**, for the parity a drag
+/// alone cannot give: the `<` `>` `x` were reachable without a pointer and a
+/// drag is not. With a step selected and no text box holding the focus -- the
+/// palette's two boxes and the template each take arrow keys and Backspace of
+/// their own -- Delete and Backspace take the step away, Alt+Up and Alt+Down
+/// move it, and Up and Down move the selection. Read after the rows have
+/// drawn, so the edit lands on the next frame the way a drop does.
+fn step_keys(ui: &egui::Ui, count: usize, selected: &mut Option<usize>) -> Option<StepEdit> {
+    let Some(index) = *selected else { return None };
+    if index >= count {
+        *selected = None;
+        return None;
+    }
+    if ui.memory(|m| m.focused().is_some()) {
+        return None;
+    }
+    let pressed = |modifiers: egui::Modifiers, key: egui::Key| {
+        ui.ctx().input_mut(|i| i.consume_key(modifiers, key))
+    };
+    if pressed(egui::Modifiers::NONE, egui::Key::Delete)
+        || pressed(egui::Modifiers::NONE, egui::Key::Backspace)
+    {
+        return Some(StepEdit::Remove(index));
+    }
+    if pressed(egui::Modifiers::ALT, egui::Key::ArrowUp) {
+        return (index > 0).then(|| StepEdit::Move { from: index, to: index - 1 });
+    }
+    if pressed(egui::Modifiers::ALT, egui::Key::ArrowDown) {
+        return (index + 1 < count).then(|| StepEdit::Move { from: index, to: index + 1 });
+    }
+    if pressed(egui::Modifiers::NONE, egui::Key::ArrowUp) {
+        *selected = Some(index.saturating_sub(1));
+    } else if pressed(egui::Modifiers::NONE, egui::Key::ArrowDown) {
+        *selected = Some((index + 1).min(count - 1));
+    }
+    None
 }
 
 /// One of 4a's rows: `display: flex; align-items: center; gap: 12px;
@@ -1497,13 +1965,12 @@ fn step_list(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option<Chip
 /// widths, the step in the `flex: 1` middle, and the far cell at the end.
 ///
 /// **The far end is laid first, right to left, and the middle takes what is
-/// left.** That is 4a's `flex: 1` without measuring the trailing cells by
-/// hand: the far cell and the three controls claim their own widths, and the
-/// nested left-to-right scope inside them is handed the remainder as a lane.
-/// The middle wraps inside that lane (see [`step_middle`]), so a row that is
-/// too long for the card grows downward and its other cells stay on its
-/// first line -- the prefix reads with the step, and the explanation hangs
-/// under it.
+/// left.** That is 4a's `flex: 1` without measuring the far cell by hand:
+/// it claims its own width, and the nested left-to-right scope inside is
+/// handed the remainder as a lane. The middle wraps inside that lane (see
+/// [`step_middle`]), so a row too long for the card grows downward and its
+/// other cells stay on its first line -- the prefix reads with the step, and
+/// the explanation hangs under it.
 ///
 /// A secret step wears [`theme::secret_band`], 4a's fifth row: the danger
 /// wash and edge, the index in [`theme::DANGER_QUIET`] (`#a2554d`), the kind
@@ -1513,72 +1980,96 @@ fn step_list(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option<Chip
 /// under it (`Sends only if the focused control is a masked field`) is not:
 /// that gate is `preflight`'s and is not a per-step setting in this build.
 ///
-/// The controls at the row's end are not 4a's, which has none: its rows are
-/// dragged. This app's are moved by `<` and `>` and taken away by `x`, and
-/// the handle is drawn as 4a's mark for a row that moves; it is not yet a
-/// drag source, and a drag on it does nothing.
-fn step_row(ui: &mut egui::Ui, row: &StepRow, count: usize, editable: bool) -> Option<ChipEdit> {
-    let mut edit = None;
-    let ground = if row.secret {
-        theme::secret_band()
-    } else {
-        egui::Frame::new().fill(theme::CARD).stroke(Stroke::new(1.0, theme::HAIRLINE))
+/// **A selected row wears 8a's fresh-row treatment** -- `background:
+/// #eef2fc; border: 1px solid #b8c7ea`, the wash and edge `detail_edit`'s
+/// app row puts on the binding just made -- because that is what this
+/// design system already uses for "this row is the one in hand". The secret
+/// row keeps its own wash, which is the point of it, and takes the edge in
+/// [`theme::BLUE`] so the selection still reads over red.
+///
+/// Answers the row's rect, for [`step_drop`], and what its surface reported.
+fn step_row(
+    ui: &mut egui::Ui,
+    step: &Step,
+    index: usize,
+    editable: bool,
+    selected: bool,
+) -> (egui::Rect, RowPress) {
+    let mut press = RowPress::None;
+    let ground = match (step.secret, selected) {
+        (true, false) => theme::secret_band(),
+        (true, true) => theme::secret_band().stroke(Stroke::new(1.0, theme::BLUE)),
+        (false, false) => egui::Frame::new().fill(theme::CARD).stroke(Stroke::new(1.0, theme::HAIRLINE)),
+        (false, true) => {
+            egui::Frame::new().fill(theme::BLUE_WASH).stroke(Stroke::new(1.0, theme::BLUE_EDGE))
+        }
     };
-    ground
+    let framed = ground
         .corner_radius(CornerRadius::same(STEP_ROW_RADIUS))
         .inner_margin(Margin::symmetric(STEP_ROW_PAD_X, STEP_ROW_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let height = step_row_height(ui, editable);
+            let height = step_row_height(ui);
             centred_row(ui, height, |ui| {
                 ui.spacing_mut().item_spacing.x = STEP_ROW_GAP_X;
-                step_grip(ui, row.secret);
-                step_index(ui, row);
-                step_kind_chip(ui, row);
+                step_grip(ui, step, index, editable);
+                step_index(ui, step);
+                step_kind_chip(ui, step);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if editable {
-                        // Right to left, so they read `< > x` on the screen.
-                        ui.spacing_mut().item_spacing.x = STEP_CONTROL_GAP;
-                        let index = row.number - 1;
-                        if ui.add(detail_edit::small_chip_button("x")).clicked() {
-                            edit = Some(ChipEdit::Remove(index));
-                        }
-                        if ui
-                            .add_enabled(row.number < count, detail_edit::small_chip_button(">"))
-                            .clicked()
-                        {
-                            edit = Some(ChipEdit::Forward(index));
-                        }
-                        if ui.add_enabled(index > 0, detail_edit::small_chip_button("<")).clicked()
-                        {
-                            edit = Some(ChipEdit::Back(index));
-                        }
-                    }
                     ui.spacing_mut().item_spacing.x = STEP_ROW_GAP_X;
-                    step_far_cell(ui, row);
+                    step_far_cell(ui, step);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        step_middle(ui, row, height);
+                        step_middle(ui, step, height);
                     });
                 });
             });
         });
-    edit
+    if editable {
+        // Registered with the row's own id after its contents, as
+        // `item_list`'s rows are: the handle inside it senses a drag and the
+        // row senses a click, and egui tells the two gestures apart by
+        // travel.
+        let response = framed.response.interact(egui::Sense::click());
+        if response.clicked() {
+            press = RowPress::Select;
+        }
+        response.context_menu(|ui| {
+            if ui.button(MENU_MOVE_UP).clicked() {
+                press = RowPress::MoveUp;
+                ui.close();
+            }
+            if ui.button(MENU_MOVE_DOWN).clicked() {
+                press = RowPress::MoveDown;
+                ui.close();
+            }
+            if ui.button(MENU_REMOVE).clicked() {
+                press = RowPress::Remove;
+                ui.close();
+            }
+        });
+    }
+    (framed.response.rect, press)
 }
 
+/// The row's context menu, for the pointer that would rather not drag: the
+/// two moves the arrows used to be, and the removal the `x` was.
+pub const MENU_MOVE_UP: &str = "Move up";
+pub const MENU_MOVE_DOWN: &str = "Move down";
+pub const MENU_REMOVE: &str = "Remove step";
+
 /// The row's band: its tallest cell, known before the row is laid so every
-/// cell is centred on the same line (see [`centred_row`]). The controls when
-/// the row has them, and otherwise the field pill, which stands a point over
-/// the keycap; the middle may still grow past this by wrapping, and then it
-/// grows downward from the line the other cells are on.
-fn step_row_height(ui: &egui::Ui, editable: bool) -> f32 {
-    let control = if editable { detail_edit::small_chip_button_height(ui) } else { 0.0 };
+/// cell is centred on the same line (see [`centred_row`]). The field pill,
+/// which stands a point over the keycap; the middle may still grow past this
+/// by wrapping, and then it grows downward from the line the other cells are
+/// on.
+fn step_row_height(ui: &egui::Ui) -> f32 {
     let row = |px: f32, family: &str| {
         ui.ctx()
             .fonts_mut(|f| f.row_height(&egui::FontId::new(px, egui::FontFamily::Name(family.into()))))
     };
     let pill = row(FIELD_PILL_PX, theme::BOLD) + FIELD_PILL_PAD_Y * 2.0 + 2.0;
     let keycap = row(KEYCAP_PX, theme::MONO_BOLD) + KEYCAP_PAD_Y * 2.0 + KEYCAP_EDGE + KEYCAP_FOOT;
-    control.max(pill).max(keycap)
+    pill.max(keycap)
 }
 
 /// The face the row's egui-laid runs are set in -- the explanation, the far
@@ -1597,18 +2088,27 @@ fn run_top(ui: &egui::Ui, middle: f32, font: &egui::FontId) -> f32 {
 }
 
 /// 4a's drag handle: a `width: 20px` column of three bars, `width: 12px;
-/// height: 2px; border-radius: 2px; background: #d7d3d3`, `gap: 3px`.
+/// height: 2px; border-radius: 2px; background: #d7d3d3`, `gap: 3px` -- and
+/// the drag source that reorders the list.
 ///
 /// Drawn, not a glyph, for the crate's standing reason: `⋮` resolves to
 /// nothing in Archivo and a mark out of a fallback face brings its own weight
 /// and baseline. On the secret row 4a tints the bars `#e0b2ac`, which is not
 /// in the palette; [`theme::DANGER_EDGE`] is the band's own edge, one shade
 /// over, and the band's edge is what the bars are.
-fn step_grip(ui: &mut egui::Ui, secret: bool) {
+///
+/// **The drag is `item_list`'s idiom, not `Ui::dnd_drag_source`**: the
+/// handle's rect is re-registered with `Sense::drag`, the payload set on the
+/// frame the drag starts, and a chip naming the step follows the pointer
+/// from a `Tooltip`-order layer -- nothing re-parented, nothing allocated
+/// twice. The hit area is the handle's 20-point column at the row's height,
+/// which is wider than the bars and is what a finger or a hurried pointer
+/// lands on.
+fn step_grip(ui: &mut egui::Ui, step: &Step, index: usize, editable: bool) {
     let height = STEP_GRIP_BAR.y * 3.0 + STEP_GRIP_GAP * 2.0;
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(STEP_GRIP_WIDTH, height), egui::Sense::hover());
-    let color = if secret { theme::DANGER_EDGE } else { theme::BORDER_STRONG };
+    let color = if step.secret { theme::DANGER_EDGE } else { theme::BORDER_STRONG };
     for bar in 0..3 {
         let top = rect.top() + bar as f32 * (STEP_GRIP_BAR.y + STEP_GRIP_GAP);
         ui.painter().rect_filled(
@@ -1620,14 +2120,48 @@ fn step_grip(ui: &mut egui::Ui, secret: bool) {
             color,
         );
     }
+    if editable {
+        let hit = egui::Rect::from_center_size(
+            rect.center(),
+            egui::vec2(STEP_GRIP_WIDTH, ui.max_rect().height()),
+        );
+        let response = ui.interact(hit, ui.id().with(("step-grip", index)), egui::Sense::drag());
+        response.dnd_set_drag_payload(DraggedStep { from: index });
+        if response.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+            step_ghost(ui, &step.label());
+        }
+    }
+}
+
+/// The chip that follows the pointer while a step is dragged, naming it --
+/// `item_list::drag_ghost`'s idiom, painted into a `Tooltip`-order layer so it
+/// allocates nothing in the row, and offset from the pointer's hot spot so it
+/// does not cover the gap the step is about to be dropped in.
+fn step_ghost(ui: &egui::Ui, label: &str) {
+    let Some(pointer) = ui.ctx().pointer_interact_pos() else { return };
+    const PAD: egui::Vec2 = egui::Vec2::new(8.0, 5.0);
+    const CURSOR_OFFSET: egui::Vec2 = egui::Vec2::new(14.0, 10.0);
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(
+        egui::Order::Tooltip,
+        egui::Id::new("sequence-step-ghost"),
+    ));
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        egui::FontId::new(STEP_TEXT_PX, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        theme::CARD,
+    );
+    let rect = egui::Rect::from_min_size(pointer + CURSOR_OFFSET, galley.size() + PAD * 2.0);
+    painter.rect_filled(rect, CornerRadius::same(8), theme::BLUE);
+    painter.galley(rect.min + PAD, galley, theme::CARD);
 }
 
 /// The index: mono `font-size: 12px; color: #9b9797` in a `width: 14px`
 /// column, so the chips after it line up down the list whatever the count.
-fn step_index(ui: &mut egui::Ui, row: &StepRow) {
-    let ink = if row.secret { theme::DANGER_QUIET } else { theme::TEXT_GHOST };
+fn step_index(ui: &mut egui::Ui, step: &Step) {
+    let ink = if step.secret { theme::DANGER_QUIET } else { theme::TEXT_GHOST };
     let font = egui::FontId::new(STEP_INDEX_PX, egui::FontFamily::Monospace);
-    let galley = ui.painter().layout_no_wrap(row.number.to_string(), font.clone(), ink);
+    let galley = ui.painter().layout_no_wrap(step.number.to_string(), font.clone(), ink);
     let (rect, _) = ui.allocate_exact_size(
         egui::vec2(STEP_INDEX_WIDTH, galley.size().y),
         egui::Sense::hover(),
@@ -1650,16 +2184,16 @@ fn step_index(ui: &mut egui::Ui, row: &StepRow) {
 /// white on a secret. A rate change wears the wait's pair -- it is about
 /// time, not a key -- and a step this build does not understand wears the
 /// key's, which is the plain one.
-fn step_kind_chip(ui: &mut egui::Ui, row: &StepRow) {
-    let (fill, ink) = match row.kind {
-        _ if row.secret => (theme::ERROR, egui::Color32::WHITE),
+fn step_kind_chip(ui: &mut egui::Ui, step: &Step) {
+    let (fill, ink) = match step.kind {
+        _ if step.secret => (theme::ERROR, egui::Color32::WHITE),
         StepKind::Text => (theme::BLUE_WASH, theme::BLUE_DEEP),
         StepKind::Wait | StepKind::Rate => (theme::CANVAS, theme::TEXT_FAINT),
         StepKind::Key | StepKind::Raw => (theme::CANVAS, theme::TEXT_SECONDARY),
     };
     let font = egui::FontId::new(STEP_KIND_PX, egui::FontFamily::Name(theme::BOLD.into()));
     let job = theme::letterspaced(
-        row.kind.badge(),
+        step.kind.badge(),
         STEP_KIND_PX,
         theme::BOLD,
         STEP_KIND_PX * STEP_KIND_TRACKING,
@@ -1681,18 +2215,23 @@ fn step_kind_chip(ui: &mut egui::Ui, row: &StepRow) {
     );
 }
 
-/// The `flex: 1` middle: the step itself, what it resolves to, and the
-/// explanation beside it.
+/// The `flex: 1` middle: the step itself -- every token in it, in order --
+/// what it resolves to, and the explanation beside it.
+///
+/// A key step is its keycaps with 4a's `+` between them (`font-size: 11px;
+/// color: #9b9797`): `Ctrl` + `A`, `Shift` + `Tab`. A text step is a pill
+/// for each field in it and the text itself for each literal, each followed
+/// by what it resolves to when the eye is open.
 ///
 /// Wrapped, at 4a's own gap for the kind (`7px` on a key row, `8px` on a
 /// text row, `10px` on a wait row), so a row longer than the lane drops its
 /// explanation under the step rather than pushing the far cell off the card.
 /// Measured: the secret row -- pill, mask, `hidden — never shown here`, then
-/// `3 ms/char` and the three controls -- is 630 in the card's 600, so at this
-/// width that explanation is on a second line. The step's own runs are
-/// `extend`ed and never break mid-word; only the sentence flows.
-fn step_middle(ui: &mut egui::Ui, row: &StepRow, height: f32) {
-    let gap = match row.kind {
+/// `3 ms/char` -- is close to the card's 600, so at this width that
+/// explanation can be on a second line. The step's own runs are `extend`ed
+/// and never break mid-word; only the sentence flows.
+fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
+    let gap = match step.kind {
         StepKind::Key => STEP_KEY_GAP,
         StepKind::Wait => STEP_WAIT_GAP,
         StepKind::Text | StepKind::Rate | StepKind::Raw => STEP_TEXT_GAP,
@@ -1707,24 +2246,52 @@ fn step_middle(ui: &mut egui::Ui, row: &StepRow, height: f32) {
         let plain = |text: &str, ink: egui::Color32| {
             egui::Label::new(theme::semibold(text.to_string(), STEP_TEXT_PX).color(ink)).extend()
         };
-        match row.kind {
-            StepKind::Key => keycap(ui, &row.label),
-            StepKind::Text => match &row.field {
-                Some(field) => field_pill(ui, field, &row.label, row.secret),
-                // A literal: the text itself, in the row's own ink. 4a draws
-                // no literal, and a pill round typed text would make it look
-                // like a field.
-                None => {
-                    ui.add(plain(&row.label, theme::INK));
+        match step.kind {
+            StepKind::Key => {
+                for (i, row) in step.rows.iter().enumerate() {
+                    if i > 0 {
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new("+").size(STEP_RATE_PX).color(theme::TEXT_GHOST),
+                            )
+                            .extend(),
+                        );
+                    }
+                    keycap(ui, key_name(&row.label));
                 }
-            },
+            }
+            StepKind::Text => {
+                for row in &step.rows {
+                    match &row.field {
+                        Some(field) => field_pill(ui, field, &row.label, row.secret),
+                        // A literal: the text itself, in the row's own ink.
+                        // 4a draws no literal, and a pill round typed text
+                        // would make it look like a field.
+                        None => {
+                            ui.add(plain(&row.label, theme::INK));
+                        }
+                    }
+                    if !row.payload.is_empty() {
+                        // 4a's value after the pill: `font-size: 12px; color:
+                        // #9b9797` for a value, and the mask in mono
+                        // `#8c3c33` on the secret row.
+                        let text = RichText::new(row.payload.clone()).size(STEP_TEXT_PX);
+                        let text = if row.secret {
+                            text.family(egui::FontFamily::Monospace).color(theme::SECRET_INK)
+                        } else {
+                            text.color(theme::TEXT_GHOST)
+                        };
+                        ui.add(egui::Label::new(text).extend());
+                    }
+                }
+            }
             // 4a's `250 ms`: mono `font-size: 13px; font-weight: 600`. The
             // words are the row's own -- `Wait 0.3s`, in the seconds the
             // owner asked to set waits in -- rather than the design's.
             StepKind::Wait => {
                 ui.add(
                     egui::Label::new(
-                        RichText::new(row.label.clone())
+                        RichText::new(step.rows[0].label.clone())
                             .size(STEP_WAIT_PX)
                             .family(egui::FontFamily::Name(theme::MONO_BOLD.into()))
                             .color(theme::INK),
@@ -1733,36 +2300,23 @@ fn step_middle(ui: &mut egui::Ui, row: &StepRow, height: f32) {
                 );
             }
             StepKind::Rate => {
-                ui.add(plain(&row.label, theme::INK));
+                ui.add(plain(&step.rows[0].label, theme::INK));
             }
             StepKind::Raw => {
-                let label = ui.add(plain(&row.label, theme::TEXT_FAINT));
-                if !row.understood {
+                let label = ui.add(plain(&step.rows[0].label, theme::TEXT_FAINT));
+                if !step.understood() {
                     label.on_hover_text(detail_edit::SEQUENCE_UNKNOWN_TIP);
                 }
             }
         }
-        if !row.payload.is_empty() {
-            // 4a's value after the pill: `font-size: 12px; color: #9b9797`
-            // for a value, and the mask in mono `#8c3c33` on the secret row.
-            let text = RichText::new(row.payload.clone()).size(STEP_TEXT_PX);
-            let text = if row.secret {
-                text.family(egui::FontFamily::Monospace).color(theme::SECRET_INK)
-            } else {
-                text.color(theme::TEXT_GHOST)
-            };
-            ui.add(egui::Label::new(text).extend());
-        }
-        if !row.aside.is_empty() {
+        let aside = step.aside();
+        if !aside.is_empty() {
             // 4a's explanation: `font-size: 12px; color: #7d7979; padding-left:
             // 4px` -- the inset spent as space beside the gap egui has already
             // put in, because netting it the other way is a negative space.
             ui.add_space(STEP_ASIDE_INSET);
-            let ink = if row.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
-            ui.add(
-                egui::Label::new(RichText::new(row.aside.clone()).size(STEP_TEXT_PX).color(ink))
-                    .wrap(),
-            );
+            let ink = if step.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
+            ui.add(egui::Label::new(RichText::new(aside).size(STEP_TEXT_PX).color(ink)).wrap());
         }
     });
 }
@@ -1770,12 +2324,12 @@ fn step_middle(ui: &mut egui::Ui, row: &StepRow, height: f32) {
 /// The far cell: 4a's `—` at `font-size: 12px; color: #9b9797` on a row with
 /// no rate, and the rate in mono `font-size: 11px; color: #7d7979` on a text
 /// row (`#8c3c33` on the secret one).
-fn step_far_cell(ui: &mut egui::Ui, row: &StepRow) {
-    let text = if row.note == detail_edit::NO_NOTE {
+fn step_far_cell(ui: &mut egui::Ui, step: &Step) {
+    let text = if step.note() == detail_edit::NO_NOTE {
         RichText::new(detail_edit::NO_NOTE).size(STEP_TEXT_PX).color(theme::TEXT_GHOST)
     } else {
-        let ink = if row.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
-        RichText::new(row.note.clone())
+        let ink = if step.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
+        RichText::new(step.note().to_string())
             .size(STEP_RATE_PX)
             .family(egui::FontFamily::Monospace)
             .color(ink)
@@ -2154,6 +2708,7 @@ mod tests {
             revealing: false,
             literal_draft: String::new(),
             wait_draft: "1".into(),
+            selected: None,
         };
         assert!(!draft.changed());
         assert!(!draft.saveable());
@@ -2196,6 +2751,7 @@ mod tests {
             revealing: false,
             literal_draft: String::new(),
             wait_draft: "1".into(),
+            selected: None,
         };
         // Inherited and merely looked at: no fault, and nothing to save.
         assert!(draft.fault().is_none());
@@ -2218,6 +2774,115 @@ mod tests {
             sequence: String::new(),
             trigger: crate::app_match::TriggerMode::Prompt,
         })));
+    }
+
+    // -----------------------------------------------------------------------
+    // The steps, and the two edits on them
+    // -----------------------------------------------------------------------
+
+    /// The labels of the steps that ARE acts, in order.
+    fn act_steps(sequence: &str) -> Vec<String> {
+        steps(sequence, &source(), false)
+            .into_iter()
+            .filter(|step| match step.kind {
+                StepKind::Text | StepKind::Wait => true,
+                // A modifier with no key after it has no bar in the strip.
+                StepKind::Key => !step
+                    .rows
+                    .iter()
+                    .all(|row| row.aside == detail_edit::MODIFIER_NOTE),
+                StepKind::Rate | StepKind::Raw => false,
+            })
+            .map(|step| step.label())
+            .collect()
+    }
+
+    /// **Wherever [`acts`] has a bar, [`steps`] has the same row**: the same
+    /// grouping, the same words, over the corpus. The rows `steps` adds --
+    /// a rate change, a raw token, a lone modifier -- are the ones `acts`
+    /// has no bar for, and they are filtered here rather than reconciled,
+    /// because that difference is the point of `steps`.
+    #[test]
+    fn the_steps_that_are_acts_are_the_acts() {
+        for sequence in CORPUS.iter().chain(&["hello{USERNAME}world{TAB}", "+{TAB}{USERNAME}"]) {
+            let expected: Vec<String> = acts(sequence).into_iter().map(|act| act.label).collect();
+            assert_eq!(act_steps(sequence), expected, "for {sequence:?}");
+        }
+    }
+
+    #[test]
+    fn a_step_is_a_span_and_a_move_moves_all_of_it() {
+        // Three tokens, one step: the text run travels whole.
+        let sequence = "hello{USERNAME}world{TAB}{PASSWORD}";
+        assert_eq!(steps(sequence, &source(), false).len(), 3);
+        // Sent past `Password`, a field, the run lands beside it and the two
+        // are one text step: it is step 1 of two, not step 2 of three.
+        assert_eq!(
+            sequence_with_step_moved(sequence, 0, 2),
+            ("{TAB}{PASSWORD}hello{USERNAME}world".to_string(), 1)
+        );
+        // A modifier travels with the key it is held for.
+        assert_eq!(
+            sequence_with_step_moved("+{TAB}{USERNAME}", 1, 0),
+            ("{USERNAME}+{TAB}".to_string(), 0)
+        );
+        // Moving down past a neighbour and up past one are each other's
+        // undo, with neighbours that cannot merge.
+        let (moved, at) = sequence_with_step_moved("{USERNAME}{TAB}{DELAY 250}", 0, 1);
+        assert_eq!((moved.as_str(), at), ("{TAB}{USERNAME}{DELAY 250}", 1));
+        assert_eq!(
+            sequence_with_step_moved(&moved, 1, 0),
+            ("{USERNAME}{TAB}{DELAY 250}".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn a_move_that_changes_nothing_hands_the_string_back_untouched() {
+        let sequence = "{USERNAME}{TAB}{PASSWORD}";
+        assert_eq!(sequence_with_step_moved(sequence, 1, 1), (sequence.to_string(), 1));
+        assert_eq!(sequence_with_step_moved(sequence, 7, 0), (sequence.to_string(), 7));
+        assert_eq!(sequence_with_step_moved(sequence, 0, 7), (sequence.to_string(), 0));
+        assert_eq!(sequence_without_step(sequence, 7), sequence);
+    }
+
+    #[test]
+    fn two_text_steps_put_side_by_side_become_one_and_the_moved_index_says_where() {
+        // [Username][Tab][Password] with Tab sent to the end: the two fields
+        // are adjacent and the list re-reads as two steps, not three -- and
+        // Tab, asked to be step 2, is step 1.
+        let (moved, at) = sequence_with_step_moved("{USERNAME}{TAB}{PASSWORD}", 1, 2);
+        assert_eq!((moved.as_str(), at), ("{USERNAME}{PASSWORD}{TAB}", 1));
+        assert_eq!(steps(&moved, &source(), false).len(), 2);
+        // The moved step itself merging: `hello` sent past Tab lands beside
+        // `world`, and the one step they become is where it is.
+        let (moved, at) = sequence_with_step_moved("hello{TAB}world", 0, 1);
+        assert_eq!((moved.as_str(), at), ("{TAB}helloworld", 1));
+        // A lone modifier sent before a key joins it.
+        let (moved, at) = sequence_with_step_moved("+{USERNAME}{TAB}", 0, 1);
+        assert_eq!((moved.as_str(), at), ("{USERNAME}+{TAB}", 1));
+        assert_eq!(steps(&moved, &source(), false).len(), 2);
+    }
+
+    #[test]
+    fn removing_a_step_removes_its_whole_span_and_the_last_one_restores_the_default() {
+        assert_eq!(sequence_without_step("{USERNAME}+{TAB}{PASSWORD}", 1), "{USERNAME}{PASSWORD}");
+        assert_eq!(sequence_without_step("hello{USERNAME}world{TAB}", 0), "{TAB}");
+        // The empty string IS the default, and the item inherits again.
+        assert_eq!(sequence_without_step("{TAB}", 0), "");
+    }
+
+    #[test]
+    fn a_lone_modifier_is_its_own_row_and_says_so() {
+        let list = steps("+hello{TAB}", &source(), false);
+        assert_eq!(list.len(), 3, "{list:?}");
+        assert_eq!(list[0].kind, StepKind::Key);
+        assert_eq!(list[0].aside(), detail_edit::MODIFIER_NOTE);
+        // And with its key it is one row, saying nothing about being held.
+        let held = steps("+{TAB}", &source(), false);
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].label(), "Shift + Tab");
+        assert_eq!(acts("+{TAB}")[0].label, "Shift + Tab");
+        assert_eq!(held[0].aside(), "");
     }
 
     // -----------------------------------------------------------------------
@@ -2285,6 +2950,38 @@ mod tests {
             assert_eq!(found.len(), 1, "expected one header band, found {}", found.len());
             found[0].rect
         }
+
+        /// The row frame -- 4a's white card with the hairline round it, or
+        /// the selected or secret one -- that holds `inside`.
+        fn row_around(&self, inside: egui::Rect) -> egui::Rect {
+            self.rects
+                .iter()
+                .filter(|r| {
+                    r.corners.nw == STEP_ROW_RADIUS
+                        && r.corners.sw == STEP_ROW_RADIUS
+                        && r.rect.contains_rect(inside)
+                })
+                .map(|r| r.rect)
+                .min_by(|a, b| a.height().total_cmp(&b.height()))
+                .unwrap_or_else(|| panic!("no step row is painted round {inside:?}"))
+        }
+
+        /// The three bars of the drag handle on the row that holds `inside`,
+        /// as one rect: what a drag starts on.
+        fn grip_of(&self, row: egui::Rect) -> egui::Rect {
+            let bars: Vec<egui::Rect> = self
+                .rects
+                .iter()
+                .filter(|r| {
+                    (r.rect.width() - STEP_GRIP_BAR.x).abs() < 0.01
+                        && (r.rect.height() - STEP_GRIP_BAR.y).abs() < 0.01
+                        && row.contains_rect(r.rect)
+                })
+                .map(|r| r.rect)
+                .collect();
+            assert_eq!(bars.len(), 3, "expected the handle's three bars in {row:?}");
+            bars.iter().skip(1).fold(bars[0], |a, b| a.union(*b))
+        }
     }
 
     fn walk(shape: &egui::Shape, painted: &mut Painted) {
@@ -2335,6 +3032,7 @@ mod tests {
             revealing: false,
             literal_draft: String::new(),
             wait_draft: "1".into(),
+            selected: None,
         }
     }
 
@@ -2388,37 +3086,19 @@ mod tests {
         }
 
         fn frame_with(&self, draft: &mut SequenceDraft, events: &[egui::Event]) -> Painted {
-            let palette = vec![FieldRef::Username, FieldRef::Password];
-            let totp = crate::vault_window::detail::TotpState::NoSecret;
-            let source = ResolveSource {
-                username: "a.novak@ledgerline.com",
-                password: "correct-horse-battery",
-                custom: Vec::new(),
-                totp: &totp,
-            };
-            let mut apps = AppIdentityCache::default();
-            let output = self.ctx.run_ui(self.input(events), |ui| {
-                let _ = draw_sequence_builder(
-                    ui,
-                    draft,
-                    &palette,
-                    &source,
-                    self.icon.as_ref(),
-                    &mut apps,
-                );
-            });
-            let mut painted = Painted::default();
-            for clipped in &output.shapes {
-                walk(&clipped.shape, &mut painted);
-            }
-            painted
+            self.frame_with_input(draft, self.input(events))
         }
 
         /// The builder at rest: an `egui::Area` is laid out from the size it
-        /// had on the previous frame, so the frame read is the third.
+        /// had on the previous frame, the `ScrollArea` inside it from the
+        /// frame after that, and the card re-centres as its body settles --
+        /// measured, the rows sixty points higher on the fifth frame than on
+        /// the third, and the hint under them painted only from the fourth.
+        /// So the frame read is the fifth.
         fn frame(&self, draft: &mut SequenceDraft) -> Painted {
-            let _ = self.frame_with(draft, &[]);
-            let _ = self.frame_with(draft, &[]);
+            for _ in 0..4 {
+                let _ = self.frame_with(draft, &[]);
+            }
             self.frame_with(draft, &[])
         }
 
@@ -2434,6 +3114,69 @@ mod tests {
             let _ = self.frame_with(draft, &[egui::Event::PointerMoved(at), button(true)]);
             let _ = self.frame_with(draft, &[button(false)]);
             self.frame_with(draft, &[])
+        }
+
+        /// A press at `from`, the pointer carried to `to` in four moves --
+        /// egui counts a press a drag once it has travelled, so one move is
+        /// not enough -- and a release there. Answers the frame after.
+        fn drag(&self, draft: &mut SequenceDraft, from: egui::Pos2, to: egui::Pos2) -> Painted {
+            let button = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = self.frame_with(draft, &[egui::Event::PointerMoved(from), button(from, true)]);
+            for step in 1..=4 {
+                let at = from + (to - from) * (step as f32 / 4.0);
+                let _ = self.frame_with(draft, &[egui::Event::PointerMoved(at)]);
+            }
+            let _ = self.frame_with(draft, &[button(to, false)]);
+            self.frame_with(draft, &[])
+        }
+
+        /// One key, pressed and released, then the frame after.
+        fn key(&self, draft: &mut SequenceDraft, key: egui::Key, modifiers: egui::Modifiers) -> Painted {
+            let event = |pressed| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed,
+                repeat: false,
+                modifiers,
+            };
+            let _ = self.frame_with_input(
+                draft,
+                egui::RawInput { modifiers, ..self.input(&[event(true)]) },
+            );
+            let _ = self.frame_with(draft, &[event(false)]);
+            self.frame_with(draft, &[])
+        }
+
+        fn frame_with_input(&self, draft: &mut SequenceDraft, input: egui::RawInput) -> Painted {
+            let palette = vec![FieldRef::Username, FieldRef::Password];
+            let totp = crate::vault_window::detail::TotpState::NoSecret;
+            let source = ResolveSource {
+                username: "a.novak@ledgerline.com",
+                password: "correct-horse-battery",
+                custom: Vec::new(),
+                totp: &totp,
+            };
+            let mut apps = AppIdentityCache::default();
+            let output = self.ctx.run_ui(input, |ui| {
+                let _ = draw_sequence_builder(
+                    ui,
+                    draft,
+                    &palette,
+                    &source,
+                    self.icon.as_ref(),
+                    &mut apps,
+                );
+            });
+            let mut painted = Painted::default();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut painted);
+            }
+            painted
         }
     }
 
@@ -2521,39 +3264,41 @@ mod tests {
     }
 
     /// **With the design's content in the 640-point card the chips drop under
-    /// the app's name**, and the band is still one line: the two tiles share
-    /// the row's middle and the chips sit under the second name.
-    ///
-    /// The two NAMES do not share a line, and are not asserted to: 4a's
-    /// `align-items: center` centres each subject's column on the row, and
-    /// the app's column is a chip row taller than the item's, so the item's
-    /// name sits lower by half of that. Measured: `SAP Production` centred
-    /// on 216 and `SAP Logon 760` on 205.5, the tiles both on 209.
+    /// the app's name**, and the band is still one line: the two tiles and
+    /// the two captions share their lines, and the chips sit under the second
+    /// name. See [`BandSubject::draw`] for why the captions, and not the
+    /// columns' middles, are what line up.
     #[test]
     fn the_chips_drop_under_the_apps_name_and_the_band_stays_one_line() {
         let modal = Modal::over(WINDOWS[0]);
         let painted = modal.frame(&mut draft());
         let item_tile = painted.rect_of("SP");
         let app_tile = painted.rect_of("SL");
-        let app = painted.rect_of("SAP Logon 760");
+        let item_caption = painted.rect_of("VAULT ITEM");
+        let app_caption = painted.rect_of("SENDS ONLY TO");
         let process = painted.rect_of("saplogon.exe");
         let class = painted.rect_of("SAPFEWndClass");
         assert!(
             (item_tile.center().y - app_tile.center().y).abs() <= 0.5,
             "the two tiles are not on one line: {item_tile:?} and {app_tile:?}"
         );
-        assert!(app_tile.right() < app.left(), "the app's name is not beside its tile");
         assert!(
-            process.top() >= app.bottom() && class.top() >= app.bottom(),
-            "the chips did not drop under the name: name {app:?}, chips {process:?} {class:?}"
+            (item_caption.center().y - app_caption.center().y).abs() <= 0.5,
+            "the two captions are not on one line: {item_caption:?} and {app_caption:?}"
+        );
+        assert!(
+            app_caption.top() >= app_tile.top() - 12.0,
+            "the caption {app_caption:?} starts above its tile {app_tile:?}"
+        );
+        assert!(app_tile.right() < app_caption.left(), "the caption is not beside its tile");
+        assert!(
+            process.top() >= app_caption.bottom() && class.top() >= app_caption.bottom(),
+            "the chips did not drop under the name: caption {app_caption:?}, chips {process:?} {class:?}"
         );
         assert!(
             (process.center().y - class.center().y).abs() <= 0.5 && process.right() < class.left(),
             "the two chips are not on one line in order"
         );
-        // 4a's small capitals, from sentence-case constants.
-        assert!(painted.strings().contains(&"VAULT ITEM"));
-        assert!(painted.strings().contains(&"SENDS ONLY TO"));
     }
 
     /// **An app name the line cannot hold puts the app on a second line, with
@@ -2614,9 +3359,11 @@ mod tests {
     }
 
     /// **4a's SEQUENCE band**: the caption in capitals, the tally without the
-    /// edit form's "total", and the two on the pill's line.
+    /// edit form's "total", and the two on the pill's line -- and no card
+    /// round it: the tint is square, and nothing with the section card's
+    /// radius is painted round the rows.
     #[test]
-    fn the_sequence_band_is_4as_caption_tally_and_pill_on_one_line() {
+    fn the_sequence_band_is_a_square_tint_with_the_caption_tally_and_pill_on_one_line() {
         let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
         let caption = painted.rect_of("SEQUENCE");
         let tally = painted
@@ -2635,24 +3382,35 @@ mod tests {
             );
         }
         assert!(caption.right() < tally.1.left() && tally.1.right() < steps.left());
+        let tint = painted
+            .rects
+            .iter()
+            .find(|r| r.fill == theme::CARD_TINT && r.rect.contains_rect(caption))
+            .expect("the band's tint is painted");
+        assert_eq!(tint.corners, CornerRadius::ZERO, "the band has a card's corners");
+        // Nothing with a section card's edge encloses the band and the rows.
+        let row = painted.row_around(painted.rect_of("Tab"));
+        assert!(
+            !painted.rects.iter().any(|r| {
+                r.stroke == theme::HAIRLINE && r.rect.contains_rect(tint.rect) && r.rect.contains_rect(row)
+            }),
+            "a card is drawn round the SEQUENCE band and its rows"
+        );
     }
 
-    /// **Every cell of a step row sits on the row's line.** The defect this
-    /// holds against was found by measuring and not by looking: egui centres
-    /// each child on the band as it stands when that child is placed, so
-    /// the grip, index and kind chip -- placed first -- sat three points
-    /// above the controls placed after them. See [`centred_row`].
+    /// **Every cell of a step row sits on the row's line**, and there are no
+    /// controls on it: a handle, an index, a chip, the step, a far cell.
     #[test]
-    fn every_cell_of_a_step_row_is_on_the_rows_line() {
+    fn every_cell_of_a_step_row_is_on_the_rows_line_and_no_control_is() {
         let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
-        // Row two: `Tab`, a keycap. Its index, its `KEY` chip, its `—`, and
-        // its three controls.
+        // Row two: `Tab`, a keycap. Its index, its `KEY` chip and its `—`.
         let keycap = painted.rect_of("Tab");
+        let row = painted.row_around(keycap);
         let on_row = |text: &str| -> egui::Rect {
             let found: Vec<egui::Rect> = painted
                 .rects_of(text)
                 .into_iter()
-                .filter(|r| (r.center().y - keycap.center().y).abs() < 12.0)
+                .filter(|r| row.contains_rect(*r))
                 .collect();
             assert_eq!(found.len(), 1, "expected one {text:?} on the Tab row, found {}", found.len());
             found[0]
@@ -2663,45 +3421,93 @@ mod tests {
         // 12-point mono face divide differently. Measured: `KEY`'s box
         // centred on 425 and `Tab`'s on 427, both inks on 425, the row on
         // 426. Three points was the defect; two is the box.
-        let row = painted
-            .rects
-            .iter()
-            .find(|r| {
-                r.fill == theme::CARD && r.stroke == theme::HAIRLINE && r.rect.contains_rect(keycap)
-            })
-            .map(|r| r.rect)
-            .expect("the Tab row's frame is painted");
-        for text in ["2", "KEY", "\u{2014}", "<", ">", "x", "Tab"] {
+        for text in ["2", "KEY", "\u{2014}", "Tab"] {
             let rect = on_row(text);
             assert!(
                 (rect.center().y - row.center().y).abs() <= 2.0,
                 "{text:?} at {rect:?} is off the row's line at {row:?}"
             );
         }
-        // And in 4a's order across the row.
-        let (index, kind, dash, back, forward, remove) =
-            (on_row("2"), on_row("KEY"), on_row("\u{2014}"), on_row("<"), on_row(">"), on_row("x"));
-        assert!(index.right() <= kind.left() && kind.right() <= keycap.left());
-        assert!(keycap.right() <= dash.left() && dash.right() <= back.left());
-        assert!(back.right() <= forward.left() && forward.right() <= remove.left());
+        let grip = painted.grip_of(row);
+        assert!((grip.center().y - row.center().y).abs() <= 1.0, "the handle is off the line");
+        // In 4a's order across the row.
+        let (index, kind, dash) = (on_row("2"), on_row("KEY"), on_row("\u{2014}"));
+        assert!(grip.right() <= index.left() && index.right() <= kind.left());
+        assert!(kind.right() <= keycap.left() && keycap.right() <= dash.left());
+        for control in ["<", ">", "x"] {
+            assert!(
+                painted.rects_of(control).is_empty(),
+                "the row still carries a {control:?} control"
+            );
+        }
+        assert!(painted.strings().contains(&REORDER_HINT), "the list does not say how it is edited");
     }
 
-    /// **A row's own `x` takes away that row's step.** The third of five, so
-    /// neither the first nor the last: a control bound to the wrong index in
-    /// either direction is visible.
+    /// **Dragging a step's handle onto another row moves it there.** The
+    /// third of five, `Password`, carried up over `Tab` and dropped in the
+    /// upper half of `Tab`'s row: the slot above `Tab`.
     #[test]
-    fn a_rows_own_remove_control_takes_away_that_step() {
+    fn dragging_a_steps_handle_over_another_row_moves_it_there() {
         let modal = Modal::over(WINDOWS[0]);
         let mut draft = draft();
         let painted = modal.frame(&mut draft);
-        let password = painted.rect_of("Password");
-        let remove: Vec<egui::Rect> = painted
-            .rects_of("x")
+        let from = painted.row_around(painted.rect_of("Password"));
+        let onto = painted.row_around(painted.rect_of("Tab"));
+        let grip = painted.grip_of(from);
+        let to = egui::pos2(grip.center().x, onto.top() + onto.height() * 0.25);
+        let after = modal.drag(&mut draft, grip.center(), to);
+        assert_eq!(
+            draft.sequence, "{USERNAME}{PASSWORD}{TAB}{DELAY 250}{ENTER}",
+            "the drop did not move the step. Painted: {:?}",
+            after.strings()
+        );
+        // And the moved step is the selection, so the keyboard can carry on
+        // with it -- where it IS: dropped beside `Username`, the two fields
+        // are one text step, and that step is the first.
+        assert_eq!(draft.selected, Some(0));
+    }
+
+    /// **A drag released off the list moves nothing**: the payload is left
+    /// for egui to clear, and the string is untouched.
+    #[test]
+    fn a_drag_released_off_the_list_moves_nothing() {
+        let modal = Modal::over(WINDOWS[0]);
+        let mut draft = draft();
+        let painted = modal.frame(&mut draft);
+        let before = draft.sequence.clone();
+        let from = painted.row_around(painted.rect_of("Password"));
+        let grip = painted.grip_of(from);
+        let card = painted.card();
+        let _ = modal.drag(&mut draft, grip.center(), egui::pos2(card.left() - 30.0, grip.center().y));
+        assert_eq!(draft.sequence, before);
+    }
+
+    /// **A clicked row is the selection, and Delete takes it away**; Alt+Down
+    /// moves it. The keyboard's parity with the drag, driven through real
+    /// key events.
+    #[test]
+    fn a_selected_step_is_removed_by_delete_and_moved_by_alt_and_an_arrow() {
+        let modal = Modal::over(WINDOWS[0]);
+        let mut draft = draft();
+        let painted = modal.frame(&mut draft);
+        let row = painted.row_around(painted.rect_of("Tab"));
+        // Click the row's far cell, which is the row and nothing else.
+        let dash = painted
+            .rects_of("\u{2014}")
             .into_iter()
-            .filter(|r| (r.center().y - password.center().y).abs() < 12.0)
-            .collect();
-        assert_eq!(remove.len(), 1, "expected one `x` on the Password row");
-        let _ = modal.click(&mut draft, remove[0].center());
-        assert_eq!(draft.sequence, "{USERNAME}{TAB}{DELAY 250}{ENTER}");
+            .find(|r| row.contains_rect(*r))
+            .expect("the Tab row's dash");
+        let _ = modal.click(&mut draft, dash.center());
+        assert_eq!(draft.selected, Some(1), "the click did not select the row");
+
+        let _ = modal.key(&mut draft, egui::Key::ArrowDown, egui::Modifiers::ALT);
+        assert_eq!(draft.sequence, "{USERNAME}{PASSWORD}{TAB}{DELAY 250}{ENTER}");
+        // Past `Password`, which merged with `Username` behind it: the list
+        // is a step shorter and `Tab` is its second, not its third.
+        assert_eq!(draft.selected, Some(1), "the selection did not follow the step");
+
+        let _ = modal.key(&mut draft, egui::Key::Delete, egui::Modifiers::NONE);
+        assert_eq!(draft.sequence, "{USERNAME}{PASSWORD}{DELAY 250}{ENTER}");
+        assert_eq!(draft.selected, None);
     }
 }

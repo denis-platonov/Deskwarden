@@ -5892,7 +5892,7 @@ pub fn sequence_view(sequence: &str) -> SequenceView {
 /// existing vault. So a user who deletes every chip is put back where they
 /// started, with the notice saying so, rather than silently given an item that
 /// stops filling.
-fn store(tokens: &[key_sequence::Token]) -> String {
+pub(crate) fn store(tokens: &[key_sequence::Token]) -> String {
     if tokens.is_empty() {
         String::new()
     } else {
@@ -7746,17 +7746,8 @@ pub(crate) fn small_chip_button(caption: &str) -> egui::Button<'static> {
     .corner_radius(CornerRadius::same(5))
 }
 
-/// [`small_chip_button`]'s caption size, named so its height can be asked
-/// for by a row that has to know its band before it places one.
+/// [`small_chip_button`]'s caption size.
 const SMALL_CHIP_PX: f32 = 11.0;
-
-/// What [`small_chip_button`] stands: its caption's row inside the style's
-/// button padding. For `sequence_builder`'s rows, which are sized to their
-/// tallest cell before anything is laid on them.
-pub(crate) fn small_chip_button_height(ui: &egui::Ui) -> f32 {
-    let face = egui::FontId::new(SMALL_CHIP_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-    ui.ctx().fonts_mut(|f| f.row_height(&face)) + ui.spacing().button_padding.y * 2.0
-}
 
 /// The resolved preview. Draws and drops -- see [`PreviewPart`].
 fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
@@ -8070,9 +8061,8 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
         &mut app.sequence,
         &mut app.template_touched,
         fault,
-        source,
-        |ui, rows| {
-            let _ = sequence_steps(ui, rows, false);
+        |ui, sequence| {
+            let _ = sequence_steps(ui, &step_rows(sequence, source, false), false);
         },
     );
 }
@@ -8092,9 +8082,10 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
 /// looked at leaves the item untouched, and a template that is edited stores
 /// the user's own bytes rather than this build's spelling of them.
 ///
-/// `steps` draws the read-out under the field. A closure rather than a call
-/// to [`sequence_steps`], because the two callers draw a step row two ways:
-/// the edit form's list, at a 298-point pane, and the builder's 4a row, which
+/// `steps` draws the read-out under the field, handed the string as it
+/// stands. A closure rather than a call to [`sequence_steps`], because the
+/// two callers draw a step row two ways: the edit form's list, at a 298-point
+/// pane and one row per token, and the builder's 4a row, one per act, which
 /// needs more than that pane has (see `sequence_builder::step_list`). What is
 /// shared is the bridge; what is handed in is the row.
 pub(crate) fn template_editor(
@@ -8103,8 +8094,7 @@ pub(crate) fn template_editor(
     sequence: &mut String,
     touched: &mut bool,
     fault: Option<&'static str>,
-    source: &ResolveSource<'_>,
-    steps: impl FnOnce(&mut egui::Ui, &[StepRow]),
+    steps: impl FnOnce(&mut egui::Ui, &str),
 ) {
     // Multiline, because a sequence with a wait and a rate in it is longer
     // than the edit form's pane is wide and that pane refuses horizontal
@@ -8152,7 +8142,7 @@ pub(crate) fn template_editor(
     // what it became.
     ui.label(RichText::new(TEMPLATE_READS_AS).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(4.0);
-    steps(ui, &step_rows(sequence, source, false));
+    steps(ui, sequence);
 }
 
 /// `sequence` with the edit a step row's controls asked for applied.
