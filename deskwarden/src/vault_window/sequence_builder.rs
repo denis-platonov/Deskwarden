@@ -38,12 +38,13 @@
 //! **The hatch on the password step.** [`super::detail_edit`] argues that one
 //! at length: the colour carries the meaning and egui has no tiling brush.
 
+use crate::app_identity::AppIdentityCache;
 use crate::key_sequence::{self, FieldRef, ResolveSource, Token};
 use crate::theme;
 use crate::vault_window::detail_edit::{
-    self, sequence_tally, step_rows, StepKind,
+    self, sequence_tally, step_rows, ChipEdit, StepKind, StepRow,
 };
-use eframe::egui::{self, CornerRadius, Margin, RichText};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -577,6 +578,110 @@ const BAND_TILE_GAP: f32 = 11.0;
 const BAND_ARROW_RULE: f32 = 34.0;
 const BAND_ARROW_GAP: f32 = 6.0;
 
+/// 4a's caption over each subject: `font-size: 11px; font-weight: 700;
+/// letter-spacing: 0.08em`.
+const BAND_CAPTION_PX: f32 = 11.0;
+const BAND_CAPTION_TRACKING: f32 = 0.08;
+
+/// The name under it, `font-size: 14px; font-weight: 700`, and `gap: 8px`
+/// between the name and what sits beside it; the folder beside the item's
+/// name at the small size.
+const BAND_NAME_PX: f32 = 14.0;
+const BAND_NAME_GAP: f32 = 8.0;
+const BAND_FOLDER_PX: f32 = 11.0;
+
+/// `gap: 2px` between a subject's caption and its name.
+const BAND_COLUMN_GAP: f32 = 2.0;
+
+/// The chip beside a name: `font-size: 11px; border-radius: 5px; padding: 2px
+/// 7px`.
+const BAND_CHIP_PX: f32 = 11.0;
+const BAND_CHIP_PAD_X: f32 = 7.0;
+const BAND_CHIP_PAD_Y: f32 = 2.0;
+const BAND_CHIP_RADIUS: u8 = 5;
+
+/// When the chips drop UNDER the app's name (see [`destination_band`]), the
+/// space between the name and them. Not a declaration of 4a's, which never
+/// drops them: the column's `2px` is between two text runs whose line boxes
+/// already carry slack, and a filled chip has none, so it gets two more.
+const BAND_CHIPS_UNDER_GAP: f32 = 4.0;
+
+/// Between the band's two lines when it takes two. Not 4a's either, for the
+/// same reason: the band's own `16px` would read as a third subject's worth
+/// of air, and the `8px` inside a name line as none.
+const BAND_LINE_GAP: f32 = 12.0;
+
+/// 4a's SEQUENCE band: `padding: 12px 20px; gap: 10px`, its runs at
+/// `font-size: 12px`, the caption tracked `0.08em`.
+const SEQUENCE_BAND_PAD_X: i8 = 20;
+const SEQUENCE_BAND_PAD_Y: i8 = 12;
+const SEQUENCE_BAND_GAP: f32 = 10.0;
+const SEQUENCE_BAND_PX: f32 = 12.0;
+const SEQUENCE_BAND_TRACKING: f32 = 0.08;
+
+/// 4a's step row: `gap: 12px; border-radius: 10px; padding: 11px 14px`, and
+/// the column's `gap: 8px` between rows.
+const STEP_ROW_GAP_X: f32 = 12.0;
+const STEP_ROW_RADIUS: u8 = 10;
+const STEP_ROW_PAD_X: i8 = 14;
+const STEP_ROW_PAD_Y: i8 = 11;
+const STEP_ROW_GAP: f32 = 8.0;
+
+/// The handle: a `width: 20px` column of three `12px` by `2px` bars, `gap:
+/// 3px`.
+const STEP_GRIP_WIDTH: f32 = 20.0;
+const STEP_GRIP_BAR: egui::Vec2 = egui::vec2(12.0, 2.0);
+const STEP_GRIP_GAP: f32 = 3.0;
+
+/// The index: mono `font-size: 12px` in a `width: 14px` column.
+const STEP_INDEX_WIDTH: f32 = 14.0;
+const STEP_INDEX_PX: f32 = 12.0;
+
+/// The kind chip: `width: 52px; padding: 3px 0; border-radius: 5px;
+/// font-size: 11px; letter-spacing: 0.06em`.
+const STEP_KIND_WIDTH: f32 = 52.0;
+const STEP_KIND_PAD_Y: f32 = 3.0;
+const STEP_KIND_RADIUS: u8 = 5;
+const STEP_KIND_PX: f32 = 11.0;
+const STEP_KIND_TRACKING: f32 = 0.06;
+
+/// A keycap: mono `font-size: 12px; border: 1px solid; border-bottom-width:
+/// 2px; border-radius: 5px; padding: 2px 7px`.
+const KEYCAP_PX: f32 = 12.0;
+const KEYCAP_PAD_X: f32 = 7.0;
+const KEYCAP_PAD_Y: f32 = 2.0;
+const KEYCAP_RADIUS: u8 = 5;
+const KEYCAP_EDGE: f32 = 1.0;
+const KEYCAP_FOOT: f32 = 2.0;
+
+/// A field pill: `gap: 6px; border-radius: 6px; padding: 3px 8px`, a
+/// 12-point mark and the name at `font-size: 12px`.
+const FIELD_PILL_GAP: f32 = 6.0;
+const FIELD_PILL_RADIUS: u8 = 6;
+const FIELD_PILL_PAD_X: f32 = 8.0;
+const FIELD_PILL_PAD_Y: f32 = 3.0;
+const FIELD_PILL_MARK: f32 = 12.0;
+const FIELD_PILL_PX: f32 = 12.0;
+
+/// The middle cell's gap by kind -- `7px` on a key row, `8px` on a text row,
+/// `10px` on a wait row -- the explanation's `padding-left: 4px`, and the
+/// space between the middle's lines when it wraps (not 4a's; it never
+/// wraps).
+const STEP_KEY_GAP: f32 = 7.0;
+const STEP_TEXT_GAP: f32 = 8.0;
+const STEP_WAIT_GAP: f32 = 10.0;
+const STEP_ASIDE_INSET: f32 = 4.0;
+const STEP_WRAP_GAP: f32 = 3.0;
+
+/// The runs: `font-size: 12px` on the explanation, the value and the far
+/// cell's dash, mono `13px` on a wait, mono `11px` on a rate.
+const STEP_TEXT_PX: f32 = 12.0;
+const STEP_WAIT_PX: f32 = 13.0;
+const STEP_RATE_PX: f32 = 11.0;
+
+/// Between the row's three move-and-remove controls, which 4a does not draw.
+const STEP_CONTROL_GAP: f32 = 6.0;
+
 pub const SCREEN_TITLE: &str = "Fill rule";
 pub const SAVE_LABEL: &str = "Save rule";
 pub const SAVE_BLOCKED_LABEL: &str = "Save (fix the template)";
@@ -587,11 +692,6 @@ pub const SEQUENCE_HEADING: &str = "Sequence";
 pub const TIMING_HEADING: &str = "Timing";
 pub const CHECKS_HEADING: &str = "Checks";
 pub const BUDGET_HEADING: &str = "Budget";
-
-/// The sentence under the app card. The rule the gate really enforces, in the
-/// design's own words.
-pub const REFUSED_ELSEWHERE: &str =
-    "Any window that is not this process will be refused at send time, even on the hotkey.";
 
 /// The note under the rehearse button -- 4d's own sentence, which the edit
 /// form had no room for and this screen does.
@@ -617,13 +717,35 @@ const HIDE: &str = "Hide what it types";
 /// The two controls were in the header and are in the footer, which is where
 /// this app puts an answer; `Discard` is the outlined left-hand one because
 /// the way out is always the quieter of the two.
+///
+/// `item_icon` is the caller's `icons.textures.get(item.id)`, the texture the
+/// read pane's header draws; `apps` is the window's identity cache, asked for
+/// the bound program's icon. Both are for the tiles in [`destination_band`].
 pub fn draw_sequence_builder(
     ui: &mut egui::Ui,
     draft: &mut SequenceDraft,
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
+    item_icon: Option<&egui::TextureHandle>,
+    apps: &mut AppIdentityCache,
 ) -> BuilderAction {
     let ctx = ui.ctx().clone();
+
+    // **The bound app's icon, asked of the cache once per frame and copied
+    // out**, so the borrow of `apps` is over before the card's two closures
+    // take the draft. `known_label` and not `label`: this path is a stored
+    // binding's, proved when the binding was made, not one being typed --
+    // which is the case the debounce behind `label` exists for. The name is
+    // not read from it: `draft.app_name` was resolved by the caller off the
+    // same cache when the screen opened.
+    let app_icon = {
+        let label = apps.known_label(&ctx, &draft.app.path, &draft.app.process);
+        if label.pending {
+            // A channel is not input, and egui does not repaint for one.
+            ctx.request_repaint_after(AppIdentityCache::POLL_INTERVAL);
+        }
+        label.icon.cloned()
+    };
     // **The scrim's id is a LITERAL**, and `item_list::MODAL_SCRIM_AREAS` is
     // kept honest by a walk over this crate's sources looking for exactly this
     // declaration. That list answers "is a modal up" for the item list's arrow
@@ -671,7 +793,7 @@ pub fn draw_sequence_builder(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    destination_band(ui, draft);
+                    destination_band(ui, draft, item_icon, app_icon.as_ref());
                     ui.add_space(theme::SECTION_GAP);
                     steps_column(ui, draft, palette, source);
                 });
@@ -714,124 +836,387 @@ fn body_height(ctx: &egui::Context) -> f32 {
     (ctx.content_rect().height() - 2.0 * CARD_GUTTER - CARD_CHROME).max(240.0)
 }
 
-/// **4a's band under the header: what the rule belongs to, what it may type
-/// into, and the warning that the two are the whole of it.**
+/// **4a's band under the header: what the rule belongs to, and what it may
+/// type into.**
 ///
 /// A BAND and not a rail. It was drawn as a column of two cards beside the
 /// steps, which made a three-column picture out of a two-column design and cost
 /// the steps 252 points of the width they are the point of. 4a runs it across
 /// the full width -- `padding: 16px 20px`, the two tiles 34 square with an
-/// arrow between them, the amber notice pushed to the far end -- and gives the
-/// grid under it `1fr 340px`.
+/// arrow between them -- and gives the grid under it `1fr 340px`.
 ///
 /// The arrow between the two halves is 4a's own: a 34-point rule, the mark, and
 /// another rule. It says the rule has a direction, which two cards stacked in a
 /// rail could not.
-fn destination_band(ui: &mut egui::Ui, draft: &SequenceDraft) {
+///
+/// **4a's amber notice at the band's far end is not drawn.** The owner pointed
+/// at it and said "remove". It was also what grew the card: a `Frame` inside a
+/// wrapping row is placed at the cursor before its size is known and never
+/// wraps, so the pill was laid at x = 822 against a lane that ended at 728,
+/// and the card followed it out to 1025 points -- measured in a 1240-point
+/// window, with the header band correctly at 642 across the top of it and the
+/// owner looking at the difference. The band is the two subjects and the
+/// arrow, and nothing else.
+///
+/// # How it wraps, and that it is decided rather than left to egui
+///
+/// 4a is drawn at 1240 points and this band has 560 to work with: the card's
+/// 640 less the modal's `20` a side and its own. With the design's content in
+/// it -- `SAP Production` filed under `Work`, `SAP Logon 760` with two chips --
+/// the vault item's half measures 183, the arrow 96 and the app's half 342,
+/// which with the two `gap: 18px` is 657: too wide by a hundred, so the
+/// COMMON case has to wrap. Left to a wrapping row it would not have: a
+/// `horizontal` inside one is placed at whatever width is left of the line
+/// and then overflows it, which is the 983-point band the probe found.
+///
+/// So the band measures its three groups first and takes the first of three
+/// forms that fits the lane:
+///
+/// 1. **4a exactly**: both subjects and the arrow on one line, the chips
+///    beside the app's name.
+/// 2. **The chips give first.** They drop under the app's name, inside the
+///    subject's own column, and the line holds. They are the widest thing in
+///    the band and the least important -- they qualify the name beside them
+///    -- so they are the first thing asked to move, and they move within
+///    their subject rather than off the line.
+/// 3. **Two lines**: the vault item on the first, the arrow and the app on
+///    the second. The arrow travels with the app because it points at it; a
+///    line ending in a bare arrow would read as a continuation mark. The
+///    chips take whichever of their two places fits that line.
+///
+/// [`band_form`] is the decision, pure, so it is tested on the numbers rather
+/// than inferred from a paint. Measured after the change, in the 640-point
+/// card with the content above: form 2, one line of 547 in the 560 lane.
+fn destination_band(
+    ui: &mut egui::Ui,
+    draft: &SequenceDraft,
+    item_icon: Option<&egui::TextureHandle>,
+    app_icon: Option<&egui::TextureHandle>,
+) {
     egui::Frame::new()
         .fill(theme::CARD)
         .inner_margin(Margin::symmetric(BAND_PAD_X, BAND_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            // The band's own right edge, read before anything is in it --
-            // NOT `available_width` measured inside the wrapping row below.
-            //
-            // In a wrapping layout `available_width` answers the WRAP width
-            // rather than what is left of the current line, and the push
-            // below is spent against it: inside a panel that was merely
-            // wrong by a little, and inside the `Area` this screen became it
-            // took the card to 1872 points on a 1240-point window -- the
-            // owner's "window is way to wide, should be size of modal". The
-            // same measurement `picker_footer` records, one screen over.
-            let line_right = ui.max_rect().right();
-            // Wrapped, because the band holds four things and the narrowest
-            // pane this app opens at cannot hold them on one line -- and a row
-            // that does not wrap pushes the card past the window instead of
-            // shrinking (`aae9429`).
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(BAND_GAP, 8.0);
-                band_subject(
-                    ui,
-                    VAULT_ITEM_HEADING,
-                    &draft.item_name,
-                    &draft.item_name,
-                    true,
-                    |ui| {
-                        if !draft.folder.is_empty() {
-                            ui.label(
-                                RichText::new(draft.folder.clone())
-                                    .size(11.0)
-                                    .color(theme::TEXT_FAINT),
-                            );
-                        }
-                    },
-                );
-                band_arrow(ui);
-                band_subject(
-                    ui,
-                    SENDS_TO_HEADING,
-                    &draft.app_name,
-                    &draft.app_name,
-                    false,
-                    |ui| {
-                        band_chip(ui, &draft.app.process);
-                        // Only when it is really part of the rule: a title
-                        // needle is read for a hosted window and ignored
-                        // otherwise, so printing one here on an ordinary
-                        // process would name a condition that does not apply.
-                        if draft.app.hosted && !draft.app.title.is_empty() {
-                            band_chip(ui, &draft.app.title);
-                        }
-                    },
-                );
-                // **Pushed to the far end**, which is where 4a's `flex: 1`
-                // spacer puts it -- and only when the line still has room for
-                // it, so a narrow window wraps it under the two subjects
-                // rather than reserving a lane it cannot fill.
-                let want = line_right - ui.cursor().min.x;
-                if want > BAND_NOTICE_WIDTH {
-                    ui.add_space(want - BAND_NOTICE_WIDTH);
+            // The band's own lane, read before a row is begun -- NOT
+            // `available_width` inside a wrapping row, which answers the
+            // wrap width rather than what is left of the line (`3168f5a`).
+            let lane = ui.available_width();
+            let chips = band_chips(draft);
+            let item = BandSubject {
+                caption: VAULT_ITEM_HEADING,
+                name: &draft.item_name,
+                icon: item_icon,
+                accent: true,
+                beside: BandBeside::Folder(&draft.folder),
+            };
+            let app = BandSubject {
+                caption: SENDS_TO_HEADING,
+                name: &draft.app_name,
+                icon: app_icon,
+                accent: false,
+                beside: BandBeside::Chips(&chips),
+            };
+            let form = band_form(
+                lane,
+                item.size(ui, ChipsGo::Beside).x,
+                band_arrow_width(),
+                app.size(ui, ChipsGo::Beside).x,
+                app.size(ui, ChipsGo::Under).x,
+            );
+            // 4a's `align-items: center`, which in egui means giving each
+            // line its height before anything is placed on it -- see
+            // [`centred_row`] for the measurement.
+            match form {
+                BandForm::OneLine(chips_go) => {
+                    let height = item.size(ui, ChipsGo::Beside).y.max(app.size(ui, chips_go).y);
+                    centred_row(ui, height, |ui| {
+                        ui.spacing_mut().item_spacing.x = BAND_GAP;
+                        item.draw(ui, ChipsGo::Beside);
+                        band_arrow(ui);
+                        app.draw(ui, chips_go);
+                    });
                 }
-                band_caution(ui, REFUSED_ELSEWHERE);
-            });
+                BandForm::TwoLines(chips_go) => {
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = BAND_LINE_GAP;
+                        item.draw(ui, ChipsGo::Beside);
+                        centred_row(ui, app.size(ui, chips_go).y, |ui| {
+                            ui.spacing_mut().item_spacing.x = BAND_GAP;
+                            band_arrow(ui);
+                            app.draw(ui, chips_go);
+                        });
+                    });
+                }
+            }
         });
     theme::hairline(ui);
+}
+
+/// Where the app subject's chips go. See [`destination_band`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChipsGo {
+    /// 4a's own: on the name's line, after it.
+    Beside,
+    /// Under the name, in the subject's column.
+    Under,
+}
+
+/// Which of [`destination_band`]'s three forms the lane allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BandForm {
+    OneLine(ChipsGo),
+    TwoLines(ChipsGo),
+}
+
+/// The decision behind [`destination_band`], on widths alone: the lane, the
+/// vault item's half, the arrow, and the app's half with its chips beside the
+/// name and under it. First of the three forms that fits, in the order the
+/// band's doc argues.
+fn band_form(lane: f32, item: f32, arrow: f32, app_beside: f32, app_under: f32) -> BandForm {
+    let one_line = |app: f32| item + BAND_GAP + arrow + BAND_GAP + app <= lane;
+    if one_line(app_beside) {
+        BandForm::OneLine(ChipsGo::Beside)
+    } else if one_line(app_under) {
+        BandForm::OneLine(ChipsGo::Under)
+    } else if arrow + BAND_GAP + app_beside <= lane {
+        BandForm::TwoLines(ChipsGo::Beside)
+    } else {
+        BandForm::TwoLines(ChipsGo::Under)
+    }
+}
+
+/// The chips after the app's name: its process, and its window title when
+/// the title is really part of the rule.
+///
+/// A title needle is read for a hosted window and ignored otherwise, so
+/// printing one here on an ordinary process would name a condition that does
+/// not apply.
+fn band_chips(draft: &SequenceDraft) -> Vec<String> {
+    let mut chips = vec![draft.app.process.clone()];
+    if draft.app.hosted && !draft.app.title.is_empty() {
+        chips.push(draft.app.title.clone());
+    }
+    chips
+}
+
+/// What sits beside a subject's name on its line.
+enum BandBeside<'a> {
+    /// The vault item's folder, in the faint ink. Nothing when unfiled.
+    Folder(&'a str),
+    /// The app's [`band_chips`].
+    Chips(&'a [String]),
 }
 
 /// One half of [`destination_band`]: a tile, a caption in 4a's small capitals,
 /// and a name with whatever the caller puts beside it.
 ///
 /// `accent` picks 4a's two tile treatments apart -- the vault item's is the
-/// brand wash (`background: #eef2fc; border: 1px solid #b8c7ea`) and the app's
-/// the plain grey one -- which is the only thing that says which end of the
-/// arrow is which when both names are words.
-fn band_subject(
-    ui: &mut egui::Ui,
-    caption: &str,
-    initials_of: &str,
-    name: &str,
+/// brand wash (`border: 1px solid #b8c7ea`, the monogram in `#1b3fa0`) and the
+/// app's the plain grey one (`#eae7e7`, `#605d5d`) -- which is the only thing
+/// that says which end of the arrow is which when both names are words.
+///
+/// **The tile shows the real artwork when there is any**, and the monogram
+/// only as the fallback: the item's favicon, which the read pane's header
+/// under the scrim was drawing a click ago, and the program's own icon, which
+/// [`crate::app_identity::AppIdentityCache`] resolved for the edit form's app
+/// row. Through [`theme::avatar_artwork_tile`] and [`theme::avatar_image`],
+/// as that row draws it: the artwork and the monogram are the same tile, at
+/// the same size, with the same edge, and only the contents differ. 4a fills
+/// both tiles (`#eef2fc`, `#f3f2f2`) and this app's avatar tile does not, at
+/// the owner's word -- see [`theme::avatar`] -- so what this band draws is
+/// the app's tile, not the picture's.
+///
+/// The tile is 34 where the crate's other avatars are 32. `favicon::decode_rgba`
+/// keeps a 64-pixel copy, sized for a 32-point draw at 200%; here the artwork
+/// box is `theme::ARTWORK_BOX` of 34, which at 200% is 41 pixels and well
+/// inside that.
+struct BandSubject<'a> {
+    caption: &'static str,
+    name: &'a str,
+    icon: Option<&'a egui::TextureHandle>,
     accent: bool,
-    beside: impl FnOnce(&mut egui::Ui),
-) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = BAND_TILE_GAP;
-        theme::avatar(ui, &theme::initials(initials_of), BAND_TILE, accent);
-        ui.vertical(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            ui.label(theme::letterspaced(
-                caption,
-                11.0,
-                theme::BOLD,
-                0.08,
-                theme::TEXT_GHOST,
-            ));
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                ui.label(theme::bold(name, 14.0).color(theme::INK));
-                beside(ui);
+    beside: BandBeside<'a>,
+}
+
+impl BandSubject<'_> {
+    /// 4a's caption: `font-size: 11px; font-weight: 700; letter-spacing:
+    /// 0.08em; text-transform: uppercase; color: #9b9797`. Uppercased here
+    /// rather than stored so, for the reason `theme::section_card_header`
+    /// gives: the capitals belong to this band, and the same strings are
+    /// printed in sentence case elsewhere.
+    fn caption_job(&self) -> egui::text::LayoutJob {
+        theme::letterspaced(
+            &self.caption.to_uppercase(),
+            BAND_CAPTION_PX,
+            theme::BOLD,
+            BAND_CAPTION_PX * BAND_CAPTION_TRACKING,
+            theme::TEXT_GHOST,
+        )
+    }
+
+    fn name_font() -> egui::FontId {
+        egui::FontId::new(BAND_NAME_PX, egui::FontFamily::Name(theme::BOLD.into()))
+    }
+
+    /// The galleys this subject is drawn from, with its chips where `go`
+    /// says, so the band can choose a form and size its rows before it draws
+    /// anything. **The same galleys the drawing spends**: a size measured
+    /// here and a size laid out below are the same number because they are
+    /// the same layout.
+    fn metrics(&self, ui: &egui::Ui, go: ChipsGo) -> SubjectMetrics {
+        let caption = ui.ctx().fonts_mut(|f| f.layout_job(self.caption_job())).size();
+        let name = run_size(ui, self.name, Self::name_font());
+        let (beside, under) = match (&self.beside, go) {
+            (BandBeside::Folder(folder), _) if folder.is_empty() => (egui::Vec2::ZERO, egui::Vec2::ZERO),
+            (BandBeside::Folder(folder), _) => {
+                let folder = run_size(ui, folder, egui::FontId::proportional(BAND_FOLDER_PX));
+                (egui::vec2(BAND_NAME_GAP + folder.x, folder.y), egui::Vec2::ZERO)
+            }
+            (BandBeside::Chips(chips), ChipsGo::Beside) => {
+                let mut beside = egui::Vec2::ZERO;
+                for chip in chips.iter().map(|chip| band_chip_size(ui, chip)) {
+                    beside.x += BAND_NAME_GAP + chip.x;
+                    beside.y = beside.y.max(chip.y);
+                }
+                (beside, egui::Vec2::ZERO)
+            }
+            (BandBeside::Chips(chips), ChipsGo::Under) => {
+                let mut under = egui::Vec2::ZERO;
+                for (i, chip) in chips.iter().map(|chip| band_chip_size(ui, chip)).enumerate() {
+                    under.x += chip.x + if i > 0 { BAND_NAME_GAP } else { 0.0 };
+                    under.y = under.y.max(chip.y);
+                }
+                (egui::Vec2::ZERO, under)
+            }
+        };
+        SubjectMetrics { caption, name, beside, under }
+    }
+
+    /// What the whole subject lays out as: the tile, its gap, and the column
+    /// beside it, as tall as the taller of the two.
+    fn size(&self, ui: &egui::Ui, go: ChipsGo) -> egui::Vec2 {
+        let column = self.metrics(ui, go).column();
+        egui::vec2(BAND_TILE + BAND_TILE_GAP + column.x, BAND_TILE.max(column.y))
+    }
+
+    fn draw(&self, ui: &mut egui::Ui, go: ChipsGo) {
+        let metrics = self.metrics(ui, go);
+        let column = metrics.column();
+        let size = egui::vec2(BAND_TILE + BAND_TILE_GAP + column.x, BAND_TILE.max(column.y));
+        // The subject's own row at its own size, and the column inside it at
+        // ITS own size: a `vertical` of unknown height dropped into a centred
+        // row is placed by the height egui guesses for it and grows downward
+        // from there, which is the tile a third of the way up its column
+        // that the probe found (the app's tile at 192..226 against a column
+        // running 192..245).
+        ui.allocate_ui_with_layout(size, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = BAND_TILE_GAP;
+            match self.icon {
+                Some(texture) => {
+                    let tile = theme::avatar_artwork_tile(ui, BAND_TILE, self.accent);
+                    theme::avatar_image(ui, tile, texture, self.accent);
+                }
+                None => theme::avatar(ui, &theme::initials(self.name), BAND_TILE, self.accent),
+            }
+            ui.allocate_ui_with_layout(column, egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.spacing_mut().item_spacing.y = BAND_COLUMN_GAP;
+                ui.add(egui::Label::new(self.caption_job()).extend());
+                let line = metrics.line();
+                ui.allocate_ui_with_layout(
+                    line,
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.x = BAND_NAME_GAP;
+                        ui.add(
+                            egui::Label::new(
+                                theme::bold(self.name, BAND_NAME_PX).color(theme::INK),
+                            )
+                            .extend(),
+                        );
+                        match (&self.beside, go) {
+                            (BandBeside::Folder(folder), _) if !folder.is_empty() => {
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(*folder)
+                                            .size(BAND_FOLDER_PX)
+                                            .color(theme::TEXT_FAINT),
+                                    )
+                                    .extend(),
+                                );
+                            }
+                            (BandBeside::Chips(chips), ChipsGo::Beside) => {
+                                for chip in *chips {
+                                    band_chip(ui, chip);
+                                }
+                            }
+                            _ => {}
+                        }
+                    },
+                );
+                if let (BandBeside::Chips(chips), ChipsGo::Under) = (&self.beside, go) {
+                    ui.add_space(BAND_CHIPS_UNDER_GAP - BAND_COLUMN_GAP);
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = BAND_NAME_GAP;
+                        for chip in *chips {
+                            band_chip(ui, chip);
+                        }
+                    });
+                }
             });
         });
-    });
+    }
+}
+
+/// [`BandSubject::metrics`]: the caption's galley, the name's, whatever sits
+/// beside the name (its own gap included) and whatever sits under it.
+struct SubjectMetrics {
+    caption: egui::Vec2,
+    name: egui::Vec2,
+    beside: egui::Vec2,
+    under: egui::Vec2,
+}
+
+impl SubjectMetrics {
+    /// The name's line: the name and what is beside it, as tall as the
+    /// taller.
+    fn line(&self) -> egui::Vec2 {
+        egui::vec2(self.name.x + self.beside.x, self.name.y.max(self.beside.y))
+    }
+
+    /// The column: caption over line over whatever is under, at 4a's `gap:
+    /// 2px` and [`BAND_CHIPS_UNDER_GAP`].
+    fn column(&self) -> egui::Vec2 {
+        let line = self.line();
+        let under = if self.under.y > 0.0 { BAND_CHIPS_UNDER_GAP + self.under.y } else { 0.0 };
+        egui::vec2(
+            self.caption.x.max(line.x).max(self.under.x),
+            self.caption.y + BAND_COLUMN_GAP + line.y + under,
+        )
+    }
+}
+
+/// A row of `height`, laid left to right with every child centred on its
+/// middle -- `detail::header_row`'s idiom, for the reason it gives: egui
+/// centres each child on the band as it stands when that child is placed, so
+/// a row that finds its height from its tallest child leaves the ones placed
+/// before it sitting high. Measured here before the rows were given their
+/// heights: a step row's grip and kind chip centred on y = 378 with the
+/// controls beside them on 381, and the SEQUENCE caption on 312 against its
+/// pill's 317.
+fn centred_row<R>(ui: &mut egui::Ui, height: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), height),
+        egui::Layout::left_to_right(egui::Align::Center),
+        add,
+    )
+    .inner
+}
+
+/// The size of `text` set in `font` on one line: what an `extend`ed label of
+/// it is laid out as.
+fn run_size(ui: &egui::Ui, text: &str, font: egui::FontId) -> egui::Vec2 {
+    ui.painter().layout_no_wrap(text.to_string(), font, egui::Color32::BLACK).size()
 }
 
 /// 4a's mono chip beside a name in the band: `font-size: 11px; background:
@@ -839,17 +1224,26 @@ fn band_subject(
 fn band_chip(ui: &mut egui::Ui, text: &str) {
     let galley = ui.painter().layout_no_wrap(
         text.to_string(),
-        egui::FontId::new(11.0, egui::FontFamily::Monospace),
+        egui::FontId::new(BAND_CHIP_PX, egui::FontFamily::Monospace),
         theme::TEXT_SECONDARY,
     );
-    let size = egui::vec2(galley.size().x + 14.0, galley.size().y + 4.0);
+    let size = egui::vec2(
+        galley.size().x + BAND_CHIP_PAD_X * 2.0,
+        galley.size().y + BAND_CHIP_PAD_Y * 2.0,
+    );
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(5), theme::CANVAS);
+    ui.painter().rect_filled(rect, CornerRadius::same(BAND_CHIP_RADIUS), theme::CANVAS);
     ui.painter().galley(
-        egui::pos2(rect.left() + 7.0, rect.top() + 2.0),
+        egui::pos2(rect.left() + BAND_CHIP_PAD_X, rect.top() + BAND_CHIP_PAD_Y),
         galley,
         theme::TEXT_SECONDARY,
     );
+}
+
+/// What [`band_chip`] will allocate for `text`, for [`BandSubject::metrics`].
+fn band_chip_size(ui: &egui::Ui, text: &str) -> egui::Vec2 {
+    run_size(ui, text, egui::FontId::new(BAND_CHIP_PX, egui::FontFamily::Monospace))
+        + egui::vec2(BAND_CHIP_PAD_X * 2.0, BAND_CHIP_PAD_Y * 2.0)
 }
 
 /// 4a's `--->` between the two subjects: a rule, the mark, a rule.
@@ -858,8 +1252,10 @@ fn band_chip(ui: &mut egui::Ui, text: &str) {
 /// would spell it are not in the bundled face, and a glyph that falls through
 /// to whatever the system has is a different arrow on every machine.
 fn band_arrow(ui: &mut egui::Ui) {
-    let width = BAND_ARROW_RULE * 2.0 + BAND_ARROW_GAP * 2.0 + ARROW_MARK;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, BAND_TILE), egui::Sense::hover());
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(band_arrow_width(), BAND_TILE),
+        egui::Sense::hover(),
+    );
     let middle = rect.center().y;
     let painter = ui.painter();
     for left in [rect.left(), rect.right() - BAND_ARROW_RULE] {
@@ -887,58 +1283,13 @@ fn band_arrow(ui: &mut egui::Ui) {
     ));
 }
 
+/// What [`band_arrow`] allocates across: the two rules, their gaps, the mark.
+fn band_arrow_width() -> f32 {
+    BAND_ARROW_RULE * 2.0 + BAND_ARROW_GAP * 2.0 + ARROW_MARK
+}
+
 /// The arrow mark's own box: 4a's `<svg width="16" height="16">`.
 const ARROW_MARK: f32 = 16.0;
-
-/// How much of the band's line the amber notice is given at its far end --
-/// 4a's `max-width: 40ch` on that sentence, near enough.
-const BAND_NOTICE_WIDTH: f32 = 260.0;
-
-/// 4a's amber notice at the far end of the band: `padding: 7px 12px;
-/// border-radius: 8px; background: #fef6e7; border: 1px solid #f2d99b`, a
-/// 15-point mark, and the sentence in 12px `#7a4f05`.
-///
-/// Not `theme::form_card_caution`, which is 5a's full-bleed BAND in the danger
-/// palette: this is a pill inside a row, in the caution one.
-fn band_caution(ui: &mut egui::Ui, text: &str) {
-    let fill = ui.painter().add(egui::Shape::Noop);
-    let laid = egui::Frame::new()
-        .inner_margin(Margin::symmetric(12, 7))
-        .show(ui, |ui| {
-            // **The sentence is laid at a width this pill CHOOSES**, not at
-            // whatever is left of the line.
-            //
-            // 4a gives it `max-width: 40ch`. Left to egui it took its natural
-            // single-line width -- a nested `horizontal_top` lays a `Label`
-            // against the parent's `max_rect`, not against the wrapping row
-            // outside it -- and the pill ran 223 points past the card, which
-            // on this screen's `Area` is 223 points past the window. The
-            // owner: "window is way to wide, should be size of modal".
-            ui.set_max_width(BAND_NOTICE_WIDTH);
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                let (mark, _) =
-                    ui.allocate_exact_size(egui::Vec2::splat(15.0), egui::Sense::hover());
-                theme::paint_warning_glyph(ui.painter(), mark, theme::CAUTION_MARK);
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(text).size(12.0).color(theme::CAUTION_INK),
-                    )
-                    .wrap(),
-                );
-            });
-        });
-    ui.painter().set(
-        fill,
-        egui::epaint::RectShape::new(
-            laid.response.rect,
-            CornerRadius::same(8),
-            theme::CAUTION_WASH,
-            egui::Stroke::new(1.0, theme::CAUTION_EDGE),
-            egui::StrokeKind::Inside,
-        ),
-    );
-}
 
 /// 4a's middle column: the sequence, in whichever of its two views is up, and
 /// the palette that adds to it.
@@ -951,11 +1302,21 @@ fn steps_column(
     theme::section_card(ui, |ui| {
         ui.set_width(ui.available_width());
         let summary = match sequence_tally(&draft.sequence, source) {
-            Some(tally) => detail_edit::tally_label(&tally),
+            Some(tally) => detail_edit::tally_short(&tally),
             None => detail_edit::TALLY_REFUSED.to_string(),
         };
-        theme::section_card_header(ui, SEQUENCE_HEADING, &summary, false);
-        theme::section_card_body(ui, |ui| {
+        if let Some(wants_template) = sequence_band(ui, &summary, draft.template_view) {
+            // Seeded verbatim, every time the view is entered -- so a user
+            // who opens the template view and closes it again has changed
+            // nothing at all.
+            if wants_template {
+                draft.template_draft = draft.sequence.clone();
+            }
+            draft.template_view = wants_template;
+        }
+        // At the band's `20`, not the section card's own 12: 4a's rows sit
+        // in `padding: 16px 20px`, under a band padded the same.
+        theme::section_card_body_at(ui, BAND_PAD_X, |ui| {
             ui.set_width(ui.available_width());
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 
@@ -976,17 +1337,6 @@ fn steps_column(
                 ui.add_space(6.0);
             }
 
-            if let Some(wants_template) = detail_edit::view_toggle(ui, draft.template_view) {
-                // Seeded verbatim, every time the view is entered -- so a user
-                // who opens the template view and closes it again has changed
-                // nothing at all.
-                if wants_template {
-                    draft.template_draft = draft.sequence.clone();
-                }
-                draft.template_view = wants_template;
-            }
-            ui.add_space(8.0);
-
             if draft.template_view {
                 // Read before the three disjoint field borrows below, which
                 // are fine together -- a whole-draft borrow beside them is not.
@@ -998,8 +1348,11 @@ fn steps_column(
                     &mut draft.template_touched,
                     fault,
                     source,
+                    |ui, rows| {
+                        let _ = step_list(ui, rows, false);
+                    },
                 );
-            } else if let Some(edit) = detail_edit::sequence_steps(
+            } else if let Some(edit) = step_list(
                 ui,
                 &step_rows(&draft.sequence, source, draft.revealing),
                 true,
@@ -1023,6 +1376,496 @@ fn steps_column(
             });
         });
         ui.add_space(theme::SECTION_GAP);
+    }
+}
+
+/// **4a's SEQUENCE band**: the caption, the tally, and the view toggle at the
+/// far end. Answers the view the toggle asked for, or `None`.
+///
+/// Not `theme::section_card_header`, which is 8a's card title -- `11px 16px`,
+/// `letter-spacing: 0.06em`, in [`theme::TEXT_MUTED`] with the note after it
+/// -- and was what this band went through until the owner put the two side
+/// by side: "heading is diif here". 4a declares its own: `padding: 12px 20px;
+/// gap: 10px; border-bottom: 1px solid #eae7e7; background: #fbfaf9`, the
+/// caption `font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+/// text-transform: uppercase; color: #605d5d`, the tally `font-size: 12px;
+/// color: #9b9797`, a `flex: 1` spacer, and the Steps/Template pill.
+///
+/// The pill is [`detail_edit::view_toggle`] as it stands, which is already
+/// 4a's declaration (`border: 1px solid #d7d3d3; border-radius: 7px`, the
+/// lit cell `#1b3fa0` behind white at `4px 11px`) drawn through the crate's
+/// one segmented control -- see its doc for the two points of height it keeps
+/// over the design, and why. It moved up here from the body, where it sat
+/// over the first row; the edit form's inline builder still draws its own
+/// copy below the tally, and that one stays where it is because that form
+/// has no band to put it in.
+///
+/// The line always holds all three: the lane is 560 at the card's narrowest
+/// (`card_width` never gives it less than 640) and the caption, the tally and
+/// the pill measure 76 + 10 + 87 + 10 + 122 with the design's content, so
+/// the `flex: 1` spacer is [`egui::Layout::right_to_left`] and no wrap is
+/// built for a case the width rules out.
+fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<bool> {
+    let mut wants = None;
+    egui::Frame::new()
+        .fill(theme::CARD_TINT)
+        // The card's own rounding on the two corners this band owns, and none
+        // on the two it shares with the rows: a square tint over a rounded
+        // card would show at both top corners.
+        .corner_radius(CornerRadius {
+            nw: theme::SECTION_CARD_RADIUS,
+            ne: theme::SECTION_CARD_RADIUS,
+            sw: 0,
+            se: 0,
+        })
+        .inner_margin(Margin::symmetric(SEQUENCE_BAND_PAD_X, SEQUENCE_BAND_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // At the pill's height, which is the band's: 4a's `align-items:
+            // center` puts the caption on the pill's middle, and egui does
+            // that only for a row that knows its height first.
+            centred_row(ui, theme::SEGMENT_HEIGHT, |ui| {
+                ui.spacing_mut().item_spacing.x = SEQUENCE_BAND_GAP;
+                ui.add(
+                    egui::Label::new(theme::letterspaced(
+                        &SEQUENCE_HEADING.to_uppercase(),
+                        SEQUENCE_BAND_PX,
+                        theme::BOLD,
+                        SEQUENCE_BAND_PX * SEQUENCE_BAND_TRACKING,
+                        theme::TEXT_MUTED,
+                    ))
+                    .extend(),
+                );
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(tally).size(SEQUENCE_BAND_PX).color(theme::TEXT_GHOST),
+                    )
+                    .extend(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    wants = detail_edit::view_toggle(ui, template_view);
+                });
+            });
+        });
+    theme::hairline(ui);
+    wants
+}
+
+// ---------------------------------------------------------------------------
+// 4a's step rows
+// ---------------------------------------------------------------------------
+
+/// The step list as 4a draws it: one row per token, and the controls that
+/// move and remove it.
+///
+/// **The builder's own, and not [`detail_edit::sequence_steps`].** That list
+/// is drawn in the edit form's `Fill rule` card at a pane 298 points wide,
+/// and 4a's row does not fit there: the handle, the index, the 52-point kind
+/// chip, the three `gap: 12px` between them and the `padding: 11px 14px`
+/// round them come to 150 before a step is drawn, and that card's rows have
+/// about 200. One function drawing both would be two layouts behind an `if`,
+/// which is two idioms with one name -- so the form keeps its wrapped line,
+/// and this list is 4a's. The two share everything that is not geometry:
+/// [`detail_edit::step_rows`] decides what a row says, [`ChipEdit`] what its
+/// controls do, and [`detail_edit::apply_chip_edit`] what that does to the
+/// string.
+///
+/// The owner, with the old rows on screen: "draggable tiles are also
+/// different in design". They were -- an index, a badge and the step's words
+/// on one wrapped line, with the note under it.
+///
+/// `editable` is false in the template view, where the list is the read-out
+/// of what the string became rather than the thing being edited. Returns the
+/// one edit clicked, applied by the caller after the loop.
+fn step_list(ui: &mut egui::Ui, rows: &[StepRow], editable: bool) -> Option<ChipEdit> {
+    let mut edit = None;
+    ui.scope(|ui| {
+        // 4a's `gap: 8px` between rows, in place of the body's spacing.
+        ui.spacing_mut().item_spacing.y = STEP_ROW_GAP;
+        for row in rows {
+            if let Some(pressed) = step_row(ui, row, rows.len(), editable) {
+                edit = Some(pressed);
+            }
+        }
+    });
+    edit
+}
+
+/// One of 4a's rows: `display: flex; align-items: center; gap: 12px;
+/// background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px;
+/// padding: 11px 14px`. The handle, the index and the kind chip at fixed
+/// widths, the step in the `flex: 1` middle, and the far cell at the end.
+///
+/// **The far end is laid first, right to left, and the middle takes what is
+/// left.** That is 4a's `flex: 1` without measuring the trailing cells by
+/// hand: the far cell and the three controls claim their own widths, and the
+/// nested left-to-right scope inside them is handed the remainder as a lane.
+/// The middle wraps inside that lane (see [`step_middle`]), so a row that is
+/// too long for the card grows downward and its other cells stay on its
+/// first line -- the prefix reads with the step, and the explanation hangs
+/// under it.
+///
+/// A secret step wears [`theme::secret_band`], 4a's fifth row: the danger
+/// wash and edge, the index in [`theme::DANGER_QUIET`] (`#a2554d`), the kind
+/// chip in [`theme::ERROR`] behind white, the pill the same, and its runs in
+/// [`theme::SECRET_INK`]. The hatch is still not drawn -- see
+/// `detail_edit::SECRET_STEP_RADIUS` for the argument -- and the sub-band
+/// under it (`Sends only if the focused control is a masked field`) is not:
+/// that gate is `preflight`'s and is not a per-step setting in this build.
+///
+/// The controls at the row's end are not 4a's, which has none: its rows are
+/// dragged. This app's are moved by `<` and `>` and taken away by `x`, and
+/// the handle is drawn as 4a's mark for a row that moves; it is not yet a
+/// drag source, and a drag on it does nothing.
+fn step_row(ui: &mut egui::Ui, row: &StepRow, count: usize, editable: bool) -> Option<ChipEdit> {
+    let mut edit = None;
+    let ground = if row.secret {
+        theme::secret_band()
+    } else {
+        egui::Frame::new().fill(theme::CARD).stroke(Stroke::new(1.0, theme::HAIRLINE))
+    };
+    ground
+        .corner_radius(CornerRadius::same(STEP_ROW_RADIUS))
+        .inner_margin(Margin::symmetric(STEP_ROW_PAD_X, STEP_ROW_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let height = step_row_height(ui, editable);
+            centred_row(ui, height, |ui| {
+                ui.spacing_mut().item_spacing.x = STEP_ROW_GAP_X;
+                step_grip(ui, row.secret);
+                step_index(ui, row);
+                step_kind_chip(ui, row);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if editable {
+                        // Right to left, so they read `< > x` on the screen.
+                        ui.spacing_mut().item_spacing.x = STEP_CONTROL_GAP;
+                        let index = row.number - 1;
+                        if ui.add(detail_edit::small_chip_button("x")).clicked() {
+                            edit = Some(ChipEdit::Remove(index));
+                        }
+                        if ui
+                            .add_enabled(row.number < count, detail_edit::small_chip_button(">"))
+                            .clicked()
+                        {
+                            edit = Some(ChipEdit::Forward(index));
+                        }
+                        if ui.add_enabled(index > 0, detail_edit::small_chip_button("<")).clicked()
+                        {
+                            edit = Some(ChipEdit::Back(index));
+                        }
+                    }
+                    ui.spacing_mut().item_spacing.x = STEP_ROW_GAP_X;
+                    step_far_cell(ui, row);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        step_middle(ui, row, height);
+                    });
+                });
+            });
+        });
+    edit
+}
+
+/// The row's band: its tallest cell, known before the row is laid so every
+/// cell is centred on the same line (see [`centred_row`]). The controls when
+/// the row has them, and otherwise the field pill, which stands a point over
+/// the keycap; the middle may still grow past this by wrapping, and then it
+/// grows downward from the line the other cells are on.
+fn step_row_height(ui: &egui::Ui, editable: bool) -> f32 {
+    let control = if editable { detail_edit::small_chip_button_height(ui) } else { 0.0 };
+    let row = |px: f32, family: &str| {
+        ui.ctx()
+            .fonts_mut(|f| f.row_height(&egui::FontId::new(px, egui::FontFamily::Name(family.into()))))
+    };
+    let pill = row(FIELD_PILL_PX, theme::BOLD) + FIELD_PILL_PAD_Y * 2.0 + 2.0;
+    let keycap = row(KEYCAP_PX, theme::MONO_BOLD) + KEYCAP_PAD_Y * 2.0 + KEYCAP_EDGE + KEYCAP_FOOT;
+    control.max(pill).max(keycap)
+}
+
+/// The face the row's egui-laid runs are set in -- the explanation, the far
+/// cell -- and therefore the line every hand-painted run has to land on.
+fn step_line_font() -> egui::FontId {
+    egui::FontId::proportional(STEP_TEXT_PX)
+}
+
+/// **Where a hand-painted galley's top goes so its ink sits on the row's
+/// line.** [`theme::face_ink_middle`] puts this face's cap-middle where asked,
+/// and [`theme::line_lift`] asks for the point above the geometric middle
+/// where egui puts every label's -- the rule `detail_edit::sequence_chip`
+/// settled in three attempts, reused rather than re-derived.
+fn run_top(ui: &egui::Ui, middle: f32, font: &egui::FontId) -> f32 {
+    middle - theme::face_ink_middle(ui, font) - theme::line_lift(ui, &step_line_font())
+}
+
+/// 4a's drag handle: a `width: 20px` column of three bars, `width: 12px;
+/// height: 2px; border-radius: 2px; background: #d7d3d3`, `gap: 3px`.
+///
+/// Drawn, not a glyph, for the crate's standing reason: `⋮` resolves to
+/// nothing in Archivo and a mark out of a fallback face brings its own weight
+/// and baseline. On the secret row 4a tints the bars `#e0b2ac`, which is not
+/// in the palette; [`theme::DANGER_EDGE`] is the band's own edge, one shade
+/// over, and the band's edge is what the bars are.
+fn step_grip(ui: &mut egui::Ui, secret: bool) {
+    let height = STEP_GRIP_BAR.y * 3.0 + STEP_GRIP_GAP * 2.0;
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(STEP_GRIP_WIDTH, height), egui::Sense::hover());
+    let color = if secret { theme::DANGER_EDGE } else { theme::BORDER_STRONG };
+    for bar in 0..3 {
+        let top = rect.top() + bar as f32 * (STEP_GRIP_BAR.y + STEP_GRIP_GAP);
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(
+                egui::pos2(rect.center().x - STEP_GRIP_BAR.x / 2.0, top),
+                STEP_GRIP_BAR,
+            ),
+            CornerRadius::same(2),
+            color,
+        );
+    }
+}
+
+/// The index: mono `font-size: 12px; color: #9b9797` in a `width: 14px`
+/// column, so the chips after it line up down the list whatever the count.
+fn step_index(ui: &mut egui::Ui, row: &StepRow) {
+    let ink = if row.secret { theme::DANGER_QUIET } else { theme::TEXT_GHOST };
+    let font = egui::FontId::new(STEP_INDEX_PX, egui::FontFamily::Monospace);
+    let galley = ui.painter().layout_no_wrap(row.number.to_string(), font.clone(), ink);
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(STEP_INDEX_WIDTH, galley.size().y),
+        egui::Sense::hover(),
+    );
+    ui.painter().galley(
+        egui::pos2(rect.left(), run_top(ui, rect.center().y, &font)),
+        galley,
+        ink,
+    );
+}
+
+/// The kind chip: `width: 52px; padding: 3px 0; border-radius: 5px;
+/// font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-align:
+/// center`. A FIXED 52 and centred, so KEY, TEXT and WAIT line up down the
+/// column.
+///
+/// Its two colours vary by kind, 4a's three pairs and the secret's fourth:
+/// grey `#f3f2f2`/`#444141` on a key, the field wash `#eef2fc`/`#14307a` on
+/// text, the wait grey `#f3f2f2`/`#7d7979` on a wait, and `#b42318` behind
+/// white on a secret. A rate change wears the wait's pair -- it is about
+/// time, not a key -- and a step this build does not understand wears the
+/// key's, which is the plain one.
+fn step_kind_chip(ui: &mut egui::Ui, row: &StepRow) {
+    let (fill, ink) = match row.kind {
+        _ if row.secret => (theme::ERROR, egui::Color32::WHITE),
+        StepKind::Text => (theme::BLUE_WASH, theme::BLUE_DEEP),
+        StepKind::Wait | StepKind::Rate => (theme::CANVAS, theme::TEXT_FAINT),
+        StepKind::Key | StepKind::Raw => (theme::CANVAS, theme::TEXT_SECONDARY),
+    };
+    let font = egui::FontId::new(STEP_KIND_PX, egui::FontFamily::Name(theme::BOLD.into()));
+    let job = theme::letterspaced(
+        row.kind.badge(),
+        STEP_KIND_PX,
+        theme::BOLD,
+        STEP_KIND_PX * STEP_KIND_TRACKING,
+        ink,
+    );
+    let galley = ui.ctx().fonts_mut(|f| f.layout_job(job));
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(STEP_KIND_WIDTH, galley.size().y + STEP_KIND_PAD_Y * 2.0),
+        egui::Sense::hover(),
+    );
+    ui.painter().rect_filled(rect, CornerRadius::same(STEP_KIND_RADIUS), fill);
+    ui.painter().galley(
+        egui::pos2(
+            rect.center().x - galley.size().x / 2.0,
+            run_top(ui, rect.center().y, &font),
+        ),
+        galley,
+        ink,
+    );
+}
+
+/// The `flex: 1` middle: the step itself, what it resolves to, and the
+/// explanation beside it.
+///
+/// Wrapped, at 4a's own gap for the kind (`7px` on a key row, `8px` on a
+/// text row, `10px` on a wait row), so a row longer than the lane drops its
+/// explanation under the step rather than pushing the far cell off the card.
+/// Measured: the secret row -- pill, mask, `hidden — never shown here`, then
+/// `3 ms/char` and the three controls -- is 630 in the card's 600, so at this
+/// width that explanation is on a second line. The step's own runs are
+/// `extend`ed and never break mid-word; only the sentence flows.
+fn step_middle(ui: &mut egui::Ui, row: &StepRow, height: f32) {
+    let gap = match row.kind {
+        StepKind::Key => STEP_KEY_GAP,
+        StepKind::Wait => STEP_WAIT_GAP,
+        StepKind::Text | StepKind::Rate | StepKind::Raw => STEP_TEXT_GAP,
+    };
+    // The wrapping row at the ROW's height rather than `horizontal_wrapped`,
+    // which starts its first line at the style's `interact_size` and centres
+    // the pill on that: measured a point and a half under the cells beside
+    // it. Given the row's band, its first line IS the row's line.
+    let wrapped = egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true);
+    ui.allocate_ui_with_layout(egui::vec2(ui.available_width(), height), wrapped, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(gap, STEP_WRAP_GAP);
+        let plain = |text: &str, ink: egui::Color32| {
+            egui::Label::new(theme::semibold(text.to_string(), STEP_TEXT_PX).color(ink)).extend()
+        };
+        match row.kind {
+            StepKind::Key => keycap(ui, &row.label),
+            StepKind::Text => match &row.field {
+                Some(field) => field_pill(ui, field, &row.label, row.secret),
+                // A literal: the text itself, in the row's own ink. 4a draws
+                // no literal, and a pill round typed text would make it look
+                // like a field.
+                None => {
+                    ui.add(plain(&row.label, theme::INK));
+                }
+            },
+            // 4a's `250 ms`: mono `font-size: 13px; font-weight: 600`. The
+            // words are the row's own -- `Wait 0.3s`, in the seconds the
+            // owner asked to set waits in -- rather than the design's.
+            StepKind::Wait => {
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(row.label.clone())
+                            .size(STEP_WAIT_PX)
+                            .family(egui::FontFamily::Name(theme::MONO_BOLD.into()))
+                            .color(theme::INK),
+                    )
+                    .extend(),
+                );
+            }
+            StepKind::Rate => {
+                ui.add(plain(&row.label, theme::INK));
+            }
+            StepKind::Raw => {
+                let label = ui.add(plain(&row.label, theme::TEXT_FAINT));
+                if !row.understood {
+                    label.on_hover_text(detail_edit::SEQUENCE_UNKNOWN_TIP);
+                }
+            }
+        }
+        if !row.payload.is_empty() {
+            // 4a's value after the pill: `font-size: 12px; color: #9b9797`
+            // for a value, and the mask in mono `#8c3c33` on the secret row.
+            let text = RichText::new(row.payload.clone()).size(STEP_TEXT_PX);
+            let text = if row.secret {
+                text.family(egui::FontFamily::Monospace).color(theme::SECRET_INK)
+            } else {
+                text.color(theme::TEXT_GHOST)
+            };
+            ui.add(egui::Label::new(text).extend());
+        }
+        if !row.aside.is_empty() {
+            // 4a's explanation: `font-size: 12px; color: #7d7979; padding-left:
+            // 4px` -- the inset spent as space beside the gap egui has already
+            // put in, because netting it the other way is a negative space.
+            ui.add_space(STEP_ASIDE_INSET);
+            let ink = if row.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
+            ui.add(
+                egui::Label::new(RichText::new(row.aside.clone()).size(STEP_TEXT_PX).color(ink))
+                    .wrap(),
+            );
+        }
+    });
+}
+
+/// The far cell: 4a's `—` at `font-size: 12px; color: #9b9797` on a row with
+/// no rate, and the rate in mono `font-size: 11px; color: #7d7979` on a text
+/// row (`#8c3c33` on the secret one).
+fn step_far_cell(ui: &mut egui::Ui, row: &StepRow) {
+    let text = if row.note == detail_edit::NO_NOTE {
+        RichText::new(detail_edit::NO_NOTE).size(STEP_TEXT_PX).color(theme::TEXT_GHOST)
+    } else {
+        let ink = if row.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
+        RichText::new(row.note.clone())
+            .size(STEP_RATE_PX)
+            .family(egui::FontFamily::Monospace)
+            .color(ink)
+    };
+    ui.add(egui::Label::new(text).extend());
+}
+
+/// 4a's keycap: mono `font-size: 12px; font-weight: 600; border: 1px solid
+/// #d7d3d3; border-bottom-width: 2px; border-radius: 5px; padding: 2px 7px;
+/// background: #ffffff`.
+///
+/// **The heavier foot is painted as a second rectangle.** A `Stroke` has one
+/// width for all four sides, so the cap is the edge colour filled to the
+/// outline and the face filled over it, inset one point on three sides and
+/// two on the fourth -- which leaves exactly CSS's border showing, and is
+/// what makes it a keycap rather than a box. A different shape from 8a's
+/// pills on purpose; what it shares with them is the line its letters sit
+/// on, through [`run_top`].
+fn keycap(ui: &mut egui::Ui, text: &str) {
+    let font = egui::FontId::new(KEYCAP_PX, egui::FontFamily::Name(theme::MONO_BOLD.into()));
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), theme::INK);
+    let size = egui::vec2(
+        galley.size().x + KEYCAP_PAD_X * 2.0 + KEYCAP_EDGE * 2.0,
+        galley.size().y + KEYCAP_PAD_Y * 2.0 + KEYCAP_EDGE + KEYCAP_FOOT,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, CornerRadius::same(KEYCAP_RADIUS), theme::BORDER_STRONG);
+    let face = egui::Rect::from_min_max(
+        rect.min + egui::vec2(KEYCAP_EDGE, KEYCAP_EDGE),
+        rect.max - egui::vec2(KEYCAP_EDGE, KEYCAP_FOOT),
+    );
+    painter.rect_filled(face, CornerRadius::same(KEYCAP_RADIUS - 1), theme::CARD);
+    painter.galley(
+        egui::pos2(face.left() + KEYCAP_PAD_X, run_top(ui, rect.center().y, &font)),
+        galley,
+        theme::INK,
+    );
+}
+
+/// 4a's field pill: `gap: 6px; border-radius: 6px; background: #eef2fc;
+/// border: 1px solid #b8c7ea; padding: 3px 8px`, a 12-point mark, and the
+/// name at `font-size: 12px; font-weight: 600; color: #14307a`. The secret
+/// row's is `#b42318` behind white at `font-weight: 700`, with no edge.
+///
+/// The mark is the crate's own for the field -- [`theme::FieldMark`], the
+/// family the picker's gutter draws -- painted by [`theme::paint_field_mark`]
+/// in the pill's ink. 4a draws a bust for the username and a padlock for the
+/// password; this family's password mark is a key, and one family is worth
+/// more than one matched glyph.
+fn field_pill(ui: &mut egui::Ui, field: &FieldRef, name: &str, secret: bool) {
+    let (fill, edge, ink, face) = if secret {
+        (theme::ERROR, theme::ERROR, egui::Color32::WHITE, theme::BOLD)
+    } else {
+        (theme::BLUE_WASH, theme::BLUE_EDGE, theme::BLUE_DEEP, theme::SEMIBOLD)
+    };
+    let font = egui::FontId::new(FIELD_PILL_PX, egui::FontFamily::Name(face.into()));
+    let galley = ui.painter().layout_no_wrap(name.to_string(), font.clone(), ink);
+    let size = egui::vec2(
+        FIELD_PILL_PAD_X * 2.0 + FIELD_PILL_MARK + FIELD_PILL_GAP + galley.size().x,
+        galley.size().y + FIELD_PILL_PAD_Y * 2.0 + 2.0,
+    );
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect(
+        rect,
+        CornerRadius::same(FIELD_PILL_RADIUS),
+        fill,
+        egui::Stroke::new(1.0, edge),
+        egui::StrokeKind::Inside,
+    );
+    let mark = egui::Rect::from_center_size(
+        egui::pos2(rect.left() + 1.0 + FIELD_PILL_PAD_X + FIELD_PILL_MARK / 2.0, rect.center().y),
+        egui::Vec2::splat(FIELD_PILL_MARK),
+    );
+    theme::paint_field_mark(painter, mark, field_mark(field), ink);
+    painter.galley(
+        egui::pos2(mark.right() + FIELD_PILL_GAP, run_top(ui, rect.center().y, &font)),
+        galley,
+        ink,
+    );
+}
+
+/// The mark for a field, in the picker's own family.
+fn field_mark(field: &FieldRef) -> theme::FieldMark {
+    match field {
+        FieldRef::Username => theme::FieldMark::Person,
+        FieldRef::Password => theme::FieldMark::Key,
+        FieldRef::Totp => theme::FieldMark::Clock,
+        FieldRef::Custom(_) => theme::FieldMark::Tag,
     }
 }
 
@@ -1375,5 +2218,490 @@ mod tests {
             sequence: String::new(),
             trigger: crate::app_match::TriggerMode::Prompt,
         })));
+    }
+
+    // -----------------------------------------------------------------------
+    // The modal, drawn: what one frame of it paints
+    // -----------------------------------------------------------------------
+
+    /// A shape the frame painted that is not a run of text, with the three
+    /// things the assertions below tell shapes apart by.
+    struct PaintedRect {
+        rect: egui::Rect,
+        fill: egui::Color32,
+        stroke: egui::Color32,
+        corners: CornerRadius,
+    }
+
+    #[derive(Default)]
+    struct Painted {
+        texts: Vec<(String, egui::Rect)>,
+        rects: Vec<PaintedRect>,
+    }
+
+    impl Painted {
+        fn strings(&self) -> Vec<&str> {
+            self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        fn rects_of(&self, text: &str) -> Vec<egui::Rect> {
+            self.texts.iter().filter(|(t, _)| t == text).map(|(_, r)| *r).collect()
+        }
+
+        fn rect_of(&self, text: &str) -> egui::Rect {
+            let found = self.rects_of(text);
+            assert_eq!(
+                found.len(),
+                1,
+                "expected one {text:?}, found {}. Painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+
+        /// The card's own frame: the one filled rectangle stroked in the
+        /// card's accent. `modal_card` strokes the same rect twice -- once
+        /// through the `Frame`, once over the bands -- and the second has no
+        /// fill, which is what tells them apart.
+        fn card(&self) -> egui::Rect {
+            let found: Vec<&PaintedRect> = self
+                .rects
+                .iter()
+                .filter(|r| r.fill == theme::CARD && r.stroke == theme::BLUE)
+                .collect();
+            assert_eq!(found.len(), 1, "expected one card frame, found {}", found.len());
+            found[0].rect
+        }
+
+        /// The header band: the accent fill whose top corners are rounded
+        /// and whose bottom corners are not. See `theme::modal_header_band`.
+        fn header_band(&self) -> egui::Rect {
+            let found: Vec<&PaintedRect> = self
+                .rects
+                .iter()
+                .filter(|r| r.fill == theme::BLUE && r.corners.nw > 0 && r.corners.sw == 0)
+                .collect();
+            assert_eq!(found.len(), 1, "expected one header band, found {}", found.len());
+            found[0].rect
+        }
+    }
+
+    fn walk(shape: &egui::Shape, painted: &mut Painted) {
+        match shape {
+            egui::Shape::Text(text) => painted.texts.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Rect(rect) => painted.rects.push(PaintedRect {
+                rect: rect.rect,
+                fill: rect.fill,
+                stroke: rect.stroke.color,
+                corners: rect.corner_radius,
+            }),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, painted)),
+            _ => {}
+        }
+    }
+
+    /// The design's own content: `SAP Production` filed under `Work`, bound
+    /// to `SAP Logon 760` by process and window class, typing the design's
+    /// five-step sequence with a wait in it.
+    fn draft() -> SequenceDraft {
+        draft_named("SAP Logon 760")
+    }
+
+    fn draft_named(app_name: &str) -> SequenceDraft {
+        let stored = crate::app_match::AppMatch {
+            process: "saplogon.exe".into(),
+            title: "SAPFEWndClass".into(),
+            hosted: true,
+            path: String::new(),
+            args: String::new(),
+            sequence: "{USERNAME}{TAB}{PASSWORD}{DELAY 250}{ENTER}".into(),
+            trigger: crate::app_match::TriggerMode::Prompt,
+        };
+        SequenceDraft {
+            item_id: "id".into(),
+            item_name: "SAP Production".into(),
+            folder: "Work".into(),
+            app_name: app_name.into(),
+            app: stored.clone(),
+            original: stored.sequence.clone(),
+            sequence: stored.sequence.clone(),
+            template_view: false,
+            template_draft: stored.sequence.clone(),
+            template_touched: false,
+            revealing: false,
+            literal_draft: String::new(),
+            wait_draft: "1".into(),
+        }
+    }
+
+    /// One frame of the builder over a `window`-sized screen.
+    ///
+    /// **The clock advances a tenth of a second per frame**, so the `Area`
+    /// the card floats in is fully opaque by the time a frame is read:
+    /// egui fades an area in by multiplying its layer's opacity, and a
+    /// headless context's clock does not move on its own -- the same clock
+    /// `detail_edit`'s harness keeps, for the same reason. The colours the
+    /// assertions match on are the theme's, and a faded frame paints none of
+    /// them.
+    struct Modal {
+        ctx: egui::Context,
+        window: egui::Vec2,
+        clock: std::cell::Cell<f64>,
+        icon: Option<egui::TextureHandle>,
+    }
+
+    impl Modal {
+        fn over(window: egui::Vec2) -> Self {
+            let ctx = egui::Context::default();
+            let modal = Self { ctx, window, clock: std::cell::Cell::new(0.0), icon: None };
+            // A font set registered during a frame is usable from the next
+            // one on, so two throwaway frames -- every harness in this crate
+            // runs them.
+            let _ = modal.ctx.run_ui(modal.input(&[]), |_ui| {});
+            theme::apply(&modal.ctx);
+            let _ = modal.ctx.run_ui(modal.input(&[]), |_ui| {});
+            modal
+        }
+
+        /// The same harness with a favicon for the vault item's tile.
+        fn with_item_icon(mut self) -> Self {
+            self.icon = Some(self.ctx.load_texture(
+                "item-icon",
+                egui::ColorImage::from_rgba_unmultiplied([1, 1], &[255, 255, 255, 255]),
+                egui::TextureOptions::default(),
+            ));
+            self
+        }
+
+        fn input(&self, events: &[egui::Event]) -> egui::RawInput {
+            self.clock.set(self.clock.get() + 0.1);
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.window)),
+                time: Some(self.clock.get()),
+                events: events.to_vec(),
+                ..Default::default()
+            }
+        }
+
+        fn frame_with(&self, draft: &mut SequenceDraft, events: &[egui::Event]) -> Painted {
+            let palette = vec![FieldRef::Username, FieldRef::Password];
+            let totp = crate::vault_window::detail::TotpState::NoSecret;
+            let source = ResolveSource {
+                username: "a.novak@ledgerline.com",
+                password: "correct-horse-battery",
+                custom: Vec::new(),
+                totp: &totp,
+            };
+            let mut apps = AppIdentityCache::default();
+            let output = self.ctx.run_ui(self.input(events), |ui| {
+                let _ = draw_sequence_builder(
+                    ui,
+                    draft,
+                    &palette,
+                    &source,
+                    self.icon.as_ref(),
+                    &mut apps,
+                );
+            });
+            let mut painted = Painted::default();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut painted);
+            }
+            painted
+        }
+
+        /// The builder at rest: an `egui::Area` is laid out from the size it
+        /// had on the previous frame, so the frame read is the third.
+        fn frame(&self, draft: &mut SequenceDraft) -> Painted {
+            let _ = self.frame_with(draft, &[]);
+            let _ = self.frame_with(draft, &[]);
+            self.frame_with(draft, &[])
+        }
+
+        /// A press and a release at `at`, which is what egui counts as a
+        /// click, then the frame after, which is where the click lands.
+        fn click(&self, draft: &mut SequenceDraft, at: egui::Pos2) -> Painted {
+            let button = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: Default::default(),
+            };
+            let _ = self.frame_with(draft, &[egui::Event::PointerMoved(at), button(true)]);
+            let _ = self.frame_with(draft, &[button(false)]);
+            self.frame_with(draft, &[])
+        }
+    }
+
+    /// The narrowest window this app opens at, and the design's own width.
+    /// `card_width` answers 640 for both, which is what the card is asserted
+    /// to be.
+    const WINDOWS: [egui::Vec2; 2] = [egui::vec2(900.0, 740.0), egui::vec2(1240.0, 740.0)];
+
+    /// **The header band spans the card edge to edge, and nothing the body
+    /// paints runs past the card.**
+    ///
+    /// The half with no other check, and it has regressed twice: the owner's
+    /// screenshot had the blue band stopping at x = 655 with the white card
+    /// running on to 890. `theme::modal_card` sets `ui.set_width(card.width)`
+    /// and lays the band at that width; the card is a `Frame`, and a `Frame`
+    /// grows to hold whatever its body claims, so any child of the body that
+    /// ignores its lane drags the card out from under the band. Measured
+    /// before this pass, in a 1240-point window: the card 1025.3 wide against
+    /// a band of 642. The amber notice's `Frame` was the child -- see
+    /// [`destination_band`] -- and after it went the two are 642 and 642.
+    ///
+    /// The card's width is asserted too, against [`CARD_WIDTH`] plus the
+    /// stroke either side of it, so a card that grew AND took the band with
+    /// it could not pass by agreeing with itself.
+    #[test]
+    fn the_header_band_spans_the_card_and_nothing_paints_past_it() {
+        for window in WINDOWS {
+            let modal = Modal::over(window);
+            let painted = modal.frame(&mut draft());
+            let card = painted.card();
+            let band = painted.header_band();
+            assert!(
+                (card.width() - (CARD_WIDTH + 2.0 * theme::MODAL_BAND_BLEED)).abs() <= 0.5,
+                "in a {}-point window the card is {} wide, not the {} it was asked for",
+                window.x,
+                card.width(),
+                CARD_WIDTH
+            );
+            assert!(
+                (band.left() - card.left()).abs() <= 0.5 && (band.right() - card.right()).abs() <= 0.5,
+                "in a {}-point window the header band runs {}..{} over a card running {}..{}",
+                window.x,
+                band.left(),
+                band.right(),
+                card.left(),
+                card.right()
+            );
+            for (text, rect) in &painted.texts {
+                assert!(
+                    rect.left() >= card.left() - 0.5 && rect.right() <= card.right() + 0.5,
+                    "{text:?} is painted at {rect:?}, past the card at {card:?}"
+                );
+            }
+            for shape in painted.rects.iter().filter(|r| r.fill.a() == 255) {
+                assert!(
+                    shape.rect.left() >= card.left() - 0.5 && shape.rect.right() <= card.right() + 0.5,
+                    "a {:?} rectangle is painted at {:?}, past the card at {card:?}",
+                    shape.fill,
+                    shape.rect
+                );
+            }
+        }
+    }
+
+    /// [`band_form`] on the numbers the band's doc quotes, and on the two
+    /// lanes either side of each of its three thresholds.
+    #[test]
+    fn the_band_takes_the_first_of_its_three_forms_that_fits() {
+        // The design's content in the 640-point card: 183, 96, 342 beside and
+        // 232 under, in a 560 lane.
+        let (item, arrow, beside, under) = (183.0, 96.0, 342.0, 232.0);
+        assert_eq!(band_form(700.0, item, arrow, beside, under), BandForm::OneLine(ChipsGo::Beside));
+        assert_eq!(band_form(560.0, item, arrow, beside, under), BandForm::OneLine(ChipsGo::Under));
+        // Too narrow for one line even with the chips under: the app takes
+        // the second line with its arrow, and the chips go beside the name
+        // there while that line holds them...
+        assert_eq!(band_form(500.0, item, arrow, beside, under), BandForm::TwoLines(ChipsGo::Beside));
+        // ...and under it when it does not.
+        assert_eq!(band_form(400.0, item, arrow, beside, under), BandForm::TwoLines(ChipsGo::Under));
+        // The thresholds themselves are inclusive: a line that exactly fits
+        // is a line that fits.
+        assert_eq!(band_form(657.0, item, arrow, beside, under), BandForm::OneLine(ChipsGo::Beside));
+        assert_eq!(band_form(547.0, item, arrow, beside, under), BandForm::OneLine(ChipsGo::Under));
+        assert_eq!(band_form(456.0, item, arrow, beside, under), BandForm::TwoLines(ChipsGo::Beside));
+    }
+
+    /// **With the design's content in the 640-point card the chips drop under
+    /// the app's name**, and the band is still one line: the two tiles share
+    /// the row's middle and the chips sit under the second name.
+    ///
+    /// The two NAMES do not share a line, and are not asserted to: 4a's
+    /// `align-items: center` centres each subject's column on the row, and
+    /// the app's column is a chip row taller than the item's, so the item's
+    /// name sits lower by half of that. Measured: `SAP Production` centred
+    /// on 216 and `SAP Logon 760` on 205.5, the tiles both on 209.
+    #[test]
+    fn the_chips_drop_under_the_apps_name_and_the_band_stays_one_line() {
+        let modal = Modal::over(WINDOWS[0]);
+        let painted = modal.frame(&mut draft());
+        let item_tile = painted.rect_of("SP");
+        let app_tile = painted.rect_of("SL");
+        let app = painted.rect_of("SAP Logon 760");
+        let process = painted.rect_of("saplogon.exe");
+        let class = painted.rect_of("SAPFEWndClass");
+        assert!(
+            (item_tile.center().y - app_tile.center().y).abs() <= 0.5,
+            "the two tiles are not on one line: {item_tile:?} and {app_tile:?}"
+        );
+        assert!(app_tile.right() < app.left(), "the app's name is not beside its tile");
+        assert!(
+            process.top() >= app.bottom() && class.top() >= app.bottom(),
+            "the chips did not drop under the name: name {app:?}, chips {process:?} {class:?}"
+        );
+        assert!(
+            (process.center().y - class.center().y).abs() <= 0.5 && process.right() < class.left(),
+            "the two chips are not on one line in order"
+        );
+        // 4a's small capitals, from sentence-case constants.
+        assert!(painted.strings().contains(&"VAULT ITEM"));
+        assert!(painted.strings().contains(&"SENDS ONLY TO"));
+    }
+
+    /// **An app name the line cannot hold puts the app on a second line, with
+    /// its arrow**: the vault item's name above, the app's name below it, and
+    /// the arrow's rules on the app's line rather than the item's.
+    #[test]
+    fn a_long_app_name_takes_the_app_and_its_arrow_to_a_second_line() {
+        let modal = Modal::over(WINDOWS[0]);
+        let long = "Microsoft Dynamics 365 Business Central Client";
+        let painted = modal.frame(&mut draft_named(long));
+        let item = painted.rect_of("SAP Production");
+        let app = painted.rect_of(long);
+        assert!(
+            app.top() > item.bottom(),
+            "the app's name {app:?} is not under the item's {item:?}"
+        );
+        // The arrow's two rules: one point tall, `BAND_ARROW_RULE` wide, in
+        // `theme::BORDER`.
+        let rules: Vec<&PaintedRect> = painted
+            .rects
+            .iter()
+            .filter(|r| {
+                r.fill == theme::BORDER
+                    && (r.rect.height() - 1.0).abs() < 0.01
+                    && (r.rect.width() - BAND_ARROW_RULE).abs() < 0.01
+            })
+            .collect();
+        assert_eq!(rules.len(), 2, "expected the arrow's two rules");
+        for rule in rules {
+            assert!(
+                rule.rect.center().y > item.bottom(),
+                "an arrow rule at {:?} is on the item's line, not the app's",
+                rule.rect
+            );
+        }
+        // And still inside the card: the whole point of choosing a form.
+        let card = painted.card();
+        assert!(app.right() <= card.right() + 0.5, "the app's name runs past the card");
+    }
+
+    /// **The vault item's tile shows the favicon when there is one**, and its
+    /// monogram only when there is not. The app's tile has no icon in this
+    /// harness -- the cache is cold and the path is empty -- so its monogram
+    /// stays, which is the control.
+    #[test]
+    fn the_item_tile_shows_the_favicon_and_the_monogram_only_without_one() {
+        let bare = Modal::over(WINDOWS[0]).frame(&mut draft());
+        assert!(bare.strings().contains(&"SP"), "no monogram without a favicon: {:?}", bare.strings());
+        assert!(bare.strings().contains(&"SL"));
+
+        let pictured = Modal::over(WINDOWS[0]).with_item_icon().frame(&mut draft());
+        assert!(
+            !pictured.strings().contains(&"SP"),
+            "the monogram is painted over the favicon: {:?}",
+            pictured.strings()
+        );
+        assert!(pictured.strings().contains(&"SL"), "the app's tile lost its monogram");
+    }
+
+    /// **4a's SEQUENCE band**: the caption in capitals, the tally without the
+    /// edit form's "total", and the two on the pill's line.
+    #[test]
+    fn the_sequence_band_is_4as_caption_tally_and_pill_on_one_line() {
+        let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
+        let caption = painted.rect_of("SEQUENCE");
+        let tally = painted
+            .texts
+            .iter()
+            .find(|(t, _)| t.starts_with("5 steps"))
+            .map(|(t, r)| (t.clone(), *r))
+            .expect("the tally is painted");
+        assert!(!tally.0.ends_with("total"), "the band spells the tally {:?}", tally.0);
+        let steps = painted.rect_of("Steps");
+        let template = painted.rect_of("Template");
+        for (what, rect) in [("caption", caption), ("tally", tally.1), ("Template", template)] {
+            assert!(
+                (rect.center().y - steps.center().y).abs() <= 1.0,
+                "the {what} at {rect:?} is off the pill's line at {steps:?}"
+            );
+        }
+        assert!(caption.right() < tally.1.left() && tally.1.right() < steps.left());
+    }
+
+    /// **Every cell of a step row sits on the row's line.** The defect this
+    /// holds against was found by measuring and not by looking: egui centres
+    /// each child on the band as it stands when that child is placed, so
+    /// the grip, index and kind chip -- placed first -- sat three points
+    /// above the controls placed after them. See [`centred_row`].
+    #[test]
+    fn every_cell_of_a_step_row_is_on_the_rows_line() {
+        let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
+        // Row two: `Tab`, a keycap. Its index, its `KEY` chip, its `—`, and
+        // its three controls.
+        let keycap = painted.rect_of("Tab");
+        let on_row = |text: &str| -> egui::Rect {
+            let found: Vec<egui::Rect> = painted
+                .rects_of(text)
+                .into_iter()
+                .filter(|r| (r.center().y - keycap.center().y).abs() < 12.0)
+                .collect();
+            assert_eq!(found.len(), 1, "expected one {text:?} on the Tab row, found {}", found.len());
+            found[0]
+        };
+        // Against the ROW's middle, with two points of room: what is painted
+        // on one line is each face's ink, and what a galley reports is its
+        // box -- ascent plus descent, which an 11-point bold face and a
+        // 12-point mono face divide differently. Measured: `KEY`'s box
+        // centred on 425 and `Tab`'s on 427, both inks on 425, the row on
+        // 426. Three points was the defect; two is the box.
+        let row = painted
+            .rects
+            .iter()
+            .find(|r| {
+                r.fill == theme::CARD && r.stroke == theme::HAIRLINE && r.rect.contains_rect(keycap)
+            })
+            .map(|r| r.rect)
+            .expect("the Tab row's frame is painted");
+        for text in ["2", "KEY", "\u{2014}", "<", ">", "x", "Tab"] {
+            let rect = on_row(text);
+            assert!(
+                (rect.center().y - row.center().y).abs() <= 2.0,
+                "{text:?} at {rect:?} is off the row's line at {row:?}"
+            );
+        }
+        // And in 4a's order across the row.
+        let (index, kind, dash, back, forward, remove) =
+            (on_row("2"), on_row("KEY"), on_row("\u{2014}"), on_row("<"), on_row(">"), on_row("x"));
+        assert!(index.right() <= kind.left() && kind.right() <= keycap.left());
+        assert!(keycap.right() <= dash.left() && dash.right() <= back.left());
+        assert!(back.right() <= forward.left() && forward.right() <= remove.left());
+    }
+
+    /// **A row's own `x` takes away that row's step.** The third of five, so
+    /// neither the first nor the last: a control bound to the wrong index in
+    /// either direction is visible.
+    #[test]
+    fn a_rows_own_remove_control_takes_away_that_step() {
+        let modal = Modal::over(WINDOWS[0]);
+        let mut draft = draft();
+        let painted = modal.frame(&mut draft);
+        let password = painted.rect_of("Password");
+        let remove: Vec<egui::Rect> = painted
+            .rects_of("x")
+            .into_iter()
+            .filter(|r| (r.center().y - password.center().y).abs() < 12.0)
+            .collect();
+        assert_eq!(remove.len(), 1, "expected one `x` on the Password row");
+        let _ = modal.click(&mut draft, remove[0].center());
+        assert_eq!(draft.sequence, "{USERNAME}{TAB}{DELAY 250}{ENTER}");
     }
 }

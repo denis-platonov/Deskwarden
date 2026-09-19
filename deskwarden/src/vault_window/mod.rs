@@ -5724,7 +5724,18 @@ pub fn build_frame_with_search(
                             totp: &totp_state,
                         };
                         match sequence_builder::draw_sequence_builder(
-                            ui, draft, &palette, &source,
+                            ui,
+                            draft,
+                            &palette,
+                            &source,
+                            // The item's own favicon, keyed by its id exactly
+                            // as `draw_read_arm`'s call above reads it, so the
+                            // band's tile shows the picture the pane under the
+                            // scrim was showing one click ago.
+                            selected_item
+                                .as_ref()
+                                .and_then(|item| icons.textures.get(item.id.as_str())),
+                            &mut app_identities,
                         ) {
                             // **Opened from the edit form, this Save writes
                             // nothing to the vault.** It hands the sequence
@@ -18358,12 +18369,12 @@ mod app_block_wiring_tests {
     fn every_pane_that_names_an_app_is_handed_the_one_identity_cache() {
         assert_eq!(
             occurrences(source(), PASSES_THE_CACHE),
-            5,
-            "expected {PASSES_THE_CACHE:?} exactly five times -- once per draft editor, once \
+            6,
+            "expected {PASSES_THE_CACHE:?} exactly six times -- once per draft editor, once \
              for the READ pane, and twice more in 4a's arm, which draws whichever of those \
-             two the builder was opened from BEHIND the modal. \
-             once for the READ pane, whose MATCHED APP card now shows what the bound app is \
-             really called. Constructing \
+             two the builder was opened from BEHIND the modal, and once for the builder \
+             itself, whose destination band draws the bound app's icon in its tile. The \
+             READ pane's MATCHED APP card is where the app's real name comes from. Constructing \
              a cache inside the frame closure instead would resolve the matched app's name and \
              re-upload its icon on EVERY repaint, which is the per-frame I/O `app_identity` \
              exists to prevent"

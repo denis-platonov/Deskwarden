@@ -3977,6 +3977,53 @@ pub fn field_mark_shapes(mark: FieldMark) -> &'static [MarkShape] {
     }]
 }
 
+/// One field mark, laid down by egui into `frame`.
+///
+/// **The same geometry [`crate::win32_draw::draw_field_mark`] strokes with
+/// GDI**, scaled the same way -- [`FIELD_MARK_ARTBOARD`] into the frame's
+/// shorter side, the stroke [`FIELD_MARK_STROKE`] in artboard units and never
+/// under a point, a real circle for a ring -- so the mark in the sequence
+/// builder's field pill IS the mark in the picker's gutter, and the two
+/// renderers cannot be told apart by the shape they drew. Written the day 4a's
+/// step rows got their pill, which wants a 12-point bust beside `Username`
+/// and a key beside `Password`; before that every egui surface that needed
+/// one of these had drawn it as a favicon or as nothing.
+pub fn paint_field_mark(painter: &egui::Painter, frame: Rect, mark: FieldMark, color: Color32) {
+    let side = frame.width().min(frame.height());
+    let unit = side / FIELD_MARK_ARTBOARD;
+    let origin = frame.center() - Vec2::splat(side / 2.0);
+    let at = |q: Pos2| origin + q.to_vec2() * unit;
+    let stroke = Stroke::new((FIELD_MARK_STROKE * unit).max(1.0), color);
+    for shape in field_mark_shapes(mark) {
+        match shape {
+            MarkShape::Circle { centre, radius, filled } => {
+                if *filled {
+                    painter.circle_filled(at(*centre), radius * unit, color);
+                } else {
+                    painter.circle_stroke(at(*centre), radius * unit, stroke);
+                }
+            }
+            MarkShape::Path { points, kind } => {
+                let points: Vec<Pos2> = points.iter().map(|q| at(*q)).collect();
+                if points.len() < 2 {
+                    continue;
+                }
+                match kind {
+                    MarkPathKind::Filled => {
+                        painter.add(egui::Shape::convex_polygon(points, color, Stroke::NONE));
+                    }
+                    MarkPathKind::Closed => {
+                        painter.add(egui::Shape::closed_line(points, stroke));
+                    }
+                    MarkPathKind::Open => {
+                        painter.add(egui::Shape::line(points, stroke));
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn build_field_marks() -> [Vec<MarkShape>; 6] {
     use std::f32::consts::PI;
     let p = Pos2::new;

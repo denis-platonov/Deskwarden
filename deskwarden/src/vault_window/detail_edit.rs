@@ -6053,10 +6053,42 @@ pub struct StepRow {
     /// Whether `payload` is a mask standing in for something that is never
     /// drawn.
     pub secret: bool,
+    /// The far cell: the typing rate on a text step, [`NO_NOTE`]'s dash on
+    /// every other kind. 4a's `50 ms/char` and `—`.
     pub note: String,
+    /// What the row says BESIDE its step, in 4a's explanation slot -- `held
+    /// for the next key` on a modifier, `sets the typing speed from here on`
+    /// on a rate, [`SECRET_NOTE`] on a secret -- and empty when there is
+    /// nothing to explain.
+    ///
+    /// Split from [`Self::note`] the day the builder's rows became 4a's, which
+    /// has two cells where the edit form's list has one line under the step:
+    /// an explanation after it, and a far-right cell for the rate or the dash.
+    /// One string held both, joined with a dot, and a drawer that had to take
+    /// it apart again would be parsing its own prose. [`Self::footnote`] is
+    /// the one line, for the list that still draws one.
+    pub aside: String,
+    /// The field this step types, for the row that draws a field as 4a's
+    /// pill with a mark in it. `None` on every step that is not a field.
+    pub field: Option<FieldRef>,
     /// Whether this build knows what the step is. `false` draws it faintly and
     /// says [`SEQUENCE_UNKNOWN_TIP`] on hover.
     pub understood: bool,
+}
+
+impl StepRow {
+    /// The two cells as ONE line, for a list with one line to put them on:
+    /// the edit form's, which draws this under the step. A row with nothing
+    /// to explain reads its far cell; one with nothing in its far cell reads
+    /// its explanation; one with both reads them joined with the dot they
+    /// were one string with before they were split.
+    pub fn footnote(&self) -> String {
+        match (self.note.as_str(), self.aside.is_empty()) {
+            (_, true) => self.note.clone(),
+            (NO_NOTE, false) => self.aside.clone(),
+            _ => format!("{} \u{b7} {}", self.note, self.aside),
+        }
+    }
 }
 
 /// The typing-rate note carried by a text row, in the design's words.
@@ -6080,8 +6112,10 @@ pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Ve
     let mut rate: Option<u32> = None;
     let mut rows = Vec::with_capacity(tokens.len());
     for (index, token) in tokens.iter().enumerate() {
-        let (kind, payload, secret, note) = match token {
-            Token::Literal(_) => (StepKind::Text, String::new(), false, rate_note(rate)),
+        let none = String::new;
+        let dash = || NO_NOTE.to_string();
+        let (kind, payload, secret, note, aside) = match token {
+            Token::Literal(_) => (StepKind::Text, none(), false, rate_note(rate), none()),
             Token::Field(field) => {
                 let secret = matches!(field, FieldRef::Password | FieldRef::Totp);
                 let payload = if secret {
@@ -6091,20 +6125,17 @@ pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Ve
                 } else {
                     String::new()
                 };
-                let note =
-                    if secret { format!("{} \u{b7} {}", rate_note(rate), SECRET_NOTE) } else { rate_note(rate) };
-                (StepKind::Text, payload, secret, note)
+                let aside = if secret { SECRET_NOTE.to_string() } else { none() };
+                (StepKind::Text, payload, secret, rate_note(rate), aside)
             }
-            Token::Key(_) => (StepKind::Key, String::new(), false, NO_NOTE.to_string()),
-            Token::Delay(_) => (StepKind::Wait, String::new(), false, NO_NOTE.to_string()),
+            Token::Key(_) => (StepKind::Key, none(), false, dash(), none()),
+            Token::Delay(_) => (StepKind::Wait, none(), false, dash(), none()),
             Token::DelayRate(ms) => {
                 rate = Some(*ms);
-                (StepKind::Rate, String::new(), false, RATE_NOTE.to_string())
+                (StepKind::Rate, none(), false, dash(), RATE_NOTE.to_string())
             }
-            Token::Modifier(_) => (StepKind::Key, String::new(), false, MODIFIER_NOTE.to_string()),
-            Token::Grouping(_) | Token::Unknown(_) => {
-                (StepKind::Raw, String::new(), false, NO_NOTE.to_string())
-            }
+            Token::Modifier(_) => (StepKind::Key, none(), false, dash(), MODIFIER_NOTE.to_string()),
+            Token::Grouping(_) | Token::Unknown(_) => (StepKind::Raw, none(), false, dash(), none()),
         };
         rows.push(StepRow {
             number: index + 1,
@@ -6113,6 +6144,11 @@ pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Ve
             payload,
             secret,
             note,
+            aside,
+            field: match token {
+                Token::Field(field) => Some(field.clone()),
+                _ => None,
+            },
             understood: token.is_understood(),
         });
     }
@@ -6251,10 +6287,22 @@ pub fn duration_label(d: Duration) -> String {
     }
 }
 
-/// The design's "6 steps \u{b7} 2.1 s" line.
-pub fn tally_label(tally: &SequenceTally) -> String {
+/// The design's "6 steps \u{b7} 2.1 s" line, as 4a's SEQUENCE band spells it.
+///
+/// **No "total".** 4a's band reads `6 steps · 2.1 s` and nothing after it. The
+/// word is [`tally_label`]'s, for the edit form's card, where the line stands
+/// alone under the chips and a bare `2.1 s` could be read as one step's wait;
+/// in the band it sits beside a heading that says what is being counted, and
+/// the rows under it say what each wait is.
+pub fn tally_short(tally: &SequenceTally) -> String {
     let unit = if tally.steps == 1 { "step" } else { "steps" };
-    format!("{} {unit} \u{b7} {} total", tally.steps, duration_label(tally.total))
+    format!("{} {unit} \u{b7} {}", tally.steps, duration_label(tally.total))
+}
+
+/// [`tally_short`] with the edit form's "total" after it. One spelling of the
+/// count and the duration, so the two surfaces cannot disagree about either.
+pub fn tally_label(tally: &SequenceTally) -> String {
+    format!("{} total", tally_short(tally))
 }
 
 /// The design's budget pair, **against the crate's real limits** rather than
@@ -7627,7 +7675,7 @@ pub(crate) fn sequence_steps(
                         }
                     }
                 });
-                ui.label(RichText::new(row.note.clone()).size(11.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(row.footnote()).size(11.0).color(theme::TEXT_FAINT));
                 });
             });
         ui.add_space(4.0);
@@ -7682,18 +7730,32 @@ pub(crate) fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool
 }
 
 /// The tip on a step this build carries but does not understand.
-const SEQUENCE_UNKNOWN_TIP: &str =
+pub(crate) const SEQUENCE_UNKNOWN_TIP: &str =
     "Deskwarden does not know this step. It is kept exactly as it is so another password \
      manager can still read it.";
 
 /// The move/remove controls. ASCII captions on purpose: the app's own font is
 /// a Latin text face, and an arrow glyph it has no coverage for is a control
 /// that draws as a box.
-fn small_chip_button(caption: &str) -> egui::Button<'static> {
-    egui::Button::new(theme::semibold(caption.to_string(), 11.0).color(theme::TEXT_FAINT))
-        .fill(theme::CARD)
-        .stroke(Stroke::new(1.0, theme::BORDER))
-        .corner_radius(CornerRadius::same(5))
+pub(crate) fn small_chip_button(caption: &str) -> egui::Button<'static> {
+    egui::Button::new(
+        theme::semibold(caption.to_string(), SMALL_CHIP_PX).color(theme::TEXT_FAINT),
+    )
+    .fill(theme::CARD)
+    .stroke(Stroke::new(1.0, theme::BORDER))
+    .corner_radius(CornerRadius::same(5))
+}
+
+/// [`small_chip_button`]'s caption size, named so its height can be asked
+/// for by a row that has to know its band before it places one.
+const SMALL_CHIP_PX: f32 = 11.0;
+
+/// What [`small_chip_button`] stands: its caption's row inside the style's
+/// button padding. For `sequence_builder`'s rows, which are sized to their
+/// tallest cell before anything is laid on them.
+pub(crate) fn small_chip_button_height(ui: &egui::Ui) -> f32 {
+    let face = egui::FontId::new(SMALL_CHIP_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+    ui.ctx().fonts_mut(|f| f.row_height(&face)) + ui.spacing().button_padding.y * 2.0
 }
 
 /// The resolved preview. Draws and drops -- see [`PreviewPart`].
@@ -8009,6 +8071,9 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
         &mut app.template_touched,
         fault,
         source,
+        |ui, rows| {
+            let _ = sequence_steps(ui, rows, false);
+        },
     );
 }
 
@@ -8026,6 +8091,12 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
 /// the round trip byte-exact in both directions -- a template that is merely
 /// looked at leaves the item untouched, and a template that is edited stores
 /// the user's own bytes rather than this build's spelling of them.
+///
+/// `steps` draws the read-out under the field. A closure rather than a call
+/// to [`sequence_steps`], because the two callers draw a step row two ways:
+/// the edit form's list, at a 298-point pane, and the builder's 4a row, which
+/// needs more than that pane has (see `sequence_builder::step_list`). What is
+/// shared is the bridge; what is handed in is the row.
 pub(crate) fn template_editor(
     ui: &mut egui::Ui,
     template_draft: &mut String,
@@ -8033,6 +8104,7 @@ pub(crate) fn template_editor(
     touched: &mut bool,
     fault: Option<&'static str>,
     source: &ResolveSource<'_>,
+    steps: impl FnOnce(&mut egui::Ui, &[StepRow]),
 ) {
     // Multiline, because a sequence with a wait and a rate in it is longer
     // than the edit form's pane is wide and that pane refuses horizontal
@@ -8080,7 +8152,7 @@ pub(crate) fn template_editor(
     // what it became.
     ui.label(RichText::new(TEMPLATE_READS_AS).size(11.0).color(theme::TEXT_FAINT));
     ui.add_space(4.0);
-    let _ = sequence_steps(ui, &step_rows(sequence, source, false), false);
+    steps(ui, &step_rows(sequence, source, false));
 }
 
 /// `sequence` with the edit a step row's controls asked for applied.
@@ -19007,7 +19079,7 @@ mod sequence_builder_tests {
                 assert_eq!(row.payload, SECRET_MASK, "reveal={reveal}");
             }
             for row in &rows {
-                for cell in [&row.label, &row.payload, &row.note] {
+                for cell in [&row.label, &row.payload, &row.note, &row.aside] {
                     assert!(
                         !cell.contains(PASSWORD),
                         "reveal={reveal}: a row cell {cell:?} carries the password"
