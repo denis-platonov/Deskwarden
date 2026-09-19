@@ -560,9 +560,6 @@ pub fn fill_rule_visible(app_match: Option<&crate::app_match::AppMatch>) -> bool
 // right panel as well". `RAIL_WIDTH`, `COLUMN_GAP` and `STEPS_FLOOR` went with
 // it, and so did `column`, which existed to lay one.
 
-/// The header strip's height: 4a's `height: 46px`.
-const HEADER_HEIGHT: f32 = 46.0;
-
 /// The band under it, and the steps column: 4a's `padding: 16px 20px`.
 const BAND_PAD_X: i8 = 20;
 const BAND_PAD_Y: i8 = 16;
@@ -606,170 +603,115 @@ pub const REHEARSE_NOTE: &str =
 const REVEAL: &str = "Show what it types";
 const HIDE: &str = "Hide what it types";
 
-/// Draws 4a. Returns what the user asked for, which the window acts on.
+/// **4a's builder, in this app's standard modal.**
+///
+/// The screen took the window once -- the item list undrawn, the detail pane
+/// zeroed -- because 4a is drawn at 1240 points and this was three columns.
+/// The rail went, then the third column, and what is left is one column of
+/// steps, which belongs in the shape every other card that asks a question
+/// already has. The owner: "make standard modal layout with X and button at
+/// the bottom, make it taller and more narrow".
+///
+/// So it is `theme::modal_card`: a coloured header band carrying the title and
+/// the dismiss mark, a body, and a footer whose two answers sit at the bottom.
+/// The two controls were in the header and are in the footer, which is where
+/// this app puts an answer; `Discard` is the outlined left-hand one because
+/// the way out is always the quieter of the two.
 pub fn draw_sequence_builder(
     ui: &mut egui::Ui,
     draft: &mut SequenceDraft,
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
 ) -> BuilderAction {
-    // **A modal, over whatever the user was looking at** -- the same door
-    // `totp_add`, `icon_modal` and 8b's window picker come through.
-    //
-    // This screen used to take the window: the item list was not drawn and the
-    // detail pane's width was zeroed, because 4a was three columns and the
-    // pane alone is 298pt at the app's minimum. It is one column since the
-    // rail went, and the owner wants it where every other card that asks a
-    // question lives: "like a regular modal - opens up in front making details
-    // panel disabled", and "same as pick an app".
-    //
-    // The scrim is what disables the panel behind, and it is also what makes
-    // the id below matter: `item_list::MODAL_SCRIM_AREAS` is kept honest by a
-    // walk over this crate's sources looking for exactly this declaration, and
-    // that list answers "is a modal up" for the item list's arrow keys and the
-    // read pane's toast. A scrim it cannot see is a modal those two do not
-    // know about -- which is why the id is a literal and not a constant.
     let ctx = ui.ctx().clone();
+    // **The scrim's id is a LITERAL**, and `item_list::MODAL_SCRIM_AREAS` is
+    // kept honest by a walk over this crate's sources looking for exactly this
+    // declaration. That list answers "is a modal up" for the item list's arrow
+    // keys and the read pane's toast, so a scrim it cannot see is a modal
+    // those two do not know about.
     theme::modal_scrim(&ctx, egui::Area::new(egui::Id::new("sequence-builder-scrim")));
-    let mut action = BuilderAction::None;
-    let width = card_width(&ctx);
-    let height = card_height(&ctx);
-    theme::movable_modal(&ctx, egui::Area::new(egui::Id::new("sequence-builder"))).show(
+
+    // **Read before the body draws**, so a press cannot be swallowed by a text
+    // box that happens to have focus: the box takes a bare `s`, never the
+    // chord. CTRL+S is 4a's own caption on the Save button.
+    //
+    // The one other `egui::Key::S` in this app's production is the read pane's
+    // Send-a-record chord, and the two do not compete: they differ by SHIFT
+    // and `consume_shortcut` compares the whole modifier set.
+    let save_chord = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
+    let chorded = draft.saveable() && ctx.input_mut(|i| i.consume_shortcut(&save_chord));
+
+    // Read before the card, because `modal_card` takes the body and the
+    // confirm as two closures that must not both borrow the draft.
+    let blocked = draft.fault().is_some();
+    let saveable = draft.saveable();
+    let label = if blocked { SAVE_BLOCKED_LABEL } else { SAVE_LABEL };
+    let height = body_height(&ctx);
+
+    let press = theme::modal_card(
         &ctx,
+        egui::Area::new(egui::Id::new("sequence-builder")),
+        theme::ModalCard {
+            accent: theme::BLUE,
+            // No mark: this is a form, not a question about a consequence.
+            glyph: theme::ModalGlyph::None,
+            title: SCREEN_TITLE,
+            width: card_width(&ctx),
+            dismiss: DISCARD_LABEL,
+        },
         |ui| {
-            // First, before the header draws: egui hit-tests clicks and drags
-            // separately but not independently, so a drag strip registered
-            // after the band would swallow the presses meant for the two
-            // buttons in it. See `theme::modal_drag_handle`.
-            theme::modal_drag_handle(ui, HEADER_HEIGHT);
-            ui.set_width(width);
-            egui::Frame::new()
-                .fill(theme::CANVAS)
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                .corner_radius(CornerRadius::same(CARD_RADIUS))
-                .shadow(CARD_SHADOW)
+            // **The body scrolls and the CARD does not grow.** A sequence of
+            // twenty steps would otherwise make a modal taller than the window
+            // it floats over. `auto_shrink` is off on BOTH axes: on the y it
+            // does not mean "cap at `max_height`", it means "be as tall as
+            // your content", which is the opposite -- measured once already at
+            // 842 points in a 740-point window.
+            egui::ScrollArea::vertical()
+                .max_height(height)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.set_width(width);
-                    action = card_body(ui, draft, palette, source, height);
+                    ui.set_width(ui.available_width());
+                    destination_band(ui, draft);
+                    ui.add_space(theme::SECTION_GAP);
+                    steps_column(ui, draft, palette, source);
                 });
         },
+        |ui| theme::primary_button_enabled(ui, label, Some("CTRL+S"), saveable),
     );
-    action
+
+    if chorded || press.confirmed {
+        BuilderAction::Save
+    } else if press.dismissed {
+        BuilderAction::Discard
+    } else {
+        BuilderAction::None
+    }
 }
 
-/// 4a's own card: `border: 1px solid #dedbd9; border-radius: 12px; box-shadow:
-/// 0 10px 30px rgba(45, 43, 43, 0.14)` over `#f7f6f5`.
-const CARD_RADIUS: u8 = 12;
-const CARD_SHADOW: egui::epaint::Shadow = egui::epaint::Shadow {
-    offset: [0, 10],
-    blur: 30,
-    spread: 0,
-    color: egui::Color32::from_black_alpha(36),
-};
-
-/// How wide the card is, and how tall it may grow, against this window.
+/// How wide the card is against this window.
 ///
-/// 4a is drawn at 1240 points. A modal cannot be: it has to leave the window
-/// it floats over visible at the edges, and this app opens as small as 900.
-/// So it takes what it can up to the design's width, and leaves a gutter.
-const CARD_WIDTH: f32 = 1040.0;
+/// **Narrower than 4a**, at the owner's word. The design is drawn at 1240
+/// points across two columns; this is one column in a modal, and a modal has
+/// to leave the window it floats over visible at the edges. 640 is a form's
+/// width -- the widest thing in it is a step row -- and the `min` is what
+/// keeps it inside the 900-point window this app can open at.
+const CARD_WIDTH: f32 = 640.0;
 const CARD_GUTTER: f32 = 48.0;
 
 fn card_width(ctx: &egui::Context) -> f32 {
     CARD_WIDTH.min((ctx.content_rect().width() - 2.0 * CARD_GUTTER).max(320.0))
 }
 
-/// The tallest the card's scrolling body may be, so a long sequence does not
-/// push the card past the window it is floating over.
-fn card_height(ctx: &egui::Context) -> f32 {
-    (ctx.content_rect().height() - 2.0 * CARD_GUTTER - HEADER_HEIGHT).max(240.0)
-}
+/// The tallest the body may be before it scrolls.
+///
+/// **Taller than it was**, also at the owner's word: the card is narrower, so
+/// the steps need the room back vertically. What is subtracted is the chrome
+/// the body sits between -- `theme::modal_card`'s header band and its footer,
+/// plus the gutter that keeps the card off the window's edges.
+const CARD_CHROME: f32 = 132.0;
 
-/// Everything inside the card: the header, 4a's destination band, and the
-/// builder.
-fn card_body(
-    ui: &mut egui::Ui,
-    draft: &mut SequenceDraft,
-    palette: &[FieldRef],
-    source: &ResolveSource<'_>,
-    height: f32,
-) -> BuilderAction {
-    let mut action = header(ui, draft);
-
-    // **CTRL+S, which is 4a's own caption on the Save button.**
-    //
-    // The one other `egui::Key::S` in this app's production is the read
-    // pane's Send-a-record chord, and the two do not compete: they differ by
-    // SHIFT, `consume_shortcut` compares the WHOLE modifier set, and this
-    // screen is a `DetailMode` that replaces the read pane rather than
-    // sitting beside it. `send_create_wiring`'s
-    // `the_record_chord_is_a_key_no_other_binding_takes` names this file and
-    // checks that shape, so a third binding -- or this one going loose --
-    // still fails the suite.
-    //
-    // Read before the body so a press cannot be swallowed by a text box that
-    // happens to have focus: the box takes a bare `s`, never the chord.
-    let save_chord = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
-    if draft.saveable() && ui.input_mut(|i| i.consume_shortcut(&save_chord)) {
-        action = BuilderAction::Save;
-    }
-
-    egui::ScrollArea::vertical()
-        .max_height(height)
-        // **`auto_shrink` OFF on both axes.** On the y it does not mean "cap
-        // at `max_height`" -- it means "be as tall as your CONTENT", which is
-        // the opposite: measured, the card came out 842 points tall in a
-        // 740-point window because the body grew to its 751 points of content
-        // instead of scrolling inside 335.
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        // **Across the full width, under the header, exactly as 4a draws it.**
-        destination_band(ui, draft);
-        egui::Frame::new().inner_margin(Margin::symmetric(16, 14)).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // **One column: the builder, and nothing beside it.** See the note
-            // above `steps_column` for what the rail held and why it is gone.
-            steps_column(ui, draft, palette, source);
-        });
-    });
-    action
-}
-
-/// The strip across the top: what is being edited, and the two ways out.
-fn header(ui: &mut egui::Ui, draft: &mut SequenceDraft) -> BuilderAction {
-    let mut action = BuilderAction::None;
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .inner_margin(Margin::symmetric(16, 0))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.set_height(HEADER_HEIGHT);
-            ui.horizontal_centered(|ui| {
-                ui.label(theme::bold(SCREEN_TITLE, 15.0).color(theme::INK));
-                ui.label(RichText::new("\u{b7}").size(15.0).color(theme::TEXT_GHOST));
-                ui.label(RichText::new(draft.item_name.clone()).size(15.0).color(theme::TEXT_SECONDARY));
-                // Right-aligned, so the two controls sit where every footer in
-                // this app puts them however wide the window is.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let blocked = draft.fault().is_some();
-                    let label = if blocked { SAVE_BLOCKED_LABEL } else { SAVE_LABEL };
-                    if theme::primary_button_enabled(ui, label, Some("CTRL+S"), draft.saveable())
-                        .clicked()
-                    {
-                        action = BuilderAction::Save;
-                    }
-                    if theme::secondary_button(ui, DISCARD_LABEL).clicked() {
-                        action = BuilderAction::Discard;
-                    }
-                    if draft.changed() {
-                        theme::status_pill(ui, theme::CAUTION_MARK, theme::CHANGED_PILL);
-                    }
-                });
-            });
-        });
-    theme::hairline(ui);
-    action
+fn body_height(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() - 2.0 * CARD_GUTTER - CARD_CHROME).max(240.0)
 }
 
 /// **4a's band under the header: what the rule belongs to, what it may type
