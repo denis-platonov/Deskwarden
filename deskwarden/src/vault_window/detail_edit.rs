@@ -9686,8 +9686,31 @@ fn form_combo(
     // written later, did not inherit the fix. It does now -- which is the
     // whole argument for one door.
     ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
-    egui::ComboBox::from_id_salt(id_salt).popup_style(form_popup_style())
+    egui::ComboBox::from_id_salt(id_salt)
+        .height(FORM_COMBO_HEIGHT)
+        .popup_style(form_popup_style())
 }
+
+/// **How tall a drop-down on this form may grow before it scrolls.**
+///
+/// egui's own cap is `spacing.combo_height`, 200 points, and that is what the
+/// owner has now reported three times -- most recently with the six website
+/// match types on screen and a bar down the side of them: "still not fixed
+/// scroll".
+///
+/// The first two goes were about the scroll LANE, which was real and is fixed
+/// (see [`form_popup_style`]). This is the other half, and measuring it is
+/// what found it: the list of six lays out 214 points tall against that
+/// 200-point cap, so it really does overflow -- by fourteen points, which is
+/// exactly enough for a bar and not enough to look like one on purpose.
+///
+/// 420 rather than "as tall as the list": a cap still has to exist, because a
+/// vault with sixty folders would otherwise open a drop-down taller than the
+/// window. This is thirteen rows at the row height the popup really uses,
+/// which covers every fixed list this form offers -- the six match types, the
+/// four separators, the card brands -- and leaves the folder list, the only
+/// open-ended one, to scroll as it always did.
+const FORM_COMBO_HEIGHT: f32 = 420.0;
 
 /// **The one line that takes the gutter back off a drop-down**, applied to the
 /// POPUP's style and not to the `Ui` the combo was added to -- and that
@@ -28099,6 +28122,78 @@ mod edit_pane_layout_tests {
             "the card's one hairline is at y = {}, which is not between the websites group \
              (ending at {last_website}) and the native app group (starting at {app})",
             rules[0]
+        );
+    }
+
+    /// **A drop-down short enough to fit does not scroll.**
+    ///
+    /// Reported three times, and the first two fixes were about a different
+    /// half of it. The LANE is
+    /// `a_drop_down_on_this_form_does_not_inherit_its_scroll_gutter`'s: the
+    /// form scopes a 24-point gutter and every `Ui` under it inherited one.
+    /// This is the other half, and only measuring found it -- egui caps a
+    /// combo's list at `spacing.combo_height`, 200 points, and the six website
+    /// match types lay out 214 tall. Fourteen points of overflow: enough for a
+    /// bar, not enough to look deliberate. The owner, with all six on screen
+    /// and a bar down the side of them: "still not fixed scroll".
+    ///
+    /// **Asserted on the painted popup**, which this harness can see because a
+    /// popup is a layer of the same frame. A scrollbar is the one thing in
+    /// there that is tall and narrow, so that is what is looked for -- and the
+    /// control below is the list itself, so "found no bar" cannot pass on a
+    /// frame where the list never opened.
+    #[test]
+    fn a_short_drop_down_on_this_form_does_not_scroll() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        let totp = detail::TotpState::NoSecret;
+        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let shut = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+        let at = shut.rect_of(UriMatchChoice::BaseDomain.label()).center();
+        let _ = frame_for(&ctx, pane, &mut draft, false, &click(at), Some(&item), &totp);
+        let open = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
+
+        // The control: the list really is open, and all six choices are in it.
+        let mut listed = 0;
+        for choice in UriMatchChoice::OFFERED {
+            listed += 1;
+            assert!(
+                open.strings().contains(&choice.label()),
+                "{:?} is not in the open list, so this frame is not the open state: {:?}",
+                choice.label(),
+                open.strings()
+            );
+        }
+        assert_eq!(
+            listed,
+            UriMatchChoice::OFFERED.len(),
+            "the loop visited nothing, so it asserted nothing"
+        );
+
+        // The list's own box: the one that holds the LAST choice, which the
+        // closed combo never draws.
+        let last = open.rect_of(UriMatchChoice::RegularExpression.label());
+        let panel = open
+            .rects
+            .iter()
+            .filter(|(r, _)| r.contains_rect(last) && r.height() > 100.0)
+            .map(|(r, _)| *r)
+            .min_by(|a, b| a.height().total_cmp(&b.height()))
+            .unwrap_or_else(|| panic!("the open list has no box round it"));
+
+        let bars: Vec<Rect> = open
+            .rects
+            .iter()
+            .filter(|(r, _)| {
+                panel.contains_rect(*r) && r.width() <= 12.0 && r.height() >= 40.0
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        assert!(
+            bars.is_empty(),
+            "the six-choice list draws a scrollbar: {bars:?} inside {panel:?}"
         );
     }
 
