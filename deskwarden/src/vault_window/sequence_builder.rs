@@ -714,7 +714,15 @@ fn card_body(
         action = BuilderAction::Save;
     }
 
-    egui::ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
+    egui::ScrollArea::vertical()
+        .max_height(height)
+        // **`auto_shrink` OFF on both axes.** On the y it does not mean "cap
+        // at `max_height`" -- it means "be as tall as your CONTENT", which is
+        // the opposite: measured, the card came out 842 points tall in a
+        // 740-point window because the body grew to its 751 points of content
+        // instead of scrolling inside 335.
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
         ui.set_width(ui.available_width());
         // **Across the full width, under the header, exactly as 4a draws it.**
         destination_band(ui, draft);
@@ -783,6 +791,17 @@ fn destination_band(ui: &mut egui::Ui, draft: &SequenceDraft) {
         .inner_margin(Margin::symmetric(BAND_PAD_X, BAND_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // The band's own right edge, read before anything is in it --
+            // NOT `available_width` measured inside the wrapping row below.
+            //
+            // In a wrapping layout `available_width` answers the WRAP width
+            // rather than what is left of the current line, and the push
+            // below is spent against it: inside a panel that was merely
+            // wrong by a little, and inside the `Area` this screen became it
+            // took the card to 1872 points on a 1240-point window -- the
+            // owner's "window is way to wide, should be size of modal". The
+            // same measurement `picker_footer` records, one screen over.
+            let line_right = ui.max_rect().right();
             // Wrapped, because the band holds four things and the narrowest
             // pane this app opens at cannot hold them on one line -- and a row
             // that does not wrap pushes the card past the window instead of
@@ -827,9 +846,9 @@ fn destination_band(ui: &mut egui::Ui, draft: &SequenceDraft) {
                 // spacer puts it -- and only when the line still has room for
                 // it, so a narrow window wraps it under the two subjects
                 // rather than reserving a lane it cannot fill.
-                let want = ui.available_width();
-                if want > 260.0 {
-                    ui.add_space(want - 260.0);
+                let want = line_right - ui.cursor().min.x;
+                if want > BAND_NOTICE_WIDTH {
+                    ui.add_space(want - BAND_NOTICE_WIDTH);
                 }
                 band_caution(ui, REFUSED_ELSEWHERE);
             });
@@ -929,6 +948,10 @@ fn band_arrow(ui: &mut egui::Ui) {
 /// The arrow mark's own box: 4a's `<svg width="16" height="16">`.
 const ARROW_MARK: f32 = 16.0;
 
+/// How much of the band's line the amber notice is given at its far end --
+/// 4a's `max-width: 40ch` on that sentence, near enough.
+const BAND_NOTICE_WIDTH: f32 = 260.0;
+
 /// 4a's amber notice at the far end of the band: `padding: 7px 12px;
 /// border-radius: 8px; background: #fef6e7; border: 1px solid #f2d99b`, a
 /// 15-point mark, and the sentence in 12px `#7a4f05`.
@@ -940,12 +963,27 @@ fn band_caution(ui: &mut egui::Ui, text: &str) {
     let laid = egui::Frame::new()
         .inner_margin(Margin::symmetric(12, 7))
         .show(ui, |ui| {
+            // **The sentence is laid at a width this pill CHOOSES**, not at
+            // whatever is left of the line.
+            //
+            // 4a gives it `max-width: 40ch`. Left to egui it took its natural
+            // single-line width -- a nested `horizontal_top` lays a `Label`
+            // against the parent's `max_rect`, not against the wrapping row
+            // outside it -- and the pill ran 223 points past the card, which
+            // on this screen's `Area` is 223 points past the window. The
+            // owner: "window is way to wide, should be size of modal".
+            ui.set_max_width(BAND_NOTICE_WIDTH);
             ui.horizontal_top(|ui| {
                 ui.spacing_mut().item_spacing.x = 8.0;
                 let (mark, _) =
                     ui.allocate_exact_size(egui::Vec2::splat(15.0), egui::Sense::hover());
                 theme::paint_warning_glyph(ui.painter(), mark, theme::CAUTION_MARK);
-                ui.label(RichText::new(text).size(12.0).color(theme::CAUTION_INK));
+                ui.add(
+                    egui::Label::new(
+                        RichText::new(text).size(12.0).color(theme::CAUTION_INK),
+                    )
+                    .wrap(),
+                );
             });
         });
     ui.painter().set(
@@ -1149,6 +1187,7 @@ const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::vault_window::detail::TotpState;
 
