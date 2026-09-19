@@ -2970,6 +2970,9 @@ pub fn build_frame_with_search(
         // duplicate the chrome bar's own bottom hairline on the *top* edge
         // -- the two sat flush against each other and read as one doubled
         // line right under the titlebar.
+        //
+        // **The ITEM LIST's panel is the one exception**, and it turns its
+        // separator off -- see `list_divider`, and the measurement there.
         // A drag begun this frame supersedes whatever the LAST one had to
         // say, so the stale explanation goes before the sidebar can post a
         // new one. Read before the panels draw: the payload is on egui's
@@ -3346,9 +3349,10 @@ pub fn build_frame_with_search(
             // comment between the two lines here would break that guard
             // without any margin having been added.
             let list_width = ui.available_width() - detail_pane_width;
-            egui::Panel::left("vault-item-list")
+            let list_pane = egui::Panel::left("vault-item-list")
                 .exact_size(list_width)
                 .resizable(false)
+                .show_separator_line(false)
                 .frame(egui::Frame::new().fill(theme::CANVAS))
                 .show(ui, |ui| {
                     // THE LIST THE SELECTED ROW ACTUALLY READS, which for Trash
@@ -3427,6 +3431,50 @@ pub fn build_frame_with_search(
                         ItemListAction::None => {}
                     }
                 });
+
+            // **The list's own right-hand divider, painted just OUTSIDE it.**
+            //
+            // `egui::Panel` draws its separator INSIDE the panel it belongs
+            // to: `panel.rs` centres the one-point line on
+            // `resize_pos + 0.5 * sign * width`, and for a left panel that is
+            // `right - 0.5` -- pixel column `right - 1`, which is the list's
+            // own last column. Measured on a 1240x740 window: the list pane
+            // 212..602, its row tiles 222..592, ten clear points to the left
+            // of them and NINE to the right, because the tenth is the
+            // hairline. The owner, with both edges screenshotted: "left margin
+            // is 10px and right (including scroll) is 9px, one px mismatch".
+            //
+            // The tiles were never the problem -- their insets are ten both
+            // sides, and every test in `item_list` says so, because those
+            // harnesses draw the list in a bare `Ui` where no panel and
+            // therefore no separator exists.
+            //
+            // So the separator is off and the line is painted one point
+            // further right, on the first column of the pane beyond. Drawn on
+            // a layer ABOVE the panels because the central panel fills its own
+            // background and would otherwise cover it, and BELOW
+            // `Order::Foreground` so a modal's scrim still darkens it with
+            // everything else.
+            //
+            // Only when there IS a pane beyond: with nothing selected the list
+            // runs to the window's edge, and a divider there is a line down
+            // the outside of the window.
+            if detail_pane_width > 0.0 {
+                let edge = list_pane.response.rect;
+                ui.ctx()
+                    .layer_painter(egui::LayerId::new(
+                        egui::Order::Middle,
+                        egui::Id::new("vault-item-list-divider"),
+                    ))
+                    .rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(edge.right(), edge.top()),
+                            egui::pos2(edge.right() + 1.0, edge.bottom()),
+                        ),
+                        egui::CornerRadius::ZERO,
+                        theme::HAIRLINE,
+                    );
+            }
             // ARM SITE 2 OF 2: a row opened by a primary click while no detail
             // pane was on screen. The other of the two gestures the owner
             // named -- see `detail_slide`'s arming rule and the pin that holds
@@ -20762,6 +20810,49 @@ mod item_pane_frame_placement_tests {
     //! re-join these.
     const PANE: &str = concat!("egui::Panel::left(\"vault-item", "-list\")");
     const FRAME: &str = concat!("egui::Frame::new().fill(theme::CANVAS", "))");
+
+    /// The two halves of the list's right-hand edge: the panel draws no
+    /// separator of its own, and something draws one just outside it.
+    const NO_SEPARATOR: &str = concat!(".show_separator_line", "(false)");
+    const DIVIDER: &str = concat!("vault-item-list", "-divider");
+
+    /// **The item list's divider is painted OUTSIDE the panel, not by it.**
+    ///
+    /// `egui::Panel` centres its separator on `resize_pos + 0.5 * sign *
+    /// width`, which for a left panel is `right - 0.5` -- the panel's own last
+    /// pixel column. Measured on a 1240x740 window: the list pane 212..602,
+    /// its row tiles 222..592, ten clear points to the left of them and NINE
+    /// to the right, because the tenth is the hairline. The owner, with both
+    /// edges screenshotted: "left margin is 10px and right (including scroll)
+    /// is 9px, one px mismatch".
+    ///
+    /// **A source guard, and it has to be**, for exactly the reason the test
+    /// above is one: every harness in `item_list` draws the list in a bare
+    /// `Ui` with no panel around it, so no separator is ever painted and the
+    /// tiles measure ten both sides there however this file is written. The
+    /// thing that can regress is this builder chain, and this reads it.
+    ///
+    /// Both halves, because either alone is a different defect: the separator
+    /// back on is the one-point mismatch again, and the divider gone is a
+    /// list with no edge between it and the pane beside it.
+    #[test]
+    fn the_item_pane_draws_its_divider_outside_itself() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find(PANE)
+            .unwrap_or_else(|| panic!("no {PANE:?} in this file -- the panel was renamed"));
+        let chain = &source[start..start + 400];
+        assert!(
+            chain.contains(NO_SEPARATOR),
+            "the item pane's panel draws its own separator again, which egui paints INSIDE \
+             the panel -- so the list's right margin is one point narrower than its left"
+        );
+        assert!(
+            source.contains(DIVIDER),
+            "nothing paints the list's right-hand divider any more, so there is no edge \
+             between the list and the pane beside it"
+        );
+    }
 
     #[test]
     fn the_item_pane_panel_has_no_inner_margin() {
