@@ -210,6 +210,7 @@ pub fn draw_icon_modal(ctx: &egui::Context, state: &mut IconPickState) -> IconPi
             title: CARD_TITLE,
             width: CARD_WIDTH,
             dismiss: "Cancel",
+            body: theme::ModalBody::Padded,
         },
         |ui| {
             // The row this is about, drawn as the results list draws it --

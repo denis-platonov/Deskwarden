@@ -995,6 +995,10 @@ pub fn draw_sequence_builder(
             title: SCREEN_TITLE,
             width: card_width(&ctx),
             dismiss: DISCARD_LABEL,
+            // **The bands are the body.** Each carries 4a's own
+            // `padding: 16px 20px`, so the card's margin would inset them
+            // twice over -- see [`theme::ModalBody`].
+            body: theme::ModalBody::Flush,
         },
         |ui| {
             // **The body scrolls and the CARD does not grow.** A sequence of
@@ -1008,20 +1012,32 @@ pub fn draw_sequence_builder(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    // **The bands butt, and their rules are the joins.** 4a
-                    // stacks them with no gap at all: the destination band's
-                    // `border-bottom` IS the top of the SEQUENCE band, and
-                    // the SEQUENCE band's is the top of the rows. egui puts
-                    // `item_spacing` between two stacked children, so four
-                    // of those joins came out as eight points of white --
-                    // the owner, of the two above and below the tint: "white
-                    // spaces on top and below Sequnce". Zeroed for the
-                    // STACK and handed back inside each band's own frame,
-                    // which is `theme::modal_card`'s trick for the same
-                    // reason one level up.
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    destination_band(ui, draft, item_icon, app_icon.as_ref());
-                    steps_column(ui, draft, palette, source);
+                    // **The ground under the rows is the window's grey.** 4a
+                    // draws its card on `#f7f6f5` and lays white step rows
+                    // on it; the two bands above paint their own fills over
+                    // that ground (white, then the tint). Painted as the
+                    // BODY's ground rather than as the step block's fill, so
+                    // the grey reaches the footer on a sequence of two steps
+                    // as well as one of twenty -- the owner: "background
+                    // under sequence should be gray as per design".
+                    egui::Frame::new().fill(theme::WINDOW_BG).show(ui, |ui| {
+                        ui.set_min_height(height);
+                        ui.set_width(ui.available_width());
+                        // **The bands butt, and their rules are the joins.**
+                        // 4a stacks them with no gap at all: the destination
+                        // band's `border-bottom` IS the top of the SEQUENCE
+                        // band, and the SEQUENCE band's is the top of the
+                        // rows. egui puts `item_spacing` between two stacked
+                        // children, so four of those joins came out as eight
+                        // points of white -- the owner, of the two above and
+                        // below the tint: "white spaces on top and below
+                        // Sequnce". Zeroed for the STACK and handed back
+                        // inside each band's own frame, which is
+                        // `theme::modal_card`'s trick one level up.
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        destination_band(ui, draft, item_icon, app_icon.as_ref());
+                        steps_column(ui, draft, palette, source);
+                    });
                 });
         },
         |ui| theme::primary_button_enabled(ui, label, Some("CTRL+S"), saveable),
@@ -1040,10 +1056,15 @@ pub fn draw_sequence_builder(
 ///
 /// **Narrower than 4a**, at the owner's word. The design is drawn at 1240
 /// points across two columns; this is one column in a modal, and a modal has
-/// to leave the window it floats over visible at the edges. 640 is a form's
-/// width -- the widest thing in it is a step row -- and the `min` is what
-/// keeps it inside the 900-point window this app can open at.
-const CARD_WIDTH: f32 = 640.0;
+/// to leave the window it floats over visible at the edges. The `min` is
+/// what keeps it inside the 900-point window this app can open at.
+///
+/// **600 and not the 640 it was**: the body went flush (see
+/// [`theme::ModalBody`]) and handed the bands back the 40 points the card's
+/// margin had been spending on top of their own, so the column inside is
+/// the width it always was and the card round it is 40 narrower. "I think
+/// modal should be thinner so no white spaces on left and right".
+const CARD_WIDTH: f32 = 600.0;
 const CARD_GUTTER: f32 = 48.0;
 
 fn card_width(ctx: &egui::Context) -> f32 {
@@ -1054,9 +1075,11 @@ fn card_width(ctx: &egui::Context) -> f32 {
 ///
 /// **Taller than it was**, also at the owner's word: the card is narrower, so
 /// the steps need the room back vertically. What is subtracted is the chrome
-/// the body sits between -- `theme::modal_card`'s header band and its footer,
-/// plus the gutter that keeps the card off the window's edges.
-const CARD_CHROME: f32 = 132.0;
+/// the body sits between -- `theme::modal_card`'s header band and its footer.
+/// Not the body's own margin any more: this card's body is flush (see
+/// [`theme::ModalBody`]), so those points top and bottom are the body's own
+/// to spend.
+const CARD_CHROME: f32 = 96.0;
 
 fn body_height(ctx: &egui::Context) -> f32 {
     (ctx.content_rect().height() - 2.0 * CARD_GUTTER - CARD_CHROME).max(240.0)
@@ -2090,19 +2113,23 @@ fn wait_duration(label: &str) -> &str {
 /// What [`wait_duration`] takes off the front.
 const WAIT_WORD: &str = "Wait ";
 
-/// The face the row's egui-laid runs are set in -- the explanation, the far
-/// cell -- and therefore the line every hand-painted run has to land on.
-fn step_line_font() -> egui::FontId {
-    egui::FontId::proportional(STEP_TEXT_PX)
-}
-
-/// **Where a hand-painted galley's top goes so its ink sits on the row's
-/// line.** [`theme::face_ink_middle`] puts this face's cap-middle where asked,
-/// and [`theme::line_lift`] asks for the point above the geometric middle
-/// where egui puts every label's -- the rule `detail_edit::sequence_chip`
-/// settled in three attempts, reused rather than re-derived.
+/// **Where a hand-painted galley's top goes so its INK sits on `middle`.**
+/// [`theme::face_ink_middle`] is where the face inks its cap-height band
+/// inside its own line box, and taking it off the middle is what puts that
+/// band there -- a galley placed by its box instead sits about a point high,
+/// because a face inks the upper part of its box.
+///
+/// **`middle` is the BOX's, not the row's.** It was the row's, lifted by
+/// [`theme::line_lift`] to the line egui's own labels ink on, back when
+/// every row ended in two egui-laid runs -- the rate and the explanation --
+/// that a pill had to agree with. Those went ("remove these"), and what is
+/// left on a row is the pill, the chip and the keycap, each of which is a
+/// box of its own: the lift then only moved a run off the middle of the box
+/// it is inside, which is what the owner saw -- "pills text not centered".
+/// Measured: every one of them inked 1.03 points over its own box's middle,
+/// and now on it.
 fn run_top(ui: &egui::Ui, middle: f32, font: &egui::FontId) -> f32 {
-    middle - theme::face_ink_middle(ui, font) - theme::line_lift(ui, &step_line_font())
+    middle - theme::face_ink_middle(ui, font)
 }
 
 /// 4a's drag handle: a `width: 20px` column of three bars, `width: 12px;
@@ -2363,8 +2390,13 @@ fn keycap(ui: &mut egui::Ui, text: &str) {
         rect.max - egui::vec2(KEYCAP_EDGE, KEYCAP_FOOT),
     );
     painter.rect_filled(face, CornerRadius::same(KEYCAP_RADIUS - 1), theme::CARD);
+    // **The FACE's middle, not the cap's.** The foot is a point heavier
+    // than the other three edges, so the two are half a point apart, and
+    // CSS centres a keycap's letters in the content box -- inside the
+    // border, not across it. Measured at exactly that half point when this
+    // read `rect.center().y`.
     painter.galley(
-        egui::pos2(face.left() + KEYCAP_PAD_X, run_top(ui, rect.center().y, &font)),
+        egui::pos2(face.left() + KEYCAP_PAD_X, run_top(ui, face.center().y, &font)),
         galley,
         theme::INK,
     );
@@ -2984,12 +3016,24 @@ mod tests {
     #[derive(Default)]
     struct Painted {
         texts: Vec<(String, egui::Rect)>,
+        /// Each run's true INK -- the union of its glyphs' coverage, which
+        /// is what the eye sees centred or not, as against the galley's box
+        /// (ascent plus descent), which a face never fills.
+        inks: Vec<(String, egui::Rect)>,
         rects: Vec<PaintedRect>,
     }
 
     impl Painted {
         fn strings(&self) -> Vec<&str> {
             self.texts.iter().map(|(t, _)| t.as_str()).collect()
+        }
+
+        /// The one run spelled `text`, as INK. See [`Painted::inks`].
+        fn ink_of(&self, text: &str) -> egui::Rect {
+            let found: Vec<egui::Rect> =
+                self.inks.iter().filter(|(t, _)| t == text).map(|(_, r)| *r).collect();
+            assert_eq!(found.len(), 1, "expected one {text:?} inked, found {}", found.len());
+            found[0]
         }
 
         fn rects_of(&self, text: &str) -> Vec<egui::Rect> {
@@ -3069,10 +3113,28 @@ mod tests {
 
     fn walk(shape: &egui::Shape, painted: &mut Painted) {
         match shape {
-            egui::Shape::Text(text) => painted.texts.push((
-                text.galley.text().to_string(),
-                egui::Rect::from_min_size(text.pos, text.galley.size()),
-            )),
+            egui::Shape::Text(text) => {
+                painted.texts.push((
+                    text.galley.text().to_string(),
+                    egui::Rect::from_min_size(text.pos, text.galley.size()),
+                ));
+                let mut ink = egui::Rect::NOTHING;
+                for row in &text.galley.rows {
+                    for glyph in &row.glyphs {
+                        if glyph.uv_rect.is_nothing() {
+                            continue;
+                        }
+                        let at = text.pos
+                            + row.pos.to_vec2()
+                            + glyph.pos.to_vec2()
+                            + glyph.uv_rect.offset;
+                        ink = ink.union(egui::Rect::from_min_size(at, glyph.uv_rect.size));
+                    }
+                }
+                if ink.is_finite() {
+                    painted.inks.push((text.galley.text().to_string(), ink));
+                }
+            }
             egui::Shape::Rect(rect) => painted.rects.push(PaintedRect {
                 rect: rect.rect,
                 fill: rect.fill,
@@ -3600,6 +3662,36 @@ mod tests {
         let _ = modal.key(&mut draft, egui::Key::Delete, egui::Modifiers::NONE);
         assert_eq!(draft.sequence, "{USERNAME}{PASSWORD}{DELAY 250}{ENTER}");
         assert_eq!(draft.selected, None);
+    }
+
+    /// **A boxed run is centred in its own box.** The kind chip, the field
+    /// pill and the keycap each paint their own galley, and each one's INK
+    /// -- not its galley box, which a face never fills -- sits on the middle
+    /// of the box round it. They inked a point over it while [`run_top`]
+    /// still lifted every run to the line two egui-laid cells used to be on;
+    /// those cells are gone. The owner: "pills text not centered".
+    #[test]
+    fn a_chip_a_pill_and_a_keycap_ink_on_the_middle_of_their_own_box() {
+        let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
+        for run in ["WAIT", "Username", "Tab"] {
+            let ink = painted.ink_of(run);
+            let box_round_it = painted
+                .rects
+                .iter()
+                .filter(|r| r.rect.contains_rect(ink) && r.rect.height() <= 30.0)
+                .map(|r| r.rect)
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .unwrap_or_else(|| panic!("nothing is painted round {run:?} at {ink:?}"));
+            assert!(
+                (ink.center().y - box_round_it.center().y).abs() <= 0.25,
+                "{run:?} inks {:.2}..{:.2} in a box {:.2}..{:.2}: {:+.2} off its middle",
+                ink.top(),
+                ink.bottom(),
+                box_round_it.top(),
+                box_round_it.bottom(),
+                ink.center().y - box_round_it.center().y
+            );
+        }
     }
 
     /// **The bands butt, and their rules are the joins**: no white strip

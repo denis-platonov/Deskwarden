@@ -11848,6 +11848,7 @@ fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> Generator
             title: GENERATOR_TITLE,
             width: GENERATOR_CARD_WIDTH,
             dismiss: GENERATOR_CANCEL,
+            body: theme::ModalBody::Padded,
         },
         |ui| rerolled = generator_card_body(ui, &mut draft.generator),
         // **Greyed while there is no candidate**, rather than refusing on the

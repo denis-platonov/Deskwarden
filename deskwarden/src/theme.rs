@@ -9051,6 +9051,30 @@ pub struct ModalCard<'a> {
     /// The outlined left-hand answer's words -- the way out, always on the
     /// left, always the quieter of the two.
     pub dismiss: &'a str,
+    /// Whether the body keeps the card's own margin, or draws to its edges.
+    pub body: ModalBody,
+}
+
+/// How a [`ModalCard`]'s body is inset.
+///
+/// **A card that asks a question is [`Padded`](Self::Padded)**: its body is
+/// a sentence and the margin is what stops the sentence touching the frame.
+/// **A card whose body is BANDS is [`Flush`](Self::Flush)**: design 4a's
+/// builder is a column of full-width strips -- a tinted heading band with a
+/// rule under it, rows on the ground below -- and each of those carries its
+/// own `padding: 16px 20px`. Inside a padded body they were inset twice
+/// over, which left a strip of white down either side of every band and put
+/// the rows 40 points from the card's edge instead of 20. The owner: "I
+/// think modal should be thinner so no white spaces on left and right".
+///
+/// The footer's buttons keep the card's margin either way: they are answers,
+/// not part of the body's column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModalBody {
+    /// The card's own margin down both sides and above and below.
+    Padded,
+    /// No margin at all: the body's own content is what is spaced.
+    Flush,
 }
 
 /// Which of the footer's two answers was pressed, if either.
@@ -9687,8 +9711,12 @@ pub fn modal_card(
                     ui.spacing_mut().item_spacing.y = 0.0;
 
                     let marked = modal_header_band(ui, &card);
+                    let margin = match card.body {
+                        ModalBody::Padded => Margin::symmetric(MODAL_PAD_X, MODAL_BODY_PAD_Y),
+                        ModalBody::Flush => Margin::ZERO,
+                    };
                     egui::Frame::new()
-                        .inner_margin(Margin::symmetric(MODAL_PAD_X, MODAL_BODY_PAD_Y))
+                        .inner_margin(margin)
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing = inherited;
                             body(ui);
@@ -13639,7 +13667,14 @@ mod modal_card_tests {
                 press = modal_card(
                     ctx,
                     egui::Area::new(egui::Id::new(CARD_ID)),
-                    ModalCard { accent, glyph, title: TITLE, width: WIDTH, dismiss: DISMISS },
+                    ModalCard {
+                        accent,
+                        glyph,
+                        title: TITLE,
+                        width: WIDTH,
+                        dismiss: DISMISS,
+                        body: ModalBody::Padded,
+                    },
                     |ui| {
                         ui.add(
                             egui::Label::new(RichText::new(SENTENCE).size(12.0).color(TEXT_MUTED))
@@ -15005,6 +15040,7 @@ mod modal_drag_tests {
                         title: "Delete item",
                         width: 340.0,
                         dismiss: "Cancel",
+                        body: ModalBody::Padded,
                     },
                     |ui| {
                         ui.label(RichText::new("It moves to the Trash.").size(12.0));

@@ -202,6 +202,7 @@ pub fn draw_delete_modal(
             title: state.kind.heading(),
             width: CARD_WIDTH,
             dismiss: "Cancel",
+            body: theme::ModalBody::Padded,
         },
         |ui| {
             // The row this is about, drawn as the results list draws it --
