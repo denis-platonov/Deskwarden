@@ -1008,9 +1008,19 @@ pub fn draw_sequence_builder(
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
+                    // **The bands butt, and their rules are the joins.** 4a
+                    // stacks them with no gap at all: the destination band's
+                    // `border-bottom` IS the top of the SEQUENCE band, and
+                    // the SEQUENCE band's is the top of the rows. egui puts
+                    // `item_spacing` between two stacked children, so four
+                    // of those joins came out as eight points of white --
+                    // the owner, of the two above and below the tint: "white
+                    // spaces on top and below Sequnce". Zeroed for the
+                    // STACK and handed back inside each band's own frame,
+                    // which is `theme::modal_card`'s trick for the same
+                    // reason one level up.
+                    ui.spacing_mut().item_spacing.y = 0.0;
                     destination_band(ui, draft, item_icon, app_icon.as_ref());
-                    // No gap: 4a stacks the SEQUENCE band straight under
-                    // the destination band's rule.
                     steps_column(ui, draft, palette, source);
                 });
         },
@@ -1113,6 +1123,9 @@ fn destination_band(
         .fill(theme::CARD)
         .inner_margin(Margin::symmetric(BAND_PAD_X, BAND_PAD_Y))
         .show(ui, |ui| {
+            // The stack outside this band is butted; its own contents are
+            // ordinary stacked widgets and want the app's spacing back.
+            ui.spacing_mut().item_spacing = theme::ITEM_SPACING;
             ui.set_width(ui.available_width());
             // The band's own lane, read before a row is begun -- NOT
             // `available_width` inside a wrapping row, which answers the
@@ -1620,6 +1633,7 @@ fn steps_column(
     egui::Frame::new()
         .inner_margin(Margin::symmetric(BAND_PAD_X, BAND_PAD_Y))
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = theme::ITEM_SPACING;
             ui.set_width(ui.available_width());
             ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
 
@@ -1727,6 +1741,7 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
         .fill(theme::CARD_TINT)
         .inner_margin(Margin::symmetric(SEQUENCE_BAND_PAD_X, SEQUENCE_BAND_PAD_Y))
         .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = theme::ITEM_SPACING;
             ui.set_width(ui.available_width());
             // At the pill's height, which is the band's: 4a's `align-items:
             // center` puts the caption on the pill's middle, and egui does
@@ -3585,6 +3600,42 @@ mod tests {
         let _ = modal.key(&mut draft, egui::Key::Delete, egui::Modifiers::NONE);
         assert_eq!(draft.sequence, "{USERNAME}{PASSWORD}{DELAY 250}{ENTER}");
         assert_eq!(draft.selected, None);
+    }
+
+    /// **The bands butt, and their rules are the joins**: no white strip
+    /// above the SEQUENCE tint and none below it -- the owner: "white spaces
+    /// on top and below Sequnce".
+    #[test]
+    fn the_bands_butt_with_their_rules_as_the_joins() {
+        let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
+        let tint = painted
+            .rects
+            .iter()
+            .find(|r| r.fill == theme::CARD_TINT && r.rect.contains_rect(painted.rect_of("SEQUENCE")))
+            .expect("the band's tint is painted")
+            .rect;
+        let rules: Vec<egui::Rect> = painted
+            .rects
+            .iter()
+            .filter(|r| {
+                r.fill == theme::HAIRLINE
+                    && (r.rect.height() - 1.0).abs() < 0.1
+                    && (r.rect.width() - tint.width()).abs() < 0.1
+            })
+            .map(|r| r.rect)
+            .collect();
+        let joined = |edge: f32| rules.iter().any(|r| (r.center().y - edge).abs() <= 0.6);
+        assert!(joined(tint.top()), "white above the tint at {tint:?}: rules {rules:?}");
+        assert!(joined(tint.bottom()), "white below the tint at {tint:?}: rules {rules:?}");
+        // And the first step row hangs the band's own padding below that
+        // lower rule, not padding plus a seam.
+        let first = painted.row_around(painted.rect_of("Username"));
+        assert!(
+            (first.top() - (tint.bottom() + 1.0 + f32::from(BAND_PAD_Y))).abs() <= 0.6,
+            "the rows start at {} and the rule ends at {}",
+            first.top(),
+            tint.bottom() + 1.0
+        );
     }
 
     /// **A wait row says the duration once.** The kind chip says WAIT and

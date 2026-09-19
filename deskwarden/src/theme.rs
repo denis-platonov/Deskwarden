@@ -46,6 +46,13 @@ pub const CARD_TINT: Color32 = Color32::from_rgb(0xfb, 0xfa, 0xf9);
 pub const BORDER: Color32 = Color32::from_rgb(0xde, 0xdb, 0xd9);
 /// Hairline separators inside cards.
 pub const HAIRLINE: Color32 = Color32::from_rgb(0xea, 0xe7, 0xe7);
+
+/// **The gap egui leaves between two stacked widgets**, set once in
+/// [`apply`] and named here because a surface that has to take it AWAY --
+/// bands that butt against one another, with their rule as the join -- has
+/// to be able to hand it back to whatever it wraps. See
+/// `sequence_builder::steps_column`.
+pub const ITEM_SPACING: Vec2 = Vec2::new(8.0, 8.0);
 /// Border of interactive controls (buttons, inputs).
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(0xd7, 0xd3, 0xd3);
 /// The DASHED outline's grey, one step darker than [`BORDER_STRONG`]: a
@@ -750,7 +757,7 @@ pub fn apply(ctx: &egui::Context) {
     ]
     .into();
 
-    style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+    style.spacing.item_spacing = ITEM_SPACING;
     style.spacing.button_padding = Vec2::new(12.0, 6.0);
 
     // egui defaults every `ui.label()` to selectable text, which shows a
