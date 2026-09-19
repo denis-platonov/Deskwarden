@@ -2057,6 +2057,24 @@ fn step_row_height(ui: &egui::Ui) -> f32 {
     pill.max(keycap)
 }
 
+/// **A wait's duration without the word.**
+///
+/// The row's label is `key_sequence::wait_label`'s -- `Wait 0.3s` -- which
+/// is right everywhere it is read as a sentence: the resolved preview's
+/// `[Wait 0.3s]`, the edit form's chips. On a step row it is said twice,
+/// because the row's kind chip two cells to the left already reads `WAIT`.
+/// The owner: "wait wait 0.3 s - remove second wait". 4a's own wait row is
+/// `250 ms`, the duration alone, for exactly this reason.
+///
+/// Trimmed here rather than in `wait_label`, because the other two readers
+/// have no chip beside them and need the word.
+fn wait_duration(label: &str) -> &str {
+    label.strip_prefix(WAIT_WORD).unwrap_or(label)
+}
+
+/// What [`wait_duration`] takes off the front.
+const WAIT_WORD: &str = "Wait ";
+
 /// The face the row's egui-laid runs are set in -- the explanation, the far
 /// cell -- and therefore the line every hand-painted run has to land on.
 fn step_line_font() -> egui::FontId {
@@ -2267,13 +2285,13 @@ fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
                     }
                 }
             }
-            // 4a's `250 ms`: mono `font-size: 13px; font-weight: 600`. The
-            // words are the row's own -- `Wait 0.3s`, in the seconds the
-            // owner asked to set waits in -- rather than the design's.
+            // 4a's `250 ms`: mono `font-size: 13px; font-weight: 600`, the
+            // duration and nothing else -- in the seconds the owner asked to
+            // set waits in rather than the design's milliseconds.
             StepKind::Wait => {
                 ui.add(
                     egui::Label::new(
-                        RichText::new(step.rows[0].label.clone())
+                        RichText::new(wait_duration(&step.rows[0].label).to_string())
                             .size(STEP_WAIT_PX)
                             .family(egui::FontFamily::Name(theme::MONO_BOLD.into()))
                             .color(theme::INK),
@@ -3567,6 +3585,25 @@ mod tests {
         let _ = modal.key(&mut draft, egui::Key::Delete, egui::Modifiers::NONE);
         assert_eq!(draft.sequence, "{USERNAME}{PASSWORD}{DELAY 250}{ENTER}");
         assert_eq!(draft.selected, None);
+    }
+
+    /// **A wait row says the duration once.** The kind chip says WAIT and
+    /// the step says `0.3s`, not `Wait 0.3s`.
+    #[test]
+    fn a_wait_row_does_not_say_wait_twice() {
+        let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
+        assert!(painted.strings().contains(&"WAIT"), "no wait row: {:?}", painted.strings());
+        assert!(painted.strings().contains(&"0.3s"), "the duration: {:?}", painted.strings());
+        assert!(
+            !painted.strings().iter().any(|run| run.contains("Wait 0.3s")),
+            "the row still says the word beside the chip: {:?}",
+            painted.strings()
+        );
+        // The word itself is not wrong everywhere -- only beside the chip.
+        assert_eq!(wait_duration("Wait 0.3s"), "0.3s");
+        assert_eq!(wait_duration("Wait 20 ms"), "20 ms");
+        // Anything not spelled that way is left exactly as it is.
+        assert_eq!(wait_duration("250 ms"), "250 ms");
     }
 
     /// How far inside a row's right edge a click lands on the row itself:
