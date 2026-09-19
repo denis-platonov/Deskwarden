@@ -41,9 +41,9 @@
 use crate::key_sequence::{self, FieldRef, ResolveSource, Token};
 use crate::theme;
 use crate::vault_window::detail_edit::{
-    self, duration_label, sequence_tally, step_rows, StepKind,
+    self, sequence_tally, step_rows, StepKind,
 };
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText};
+use eframe::egui::{self, CornerRadius, Margin, RichText};
 use std::time::Duration;
 
 // ---------------------------------------------------------------------------
@@ -551,22 +551,14 @@ pub fn fill_rule_visible(app_match: Option<&crate::app_match::AppMatch>) -> bool
 // The screen
 // ---------------------------------------------------------------------------
 
-/// The checks rail's width: 4a's `grid-template-columns: 1fr 340px`.
-///
-/// **One rail and not two.** 4a puts what the rule belongs to -- the vault item
-/// and the app it may type into -- in a BAND across the full width under the
-/// header, not in a column beside the steps; this screen drew it as a second
-/// rail, which cost the steps 252 points and made a three-column picture out of
-/// a two-column design. See [`destination_band`].
-const RAIL_WIDTH: f32 = 340.0;
-
-/// The gap between the two columns.
-const COLUMN_GAP: f32 = 16.0;
-
-/// The steps column's floor. Below this the rail is stacked under it instead:
-/// two columns whose first is narrower than the edit-form pane this screen
-/// exists to escape would be a worse version of the thing it replaces.
-const STEPS_FLOOR: f32 = 420.0;
+// **There is no second column, so there are no column widths.**
+//
+// 4a is `grid-template-columns: 1fr 340px` -- the steps and a rail of
+// measurements -- and this screen has drawn both a rail and, before that, a
+// third column for what the rule belongs to. The band took the third away and
+// the owner has now taken the rail: "4a only keep builder without timing and
+// right panel as well". `RAIL_WIDTH`, `COLUMN_GAP` and `STEPS_FLOOR` went with
+// it, and so did `column`, which existed to lay one.
 
 /// The header strip's height: 4a's `height: 46px`.
 const HEADER_HEIGHT: f32 = 46.0;
@@ -648,47 +640,12 @@ pub fn draw_sequence_builder(
         destination_band(ui, draft);
         egui::Frame::new().inner_margin(Margin::symmetric(16, 14)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let wide = ui.available_width() >= STEPS_FLOOR + RAIL_WIDTH + COLUMN_GAP;
-            if wide {
-                let total = ui.available_width();
-                let steps = total - (RAIL_WIDTH + COLUMN_GAP);
-                ui.horizontal_top(|ui| {
-                    column(ui, steps, |ui| steps_column(ui, draft, palette, source));
-                    ui.add_space(COLUMN_GAP);
-                    column(ui, RAIL_WIDTH, |ui| {
-                        if let Some(asked) = right_rail(ui, draft, source) {
-                            action = asked;
-                        }
-                    });
-                });
-            } else {
-                steps_column(ui, draft, palette, source);
-                if let Some(asked) = right_rail(ui, draft, source) {
-                    action = asked;
-                }
-            }
+            // **One column: the builder, and nothing beside it.** See the note
+            // above `steps_column` for what the rail held and why it is gone.
+            steps_column(ui, draft, palette, source);
         });
     });
     action
-}
-
-/// One column of the wide layout, at an exact width and in its own top-down
-/// layout.
-///
-/// `allocate_ui_with_layout` and not `allocate_ui`: the latter hands the child
-/// egui's DEFAULT layout, which inside the `horizontal_top` above is
-/// left-to-right -- so every card in the column would be laid beside the last
-/// one instead of under it.
-fn column<R>(ui: &mut egui::Ui, width: f32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, 0.0),
-        egui::Layout::top_down(egui::Align::Min),
-        |ui| {
-            ui.set_width(width);
-            add(ui)
-        },
-    )
-    .inner
 }
 
 /// The strip across the top: what is being edited, and the two ways out.
@@ -1096,227 +1053,19 @@ fn palette_body(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRe
 /// The refusal under the wait box, said as the rule rather than as "invalid".
 const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
 
-/// 4a's right rail: timing, checks, budget, and the rehearsal.
-fn right_rail(
-    ui: &mut egui::Ui,
-    draft: &mut SequenceDraft,
-    source: &ResolveSource<'_>,
-) -> Option<BuilderAction> {
-    let mut action = None;
-
-    theme::section_card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_card_header(ui, TIMING_HEADING, "", false);
-        theme::section_card_body(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            match timing_spans(&draft.sequence, source) {
-                Some(spans) if !spans.is_empty() => timing_strip(ui, &spans),
-                // Not a blank card: the reason is already on the steps column
-                // and this says which state it is in.
-                _ => {
-                    ui.label(
-                        RichText::new(detail_edit::TALLY_REFUSED)
-                            .size(11.0)
-                            .color(theme::TEXT_FAINT),
-                    );
-                }
-            }
-        });
-    });
-    ui.add_space(theme::SECTION_GAP);
-
-    theme::section_card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_card_header(ui, CHECKS_HEADING, "", false);
-        theme::section_card_body(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            let mut fix = None;
-            for check in checks(&draft.sequence) {
-                if let Some(asked) = check_row(ui, &check) {
-                    fix = Some(asked);
-                }
-            }
-            if let Some(CheckFix::PauseAfterEnter(index)) = fix {
-                draft.sequence = with_pause_after(&draft.sequence, index);
-            }
-        });
-    });
-    ui.add_space(theme::SECTION_GAP);
-
-    theme::section_card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_card_header(ui, BUDGET_HEADING, "", false);
-        theme::section_card_body(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            match sequence_tally(&draft.sequence, source) {
-                Some(tally) => {
-                    budget_bar(ui, "Total length", tally.total, crate::injector::sequence::MAX_SEQUENCE);
-                    ui.add_space(8.0);
-                    budget_bar(ui, "Largest burst", tally.burst, crate::injector::sequence::MAX_BURST);
-                }
-                None => {
-                    ui.label(
-                        RichText::new(detail_edit::TALLY_REFUSED)
-                            .size(11.0)
-                            .color(theme::TEXT_FAINT),
-                    );
-                }
-            }
-        });
-    });
-    ui.add_space(theme::SECTION_GAP);
-
-    theme::section_card(ui, |ui| {
-        ui.set_width(ui.available_width());
-        theme::section_card_header(ui, "Rehearsal", "", false);
-        theme::section_card_body(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            if theme::secondary_button(ui, detail_edit::APP_SEQUENCE_REHEARSE).clicked() {
-                action = Some(BuilderAction::Rehearse);
-            }
-            ui.add_space(6.0);
-            ui.label(RichText::new(REHEARSE_NOTE).size(11.0).color(theme::TEXT_GHOST));
-        });
-    });
-    ui.add_space(theme::SECTION_GAP);
-    action
-}
-
-/// The height of one bar in the timing strip.
-const BAR_HEIGHT: f32 = 12.0;
-
-/// The smallest a bar is drawn however short its act is: a 10ms keypress on a
-/// 40-second sequence is a bar 0.03pt wide, which is nothing on screen and
-/// nothing to hover. A floor makes the strip a picture of the ORDER of the
-/// acts as well as their length, which is what it is read for.
-const BAR_FLOOR: f32 = 3.0;
-
-/// 4a's strip: one bar per act, the acts named down the side, and the scale
-/// under them.
-fn timing_strip(ui: &mut egui::Ui, spans: &[TimingSpan]) {
-    let total: Duration = spans.iter().map(|s| s.len).sum();
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, BAR_HEIGHT), egui::Sense::hover());
-    let painter = ui.painter();
-    let scale = if total.is_zero() { 0.0 } else { width / total.as_secs_f32() };
-    for span in spans {
-        let x = rect.left() + span.at.as_secs_f32() * scale;
-        let w = (span.len.as_secs_f32() * scale).max(BAR_FLOOR);
-        let bar = egui::Rect::from_min_size(egui::pos2(x, rect.top()), egui::vec2(w, BAR_HEIGHT));
-        painter.rect_filled(bar, CornerRadius::same(3), bar_colour(span));
-    }
-    ui.add_space(4.0);
-
-    // The scale. Drawn as a row of marks rather than as ticks under the bar,
-    // because a tick two points from its neighbour is a smudge and a number
-    // beside it is unreadable -- and because the numbers are the thing being
-    // read here, not their exact x.
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(8.0, 2.0);
-        for mark in timing_ticks(total) {
-            ui.label(RichText::new(duration_label(mark)).size(10.0).color(theme::TEXT_GHOST));
-        }
-    });
-    ui.add_space(8.0);
-
-    for span in spans {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
-            let dot = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover()).0;
-            ui.painter().rect_filled(dot, CornerRadius::same(2), bar_colour(span));
-            ui.label(
-                RichText::new(span.act.label.clone())
-                    .size(11.0)
-                    .color(if span.act.secret { theme::SECRET_INK } else { theme::INK }),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(duration_label(span.len)).size(11.0).color(theme::TEXT_FAINT),
-                );
-            });
-        });
-        ui.add_space(2.0);
-    }
-}
-
-/// A bar's colour. The one exception to the blue is the one the rest of this
-/// app already makes: a secret is red, and nothing else is.
-fn bar_colour(span: &TimingSpan) -> Color32 {
-    if span.act.secret {
-        theme::SECRET_INK
-    } else {
-        match span.act.kind {
-            StepKind::Wait => theme::BLUE_SOFT,
-            _ => theme::BLUE,
-        }
-    }
-}
-
-/// One budget line: the words, and a bar showing how much of the limit is
-/// spent.
-fn budget_bar(ui: &mut egui::Ui, label: &str, used: Duration, limit: Duration) {
-    ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(11.0).color(theme::TEXT_FAINT));
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(
-                theme::semibold(
-                    format!("{} of {}", duration_label(used), duration_label(limit)),
-                    11.0,
-                )
-                .color(theme::TEXT_SECONDARY),
-            );
-        });
-    });
-    ui.add_space(4.0);
-    let width = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 6.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(3), theme::BLUE_WASH);
-    let share = if limit.is_zero() {
-        0.0
-    } else {
-        (used.as_secs_f32() / limit.as_secs_f32()).clamp(0.0, 1.0)
-    };
-    if share > 0.0 {
-        let filled = egui::Rect::from_min_size(rect.min, egui::vec2(width * share, rect.height()));
-        ui.painter().rect_filled(filled, CornerRadius::same(3), theme::BLUE);
-    }
-}
-
-/// One line of the checks card. Returns the fix if its button was pressed.
-fn check_row(ui: &mut egui::Ui, check: &Check) -> Option<CheckFix> {
-    let mut asked = None;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(6.0, 2.0);
-        let (mark, ink) = match check.tone {
-            CheckTone::Pass => ("\u{2713}", theme::DONE_MARK),
-            CheckTone::Caution => ("!", theme::CAUTION_MARK),
-            CheckTone::Fact => ("\u{b7}", theme::TEXT_GHOST),
-        };
-        ui.label(theme::semibold(mark, 11.0).color(ink));
-        ui.vertical(|ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            ui.label(
-                RichText::new(check.line.clone()).size(11.0).color(match check.tone {
-                    CheckTone::Caution => theme::CAUTION_INK,
-                    CheckTone::Fact => theme::TEXT_FAINT,
-                    CheckTone::Pass => theme::TEXT_SECONDARY,
-                }),
-            );
-            if !check.note.is_empty() {
-                ui.label(RichText::new(check.note.clone()).size(11.0).color(theme::TEXT_GHOST));
-            }
-            if check.fix.is_some() && theme::secondary_button(ui, ADD_PAUSE_LABEL).clicked() {
-                asked = check.fix;
-            }
-        });
-    });
-    ui.add_space(8.0);
-    asked
-}
+// **4a's right rail is not drawn**, and neither is its timing strip.
+//
+// The design puts a 340-point column of measurements beside the steps -- the
+// strip, the checks, the budget bars and 4d's way in -- and this screen drew
+// all four. The owner has scoped them out: "4b and 4d we can not do for now
+// and 4a only keep builder without timing and right panel as well".
+//
+// **The measurements are not deleted, only the rail.** `checks`,
+// `timing_spans`, `timing_ticks` and `with_pause_after` are above, pure, `pub`
+// and covered by their own tests; `BAR_HEIGHT`, `BAR_FLOOR` and the four
+// functions that PAINTED them are gone, because a drawing function with no
+// caller is dead code and this crate keeps none. The day the rail comes back
+// it comes back onto logic that never stopped being right.
 
 #[cfg(test)]
 mod tests {
