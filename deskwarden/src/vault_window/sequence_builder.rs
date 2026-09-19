@@ -613,7 +613,87 @@ pub fn draw_sequence_builder(
     palette: &[FieldRef],
     source: &ResolveSource<'_>,
 ) -> BuilderAction {
-    theme::paint_window_background(ui);
+    // **A modal, over whatever the user was looking at** -- the same door
+    // `totp_add`, `icon_modal` and 8b's window picker come through.
+    //
+    // This screen used to take the window: the item list was not drawn and the
+    // detail pane's width was zeroed, because 4a was three columns and the
+    // pane alone is 298pt at the app's minimum. It is one column since the
+    // rail went, and the owner wants it where every other card that asks a
+    // question lives: "like a regular modal - opens up in front making details
+    // panel disabled", and "same as pick an app".
+    //
+    // The scrim is what disables the panel behind, and it is also what makes
+    // the id below matter: `item_list::MODAL_SCRIM_AREAS` is kept honest by a
+    // walk over this crate's sources looking for exactly this declaration, and
+    // that list answers "is a modal up" for the item list's arrow keys and the
+    // read pane's toast. A scrim it cannot see is a modal those two do not
+    // know about -- which is why the id is a literal and not a constant.
+    let ctx = ui.ctx().clone();
+    theme::modal_scrim(&ctx, egui::Area::new(egui::Id::new("sequence-builder-scrim")));
+    let mut action = BuilderAction::None;
+    let width = card_width(&ctx);
+    let height = card_height(&ctx);
+    theme::movable_modal(&ctx, egui::Area::new(egui::Id::new("sequence-builder"))).show(
+        &ctx,
+        |ui| {
+            // First, before the header draws: egui hit-tests clicks and drags
+            // separately but not independently, so a drag strip registered
+            // after the band would swallow the presses meant for the two
+            // buttons in it. See `theme::modal_drag_handle`.
+            theme::modal_drag_handle(ui, HEADER_HEIGHT);
+            ui.set_width(width);
+            egui::Frame::new()
+                .fill(theme::CANVAS)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .corner_radius(CornerRadius::same(CARD_RADIUS))
+                .shadow(CARD_SHADOW)
+                .show(ui, |ui| {
+                    ui.set_width(width);
+                    action = card_body(ui, draft, palette, source, height);
+                });
+        },
+    );
+    action
+}
+
+/// 4a's own card: `border: 1px solid #dedbd9; border-radius: 12px; box-shadow:
+/// 0 10px 30px rgba(45, 43, 43, 0.14)` over `#f7f6f5`.
+const CARD_RADIUS: u8 = 12;
+const CARD_SHADOW: egui::epaint::Shadow = egui::epaint::Shadow {
+    offset: [0, 10],
+    blur: 30,
+    spread: 0,
+    color: egui::Color32::from_black_alpha(36),
+};
+
+/// How wide the card is, and how tall it may grow, against this window.
+///
+/// 4a is drawn at 1240 points. A modal cannot be: it has to leave the window
+/// it floats over visible at the edges, and this app opens as small as 900.
+/// So it takes what it can up to the design's width, and leaves a gutter.
+const CARD_WIDTH: f32 = 1040.0;
+const CARD_GUTTER: f32 = 48.0;
+
+fn card_width(ctx: &egui::Context) -> f32 {
+    CARD_WIDTH.min((ctx.content_rect().width() - 2.0 * CARD_GUTTER).max(320.0))
+}
+
+/// The tallest the card's scrolling body may be, so a long sequence does not
+/// push the card past the window it is floating over.
+fn card_height(ctx: &egui::Context) -> f32 {
+    (ctx.content_rect().height() - 2.0 * CARD_GUTTER - HEADER_HEIGHT).max(240.0)
+}
+
+/// Everything inside the card: the header, 4a's destination band, and the
+/// builder.
+fn card_body(
+    ui: &mut egui::Ui,
+    draft: &mut SequenceDraft,
+    palette: &[FieldRef],
+    source: &ResolveSource<'_>,
+    height: f32,
+) -> BuilderAction {
     let mut action = header(ui, draft);
 
     // **CTRL+S, which is 4a's own caption on the Save button.**
@@ -634,7 +714,7 @@ pub fn draw_sequence_builder(
         action = BuilderAction::Save;
     }
 
-    egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+    egui::ScrollArea::vertical().max_height(height).auto_shrink([false, true]).show(ui, |ui| {
         ui.set_width(ui.available_width());
         // **Across the full width, under the header, exactly as 4a draws it.**
         destination_band(ui, draft);

@@ -3316,19 +3316,27 @@ pub fn build_frame_with_search(
         // of the spawn here, which is the drift this window keeps paying for.
         let mut revoke_asked: Option<(String, String)> = None;
 
-        // **4a takes the item list's column as well as the pane's.** The
-        // builder is three columns -- what the rule belongs to, the steps, and
-        // the measurements -- and the pane alone is 298pt at the app's minimum
-        // size, which is the whole reason this screen exists rather than
-        // another block inside the edit form.
-        let on_sequence = matches!(mode, DetailMode::Sequence(..));
-        let detail_pane_width = if show_sends || on_health || on_sequence {
+        // **4a is a MODAL now, and takes nothing.**
+        //
+        // It used to take the item list's column as well as the pane's -- the
+        // builder was three columns and the pane alone is 298pt at the app's
+        // minimum size. It is one column since the rail went, and the owner
+        // wants it where every other card that asks a question lives: "like a
+        // regular modal - opens up in front making details panel disabled",
+        // and "same as pick an app".
+        //
+        // So the panels behind it lay out exactly as they do in Read or Edit,
+        // and the arm below draws the surface the builder was opened FROM
+        // before drawing the builder over it. What disables that surface is
+        // the scrim, which is `theme::modal_scrim`'s job and not a width of
+        // zero here.
+        let detail_pane_width = if show_sends || on_health {
             0.0
         } else {
             let full = (ui.available_width() - LIST_WIDTH).max(0.0);
             detail_slide.width(ui.ctx(), full, selected_id.is_some())
         };
-        if !show_sends && !on_health && !on_sequence {
+        if !show_sends && !on_health {
             // **Whether a detail pane is on screen RIGHT NOW**, read before
             // the list is drawn, because the list is what changes it. This is
             // the "with no details panel" half of the owner's second gesture:
@@ -5622,12 +5630,75 @@ pub fn build_frame_with_search(
                             EditAction::None => {}
                         }
                     }
-                    // **4a -- the sequence builder.** It takes this panel
-                    // whole: `on_sequence` above zeroed the detail pane's
-                    // width and kept the item list undrawn, so the three
-                    // columns 4a asks for really are on screen.
+                    // **4a -- the sequence builder, as a modal.**
+                    //
+                    // The surface it was opened FROM is drawn first and the
+                    // builder over it, so the window behind the scrim is the
+                    // one the user left rather than an empty panel. Whatever
+                    // that surface reports is DROPPED: the scrim swallows the
+                    // pointer, so nothing under it can be pressed, and reading
+                    // an action out of a pane nobody can reach would be acting
+                    // on a click that did not happen.
                     DetailMode::Sequence(draft, parked) => {
                         detail::forget_copy_toast(ui.ctx());
+                        // The same live reads the two arms above make, for
+                        // the same reason each gives: the settings file has
+                        // not been written yet, so re-reading it would show
+                        // the value the user has already changed away from.
+                        let audience = selected_item
+                            .as_ref()
+                            .map_or(crate::rest::organizations::Audience::Personal, |item| {
+                                crate::rest::organizations::current().audience_of(item)
+                            });
+                        let check_breaches = edited_settings_for_closure
+                            .borrow()
+                            .as_ref()
+                            .map_or(check_breaches_at_open, |s| s.check_breaches);
+                        let reveal_totp_seed = edited_settings_for_closure
+                            .borrow()
+                            .as_ref()
+                            .map_or(reveal_totp_seed_at_open, |s| s.reveal_totp_seed);
+                        match (parked.as_mut(), selected_item.as_ref()) {
+                            (Some(form), item) => {
+                                let _ = draw_detail_edit(
+                                    ui,
+                                    form,
+                                    &folders,
+                                    false,
+                                    &mut app_identities,
+                                    item,
+                                    fill_count,
+                                    &audience,
+                                    &totp_state,
+                                    icons.textures.get(
+                                        item.map(|i| i.id.as_str()).unwrap_or_default(),
+                                    ),
+                                );
+                            }
+                            (None, Some(item)) => {
+                                let _ = draw_read_arm(
+                                    ui,
+                                    item,
+                                    sidebar::folder_name(&folders, item.folder_id.as_deref()),
+                                    &folders,
+                                    fill_count,
+                                    &totp_state,
+                                    may_unfile,
+                                    &mut reveal,
+                                    icons.textures.get(item.id.as_str()),
+                                    &mut app_identities,
+                                    send_ui::live_send_in(
+                                        send_fetch.result.as_ref(),
+                                        &item.name,
+                                        &crate::send::SystemClock,
+                                    ),
+                                    check_breaches,
+                                    reveal_totp_seed,
+                                    &mut breaches,
+                                );
+                            }
+                            (None, None) => {}
+                        }
                         // The item's own fields, not a draft's: this screen
                         // edits the sequence and nothing else, so the values a
                         // step would resolve to are whatever the item stores
@@ -18287,8 +18358,10 @@ mod app_block_wiring_tests {
     fn every_pane_that_names_an_app_is_handed_the_one_identity_cache() {
         assert_eq!(
             occurrences(source(), PASSES_THE_CACHE),
-            3,
-            "expected {PASSES_THE_CACHE:?} exactly three times -- once per draft editor, and \
+            5,
+            "expected {PASSES_THE_CACHE:?} exactly five times -- once per draft editor, once \
+             for the READ pane, and twice more in 4a's arm, which draws whichever of those \
+             two the builder was opened from BEHIND the modal. \
              once for the READ pane, whose MATCHED APP card now shows what the bound app is \
              really called. Constructing \
              a cache inside the frame closure instead would resolve the matched app's name and \
@@ -26887,8 +26960,10 @@ mod edit_seam_argument_tests {
         let production = production.as_str();
         assert_eq!(
             occurrences(production, BOTH_EDITORS),
-            2,
-            "expected two draft editors -- the control on the two assertions below, which \
+            3,
+            "expected three draft editors -- Edit, Create, and the one 4a's modal arm draws \
+             BEHIND itself when the builder was opened from the edit form. The control on \
+             the two assertions below, which \
              each expect one arm to exist"
         );
         assert_eq!(

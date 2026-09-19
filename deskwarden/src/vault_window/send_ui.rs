@@ -12930,15 +12930,16 @@ mod source_pins {
     /// under this gate". `password_health` carries the mirror of this test for
     /// its own pane.
     ///
-    /// The builder is a `DetailMode` rather than a screen flag, so its term is
-    /// read off `mode` a few lines above the gate; the needle is still the
-    /// whole line, which is what makes a term quietly dropped from it a
-    /// failure here.
+    /// **4a's term has gone from this gate**, and that is the change rather
+    /// than a term quietly dropped: the sequence builder was a screen that
+    /// took the window, and it is a modal now -- the panels behind it lay out
+    /// exactly as they do in Read or Edit, and what disables them is the
+    /// scrim. The needle is still the whole line, which is what makes a term
+    /// dropped by accident a failure here.
     #[test]
     fn the_item_list_is_drawn_only_inside_the_not_sends_gate() {
         let production = production();
-        let gate =
-            concat!("        if !show_", "sends && !on_health && !on_sequence {\r\n");
+        let gate = concat!("        if !show_", "sends && !on_health {\r\n");
         assert_eq!(
             production.matches(gate).count(),
             1,
