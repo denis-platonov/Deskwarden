@@ -884,13 +884,11 @@ const FIELD_PILL_MARK: f32 = 12.0;
 const FIELD_PILL_PX: f32 = 12.0;
 
 /// The middle cell's gap by kind -- `7px` on a key row, `8px` on a text row,
-/// `10px` on a wait row -- the explanation's `padding-left: 4px`, and the
-/// space between the middle's lines when it wraps (not 4a's; it never
-/// wraps).
+/// `10px` on a wait row -- and the space between the middle's lines when it
+/// wraps (not 4a's; it never wraps).
 const STEP_KEY_GAP: f32 = 7.0;
 const STEP_TEXT_GAP: f32 = 8.0;
 const STEP_WAIT_GAP: f32 = 10.0;
-const STEP_ASIDE_INSET: f32 = 4.0;
 const STEP_WRAP_GAP: f32 = 3.0;
 
 /// The runs: `font-size: 12px` on the explanation, the value and the far
@@ -1675,26 +1673,17 @@ fn steps_column(
                     }
                     None => {}
                 }
+                // 4a's `padding-top: 4px` between the last step and the
+                // row of add buttons. In the template view the insert chips
+                // ARE the palette, and a second set of buttons writing to a
+                // string the user is editing by hand would fight the cursor.
+                ui.add_space(ADD_ROW_LIFT);
+                add_step_row(ui, draft, palette);
                 ui.add_space(STEP_ROW_GAP);
                 ui.label(RichText::new(REORDER_HINT).size(11.0).color(theme::TEXT_FAINT));
             }
         });
     ui.add_space(theme::SECTION_GAP);
-
-    // The palette belongs to the step list. In the template view the insert
-    // chips ARE the palette, and a second set of Add buttons writing to a
-    // string the user is editing by hand would fight the cursor.
-    if !draft.template_view {
-        theme::section_card(ui, |ui| {
-            ui.set_width(ui.available_width());
-            theme::section_card_header(ui, "Add a step", "", false);
-            theme::section_card_body(ui, |ui| {
-                ui.set_width(ui.available_width());
-                palette_body(ui, draft, palette);
-            });
-        });
-        ui.add_space(theme::SECTION_GAP);
-    }
 }
 
 /// The line under the list that says how it is edited now that its rows carry
@@ -1717,14 +1706,15 @@ pub const REORDER_HINT: &str = "Drag a step by its handle to reorder it. Select 
 /// radius and no edge of its own: it is a strip, not a tile (see
 /// [`steps_column`]).
 ///
-/// The pill is [`detail_edit::view_toggle`] as it stands, which is already
-/// 4a's declaration (`border: 1px solid #d7d3d3; border-radius: 7px`, the
-/// lit cell `#1b3fa0` behind white at `4px 11px`) drawn through the crate's
-/// one segmented control -- see its doc for the two points of height it keeps
-/// over the design, and why. It moved up here from the body, where it sat
-/// over the first row; the edit form's inline builder still draws its own
-/// copy below the tally, and that one stays where it is because that form
-/// has no band to put it in.
+/// The pill is [`detail_edit::view_toggle_compact`]: the crate's one
+/// segmented control at 4a's own box (`border: 1px solid #d7d3d3;
+/// border-radius: 7px`, the lit cell `#1b3fa0` behind white at `4px 11px`)
+/// rather than at the 28-point field height the rest of the app draws it at.
+/// The taller pill set the band's height, and the band came out four points
+/// over the design -- the owner, of the two side by side: "too high". It
+/// moved up here from the body, where it sat over the first row; the edit
+/// form's inline builder still draws its own copy below the tally, at the
+/// form's height, because that form has no band to put it in.
 ///
 /// The line always holds all three: the lane is 560 at the card's narrowest
 /// (`card_width` never gives it less than 640) and the caption, the tally and
@@ -1741,7 +1731,8 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
             // At the pill's height, which is the band's: 4a's `align-items:
             // center` puts the caption on the pill's middle, and egui does
             // that only for a row that knows its height first.
-            centred_row(ui, theme::SEGMENT_HEIGHT, |ui| {
+            let line = theme::segment_height_compact(ui);
+            centred_row(ui, line, |ui| {
                 ui.spacing_mut().item_spacing.x = SEQUENCE_BAND_GAP;
                 ui.add(
                     egui::Label::new(theme::letterspaced(
@@ -1760,7 +1751,7 @@ fn sequence_band(ui: &mut egui::Ui, tally: &str, template_view: bool) -> Option<
                     .extend(),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    wants = detail_edit::view_toggle(ui, template_view);
+                    wants = detail_edit::view_toggle_compact(ui, template_view);
                 });
             });
         });
@@ -2015,13 +2006,7 @@ fn step_row(
                 step_grip(ui, step, index, editable);
                 step_index(ui, step);
                 step_kind_chip(ui, step);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = STEP_ROW_GAP_X;
-                    step_far_cell(ui, step);
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        step_middle(ui, step, height);
-                    });
-                });
+                step_middle(ui, step, height);
             });
         });
     if editable {
@@ -2224,12 +2209,9 @@ fn step_kind_chip(ui: &mut egui::Ui, step: &Step) {
 /// by what it resolves to when the eye is open.
 ///
 /// Wrapped, at 4a's own gap for the kind (`7px` on a key row, `8px` on a
-/// text row, `10px` on a wait row), so a row longer than the lane drops its
-/// explanation under the step rather than pushing the far cell off the card.
-/// Measured: the secret row -- pill, mask, `hidden — never shown here`, then
-/// `3 ms/char` -- is close to the card's 600, so at this width that
-/// explanation can be on a second line. The step's own runs are `extend`ed
-/// and never break mid-word; only the sentence flows.
+/// text row, `10px` on a wait row), so a text step longer than the lane
+/// drops the rest of itself onto a second line rather than off the card.
+/// The runs are `extend`ed and never break mid-word.
 fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
     let gap = match step.kind {
         StepKind::Key => STEP_KEY_GAP,
@@ -2309,33 +2291,18 @@ fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
                 }
             }
         }
-        let aside = step.aside();
-        if !aside.is_empty() {
-            // 4a's explanation: `font-size: 12px; color: #7d7979; padding-left:
-            // 4px` -- the inset spent as space beside the gap egui has already
-            // put in, because netting it the other way is a negative space.
-            ui.add_space(STEP_ASIDE_INSET);
-            let ink = if step.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
-            ui.add(egui::Label::new(RichText::new(aside).size(STEP_TEXT_PX).color(ink)).wrap());
-        }
     });
 }
 
-/// The far cell: 4a's `—` at `font-size: 12px; color: #9b9797` on a row with
-/// no rate, and the rate in mono `font-size: 11px; color: #7d7979` on a text
-/// row (`#8c3c33` on the secret one).
-fn step_far_cell(ui: &mut egui::Ui, step: &Step) {
-    let text = if step.note() == detail_edit::NO_NOTE {
-        RichText::new(detail_edit::NO_NOTE).size(STEP_TEXT_PX).color(theme::TEXT_GHOST)
-    } else {
-        let ink = if step.secret { theme::SECRET_INK } else { theme::TEXT_FAINT };
-        RichText::new(step.note().to_string())
-            .size(STEP_RATE_PX)
-            .family(egui::FontFamily::Monospace)
-            .color(ink)
-    };
-    ui.add(egui::Label::new(text).extend());
-}
+// **The row's far cell is not drawn**, and neither is the sentence beside
+// the step. 4a ends each row with the typing rate (`50 ms/char`) or a dash,
+// and explains the step in a few words after it (`hidden — never shown
+// here`, `submit`); the owner, of both at once: "remove these". They are the
+// per-step half of the timing the same owner scoped out of this screen --
+// "4a only keep builder without timing" -- and what is left is the step
+// itself, which is the thing being edited. [`Step::note`] and [`Step::aside`]
+// stay: they are what the tokens MEAN, they are tested, and the edit form's
+// own chips still say some of it.
 
 /// 4a's keycap: mono `font-size: 12px; font-weight: 600; border: 1px solid
 /// #d7d3d3; border-bottom-width: 2px; border-radius: 5px; padding: 2px 7px;
@@ -2423,89 +2390,172 @@ fn field_mark(field: &FieldRef) -> theme::FieldMark {
     }
 }
 
-/// The four palettes, and the eye.
-fn palette_body(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRef]) {
-    ui.label(RichText::new("Add a value").size(11.0).color(theme::TEXT_FAINT));
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        for field in palette {
-            if ui.add(detail_edit::palette_button(&field.label())).clicked() {
-                draft.sequence =
-                    detail_edit::sequence_with(&draft.sequence, Token::Field(field.clone()));
+/// **4a's add-a-step row**: three dashed buttons, and the two quiet controls
+/// that act on the whole sequence at the far end.
+///
+/// The design: `display: flex; gap: 8px; padding-top: 4px`, then `+ Text`,
+/// `+ Key`, `+ Wait` at [`theme::dashed_button`]'s box, a `flex: 1` spacer,
+/// and a sentence at the right. What this screen drew instead was a section
+/// card titled "Add a step" holding four captioned palettes stacked down the
+/// page -- the owner, with the design's row in hand: "No Add a step section -
+/// just buttons like this below, that's it".
+///
+/// **Each button opens its own menu**, because the design's row is 4b's way
+/// in and 4b is scoped out ("4b and 4d we can not do for now"): the step
+/// editor those buttons lead to in the design does not exist here yet. So
+/// each one carries the palette that used to sit under its caption, on
+/// `egui::Popup::menu` -- the crate's one floating layer, the same one the
+/// detail pane's kebab and this design system's dropdown use.
+///
+/// **The eye and the reset are at the spacer's end**, where 4a puts its
+/// sentence: they are not ways to add a step, they act on the sequence
+/// already built, and a row that mixed the two kinds at the same end would
+/// read as five things to press.
+fn add_step_row(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRef]) {
+    centred_row(ui, theme::BUTTON_HEIGHT, |ui| {
+        ui.spacing_mut().item_spacing.x = ADD_ROW_GAP;
+        add_text_menu(ui, draft, palette);
+        add_key_menu(ui, draft);
+        add_wait_menu(ui, draft);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = ADD_ROW_GAP;
+            if !draft.sequence.is_empty() && theme::secondary_button(ui, USE_DEFAULT).clicked() {
+                // The empty string, not the default's own spelling: an empty
+                // stored value IS the default, and rendering it would turn an
+                // item that inherits into one that pins.
+                draft.sequence = String::new();
             }
-        }
-        if palette.is_empty() {
-            ui.label(
-                RichText::new("This item has no fields to reference yet.")
-                    .size(11.0)
-                    .color(theme::TEXT_FAINT),
-            );
-        }
-    });
-    ui.add_space(8.0);
-
-    ui.label(RichText::new("Add a key").size(11.0).color(theme::TEXT_FAINT));
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
-            if ui.add(detail_edit::palette_button(key.label)).clicked() {
-                draft.sequence = detail_edit::sequence_with(&draft.sequence, Token::Key(key));
+            let caption = if draft.revealing { HIDE } else { REVEAL };
+            if theme::secondary_button(ui, caption).clicked() {
+                draft.revealing = !draft.revealing;
             }
-        }
+        });
     });
-    ui.add_space(8.0);
+}
 
-    ui.label(RichText::new("Add text").size(11.0).color(theme::TEXT_FAINT));
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        ui.add(egui::TextEdit::singleline(&mut draft.literal_draft).desired_width(160.0));
-        if theme::secondary_button(ui, "Add text").clicked() {
-            // Escaping is this app's job, not the user's.
-            if let Some(next) =
-                detail_edit::sequence_with_literal(&draft.sequence, &draft.literal_draft)
-            {
-                draft.sequence = next;
-                draft.literal_draft.clear();
-            }
-        }
-    });
-    ui.add_space(8.0);
+/// `+ Text`: the item's own fields, and a box for literal text.
+///
+/// The two are one menu because they are one step in the sequence -- a text
+/// step is fields and literals in a row -- and because 4a's `+ Text` is the
+/// one button that leads to both.
+fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldRef]) {
+    let button = theme::dashed_button(ui, ADD_TEXT_LABEL);
+    // **Not the default close-on-click**: this menu holds a text box, and a
+    // menu that shut on the first click into its own field could never be
+    // typed into.
+    egui::Popup::menu(&button)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(ADD_MENU_WIDTH);
+            menu_caption(ui, ADD_VALUE_CAPTION);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                for field in palette {
+                    if ui.add(detail_edit::palette_button(&field.label())).clicked() {
+                        draft.sequence =
+                            detail_edit::sequence_with(&draft.sequence, Token::Field(field.clone()));
+                        ui.close();
+                    }
+                }
+                if palette.is_empty() {
+                    ui.label(RichText::new(NO_FIELDS).size(11.0).color(theme::TEXT_FAINT));
+                }
+            });
+            ui.add_space(8.0);
+            menu_caption(ui, ADD_LITERAL_CAPTION);
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut draft.literal_draft).desired_width(160.0));
+                if theme::secondary_button(ui, ADD_LITERAL_BUTTON).clicked() {
+                    // Escaping is this app's job, not the user's.
+                    if let Some(next) =
+                        detail_edit::sequence_with_literal(&draft.sequence, &draft.literal_draft)
+                    {
+                        draft.sequence = next;
+                        draft.literal_draft.clear();
+                        ui.close();
+                    }
+                }
+            });
+        });
+}
 
-    ui.label(RichText::new("Add a wait").size(11.0).color(theme::TEXT_FAINT));
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        ui.add(egui::TextEdit::singleline(&mut draft.wait_draft).desired_width(56.0));
-        ui.label(RichText::new("seconds").size(11.0).color(theme::TEXT_FAINT));
-        let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
-        ui.add_enabled_ui(addable, |ui| {
-            if theme::secondary_button(ui, "Add wait").clicked() {
-                if let Some(next) =
-                    detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
-                {
-                    draft.sequence = next;
+/// `+ Key`: the keys this app knows how to send.
+fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
+    let button = theme::dashed_button(ui, ADD_KEY_LABEL);
+    egui::Popup::menu(&button).show(|ui| {
+        ui.set_min_width(ADD_MENU_WIDTH);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+            for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
+                if ui.add(detail_edit::palette_button(key.label)).clicked() {
+                    draft.sequence = detail_edit::sequence_with(&draft.sequence, Token::Key(key));
+                    ui.close();
                 }
             }
         });
-        if !addable {
-            ui.label(RichText::new(WAIT_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
-        }
-    });
-    ui.add_space(10.0);
-
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(6.0, 4.0);
-        let caption = if draft.revealing { HIDE } else { REVEAL };
-        if theme::secondary_button(ui, caption).clicked() {
-            draft.revealing = !draft.revealing;
-        }
-        if !draft.sequence.is_empty() && theme::secondary_button(ui, "Use the default").clicked() {
-            // The empty string, not the default's own spelling: an empty
-            // stored value IS the default, and rendering it would turn an item
-            // that inherits into one that pins.
-            draft.sequence = String::new();
-        }
     });
 }
+
+/// `+ Wait`: a number of seconds, which is what the owner asked waits be set
+/// in -- the sequence stores the milliseconds.
+fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
+    let button = theme::dashed_button(ui, ADD_WAIT_LABEL);
+    egui::Popup::menu(&button)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(ADD_MENU_WIDTH);
+            menu_caption(ui, ADD_WAIT_CAPTION);
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(&mut draft.wait_draft).desired_width(56.0));
+                ui.label(RichText::new(WAIT_UNIT).size(11.0).color(theme::TEXT_FAINT));
+                let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
+                ui.add_enabled_ui(addable, |ui| {
+                    if theme::secondary_button(ui, ADD_WAIT_BUTTON).clicked() {
+                        if let Some(next) =
+                            detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
+                        {
+                            draft.sequence = next;
+                            ui.close();
+                        }
+                    }
+                });
+            });
+            if key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_none() {
+                ui.add_space(4.0);
+                ui.label(RichText::new(WAIT_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+            }
+        });
+}
+
+/// A caption over one of a menu's palettes: the edit form's own small faint
+/// label, so a menu opened off this row reads as part of the same app.
+fn menu_caption(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(11.0).color(theme::TEXT_FAINT));
+}
+
+/// 4a's three captions, and the row's `gap: 8px` and `padding-top: 4px`.
+const ADD_TEXT_LABEL: &str = "+ Text";
+const ADD_KEY_LABEL: &str = "+ Key";
+const ADD_WAIT_LABEL: &str = "+ Wait";
+const ADD_ROW_GAP: f32 = 8.0;
+const ADD_ROW_LIFT: f32 = 4.0;
+
+/// How wide a menu opens. Wide enough for the widest palette's two rows of
+/// buttons and for the text box beside its Add, so the menu does not resize
+/// itself as the user types.
+const ADD_MENU_WIDTH: f32 = 280.0;
+
+/// The captions inside the menus.
+const ADD_VALUE_CAPTION: &str = "A value from this item";
+const ADD_LITERAL_CAPTION: &str = "Text to type";
+const ADD_LITERAL_BUTTON: &str = "Add text";
+const ADD_WAIT_CAPTION: &str = "How long to wait";
+const ADD_WAIT_BUTTON: &str = "Add wait";
+const WAIT_UNIT: &str = "seconds";
+const NO_FIELDS: &str = "This item has no fields to reference yet.";
+
+/// The reset: back to the app default, which is an EMPTY stored sequence.
+const USE_DEFAULT: &str = "Use the default";
 
 /// The refusal under the wait box, said as the rule rather than as "invalid".
 const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
@@ -3399,7 +3449,9 @@ mod tests {
     }
 
     /// **Every cell of a step row sits on the row's line**, and there are no
-    /// controls on it: a handle, an index, a chip, the step, a far cell.
+    /// controls on it: a handle, an index, a chip, the step, and nothing
+    /// after it -- no rate at the far end and no sentence beside the step,
+    /// which the owner asked be taken off the row ("remove these").
     #[test]
     fn every_cell_of_a_step_row_is_on_the_rows_line_and_no_control_is() {
         let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
@@ -3421,7 +3473,7 @@ mod tests {
         // 12-point mono face divide differently. Measured: `KEY`'s box
         // centred on 425 and `Tab`'s on 427, both inks on 425, the row on
         // 426. Three points was the defect; two is the box.
-        for text in ["2", "KEY", "\u{2014}", "Tab"] {
+        for text in ["2", "KEY", "Tab"] {
             let rect = on_row(text);
             assert!(
                 (rect.center().y - row.center().y).abs() <= 2.0,
@@ -3431,9 +3483,19 @@ mod tests {
         let grip = painted.grip_of(row);
         assert!((grip.center().y - row.center().y).abs() <= 1.0, "the handle is off the line");
         // In 4a's order across the row.
-        let (index, kind, dash) = (on_row("2"), on_row("KEY"), on_row("\u{2014}"));
+        let (index, kind) = (on_row("2"), on_row("KEY"));
         assert!(grip.right() <= index.left() && index.right() <= kind.left());
-        assert!(kind.right() <= keycap.left() && keycap.right() <= dash.left());
+        assert!(kind.right() <= keycap.left());
+        // The far cell and the explanation are gone: no dash at the end of a
+        // row that has no rate, no rate on the one that has, and no words
+        // beside the step saying what it does.
+        for gone in ["\u{2014}", "ms/char", "submit", detail_edit::MODIFIER_NOTE] {
+            assert!(
+                !painted.strings().iter().any(|painted| painted.contains(gone)),
+                "the row still carries {gone:?}: {:?}",
+                painted.strings()
+            );
+        }
         for control in ["<", ">", "x"] {
             assert!(
                 painted.rects_of(control).is_empty(),
@@ -3491,13 +3553,9 @@ mod tests {
         let mut draft = draft();
         let painted = modal.frame(&mut draft);
         let row = painted.row_around(painted.rect_of("Tab"));
-        // Click the row's far cell, which is the row and nothing else.
-        let dash = painted
-            .rects_of("\u{2014}")
-            .into_iter()
-            .find(|r| row.contains_rect(*r))
-            .expect("the Tab row's dash");
-        let _ = modal.click(&mut draft, dash.center());
+        // Click the row's empty right end, which is the row and nothing else
+        // -- the far cell that used to be there is gone.
+        let _ = modal.click(&mut draft, egui::pos2(row.right() - ROW_END_INSET, row.center().y));
         assert_eq!(draft.selected, Some(1), "the click did not select the row");
 
         let _ = modal.key(&mut draft, egui::Key::ArrowDown, egui::Modifiers::ALT);
@@ -3509,5 +3567,37 @@ mod tests {
         let _ = modal.key(&mut draft, egui::Key::Delete, egui::Modifiers::NONE);
         assert_eq!(draft.sequence, "{USERNAME}{PASSWORD}{DELAY 250}{ENTER}");
         assert_eq!(draft.selected, None);
+    }
+
+    /// How far inside a row's right edge a click lands on the row itself:
+    /// past the row's padding, and short of anything drawn in it.
+    const ROW_END_INSET: f32 = 6.0;
+
+    /// **4a's add row is three dashed buttons on one line**, in the design's
+    /// order, under the last step -- and the section card that used to hold
+    /// four stacked palettes is gone: "No Add a step section - just buttons
+    /// like this below, that's it".
+    #[test]
+    fn the_add_row_is_three_dashed_buttons_under_the_list() {
+        let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
+        let (text, key, wait) = (
+            painted.rect_of(ADD_TEXT_LABEL),
+            painted.rect_of(ADD_KEY_LABEL),
+            painted.rect_of(ADD_WAIT_LABEL),
+        );
+        for (what, rect) in [("+ Key", key), ("+ Wait", wait)] {
+            assert!(
+                (rect.center().y - text.center().y).abs() <= 1.0,
+                "{what} at {rect:?} is off the add row's line at {text:?}"
+            );
+        }
+        assert!(text.right() < key.left() && key.right() < wait.left(), "4a's order");
+        // Under the last step, and nothing titled like the card that went.
+        let last = painted.row_around(painted.rect_of("Enter"));
+        assert!(text.top() > last.bottom(), "the add row is not under the list");
+        assert!(
+            !painted.strings().iter().any(|painted| *painted == "Add a step"),
+            "the Add a step card is still drawn"
+        );
     }
 }

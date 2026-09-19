@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fill rule — builder mock</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  /* ----------------------------------------------------------------
+     Deskwarden's palette, straight off src/theme.rs. Change a number
+     here, reload, and we can look at it -- nothing in this file is
+     compiled into the app.
+     ---------------------------------------------------------------- */
+  :root {
+    --ink:        #201e1d;
+    --secondary:  #444141;
+    --muted:      #605d5d;
+    --faint:      #7d7979;
+    --ghost:      #9b9797;
+    --canvas:     #f3f2f2;
+    --window:     #f7f6f5;
+    --card:       #ffffff;
+    --tint:       #fbfaf9;
+    --border:     #dedbd9;
+    --hairline:   #eae7e7;
+    --strong:     #d7d3d3;
+    --dash:       #bab6b6;
+    --blue:       #1b3fa0;
+    --blue-deep:  #14307a;
+    --blue-wash:  #eef2fc;
+    --blue-edge:  #b8c7ea;
+    --danger-ink:   #8c3c33;
+    --danger-wash:  #fdf3f2;
+    --danger-edge:  #e8a9a2;
+    --danger-pill:  #fbeae8;
+    --danger-quiet: #a2554d;
+
+    --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    padding: 28px 20px 60px;
+    background: var(--window);
+    font-family: Archivo, 'Segoe UI', system-ui, sans-serif;
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  .page-note {
+    max-width: 900px;
+    margin: 0 auto 20px;
+    font-size: 12px;
+    color: var(--faint);
+  }
+  .page-note b { color: var(--muted); font-weight: 700; }
+
+  /* The window behind the modal, dimmed by the scrim. */
+  .stage {
+    position: relative;
+    max-width: 900px;
+    height: 760px;
+    margin: 0 auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--window);
+    overflow: hidden;
+  }
+  .scrim { position: absolute; inset: 0; background: rgba(32, 30, 29, 0.353); }
+
+  /* ---------------------------------------------------------------- modal */
+  .card {
+    position: absolute;
+    left: 50%;
+    top: 48px;
+    transform: translateX(-50%);
+    width: 640px;
+    background: var(--card);
+    border: 1px solid var(--blue);
+    border-radius: 10px;
+    box-shadow: 0 18px 40px rgba(32, 30, 29, 0.22);
+    overflow: hidden;
+  }
+
+  .card-header {
+    height: 40px;
+    background: var(--blue);
+    color: #fff;
+    display: flex;
+    align-items: center;
+    padding: 0 20px;
+    font-size: 14px;
+    font-weight: 700;
+  }
+  .card-header .x {
+    margin-left: auto;
+    width: 20px; height: 20px;
+    display: grid; place-items: center;
+    opacity: 0.85;
+    cursor: default;
+  }
+
+  .card-body { padding: 18px 20px; }
+
+  .card-footer {
+    border-top: 1px solid var(--hairline);
+    background: var(--tint);
+    padding: 14px 20px;
+    display: flex;
+    gap: 10px;
+  }
+  .btn {
+    height: 32px;
+    flex: 1;
+    border-radius: 7px;
+    font-size: 13px;
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+  }
+  .btn.secondary { background: var(--card); border: 1px solid var(--strong); color: var(--ink); }
+  .btn.primary   { background: var(--blue); color: #fff; }
+  .btn .kbd { font-size: 11px; opacity: 0.75; font-weight: 600; }
+
+  /* ------------------------------------------------- the destination band */
+  .dest {
+    display: flex;
+    align-items: flex-start;
+    gap: 18px;
+    padding: 0 0 16px;
+  }
+  .subject { display: flex; gap: 11px; align-items: flex-start; }
+  .tile {
+    width: 34px; height: 34px;
+    border-radius: 8px;
+    display: grid; place-items: center;
+    font-size: 13px; font-weight: 800; color: #fff;
+    flex: none;
+  }
+  .tile.item { background: #4c6ef5; }
+  .tile.app  { background: var(--canvas); color: var(--muted); border: 1px solid var(--hairline); }
+  .subject-head { display: flex; flex-direction: column; gap: 2px; }
+  .caption {
+    font-size: 11px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--ghost);
+    line-height: 1.09;
+  }
+  .subject-name { font-size: 14px; font-weight: 700; color: var(--ink); line-height: 1.09; }
+  .chips { display: flex; gap: 6px; margin-top: 6px; flex-wrap: wrap; }
+  .chip {
+    font-family: var(--mono);
+    font-size: 11px; color: var(--secondary);
+    background: var(--canvas); border-radius: 5px; padding: 2px 7px;
+  }
+  .arrow { align-self: center; color: var(--ghost); font-size: 16px; }
+
+  /* ------------------------------------------------------ the SEQUENCE band */
+  .seq-band {
+    background: var(--tint);
+    border-bottom: 1px solid var(--hairline);
+    padding: 12px 20px;
+    margin: 0 -20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .seq-band .cap {
+    font-size: 12px; font-weight: 700; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--muted);
+  }
+  .seq-band .tally { font-size: 12px; color: var(--ghost); }
+  .seg {
+    margin-left: auto;
+    display: flex;
+    border: 1px solid var(--strong);
+    border-radius: 7px;
+    overflow: hidden;
+    background: var(--card);
+  }
+  .seg div { padding: 4px 11px; font-size: 12px; font-weight: 600; color: var(--secondary); }
+  .seg div.on { background: var(--blue); color: #fff; }
+  .seg div + div { border-left: 1px solid var(--strong); }
+
+  /* -------------------------------------------------------------- the steps */
+  .steps { padding: 16px 0 0; display: flex; flex-direction: column; gap: 8px; }
+  .step {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--card);
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    padding: 11px 14px;
+  }
+  .step.secret { background: var(--danger-wash); border-color: var(--danger-edge); }
+  .step.selected { background: var(--blue-wash); border-color: var(--blue-edge); }
+  .grip { width: 20px; display: flex; flex-direction: column; gap: 3px; align-items: center; flex: none; }
+  .grip i { width: 12px; height: 2px; border-radius: 2px; background: var(--strong); }
+  .step.secret .grip i { background: var(--danger-edge); }
+  .num { font-family: var(--mono); font-size: 12px; color: var(--ghost); width: 14px; flex: none; }
+  .kind {
+    width: 52px; padding: 3px 0; border-radius: 5px; flex: none;
+    background: var(--canvas); color: var(--secondary);
+    font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-align: center;
+  }
+  .step.secret .kind { background: var(--danger-pill); color: var(--danger-ink); }
+  .middle { display: flex; align-items: center; gap: 7px; flex: 1; flex-wrap: wrap; }
+  .cap-key {
+    font-family: var(--mono); font-size: 12px; font-weight: 600;
+    border: 1px solid var(--strong); border-bottom-width: 2px;
+    border-radius: 5px; padding: 2px 7px; background: var(--card);
+  }
+  .plus { font-size: 11px; color: var(--ghost); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    border: 1px solid var(--blue-edge); border-radius: 8px;
+    padding: 5px 9px; background: var(--blue-wash);
+  }
+  .pill .tag { font-size: 10px; font-weight: 700; letter-spacing: 0.06em; color: var(--blue-deep); }
+  .pill .name { font-size: 12px; font-weight: 700; color: var(--blue-deep); }
+  .pill.secret { border-color: var(--danger-edge); background: #fdf3f2; }
+  .pill.secret .tag, .pill.secret .name { color: var(--danger-ink); }
+  .value { font-size: 12px; color: var(--ghost); }
+  .value.mask { font-family: var(--mono); color: var(--danger-ink); }
+  .wait { font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--ink); }
+
+  /* ------------------------------------------------------------ the add row */
+  .add-row { display: flex; align-items: center; gap: 8px; padding-top: 12px; }
+  .add {
+    height: 30px; padding: 0 11px;
+    border: 1px dashed var(--dash); border-radius: 8px;
+    display: flex; align-items: center;
+    font-size: 12px; font-weight: 600; color: var(--secondary);
+  }
+  .quiet {
+    margin-left: auto; display: flex; gap: 8px;
+  }
+  .quiet .btn { flex: none; padding: 0 12px; }
+
+  .hint { padding-top: 10px; font-size: 11px; color: var(--faint); line-height: 1.45; }
+</style>
+</head>
+<body>
+
+<div class="page-note">
+  <b>Fill rule — design 4a, as the app draws it now.</b>
+  A static mock: say what is wrong and it changes here in seconds, then the
+  same numbers go into <code>sequence_builder.rs</code>.
+</div>
+
+<div class="stage">
+  <div class="scrim"></div>
+
+  <div class="card">
+    <div class="card-header">Fill rule<span class="x">✕</span></div>
+
+    <div class="card-body">
+
+      <!-- destination band -->
+      <div class="dest">
+        <div class="subject">
+          <div class="tile item">SP</div>
+          <div>
+            <div class="subject-head">
+              <div class="caption">Vault item</div>
+              <div class="subject-name">SAP Production</div>
+            </div>
+            <div class="chips"><span class="chip">Work</span></div>
+          </div>
+        </div>
+        <div class="arrow">→</div>
+        <div class="subject">
+          <div class="tile app">SL</div>
+          <div>
+            <div class="subject-head">
+              <div class="caption">Sends only to</div>
+              <div class="subject-name">SAP Logon 760</div>
+            </div>
+            <div class="chips"><span class="chip">saplogon.exe</span></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SEQUENCE band -->
+      <div class="seq-band">
+        <div class="cap">Sequence</div>
+        <div class="tally">6 steps · 2.1 s</div>
+        <div class="seg"><div class="on">Steps</div><div>Template</div></div>
+      </div>
+
+      <!-- the steps -->
+      <div class="steps">
+
+        <div class="step">
+          <div class="grip"><i></i><i></i><i></i></div>
+          <div class="num">1</div>
+          <div class="kind">TEXT</div>
+          <div class="middle">
+            <span class="pill"><span class="tag">USER</span><span class="name">Username</span></span>
+            <span class="value">a.novak@ledgerline.com</span>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="grip"><i></i><i></i><i></i></div>
+          <div class="num">2</div>
+          <div class="kind">KEY</div>
+          <div class="middle"><span class="cap-key">Tab</span></div>
+        </div>
+
+        <div class="step secret">
+          <div class="grip"><i></i><i></i><i></i></div>
+          <div class="num">3</div>
+          <div class="kind">TEXT</div>
+          <div class="middle">
+            <span class="pill secret"><span class="tag">PASS</span><span class="name">Password</span></span>
+            <span class="value mask">•••••••••••</span>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="grip"><i></i><i></i><i></i></div>
+          <div class="num">4</div>
+          <div class="kind">WAIT</div>
+          <div class="middle"><span class="wait">Wait 0.3s</span></div>
+        </div>
+
+        <div class="step selected">
+          <div class="grip"><i></i><i></i><i></i></div>
+          <div class="num">5</div>
+          <div class="kind">KEY</div>
+          <div class="middle">
+            <span class="cap-key">Ctrl</span><span class="plus">+</span><span class="cap-key">A</span>
+          </div>
+        </div>
+
+        <div class="step">
+          <div class="grip"><i></i><i></i><i></i></div>
+          <div class="num">6</div>
+          <div class="kind">KEY</div>
+          <div class="middle"><span class="cap-key">Enter</span></div>
+        </div>
+
+      </div>
+
+      <!-- the add row -->
+      <div class="add-row">
+        <div class="add">+ Text</div>
+        <div class="add">+ Key</div>
+        <div class="add">+ Wait</div>
+        <div class="quiet">
+          <div class="btn secondary">Show what it types</div>
+        </div>
+      </div>
+
+      <div class="hint">
+        Drag a step by its handle to reorder it. Select a step to remove it with
+        Delete, or move it with Alt+Up and Alt+Down.
+      </div>
+
+    </div>
+
+    <div class="card-footer">
+      <div class="btn secondary">Discard</div>
+      <div class="btn primary">Save rule <span class="kbd">CTRL+S</span></div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

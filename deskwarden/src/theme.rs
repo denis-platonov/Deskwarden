@@ -10,7 +10,7 @@
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontFamily, FontId, Margin, Pos2, Rect, Response, RichText, Sense,
-    Shadow, Stroke, StrokeKind, TextStyle, Ui, Vec2,
+    Shadow, Shape, Stroke, StrokeKind, TextStyle, Ui, Vec2,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -48,6 +48,11 @@ pub const BORDER: Color32 = Color32::from_rgb(0xde, 0xdb, 0xd9);
 pub const HAIRLINE: Color32 = Color32::from_rgb(0xea, 0xe7, 0xe7);
 /// Border of interactive controls (buttons, inputs).
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(0xd7, 0xd3, 0xd3);
+/// The DASHED outline's grey, one step darker than [`BORDER_STRONG`]: a
+/// broken line shows less of itself than a solid one, so the design darkens
+/// it to keep the two edges reading as the same weight. Design 4a's
+/// `border: 1px dashed #bab6b6` on the add-a-step buttons.
+pub const BORDER_DASH: Color32 = Color32::from_rgb(0xba, 0xb6, 0xb6);
 
 /// Deepest blue: quadrant 1, emphasized text on blue washes.
 pub const BLUE_DEEP: Color32 = Color32::from_rgb(0x14, 0x30, 0x7a);
@@ -2542,6 +2547,115 @@ pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
     )
 }
 
+/// **The add-something button: an outline of dashes round a caption.**
+///
+/// Design 4a's three under the step list -- `height: 30px; padding: 0 11px;
+/// border: 1px dashed #bab6b6; border-radius: 8px; font-size: 12px;
+/// font-weight: 600; color: #444141` -- the shape the design uses wherever a
+/// control makes a new thing rather than acting on an existing one. The
+/// broken edge is the point: a solid outline would make these read as
+/// alternatives to the buttons in the card's footer, when what they are is
+/// the outline of a step that is not there yet.
+///
+/// Hand-painted rather than an `egui::Button`, because a `Stroke` is one
+/// solid line on all four sides and epaint's dashes take a PATH. The path is
+/// the rounded rectangle walked as a polyline, corners included, so the
+/// dashes run round the corners continuously instead of stopping at four
+/// straight sides -- `dashed_line` measures along the whole path it is given.
+pub fn dashed_button(ui: &mut Ui, label: &str) -> Response {
+    let galley = dashed_button_galley(ui, label);
+    let size = Vec2::new(galley.size().x + 2.0 * DASHED_BUTTON_PAD_X, DASHED_BUTTON_HEIGHT);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if ui.is_rect_visible(rect) {
+        // Hovered, the ground fills and the dashes stay: the control does not
+        // change shape under the pointer, and the fill is what says it is
+        // live -- the same answer `segmented_control` gives an unlit cell.
+        if response.hovered() {
+            ui.painter().rect_filled(rect, CornerRadius::same(DASHED_BUTTON_RADIUS), CANVAS);
+        }
+        for shape in Shape::dashed_line(
+            &rounded_rect_path(rect, f32::from(DASHED_BUTTON_RADIUS)),
+            Stroke::new(1.0, BORDER_DASH),
+            DASHED_BUTTON_DASH,
+            DASHED_BUTTON_GAP,
+        ) {
+            ui.painter().add(shape);
+        }
+        let at = Pos2::new(
+            rect.center().x - galley.size().x / 2.0,
+            rect.center().y - galley.size().y / 2.0,
+        );
+        ui.painter().galley(at, galley, TEXT_SECONDARY);
+    }
+    response
+}
+
+/// [`dashed_button`]'s caption, laid out once -- so the width the control is
+/// ALLOCATED and the run later painted into it are the same measurement.
+fn dashed_button_galley(ui: &Ui, label: &str) -> Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        label.to_owned(),
+        FontId::new(DASHED_BUTTON_TEXT_PX, FontFamily::Name(SEMIBOLD.into())),
+        TEXT_SECONDARY,
+    )
+}
+
+/// 4a's `height: 30px`.
+///
+/// Public because a surface's own tests assert its row of them is one line at
+/// one height -- the reason [`SEGMENT_HEIGHT`] is public.
+pub const DASHED_BUTTON_HEIGHT: f32 = 30.0;
+/// 4a's `padding: 0 11px`, one side.
+const DASHED_BUTTON_PAD_X: f32 = 11.0;
+/// 4a's `border-radius: 8px`.
+const DASHED_BUTTON_RADIUS: u8 = 8;
+/// 4a's `font-size: 12px; font-weight: 600`.
+const DASHED_BUTTON_TEXT_PX: f32 = 12.0;
+/// The dash, and the gap between two of them. CSS does not say what a
+/// `dashed` border's dashes measure -- it is the renderer's choice -- so
+/// these are what comes out looking like the design at this radius: a dash a
+/// little longer than its gap, which is what a browser draws.
+const DASHED_BUTTON_DASH: f32 = 4.0;
+const DASHED_BUTTON_GAP: f32 = 3.0;
+
+/// A rounded rectangle as a closed polyline, for a painter that needs a PATH
+/// rather than a shape -- the dashes in [`dashed_button`].
+///
+/// Each corner is walked in [`ROUNDED_PATH_STEPS`] straight hops, which at the
+/// radii this app uses (5 to 10 points) is a fraction of a point of chord
+/// error: invisible, and far cheaper than a real arc for a line that is
+/// mostly gaps anyway.
+fn rounded_rect_path(rect: Rect, radius: f32) -> Vec<Pos2> {
+    let radius = radius.min(rect.width() / 2.0).min(rect.height() / 2.0);
+    let quarter = std::f32::consts::FRAC_PI_2;
+    // Clockwise from the top-left corner, each entry the corner's centre and
+    // the angle its arc starts at, so the path closes on itself and the last
+    // dash meets the first.
+    let corners = [
+        (Pos2::new(rect.left() + radius, rect.top() + radius), 2.0 * quarter),
+        (Pos2::new(rect.right() - radius, rect.top() + radius), 3.0 * quarter),
+        (Pos2::new(rect.right() - radius, rect.bottom() - radius), 0.0),
+        (Pos2::new(rect.left() + radius, rect.bottom() - radius), quarter),
+    ];
+    let mut path = Vec::with_capacity(4 * (ROUNDED_PATH_STEPS + 1) + 1);
+    for (centre, from) in corners {
+        for step in 0..=ROUNDED_PATH_STEPS {
+            let angle = from + quarter * step as f32 / ROUNDED_PATH_STEPS as f32;
+            path.push(Pos2::new(centre.x + radius * angle.cos(), centre.y + radius * angle.sin()));
+        }
+    }
+    if let Some(&first) = path.first() {
+        path.push(first);
+    }
+    path
+}
+
+/// How many straight hops one quarter-turn of [`rounded_rect_path`] is.
+const ROUNDED_PATH_STEPS: usize = 4;
+
 // ---------------------------------------------------------------------------
 // Design 5b's action row: design-system buttons placed into a MEASURED RECT
 // ---------------------------------------------------------------------------
@@ -2818,9 +2932,41 @@ pub struct Segment<'a> {
 /// this design system already gives [`primary_button`] -- the other place
 /// where one control in a group is the one that matters.
 pub fn segmented_control(ui: &mut Ui, segments: &[Segment<'_>]) -> Option<usize> {
+    segmented_run(ui, segments, SEGMENT_HEIGHT)
+}
+
+/// [`segmented_control`] at the height the DESIGN draws it, for a surface
+/// that has the run beside no form field at all.
+///
+/// [`SEGMENT_HEIGHT`]'s 28 is this app's field height, and it is right
+/// wherever the run sits in a card among steppers and text boxes. Design 4a's
+/// view toggle sits in a heading band beside a caption and nothing else, and
+/// there the extra points made the whole band too tall -- the owner, of the
+/// design and the build side by side: "too high". So this one is the
+/// design's own box: `padding: 4px 11px` round one 12px line plus the 1px
+/// edge, measured off the face rather than restated as a number, so it stays
+/// the design's box if the face is ever changed.
+pub fn segmented_control_compact(ui: &mut Ui, segments: &[Segment<'_>]) -> Option<usize> {
+    let height = segment_height_compact(ui);
+    segmented_run(ui, segments, height)
+}
+
+/// [`segmented_control_compact`]'s height: 4a's `padding: 4px 11px` and its
+/// `border: 1px solid #d7d3d3` round one line of [`SEGMENT_TEXT_SIZE`].
+pub fn segment_height_compact(ui: &Ui) -> f32 {
+    let line = ui.ctx().fonts_mut(|f| {
+        f.row_height(&FontId::new(SEGMENT_TEXT_SIZE, FontFamily::Name(SEMIBOLD.into())))
+    });
+    line + 2.0 * SEGMENT_COMPACT_PAD_Y + 2.0
+}
+
+/// 4a's `padding: 4px` on a compact cell, one side.
+const SEGMENT_COMPACT_PAD_Y: f32 = 4.0;
+
+fn segmented_run(ui: &mut Ui, segments: &[Segment<'_>], height: f32) -> Option<usize> {
     let widths = segment_widths(ui, segments);
     let (run, response) =
-        ui.allocate_exact_size(Vec2::new(run_width(&widths), SEGMENT_HEIGHT), Sense::click());
+        ui.allocate_exact_size(Vec2::new(run_width(&widths), height), Sense::click());
     // Read once: `hover_pos` is a pointer position and this control is
     // hit-testing it cell by cell, so a second read mid-loop could put the
     // hover on one cell and the click on another within one frame.

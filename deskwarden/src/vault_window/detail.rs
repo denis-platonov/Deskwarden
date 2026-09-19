@@ -4715,10 +4715,10 @@ struct AppRow {
     /// longer prints it on its own line: the `Program file` row below is
     /// showing the full path, which ends in it.
     copy: String,
-    /// `false` for a placeholder. It reaches [`copy_row`]'s `copyable`, so a
-    /// row saying "Not recorded" is inert -- no tint, no hand, no tooltip, no
-    /// toast -- for the same reason an empty Password row is (see
-    /// [`row_offers_copy`]).
+    /// Whether a click on this row has anything to put on the clipboard. It
+    /// reaches [`copy_row`]'s `copyable`, so a row with nothing behind it is
+    /// inert -- no tint, no hand, no tooltip, no toast -- for the same reason
+    /// an empty Password row is (see [`row_offers_copy`]).
     ///
     /// Derived from [`Self::copy`] and not from `value`: a row that showed a
     /// resolved name and had nothing to copy would offer a tint, a hand and a
@@ -4732,9 +4732,16 @@ struct AppRow {
     app: bool,
 }
 
-/// The placeholder for a `path` this match never captured -- every match saved
-/// before the field existed, which is a shape still sitting in real vaults.
-const APP_PATH_UNRECORDED: &str = "Not recorded";
+// **A `path` this match never captured draws NO ROW.** Every match saved
+// before the field existed is such a shape, and they are still sitting in
+// real vaults; this pane used to give them a `Program file` row reading "Not
+// recorded", inert -- no tint, no hand, no toast -- so that a word this pane
+// invented could never reach the clipboard. The owner, with that row on
+// screen: "if nothing - don't show on Details screen". A row whose value is
+// the absence of a value is a line of the card spent saying nothing, and the
+// read pane already answers "there is nothing here" the way the rest of this
+// app does: by not drawing the row. The edit form is where a path is put in,
+// and it draws its box whether or not one is there.
 
 /// The card's rows, in order, for a match that exists.
 ///
@@ -4754,11 +4761,13 @@ const APP_PATH_UNRECORDED: &str = "Not recorded";
 ///    is inert by design (see [`AppMatch::hosted`]): every one saved during
 ///    the one commit that recorded titles for every row is deliberately never
 ///    matched on, and drawing it here would tell the user it does something.
-///  * **Program file** -- `path`, or [`APP_PATH_UNRECORDED`]. Shown as the
+///  * **Program file** -- `path`, and only when there is one. Shown as the
 ///    match stores it, NOT through `AppMatch::launchable_path`: that function
 ///    answers "is this safe to execute", this row answers "what did the picker
 ///    record", and showing nothing for a path that fails the launch check
 ///    would hide the very corruption a user needs to see in order to fix it.
+///    A match with no path at all draws no row -- see the note above the
+///    function.
 fn app_match_rows(m: &AppMatch, name: &str) -> Vec<AppRow> {
     let mut rows = vec![AppRow {
         label: "App",
@@ -4781,22 +4790,15 @@ fn app_match_rows(m: &AppMatch, name: &str) -> Vec<AppRow> {
             app: false,
         });
     }
-    let recorded = row_offers_copy(&m.path);
-    rows.push(AppRow {
-        label: "Program file",
-        value: if recorded {
-            m.path.clone()
-        } else {
-            APP_PATH_UNRECORDED.to_string()
-        },
-        // The path itself, empty when there is none -- NOT the placeholder,
-        // which is this pane's own word and must never be what a click puts
-        // on the clipboard. Keeping it here is what lets `real` be one
-        // expression over `copy` on every row.
-        copy: m.path.clone(),
-        real: recorded,
-        app: false,
-    });
+    if row_offers_copy(&m.path) {
+        rows.push(AppRow {
+            label: "Program file",
+            value: m.path.clone(),
+            copy: m.path.clone(),
+            real: true,
+            app: false,
+        });
+    }
     rows
 }
 
@@ -5626,10 +5628,9 @@ fn app_value_row(
             ui.label(galley);
         },
         |_ui| {},
-        // `copy`, not `value`: the `Program file` row shows this pane's own
-        // "Not recorded" placeholder when there is no path, and a click must
-        // never put a word this pane invented on the clipboard. See
-        // [`AppRow::copy`].
+        // `copy`, not `value`: the `App` row displays the app's resolved
+        // name and copies its executable, and a click has to put on the
+        // clipboard the thing that pastes somewhere. See [`AppRow::copy`].
         DetailAction::CopyValue(copy.to_string()),
         None,
         row_offers_copy(copy),
@@ -12451,24 +12452,23 @@ mod tests {
     const RESOLVED_NAME: &str = "Ledgerline Accounting Suite";
 
     /// Every match saved before `path` existed -- a shape still sitting in
-    /// real vaults. The row must say so, and must not offer to copy the words
-    /// "Not recorded" onto the clipboard.
+    /// real vaults. **The card draws no row at all for it**: the owner, of
+    /// the "Not recorded" placeholder this pane used to print, "if nothing -
+    /// don't show on Details screen".
     #[test]
-    fn a_match_that_recorded_no_program_file_says_so_and_that_row_is_inert() {
+    fn a_match_that_recorded_no_program_file_draws_no_row_for_it() {
         let m = AppMatch::for_process("Ledgerline.exe", TriggerMode::Auto);
         let rows = app_match_rows(&m, RESOLVED_NAME);
-        let path = rows
-            .iter()
-            .find(|r| r.label == "Program file")
-            .expect("the card dropped the Program file row entirely");
-        assert_eq!(path.value, "Not recorded");
-        assert!(!path.real, "the placeholder would be copied to the clipboard");
-        assert_eq!(
-            path.copy, "",
-            "the pane's own placeholder is what a click would put on the clipboard"
+        assert!(
+            !rows.iter().any(|r| r.label == "Program file"),
+            "the card still draws a Program file row: {rows:?}"
         );
-        // Control: a match that DID record one is copyable, so `real` is not
-        // simply always false.
+        assert!(
+            !rows.iter().any(|r| r.value.contains("recorded")),
+            "the placeholder is still painted somewhere: {rows:?}"
+        );
+        // Control: a match that DID record one still has its row, so the
+        // rule is the path and not the card.
         let recorded = app_match_rows(&a_desktop_match(), RESOLVED_NAME);
         assert!(recorded.iter().find(|r| r.label == "Program file").unwrap().real);
     }
@@ -14473,10 +14473,11 @@ mod tests {
         );
     }
 
-    /// The card's rows are the pane's ordinary copy rows, and the placeholder
-    /// is not -- Task 1's rule, reaching this card.
+    /// The card's Program file row is one of the pane's ordinary copy rows,
+    /// and a match with no path has no such row at all -- the owner: "if
+    /// nothing - don't show on Details screen".
     #[test]
-    fn the_program_file_row_copies_its_path_and_the_placeholder_copies_nothing() {
+    fn the_program_file_row_copies_its_path_and_a_match_without_one_has_no_row() {
         let bound = bound_to(&a_login(), &a_desktop_match());
         let mut pane = Pane::new();
         let laid_out = pane.idle(&bound, &TotpState::NoSecret);
@@ -14495,20 +14496,12 @@ mod tests {
         );
         let mut pane = Pane::new();
         let laid_out = pane.idle(&unrecorded, &TotpState::NoSecret);
-        assert!(laid_out.painted("Not recorded"), "{:?}", laid_out.strings());
-        let row = laid_out.rect_of("Program file");
-        let clicked = pane.click(&unrecorded, &TotpState::NoSecret, row.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::None,
-            "the \"Not recorded\" placeholder was copied to the clipboard"
-        );
-        let hovered = pane.hover(&unrecorded, &TotpState::NoSecret, row.center());
-        assert_ne!(
-            hovered.cursor,
-            egui::CursorIcon::PointingHand,
-            "the placeholder row still offers a click"
-        );
+        for gone in ["Program file", "Not recorded"] {
+            assert!(!laid_out.painted(gone), "{gone:?} is still drawn: {:?}", laid_out.strings());
+        }
+        // The card is still there, and still says the app it is bound to:
+        // what went is the empty row, not the binding.
+        assert!(laid_out.painted("App"), "{:?}", laid_out.strings());
     }
 
     // -----------------------------------------------------------------

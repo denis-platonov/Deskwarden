@@ -7713,6 +7713,22 @@ pub(crate) fn sequence_steps(
 /// the app is 28 and a run two points shorter in this one form would read as a
 /// mismeasurement rather than as a decision. One control, one height.
 pub(crate) fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
+    view_toggle_run(ui, template_view, theme::segmented_control)
+}
+
+/// [`view_toggle`] at the design's own height, for 4a's heading band -- see
+/// [`theme::segmented_control_compact`] for why the band gets a different
+/// box from the one this form draws among its fields.
+pub(crate) fn view_toggle_compact(ui: &mut egui::Ui, template_view: bool) -> Option<bool> {
+    view_toggle_run(ui, template_view, theme::segmented_control_compact)
+}
+
+/// The toggle's cells and its one rule, over whichever run paints them.
+fn view_toggle_run(
+    ui: &mut egui::Ui,
+    template_view: bool,
+    run: impl Fn(&mut egui::Ui, &[theme::Segment<'_>]) -> Option<usize>,
+) -> Option<bool> {
     let cells = [
         theme::Segment { label: VIEW_STEPS, selected: !template_view },
         theme::Segment { label: VIEW_TEMPLATE, selected: template_view },
@@ -7722,7 +7738,7 @@ pub(crate) fn view_toggle(ui: &mut egui::Ui, template_view: bool) -> Option<bool
     // for the view already on screen; answering `Some` there would re-seed
     // `template_draft` from `sequence` on every click of the lit cell, which
     // is an edit the user did not make. See the caller.
-    match theme::segmented_control(ui, &cells) {
+    match run(ui, &cells) {
         Some(0) if template_view => Some(false),
         Some(1) if !template_view => Some(true),
         _ => None,
