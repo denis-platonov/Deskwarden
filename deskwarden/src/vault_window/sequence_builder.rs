@@ -2715,7 +2715,16 @@ fn menu_body<R>(
 fn palette_menu_width(ui: &egui::Ui, palette: &[FieldRef]) -> f32 {
     let pills: f32 = palette.iter().map(|field| field_pill_width(ui, &field.label())).sum();
     let gaps = MENU_PALETTE_GAP * palette.len().saturating_sub(1) as f32;
-    (pills + gaps).clamp(ADD_MENU_WIDTH, ADD_MENU_MAX_WIDTH)
+    // **The wider of the menu's two rows, and nothing over.** It was floored
+    // at the key palette's width, which left the menu wider than anything in
+    // it once the pills fitted -- the owner: "make that popup size of field
+    // - tighther". The other row is the literal box and its Add, and the box
+    // has a width of its own to keep: a text box narrower than
+    // [`LITERAL_BOX_WIDTH`] is one that cannot show what was typed into it.
+    let field_row = LITERAL_BOX_WIDTH
+        + theme::ROW_BUTTON_GAP
+        + theme::row_button_width(ui, ADD_LITERAL_BUTTON);
+    (pills + gaps).max(field_row).min(ADD_MENU_MAX_WIDTH)
 }
 
 /// How wide [`field_pill`] will draw for `name`, without drawing it -- the
@@ -2733,11 +2742,15 @@ const ADD_WAIT_LABEL: &str = "+ Wait";
 const ADD_ROW_GAP: f32 = 8.0;
 const ADD_ROW_LIFT: f32 = 4.0;
 
-/// How wide a menu opens, and the widest [`palette_menu_width`] will take
-/// it. The floor is wide enough for the key palette's caps and for the text
-/// box beside its Add, so a menu does not resize itself as the user types.
+/// How wide the KEY menu opens -- its caps wrap, so its width is a budget
+/// rather than a result -- and the widest [`palette_menu_width`] will take
+/// the value menu.
 const ADD_MENU_WIDTH: f32 = 280.0;
 const ADD_MENU_MAX_WIDTH: f32 = 520.0;
+
+/// The literal box's own width, which is what the value menu is at least as
+/// wide as.
+const LITERAL_BOX_WIDTH: f32 = 160.0;
 
 /// The gaps inside a menu: between two palette cells, and between one
 /// captioned block and the next.

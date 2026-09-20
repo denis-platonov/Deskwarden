@@ -554,6 +554,22 @@ pub fn effective_tokens(sequence: &str) -> Vec<Token> {
 /// `deskwarden:`-prefixed fields are this app's own bookkeeping (the app match
 /// itself, and the sequence) and are not offered: typing this app's JSON into
 /// a login form is not something a user is trying to do.
+///
+/// **Nor is a HIDDEN custom field offered** -- Bitwarden's `type: 1`, the
+/// one the edit form draws masked with a reveal beside it. The owner, of an
+/// `MFA secret` pill in the builder's palette: "remove from pills - that's
+/// usually secret field even if shown in settings". A field somebody chose
+/// to store as hidden is a credential like the password, and the two
+/// credentials this app DOES offer -- `{PASSWORD}` and `{TOTP}` -- are the
+/// ones a sign-in form asks for. A recovery code or an authenticator seed is
+/// not something an app is waiting to be typed, and a palette that offers it
+/// one click from a sequence is a palette that will eventually type it
+/// somewhere.
+///
+/// **Still reachable by hand**: `{S:MFA secret}` parses and resolves exactly
+/// as it did (see [`Token::Field`]), so a sequence that already names one
+/// keeps working and a user who means it can still write it. What is gone is
+/// the offer.
 pub fn field_palette(item: &VaultItem) -> Vec<FieldRef> {
     let mut out = Vec::new();
     let login = item.login.as_ref();
@@ -568,7 +584,7 @@ pub fn field_palette(item: &VaultItem) -> Vec<FieldRef> {
     }
     for field in &item.fields {
         let Some(name) = field.name.as_deref() else { continue };
-        if name.is_empty() || name.starts_with("deskwarden:") {
+        if name.is_empty() || name.starts_with("deskwarden:") || is_hidden_field(field) {
             continue;
         }
         let candidate = FieldRef::Custom(name.to_string());
@@ -577,6 +593,19 @@ pub fn field_palette(item: &VaultItem) -> Vec<FieldRef> {
         }
     }
     out
+}
+
+/// Whether this custom field is Bitwarden's `type: 1`, the hidden one.
+///
+/// Read off the flattened `other` map for the reason
+/// `detail_edit::FieldDraft::from` reads it there: the type is a wire key
+/// this crate deliberately does not model, so that a field of a type this
+/// build has never seen is carried through untouched rather than converted.
+/// Compared against the JSON number, not parsed, so a `"1"` string -- which
+/// `bw` does not send and a hand-edited vault might -- is NOT taken for a
+/// hidden field and simply stays visible.
+fn is_hidden_field(field: &crate::vault_bridge::VaultField) -> bool {
+    field.other.get("type") == Some(&serde_json::json!(1))
 }
 
 // ---------------------------------------------------------------------------
@@ -1280,6 +1309,47 @@ mod tests {
                 FieldRef::Custom("PIN".to_string()),
                 FieldRef::Custom("Employee ID".to_string()),
             ]
+        );
+    }
+
+    /// **A hidden custom field is not offered**, and a sequence that names
+    /// one by hand still resolves it.
+    ///
+    /// The owner, of an `MFA secret` pill: "remove from pills - that's
+    /// usually secret field even if shown in settings". A field somebody
+    /// chose to store as Bitwarden's `type: 1` is a credential, and the two
+    /// credentials this app offers to type are the ones a sign-in form asks
+    /// for.
+    #[test]
+    fn a_hidden_custom_field_is_not_offered_but_still_resolves() {
+        let mut item = item();
+        let mut hidden = field("MFA secret", "JBSWY3DPEHPK3PXP");
+        hidden.other.insert("type".to_string(), serde_json::json!(1));
+        item.fields.push(hidden);
+        // A plain one beside it, so what is asserted is the TYPE and not
+        // "the last field is dropped".
+        item.fields.push(field("Reader", "R-7"));
+
+        let palette = field_palette(&item);
+        assert!(
+            !palette.contains(&FieldRef::Custom("MFA secret".to_string())),
+            "the hidden field is still offered: {palette:?}"
+        );
+        assert!(
+            palette.contains(&FieldRef::Custom("Reader".to_string())),
+            "the plain field beside it went too: {palette:?}"
+        );
+
+        // ...and the offer is all that is gone. Written by hand, it parses
+        // and resolves exactly as it did.
+        let token = parse("{S:MFA secret}");
+        assert_eq!(token, vec![Token::Field(FieldRef::Custom("MFA secret".to_string()))]);
+        let totp = TotpState::NoSecret;
+        let source = source(&item, &totp);
+        assert_eq!(
+            source.custom_value("MFA secret").as_deref(),
+            Some("JBSWY3DPEHPK3PXP"),
+            "a hand-written reference to it no longer resolves"
         );
     }
 
