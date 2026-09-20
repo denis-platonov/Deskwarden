@@ -8009,7 +8009,11 @@ fn app_sequence_block(
     ui.label(RichText::new("Add a wait").size(11.0).color(theme::TEXT_FAINT));
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-        ui.add(egui::TextEdit::singleline(&mut app.wait_draft).desired_width(48.0));
+        // Only a number goes in -- `key_sequence::only_a_number`, the same
+        // rule 4a's own wait box keeps.
+        if ui.add(egui::TextEdit::singleline(&mut app.wait_draft).desired_width(48.0)).changed() {
+            app.wait_draft = key_sequence::only_a_number(&app.wait_draft);
+        }
         ui.label(RichText::new("seconds").size(11.0).color(theme::TEXT_FAINT));
         let addable = key_sequence::wait_ms_from_seconds(&app.wait_draft).is_some();
         if ui.add_enabled(addable, egui::Button::new("Add wait")).clicked() {
@@ -8709,8 +8713,15 @@ pub(crate) const TEMPLATE_TOKEN_PAD_X: f32 = 4.0;
 /// face's own. The chip is the cap band plus this each way; the ROW grows
 /// with it and the caret does not, because the caret is this band too.
 const TEMPLATE_TOKEN_PAD_Y: f32 = 4.5;
-/// What one row of chips leaves the next.
-const TEMPLATE_ROW_AIR: f32 = 3.0;
+/// What one row of chips leaves the next -- and it is the WIDER of this
+/// box's two gaps, which is the way round the owner asked for once both
+/// were on screen: "swap hairlines - what we have in between make in
+/// between roes and what we have in between roes make between pills
+/// hotizontally". Two chips side by side read as two things at three
+/// points apart; two rows need more, because what separates them is the
+/// only thing saying the line below is a line and not a wrap of the chip
+/// above it.
+const TEMPLATE_ROW_AIR: f32 = 6.0;
 /// The caret this box draws for itself: two points, which is what egui's own
 /// is at this size, and as tall as a chip.
 pub(crate) const TEMPLATE_CARET_WIDTH: f32 = 2.0;
@@ -8719,7 +8730,7 @@ pub(crate) const TEMPLATE_TOKEN_RADIUS: u8 = 4;
 /// [`template_galley`], less the padding each chip takes out of it. Two
 /// points of the box's own white, which is the "white hairline between
 /// pills horizontally" the owner asked for.
-pub(crate) const TEMPLATE_TOKEN_GAP: f32 = 14.0;
+pub(crate) const TEMPLATE_TOKEN_GAP: f32 = 11.0;
 /// How far past the wrap width a token that must not split has its `{`
 /// sent, over and above what the last layout said would reach it. Glyph
 /// positions are rounded to the pixel one by one, so a point covers it.

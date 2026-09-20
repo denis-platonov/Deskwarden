@@ -2769,6 +2769,14 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
                         false,
                         WAIT_BOX_WIDTH,
                     );
+                    // **Only a number goes in**: see
+                    // `key_sequence::only_a_number`, and the owner's "only
+                    // allow numbers". Applied to what the box now holds
+                    // rather than to the key that arrived, so a paste is
+                    // filtered too.
+                    if box_response.changed() {
+                        draft.wait_draft = key_sequence::only_a_number(&draft.wait_draft);
+                    }
                     ui.label(RichText::new(WAIT_UNIT).size(11.0).color(theme::TEXT_FAINT));
                     let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
                     let typed = entered(&box_response, ui);

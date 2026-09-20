@@ -307,6 +307,34 @@ pub fn wait_label(ms: u32) -> String {
 /// mistyped `36000` that parked the fill for ten hours would look exactly like
 /// a hang. Accepts a decimal point or a comma, because both are decimal
 /// separators on the keyboards this app ships to.
+/// **What a wait box will hold**: `text` with everything that is not a
+/// number in it taken out.
+///
+/// The owner, having typed letters into one: "only allow numbers". A box
+/// that accepts `gf` and then refuses to add anything is a box that made
+/// the user type a mistake before telling them; one that cannot hold a
+/// letter at all never asks the question.
+///
+/// Digits and ONE separator -- a point or a comma, both of which
+/// [`wait_ms_from_seconds`] parses, because both are decimal separators on
+/// the keyboards this app ships to. The second separator is dropped rather
+/// than the first, so a user correcting `1..` keeps the one they meant.
+/// Nothing is reordered and nothing is added: this only ever removes, so a
+/// half-typed number is still the number the user is halfway through.
+pub fn only_a_number(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut separated = false;
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            out.push(c);
+        } else if (c == '.' || c == ',') && !separated {
+            separated = true;
+            out.push(c);
+        }
+    }
+    out
+}
+
 pub fn wait_ms_from_seconds(text: &str) -> Option<u32> {
     let text = text.trim().replace(',', ".");
     if text.is_empty() {
@@ -1293,6 +1321,26 @@ mod tests {
         ] {
             assert_eq!(wait_label(ms), expected, "{ms} ms");
         }
+    }
+
+    /// **A wait box holds only a number.** The owner, having typed letters
+    /// into one: "only allow numbers".
+    #[test]
+    fn a_wait_box_keeps_only_the_number_in_what_was_typed() {
+        for (typed, kept) in [
+            ("gf", ""),
+            ("1", "1"),
+            ("1.5", "1.5"),
+            ("1,5", "1,5"),
+            ("1.5.5", "1.55"),
+            ("v1.5s", "1.5"),
+            ("", ""),
+            ("-1", "1"),
+        ] {
+            assert_eq!(only_a_number(typed), kept, "{typed:?}");
+        }
+        // Everything it keeps, the parser still reads the same way.
+        assert_eq!(wait_ms_from_seconds(&only_a_number("1.5")), Some(1500));
     }
 
     #[test]
