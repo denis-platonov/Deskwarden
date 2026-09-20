@@ -5725,12 +5725,6 @@ fn chip_height(ui: &egui::Ui) -> f32 {
     tallest + STEP_CHIP_PAD_Y * 2.0
 }
 
-/// The face the row's own runs are set in -- its caption and its button --
-/// and therefore the face whose line the chips have to land on.
-fn chip_row_font() -> egui::FontId {
-    egui::FontId::new(STEP_CHIP_TOTAL_PX, egui::FontFamily::Proportional)
-}
-
 /// One of 8a's chips, at the row's shared [`chip_height`].
 pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone, height: f32) {
     let (family, fill, edge, ink) = chip_palette(tone);
@@ -5745,22 +5739,26 @@ pub(crate) fn sequence_chip(ui: &mut egui::Ui, text: &str, tone: ChipTone, heigh
         egui::Stroke::new(1.0, edge),
         egui::StrokeKind::Inside,
     );
-    // **The FACE's ink on the ROW's line**, not the galley box, not this
-    // particular word's ink, and not the pill's geometric middle.
+    // **The FACE's ink on the PILL's middle**, not the galley box and not
+    // this particular word's ink.
     //
-    // `face_ink_middle` is what puts a mono `250 ms` and a semibold `Username`
-    // on one line with each other -- a box is ascent plus descent and two
-    // faces divide that differently. `line_lift` is what puts that line where
-    // the REST of the row already is: egui centres a galley by its box, and a
-    // face inks the upper part of that box, so everything egui lays sits a
-    // point above the geometric middle. Face-centred alone, the pills sat a
-    // point below the caption and the button beside them -- the owner: "check
-    // elements they feel like not aligned vertically".
+    // `face_ink_middle` is what puts a mono `3.0 s` and a semibold
+    // `Username` on one line with each other: a box is ascent plus descent
+    // and two faces divide that differently.
+    //
+    // **And no `line_lift`.** That term put this ink on the line egui's own
+    // labels ink on -- a point above the geometric middle, because egui
+    // centres a galley by its box and a face inks the upper part of one --
+    // so that a pill agreed with the plain runs beside it. It also moved
+    // every pill's word a point off the middle of the pill round it, which
+    // is the thing the eye actually measures: a word in a box is read
+    // against the box. The owner, of `Enter` in its own pill: "Enter pill
+    // text not centered". The builder's own chips settled the same way, in
+    // `sequence_builder::run_top`.
     ui.painter().galley(
         egui::pos2(
             rect.left() + STEP_CHIP_PAD_X,
-            rect.center().y - theme::face_ink_middle(ui, &font)
-                - theme::line_lift(ui, &chip_row_font()),
+            rect.center().y - theme::face_ink_middle(ui, &font),
         ),
         galley,
         ink,
@@ -8155,15 +8153,24 @@ pub(crate) fn template_editor(
             let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
                 template_galley(ui, buffer.as_str(), wrap)
             };
-            ui.add(
-                egui::TextEdit::multiline(template_draft)
-                    .id(box_id)
-                    .desired_rows(1)
-                    .desired_width(f32::INFINITY)
-                    .frame(egui::Frame::new())
-                    .margin(Margin::ZERO)
-                    .layouter(&mut layouter),
-            )
+            // **A slot claimed before the text, filled after it.** The pills
+            // are painted UNDER the glyphs and their shape is not known
+            // until the galley exists -- `theme::field_box` reserves an
+            // index the same way, and for the same reason.
+            let grounds = ui.painter().add(egui::Shape::Noop);
+            let laid = egui::TextEdit::multiline(template_draft)
+                .id(box_id)
+                .desired_rows(1)
+                .desired_width(f32::INFINITY)
+                .frame(egui::Frame::new())
+                .margin(Margin::ZERO)
+                .layouter(&mut layouter)
+                .show(ui);
+            ui.painter().set(
+                grounds,
+                egui::Shape::Vec(template_pills(ui, &laid.galley, laid.galley_pos)),
+            );
+            laid.response
         });
     // The halo, round the box it is about -- 4c's `box-shadow: 0 0 0 3px
     // #dbe4f7`, which is `theme::field_box`'s own focus treatment.
@@ -8317,17 +8324,21 @@ fn template_galley(
     let line = TEMPLATE_TEXT_PX * TEMPLATE_LINE_HEIGHT;
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap;
-    job.wrap.break_anywhere = true;
+    // **A token wraps whole.** `break_anywhere` split `{ENTER}` into `{EN`
+    // and `TER}` across two lines, each with half a chip under it -- the
+    // owner: "make sure only full pill goes there". egui breaks between
+    // words, and every token is its own word here.
+    job.wrap.break_anywhere = false;
     for (index, (run, token)) in template_runs(text).into_iter().enumerate() {
-        let (background, color) = if token {
+        let color = if token {
             match token_tone(run) {
-                TokenTone::Value => (theme::FOCUS_RING, theme::BLUE_DEEP),
-                TokenTone::Secret => (theme::DANGER_PILL, theme::DANGER_INK),
-                TokenTone::Timing => (theme::CANVAS, theme::TEXT_FAINT),
-                TokenTone::Key => (theme::CANVAS, theme::TEXT_SECONDARY),
+                TokenTone::Value => theme::BLUE_DEEP,
+                TokenTone::Secret => theme::DANGER_INK,
+                TokenTone::Timing => theme::TEXT_FAINT,
+                TokenTone::Key => theme::TEXT_SECONDARY,
             }
         } else {
-            (egui::Color32::TRANSPARENT, theme::INK)
+            theme::INK
         };
         // **The gap between two chips, as a LEADING SPACE and not as
         // characters.** 4c's tokens carry `padding: 2px 5px` and the
@@ -8344,20 +8355,77 @@ fn template_galley(
             egui::TextFormat {
                 font_id: font.clone(),
                 color,
-                background,
-                // 4c's `padding: 2px 5px` round a token, as far as a text
-                // layout can give it: epaint fills a run's background to
-                // the row box and `expand_bg` grows it beyond -- there is
-                // no asymmetric padding, so this is the design's vertical
-                // number, which is the one that makes a token read as a
-                // chip rather than as a highlight.
-                expand_bg: if token { TEMPLATE_TOKEN_PAD } else { 0.0 },
+                // No `background`: the chips are painted under the line by
+                // [`template_pills`], because epaint's is a square filling
+                // the row box and 4c's is a rounded one round the word.
                 line_height: Some(line),
                 ..Default::default()
             },
         );
     }
     ui.ctx().fonts_mut(|f| f.layout_job(job))
+}
+
+/// **4c's token chips, painted under the line.**
+///
+/// The ground behind a token was `TextFormat::background`, which epaint
+/// draws as a square filling the row box: square where the design's is
+/// `border-radius: 4px`, as tall as the LINE rather than as the word, and
+/// centred on a box that no face fills -- so the word sat high in it. The
+/// owner, of both at once: "text not centered again, also those should be
+/// pills".
+///
+/// So the tokens are found in the text, their ends are asked of the galley
+/// (`pos_from_cursor` is where a caret would go, which is exactly the left
+/// edge of a character), and the chip is drawn round the ink between them.
+/// A token that egui has broken across two rows is left alone: its two
+/// halves are not one pill, and [`template_galley`] does not let a token
+/// break in the first place.
+fn template_pills(
+    ui: &egui::Ui,
+    galley: &egui::Galley,
+    origin: egui::Pos2,
+) -> Vec<egui::Shape> {
+    let font = egui::FontId::new(TEMPLATE_TEXT_PX, egui::FontFamily::Monospace);
+    let line = TEMPLATE_TEXT_PX * TEMPLATE_LINE_HEIGHT;
+    let ink_middle = theme::line_ink_middle(ui.ctx(), &font, line);
+    let height = ui.ctx().fonts_mut(|f| f.row_height(&font)) + 2.0 * TEMPLATE_TOKEN_PAD_Y;
+    let text = galley.text().to_string();
+    let mut shapes = Vec::new();
+    let mut chars = 0usize;
+    for (run, token) in template_runs(&text) {
+        let length = run.chars().count();
+        if token {
+            let from = galley.pos_from_cursor(egui::text::CCursor::new(chars));
+            let to = galley.pos_from_cursor(egui::text::CCursor::new(chars + length));
+            // One row, or no pill: see the doc above.
+            if (from.top() - to.top()).abs() < 0.5 {
+                let tone = token_tone(run);
+                let top = origin.y + from.top() + ink_middle - height / 2.0;
+                let rect = egui::Rect::from_min_max(
+                    egui::pos2(origin.x + from.left() - TEMPLATE_TOKEN_PAD_X, top),
+                    egui::pos2(origin.x + to.left() + TEMPLATE_TOKEN_PAD_X, top + height),
+                );
+                shapes.push(egui::Shape::rect_filled(
+                    rect,
+                    CornerRadius::same(TEMPLATE_TOKEN_RADIUS),
+                    token_ground(tone),
+                ));
+            }
+        }
+        chars += length;
+    }
+    shapes
+}
+
+/// The ground a token of this kind is drawn on. Its INK is
+/// [`template_galley`]'s, and the two are picked together.
+fn token_ground(tone: TokenTone) -> egui::Color32 {
+    match tone {
+        TokenTone::Value => theme::FOCUS_RING,
+        TokenTone::Secret => theme::DANGER_PILL,
+        TokenTone::Timing | TokenTone::Key => theme::CANVAS,
+    }
 }
 
 /// `text` split into its `{...}` tokens and the literal runs between them,
@@ -8400,14 +8468,22 @@ const TEMPLATE_TEXT_PX: f32 = 13.0;
 /// [`TEMPLATE_TOKEN_PAD`] instead, because egui draws the caret at the line
 /// and a 1.9 line in a 13-point face is a 25-point bar. The owner, twice:
 /// "text cursor is huge".
-const TEMPLATE_LINE_HEIGHT: f32 = 1.25;
-/// How far a token's ground is grown past its glyphs -- 4c's `padding: 2px
-/// 5px`, as far as a text layout can express it (`expand_bg` is one number
-/// for all four sides).
-const TEMPLATE_TOKEN_PAD: f32 = 3.0;
-/// What separates one chip from the next. See the leading space in
-/// [`template_galley`].
-const TEMPLATE_TOKEN_GAP: f32 = 7.0;
+/// **The line box, which is also the caret and the room between two rows of
+/// chips.** 4c's is `line-height: 1.9`; this is less, because egui draws the
+/// caret at the line and a 1.9 line in a 13-point face is a 25-point bar --
+/// the owner, twice: "text cursor is huge". What is left has to be enough
+/// for a chip and a little air, which is the other half of the ask: "there
+/// is enough space in between of lines to draw pills and a bit of space".
+const TEMPLATE_LINE_HEIGHT: f32 = 1.6;
+/// 4c's `padding: 2px 5px` round a token, and its `border-radius: 4px`.
+const TEMPLATE_TOKEN_PAD_X: f32 = 4.0;
+const TEMPLATE_TOKEN_PAD_Y: f32 = 2.5;
+const TEMPLATE_TOKEN_RADIUS: u8 = 4;
+/// What separates one chip from the next: the leading space in
+/// [`template_galley`], less the padding each chip takes out of it. Two
+/// points of the box's own white, which is the "white hairline between
+/// pills horizontally" the owner asked for.
+const TEMPLATE_TOKEN_GAP: f32 = 10.0;
 const TEMPLATE_GAP: f32 = 14.0;
 const TEMPLATE_CHIP_GAP: f32 = 7.0;
 const TEMPLATE_CHIP_PX: f32 = 11.0;
@@ -10817,7 +10893,18 @@ pub fn draw_detail_edit(
                 {
                     action = EditAction::Save;
                 }
-                if theme::section_footer_secondary_button(ui, CANCEL_BUTTON).clicked() {
+                // **The chord only where there is room for it.** `ESC`
+                // costs this button about 26 points, and at the app's
+                // minimum pane the footer's two buttons and the card round
+                // them come to 302 on a 298-point pane -- measured, by the
+                // test that holds every control inside the pane. The same
+                // gate the rows use: wide enough for a label column is wide
+                // enough for a hint on a button.
+                let chord =
+                    theme::section_rows_fit(ui).then_some(theme::MODAL_DISMISS_CHORD);
+                if theme::section_footer_secondary_button_with(ui, CANCEL_BUTTON, chord)
+                    .clicked()
+                {
                     // **Not `EditAction::Cancel` outright.** A draft with
                     // unsaved edits asks first; an untouched one closes now.
                     // See `EditDraft::is_dirty` for why the gate is on the
@@ -28494,18 +28581,55 @@ mod edit_pane_layout_tests {
             });
             top + middle
         };
-        let caption_line = line_of(
-            SEQUENCE_ROW_LABEL,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        );
-        let mono = egui::FontId::new(STEP_CHIP_PX, egui::FontFamily::Monospace);
-        let semi =
-            egui::FontId::new(STEP_CHIP_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-        for (run, font) in [("Username", semi), ("Tab", mono.clone()), ("250 ms", mono)] {
-            let pill = line_of(run, font);
+        let _ = line_of;
+        // **Each word is centred in its OWN pill**, and the pills are on one
+        // line with each other.
+        //
+        // It used to be the other claim -- every chip's ink on the line the
+        // row's caption inks on, a point above the pills' middles, so that
+        // the row read as one line of type. The owner, looking at the pills
+        // rather than at the row: "Enter pill text not centered", and then
+        // "actually none of them are". A word inside a box is read against
+        // the box; the line the caption is on is the line of the BOXES,
+        // which is what the second half below asserts.
+        // The run's INK, which is what the eye centres -- a galley box is
+        // ascent plus descent and no face fills one.
+        let ink_middle = |run: &str| -> f32 {
+            *painted
+                .ink_middles
+                .iter()
+                .filter(|(text, _, _)| text == run)
+                .map(|(_, _, middle)| middle)
+                .last()
+                .unwrap_or_else(|| panic!("no {run:?} ink on the row"))
+        };
+        let pill_around = |run: &str| -> Rect {
+            let box_of = *painted
+                .rects_of(run)
+                .last()
+                .unwrap_or_else(|| panic!("no {run:?} on the row"));
+            painted
+                .rects
+                .iter()
+                .map(|(rect, _)| *rect)
+                .filter(|rect| rect.contains_rect(box_of) && rect.height() <= 30.0)
+                .min_by(|a, b| a.area().total_cmp(&b.area()))
+                .unwrap_or_else(|| panic!("nothing is painted round {run:?}"))
+        };
+        let mut lines = Vec::new();
+        for run in ["Username", "Tab", "250 ms"] {
+            let pill = pill_around(run);
             assert!(
-                (pill - caption_line).abs() <= 0.5,
-                "the {run:?} pill's line is {pill} and the row's caption sits on                  {caption_line} -- the row does not read as one line"
+                (ink_middle(run) - pill.center().y).abs() <= 0.6,
+                "the {run:?} pill's word inks {:+.2} off the middle of the pill round it",
+                ink_middle(run) - pill.center().y
+            );
+            lines.push(pill.center().y);
+        }
+        for line in &lines[1..] {
+            assert!(
+                (line - lines[0]).abs() <= 0.5,
+                "the pills are on {lines:?}, which is not one line"
             );
         }
 

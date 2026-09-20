@@ -3563,29 +3563,18 @@ pub fn draw_detail_read(
                         action = DetailAction::Edit;
                         ui.close();
                     }
-                    // **Design 4a, next to Edit**, because it is the same act
-                    // narrowed: Edit opens a form over every field, this opens
-                    // the builder over the one field that says what gets
-                    // typed. See `FILL_RULE_EDIT_LABEL` for why the door is
-                    // here and not on the card the rule belongs to.
+                    // **4a's door is NOT in this menu.** It was, next to
+                    // Edit, as the same act narrowed -- Edit opens a form
+                    // over every field, that opened the builder over the
+                    // one field that says what gets typed. The owner, with
+                    // the menu open: "remove Edit the sequence from here".
                     //
-                    // Gated on the PARSED binding, not on the field: a binding
-                    // that will not parse has no sequence to edit, and the
-                    // card above already offers the way to clear it.
-                    if crate::vault_window::sequence_builder::fill_rule_visible(app_match.as_ref())
-                    {
-                        let edit = ui.button(FILL_RULE_EDIT_LABEL);
-                        if edit
-                            .on_hover_text(
-                                "Open the sequence builder: what Deskwarden types into this app, \
-                                 step by step.",
-                            )
-                            .clicked()
-                        {
-                            action = DetailAction::EditSequence;
-                            ui.close();
-                        }
-                    }
+                    // The builder is still one click further in: the edit
+                    // form's `Fill rule` card carries `Edit sequence`, which
+                    // is where the rule itself is on screen. This menu is
+                    // for acts on the ITEM -- edit it, clone it, file it,
+                    // delete it -- and a second Edit that opened a different
+                    // editor was the odd one out.
                     // **Clone, next to Edit** -- the two entries that open the
                     // same form, kept adjacent.
                     //
@@ -5884,33 +5873,13 @@ fn sharing_card(
     );
 }
 
-/// **Design 4a's door, and it is a KEBAB ENTRY -- which is a measurement,
-/// not a preference.**
-///
-/// Two shapes were built and both were measured out of existence at the app's
-/// minimum window size, where `the_note_fits_and_is_reachable_on_the_shortest_window`
-/// asks for one scroll offset showing both the `MATCHED APP` and `NOTES`
-/// headings on the tallest item this pane can be given:
-///
-///  * A `FILL RULE` card of its own -- a heading band, a wrapped line and a
-///    control row, about 165pt with its gap. Far over.
-///  * A `Types` row plus a third button in this card's footer. The row is
-///    ~58pt and the button wraps the footer's controls on to a second line,
-///    ~38pt. **Either one alone is over**: with the button removed and
-///    nothing else changed the test passes, and with it back it fails, so the
-///    card has essentially no vertical slack left at 298x600.
-///
-/// That test is not a formality -- it is the third time a layout change in
-/// this file has pushed a control out of the scroll viewport -- and the
-/// guarantee it holds (every control on this pane is reachable on the
-/// smallest window this app opens) is worth more than a summary line that is
-/// one click away inside the builder itself.
-///
-/// So the door sits in the pane's own menu, beside `Edit`, where the item's
-/// other acts live and where a new entry costs the layout nothing. It is
-/// drawn only for an item with a parsed binding, because
-/// `AppMatch::sequence` has nowhere to live without one.
-pub const FILL_RULE_EDIT_LABEL: &str = "Edit the sequence";
+// **There is no `Edit the sequence` entry**, and the long argument for where
+// its door belonged has gone with it. The short of it: this pane has no room
+// for a `FILL RULE` card of its own -- the test that matters here is that
+// every control is reachable at 298x600, and the card is 165 points over it
+// -- so the door went into the pane's menu instead, and the owner has now
+// taken it off that menu too. The edit form's own `Fill rule` card is the
+// way in.
 
 /// The card's one destructive control, in one place because [`app_card_footer`]
 /// draws it for the bound card and for [`app_notice_with_remove`] alike.

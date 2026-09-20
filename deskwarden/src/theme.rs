@@ -2034,6 +2034,58 @@ pub fn bar_knob(track: Rect, phase: f32) -> Rect {
     )
 }
 
+/// What a caption reserves for [`paint_return_arrow`] when the chord is the
+/// return key, and the chord that means it.
+const RETURN_ARROW_ROOM: f32 = 26.0;
+const RETURN_CHORD: &str = "↵";
+
+/// One button with a caption and, beside it, the key that does the same
+/// thing -- drawn as two galleys so each is still a run of its own.
+struct ChordedButton<'a> {
+    label: &'a str,
+    chord: Option<&'a str>,
+    trailing: f32,
+    ink: Color32,
+    chord_ink: Color32,
+    fill: Color32,
+    edge: Stroke,
+    sense: Sense,
+    radius: u8,
+    height: f32,
+}
+
+fn chorded_button(ui: &mut Ui, button: ChordedButton<'_>) -> Response {
+    let font = FontId::new(13.0, FontFamily::Name(SEMIBOLD.into()));
+    let chord_font = FontId::new(BUTTON_CHORD_PX, FontFamily::Monospace);
+    let caption = ui.painter().layout_no_wrap(button.label.to_string(), font.clone(), button.ink);
+    let chord = button.chord.map(|chord| {
+        ui.painter().layout_no_wrap(chord.to_string(), chord_font.clone(), button.chord_ink)
+    });
+    let run = caption.size().x
+        + button.trailing
+        + chord.as_ref().map_or(0.0, |chord| chord.size().x + BUTTON_CHORD_GAP);
+    let pad = ui.spacing().button_padding.x;
+    let response = ui.add(
+        egui::Button::new("")
+            .fill(button.fill)
+            .stroke(button.edge)
+            .sense(button.sense)
+            .corner_radius(CornerRadius::same(button.radius))
+            .min_size(Vec2::new(run + 2.0 * pad, button.height)),
+    );
+    let left = response.rect.center().x - run / 2.0;
+    let at = centred_galley_top(ui.ctx(), response.rect, &caption, &font, left);
+    let after = at.x + caption.size().x + BUTTON_CHORD_GAP;
+    ui.painter().galley(at, caption, button.ink);
+    if let Some(chord) = chord {
+        // On the caption's own ink line: two faces at two sizes share a
+        // line when their INK does, not when their boxes do.
+        let top = at.y + face_ink_middle(ui, &font) - face_ink_middle(ui, &chord_font);
+        ui.painter().galley(Pos2::new(after, top), chord, button.chord_ink);
+    }
+    response
+}
+
 /// The keyboard chord beside a primary button's caption: 4a's own
 /// `font-family: mono; font-size: 10px; opacity: 0.8`, and the gap before
 /// it. Quieter than the words it follows, which is what makes it read as a
@@ -2260,13 +2312,34 @@ pub fn section_footer_primary_button(
 /// the owner's report was "not centered both", on a strip whose two controls
 /// sit on one line and are read against each other.
 pub fn section_footer_secondary_button(ui: &mut Ui, label: &str) -> Response {
+    section_footer_secondary_button_with(ui, label, None)
+}
+
+/// [`section_footer_secondary_button`] **with the key that does the same
+/// thing** beside its words.
+///
+/// The same treatment [`primary_button`] gives `CTRL+S`: mono, small, and
+/// quieter than the caption, so it reads as a hint rather than as more
+/// words. The owner, once Escape closed this form: "Add Esc glyph to
+/// Discard".
+pub fn section_footer_secondary_button_with(
+    ui: &mut Ui,
+    label: &str,
+    chord: Option<&str>,
+) -> Response {
     ui.scope(|ui| {
         ui.spacing_mut().button_padding.x = SECTION_FOOTER_BUTTON_PAD_X;
         let font = FontId::new(SECTION_FOOTER_TEXT_PX, FontFamily::Name(SEMIBOLD.into()));
+        let chord_font = FontId::new(BUTTON_CHORD_PX, FontFamily::Monospace);
+        let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), INK);
+        let hint = chord
+            .map(|chord| ui.painter().layout_no_wrap(chord.to_string(), chord_font.clone(), TEXT_FAINT));
         // The width the label would have taken had egui laid it out, so this
         // button is the size it always was -- `action_button_width` is
-        // `semibold` at 13, which is exactly the face above.
-        let width = action_button_width(ui.painter(), label, SECTION_FOOTER_BUTTON_PAD_X);
+        // `semibold` at 13, which is exactly the face above -- plus the
+        // chord and its gap when there is one.
+        let width = action_button_width(ui.painter(), label, SECTION_FOOTER_BUTTON_PAD_X)
+            + hint.as_ref().map_or(0.0, |hint| hint.size().x + BUTTON_CHORD_GAP);
         let response = ui.add(
             egui::Button::new("")
                 .fill(CARD)
@@ -2274,15 +2347,19 @@ pub fn section_footer_secondary_button(ui: &mut Ui, label: &str) -> Response {
                 .corner_radius(CornerRadius::same(SECTION_FOOTER_BUTTON_RADIUS))
                 .min_size(Vec2::new(width, SECTION_FOOTER_BUTTON_HEIGHT)),
         );
-        let galley = ui.painter().layout_no_wrap(label.to_string(), font.clone(), INK);
-        let at = centred_galley_top(
-            ui.ctx(),
-            response.rect,
-            &galley,
-            &font,
-            response.rect.center().x - galley.size().x / 2.0,
-        );
+        let run = galley.size().x + hint.as_ref().map_or(0.0, |h| h.size().x + BUTTON_CHORD_GAP);
+        let left = response.rect.center().x - run / 2.0;
+        let at = centred_galley_top(ui.ctx(), response.rect, &galley, &font, left);
+        let after = at.x + galley.size().x + BUTTON_CHORD_GAP;
         ui.painter().galley(at, galley, INK);
+        if let Some(hint) = hint {
+            // On the caption's own ink line, not on its box's: two faces
+            // at two sizes share a line when their INK does, which is what
+            // `centred_galley_top` put the caption on. See
+            // [`face_ink_middle`].
+            let top = at.y + face_ink_middle(ui, &font) - face_ink_middle(ui, &chord_font);
+            ui.painter().galley(Pos2::new(after, top), hint, TEXT_FAINT);
+        }
         response
     })
     .inner
@@ -2469,7 +2546,8 @@ fn primary_button_with_metrics(
     } else {
         (OFF_INK, OFF_FILL, Stroke::new(1.0, OFF_EDGE), Sense::hover())
     };
-    // **The caption and the chord are two runs, not one string.**
+    // **The caption and the chord are two runs, painted -- not one
+    // string, and not one `LayoutJob` either.**
     //
     // They were `format!("{label}  {k}")` in one 13-point semibold face, so
     // `Save rule  CTRL+S` read as a four-word caption. Everywhere else in
@@ -2477,40 +2555,30 @@ fn primary_button_with_metrics(
     // design's own `font-family: mono; font-size: 10px; opacity: 0.8` on
     // this very button -- and the owner, of the two set alike: "these
     // should be diff fonts label + shortcut as usually we have".
-    let caption = |color: Color32| egui::TextFormat {
-        font_id: FontId::new(13.0, FontFamily::Name(SEMIBOLD.into())),
-        color,
-        valign: egui::Align::Center,
-        ..Default::default()
-    };
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap = egui::text::TextWrapping::no_max_width();
-    job.append(label, 0.0, caption(ink));
-    match kbd {
-        // Trailing spaces reserve room for the painted arrow and the gap
-        // before it.
-        Some("↵") => job.append("      ", 0.0, caption(ink)),
-        Some(chord) => job.append(
-            chord,
-            BUTTON_CHORD_GAP,
-            egui::TextFormat {
-                font_id: FontId::new(BUTTON_CHORD_PX, FontFamily::Monospace),
-                color: if enabled { Color32::from_white_alpha(BUTTON_CHORD_ALPHA) } else { ink },
-                valign: egui::Align::Center,
-                ..Default::default()
+    //
+    // Two GALLEYS and not two sections of one job, because a job lays one
+    // galley and that galley's text is `Save ruleCTRL+S`: this crate's
+    // harnesses read the painted runs, and a caption that can no longer be
+    // found by its own words is a screen nothing can assert about.
+    let response = chorded_button(
+        ui,
+        ChordedButton {
+            label,
+            chord: match kbd {
+                Some(k) if k != RETURN_CHORD => Some(k),
+                _ => None,
             },
-        ),
-        None => {}
-    }
-    let response = ui.add(
-        egui::Button::new(job)
-            .fill(fill)
-            .stroke(edge)
-            .sense(sense)
-            .corner_radius(CornerRadius::same(radius))
-            // The design's action buttons are 32px tall (3h Continue, 2b/3f
-            // toolbar); text + padding alone comes up short.
-            .min_size(Vec2::new(0.0, height)),
+            // The return arrow is painted below, so the caption reserves
+            // room for it instead of spelling it.
+            trailing: if paint_return { RETURN_ARROW_ROOM } else { 0.0 },
+            ink,
+            chord_ink: if enabled { Color32::from_white_alpha(BUTTON_CHORD_ALPHA) } else { ink },
+            fill,
+            edge,
+            sense,
+            radius,
+            height,
+        },
     );
     if paint_return {
         paint_return_arrow(
@@ -2577,6 +2645,30 @@ fn paint_return_arrow(painter: &egui::Painter, center: Pos2, size: f32, color: C
 /// draws: the two panes are one click apart and a Copy that changed size
 /// between them is the difference this whole pass has been removing.
 pub const ROW_BUTTON_GAP: f32 = 8.0;
+
+/// What every modal's way out is bound to, spelled for the button.
+pub const MODAL_DISMISS_CHORD: &str = "ESC";
+
+/// [`secondary_button`] **with the key that does the same thing** beside its
+/// words, in [`primary_button`]'s own treatment for a chord: mono, small,
+/// and quieter than the caption.
+pub fn secondary_button_with_chord(ui: &mut Ui, label: &str, chord: &str) -> Response {
+    chorded_button(
+        ui,
+        ChordedButton {
+            label,
+            chord: Some(chord),
+            trailing: 0.0,
+            ink: INK,
+            chord_ink: TEXT_FAINT,
+            fill: CARD,
+            edge: Stroke::new(1.0, BORDER_STRONG),
+            sense: Sense::click(),
+            radius: 7,
+            height: BUTTON_HEIGHT,
+        },
+    )
+}
 
 pub fn secondary_button(ui: &mut Ui, label: &str) -> Response {
     ui.add(
@@ -10120,7 +10212,11 @@ fn modal_footer_band(
                     Pos2::new(row.max.x - half, row.min.y),
                     Vec2::new(half, BUTTON_HEIGHT),
                 ),
-                |ui| secondary_button(ui, card.dismiss),
+                // **With `ESC` on it.** Every card in this app closes on
+                // Escape, and a button that says so teaches the key -- the
+                // same argument `CTRL+S` on the confirm makes. The owner:
+                // "Add same Esc to Discard fir Fill rule modal".
+                |ui| secondary_button_with_chord(ui, card.dismiss, MODAL_DISMISS_CHORD),
             );
         });
     // The band, now that its rect is known: out to the card's edge on the
