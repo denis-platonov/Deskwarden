@@ -15,6 +15,60 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.26 - 2026-09-20
+
+### Design 4a: the fill rule has a builder
+
+`Edit sequence`, on the edit form's `Fill rule` card, opens the sequence
+builder as a card over the form: the item and the app it types into across the
+top, the sequence as a list of steps, and one row per act -- a drag handle, its
+number, what kind of step it is, and the step itself as keycaps and field
+pills. A step is moved by dragging its handle or with `Alt`+the arrow keys, and
+removed with `Delete`; the rows carry no controls of their own, which is what
+lets a row be read at a glance.
+
+Under the list are three dashed buttons -- `+ Text`, `+ Key`, `+ Wait` -- each
+opening the palette that adds that kind of step. The value palette offers the
+item's own fields, drawn as the very pills the step will be; a custom field
+stored as hidden, or named like a secret, is not offered, because a recovery
+code or an authenticator seed is not something an app is waiting to be typed.
+
+`Show what it types` now shows everything it types, passwords and one-time
+codes included. It is a deliberate press in an unlocked window, and a preview
+that masked the one value worth checking before saving a rule was answering a
+question nobody asked.
+
+### Design 4c: the template view
+
+The same sequence as one editable line, with every `{TOKEN}` on a rounded
+ground in the colour of what it is -- a value blue, a credential red, a wait
+grey, a key plain -- and an `INSERT` row of the tokens worth one click. The
+line is the string: what is typed there is what is stored, byte for byte, so a
+sequence written by another password manager survives a look at this screen.
+
+### Escape, everywhere it is a way out
+
+The edit form closes on `Escape` exactly as its `Cancel` does: an untouched
+form closes, an edited one asks first. The builder does the same, and so does
+an edited rule. Every card that can be dismissed now says `ESC` on the button
+that dismisses it, and every card puts its answer on the LEFT and its way out
+on the right, which is the order this form has used since 8a.
+
+### The autofill targets card is 8a's
+
+A target's program file and command line fold away under it, behind the
+settings mark on its row, and the way to add another target sits at the foot of
+the card. Measured against the design and tightened: the card is 186 points
+where it was 292, and the caption beside a target lines up with the target.
+
+### Fixes
+
+- The item list's divider no longer stays bright when a card is open over it.
+- A field's value sits on the middle of its box, and a pill's word on the
+  middle of its pill. Both were about a point high.
+- A wait box holds only a number.
+- `rustls` moves to 0.23.45 (GHSA-2mjx-qc3c-rqvc).
+
 ## 0.15.25 - 2026-09-17
 
 ### The edit form is design 8a's card grid
