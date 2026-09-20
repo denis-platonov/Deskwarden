@@ -8426,6 +8426,24 @@ fn section_body_state(ui: &Ui) -> egui::Id {
     ui.id().with("section-body")
 }
 
+/// **Tell a card's body that something was drawn in it**, for content that is
+/// not a [`section_row`].
+///
+/// A body's first row owes no rule above itself, and "is this the first" is
+/// tracked here rather than at the call sites (see [`section_row_impl`]).
+/// A card whose first content is NOT a row -- `detail_edit`'s websites cell
+/// ends in a link drawn straight into the field column -- would otherwise
+/// leave the next real row believing it is first, and the one hairline that
+/// card draws would go missing. Measured exactly that way: the rule between
+/// 8a's websites group and its native-apps group vanished the moment the
+/// link above it stopped being a row.
+pub fn section_row_seen(ui: &mut Ui) {
+    let id = section_body_state(ui);
+    if let Some(state) = ui.data(|data| data.get_temp::<SectionBody>(id)) {
+        ui.data_mut(|data| data.insert_temp(id, SectionBody { first: false, ..state }));
+    }
+}
+
 /// The rule between two rows of a card, drawn **full bleed**.
 ///
 /// The read pane's rows are bands that reach the card's edge, so the hairline

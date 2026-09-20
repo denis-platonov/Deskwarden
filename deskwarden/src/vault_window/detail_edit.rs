@@ -1535,14 +1535,12 @@ impl Section {
     /// and shows only the matched-app row -- so the design's own words would
     /// be a card describing something the record does not have. The owner, on
     /// a note: "Does Secnote need Autofill targets?".
-    pub const fn note(self, kind: ItemKind) -> &'static str {
-        match self {
-            Section::Autofill => match kind {
-                ItemKind::Login => "where this login is offered",
-                _ => "which app this fills in",
-            },
-            _ => "",
-        }
+    pub const fn note(self, _kind: ItemKind) -> &'static str {
+        // **No card carries one any more.** `Fill rule`'s went first ("what
+        // Deskwarden types"), and the owner has now pointed at this card's:
+        // "remove". What is left in the band is the two words the design
+        // sets there, and what the card holds is on screen under them.
+        ""
     }
 
     /// **The chip 8a puts beside a card's title**, or `None`.
@@ -5195,19 +5193,20 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     // **8a's link, in 8a's place: under the rows, left-aligned to the FIELD
     // column rather than to the card's edge.**
     //
-    // Through `theme::section_row` with an EMPTY caption, which is that
-    // function's own idiom for "a row that belongs to the one above it" (it
-    // is how the generator sits under the password box). In the wide arm the
-    // empty label cell is what indents the link to the field column; in the
-    // stacked arm there is no cell and the link simply follows the last row,
-    // which is where it would have been anyway.
+    // Through [`field_column_row`] and not `theme::section_row`: the design
+    // has this link INSIDE the websites cell, `gap: 8px` under the last box,
+    // and a row of the card rules itself off from the row above and pays the
+    // card's padding either side of that rule. Measured, as a link 30 points
+    // under its own boxes and 50 above the next caption -- the owner: "too
+    // much of space under + Add website... measure the design and tighten it
+    // up".
     //
     // A link and not `theme::secondary_button`: 8a draws `+ Add website` as
     // blue type, and the control it replaced was a 32-point outlined button
     // on a line of its own. `theme::action_link` and not `link_label` because
     // the design sets this one in `font-weight: 600` -- see that function.
     let mut add = false;
-    theme::section_row(ui, "", |ui| {
+    field_column_row(ui, |ui| {
         ui.horizontal_wrapped(|ui| {
             add = theme::action_link(ui, WEBSITE_ADD_BUTTON, TARGET_LINK_PX).clicked();
         });
@@ -8586,6 +8585,18 @@ fn app_target_row(
     let open = app.settings_open;
     let mut press = TargetPress::default();
     let rule = app_rule_label(app.hosted);
+    // **Only the FRESH row is padded.** 8a's ordinary target row is a
+    // 34-point box and nothing round it; the row it highlights is the one
+    // with `padding: 9px 11px`, because that one has a wash to hold and a
+    // second line inside it. Padding both cost the row 16 points it does
+    // not spend in the design and, worse, pushed its box below the caption
+    // beside it, which the label column aligns to the FIRST LINE of -- the
+    // owner: "Matched app us way too high".
+    let pad = if fresh {
+        Margin::symmetric(APP_ROW_PAD_X, APP_ROW_PAD_Y)
+    } else {
+        Margin::ZERO
+    };
     egui::Frame::new()
         // 8a's `background: #eef2fc; border: 1px solid #b8c7ea` on the row it
         // highlights, and the same box drawn in nothing on the row it does
@@ -8596,7 +8607,7 @@ fn app_target_row(
             if fresh { theme::BLUE_EDGE } else { egui::Color32::TRANSPARENT },
         ))
         .corner_radius(CornerRadius::same(APP_ROW_RADIUS))
-        .inner_margin(Margin::symmetric(APP_ROW_PAD_X, APP_ROW_PAD_Y))
+        .inner_margin(pad)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
@@ -8673,9 +8684,39 @@ struct TargetPress {
 /// bigger than the mark's own ink. See [`theme::tune_mark`].
 const TARGET_SETTINGS_MARK: f32 = 20.0;
 
-/// What separates the targets from the way of adding one: space, and no
-/// rule. See the comment at the foot of [`app_block`].
-const APP_ADD_GAP: f32 = 14.0;
+// **What separates a cell's last control from the link under it is egui's
+// own `item_spacing.y`, which `theme::apply` sets to 8 -- and 8 is exactly
+// the `gap: 8px` 8a puts down that cell.** An `add_space` here as well made
+// it 16, measured as a link 18.5 points under its own box where the design
+// has 10.5. The number is `theme::ITEM_SPACING`'s, and nothing is added to
+// it.
+
+/// **A line in a row's FIELD COLUMN, with no caption and no rule.**
+///
+/// `theme::section_row` is a row of the card: it rules itself off from the
+/// row above and pays the card's padding either side of that rule. A link
+/// that belongs to the row above it is not a row -- 8a draws it inside the
+/// same cell, under the last control, at that cell's own gap -- and drawing
+/// it as one cost 8a's card 60 points of air it does not have.
+///
+/// Below `theme::section_rows_fit` there is no label column to indent into,
+/// and the line simply follows what came before it, which is what every
+/// other row on this form does at that width.
+fn field_column_row<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    // It is not a row, and it is still CONTENT: the row after it owes a rule
+    // above itself. See `theme::section_row_seen`, which records the
+    // measurement -- 8a's one hairline went missing when this line stopped
+    // being a row.
+    theme::section_row_seen(ui);
+    if !theme::section_rows_fit(ui) {
+        return add(ui);
+    }
+    ui.horizontal_top(|ui| {
+        ui.add_space(theme::SECTION_LABEL_WIDTH + theme::SECTION_ROW_GAP);
+        ui.vertical(|ui| add(ui)).inner
+    })
+    .inner
+}
 
 /// What the mark says when the pointer rests on it. It names what is under
 /// it, because a drawn mark with no word on it has only this to say what it
@@ -8871,23 +8912,23 @@ fn app_block(
     }
 
     // **8a's `+ Pick a running window`, with its grey run beside it**, at the
-    // foot of the block -- `websites_block`'s `+ Add website` idiom, in an
-    // empty-caption row so the link sits under the field column rather than
-    // under the caption.
+    // foot of the block and in the FIELD COLUMN -- which is where 8a puts
+    // it: its native-apps row is one cell holding the target rows and this
+    // link, `gap: 8px` between them, not a row of its own.
     //
-    // **At the BOTTOM.** It used to sit directly under the target, above
-    // that target's own path and arguments, which made the reading order
-    // "this app -- add another -- this app's program file". The owner: "+
-    // Pick or Enter should be at the bottom separated with separator".
+    // **Not `theme::section_row`.** That draws a rule above itself and pays
+    // the card's own padding either side of it, so the link arrived 43
+    // points under the target it belongs to and 43 above the card's edge --
+    // measured, and the owner: "lots of space under + Pick a running window
+    // as well - measure the design and tighten it up". Indented by hand into
+    // the same column instead, eight points under whatever the block last
+    // drew, which is 8a's own gap.
     //
-    // **The separator is the space and not a rule.** A `theme::hairline` was
-    // drawn here and the owner, with it on screen: "hairline not needed
-    // here" -- the card already has a rule under its heading and another
-    // under the card itself, and a third across a block of two rows cuts a
-    // small card into smaller ones. The gap says the same thing.
-    ui.add_space(APP_ADD_GAP);
+    // **At the BOTTOM**, under the target's settings when they are open: "+
+    // Pick or Enter should be at the bottom". There is no rule over it --
+    // one was drawn and the owner: "hairline not needed here".
     let mut pick = false;
-    theme::section_row(ui, "", |ui| {
+    field_column_row(ui, |ui| {
         // The same 14-point gap the row above it uses -- see
         // [`TARGET_LINK_GAP`], and why this card's rows have to say so.
         ui.spacing_mut().item_spacing.x = TARGET_LINK_GAP;
@@ -8910,7 +8951,6 @@ fn app_block(
             app.windows = running_app_rows();
         }
     }
-    ui.add_space(10.0);
 
     // **No autofill control here, deliberately.** What a matched foreground
     // window does is one global preference -- `settings::Settings::
@@ -27804,17 +27844,21 @@ mod edit_pane_layout_tests {
         }
         assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
 
-        // ...and the note is not described as a login by a card it does not
-        // have. Asserted against the LOGIN's own subtitle, so the claim is
-        // about that sentence and not about any string this test invented.
+        // ...and no card describes itself in prose at all any more: 8a's
+        // band is its two words, and the owner has now taken the last
+        // subtitle off ("remove"). Asserted as the sentence this card used
+        // to carry, so a build that brought it back -- on a secure note,
+        // which is not a login and never had websites -- fails here.
         let mut draft = EditDraft::from_item(&note);
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&note), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&note), &totp);
-        assert!(
-            !painted.strings().contains(&Section::Autofill.note(ItemKind::Login)),
-            "the form over a secure note still says {:?}",
-            Section::Autofill.note(ItemKind::Login)
-        );
+        for gone in ["where this login is offered", "which app this fills in"] {
+            assert!(
+                !painted.strings().contains(&gone),
+                "the form over a secure note still says {gone:?}"
+            );
+        }
+        assert!(Section::Autofill.note(ItemKind::Login).is_empty(), "a card grew a subtitle");
     }
 
     /// **No field in this form cuts the tail off its own text.**
