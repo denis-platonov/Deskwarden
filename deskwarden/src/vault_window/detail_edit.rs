@@ -884,6 +884,22 @@ pub struct AppMatchDraft {
     pub just_picked: bool,
     /// Whether the running-window list is open.
     pub picking: bool,
+    /// **Whether this target's own settings are open under its row** -- the
+    /// program file, the window it was captured from, and the command line.
+    ///
+    /// Those three used to be rows of the card in their own right, stacked
+    /// under the target and above the way of adding one, which made a card
+    /// about *which app* read as a card about a path. The owner: "For
+    /// Autofill target if already selected - file and cli should be shown
+    /// under the process (so it is like settings to this) if clicked".
+    /// They are settings OF the target, so they live under it and only when
+    /// it has been opened.
+    ///
+    /// Shut by default, and not stored: it is a state of looking at the
+    /// form, not of the binding. The one thing that opens it by itself is
+    /// the add row's `enter a path` door, whose whole purpose is to type
+    /// into the box this reveals.
+    pub settings_open: bool,
     /// The rows that list is showing.
     ///
     /// Captured when the list is opened and when Refresh is clicked -- **never
@@ -1069,6 +1085,7 @@ impl AppMatchDraft {
             trigger: NEW_BINDING_TRIGGER,
             just_picked: false,
             picking: false,
+            settings_open: false,
             windows: Vec::new(),
             picked: None,
             taken: Vec::new(),
@@ -1133,6 +1150,7 @@ impl AppMatchDraft {
             // however recently it was really made.
             just_picked: false,
             picking: false,
+            settings_open: false,
             windows: Vec::new(),
             picked: None,
             taken: Vec::new(),
@@ -8232,6 +8250,14 @@ fn open_new_binding(app: &mut AppMatchDraft, choice: AppAddChoice) {
         // own link follows.
         app.windows = running_app_rows();
     }
+    // **`enter a path` opens the settings it means to be typed into.** The
+    // path box lives under the target now (see
+    // [`AppMatchDraft::settings_open`]), and a door that opened a block with
+    // the box it promised folded away would be the same two-presses-for-one-
+    // decision the branch above exists to avoid.
+    if choice == AppAddChoice::Path {
+        app.settings_open = true;
+    }
 }
 
 fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
@@ -8555,9 +8581,10 @@ fn app_target_row(
     app: &mut AppMatchDraft,
     name: &str,
     icon: Option<&egui::TextureHandle>,
-) -> bool {
+) -> TargetPress {
     let fresh = app.just_picked;
-    let mut remove = false;
+    let open = app.settings_open;
+    let mut press = TargetPress::default();
     let rule = app_rule_label(app.hosted);
     egui::Frame::new()
         // 8a's `background: #eef2fc; border: 1px solid #b8c7ea` on the row it
@@ -8588,20 +8615,29 @@ fn app_target_row(
                 }
                 // The tile is outside the row proper, exactly as 8a draws it,
                 // so what `target_row` divides up is what is left after it.
-                let trailing = picker_chip_width(ui, rule)
+                let trailing = TARGET_DISCLOSURE
+                    + picker_chip_width(ui, rule)
                     + theme::CLOSE_MARK_HIT
-                    + TARGET_ROW_GAP * 2.0
+                    + TARGET_ROW_GAP * 3.0
                     + TARGET_ROW_SLACK;
                 let process = app.process.clone();
                 let floor = app_name_field_want(ui, name, &process);
-                remove = target_row(
+                press = target_row(
                     ui,
                     trailing,
                     floor,
                     |ui, room| app_name_field(ui, name, &process, room),
                     |ui| {
+                        // The mark that opens what is under this row, at the
+                        // head of the two controls that act ON the row -- so
+                        // the line reads "what this is, what it matches on,
+                        // and take it away", with the way in first.
+                        let settings = theme::disclosure_mark(ui, TARGET_DISCLOSURE, open)
+                            .on_hover_text(APP_SETTINGS_TIP)
+                            .clicked();
                         picker_chip(ui, rule, theme::TEXT_FAINT);
-                        theme::close_glyph_titled(ui, APP_REMOVE_BUTTON).clicked()
+                        let remove = theme::close_glyph_titled(ui, APP_REMOVE_BUTTON).clicked();
+                        TargetPress { remove, settings }
                     },
                 );
             });
@@ -8619,8 +8655,28 @@ fn app_target_row(
                 );
             }
         });
-    remove
+    press
 }
+
+/// What [`app_target_row`] reported. A named pair rather than two bools,
+/// which at a call site are two bools in some order.
+#[derive(Debug, Clone, Copy, Default)]
+struct TargetPress {
+    /// The ✕: stage this binding for removal.
+    remove: bool,
+    /// The row itself: open or shut its settings.
+    settings: bool,
+}
+
+/// The disclosure mark's box on a target row.
+const TARGET_DISCLOSURE: f32 = 16.0;
+
+/// The room above and below the rule that separates the targets from the way
+/// of adding one.
+const APP_ADD_RULE_GAP: f32 = 10.0;
+
+/// What the mark says when the pointer rests on it.
+const APP_SETTINGS_TIP: &str = "The program file and command line for this app";
 
 fn app_block(
     ui: &mut egui::Ui,
@@ -8676,39 +8732,14 @@ fn app_block(
     // `Native apps`: the read pane has called the card MATCHED APP since the
     // feature shipped, and two words for one thing on two panes is worse than
     // departing from the design's noun. See [`APP_BLOCK_HEADING`].
-    let mut remove = false;
+    let mut press = TargetPress::default();
     theme::section_row(ui, APP_BLOCK_HEADING, |ui| {
-        remove = app_target_row(ui, app, &name, icon.as_ref());
+        press = app_target_row(ui, app, &name, icon.as_ref());
     });
-
-    // **8a's `+ Pick a running window`, with its grey run beside it**, in an
-    // empty-caption row so the link sits under the field column rather than
-    // under the caption -- `websites_block`'s `+ Add website` idiom, one row
-    // down, because they are the same element of the same design.
-    let mut pick = false;
-    theme::section_row(ui, "", |ui| {
-        // The same 14-point gap the row above it uses -- see
-        // [`TARGET_LINK_GAP`], and why this card's rows have to say so.
-        ui.spacing_mut().item_spacing.x = TARGET_LINK_GAP;
-        // Wrapped: the link and the hint are two runs that must be allowed to
-        // fall onto two lines on a 298-point pane rather than push the card
-        // out (`aae9429`).
-        ui.horizontal_wrapped(|ui| {
-            pick = theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked();
-            link_row_note(ui, APP_PICK_HINT);
-        });
-    });
-    if pick {
-        let opening = !app.picking;
-        // Through `set_picking`, not a bare assignment: it is what clears the
-        // staged row and the `already a target` list, so a second opening of
-        // 8b's card starts with nothing selected.
-        app.set_picking(opening);
-        if opening {
-            // Enumerated on OPEN, never per frame.
-            app.windows = running_app_rows();
-        }
+    if press.settings {
+        app.settings_open = !app.settings_open;
     }
+    let remove = press.remove;
 
     if app.picking {
         // **Over the window, not in this column** -- see `app_window_overlay`.
@@ -8742,92 +8773,137 @@ fn app_block(
         }
     }
 
-    if app.hosted && !app.title.is_empty() {
-        // Read-only, because it is not a setting: it is what the frame was
-        // called when the app was captured, and it is the only thing that can
-        // identify a suspended Store app. Typing over it would be typing a new
-        // identity for something that is not there to check it against.
-        theme::section_row(ui, APP_WINDOW_LABEL, |ui| {
-            theme::section_disabled_text_field(ui, &app.title);
+    // **The target's own settings, under the target.** Shut unless the row
+    // above has been opened -- see [`AppMatchDraft::settings_open`] for the
+    // owner's words. Everything from here to the rule below is about the
+    // program this binding points at rather than about which program it is.
+    if app.settings_open {
+        if app.hosted && !app.title.is_empty() {
+            // Read-only, because it is not a setting: it is what the frame was
+            // called when the app was captured, and it is the only thing that can
+            // identify a suspended Store app. Typing over it would be typing a new
+            // identity for something that is not there to check it against.
+            theme::section_row(ui, APP_WINDOW_LABEL, |ui| {
+                theme::section_disabled_text_field(ui, &app.title);
+            });
+        }
+
+        // **The program file, which 8a's row has no place for.** 8a's binding is
+        // a process name; this app's is a launchable path, because the read
+        // pane's open-the-matched-app action (`detail::OPEN_APP_CHORD`) starts
+        // the program from `AppMatch::launchable_path` when it is not running,
+        // and a card that could not say WHICH program would be a card that could
+        // not do that. So it keeps a row of its own, with its Browse under the
+        // box rather than beside it -- see the comment on the editable arm.
+        let path_row = app_path_row(app.hosted);
+        theme::section_row(ui, APP_PATH_LABEL, |ui| {
+            match path_row {
+                AppPathRow::Editable => {
+                    // **Browse at the end of the line, the way every other button
+                    // on this form sits.**
+                    //
+                    // It used to go UNDER the box, on the argument that a full
+                    // Windows path is the longest string this form holds
+                    // (`C:\Deskwarden Test\Chrome\chrome.exe` lays at 257 points
+                    // at `theme::SECTION_FIELD_PX`) against a card body of about
+                    // 254 at `settings::MIN_VAULT_WINDOW_SIZE`, so there is no
+                    // width at which a button on that line leaves the whole path
+                    // readable. True, and beside the point the owner made: "I'd do
+                    // Browse in the end like the rest of buttons". Every other row
+                    // on this form that has a button has it there, and a path box
+                    // that scrolls its own text is a box, where a card with one
+                    // button in a place of its own is a card that looks assembled
+                    // from two designs.
+                    //
+                    // Through `row_with_buttons`, which is that idiom: the button
+                    // is measured first so it lands flush right, the field takes
+                    // exactly the remainder, and below `FIELD_FLOOR` the row wraps
+                    // rather than pushing the card past the pane -- which is the
+                    // narrow case the old comment was really about.
+                    row_with_buttons(ui, &[APP_BROWSE_BUTTON], |ui, room| {
+                        if theme::section_text_field_within(ui, &mut app.path, false, room).changed() {
+                            // `process` is re-derived on every keystroke, which is
+                            // what keeps `launchable_path`'s file-name tie-back
+                            // satisfiable -- see `AppMatchDraft::set_path`.
+                            let typed = app.path.clone();
+                            app.set_path(&typed);
+                        }
+                        // **`theme::row_button`, not `theme::secondary_button`**:
+                        // the box beside it is `theme::SECTION_FIELD_HEIGHT`, 28
+                        // points, which is `ROW_BUTTON_HEIGHT_2B`, where
+                        // `secondary_button` is 32.
+                        if theme::row_button(ui, APP_BROWSE_BUTTON).clicked() {
+                            action = Some(EditAction::PickAppFile);
+                        }
+                    });
+                }
+                AppPathRow::NotApplicable(text) => {
+                    // A Store app is not started by path, so there is nothing to
+                    // browse for either -- the button is not drawn at all rather
+                    // than drawn greyed, which is what the `add_enabled_ui` it
+                    // replaces did. A row whose only control is inert is a row
+                    // with no control.
+                    theme::section_disabled_text_field(ui, text);
+                }
+            }
+        });
+
+        if let Some(warning) = app_path_warning(&app.to_match()) {
+            ui.add_space(4.0);
+            ui.label(RichText::new(warning).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+        }
+
+        theme::section_row(ui, APP_ARGS_LABEL, |ui| match path_row {
+            AppPathRow::Editable => {
+                theme::section_text_field(ui, &mut app.args, false);
+            }
+            // A Store app is not started by path, so there is no command line to
+            // give it. Disabled for the same reason the path box is, and saying so
+            // in the same words.
+            AppPathRow::NotApplicable(_) => {
+                theme::section_disabled_text_field(ui, APP_ARGS_STORE_APP);
+            }
         });
     }
 
-    // **The program file, which 8a's row has no place for.** 8a's binding is
-    // a process name; this app's is a launchable path, because the read
-    // pane's open-the-matched-app action (`detail::OPEN_APP_CHORD`) starts
-    // the program from `AppMatch::launchable_path` when it is not running,
-    // and a card that could not say WHICH program would be a card that could
-    // not do that. So it keeps a row of its own, with its Browse under the
-    // box rather than beside it -- see the comment on the editable arm.
-    let path_row = app_path_row(app.hosted);
-    theme::section_row(ui, APP_PATH_LABEL, |ui| {
-        match path_row {
-            AppPathRow::Editable => {
-                // **Browse at the end of the line, the way every other button
-                // on this form sits.**
-                //
-                // It used to go UNDER the box, on the argument that a full
-                // Windows path is the longest string this form holds
-                // (`C:\Deskwarden Test\Chrome\chrome.exe` lays at 257 points
-                // at `theme::SECTION_FIELD_PX`) against a card body of about
-                // 254 at `settings::MIN_VAULT_WINDOW_SIZE`, so there is no
-                // width at which a button on that line leaves the whole path
-                // readable. True, and beside the point the owner made: "I'd do
-                // Browse in the end like the rest of buttons". Every other row
-                // on this form that has a button has it there, and a path box
-                // that scrolls its own text is a box, where a card with one
-                // button in a place of its own is a card that looks assembled
-                // from two designs.
-                //
-                // Through `row_with_buttons`, which is that idiom: the button
-                // is measured first so it lands flush right, the field takes
-                // exactly the remainder, and below `FIELD_FLOOR` the row wraps
-                // rather than pushing the card past the pane -- which is the
-                // narrow case the old comment was really about.
-                row_with_buttons(ui, &[APP_BROWSE_BUTTON], |ui, room| {
-                    if theme::section_text_field_within(ui, &mut app.path, false, room).changed() {
-                        // `process` is re-derived on every keystroke, which is
-                        // what keeps `launchable_path`'s file-name tie-back
-                        // satisfiable -- see `AppMatchDraft::set_path`.
-                        let typed = app.path.clone();
-                        app.set_path(&typed);
-                    }
-                    // **`theme::row_button`, not `theme::secondary_button`**:
-                    // the box beside it is `theme::SECTION_FIELD_HEIGHT`, 28
-                    // points, which is `ROW_BUTTON_HEIGHT_2B`, where
-                    // `secondary_button` is 32.
-                    if theme::row_button(ui, APP_BROWSE_BUTTON).clicked() {
-                        action = Some(EditAction::PickAppFile);
-                    }
-                });
-            }
-            AppPathRow::NotApplicable(text) => {
-                // A Store app is not started by path, so there is nothing to
-                // browse for either -- the button is not drawn at all rather
-                // than drawn greyed, which is what the `add_enabled_ui` it
-                // replaces did. A row whose only control is inert is a row
-                // with no control.
-                theme::section_disabled_text_field(ui, text);
-            }
-        }
+    // **8a's `+ Pick a running window`, with its grey run beside it**, under
+    // a rule at the foot of the block -- `websites_block`'s `+ Add website`
+    // idiom, in an empty-caption row so the link sits under the field column
+    // rather than under the caption.
+    //
+    // **At the BOTTOM, and ruled off.** It used to sit directly under the
+    // target, above that target's own path and arguments, which made the
+    // reading order "this app -- add another -- this app's program file".
+    // The owner: "+ Pick or Enter should be at the bottom separated with
+    // separator". The rule is what says the link belongs to the card and not
+    // to the row above it.
+    ui.add_space(APP_ADD_RULE_GAP);
+    theme::hairline(ui);
+    ui.add_space(APP_ADD_RULE_GAP);
+    let mut pick = false;
+    theme::section_row(ui, "", |ui| {
+        // The same 14-point gap the row above it uses -- see
+        // [`TARGET_LINK_GAP`], and why this card's rows have to say so.
+        ui.spacing_mut().item_spacing.x = TARGET_LINK_GAP;
+        // Wrapped: the link and the hint are two runs that must be allowed to
+        // fall onto two lines on a 298-point pane rather than push the card
+        // out (`aae9429`).
+        ui.horizontal_wrapped(|ui| {
+            pick = theme::action_link(ui, APP_PICK_LINK, TARGET_LINK_PX).clicked();
+            link_row_note(ui, APP_PICK_HINT);
+        });
     });
-
-    if let Some(warning) = app_path_warning(&app.to_match()) {
-        ui.add_space(4.0);
-        ui.label(RichText::new(warning).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
+    if pick {
+        let opening = !app.picking;
+        // Through `set_picking`, not a bare assignment: it is what clears the
+        // staged row and the `already a target` list, so a second opening of
+        // 8b's card starts with nothing selected.
+        app.set_picking(opening);
+        if opening {
+            // Enumerated on OPEN, never per frame.
+            app.windows = running_app_rows();
+        }
     }
-
-    theme::section_row(ui, APP_ARGS_LABEL, |ui| match path_row {
-        AppPathRow::Editable => {
-            theme::section_text_field(ui, &mut app.args, false);
-        }
-        // A Store app is not started by path, so there is no command line to
-        // give it. Disabled for the same reason the path box is, and saying so
-        // in the same words.
-        AppPathRow::NotApplicable(_) => {
-            theme::section_disabled_text_field(ui, APP_ARGS_STORE_APP);
-        }
-    });
     ui.add_space(10.0);
 
     // **No autofill control here, deliberately.** What a matched foreground
@@ -16080,6 +16156,12 @@ mod generator_row_tests {
         let mut draft = EditDraft::empty();
         draft.name = "Ledgerline".to_string();
         draft.app = Some(AppMatchDraft::from_match(m));
+        // **With the target's settings open**, because that is where the
+        // program file and the command line are now drawn -- see
+        // [`AppMatchDraft::settings_open`]. A fixture that left them shut
+        // would make every test below assert about rows that are not on
+        // screen; the SHUT state has its own test.
+        draft.app.as_mut().unwrap().settings_open = true;
         draft
     }
 
@@ -16324,6 +16406,66 @@ mod generator_row_tests {
     fn click_and_type(ctx: &egui::Context, draft: &mut EditDraft, pos: Pos2, text: &str) {
         let _ = frame(ctx, draft, &click(pos));
         let _ = frame(ctx, draft, &[egui::Event::Text(text.to_string())]);
+    }
+
+    /// **A target's settings are folded away until its chevron is pressed**,
+    /// and the way of adding another target is at the FOOT of the block,
+    /// under a rule.
+    ///
+    /// The owner: "For Autofill target if already selected - file and cli
+    /// should be shown under the process (so it is like settings to this) if
+    /// clicked, + Pick or Enter should be at the bottom separated with
+    /// separator". Three claims, in that order.
+    #[test]
+    fn a_targets_settings_open_under_it_and_the_add_row_is_at_the_foot() {
+        let ctx = styled_context();
+        let mut draft = app_draft(&chrome());
+        // `app_draft` opens them for the tests that are about those rows; this
+        // one is about the fold itself.
+        draft.app.as_mut().unwrap().settings_open = false;
+
+        let (_, shut) = frame(&ctx, &mut draft, &[]);
+        for folded in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON] {
+            assert!(
+                !shut.strings().contains(&folded),
+                "{folded:?} is drawn over a target nobody has opened: {:?}",
+                shut.strings()
+            );
+        }
+        // The row itself is still there, and so is the way to add another.
+        assert!(shut.strings().contains(&APP_PICK_LINK), "{:?}", shut.strings());
+
+        // **Pressed, not set**: the chevron paints two strokes and no text,
+        // so it is found by the one thing beside it that does -- the match
+        // chip -- and the gap the row puts between them.
+        let chip = shut.rect_of(app_rule_label(false));
+        let mark = Pos2::new(
+            chip.left() - TARGET_ROW_GAP - TARGET_DISCLOSURE / 2.0,
+            chip.center().y,
+        );
+        let _ = frame(&ctx, &mut draft, &click(mark));
+        assert!(
+            draft.app.as_ref().unwrap().settings_open,
+            "the chevron did not open the target's settings"
+        );
+        let (_, open) = frame(&ctx, &mut draft, &[]);
+        for shown in [APP_PATH_LABEL, APP_ARGS_LABEL, APP_BROWSE_BUTTON] {
+            assert!(
+                open.strings().contains(&shown),
+                "{shown:?} is not drawn under an opened target: {:?}",
+                open.strings()
+            );
+        }
+        // **And the add row is under all of it.** The link used to sit
+        // directly under the target, above that target's own settings.
+        let link = open.rect_of(APP_PICK_LINK);
+        for above in [APP_PATH_LABEL, APP_ARGS_LABEL] {
+            let row = open.rect_of(above);
+            assert!(
+                row.bottom() <= link.top(),
+                "{above:?} at {row:?} is below the add row at {link:?}"
+            );
+        }
     }
 
     #[test]
@@ -20887,6 +21029,10 @@ mod edit_pane_layout_tests {
             sequence: String::new(),
             trigger: TriggerMode::Prompt,
         }));
+        // The tallest form is the one with every row open, which now
+        // includes the target's own settings -- see
+        // [`AppMatchDraft::settings_open`].
+        draft.app.as_mut().unwrap().settings_open = true;
         assert!(!draft.is_valid(), "the tall case wants the name error showing");
         draft
     }
@@ -27398,6 +27544,9 @@ mod edit_pane_layout_tests {
         let mut app = AppMatchDraft::unbound();
         app.set_path(PATH_ALREADY_TYPED);
         app.picking = true;
+        // As the `enter a path` door leaves it -- see `open_new_binding`:
+        // the box the path was typed into is the one under the target.
+        app.settings_open = true;
         typed.app = Some(app);
         let _ = frame_for(&ctx, pane, &mut typed, false, &[], Some(&item), &totp);
         let _ = frame_for(&ctx, pane, &mut typed, false, &escape, Some(&item), &totp);
@@ -28012,7 +28161,11 @@ mod edit_pane_layout_tests {
         let ctx = styled_context(pane);
         let item = login_with_websites(1);
         let mut draft = EditDraft::from_item(&item);
-        draft.app = Some(AppMatchDraft::unbound());
+        let mut app = AppMatchDraft::unbound();
+        // The row this test is about is inside the target's settings -- see
+        // [`AppMatchDraft::settings_open`].
+        app.settings_open = true;
+        draft.app = Some(app);
         let totp = detail::TotpState::NoSecret;
         let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
         let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);

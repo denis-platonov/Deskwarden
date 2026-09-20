@@ -3345,6 +3345,45 @@ fn paint_chevron(ui: &Ui, rect: Rect, color: Color32) {
     );
 }
 
+/// **A disclosure chevron**: pointing down at what is shut, and up at what
+/// is open, and pressable.
+///
+/// The same two strokes [`paint_chevron`] draws under a dropdown, flipped --
+/// so a row that opens something under itself and a box that opens a list
+/// over itself wear one mark and not two. `size` is the mark's box, which is
+/// its hit area as well: the caller allocates it, because the row it sits in
+/// is the thing that knows what it is beside.
+///
+/// **The mark and not the whole row**, where it would be tempting to make
+/// the line itself the control. egui hit-tests by registration order, so a
+/// row made clickable after its own contents sits OVER them and swallows
+/// presses meant for the ✕ at its end -- measured, on the edit form's
+/// target row, as a Remove that staged nothing. A mark of its own fights
+/// nothing.
+pub fn disclosure_mark(ui: &mut Ui, size: f32, open: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let mark = Rect::from_center_size(rect.center(), Vec2::splat(CHEVRON_HALF * 2.0));
+    let colour = if response.hovered() { INK } else { TEXT_FAINT };
+    if open {
+        let stroke = Stroke::new(ICON_STROKE, colour);
+        let painter = ui.painter();
+        painter.line_segment(
+            [Pos2::new(mark.left(), mark.bottom()), Pos2::new(mark.center().x, mark.top())],
+            stroke,
+        );
+        painter.line_segment(
+            [Pos2::new(mark.center().x, mark.top()), Pos2::new(mark.right(), mark.bottom())],
+            stroke,
+        );
+    } else {
+        paint_chevron(ui, mark, colour);
+    }
+    response
+}
+
 /// One open row, returning whether it was chosen.
 fn dropdown_row(ui: &mut Ui, width: f32, choice: &Choice<'_>) -> bool {
     let (rect, response) =
