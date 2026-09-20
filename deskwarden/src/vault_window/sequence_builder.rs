@@ -1001,15 +1001,18 @@ pub fn draw_sequence_builder(
             body: theme::ModalBody::Flush,
         },
         |ui| {
-            // **The body scrolls and the CARD does not grow.** A sequence of
-            // twenty steps would otherwise make a modal taller than the window
-            // it floats over. `auto_shrink` is off on BOTH axes: on the y it
-            // does not mean "cap at `max_height`", it means "be as tall as
-            // your content", which is the opposite -- measured once already at
-            // 842 points in a 740-point window.
+            // **The card is as tall as its content, and no taller than the
+            // window.** `auto_shrink` on the y means "be as tall as your
+            // content" -- which is what the owner asked for ("make height
+            // dynamic, so it adjusts based on the content of the modal") --
+            // and `max_height` is what keeps a twenty-step sequence from
+            // making a card taller than the window it floats over: past
+            // that the body scrolls. Both are needed. On the x it stays
+            // off, because the card's width is the card's, not its widest
+            // row's.
             egui::ScrollArea::vertical()
                 .max_height(height)
-                .auto_shrink([false, false])
+                .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     // **The ground under the rows is the window's grey.** 4a
@@ -1021,7 +1024,6 @@ pub fn draw_sequence_builder(
                     // as well as one of twenty -- the owner: "background
                     // under sequence should be gray as per design".
                     egui::Frame::new().fill(theme::WINDOW_BG).show(ui, |ui| {
-                        ui.set_min_height(height);
                         ui.set_width(ui.available_width());
                         // **The bands butt, and their rules are the joins.**
                         // 4a stacks them with no gap at all: the destination
@@ -2376,13 +2378,31 @@ fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
 /// pills on purpose; what it shares with them is the line its letters sit
 /// on, through [`run_top`].
 fn keycap(ui: &mut egui::Ui, text: &str) {
+    let _ = keycap_sensed(ui, text, egui::Sense::hover());
+}
+
+/// [`keycap`] **as a control**: the same cap, pressable.
+///
+/// The `+ Key` menu's palette -- the owner: "for keys buttons on + Key click
+/// use same pills as in sequencer". What the press adds to the sequence is a
+/// key step, and a key step is drawn as this cap, so the palette IS the
+/// result at the size it will be.
+fn keycap_button(ui: &mut egui::Ui, text: &str) -> egui::Response {
+    let response = keycap_sensed(ui, text, egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn keycap_sensed(ui: &mut egui::Ui, text: &str, sense: egui::Sense) -> egui::Response {
     let font = egui::FontId::new(KEYCAP_PX, egui::FontFamily::Name(theme::MONO_BOLD.into()));
     let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), theme::INK);
     let size = egui::vec2(
         galley.size().x + KEYCAP_PAD_X * 2.0 + KEYCAP_EDGE * 2.0,
         galley.size().y + KEYCAP_PAD_Y * 2.0 + KEYCAP_EDGE + KEYCAP_FOOT,
     );
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, sense);
     let painter = ui.painter();
     painter.rect_filled(rect, CornerRadius::same(KEYCAP_RADIUS), theme::BORDER_STRONG);
     let face = egui::Rect::from_min_max(
@@ -2400,6 +2420,7 @@ fn keycap(ui: &mut egui::Ui, text: &str) {
         galley,
         theme::INK,
     );
+    response
 }
 
 /// 4a's field pill: `gap: 6px; border-radius: 6px; background: #eef2fc;
@@ -2413,6 +2434,36 @@ fn keycap(ui: &mut egui::Ui, text: &str) {
 /// password; this family's password mark is a key, and one family is worth
 /// more than one matched glyph.
 fn field_pill(ui: &mut egui::Ui, field: &FieldRef, name: &str, secret: bool) {
+    let _ = field_pill_sensed(ui, field, name, secret, egui::Sense::hover());
+}
+
+/// [`field_pill`] **as a control**: the same pill, pressable.
+///
+/// The `+ Text` menu's palette. It was `detail_edit::palette_button` -- an
+/// ordinary outlined button with the field's name on it -- and the owner,
+/// of the menu beside the rows it writes into: "make sure css matches the
+/// rest". A palette whose buttons are the very pill the step will be says
+/// what the press does without a word of explanation.
+fn field_pill_button(
+    ui: &mut egui::Ui,
+    field: &FieldRef,
+    name: &str,
+    secret: bool,
+) -> egui::Response {
+    let response = field_pill_sensed(ui, field, name, secret, egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+fn field_pill_sensed(
+    ui: &mut egui::Ui,
+    field: &FieldRef,
+    name: &str,
+    secret: bool,
+    sense: egui::Sense,
+) -> egui::Response {
     let (fill, edge, ink, face) = if secret {
         (theme::ERROR, theme::ERROR, egui::Color32::WHITE, theme::BOLD)
     } else {
@@ -2424,7 +2475,7 @@ fn field_pill(ui: &mut egui::Ui, field: &FieldRef, name: &str, secret: bool) {
         FIELD_PILL_PAD_X * 2.0 + FIELD_PILL_MARK + FIELD_PILL_GAP + galley.size().x,
         galley.size().y + FIELD_PILL_PAD_Y * 2.0 + 2.0,
     );
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, sense);
     let painter = ui.painter();
     painter.rect(
         rect,
@@ -2443,6 +2494,7 @@ fn field_pill(ui: &mut egui::Ui, field: &FieldRef, name: &str, secret: bool) {
         galley,
         ink,
     );
+    response
 }
 
 /// The mark for a field, in the picker's own family.
@@ -2511,35 +2563,43 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
     egui::Popup::menu(&button)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            ui.set_min_width(ADD_MENU_WIDTH);
-            menu_caption(ui, ADD_VALUE_CAPTION);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-                for field in palette {
-                    if ui.add(detail_edit::palette_button(&field.label())).clicked() {
-                        draft.sequence =
-                            detail_edit::sequence_with(&draft.sequence, Token::Field(field.clone()));
-                        ui.close();
+            menu_body(ui, |ui| {
+                menu_caption(ui, ADD_VALUE_CAPTION);
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_PALETTE_GAP);
+                    for field in palette {
+                        let secret = matches!(field, FieldRef::Password | FieldRef::Totp);
+                        if field_pill_button(ui, field, &field.label(), secret).clicked() {
+                            draft.sequence = detail_edit::sequence_with(
+                                &draft.sequence,
+                                Token::Field(field.clone()),
+                            );
+                            ui.close();
+                        }
                     }
-                }
-                if palette.is_empty() {
-                    ui.label(RichText::new(NO_FIELDS).size(11.0).color(theme::TEXT_FAINT));
-                }
-            });
-            ui.add_space(8.0);
-            menu_caption(ui, ADD_LITERAL_CAPTION);
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut draft.literal_draft).desired_width(160.0));
-                if theme::secondary_button(ui, ADD_LITERAL_BUTTON).clicked() {
+                    if palette.is_empty() {
+                        ui.label(RichText::new(NO_FIELDS).size(11.0).color(theme::TEXT_FAINT));
+                    }
+                });
+                ui.add_space(MENU_BLOCK_GAP);
+                menu_caption(ui, ADD_LITERAL_CAPTION);
+                ui.horizontal(|ui| {
+                    let room =
+                        ui.available_width() - theme::row_button_width(ui, ADD_LITERAL_BUTTON)
+                            - theme::ROW_BUTTON_GAP;
+                    theme::section_text_field_within(ui, &mut draft.literal_draft, false, room);
+                    if theme::secondary_button(ui, ADD_LITERAL_BUTTON).clicked() {
                     // Escaping is this app's job, not the user's.
-                    if let Some(next) =
-                        detail_edit::sequence_with_literal(&draft.sequence, &draft.literal_draft)
-                    {
-                        draft.sequence = next;
-                        draft.literal_draft.clear();
-                        ui.close();
+                        if let Some(next) = detail_edit::sequence_with_literal(
+                            &draft.sequence,
+                            &draft.literal_draft,
+                        ) {
+                            draft.sequence = next;
+                            draft.literal_draft.clear();
+                            ui.close();
+                        }
                     }
-                }
+                });
             });
         });
 }
@@ -2548,15 +2608,18 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
 fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
     let button = theme::dashed_button(ui, ADD_KEY_LABEL);
     egui::Popup::menu(&button).show(|ui| {
-        ui.set_min_width(ADD_MENU_WIDTH);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
-            for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
-                if ui.add(detail_edit::palette_button(key.label)).clicked() {
-                    draft.sequence = detail_edit::sequence_with(&draft.sequence, Token::Key(key));
-                    ui.close();
+        menu_body(ui, |ui| {
+            menu_caption(ui, ADD_KEY_CAPTION);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_PALETTE_GAP);
+                for key in key_sequence::KEYS.iter().filter(|k| k.palette) {
+                    if keycap_button(ui, key_name(key.label)).clicked() {
+                        draft.sequence =
+                            detail_edit::sequence_with(&draft.sequence, Token::Key(key));
+                        ui.close();
+                    }
                 }
-            }
+            });
         });
     });
 }
@@ -2568,27 +2631,33 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
     egui::Popup::menu(&button)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            ui.set_min_width(ADD_MENU_WIDTH);
-            menu_caption(ui, ADD_WAIT_CAPTION);
-            ui.horizontal(|ui| {
-                ui.add(egui::TextEdit::singleline(&mut draft.wait_draft).desired_width(56.0));
-                ui.label(RichText::new(WAIT_UNIT).size(11.0).color(theme::TEXT_FAINT));
-                let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
-                ui.add_enabled_ui(addable, |ui| {
-                    if theme::secondary_button(ui, ADD_WAIT_BUTTON).clicked() {
-                        if let Some(next) =
-                            detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
-                        {
-                            draft.sequence = next;
-                            ui.close();
+            menu_body(ui, |ui| {
+                menu_caption(ui, ADD_WAIT_CAPTION);
+                ui.horizontal(|ui| {
+                    theme::section_text_field_within(
+                        ui,
+                        &mut draft.wait_draft,
+                        false,
+                        WAIT_BOX_WIDTH,
+                    );
+                    ui.label(RichText::new(WAIT_UNIT).size(11.0).color(theme::TEXT_FAINT));
+                    let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
+                    ui.add_enabled_ui(addable, |ui| {
+                        if theme::secondary_button(ui, ADD_WAIT_BUTTON).clicked() {
+                            if let Some(next) =
+                                detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
+                            {
+                                draft.sequence = next;
+                                ui.close();
+                            }
                         }
-                    }
+                    });
                 });
+                if key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_none() {
+                    ui.add_space(MENU_PALETTE_GAP);
+                    ui.label(RichText::new(WAIT_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
+                }
             });
-            if key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_none() {
-                ui.add_space(4.0);
-                ui.label(RichText::new(WAIT_REFUSAL).size(11.0).color(theme::TEXT_FAINT));
-            }
         });
 }
 
@@ -2596,6 +2665,21 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
 /// label, so a menu opened off this row reads as part of the same app.
 fn menu_caption(ui: &mut egui::Ui, text: &str) {
     ui.label(RichText::new(text).size(11.0).color(theme::TEXT_FAINT));
+}
+
+/// **What every one of the three menus is inside.**
+///
+/// egui's menu layer is a frame with its own padding and its own spacing,
+/// and what was drawn into it was a column of egui's default widgets --
+/// outlined buttons, a bare `TextEdit` with egui's own focus border. The
+/// owner: "make sure css matches the rest". So each menu is this: the card's
+/// own margin, the app's `item_spacing`, one width for all three, and inside
+/// it nothing but controls this design system already draws.
+fn menu_body<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.set_min_width(ADD_MENU_WIDTH);
+    ui.set_max_width(ADD_MENU_WIDTH);
+    ui.spacing_mut().item_spacing = theme::ITEM_SPACING;
+    add(ui)
 }
 
 /// 4a's three captions, and the row's `gap: 8px` and `padding-top: 4px`.
@@ -2610,8 +2694,18 @@ const ADD_ROW_LIFT: f32 = 4.0;
 /// itself as the user types.
 const ADD_MENU_WIDTH: f32 = 280.0;
 
+/// The gaps inside a menu: between two palette cells, and between one
+/// captioned block and the next.
+const MENU_PALETTE_GAP: f32 = 4.0;
+const MENU_BLOCK_GAP: f32 = 8.0;
+
+/// The wait box. Wide enough for `3600` and no wider: it takes a number of
+/// seconds, and a box the width of the menu would promise a sentence.
+const WAIT_BOX_WIDTH: f32 = 72.0;
+
 /// The captions inside the menus.
 const ADD_VALUE_CAPTION: &str = "A value from this item";
+const ADD_KEY_CAPTION: &str = "A key to press";
 const ADD_LITERAL_CAPTION: &str = "Text to type";
 const ADD_LITERAL_BUTTON: &str = "Add text";
 const ADD_WAIT_CAPTION: &str = "How long to wait";

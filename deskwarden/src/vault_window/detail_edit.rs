@@ -4463,17 +4463,12 @@ pub fn website_label(index: usize) -> String {
 pub const WEBSITE_FIRST_NOTE: &str =
     "The first one is what this item's page shows and where its icon comes from.";
 
-/// The note under the websites block, in every state.
-///
-/// **It no longer says the match type is untouched, because it no longer is
-/// -- the row carries an editor for it now (see [`UriMatchChoice`]).** What
-/// it says instead is the fact that editor cannot say for itself: the value
-/// has no effect in THIS program. A dropdown whose whole consequence happens
-/// in another application is one a user will otherwise test by setting it and
-/// watching Deskwarden behave identically, and conclude is broken.
-pub const WEBSITE_MATCH_NOTE: &str =
-    "Match detection is used by the Bitwarden browser extension when it offers this login on \
-     a page. Deskwarden itself matches on the app window in front of you.";
+// **The websites block draws no note.** It carried one saying that the
+// match type is the browser extension's business and not this program's --
+// true, and the owner has taken it off the card all the same: "remove both",
+// of this and of the arguments box's. Two paragraphs of small grey type in
+// the middle of a form are read once and then are furniture, and what they
+// explained is a dropdown whose choices already name themselves.
 
 /// 8a's `+ Add website`: a blue link under the rows, not a button.
 ///
@@ -5203,7 +5198,6 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
         uris.push(UriDraft::new());
     }
     ui.add_space(4.0);
-    ui.label(RichText::new(WEBSITE_MATCH_NOTE).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
 }
 
 /// The custom fields, as rows of name, value and Remove.
@@ -5383,13 +5377,10 @@ const APP_PATH_LABEL: &str = "Program file";
 /// so it fits into one line".
 const APP_ARGS_LABEL: &str = "CLI arguments";
 
-/// What the arguments box is for, said in the terms the user asked in.
-///
-/// Naming the browser-profile case explicitly because it is the case: the
-/// same executable, twice, told apart only by this string.
-const APP_ARGS_HINT: &str = "Passed to the program when Deskwarden opens it \u{2014} for example \
-                             --profile-directory=\"Profile 2\" to pick a browser profile. Saved \
-                             exactly as you type it.";
+// **The arguments box draws no hint.** It said what the box is for and
+// named the browser-profile case; the owner: "remove both". The label
+// beside it already says `CLI arguments`, which is the sentence's own
+// subject.
 
 /// The arguments row for a Microsoft Store app. There is no command line to
 /// pass: nothing is started by path (see [`AppPathRow`]).
@@ -6101,12 +6092,19 @@ fn rate_note(rate: Option<u32>) -> String {
 
 /// The step list for `sequence`, as drawn.
 ///
-/// `reveal` is the eye (`AppMatchDraft::previewing`): with it shut, a field row
-/// names its field and shows no value at all. With it open, a non-secret field
-/// shows what it would resolve to -- the same thing the preview line already
-/// showed, in the row that will type it. **A password shows [`SECRET_MASK`] in
-/// both states**, and a one-time code is treated as a secret too: it is a
-/// credential, and the design's own rule is that secrets are masked.
+/// `reveal` is the eye (`AppMatchDraft::previewing`): with it shut, a field
+/// row names its field and shows no value at all -- except a secret, which
+/// shows [`SECRET_MASK`] so the row says there IS something there.
+///
+/// **With it open, every field shows what it would type, secrets included.**
+/// The rule used to be that a password and a one-time code stayed masked in
+/// both states; the owner, of the control whose whole caption is "Show what
+/// it types": "When Show what it types clicked - also show passwords etc".
+/// It is a deliberate press, in an unlocked vault window, beside a password
+/// box that already reveals its own field -- and a preview that masked the
+/// one value a user most needs to check before saving a fill rule was
+/// answering a question nobody asked. The row keeps its secret colouring
+/// either way, so what is on screen still reads as a credential.
 pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Vec<StepRow> {
     let tokens = sequence_view(sequence).tokens;
     let mut rate: Option<u32> = None;
@@ -6118,10 +6116,10 @@ pub fn step_rows(sequence: &str, source: &ResolveSource<'_>, reveal: bool) -> Ve
             Token::Literal(_) => (StepKind::Text, none(), false, rate_note(rate), none()),
             Token::Field(field) => {
                 let secret = matches!(field, FieldRef::Password | FieldRef::Totp);
-                let payload = if secret {
-                    SECRET_MASK.to_string()
-                } else if reveal {
+                let payload = if reveal {
                     resolved_value(field, source)
+                } else if secret {
+                    SECRET_MASK.to_string()
                 } else {
                     String::new()
                 };
@@ -8830,8 +8828,6 @@ fn app_block(
             theme::section_disabled_text_field(ui, APP_ARGS_STORE_APP);
         }
     });
-    ui.add_space(4.0);
-    ui.label(RichText::new(APP_ARGS_HINT).size(TARGET_NOTE_PX).color(theme::TEXT_FAINT));
     ui.add_space(10.0);
 
     // **No autofill control here, deliberately.** What a matched foreground
@@ -12628,7 +12624,6 @@ mod tests {
         for text in [
             app_path_warning(&AppMatch { path: r"..\x\chrome.exe".to_string(), ..chrome_match() })
                 .unwrap(),
-            APP_ARGS_HINT,
             APP_ARGS_STORE_APP,
         ] {
             assert!(!text.to_lowercase().contains("hosted"), "{text:?}");
@@ -18631,10 +18626,11 @@ mod sequence_builder_tests {
         };
         let open = reveal(&ctx, PANE, &mut draft, &item, &live_code());
         // The control: the eye really was open, and really was adding the
-        // preview's own copy to the one the field always draws.
+        // preview's own copies -- the step row's value and the resolved
+        // preview line's -- to the one the field always draws.
         assert_eq!(
             shown(&open),
-            2,
+            3,
             "the revealed builder is not showing the password in its preview: {:?}",
             open.strings()
         );
@@ -19065,39 +19061,47 @@ mod sequence_builder_tests {
         );
     }
 
-    /// **A password is never in the row, in either state of the eye.**
+    /// **A secret is masked until the eye is open, and then it is shown.**
     ///
-    /// Both states, because "masked" must be a property of the FIELD and not
-    /// of a flag that is off right now: the reveal argument is passed both
-    /// ways and the assertion is the same both times. The one-time code is
-    /// held to the same rule -- it is a credential too.
+    /// The rule used to be that a password and a one-time code stayed masked
+    /// in both states. The owner, of a control captioned "Show what it
+    /// types": "When Show what it types clicked - also show passwords etc".
+    /// So the eye is what the two states differ by -- and with it SHUT a
+    /// secret is still the one field that shows a mask rather than nothing,
+    /// because a row that said only `Password` would not say whether there
+    /// is a password to type at all.
     #[test]
-    fn a_secret_step_shows_a_mask_and_never_its_value() {
+    fn a_secret_step_is_masked_until_the_eye_is_open() {
         const SEQUENCE: &str = "{USERNAME}{TAB}{PASSWORD}{TOTP}";
         let item = item();
         let totp = live_code();
         let source = rows_source(&item, &totp);
 
-        for reveal in [false, true] {
-            let rows = step_rows(SEQUENCE, &source, reveal);
-            let secrets: Vec<&StepRow> = rows.iter().filter(|r| r.secret).collect();
-            assert_eq!(secrets.len(), 2, "reveal={reveal}: {rows:?}");
-            for row in &secrets {
-                assert_eq!(row.payload, SECRET_MASK, "reveal={reveal}");
-            }
-            for row in &rows {
-                for cell in [&row.label, &row.payload, &row.note, &row.aside] {
-                    assert!(
-                        !cell.contains(PASSWORD),
-                        "reveal={reveal}: a row cell {cell:?} carries the password"
-                    );
-                    assert!(
-                        !cell.contains(TOTP_CODE),
-                        "reveal={reveal}: a row cell {cell:?} carries the one-time code"
-                    );
-                }
+        let shut = step_rows(SEQUENCE, &source, false);
+        let secrets: Vec<&StepRow> = shut.iter().filter(|r| r.secret).collect();
+        assert_eq!(secrets.len(), 2, "{shut:?}");
+        for row in &secrets {
+            assert_eq!(row.payload, SECRET_MASK);
+        }
+        for row in &shut {
+            for cell in [&row.label, &row.payload, &row.note, &row.aside] {
+                assert!(!cell.contains(PASSWORD), "the shut eye leaked the password in {cell:?}");
+                assert!(!cell.contains(TOTP_CODE), "the shut eye leaked the code in {cell:?}");
             }
         }
+
+        let open = step_rows(SEQUENCE, &source, true);
+        let payloads: Vec<&str> = open.iter().map(|r| r.payload.as_str()).collect();
+        assert!(
+            payloads.contains(&PASSWORD),
+            "the open eye did not show the password: {payloads:?}"
+        );
+        assert!(
+            payloads.contains(&TOTP_CODE),
+            "the open eye did not show the one-time code: {payloads:?}"
+        );
+        // Still marked as secrets, so the row keeps its own colouring.
+        assert_eq!(open.iter().filter(|r| r.secret).count(), 2);
     }
 
     /// The positive control on the test above: the eye really does reach the
@@ -19685,13 +19689,14 @@ mod sequence_builder_tests {
         );
     }
 
-    /// **The password is not painted in the step list**, with the eye shut and
-    /// with it open. Asked of the band the rows occupy rather than of the
-    /// whole form, because the form's own password box is above it and the
-    /// eye's preview -- which is a reveal the user asked for by name -- is
+    /// **The password is not painted in the step list while the eye is
+    /// shut**, and is once it is open -- which is what the eye is for ("When
+    /// Show what it types clicked - also show passwords etc"). Asked of the
+    /// band the rows occupy rather than of the whole form, because the
+    /// form's own password box is above it and the resolved preview is
     /// below.
     #[test]
-    fn no_row_in_the_step_list_paints_the_password() {
+    fn no_row_in_the_step_list_paints_the_password_until_the_eye_is_open() {
         const SEQUENCE: &str = "{USERNAME}{TAB}{PASSWORD}{ENTER}";
         let item = item();
         let ctx = styled_context(PANE);
@@ -19703,22 +19708,27 @@ mod sequence_builder_tests {
             let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
             let floor = painted.rect_of(APP_SEQUENCE_HINT).bottom();
             let ceiling = painted.rect_of("Add a value").top();
-            for (source, drawn, rect) in &painted.rendered {
-                if rect.top() <= floor || rect.top() >= ceiling {
-                    continue;
-                }
+            let in_the_list = |rect: &egui::Rect| rect.top() > floor && rect.top() < ceiling;
+            let painted_here: Vec<&String> = painted
+                .rendered
+                .iter()
+                .filter(|(_, _, rect)| in_the_list(rect))
+                .map(|(source, _, _)| source)
+                .collect();
+            let leaked = painted_here.iter().any(|run| run.contains(PASSWORD));
+            assert_eq!(
+                leaked, previewing,
+                "previewing={previewing}: the step list painted {:?}",
+                painted_here
+            );
+            // The positive control: with the eye shut the masked row IS
+            // there, so the check above is not passing over an empty band.
+            if !previewing {
                 assert!(
-                    !source.contains(PASSWORD) && !drawn.contains(PASSWORD),
-                    "previewing={previewing}: the step list painted the password ({source:?} / \
-                     {drawn:?})"
+                    painted.strings().contains(&SECRET_MASK),
+                    "the masked password row is not drawn at all"
                 );
             }
-            // The positive control: the masked row IS there, so the loop above
-            // is not passing over an empty band.
-            assert!(
-                painted.strings().contains(&SECRET_MASK),
-                "previewing={previewing}: the masked password row is not drawn at all"
-            );
         }
         let _ = open;
     }
@@ -25091,7 +25101,6 @@ mod edit_pane_layout_tests {
         }
         assert_eq!(dropdowns, 3, "the dropdown loop asserted about nothing");
         assert_inside("the add-a-website link", WEBSITE_ADD_BUTTON, pane, &painted);
-        assert_inside("the match-type note", WEBSITE_MATCH_NOTE, pane, &painted);
     }
 
     /// **...and every one of them is reachable at the minimum window
