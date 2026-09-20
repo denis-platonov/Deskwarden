@@ -8086,15 +8086,13 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
     // Read before the three mutable field borrows below, which are disjoint
     // and therefore fine together -- this one is not.
     let fault = app.template_fault();
+    let _ = source;
     template_editor(
         ui,
         &mut app.template_draft,
         &mut app.sequence,
         &mut app.template_touched,
         fault,
-        |ui, sequence| {
-            let _ = sequence_steps(ui, &step_rows(sequence, source, false), false);
-        },
     );
 }
 
@@ -8113,68 +8111,263 @@ fn app_template_view(ui: &mut egui::Ui, app: &mut AppMatchDraft, source: &Resolv
 /// looked at leaves the item untouched, and a template that is edited stores
 /// the user's own bytes rather than this build's spelling of them.
 ///
-/// `steps` draws the read-out under the field, handed the string as it
-/// stands. A closure rather than a call to [`sequence_steps`], because the
-/// two callers draw a step row two ways: the edit form's list, at a 298-point
-/// pane and one row per token, and the builder's 4a row, one per act, which
-/// needs more than that pane has (see `sequence_builder::step_list`). What is
-/// shared is the bridge; what is handed in is the row.
+/// **The parsed steps are NOT drawn under the field.** 4c ends with a
+/// `Reads as` block -- the same sequence again, as chips -- and the owner,
+/// with it on screen: "remove - text sequence is already the same thing".
+/// In the design that block is the argument for the view; here the line
+/// itself is coloured token by token, which says the same thing in the
+/// place the user is typing. The closure that drew it is gone from this
+/// signature, and both callers with it.
 pub(crate) fn template_editor(
     ui: &mut egui::Ui,
     template_draft: &mut String,
     sequence: &mut String,
     touched: &mut bool,
     fault: Option<&'static str>,
-    steps: impl FnOnce(&mut egui::Ui, &str),
 ) {
-    // Multiline, because a sequence with a wait and a rate in it is longer
-    // than the edit form's pane is wide and that pane refuses horizontal
-    // scrolling (`assert_inside`). Wrapped text is readable; a line running
-    // off the right edge is a template whose end the user cannot see.
-    let response = ui.add(
-        egui::TextEdit::multiline(template_draft)
-            .desired_rows(2)
-            .desired_width(f32::INFINITY)
-            .font(egui::TextStyle::Monospace),
-    );
+    // **4c's own box**: `border: 1px solid; border-radius: 8px; padding:
+    // 12px 13px`, mono 13 on a line box wide enough for the token chips
+    // inside it (`line-height: 1.9`). Blue and haloed while it has focus,
+    // which is this app's focus treatment everywhere.
+    let box_id = ui.id().with("template-box");
+    let focused = ui.memory(|m| m.has_focus(box_id));
+    let framed = egui::Frame::new()
+        .fill(theme::CARD)
+        .stroke(Stroke::new(1.0, if focused { theme::BLUE } else { theme::BORDER_STRONG }))
+        .corner_radius(CornerRadius::same(TEMPLATE_BOX_RADIUS))
+        .inner_margin(Margin::symmetric(TEMPLATE_BOX_PAD_X, TEMPLATE_BOX_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            // Multiline, because a sequence with a wait and a rate in it is
+            // longer than the edit form's pane is wide and that pane refuses
+            // horizontal scrolling (`assert_inside`). Wrapped text is
+            // readable; a line running off the right edge is a template
+            // whose end the user cannot see.
+            let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
+                template_galley(ui, buffer.as_str(), wrap)
+            };
+            ui.add(
+                egui::TextEdit::multiline(template_draft)
+                    .id(box_id)
+                    .desired_rows(1)
+                    .desired_width(f32::INFINITY)
+                    .frame(egui::Frame::new())
+                    .margin(Margin::ZERO)
+                    .layouter(&mut layouter),
+            )
+        });
+    // The halo, round the box it is about -- 4c's `box-shadow: 0 0 0 3px
+    // #dbe4f7`, which is `theme::field_box`'s own focus treatment.
+    if focused {
+        ui.painter().rect_stroke(
+            framed.response.rect.expand(2.0),
+            CornerRadius::same(TEMPLATE_BOX_RADIUS),
+            Stroke::new(3.0, theme::FOCUS_RING),
+            egui::StrokeKind::Middle,
+        );
+    }
+    let response = framed.inner;
     if response.changed() {
         *touched = true;
         *sequence = template_draft.clone();
     }
-    ui.add_space(4.0);
 
     if template_draft.is_empty() {
+        ui.add_space(TEMPLATE_GAP);
         ui.label(RichText::new(TEMPLATE_EMPTY_NOTE).size(11.0).color(theme::TEXT_FAINT));
-        ui.add_space(4.0);
     }
 
     // **The refusal, in the field that caused it.** Save is off while this is
     // on screen -- see `EditDraft::sequence_fault`.
     if let Some(fault) = fault {
+        ui.add_space(TEMPLATE_GAP);
         ui.label(RichText::new(fault).size(11.0).color(theme::ERROR));
-        ui.add_space(4.0);
     }
 
-    ui.label(RichText::new("Insert").size(11.0).color(theme::TEXT_FAINT));
+    // **4c's `INSERT` row**: the caption in small capitals and the tokens as
+    // pills -- mono 11 in a `border-radius: 999px; padding: 3px 9px` capsule,
+    // the two credentials in their own colours and the rest outlined. They
+    // were this form's ordinary palette buttons; the design draws the thing
+    // that will be INSERTED, in the colour it will wear in the line above.
+    ui.add_space(TEMPLATE_GAP);
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+        ui.spacing_mut().item_spacing = egui::vec2(TEMPLATE_CHIP_GAP, TEMPLATE_CHIP_GAP);
+        ui.add(
+            egui::Label::new(theme::letterspaced(
+                TEMPLATE_INSERT_CAPTION,
+                TEMPLATE_CAPTION_PX,
+                theme::BOLD,
+                TEMPLATE_CAPTION_PX * TEMPLATE_CAPTION_TRACKING,
+                theme::TEXT_GHOST,
+            ))
+            .extend(),
+        );
         for chip in TEMPLATE_CHIPS {
-            if ui.add(palette_button(chip)).clicked() {
+            if insert_chip(ui, chip).clicked() {
                 *template_draft = template_with(template_draft, chip);
                 *touched = true;
                 *sequence = template_draft.clone();
             }
         }
     });
-    ui.add_space(8.0);
-
-    // The parsed steps, under the field, read-only. The design's whole point:
-    // the string is never the only thing on screen, so the user always sees
-    // what it became.
-    ui.label(RichText::new(TEMPLATE_READS_AS).size(11.0).color(theme::TEXT_FAINT));
-    ui.add_space(4.0);
-    steps(ui, sequence);
 }
+
+/// **One `INSERT` pill**: 4c's `font-family: mono; font-size: 11px;
+/// border-radius: 999px; padding: 3px 9px`, in the colour its token wears in
+/// the line above -- blue for a value, red for a secret, outlined for a key
+/// or a wait.
+fn insert_chip(ui: &mut egui::Ui, token: &str) -> egui::Response {
+    let (fill, edge, ink) = match token_tone(token) {
+        TokenTone::Value => (theme::BLUE_WASH, theme::BLUE_EDGE, theme::BLUE_DEEP),
+        TokenTone::Secret => (theme::DANGER_WASH, theme::DANGER_EDGE, theme::DANGER_INK),
+        TokenTone::Timing | TokenTone::Key => {
+            (theme::CARD, theme::BORDER_STRONG, theme::TEXT_SECONDARY)
+        }
+    };
+    let font = egui::FontId::new(TEMPLATE_CHIP_PX, egui::FontFamily::Monospace);
+    let galley = ui.painter().layout_no_wrap(token.to_string(), font.clone(), ink);
+    let size = egui::vec2(
+        galley.size().x + 2.0 * TEMPLATE_CHIP_PAD_X,
+        theme::ink_depth_of(ui.ctx(), &font, galley.size().y) + 2.0 * TEMPLATE_CHIP_PAD_Y,
+    );
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(u8::try_from(size.y as i32 / 2).unwrap_or(9)),
+        fill,
+        Stroke::new(1.0, edge),
+        egui::StrokeKind::Inside,
+    );
+    let at = egui::pos2(
+        rect.left() + TEMPLATE_CHIP_PAD_X,
+        rect.center().y - theme::face_ink_middle(ui, &font),
+    );
+    ui.painter().galley(at, galley, ink);
+    response
+}
+
+/// What a `{TOKEN}` is, for the colour it takes in 4c's line and in its
+/// `INSERT` row. Off the token's own spelling, because both places are
+/// looking at a STRING -- the template view's whole subject is text that may
+/// not parse yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenTone {
+    /// `{USERNAME}`, `{S:Name}` -- a value from the item.
+    Value,
+    /// `{PASSWORD}`, `{TOTP}` -- a credential.
+    Secret,
+    /// `{WAIT=..}`, `{DELAY..}` -- how fast, not what.
+    Timing,
+    /// Everything else: a key, or a token this build does not know.
+    Key,
+}
+
+fn token_tone(token: &str) -> TokenTone {
+    let inner = token.trim_start_matches('{').trim_end_matches('}').to_ascii_uppercase();
+    if inner == "PASSWORD" || inner == "TOTP" {
+        TokenTone::Secret
+    } else if inner == "USERNAME" || inner.starts_with("S:") {
+        TokenTone::Value
+    } else if inner.starts_with("WAIT") || inner.starts_with("DELAY") {
+        TokenTone::Timing
+    } else {
+        TokenTone::Key
+    }
+}
+
+/// **4c's line, laid out**: every `{TOKEN}` on its own tinted ground and the
+/// literal text between them plain.
+///
+/// A layouter and not a read-only preview: the design colours the very line
+/// the user is typing in, which is the whole argument of the template view
+/// -- "you always see what the string became" without looking anywhere else.
+/// egui hands a custom layouter the raw buffer, so the tokens are found
+/// here, in the text, rather than through the parser: a half-typed `{USERN`
+/// has no token to colour and must still lay out.
+fn template_galley(
+    ui: &egui::Ui,
+    text: &str,
+    wrap: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let font = egui::FontId::new(TEMPLATE_TEXT_PX, egui::FontFamily::Monospace);
+    let line = TEMPLATE_TEXT_PX * TEMPLATE_LINE_HEIGHT;
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap.max_width = wrap;
+    job.wrap.break_anywhere = true;
+    for (run, token) in template_runs(text) {
+        let (background, color) = if token {
+            match token_tone(run) {
+                TokenTone::Value => (theme::FOCUS_RING, theme::BLUE_DEEP),
+                TokenTone::Secret => (theme::DANGER_PILL, theme::DANGER_INK),
+                TokenTone::Timing => (theme::CANVAS, theme::TEXT_FAINT),
+                TokenTone::Key => (theme::CANVAS, theme::TEXT_SECONDARY),
+            }
+        } else {
+            (egui::Color32::TRANSPARENT, theme::INK)
+        };
+        job.append(
+            run,
+            0.0,
+            egui::TextFormat {
+                font_id: font.clone(),
+                color,
+                background,
+                line_height: Some(line),
+                ..Default::default()
+            },
+        );
+    }
+    ui.ctx().fonts_mut(|f| f.layout_job(job))
+}
+
+/// `text` split into its `{...}` tokens and the literal runs between them,
+/// in order, each flagged for which it is.
+///
+/// Pure and tested: an unclosed brace is literal text to the end, which is
+/// what a user midway through typing one has.
+fn template_runs(text: &str) -> Vec<(&str, bool)> {
+    let mut runs = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        if open > 0 {
+            runs.push((&rest[..open], false));
+        }
+        match rest[open..].find('}') {
+            Some(close) => {
+                runs.push((&rest[open..=open + close], true));
+                rest = &rest[open + close + 1..];
+            }
+            None => {
+                runs.push((&rest[open..], false));
+                rest = "";
+                break;
+            }
+        }
+    }
+    if !rest.is_empty() {
+        runs.push((rest, false));
+    }
+    runs
+}
+
+/// 4c's own numbers for the template box and its `INSERT` row.
+const TEMPLATE_BOX_RADIUS: u8 = 8;
+const TEMPLATE_BOX_PAD_X: i8 = 13;
+const TEMPLATE_BOX_PAD_Y: i8 = 12;
+const TEMPLATE_TEXT_PX: f32 = 13.0;
+const TEMPLATE_LINE_HEIGHT: f32 = 1.9;
+const TEMPLATE_GAP: f32 = 14.0;
+const TEMPLATE_CHIP_GAP: f32 = 7.0;
+const TEMPLATE_CHIP_PX: f32 = 11.0;
+const TEMPLATE_CHIP_PAD_X: f32 = 9.0;
+const TEMPLATE_CHIP_PAD_Y: f32 = 3.0;
+const TEMPLATE_CAPTION_PX: f32 = 11.0;
+const TEMPLATE_CAPTION_TRACKING: f32 = 0.08;
+const TEMPLATE_INSERT_CAPTION: &str = "INSERT";
+
 
 /// `sequence` with the edit a step row's controls asked for applied.
 ///
@@ -19767,7 +19960,7 @@ mod sequence_builder_tests {
         // onto the draft is on the path under test.
         let template = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let top = template.rect_of(VIEW_TEMPLATE).bottom();
-        let bottom = template.rect_of("Insert").top();
+        let bottom = template.rect_of(TEMPLATE_INSERT_CAPTION).top();
         let field = template
             .texts
             .iter()
@@ -19789,16 +19982,52 @@ mod sequence_builder_tests {
         events.push(egui::Event::Text("{TAB}{PASSWORD}".to_string()));
         let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &events);
         assert_eq!(draft.app.as_ref().unwrap().sequence, "{USERNAME}{TAB}{PASSWORD}");
-        // The parsed list is on screen under the field, so the string is never
-        // the only thing the user can see.
-        for step in ["Username", "Tab", "Password"] {
-            assert!(
-                after.strings().contains(&step),
-                "the parsed step {step:?} is not drawn under the template field: {:?}",
-                after.strings()
-            );
+        // **And the parsed list is NOT under the field.** 4c ends in a
+        // `Reads as` block and the owner took it off: "remove - text
+        // sequence is already the same thing". What tells the user what the
+        // string became is the string itself, coloured token by token --
+        // asserted by `the_template_line_tints_each_token_by_what_it_is`.
+        assert!(
+            !after.strings().contains(&TEMPLATE_READS_AS),
+            "the read-out is back under the template field: {:?}",
+            after.strings()
+        );
+        assert!(
+            after.strings().contains(&TEMPLATE_INSERT_CAPTION),
+            "the Insert row went with it: {:?}",
+            after.strings()
+        );
+    }
+
+    /// **4c tints each token by what it is**, in the line the user types in
+    /// -- a value blue, a credential red, a wait grey, a key plain -- and
+    /// the literal text between them carries no ground at all.
+    ///
+    /// Asked of `template_runs` and `token_tone`, which are what the
+    /// layouter is built from: the galley itself is egui's, and a test that
+    /// went looking for backgrounds in it would be testing epaint.
+    #[test]
+    fn the_template_line_tints_each_token_by_what_it_is() {
+        assert_eq!(
+            template_runs("hi{USERNAME}{TAB}"),
+            vec![("hi", false), ("{USERNAME}", true), ("{TAB}", true)]
+        );
+        // A brace the user has not finished typing is text, not a token.
+        assert_eq!(template_runs("{USERN"), vec![("{USERN", false)]);
+        assert_eq!(template_runs(""), Vec::new());
+
+        for (token, tone) in [
+            ("{USERNAME}", TokenTone::Value),
+            ("{S:PIN}", TokenTone::Value),
+            ("{PASSWORD}", TokenTone::Secret),
+            ("{TOTP}", TokenTone::Secret),
+            ("{WAIT=250}", TokenTone::Timing),
+            ("{DELAY 250}", TokenTone::Timing),
+            ("{TAB}", TokenTone::Key),
+            ("{WHAT IS THIS}", TokenTone::Key),
+        ] {
+            assert_eq!(token_tone(token), tone, "{token}");
         }
-        assert!(after.strings().contains(&TEMPLATE_READS_AS), "the read-out lost its heading");
     }
 
     /// **The refusal reaches the button.** An unparseable template turns Save

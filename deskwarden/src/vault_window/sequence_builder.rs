@@ -978,6 +978,17 @@ pub fn draw_sequence_builder(
     let save_chord = egui::KeyboardShortcut::new(egui::Modifiers::COMMAND, egui::Key::S);
     let chorded = draft.saveable() && ctx.input_mut(|i| i.consume_shortcut(&save_chord));
 
+    // **Escape is the way out**, like every other card in this app -- the
+    // window picker's own Esc was wired for the same report. The owner: "Esc
+    // doesn't close modal".
+    //
+    // `consume_key`, so the press is taken off the queue and nothing behind
+    // the scrim reads it as its own Escape, and read HERE for the reason the
+    // save chord is: a text box with focus must not be able to swallow it. A
+    // box that wants Escape for itself takes it first -- `theme::field_box`'s
+    // clearable arm reads `lost_focus`, which happens before this.
+    let escaped = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+
     // Read before the card, because `modal_card` takes the body and the
     // confirm as two closures that must not both borrow the draft.
     let blocked = draft.fault().is_some();
@@ -1047,7 +1058,7 @@ pub fn draw_sequence_builder(
 
     if chorded || press.confirmed {
         BuilderAction::Save
-    } else if press.dismissed {
+    } else if escaped || press.dismissed {
         BuilderAction::Discard
     } else {
         BuilderAction::None
@@ -1689,9 +1700,6 @@ fn steps_column(
                     &mut draft.sequence,
                     &mut draft.template_touched,
                     fault,
-                    |ui, sequence| {
-                        let _ = step_list(ui, &steps(sequence, source, false), None);
-                    },
                 );
             } else {
                 let list = steps(&draft.sequence, source, draft.revealing);
@@ -2097,6 +2105,24 @@ fn step_row_height(ui: &egui::Ui) -> f32 {
     pill.max(keycap)
 }
 
+/// **A bare run on a step row, inked on the row's line.**
+///
+/// The row's boxed cells -- the kind chip, the field pill, the keycap --
+/// each centre their own ink in their own box (see [`run_top`]), and a run
+/// with no box round it has to land on the same line. `ui.add` of a `Label`
+/// does not: egui centres the galley's BOX, which is ascent plus descender,
+/// and a face inks the upper part of that -- about a point high, which is
+/// exactly what the owner saw between `WAIT` and `1s`.
+fn row_run(ui: &mut egui::Ui, text: &str, font: egui::FontId, ink: egui::Color32) {
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), ink);
+    let (rect, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+    ui.painter().galley(
+        egui::pos2(rect.left(), run_top(ui, rect.center().y, &font)),
+        galley,
+        ink,
+    );
+}
+
 /// **A wait's duration without the word.**
 ///
 /// The row's label is `key_sequence::wait_label`'s -- `Wait 0.3s` -- which
@@ -2332,15 +2358,22 @@ fn step_middle(ui: &mut egui::Ui, step: &Step, height: f32) {
             // 4a's `250 ms`: mono `font-size: 13px; font-weight: 600`, the
             // duration and nothing else -- in the seconds the owner asked to
             // set waits in rather than the design's milliseconds.
+            //
+            // **Painted, not `ui.add`.** egui centres a label by its galley
+            // BOX, and a box is ascent plus descender where a face inks only
+            // the upper part of it -- so `1s` sat a point over the middle of
+            // the `WAIT` chip two cells to its left, which is hand-painted
+            // and inks on the middle exactly. The owner: "1 s is not
+            // centered". [`row_run`] is the same rule the chip uses.
             StepKind::Wait => {
-                ui.add(
-                    egui::Label::new(
-                        RichText::new(wait_duration(&step.rows[0].label).to_string())
-                            .size(STEP_WAIT_PX)
-                            .family(egui::FontFamily::Name(theme::MONO_BOLD.into()))
-                            .color(theme::INK),
-                    )
-                    .extend(),
+                row_run(
+                    ui,
+                    wait_duration(&step.rows[0].label),
+                    egui::FontId::new(
+                        STEP_WAIT_PX,
+                        egui::FontFamily::Name(theme::MONO_BOLD.into()),
+                    ),
+                    theme::INK,
                 );
             }
             StepKind::Rate => {
@@ -2595,8 +2628,11 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                     let room =
                         ui.available_width() - theme::row_button_width(ui, ADD_LITERAL_BUTTON)
                             - theme::ROW_BUTTON_GAP;
-                    theme::section_text_field_within(ui, &mut draft.literal_draft, false, room);
-                    if theme::row_button(ui, ADD_LITERAL_BUTTON).clicked() {
+                    let box_response =
+                        theme::section_text_field_within(ui, &mut draft.literal_draft, false, room);
+                    if theme::row_button(ui, ADD_LITERAL_BUTTON).clicked()
+                        || entered(&box_response, ui)
+                    {
                         // Escaping is this app's job, not the user's.
                         if let Some(next) = detail_edit::sequence_with_literal(
                             &draft.sequence,
@@ -2642,7 +2678,7 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
             menu_body(ui, None, |ui| {
                 menu_caption(ui, ADD_WAIT_CAPTION);
                 ui.horizontal(|ui| {
-                    theme::section_text_field_within(
+                    let box_response = theme::section_text_field_within(
                         ui,
                         &mut draft.wait_draft,
                         false,
@@ -2650,8 +2686,9 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
                     );
                     ui.label(RichText::new(WAIT_UNIT).size(11.0).color(theme::TEXT_FAINT));
                     let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
+                    let typed = entered(&box_response, ui);
                     ui.add_enabled_ui(addable, |ui| {
-                        if theme::row_button(ui, ADD_WAIT_BUTTON).clicked() {
+                        if theme::row_button(ui, ADD_WAIT_BUTTON).clicked() || (typed && addable) {
                             if let Some(next) =
                                 detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
                             {
@@ -2667,6 +2704,17 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
                 }
             });
         });
+}
+
+/// **Whether the box that drew `response` was just submitted with Enter.**
+///
+/// A one-line box with a button beside it is a tiny form, and a tiny form
+/// submits on Return -- the owner, of the two Add buttons: "these fields
+/// should also add by Enter". `lost_focus` and the key together is egui's
+/// own idiom for it: a `TextEdit` gives focus up on Return, and the key
+/// press is still in this frame's input to be read.
+fn entered(response: &egui::Response, ui: &egui::Ui) -> bool {
+    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
 /// A caption over one of a menu's palettes: the edit form's own small faint
@@ -3450,6 +3498,46 @@ mod tests {
             self.frame_with(draft, &[])
         }
 
+        /// What the builder REPORTED for a key press, rather than what it
+        /// painted after one -- the two ways out answer here and nowhere on
+        /// screen.
+        fn key_action(
+            &self,
+            draft: &mut SequenceDraft,
+            key: egui::Key,
+            modifiers: egui::Modifiers,
+        ) -> BuilderAction {
+            let event = egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            };
+            let palette = vec![FieldRef::Username, FieldRef::Password];
+            let totp = crate::vault_window::detail::TotpState::NoSecret;
+            let source = ResolveSource {
+                username: "a.novak@ledgerline.com",
+                password: "correct-horse-battery",
+                custom: Vec::new(),
+                totp: &totp,
+            };
+            let mut apps = AppIdentityCache::default();
+            let mut action = BuilderAction::None;
+            let input = egui::RawInput { modifiers, ..self.input(&[event]) };
+            let _ = self.ctx.run_ui(input, |ui| {
+                action = draw_sequence_builder(
+                    ui,
+                    draft,
+                    &palette,
+                    &source,
+                    self.icon.as_ref(),
+                    &mut apps,
+                );
+            });
+            action
+        }
+
         fn frame_with_input(&self, draft: &mut SequenceDraft, input: egui::RawInput) -> Painted {
             let palette = vec![FieldRef::Username, FieldRef::Password];
             let totp = crate::vault_window::detail::TotpState::NoSecret;
@@ -3880,6 +3968,43 @@ mod tests {
             "the rows start at {} and the rule ends at {}",
             first.top(),
             tint.bottom() + 1.0
+        );
+    }
+
+    /// **Escape discards the builder**, like every other card in this app.
+    /// The owner: "Esc doesn't close modal".
+    #[test]
+    fn escape_discards_the_builder() {
+        let modal = Modal::over(WINDOWS[0]);
+        let mut draft = draft();
+        let _ = modal.frame(&mut draft);
+        assert_eq!(
+            modal.key_action(&mut draft, egui::Key::Escape, egui::Modifiers::NONE),
+            BuilderAction::Discard,
+            "Escape did not close the builder"
+        );
+        // The control: an ordinary key is not a way out.
+        assert_eq!(
+            modal.key_action(&mut draft, egui::Key::A, egui::Modifiers::NONE),
+            BuilderAction::None
+        );
+    }
+
+    /// **A wait row's duration inks on the row's line**, like the boxed cells
+    /// beside it: the owner, of `1s` beside a `WAIT` chip, "1 s is not
+    /// centered".
+    #[test]
+    fn a_waits_duration_inks_on_the_rows_line() {
+        let painted = Modal::over(WINDOWS[0]).frame(&mut draft());
+        let chip = painted.ink_of("WAIT");
+        let duration = painted.ink_of("0.3s");
+        assert!(
+            (chip.center().y - duration.center().y).abs() <= 0.3,
+            "the chip inks {:.2}..{:.2} and the duration {:.2}..{:.2}",
+            chip.top(),
+            chip.bottom(),
+            duration.top(),
+            duration.bottom()
         );
     }
 

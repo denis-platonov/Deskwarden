@@ -3459,10 +3459,17 @@ pub fn build_frame_with_search(
             //
             // So the separator is off and the line is painted one point
             // further right, on the first column of the pane beyond. Drawn on
-            // a layer ABOVE the panels because the central panel fills its own
-            // background and would otherwise cover it, and BELOW
-            // `Order::Foreground` so a modal's scrim still darkens it with
-            // everything else.
+            // a layer of its own because the central panel fills its own
+            // background and would otherwise cover it -- and on
+            // `Order::Background`, which is the panels' own order, so that a
+            // modal's scrim covers it with everything else.
+            //
+            // **`Order::Middle` was wrong**, and the scrim is on Middle too:
+            // within one order egui paints by layer order, this layer is
+            // created after the scrim's area exists, and the hairline came
+            // out on TOP of the dimming -- a bright line down a darkened
+            // window. The owner, with a modal open: "this becomes white when
+            // modal open".
             //
             // Only when there IS a pane beyond: with nothing selected the list
             // runs to the window's edge, and a divider there is a line down
@@ -3471,7 +3478,7 @@ pub fn build_frame_with_search(
                 let edge = list_pane.response.rect;
                 ui.ctx()
                     .layer_painter(egui::LayerId::new(
-                        egui::Order::Middle,
+                        egui::Order::Background,
                         egui::Id::new("vault-item-list-divider"),
                     ))
                     .rect_filled(
