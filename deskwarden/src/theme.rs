@@ -3345,45 +3345,6 @@ fn paint_chevron(ui: &Ui, rect: Rect, color: Color32) {
     );
 }
 
-/// **A disclosure chevron**: pointing down at what is shut, and up at what
-/// is open, and pressable.
-///
-/// The same two strokes [`paint_chevron`] draws under a dropdown, flipped --
-/// so a row that opens something under itself and a box that opens a list
-/// over itself wear one mark and not two. `size` is the mark's box, which is
-/// its hit area as well: the caller allocates it, because the row it sits in
-/// is the thing that knows what it is beside.
-///
-/// **The mark and not the whole row**, where it would be tempting to make
-/// the line itself the control. egui hit-tests by registration order, so a
-/// row made clickable after its own contents sits OVER them and swallows
-/// presses meant for the ✕ at its end -- measured, on the edit form's
-/// target row, as a Remove that staged nothing. A mark of its own fights
-/// nothing.
-pub fn disclosure_mark(ui: &mut Ui, size: f32, open: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let mark = Rect::from_center_size(rect.center(), Vec2::splat(CHEVRON_HALF * 2.0));
-    let colour = if response.hovered() { INK } else { TEXT_FAINT };
-    if open {
-        let stroke = Stroke::new(ICON_STROKE, colour);
-        let painter = ui.painter();
-        painter.line_segment(
-            [Pos2::new(mark.left(), mark.bottom()), Pos2::new(mark.center().x, mark.top())],
-            stroke,
-        );
-        painter.line_segment(
-            [Pos2::new(mark.center().x, mark.top()), Pos2::new(mark.right(), mark.bottom())],
-            stroke,
-        );
-    } else {
-        paint_chevron(ui, mark, colour);
-    }
-    response
-}
-
 /// One open row, returning whether it was chosen.
 fn dropdown_row(ui: &mut Ui, width: f32, choice: &Choice<'_>) -> bool {
     let (rect, response) =
@@ -5471,17 +5432,46 @@ fn tune_rows(center: Pos2) -> Vec<TuneRow> {
 /// [`close_glyph`]'s "Dismiss" is the precedent for an unlabelled drawn
 /// control naming itself on hover.
 pub fn tune_button(ui: &mut Ui) -> Response {
-    const SIZE: f32 = 28.0;
+    tune_mark(ui, TUNE_BUTTON_SIZE, false, "Preferences")
+}
 
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(SIZE), Sense::click());
+/// The titlebar control's box.
+const TUNE_BUTTON_SIZE: f32 = 28.0;
+
+/// **[`tune_button`]'s mark, at a size and a caption of the caller's**, and
+/// able to say that what it opens is open.
+///
+/// The edit form's target rows use it for the settings that fold out under
+/// them. They wore a disclosure chevron first, and the owner, of the mark
+/// beside a name box: "V char is not clear what it does, is there a better
+/// caret?" -- a chevron says *something opens*, which is the least
+/// interesting half of what that press does, and at 16 points beside a text
+/// box it reads as the letter V. This mark already means "settings" in this
+/// app, one titlebar away, so a row that carries settings of its own can say
+/// so in the vocabulary that is already here.
+///
+/// `lit` is what makes it a two-state control on those rows: [`BLUE`] while
+/// the settings under it are open, which is the colour this design system
+/// gives a toggle that is on (see `star_toggle`), and the neutral
+/// hover/rest pair of [`kebab_button`]'s otherwise.
+///
+/// The mark's geometry does not scale with `size`: [`tune_rows`] draws it at
+/// one size, about 17 points of ink, and `size` is the BOX round it -- the
+/// hit target. Any box under that would clip the faders, so the callers ask
+/// for 20 and 28.
+pub fn tune_mark(ui: &mut Ui, size: f32, lit: bool, hover: &str) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    // The same two-state treatment `kebab_button` uses: this is a neutral
-    // navigation control with no "on" state, so it never takes BLUE (which
-    // `star_toggle` reserves for an actual toggle being on) and never takes
-    // ERROR (reserved for failures).
-    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
+    // The same two-state treatment `kebab_button` uses: a neutral control
+    // with no "on" state never takes BLUE (which `star_toggle` reserves for
+    // a toggle that IS on) and never takes ERROR (reserved for failures).
+    let color = match (lit, response.hovered()) {
+        (true, _) => BLUE,
+        (false, true) => INK,
+        (false, false) => TEXT_SECONDARY,
+    };
     let stroke = Stroke::new(ICON_STROKE, color);
     let painter = ui.painter();
     for row in tune_rows(rect.center()) {
@@ -5494,7 +5484,7 @@ pub fn tune_button(ui: &mut Ui) -> Response {
         painter.line_segment(row.line, stroke);
         painter.rect_filled(row.knob, TUNE_FADER_ROUNDING, color);
     }
-    response.on_hover_text("Preferences")
+    response.on_hover_text(hover.to_owned())
 }
 
 /// Half the switcher chevron's width. Deliberately smaller than the gear's
@@ -6403,7 +6393,7 @@ pub fn ink_depth_of(ctx: &egui::Context, font: &FontId, line_height: f32) -> f32
 /// row given a custom `line_height` does not put its baseline where the face's
 /// default row does, so nothing here can be reasoned to from the metrics.
 pub fn line_ink_middle(ctx: &egui::Context, font: &FontId, line_height: f32) -> f32 {
-    let (top, bottom) = face_ink_at(ctx, font, line_height);
+    let (top, bottom) = probe_ink_at(ctx, font, line_height, ASCENT_PROBE);
     (top + bottom) / 2.0
 }
 
@@ -6414,11 +6404,31 @@ pub fn line_ink_middle(ctx: &egui::Context, font: &FontId, line_height: f32) -> 
 /// two questions about the same measurement and a caller asking both must not
 /// be able to get answers from two different layouts.
 fn face_ink_at(ctx: &egui::Context, font: &FontId, line_height: f32) -> (f32, f32) {
+    probe_ink_at(ctx, font, line_height, INK_PROBE)
+}
+
+/// [`face_ink_at`] over a probe of the caller's.
+///
+/// Two probes, because the two questions this file asks of a line box are
+/// different ones. **How DEEP is the box** has to be answered over
+/// [`INK_PROBE`], descenders and all, or a `g` is clipped at its foot.
+/// **Where is the run's MIDDLE** is answered over [`ASCENT_PROBE`], the cap
+/// band alone: a box whose descender band is counted into the middle pushes
+/// every run in it about a point up, which is the defect
+/// `detail_edit::sequence_chip` settled in three attempts and the owner then
+/// found again in a field -- "1 in field is not centered", of a digit that
+/// has no descender to be centred with.
+fn probe_ink_at(
+    ctx: &egui::Context,
+    font: &FontId,
+    line_height: f32,
+    probe: &str,
+) -> (f32, f32) {
     ctx.fonts_mut(|f| {
         let mut job = egui::text::LayoutJob::default();
         job.wrap = egui::text::TextWrapping::no_max_width();
         job.append(
-            INK_PROBE,
+            probe,
             0.0,
             egui::TextFormat {
                 line_height: Some(line_height),
@@ -11858,6 +11868,87 @@ mod drawn_icon_family_tests {
         });
         output.shapes.into_iter().map(|c| c.shape).collect()
     }
+
+    /// **A field's value inks on the middle of its box.**
+    ///
+    /// Not its galley box, and not a line box counted down to the bottom of
+    /// the descender band: the run a reader sees is the cap band, and a box
+    /// that centres cap-plus-descender floats every value in the app about a
+    /// point high. The owner, of a wait box holding `1`: "1 in field is not
+    /// centered" -- a digit, which has no descender to be centred with.
+    ///
+    /// Asserted over two values, one with descenders and one without, because
+    /// the rule has to be a property of the FACE and not of what happens to
+    /// be typed: both are placed by the same probe, so the box does not move
+    /// as the user types.
+    #[test]
+    fn a_fields_value_inks_on_the_middle_of_its_box() {
+        for value in ["1", "gyp"] {
+            let shapes = frame(|ui| {
+                let mut text = value.to_string();
+                ui.horizontal(|ui| {
+                    let _ = section_text_field_within(ui, &mut text, false, 120.0);
+                });
+            });
+            let mut ink = Rect::NOTHING;
+            let mut boxes: Vec<Rect> = Vec::new();
+            fn walk(shape: &egui::Shape, ink: &mut Rect, boxes: &mut Vec<Rect>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => {
+                        for shape in shapes {
+                            walk(shape, ink, boxes);
+                        }
+                    }
+                    egui::Shape::Text(text) => {
+                        for row in &text.galley.rows {
+                            for glyph in &row.glyphs {
+                                if glyph.uv_rect.is_nothing() {
+                                    continue;
+                                }
+                                let at = text.pos
+                                    + row.pos.to_vec2()
+                                    + glyph.pos.to_vec2()
+                                    + glyph.uv_rect.offset;
+                                *ink = ink.union(Rect::from_min_size(at, glyph.uv_rect.size));
+                            }
+                        }
+                    }
+                    egui::Shape::Rect(rect) => {
+                        if (rect.rect.height() - SECTION_FIELD_HEIGHT).abs() < 0.6 {
+                            boxes.push(rect.rect);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for shape in &shapes {
+                walk(shape, &mut ink, &mut boxes);
+            }
+            let field = boxes
+                .iter()
+                .copied()
+                .find(|r| r.contains(ink.center()))
+                .unwrap_or_else(|| panic!("{value:?}: no field box was painted round {ink:?}"));
+            // The cap band's middle, which for `gyp` is the x-height band:
+            // either way it is the ink a reader weighs, and the descender
+            // hangs below it as it does on paper.
+            let cap = if value == "1" { ink.center().y } else { ink.top() + CAP_BAND };
+            assert!(
+                (cap - field.center().y).abs() <= 0.6,
+                "{value:?} inks {:.2}..{:.2} in a box {:.2}..{:.2}: {:+.2} off its middle",
+                ink.top(),
+                ink.bottom(),
+                field.top(),
+                field.bottom(),
+                cap - field.center().y
+            );
+        }
+    }
+
+    /// Half of `gyp`'s band above the baseline, at this app's section font --
+    /// measured once, here, so the assertion above can ask about the part of
+    /// a descending run that is really centred.
+    const CAP_BAND: f32 = 4.5;
 
     /// Every shape in `shapes`, flattened out of the `Shape::Vec` nesting
     /// egui builds, that paints inside `within`.

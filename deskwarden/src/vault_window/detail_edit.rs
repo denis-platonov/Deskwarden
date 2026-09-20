@@ -8615,7 +8615,7 @@ fn app_target_row(
                 }
                 // The tile is outside the row proper, exactly as 8a draws it,
                 // so what `target_row` divides up is what is left after it.
-                let trailing = TARGET_DISCLOSURE
+                let trailing = TARGET_SETTINGS_MARK
                     + picker_chip_width(ui, rule)
                     + theme::CLOSE_MARK_HIT
                     + TARGET_ROW_GAP * 3.0
@@ -8631,10 +8631,11 @@ fn app_target_row(
                         // The mark that opens what is under this row, at the
                         // head of the two controls that act ON the row -- so
                         // the line reads "what this is, what it matches on,
-                        // and take it away", with the way in first.
-                        let settings = theme::disclosure_mark(ui, TARGET_DISCLOSURE, open)
-                            .on_hover_text(APP_SETTINGS_TIP)
-                            .clicked();
+                        // and take it away", with the way in first. Lit
+                        // while those settings are open.
+                        let settings =
+                            theme::tune_mark(ui, TARGET_SETTINGS_MARK, open, APP_SETTINGS_TIP)
+                                .clicked();
                         picker_chip(ui, rule, theme::TEXT_FAINT);
                         let remove = theme::close_glyph_titled(ui, APP_REMOVE_BUTTON).clicked();
                         TargetPress { remove, settings }
@@ -8668,15 +8669,18 @@ struct TargetPress {
     settings: bool,
 }
 
-/// The disclosure mark's box on a target row.
-const TARGET_DISCLOSURE: f32 = 16.0;
+/// The settings mark's box on a target row -- its hit target, which is
+/// bigger than the mark's own ink. See [`theme::tune_mark`].
+const TARGET_SETTINGS_MARK: f32 = 20.0;
 
-/// The room above and below the rule that separates the targets from the way
-/// of adding one.
-const APP_ADD_RULE_GAP: f32 = 10.0;
+/// What separates the targets from the way of adding one: space, and no
+/// rule. See the comment at the foot of [`app_block`].
+const APP_ADD_GAP: f32 = 14.0;
 
-/// What the mark says when the pointer rests on it.
-const APP_SETTINGS_TIP: &str = "The program file and command line for this app";
+/// What the mark says when the pointer rests on it. It names what is under
+/// it, because a drawn mark with no word on it has only this to say what it
+/// does -- `theme::close_glyph`'s "Dismiss" is the precedent.
+const APP_SETTINGS_TIP: &str = "Program file and command line for this app";
 
 fn app_block(
     ui: &mut egui::Ui,
@@ -8866,20 +8870,22 @@ fn app_block(
         });
     }
 
-    // **8a's `+ Pick a running window`, with its grey run beside it**, under
-    // a rule at the foot of the block -- `websites_block`'s `+ Add website`
-    // idiom, in an empty-caption row so the link sits under the field column
-    // rather than under the caption.
+    // **8a's `+ Pick a running window`, with its grey run beside it**, at the
+    // foot of the block -- `websites_block`'s `+ Add website` idiom, in an
+    // empty-caption row so the link sits under the field column rather than
+    // under the caption.
     //
-    // **At the BOTTOM, and ruled off.** It used to sit directly under the
-    // target, above that target's own path and arguments, which made the
-    // reading order "this app -- add another -- this app's program file".
-    // The owner: "+ Pick or Enter should be at the bottom separated with
-    // separator". The rule is what says the link belongs to the card and not
-    // to the row above it.
-    ui.add_space(APP_ADD_RULE_GAP);
-    theme::hairline(ui);
-    ui.add_space(APP_ADD_RULE_GAP);
+    // **At the BOTTOM.** It used to sit directly under the target, above
+    // that target's own path and arguments, which made the reading order
+    // "this app -- add another -- this app's program file". The owner: "+
+    // Pick or Enter should be at the bottom separated with separator".
+    //
+    // **The separator is the space and not a rule.** A `theme::hairline` was
+    // drawn here and the owner, with it on screen: "hairline not needed
+    // here" -- the card already has a rule under its heading and another
+    // under the card itself, and a third across a block of two rows cuts a
+    // small card into smaller ones. The gap says the same thing.
+    ui.add_space(APP_ADD_GAP);
     let mut pick = false;
     theme::section_row(ui, "", |ui| {
         // The same 14-point gap the row above it uses -- see
@@ -16440,7 +16446,7 @@ mod generator_row_tests {
         // chip -- and the gap the row puts between them.
         let chip = shut.rect_of(app_rule_label(false));
         let mark = Pos2::new(
-            chip.left() - TARGET_ROW_GAP - TARGET_DISCLOSURE / 2.0,
+            chip.left() - TARGET_ROW_GAP - TARGET_SETTINGS_MARK / 2.0,
             chip.center().y,
         );
         let _ = frame(&ctx, &mut draft, &click(mark));
@@ -20341,8 +20347,16 @@ mod sequence_builder_tests {
                     && r.rect.contains_rect(tile.rect)
             })
             .collect();
-        assert_eq!(rows.len(), 1, "the first row has {} boxes round its tile", rows.len());
-        let row = rows[0].rect;
+        // **The SMALLEST box round the tile.** The picker floats over the
+        // form, and a card row behind it shares this radius -- so "the boxes
+        // that enclose this tile" is one row and, at some heights of the
+        // form under it, a row of the form as well. The row is the tight
+        // one; enclosing it is not the claim.
+        let row = rows
+            .iter()
+            .map(|r| r.rect)
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the first row has no box round its tile");
 
         // `padding: 10px` plus the row's own `1px` border, which is what the
         // painted rectangle is (see [`PICKER_BORDER`]) -- the same arithmetic
@@ -20399,11 +20413,15 @@ mod sequence_builder_tests {
                     && r.rect.contains_rect(second_tile.rect)
             })
             .collect();
-        assert_eq!(second.len(), 1);
+        let second_row = second
+            .iter()
+            .map(|r| r.rect)
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("the second row has no box round its tile");
         assert!(
-            (second[0].rect.top() - row.bottom() - PICKER_LIST_GAP_Y).abs() <= 0.6,
+            (second_row.top() - row.bottom() - PICKER_LIST_GAP_Y).abs() <= 0.6,
             "the rows are {} apart, not 8b's {PICKER_LIST_GAP_Y}",
-            second[0].rect.top() - row.bottom()
+            second_row.top() - row.bottom()
         );
     }
 

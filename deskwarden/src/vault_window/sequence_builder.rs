@@ -2560,10 +2560,11 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
     // **Not the default close-on-click**: this menu holds a text box, and a
     // menu that shut on the first click into its own field could never be
     // typed into.
+    let width = palette_menu_width(ui, palette);
     egui::Popup::menu(&button)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            menu_body(ui, |ui| {
+            menu_body(ui, Some(width), |ui| {
                 menu_caption(ui, ADD_VALUE_CAPTION);
                 ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_PALETTE_GAP);
@@ -2584,12 +2585,19 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                 ui.add_space(MENU_BLOCK_GAP);
                 menu_caption(ui, ADD_LITERAL_CAPTION);
                 ui.horizontal(|ui| {
+                    // **`row_button`, not `secondary_button`.** The box
+                    // beside it is `theme::SECTION_FIELD_HEIGHT`, 28 points,
+                    // and the app's field-height button is this one -- the
+                    // same pairing the edit form's `Browse\u{2026}` row
+                    // draws. The owner, of a 32-point button beside a
+                    // 28-point box: "text button make sure same size as
+                    // field and paddings same as other button".
                     let room =
                         ui.available_width() - theme::row_button_width(ui, ADD_LITERAL_BUTTON)
                             - theme::ROW_BUTTON_GAP;
                     theme::section_text_field_within(ui, &mut draft.literal_draft, false, room);
-                    if theme::secondary_button(ui, ADD_LITERAL_BUTTON).clicked() {
-                    // Escaping is this app's job, not the user's.
+                    if theme::row_button(ui, ADD_LITERAL_BUTTON).clicked() {
+                        // Escaping is this app's job, not the user's.
                         if let Some(next) = detail_edit::sequence_with_literal(
                             &draft.sequence,
                             &draft.literal_draft,
@@ -2608,7 +2616,7 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
 fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
     let button = theme::dashed_button(ui, ADD_KEY_LABEL);
     egui::Popup::menu(&button).show(|ui| {
-        menu_body(ui, |ui| {
+        menu_body(ui, Some(ADD_MENU_WIDTH), |ui| {
             menu_caption(ui, ADD_KEY_CAPTION);
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_PALETTE_GAP);
@@ -2631,7 +2639,7 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
     egui::Popup::menu(&button)
         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
         .show(|ui| {
-            menu_body(ui, |ui| {
+            menu_body(ui, None, |ui| {
                 menu_caption(ui, ADD_WAIT_CAPTION);
                 ui.horizontal(|ui| {
                     theme::section_text_field_within(
@@ -2643,7 +2651,7 @@ fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
                     ui.label(RichText::new(WAIT_UNIT).size(11.0).color(theme::TEXT_FAINT));
                     let addable = key_sequence::wait_ms_from_seconds(&draft.wait_draft).is_some();
                     ui.add_enabled_ui(addable, |ui| {
-                        if theme::secondary_button(ui, ADD_WAIT_BUTTON).clicked() {
+                        if theme::row_button(ui, ADD_WAIT_BUTTON).clicked() {
                             if let Some(next) =
                                 detail_edit::sequence_with_wait(&draft.sequence, &draft.wait_draft)
                             {
@@ -2673,13 +2681,49 @@ fn menu_caption(ui: &mut egui::Ui, text: &str) {
 /// and what was drawn into it was a column of egui's default widgets --
 /// outlined buttons, a bare `TextEdit` with egui's own focus border. The
 /// owner: "make sure css matches the rest". So each menu is this: the card's
-/// own margin, the app's `item_spacing`, one width for all three, and inside
-/// it nothing but controls this design system already draws.
-fn menu_body<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    ui.set_min_width(ADD_MENU_WIDTH);
-    ui.set_max_width(ADD_MENU_WIDTH);
+/// own margin, the app's `item_spacing`, and inside it nothing but controls
+/// this design system already draws.
+fn menu_body<R>(
+    ui: &mut egui::Ui,
+    width: Option<f32>,
+    add: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    // **`None` means "as wide as what is in it".** The wait menu -- one small
+    // box, the word `seconds`, a button -- was being held open at the key
+    // palette's width, which left a third of it empty: "popup size should be
+    // as per size of elemetns - right now lots of space on the right". Only
+    // a menu whose content WRAPS needs a width, because there the width is
+    // the wrap budget rather than a result of what is inside.
+    if let Some(width) = width {
+        ui.set_min_width(width);
+        ui.set_max_width(width);
+    }
     ui.spacing_mut().item_spacing = theme::ITEM_SPACING;
     add(ui)
+}
+
+/// **How wide the `+ Text` menu opens: wide enough for its pills on ONE
+/// line.**
+///
+/// The owner, of a palette that had wrapped onto two: "value pills in one
+/// line". The pills are the item's own fields, so the width cannot be a
+/// number -- an item with six custom fields has six pills. It is measured
+/// off the very galleys the pills will draw, floored at the width the other
+/// two menus use so the three do not differ for no reason, and capped so a
+/// login with a dozen fields opens a menu and not a second window; past the
+/// cap the row wraps as it did.
+fn palette_menu_width(ui: &egui::Ui, palette: &[FieldRef]) -> f32 {
+    let pills: f32 = palette.iter().map(|field| field_pill_width(ui, &field.label())).sum();
+    let gaps = MENU_PALETTE_GAP * palette.len().saturating_sub(1) as f32;
+    (pills + gaps).clamp(ADD_MENU_WIDTH, ADD_MENU_MAX_WIDTH)
+}
+
+/// How wide [`field_pill`] will draw for `name`, without drawing it -- the
+/// same arithmetic its own body does, over the same galley.
+fn field_pill_width(ui: &egui::Ui, name: &str) -> f32 {
+    let font = egui::FontId::new(FIELD_PILL_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+    let galley = ui.painter().layout_no_wrap(name.to_string(), font, theme::INK);
+    FIELD_PILL_PAD_X * 2.0 + FIELD_PILL_MARK + FIELD_PILL_GAP + galley.size().x
 }
 
 /// 4a's three captions, and the row's `gap: 8px` and `padding-top: 4px`.
@@ -2689,10 +2733,11 @@ const ADD_WAIT_LABEL: &str = "+ Wait";
 const ADD_ROW_GAP: f32 = 8.0;
 const ADD_ROW_LIFT: f32 = 4.0;
 
-/// How wide a menu opens. Wide enough for the widest palette's two rows of
-/// buttons and for the text box beside its Add, so the menu does not resize
-/// itself as the user types.
+/// How wide a menu opens, and the widest [`palette_menu_width`] will take
+/// it. The floor is wide enough for the key palette's caps and for the text
+/// box beside its Add, so a menu does not resize itself as the user types.
 const ADD_MENU_WIDTH: f32 = 280.0;
+const ADD_MENU_MAX_WIDTH: f32 = 520.0;
 
 /// The gaps inside a menu: between two palette cells, and between one
 /// captioned block and the next.
@@ -2760,6 +2805,7 @@ mod tests {
         "{PASSWORD}",
         "{DELAY 500}",
     ];
+
 
     #[test]
     fn the_acts_here_are_the_acts_the_tally_counts() {
