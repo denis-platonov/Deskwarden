@@ -7216,6 +7216,32 @@ pub fn face_ink_middle(ui: &Ui, font: &FontId) -> f32 {
     ink_middle_of(&probe)
 }
 
+/// **How tall a face's ink band is** -- [`ASCENT_PROBE`]'s cap height, which
+/// is the band a reader sees and not the line box round it.
+///
+/// For a chip drawn round a run: a box taken from the row height is a box
+/// with the face's leading in it, and at 13 points that is three points of
+/// nothing over the letters and three under. `detail_edit`'s template chips
+/// are drawn from this, which is what lets two rows of them sit on two lines
+/// without touching.
+pub fn face_ink_height(ui: &Ui, font: &FontId) -> f32 {
+    let probe =
+        ui.painter().layout_no_wrap(ASCENT_PROBE.to_string(), font.clone(), Color32::BLACK);
+    let mut top = f32::INFINITY;
+    let mut bottom = f32::NEG_INFINITY;
+    for row in &probe.rows {
+        for glyph in &row.glyphs {
+            if glyph.uv_rect.is_nothing() {
+                continue;
+            }
+            let at = row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+            top = top.min(at);
+            bottom = bottom.max(at + glyph.uv_rect.size.y);
+        }
+    }
+    if top.is_finite() { bottom - top } else { probe.size().y }
+}
+
 /// **How far above a box's geometric centre egui puts a face's ink** when it
 /// centres a galley in that box -- which is what `Ui::horizontal`, every
 /// `Button` and every `Label` in this app do.

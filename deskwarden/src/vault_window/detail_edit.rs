@@ -8321,7 +8321,15 @@ fn template_galley(
     // that from `expand_bg` above, and a 1.9 line left a caret 25 points
     // tall in a 13-point face -- the owner: "text cursor is huge", which is
     // the same complaint `theme::field_box` was built round.
-    let line = TEMPLATE_TEXT_PX * TEMPLATE_LINE_HEIGHT;
+    let line = template_line(ui, &font);
+    // **A token's own space must not break the line.** `{DELAY 3000}` has one
+    // in it, egui breaks a row at a space, and the half that landed on the
+    // next line lost its chip -- the owner: "delay should also be gray pill".
+    // The LAYOUT gets a no-break space in its place: one character for one
+    // character, so every index into this galley is still an index into the
+    // user's own string, which is what the caret and the selection are.
+    let laid: String = spaced_tokens(text);
+    let text = laid.as_str();
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap;
     // **A token wraps whole.** `break_anywhere` split `{ENTER}` into `{EN`
@@ -8359,6 +8367,12 @@ fn template_galley(
                 // [`template_pills`], because epaint's is a square filling
                 // the row box and 4c's is a rounded one round the word.
                 line_height: Some(line),
+                // **Centred in the line box.** A face inks the upper part of
+                // its box, so a two-line box came out with more air under the
+                // last line than over the first -- the owner: "bottom padding
+                // is not same as top for multiline". It is also what puts the
+                // ink on the middle the chips are drawn round.
+                valign: egui::Align::Center,
                 ..Default::default()
             },
         );
@@ -8387,9 +8401,12 @@ fn template_pills(
     origin: egui::Pos2,
 ) -> Vec<egui::Shape> {
     let font = egui::FontId::new(TEMPLATE_TEXT_PX, egui::FontFamily::Monospace);
-    let line = TEMPLATE_TEXT_PX * TEMPLATE_LINE_HEIGHT;
-    let ink_middle = theme::line_ink_middle(ui.ctx(), &font, line);
-    let height = ui.ctx().fonts_mut(|f| f.row_height(&font)) + 2.0 * TEMPLATE_TOKEN_PAD_Y;
+    // **Round the INK, not round the line.** A box taken from the row height
+    // carries the face's leading with it, and two rows of those overlap on a
+    // line box small enough to keep the caret sane -- the owner, of both at
+    // once: "text cursor is still way to big" and "pills gets one on each
+    // other".
+    let height = theme::face_ink_height(ui, &font) + 2.0 * TEMPLATE_TOKEN_PAD_Y;
     let text = galley.text().to_string();
     let mut shapes = Vec::new();
     let mut chars = 0usize;
@@ -8400,22 +8417,56 @@ fn template_pills(
             let to = galley.pos_from_cursor(egui::text::CCursor::new(chars + length));
             // One row, or no pill: see the doc above.
             if (from.top() - to.top()).abs() < 0.5 {
-                let tone = token_tone(run);
-                let top = origin.y + from.top() + ink_middle - height / 2.0;
+                // The row's own middle, which is where the ink is: the runs
+                // are laid `valign: Center`.
+                let middle = origin.y + from.center().y;
                 let rect = egui::Rect::from_min_max(
-                    egui::pos2(origin.x + from.left() - TEMPLATE_TOKEN_PAD_X, top),
-                    egui::pos2(origin.x + to.left() + TEMPLATE_TOKEN_PAD_X, top + height),
+                    egui::pos2(
+                        origin.x + from.left() - TEMPLATE_TOKEN_PAD_X,
+                        middle - height / 2.0,
+                    ),
+                    egui::pos2(
+                        origin.x + to.left() + TEMPLATE_TOKEN_PAD_X,
+                        middle + height / 2.0,
+                    ),
                 );
                 shapes.push(egui::Shape::rect_filled(
                     rect,
                     CornerRadius::same(TEMPLATE_TOKEN_RADIUS),
-                    token_ground(tone),
+                    token_ground(token_tone(run)),
                 ));
             }
         }
         chars += length;
     }
     shapes
+}
+
+/// **The line box the template's text is laid on**, which is also the caret
+/// and the distance between two rows of chips.
+///
+/// The face's own row plus a little: 4c's `line-height: 1.9` is 25 points in
+/// a 13-point face and egui draws the caret at the line, which is the
+/// complaint this number has now answered twice ("text cursor is still way
+/// to big"). What the extra buys is the air between one row's chips and the
+/// next's -- the chips are drawn round the INK, so they are shorter than
+/// this and two rows of them cannot touch.
+fn template_line(ui: &egui::Ui, font: &egui::FontId) -> f32 {
+    ui.ctx().fonts_mut(|f| f.row_height(font)) + TEMPLATE_LINE_AIR
+}
+
+/// `text` with the space inside every `{...}` token laid out as a no-break
+/// one. Character for character, so the galley's indices are the buffer's.
+fn spaced_tokens(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (run, token) in template_runs(text) {
+        if token {
+            out.extend(run.chars().map(|c| if c == ' ' { '\u{a0}' } else { c }));
+        } else {
+            out.push_str(run);
+        }
+    }
+    out
 }
 
 /// The ground a token of this kind is drawn on. Its INK is
@@ -8468,16 +8519,13 @@ const TEMPLATE_TEXT_PX: f32 = 13.0;
 /// [`TEMPLATE_TOKEN_PAD`] instead, because egui draws the caret at the line
 /// and a 1.9 line in a 13-point face is a 25-point bar. The owner, twice:
 /// "text cursor is huge".
-/// **The line box, which is also the caret and the room between two rows of
-/// chips.** 4c's is `line-height: 1.9`; this is less, because egui draws the
-/// caret at the line and a 1.9 line in a 13-point face is a 25-point bar --
-/// the owner, twice: "text cursor is huge". What is left has to be enough
-/// for a chip and a little air, which is the other half of the ask: "there
-/// is enough space in between of lines to draw pills and a bit of space".
-const TEMPLATE_LINE_HEIGHT: f32 = 1.6;
+/// What [`template_line`] adds to the face's own row: the air between one row
+/// of chips and the next, and the only thing that makes the caret taller than
+/// a line of type.
+const TEMPLATE_LINE_AIR: f32 = 6.0;
 /// 4c's `padding: 2px 5px` round a token, and its `border-radius: 4px`.
 const TEMPLATE_TOKEN_PAD_X: f32 = 4.0;
-const TEMPLATE_TOKEN_PAD_Y: f32 = 2.5;
+const TEMPLATE_TOKEN_PAD_Y: f32 = 3.0;
 const TEMPLATE_TOKEN_RADIUS: u8 = 4;
 /// What separates one chip from the next: the leading space in
 /// [`template_galley`], less the padding each chip takes out of it. Two
