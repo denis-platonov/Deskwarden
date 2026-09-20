@@ -8179,6 +8179,22 @@ pub(crate) fn template_editor(
             // until the galley exists -- `theme::field_box` reserves an
             // index the same way, and for the same reason.
             let grounds = ui.painter().add(egui::Shape::Noop);
+            // **egui's caret is switched off and this box draws its own.**
+            //
+            // egui draws the caret at the ROW, expanded a point and a half
+            // either way, and the row here has to hold a chip and keep the
+            // next row's chips off it -- so the caret came out taller than
+            // the type and hanging below it, which is what this box has now
+            // been told three times ("text cursor is still way to big",
+            // "seems to be bigger and positioned lower"). The two are only
+            // in tension while they are the same measurement. Ours is the
+            // CHIP's band: the height of the thing it stands beside.
+            //
+            // It does not blink, and that is the cost. A blinking caret is
+            // `Visuals::text_cursor`'s and it comes with the row's height;
+            // a caret that is the wrong size every other half-second is not
+            // better than one that is the right size always.
+            ui.visuals_mut().text_cursor.stroke.width = 0.0;
             let laid = egui::TextEdit::multiline(template_draft)
                 .id(box_id)
                 // The same face the layouter uses, so the box's minimum
@@ -8195,6 +8211,22 @@ pub(crate) fn template_editor(
                 grounds,
                 egui::Shape::Vec(template_pills(ui, &laid.galley, laid.galley_pos)),
             );
+            if focused {
+                if let Some(range) = laid.cursor_range {
+                    let at = laid.galley.pos_from_cursor(range.primary);
+                    ui.painter().rect_filled(
+                        egui::Rect::from_min_size(
+                            egui::pos2(
+                                laid.galley_pos.x + at.left(),
+                                laid.galley_pos.y + at.top() + chip_top,
+                            ),
+                            egui::vec2(TEMPLATE_CARET_WIDTH, chip_height),
+                        ),
+                        CornerRadius::ZERO,
+                        theme::INK,
+                    );
+                }
+            }
             // The air under the last chip is taken from where egui put the
             // field's bottom, not from the face's row: egui lays each row at
             // a whole pixel (15 for this face's 15.22) and holds a one-row
@@ -8363,6 +8395,12 @@ fn template_galley(
     wrap: f32,
 ) -> std::sync::Arc<egui::Galley> {
     let font = template_font();
+    // **The row is a chip plus the air between two of them**, and no longer
+    // the face's own line: the chips grew ("pills should be higher as per
+    // design") and two rows of them would touch. The caret used to grow
+    // with this and does not any more -- the box draws its own, at the
+    // chip's height, in `template_editor`.
+    let line = template_chip_height(ui) + TEMPLATE_ROW_AIR;
     // **A token's own space must not break the line.** `{DELAY 3000}` has one
     // in it, egui breaks a row at a space, and the half that landed on the
     // next line lost its chip -- the owner: "delay should also be gray pill".
@@ -8396,6 +8434,12 @@ fn template_galley(
                     // by [`template_pills`], because epaint's is a square
                     // filling the row box and 4c's is a rounded one round
                     // the word.
+                    //
+                    // The extra over the face's own row falls BELOW the
+                    // ink, which is where the next row's chips need it:
+                    // epaint puts a glyph at its face's ascent from the
+                    // row's top whatever the row is.
+                    line_height: Some(line),
                     ..Default::default()
                 },
             );
@@ -8522,8 +8566,22 @@ fn template_pills(
 /// the same two numbers and the chips and the air must not disagree.
 fn template_chip_band(ui: &egui::Ui) -> (f32, f32) {
     let font = template_font();
-    let height = theme::face_ink_height(ui, &font) + 2.0 * TEMPLATE_TOKEN_PAD_Y;
-    (theme::face_ink_middle(ui, &font) - height / 2.0, height)
+    let height = template_chip_height(ui);
+    // **Measured at the line the text is really laid on**, not at the
+    // face's own row: a row given a custom `line_height` does not put its
+    // baseline where the same face's default row does, and the chips came
+    // out a point over their caps the moment the row grew to hold them.
+    // `line_ink_middle` lays the probe exactly as the caller will lay its
+    // run, which is the whole reason it takes a line height.
+    let line = height + TEMPLATE_ROW_AIR;
+    (theme::line_ink_middle(ui.ctx(), &font, line) - height / 2.0, height)
+}
+
+/// A chip's own height: the cap band and [`TEMPLATE_TOKEN_PAD_Y`] each way.
+/// Free of the line, which is measured FROM it -- a row is a chip plus the
+/// air it leaves the next one.
+fn template_chip_height(ui: &egui::Ui) -> f32 {
+    theme::face_ink_height(ui, &template_font()) + 2.0 * TEMPLATE_TOKEN_PAD_Y
 }
 
 /// The first token `galley` laid across two rows that does not itself open
@@ -8646,13 +8704,22 @@ const TEMPLATE_TEXT_PX: f32 = 13.0;
 /// The vertical one is round the cap band and not round the row, and three
 /// is what the row has to give: see [`template_chip_band`].
 pub(crate) const TEMPLATE_TOKEN_PAD_X: f32 = 4.0;
-const TEMPLATE_TOKEN_PAD_Y: f32 = 3.0;
+/// Taller than it was, at the owner's word -- "pills should be higher as per
+/// design", whose token is `padding: 2px 5px` on a line box half again the
+/// face's own. The chip is the cap band plus this each way; the ROW grows
+/// with it and the caret does not, because the caret is this band too.
+const TEMPLATE_TOKEN_PAD_Y: f32 = 4.5;
+/// What one row of chips leaves the next.
+const TEMPLATE_ROW_AIR: f32 = 3.0;
+/// The caret this box draws for itself: two points, which is what egui's own
+/// is at this size, and as tall as a chip.
+pub(crate) const TEMPLATE_CARET_WIDTH: f32 = 2.0;
 pub(crate) const TEMPLATE_TOKEN_RADIUS: u8 = 4;
 /// What separates one run from the next: the leading space in
 /// [`template_galley`], less the padding each chip takes out of it. Two
 /// points of the box's own white, which is the "white hairline between
 /// pills horizontally" the owner asked for.
-pub(crate) const TEMPLATE_TOKEN_GAP: f32 = 10.0;
+pub(crate) const TEMPLATE_TOKEN_GAP: f32 = 14.0;
 /// How far past the wrap width a token that must not split has its `{`
 /// sent, over and above what the last layout said would reach it. Glyph
 /// positions are rounded to the pixel one by one, so a point covers it.
@@ -12807,8 +12874,12 @@ fn generator_preview(ui: &mut egui::Ui, preview: &str) {
 /// A two-variant enum rather than a `bool`, because the two answers are not
 /// symmetric -- one of them destroys the user's typing -- and `Some(true)` at
 /// a call site says nothing about which one that is.
+/// **Shared with 4a's builder**, which asks the same question about the
+/// same kind of loss: a rule edited and then closed. One card and one
+/// wording, because two dialogues that mean "you are about to lose
+/// something" and word it differently teach a reader to stop reading them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DiscardAnswer {
+pub(crate) enum DiscardAnswer {
     KeepEditing,
     Discard,
 }
@@ -12832,7 +12903,7 @@ enum DiscardAnswer {
 ///   screen", and every other transient overlay in this app cancels on it --
 ///   which is precisely why it must resolve to the SAFE answer here. The
 ///   destructive answer requires the pointer.
-fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
+pub(crate) fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
     let mut answer = None;
 
     // Full-window click-catcher under the card, so a click aimed at the form

@@ -663,6 +663,16 @@ pub struct SequenceDraft {
     /// `step_keys`. Not saved and not compared: a selection is not an edit,
     /// and [`SequenceDraft::changed`] does not look at it.
     pub selected: Option<usize>,
+    /// **Whether the "discard your changes?" card is up over this one.**
+    ///
+    /// The owner: "if dirty rule and Esc - should ask about being reset".
+    /// The edit form has asked that question since it had a Cancel, and a
+    /// builder that threw an edited rule away on one press of Escape was
+    /// the one screen in this app where a way out was not also a question.
+    ///
+    /// Not part of the rule and not stored: it is a state of closing the
+    /// card, and a card that opened with it set would open on a dialogue.
+    pub discard_prompt: bool,
 }
 
 impl SequenceDraft {
@@ -691,6 +701,7 @@ impl SequenceDraft {
             literal_draft: String::new(),
             wait_draft: DEFAULT_WAIT_SECONDS.to_string(),
             selected: None,
+            discard_prompt: false,
         })
     }
 
@@ -996,8 +1007,13 @@ pub fn draw_sequence_builder(
     // nothing behind the scrim reads it as its own Escape, and read here for
     // the reason the save chord is: a text box with focus must not be able
     // to swallow it.
+    //
+    // **Nor while the discard question is up**: that card has an Escape of
+    // its own, and it means "keep editing" -- see
+    // `detail_edit::draw_discard_confirm`.
     let menu_open = egui::Popup::is_any_open(&ctx);
     let escaped = !menu_open
+        && !draft.discard_prompt
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
     // Read before the card, because `modal_card` takes the body and the
@@ -1067,10 +1083,35 @@ pub fn draw_sequence_builder(
         |ui| theme::primary_button_enabled(ui, label, Some("CTRL+S"), saveable),
     );
 
+    // **The question, over the card it is about**, and drawn last so its
+    // scrim covers the rule it is asking about. Only the two ways out can
+    // raise it, and only on a rule that has been edited.
+    if draft.discard_prompt {
+        match detail_edit::draw_discard_confirm(&ctx) {
+            Some(detail_edit::DiscardAnswer::Discard) => {
+                draft.discard_prompt = false;
+                return BuilderAction::Discard;
+            }
+            Some(detail_edit::DiscardAnswer::KeepEditing) => draft.discard_prompt = false,
+            None => {}
+        }
+        return BuilderAction::None;
+    }
+
     if chorded || press.confirmed {
         BuilderAction::Save
     } else if escaped || press.dismissed {
-        BuilderAction::Discard
+        // **An edited rule asks first.** Untouched, the card just closes:
+        // there is nothing to lose and a question about nothing is a
+        // question a reader learns to click through. `changed` is the same
+        // test the Save button is lit by, so the card asks exactly when
+        // Save would have had something to write.
+        if draft.changed() {
+            draft.discard_prompt = true;
+            BuilderAction::None
+        } else {
+            BuilderAction::Discard
+        }
     } else {
         BuilderAction::None
     }
@@ -2610,7 +2651,14 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
         .show(|ui| {
             menu_body(ui, Some(width), |ui| {
                 menu_caption(ui, ADD_VALUE_CAPTION);
-                ui.horizontal_wrapped(|ui| {
+                // **What the pills really measured**, read off the lane they
+                // were laid in rather than off the estimate that opened the
+                // menu: the two differ by the rounding in every pill's own
+                // galley, and the row under this one is laid to THIS number
+                // so that the button at its end and the last pill end on one
+                // edge. The owner: "make sure both last pill and button have
+                // same padding, text box can be trimmed if needed".
+                let laid = ui.horizontal_wrapped(|ui| {
                     ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_PALETTE_GAP);
                     for field in palette {
                         let secret = matches!(field, FieldRef::Password | FieldRef::Totp);
@@ -2625,8 +2673,9 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                     if palette.is_empty() {
                         ui.label(RichText::new(NO_FIELDS).size(11.0).color(theme::TEXT_FAINT));
                     }
+                    ui.min_rect().right()
                 });
-                ui.add_space(MENU_BLOCK_GAP);
+                let pills_end = laid.inner;
                 menu_caption(ui, ADD_LITERAL_CAPTION);
                 ui.horizontal(|ui| {
                     // **`row_button`, not `secondary_button`.** The box
@@ -2636,14 +2685,39 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
                     // draws. The owner, of a 32-point button beside a
                     // 28-point box: "text button make sure same size as
                     // field and paddings same as other button".
-                    let room =
-                        ui.available_width() - theme::row_button_width(ui, ADD_LITERAL_BUTTON)
-                            - theme::ROW_BUTTON_GAP;
-                    let box_response =
-                        theme::section_text_field_within(ui, &mut draft.literal_draft, false, room);
-                    if theme::row_button(ui, ADD_LITERAL_BUTTON).clicked()
-                        || entered(&box_response, ui)
-                    {
+                    // **The button is laid FIRST, from the right**, so it
+                    // ends exactly where the last pill above it ends and
+                    // the box takes what is left -- "make sure both last
+                    // pill and button have same padding, text box can be
+                    // trimmed if needed". Measured the other way round, off
+                    // `row_button_width` and a subtraction, it landed two
+                    // points out: a button's drawn width is egui's and not
+                    // this crate's arithmetic.
+                    ui.set_max_width(pills_end - ui.min_rect().left());
+                    let mut box_response = None;
+                    let add = ui
+                        .with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = theme::ROW_BUTTON_GAP;
+                            let add = theme::row_button(ui, ADD_LITERAL_BUTTON).clicked();
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    let room = ui.available_width();
+                                    box_response = Some(theme::section_text_field_within(
+                                        ui,
+                                        &mut draft.literal_draft,
+                                        false,
+                                        room,
+                                    ));
+                                },
+                            );
+                            add
+                        })
+                        .inner;
+                    let typed = box_response.as_ref().is_some_and(|box_response| {
+                        entered(box_response, ui)
+                    });
+                    if add || typed {
                         // Escaping is this app's job, not the user's.
                         if let Some(next) = detail_edit::sequence_with_literal(
                             &draft.sequence,
@@ -2757,7 +2831,13 @@ fn menu_body<R>(
         ui.set_min_width(width);
         ui.set_max_width(width);
     }
-    ui.spacing_mut().item_spacing = theme::ITEM_SPACING;
+    // **One gap down the menu, and it is the menu's own padding.** A caption
+    // and the row under it were `item_spacing` apart and each block another
+    // `MENU_BLOCK_GAP` on top, so the air over `Text to type` was sixteen
+    // points against five at the top of the card -- the owner: "padding on
+    // top of Text to type seems to be big comared to popup to A value from
+    // this item".
+    ui.spacing_mut().item_spacing = egui::vec2(MENU_PALETTE_GAP, MENU_BLOCK_GAP);
     add(ui)
 }
 
@@ -2830,10 +2910,12 @@ const ADD_MENU_WIDTH: f32 = 280.0;
 /// wide as.
 const LITERAL_BOX_WIDTH: f32 = 160.0;
 
-/// The gaps inside a menu: between two palette cells, and between one
-/// captioned block and the next.
+/// The gaps inside a menu: between two palette cells, and down the menu
+/// between every line of it -- a caption and its row, and one block and the
+/// next. One number, because a menu with two rhythms in it reads as two
+/// menus; see [`menu_body`].
 const MENU_PALETTE_GAP: f32 = 4.0;
-const MENU_BLOCK_GAP: f32 = 8.0;
+const MENU_BLOCK_GAP: f32 = 6.0;
 
 /// The wait box. Wide enough for `3600` and no wider: it takes a number of
 /// seconds, and a box the width of the menu would promise a sentence.
@@ -3055,6 +3137,7 @@ mod tests {
             literal_draft: String::new(),
             wait_draft: "1".into(),
             selected: None,
+            discard_prompt: false,
         };
         assert!(!draft.changed());
         assert!(!draft.saveable());
@@ -3098,6 +3181,7 @@ mod tests {
             literal_draft: String::new(),
             wait_draft: "1".into(),
             selected: None,
+            discard_prompt: false,
         };
         // Inherited and merely looked at: no fault, and nothing to save.
         assert!(draft.fault().is_none());
@@ -3414,6 +3498,7 @@ mod tests {
             literal_draft: String::new(),
             wait_draft: "1".into(),
             selected: None,
+            discard_prompt: false,
         }
     }
 
@@ -4114,6 +4199,42 @@ mod tests {
         );
     }
 
+    /// **An edited rule asks before it is thrown away**, and an untouched
+    /// one just closes. The owner: "if dirty rule and Esc - should ask
+    /// about being reset".
+    #[test]
+    fn escape_on_an_edited_rule_asks_before_it_discards() {
+        let modal = Modal::over(WINDOWS[0]);
+
+        // Untouched: Escape closes, and asks nothing.
+        let mut clean = draft();
+        let _ = modal.frame(&mut clean);
+        assert!(!clean.changed(), "the fixture opened dirty");
+        assert_eq!(
+            modal.key_action(&mut clean, egui::Key::Escape, egui::Modifiers::NONE),
+            BuilderAction::Discard
+        );
+        assert!(!clean.discard_prompt, "an untouched rule asked a question about nothing");
+
+        // Edited: Escape asks, and does NOT close behind the question.
+        let mut dirty = draft();
+        dirty.sequence = format!("{}{{ENTER}}", dirty.sequence);
+        let _ = modal.frame(&mut dirty);
+        assert!(dirty.changed(), "the premise: the rule has been edited");
+        assert_eq!(
+            modal.key_action(&mut dirty, egui::Key::Escape, egui::Modifiers::NONE),
+            BuilderAction::None,
+            "an edited rule was thrown away without a word"
+        );
+        assert!(dirty.discard_prompt, "nothing was asked");
+        // ...and the card behind the question does not take a second press
+        // as its own: that one belongs to the question.
+        assert_eq!(
+            modal.key_action(&mut dirty, egui::Key::Escape, egui::Modifiers::NONE),
+            BuilderAction::None
+        );
+    }
+
     /// **A wait row's duration inks on the row's line**, like the boxed cells
     /// beside it: the owner, of `1s` beside a `WAIT` chip, "1 s is not
     /// centered".
@@ -4300,6 +4421,15 @@ mod tests {
         draft.template_view = true;
         draft.template_draft = template.into();
         draft.sequence = template.into();
+        // **Clicked into, so the box has focus.** The caret is the box's own
+        // now -- egui's is switched off, see `detail_edit::template_editor`
+        // -- and a caret is only painted for a box that has focus, which is
+        // also the only state in which its height is a claim worth making.
+        let first = modal.frame(&mut draft);
+        let (pos, galley) = first.template_galley(template);
+        let line = egui::Rect::from_min_size(pos, galley.size());
+        let box_rect = first.template_box(line);
+        let _ = modal.click(&mut draft, box_rect.center());
         modal.frame(&mut draft)
     }
 
@@ -4362,12 +4492,32 @@ mod tests {
                 pair[1]
             );
         }
-        // The caret is drawn at the row, so the row is the face's own.
+        // **The row is a chip and the air it leaves the next row** -- it has
+        // to be, now that the chips are taller than the face's own line
+        // ("pills should be higher as per design") -- and the CARET is no
+        // longer that row: the box draws its own at the chip's height, which
+        // is what three rounds of "text cursor is still way to big" settled.
         let row = modal.ctx.fonts_mut(|f| f.row_height(&detail_edit::template_font()));
         assert!(
-            galley.rows[0].height() <= row + 0.5,
-            "the line is {:.2} in a {row:.2} face: the caret is taller than the type",
+            galley.rows[0].height() > row,
+            "the row is {:.2} in a {row:.2} face: it cannot hold a chip",
             galley.rows[0].height()
+        );
+        let caret = painted
+            .rects
+            .iter()
+            .filter(|rect| {
+                rect.fill == theme::INK
+                    && (rect.rect.width() - detail_edit::TEMPLATE_CARET_WIDTH).abs() < 0.1
+            })
+            .map(|rect| rect.rect)
+            .next()
+            .expect("the focused box paints no caret");
+        assert!(
+            (caret.height() - chips[0].height()).abs() <= 0.25,
+            "the caret is {:.2} tall against a chip of {:.2}",
+            caret.height(),
+            chips[0].height()
         );
         // 4c's padding 12, measured to the chip, the same both ways.
         let (above, below) = (chips[0].top() - bx.top(), bx.bottom() - chips[0].bottom());
