@@ -8142,9 +8142,30 @@ pub(crate) fn template_editor(
         .fill(theme::CARD)
         .stroke(Stroke::new(1.0, if focused { theme::BLUE } else { theme::BORDER_STRONG }))
         .corner_radius(CornerRadius::same(TEMPLATE_BOX_RADIUS))
-        .inner_margin(Margin::symmetric(TEMPLATE_BOX_PAD_X, TEMPLATE_BOX_PAD_Y))
+        // Sideways only. The air above and below is measured from the chips
+        // and added as space, below.
+        .inner_margin(Margin::symmetric(TEMPLATE_BOX_PAD_X, 0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // One widget in the box, so egui's spacing after it is only
+            // ever air under the last chip: eight points more of it than
+            // over the first, measured, until this was zero.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let font = template_font();
+            // **4c's `padding: 12px` is measured to the CHIPS, not to the
+            // line box.** The chips are drawn round the cap band, which a
+            // face inks in the upper part of its row -- on the monospace cut
+            // at 13 points the band's middle is 5 points down a 15.22-point
+            // row, so a 14-point chip reaches 2 above the row's top and
+            // ends 3.22 short of its bottom. A box padded 12 round the ROW
+            // would have five points more air under its last chip than over
+            // its first, which is the shape of the owner's "bottom padding
+            // is not same as top for multiline". So the padding is put where
+            // the eye reads it, as the distance from the box's edge to the
+            // nearest chip, the same both ways. `Margin` is whole points,
+            // which is why this is space and not the frame's own margin.
+            let (chip_top, chip_height) = template_chip_band(ui);
+            ui.add_space(f32::from(TEMPLATE_BOX_PAD_Y) - chip_top);
             // Multiline, because a sequence with a wait and a rate in it is
             // longer than the edit form's pane is wide and that pane refuses
             // horizontal scrolling (`assert_inside`). Wrapped text is
@@ -8160,6 +8181,10 @@ pub(crate) fn template_editor(
             let grounds = ui.painter().add(egui::Shape::Noop);
             let laid = egui::TextEdit::multiline(template_draft)
                 .id(box_id)
+                // The same face the layouter uses, so the box's minimum
+                // height and an empty box's caret are this line's and not
+                // the style's default monospace one.
+                .font(font.clone())
                 .desired_rows(1)
                 .desired_width(f32::INFINITY)
                 .frame(egui::Frame::new())
@@ -8170,6 +8195,15 @@ pub(crate) fn template_editor(
                 grounds,
                 egui::Shape::Vec(template_pills(ui, &laid.galley, laid.galley_pos)),
             );
+            // The air under the last chip is taken from where egui put the
+            // field's bottom, not from the face's row: egui lays each row at
+            // a whole pixel (15 for this face's 15.22) and holds a one-row
+            // box to the face's own height, so a bottom reckoned from the
+            // row came out 0.22 short on two lines and right on one.
+            let last_row = laid.galley.rows.last().map_or(0.0, |row| row.pos.y);
+            let chip_bottom = laid.galley_pos.y + last_row + chip_top + chip_height;
+            let under = laid.response.rect.bottom() - chip_bottom;
+            ui.add_space(f32::from(TEMPLATE_BOX_PAD_Y) - under);
             laid.response
         });
     // The halo, round the box it is about -- 4c's `box-shadow: 0 0 0 3px
@@ -8310,18 +8344,25 @@ fn token_tone(token: &str) -> TokenTone {
 /// egui hands a custom layouter the raw buffer, so the tokens are found
 /// here, in the text, rather than through the parser: a half-typed `{USERN`
 /// has no token to colour and must still lay out.
+///
+/// **The line box is the face's own row, and so is the caret.** egui draws
+/// the caret from a row's top to its bottom and a point and a half past
+/// each, so the line box is the only dial there is. 4c's `line-height: 1.9`
+/// is 25 points in a 13-point face, and the row plus six that replaced it
+/// left a caret 24 points tall -- the owner, of both: "text cursor is still
+/// way to big". A `line_height` override buys nothing else, either: epaint
+/// places the ink at the face's ascent from the row's top whatever the row's
+/// height is (`valign` divides only the difference between a glyph's own
+/// line height and its row's, which is zero when every glyph carries the
+/// same one), so every point added went under the letters. The air between
+/// two rows of chips comes from the chips being shorter than the row, see
+/// [`template_chip_band`].
 fn template_galley(
     ui: &egui::Ui,
     text: &str,
     wrap: f32,
 ) -> std::sync::Arc<egui::Galley> {
-    let font = egui::FontId::new(TEMPLATE_TEXT_PX, egui::FontFamily::Monospace);
-    // **The caret is drawn at the LINE, so the line is not 4c's 1.9.**
-    // The design's line box exists to give its token chips room; ours get
-    // that from `expand_bg` above, and a 1.9 line left a caret 25 points
-    // tall in a 13-point face -- the owner: "text cursor is huge", which is
-    // the same complaint `theme::field_box` was built round.
-    let line = template_line(ui, &font);
+    let font = template_font();
     // **A token's own space must not break the line.** `{DELAY 3000}` has one
     // in it, egui breaks a row at a space, and the half that landed on the
     // next line lost its chip -- the owner: "delay should also be gray pill".
@@ -8329,55 +8370,76 @@ fn template_galley(
     // character, so every index into this galley is still an index into the
     // user's own string, which is what the caret and the selection are.
     let laid: String = spaced_tokens(text);
-    let text = laid.as_str();
-    let mut job = egui::text::LayoutJob::default();
-    job.wrap.max_width = wrap;
-    // **A token wraps whole.** `break_anywhere` split `{ENTER}` into `{EN`
-    // and `TER}` across two lines, each with half a chip under it -- the
-    // owner: "make sure only full pill goes there". egui breaks between
-    // words, and every token is its own word here.
-    job.wrap.break_anywhere = false;
-    for (index, (run, token)) in template_runs(text).into_iter().enumerate() {
-        let color = if token {
-            match token_tone(run) {
-                TokenTone::Value => theme::BLUE_DEEP,
-                TokenTone::Secret => theme::DANGER_INK,
-                TokenTone::Timing => theme::TEXT_FAINT,
-                TokenTone::Key => theme::TEXT_SECONDARY,
-            }
-        } else {
-            theme::INK
-        };
-        // **The gap between two chips, as a LEADING SPACE and not as
-        // characters.** 4c's tokens carry `padding: 2px 5px` and the
-        // design's own example has literal spaces between them; a real
-        // sequence has none, so `{ENTER}{DELAY 3000}` arrived as one
-        // unbroken grey slab. A layouter may not invent characters -- the
-        // caret and the selection are indices into the user's own string --
-        // and `LayoutJob`'s leading space is the one gap that is not text:
-        // it moves the run and stays outside the ground behind it.
-        let leading = if index == 0 { 0.0 } else { TEMPLATE_TOKEN_GAP };
-        job.append(
-            run,
-            leading,
-            egui::TextFormat {
-                font_id: font.clone(),
-                color,
-                // No `background`: the chips are painted under the line by
-                // [`template_pills`], because epaint's is a square filling
-                // the row box and 4c's is a rounded one round the word.
-                line_height: Some(line),
-                // **Centred in the line box.** A face inks the upper part of
-                // its box, so a two-line box came out with more air under the
-                // last line than over the first -- the owner: "bottom padding
-                // is not same as top for multiline". It is also what puts the
-                // ink on the middle the chips are drawn round.
-                valign: egui::Align::Center,
-                ..Default::default()
-            },
-        );
+    let runs = template_runs(&laid);
+    let job = |leadings: &[f32]| {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap;
+        job.wrap.break_anywhere = false;
+        for ((run, token), leading) in runs.iter().zip(leadings) {
+            let color = if *token {
+                match token_tone(run) {
+                    TokenTone::Value => theme::BLUE_DEEP,
+                    TokenTone::Secret => theme::DANGER_INK,
+                    TokenTone::Timing => theme::TEXT_FAINT,
+                    TokenTone::Key => theme::TEXT_SECONDARY,
+                }
+            } else {
+                theme::INK
+            };
+            job.append(
+                run,
+                *leading,
+                egui::TextFormat {
+                    font_id: font.clone(),
+                    color,
+                    // No `background`: the chips are painted under the line
+                    // by [`template_pills`], because epaint's is a square
+                    // filling the row box and 4c's is a rounded one round
+                    // the word.
+                    ..Default::default()
+                },
+            );
+        }
+        job
+    };
+    // **The gap between two chips, as a LEADING SPACE and not as
+    // characters.** 4c's tokens carry `padding: 2px 5px` and the design's
+    // own example has literal spaces between them; a real sequence has
+    // none, so `{ENTER}{DELAY 3000}` arrived as one unbroken grey slab. A
+    // layouter may not invent characters -- the caret and the selection are
+    // indices into the user's own string -- and `LayoutJob`'s leading space
+    // is the one gap that is not text: it moves the run and stays outside
+    // the ground behind it. epaint drops it at a row break, so a token that
+    // opens a row sits flush left.
+    let mut leadings: Vec<f32> =
+        (0..runs.len()).map(|index| if index == 0 { 0.0 } else { TEMPLATE_TOKEN_GAP }).collect();
+    let mut galley = ui.ctx().fonts_mut(|f| f.layout_job(job(&leadings)));
+    // **A token wraps whole.** `break_anywhere = false` was supposed to see
+    // to that and does not: a template has no spaces in it (the one in a
+    // wait is laid as a no-break, above), and with no word boundary to
+    // break at epaint falls back to the latest punctuation -- and `{` is
+    // punctuation. Measured, seven `{TAB}`s before an `{ENTER}` left `{` on
+    // one row and `ENTER}` on the next, each with half a chip under it; the
+    // owner: "make sure only full pill goes there".
+    //
+    // epaint breaks BEFORE a glyph that will not fit, at the latest
+    // candidate before it, so a token whose `{` itself does not fit is
+    // pushed to the next row whole. That is the lever: a token laid across
+    // two rows gets its leading space grown by exactly what sends its `{`
+    // past the wrap width, and the layout is asked again. epaint's own
+    // break rule decides where the row ends, this does not re-implement
+    // it. Each pass settles one token for good -- a pushed token opens its
+    // row and is never split again -- so the loop is bounded by the number
+    // of runs and in practice ends on the first or second pass; the galley
+    // cache answers every pass after the first frame.
+    if wrap.is_finite() {
+        for _ in 0..runs.len() {
+            let Some((index, from_x)) = split_token(&galley, &runs) else { break };
+            leadings[index] += wrap - from_x + TEMPLATE_WRAP_SLACK;
+            galley = ui.ctx().fonts_mut(|f| f.layout_job(job(&leadings)));
+        }
     }
-    ui.ctx().fonts_mut(|f| f.layout_job(job))
+    galley
 }
 
 /// **4c's token chips, painted under the line.**
@@ -8389,45 +8451,43 @@ fn template_galley(
 /// owner, of both at once: "text not centered again, also those should be
 /// pills".
 ///
-/// So the tokens are found in the text, their ends are asked of the galley
-/// (`pos_from_cursor` is where a caret would go, which is exactly the left
-/// edge of a character), and the chip is drawn round the ink between them.
-/// A token that egui has broken across two rows is left alone: its two
-/// halves are not one pill, and [`template_galley`] does not let a token
-/// break in the first place.
+/// So the tokens are found in the text, and each one's chip is drawn from
+/// its first glyph's left edge to its last glyph's right edge, round the
+/// cap band of its row. **Its ends are the glyphs' own**, not a caret's:
+/// `pos_from_cursor` at the index after a token answers with the NEXT
+/// glyph's left edge, which sits past the leading space between two tokens,
+/// so a chip measured that way ran to its neighbour's start and two chips
+/// overlapped by exactly twice their padding -- measured, `{USERNAME}`'s at
+/// 350..439 over `{ENTER}`'s at 431..499. The owner: "pills gets one on
+/// each other" and "make sure there is a white hairline between pills
+/// horizontally". A token that egui has laid across two rows gets no chip:
+/// its two halves are not one pill, and [`template_galley`] does not let
+/// that happen in the first place.
 fn template_pills(
     ui: &egui::Ui,
     galley: &egui::Galley,
     origin: egui::Pos2,
 ) -> Vec<egui::Shape> {
-    let font = egui::FontId::new(TEMPLATE_TEXT_PX, egui::FontFamily::Monospace);
-    // **Round the INK, not round the line.** A box taken from the row height
-    // carries the face's leading with it, and two rows of those overlap on a
-    // line box small enough to keep the caret sane -- the owner, of both at
-    // once: "text cursor is still way to big" and "pills gets one on each
-    // other".
-    let height = theme::face_ink_height(ui, &font) + 2.0 * TEMPLATE_TOKEN_PAD_Y;
+    let (chip_top, chip_height) = template_chip_band(ui);
     let text = galley.text().to_string();
+    let laid = laid_chars(galley);
     let mut shapes = Vec::new();
-    let mut chars = 0usize;
+    let mut at = 0usize;
     for (run, token) in template_runs(&text) {
         let length = run.chars().count();
         if token {
-            let from = galley.pos_from_cursor(egui::text::CCursor::new(chars));
-            let to = galley.pos_from_cursor(egui::text::CCursor::new(chars + length));
-            // One row, or no pill: see the doc above.
-            if (from.top() - to.top()).abs() < 0.5 {
-                // The row's own middle, which is where the ink is: the runs
-                // are laid `valign: Center`.
-                let middle = origin.y + from.center().y;
+            if let Some((row, first, last)) = one_row(&laid, at, at + length) {
+                let row = &galley.rows[row];
+                let glyphs = &row.row.glyphs;
+                let top = origin.y + row.pos.y + chip_top;
                 let rect = egui::Rect::from_min_max(
                     egui::pos2(
-                        origin.x + from.left() - TEMPLATE_TOKEN_PAD_X,
-                        middle - height / 2.0,
+                        origin.x + row.pos.x + glyphs[first].pos.x - TEMPLATE_TOKEN_PAD_X,
+                        top,
                     ),
                     egui::pos2(
-                        origin.x + to.left() + TEMPLATE_TOKEN_PAD_X,
-                        middle + height / 2.0,
+                        origin.x + row.pos.x + glyphs[last].max_x() + TEMPLATE_TOKEN_PAD_X,
+                        top + chip_height,
                     ),
                 );
                 shapes.push(egui::Shape::rect_filled(
@@ -8437,22 +8497,88 @@ fn template_pills(
                 ));
             }
         }
-        chars += length;
+        at += length;
     }
     shapes
 }
 
-/// **The line box the template's text is laid on**, which is also the caret
-/// and the distance between two rows of chips.
+/// **Where a chip sits in its row**: its top as a distance down from the
+/// row's top (negative when it reaches above it), and its height.
 ///
-/// The face's own row plus a little: 4c's `line-height: 1.9` is 25 points in
-/// a 13-point face and egui draws the caret at the line, which is the
-/// complaint this number has now answered twice ("text cursor is still way
-/// to big"). What the extra buys is the air between one row's chips and the
-/// next's -- the chips are drawn round the INK, so they are shorter than
-/// this and two rows of them cannot touch.
-fn template_line(ui: &egui::Ui, font: &egui::FontId) -> f32 {
-    ui.ctx().fonts_mut(|f| f.row_height(font)) + TEMPLATE_LINE_AIR
+/// Round the CAP BAND, not round the row. A box taken from the row height
+/// carries the face's leading with it and two rows of those touch; the row
+/// is the caret and cannot grow (see [`template_galley`]), so the chip is
+/// what is shorter. The cap band plus [`TEMPLATE_TOKEN_PAD_Y`] each way is
+/// 14 points on the 13-point monospace cut, in a 15.22-point row that egui
+/// lays at 15 whole pixels: a point of the box's own white between one
+/// row's chips and the next's, which is the "bit of space" the owner asked
+/// for between lines and all a row this size has to give. The chip is
+/// centred on the band's middle -- [`theme::face_ink_middle`], the cap
+/// height of an `X` -- because that is what the eye reads as the word's
+/// middle; the braces reach a point above and three below the caps and
+/// come out flush with the chip's foot.
+///
+/// One function, because [`template_editor`] measures the box's air from
+/// the same two numbers and the chips and the air must not disagree.
+fn template_chip_band(ui: &egui::Ui) -> (f32, f32) {
+    let font = template_font();
+    let height = theme::face_ink_height(ui, &font) + 2.0 * TEMPLATE_TOKEN_PAD_Y;
+    (theme::face_ink_middle(ui, &font) - height / 2.0, height)
+}
+
+/// The first token `galley` laid across two rows that does not itself open
+/// a row, as its index in [`template_runs`] and the row-local x of its
+/// first glyph. `None` when every token is on one row -- or the ones that
+/// are not are wider than the row, which no leading space can mend.
+fn split_token(galley: &egui::Galley, runs: &[(&str, bool)]) -> Option<(usize, f32)> {
+    let laid = laid_chars(galley);
+    let mut at = 0usize;
+    for (index, (run, token)) in runs.iter().enumerate() {
+        let length = run.chars().count();
+        if *token && one_row(&laid, at, at + length).is_none() {
+            if let Some((row, first)) = laid.get(at).copied().flatten() {
+                let x = galley.rows[row].row.glyphs[first].pos.x;
+                // A glyph that opens its row is at exactly 0: epaint takes
+                // the row's start off every glyph in it. Half a point
+                // covers the pixel rounding of one that merely starts a
+                // paragraph.
+                if x > 0.5 {
+                    return Some((index, x));
+                }
+            }
+        }
+        at += length;
+    }
+    None
+}
+
+/// Where each character of `galley`'s text was laid -- its row and its
+/// glyph in that row -- or `None` for a newline, which egui counts as a
+/// character and lays as no glyph. Indexed by character, so a run's span in
+/// the text is its span here.
+fn laid_chars(galley: &egui::Galley) -> Vec<Option<(usize, usize)>> {
+    let mut laid = Vec::with_capacity(galley.text().len());
+    for (row, placed) in galley.rows.iter().enumerate() {
+        laid.extend((0..placed.row.glyphs.len()).map(|glyph| Some((row, glyph))));
+        if placed.ends_with_newline {
+            laid.push(None);
+        }
+    }
+    laid
+}
+
+/// The one row the characters `from..to` are all laid on, with the first
+/// and the last one's glyph index in it -- or `None` if they are not on
+/// one row, or a newline is among them.
+fn one_row(laid: &[Option<(usize, usize)>], from: usize, to: usize) -> Option<(usize, usize, usize)> {
+    let (row, first) = laid.get(from).copied().flatten()?;
+    let (end, last) = laid.get(to.checked_sub(1)?).copied().flatten()?;
+    (row == end && laid[from..to].iter().all(Option::is_some)).then_some((row, first, last))
+}
+
+/// 4c's `font-family: mono; font-size: 13px`.
+pub(crate) fn template_font() -> egui::FontId {
+    egui::FontId::new(TEMPLATE_TEXT_PX, egui::FontFamily::Monospace)
 }
 
 /// `text` with the space inside every `{...}` token laid out as a no-break
@@ -8510,28 +8636,27 @@ fn template_runs(text: &str) -> Vec<(&str, bool)> {
 }
 
 /// 4c's own numbers for the template box and its `INSERT` row.
-const TEMPLATE_BOX_RADIUS: u8 = 8;
+pub(crate) const TEMPLATE_BOX_RADIUS: u8 = 8;
 const TEMPLATE_BOX_PAD_X: i8 = 13;
-const TEMPLATE_BOX_PAD_Y: i8 = 12;
+/// 4c's `padding: 12px`, measured from the box's inside edge to the nearest
+/// chip -- see [`template_editor`] for why not to the line.
+pub(crate) const TEMPLATE_BOX_PAD_Y: i8 = 12;
 const TEMPLATE_TEXT_PX: f32 = 13.0;
-/// **The line box, which is also the caret.** 4c's own is `line-height:
-/// 1.9` -- room for its token chips -- and ours get that from
-/// [`TEMPLATE_TOKEN_PAD`] instead, because egui draws the caret at the line
-/// and a 1.9 line in a 13-point face is a 25-point bar. The owner, twice:
-/// "text cursor is huge".
-/// What [`template_line`] adds to the face's own row: the air between one row
-/// of chips and the next, and the only thing that makes the caret taller than
-/// a line of type.
-const TEMPLATE_LINE_AIR: f32 = 6.0;
 /// 4c's `padding: 2px 5px` round a token, and its `border-radius: 4px`.
-const TEMPLATE_TOKEN_PAD_X: f32 = 4.0;
+/// The vertical one is round the cap band and not round the row, and three
+/// is what the row has to give: see [`template_chip_band`].
+pub(crate) const TEMPLATE_TOKEN_PAD_X: f32 = 4.0;
 const TEMPLATE_TOKEN_PAD_Y: f32 = 3.0;
-const TEMPLATE_TOKEN_RADIUS: u8 = 4;
-/// What separates one chip from the next: the leading space in
+pub(crate) const TEMPLATE_TOKEN_RADIUS: u8 = 4;
+/// What separates one run from the next: the leading space in
 /// [`template_galley`], less the padding each chip takes out of it. Two
 /// points of the box's own white, which is the "white hairline between
 /// pills horizontally" the owner asked for.
-const TEMPLATE_TOKEN_GAP: f32 = 10.0;
+pub(crate) const TEMPLATE_TOKEN_GAP: f32 = 10.0;
+/// How far past the wrap width a token that must not split has its `{`
+/// sent, over and above what the last layout said would reach it. Glyph
+/// positions are rounded to the pixel one by one, so a point covers it.
+const TEMPLATE_WRAP_SLACK: f32 = 1.0;
 const TEMPLATE_GAP: f32 = 14.0;
 const TEMPLATE_CHIP_GAP: f32 = 7.0;
 const TEMPLATE_CHIP_PX: f32 = 11.0;

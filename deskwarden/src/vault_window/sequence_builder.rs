@@ -3251,6 +3251,10 @@ mod tests {
         /// is what the eye sees centred or not, as against the galley's box
         /// (ascent plus descent), which a face never fills.
         inks: Vec<(String, egui::Rect)>,
+        /// Every galley painted, with where it was put: what a test that
+        /// needs a run's own glyphs -- a token's, inside the template line
+        /// -- reads, since `inks` is the union over a whole galley.
+        galleys: Vec<(egui::Pos2, std::sync::Arc<egui::Galley>)>,
         rects: Vec<PaintedRect>,
     }
 
@@ -3365,6 +3369,7 @@ mod tests {
                 if ink.is_finite() {
                     painted.inks.push((text.galley.text().to_string(), ink));
                 }
+                painted.galleys.push((text.pos, text.galley.clone()));
             }
             egui::Shape::Rect(rect) => painted.rects.push(PaintedRect {
                 rect: rect.rect,
@@ -4176,5 +4181,244 @@ mod tests {
             !painted.strings().iter().any(|painted| *painted == "Add a step"),
             "the Add a step card is still drawn"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 4c's line: the chips under the template
+    // -----------------------------------------------------------------------
+
+    /// One token of the template line as it was laid: the rows its glyphs
+    /// landed on, the glyphs' own extent, and the ink of its capitals and
+    /// digits -- the band a reader sees as the word, and the band its chip
+    /// is asserted to be centred on.
+    struct LaidToken {
+        word: String,
+        rows: Vec<usize>,
+        left: f32,
+        right: f32,
+        caps: egui::Rect,
+    }
+
+    impl Painted {
+        /// The template line's galley: the one whose text is `template`,
+        /// with the space inside a wait laid as the no-break one the
+        /// layouter puts there. The `INSERT` row's pills are one token each
+        /// and cannot be mistaken for a template of two.
+        fn template_galley(&self, template: &str) -> (egui::Pos2, &egui::Galley) {
+            let found: Vec<&(egui::Pos2, std::sync::Arc<egui::Galley>)> = self
+                .galleys
+                .iter()
+                .filter(|(_, galley)| galley.text().replace('\u{a0}', " ") == template)
+                .collect();
+            assert_eq!(found.len(), 1, "expected the template line once, found {}", found.len());
+            (found[0].0, &found[0].1)
+        }
+
+        /// The box 4c's line is typed in: the white, hairlined,
+        /// 8-radius frame round `inside`.
+        fn template_box(&self, inside: egui::Rect) -> egui::Rect {
+            self.rects
+                .iter()
+                .filter(|r| {
+                    r.corners.nw == detail_edit::TEMPLATE_BOX_RADIUS
+                        && r.fill == theme::CARD
+                        && r.rect.contains_rect(inside)
+                })
+                .map(|r| r.rect)
+                .min_by(|a, b| a.height().total_cmp(&b.height()))
+                .unwrap_or_else(|| panic!("no template box is painted round {inside:?}"))
+        }
+
+        /// The chips painted under the line inside `template_box`, in
+        /// reading order: 4c's 4-radius grounds and nothing else in the box
+        /// has those corners.
+        fn template_chips(&self, template_box: egui::Rect) -> Vec<egui::Rect> {
+            let mut chips: Vec<egui::Rect> = self
+                .rects
+                .iter()
+                .filter(|r| {
+                    r.corners.nw == detail_edit::TEMPLATE_TOKEN_RADIUS
+                        && template_box.contains_rect(r.rect)
+                })
+                .map(|r| r.rect)
+                .collect();
+            chips.sort_by(|a, b| (a.top(), a.left()).partial_cmp(&(b.top(), b.left())).unwrap());
+            chips
+        }
+
+        /// Every `{...}` token of the template line, laid. See [`LaidToken`].
+        fn laid_tokens(&self, template: &str) -> Vec<LaidToken> {
+            let (pos, galley) = self.template_galley(template);
+            // Character index -> (row, glyph), the way the layouter counts:
+            // a newline is a character and no glyph.
+            let mut laid = Vec::new();
+            for (r, row) in galley.rows.iter().enumerate() {
+                laid.extend(row.row.glyphs.iter().map(|g| Some((r, g))));
+                if row.ends_with_newline {
+                    laid.push(None);
+                }
+            }
+            let chars: Vec<char> = galley.text().chars().collect();
+            let mut tokens = Vec::new();
+            let mut i = 0;
+            while i < chars.len() {
+                let Some(close) = (chars[i] == '{').then(|| chars[i..].iter().position(|c| *c == '}')).flatten()
+                else {
+                    i += 1;
+                    continue;
+                };
+                let (from, to) = (i, i + close + 1);
+                let mut token = LaidToken {
+                    word: chars[from..to].iter().collect(),
+                    rows: Vec::new(),
+                    left: f32::INFINITY,
+                    right: f32::NEG_INFINITY,
+                    caps: egui::Rect::NOTHING,
+                };
+                for (r, g) in laid[from..to].iter().flatten() {
+                    let row = &galley.rows[*r];
+                    let origin = pos + row.pos.to_vec2();
+                    token.rows.push(*r);
+                    token.left = token.left.min(origin.x + g.pos.x);
+                    token.right = token.right.max(origin.x + g.max_x());
+                    if (g.chr.is_ascii_uppercase() || g.chr.is_ascii_digit()) && !g.uv_rect.is_nothing() {
+                        let at = origin + g.pos.to_vec2() + g.uv_rect.offset;
+                        token.caps = token.caps.union(egui::Rect::from_min_size(at, g.uv_rect.size));
+                    }
+                }
+                token.rows.dedup();
+                tokens.push(token);
+                i = to;
+            }
+            tokens
+        }
+    }
+
+    /// The builder with the template view on and `template` in the box.
+    fn template_frame(modal: &Modal, template: &str) -> Painted {
+        let mut draft = draft();
+        draft.template_view = true;
+        draft.template_draft = template.into();
+        draft.sequence = template.into();
+        modal.frame(&mut draft)
+    }
+
+    /// **Each chip sits round its own token**: centred on the word's cap
+    /// band, from its first glyph to its last plus 4c's padding, with the
+    /// box's own white between it and the next -- and the line it is on is
+    /// the face's own row, which is what the caret is drawn at.
+    ///
+    /// Two numbers here were wrong and are pinned. The chip's middle was
+    /// 4.5 points under its token's (the chips were centred on a line box
+    /// whose extra height egui puts entirely under the ink -- "text not
+    /// centered again"), and two adjacent chips overlapped by 8 (a token's
+    /// end was read as the next glyph's start, past the gap between them
+    /// -- "pills gets one on each other"). The owner asked for the hairline
+    /// by name: "make sure there is a white hairline between pills
+    /// horizontally". `{DELAY 3000}` is here for its space: "delay should
+    /// also be gray pill".
+    #[test]
+    fn the_template_chips_sit_round_their_tokens() {
+        let template = "{USERNAME}{ENTER}{DELAY 3000}{PASSWORD}";
+        let modal = Modal::over(WINDOWS[1]);
+        let painted = template_frame(&modal, template);
+        let tokens = painted.laid_tokens(template);
+        let (pos, galley) = painted.template_galley(template);
+        let line = egui::Rect::from_min_size(pos, galley.size());
+        let bx = painted.template_box(line);
+        let chips = painted.template_chips(bx);
+        assert_eq!(tokens.len(), 4);
+        assert_eq!(chips.len(), tokens.len(), "one chip per token: {chips:?}");
+        for (token, chip) in tokens.iter().zip(&chips) {
+            assert_eq!(token.rows.len(), 1, "{} is on more than one row", token.word);
+            assert!(
+                (chip.center().y - token.caps.center().y).abs() <= 0.5,
+                "{}'s chip {:.2}..{:.2} is {:+.2} off its caps {:.2}..{:.2}",
+                token.word,
+                chip.top(),
+                chip.bottom(),
+                chip.center().y - token.caps.center().y,
+                token.caps.top(),
+                token.caps.bottom(),
+            );
+            assert!(
+                (chip.left() - (token.left - detail_edit::TEMPLATE_TOKEN_PAD_X)).abs() <= 0.01
+                    && (chip.right() - (token.right + detail_edit::TEMPLATE_TOKEN_PAD_X)).abs() <= 0.01,
+                "{}'s chip {:.2}..{:.2} is not its glyphs {:.2}..{:.2} plus the padding",
+                token.word,
+                chip.left(),
+                chip.right(),
+                token.left,
+                token.right,
+            );
+        }
+        let hairline = detail_edit::TEMPLATE_TOKEN_GAP - 2.0 * detail_edit::TEMPLATE_TOKEN_PAD_X;
+        for pair in chips.windows(2) {
+            let white = pair[1].left() - pair[0].right();
+            assert!(
+                white >= 1.0 && white <= hairline + 0.5,
+                "{white:.2} between {:?} and {:?}: not the hairline of about {hairline}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // The caret is drawn at the row, so the row is the face's own.
+        let row = modal.ctx.fonts_mut(|f| f.row_height(&detail_edit::template_font()));
+        assert!(
+            galley.rows[0].height() <= row + 0.5,
+            "the line is {:.2} in a {row:.2} face: the caret is taller than the type",
+            galley.rows[0].height()
+        );
+        // 4c's padding 12, measured to the chip, the same both ways.
+        let (above, below) = (chips[0].top() - bx.top(), bx.bottom() - chips[0].bottom());
+        assert!(
+            (above - below).abs() <= 0.25 && (above - 13.0).abs() <= 0.25,
+            "{above:.2} over the chip and {below:.2} under it: not 12 inside a one-point stroke"
+        );
+    }
+
+    /// **A token wraps whole, and its chip with it**, over every length from
+    /// one row to two. epaint breaks a spaceless line at the latest
+    /// punctuation and `{` is punctuation: seven `{TAB}`s before an
+    /// `{ENTER}` left `{` on one row and `ENTER}` on the next, each with
+    /// half a chip -- the owner: "make sure only full pill goes there and
+    /// there is enough space in between of lines to draw pills". Two rows
+    /// of chips must not touch, and the air over the first row is the air
+    /// under the last.
+    #[test]
+    fn a_token_wraps_whole_and_its_chip_with_it() {
+        let modal = Modal::over(WINDOWS[1]);
+        let mut wrapped = 0;
+        for tabs in 0..16 {
+            let template = format!("{{USERNAME}}{}{{PASSWORD}}{{ENTER}}", "{TAB}".repeat(tabs));
+            let painted = template_frame(&modal, &template);
+            let tokens = painted.laid_tokens(&template);
+            let (pos, galley) = painted.template_galley(&template);
+            let bx = painted.template_box(egui::Rect::from_min_size(pos, galley.size()));
+            let chips = painted.template_chips(bx);
+            assert_eq!(tokens.len(), tabs + 3);
+            for token in &tokens {
+                assert_eq!(token.rows.len(), 1, "{} is split across rows {:?} with {tabs} tabs", token.word, token.rows);
+            }
+            assert_eq!(chips.len(), tokens.len(), "a token without its chip with {tabs} tabs");
+            for (a, b) in chips.iter().flat_map(|a| chips.iter().map(move |b| (a, b))) {
+                if a.top() < b.top() {
+                    assert!(
+                        b.top() - a.bottom() >= 0.5,
+                        "chips {a:?} and {b:?} touch across rows with {tabs} tabs"
+                    );
+                }
+            }
+            let last = chips.last().unwrap();
+            let (above, below) = (chips[0].top() - bx.top(), bx.bottom() - last.bottom());
+            assert!(
+                (above - below).abs() <= 0.25,
+                "{above:.2} over the first chip and {below:.2} under the last with {tabs} tabs"
+            );
+            if galley.rows.len() > 1 {
+                wrapped += 1;
+            }
+        }
+        assert!(wrapped >= 8, "only {wrapped} of the sixteen templates wrapped: the case is not exercised");
     }
 }
