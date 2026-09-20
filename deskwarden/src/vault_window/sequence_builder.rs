@@ -2772,7 +2772,19 @@ fn menu_body<R>(
 /// login with a dozen fields opens a menu and not a second window; past the
 /// cap the row wraps as it did.
 fn palette_menu_width(ui: &egui::Ui, palette: &[FieldRef]) -> f32 {
-    let pills: f32 = palette.iter().map(|field| field_pill_width(ui, &field.label())).sum();
+    let pills: f32 = palette
+        .iter()
+        .map(|field| {
+            // **Measured in the face it will be DRAWN in.** A secret's pill
+            // is bold and the rest are semibold, and measuring them all
+            // semibold came up a few points short over four pills -- which
+            // is a menu one pill too narrow, and the last of them wrapping
+            // onto a line of its own: "should be one line of pills since
+            // popup is not wider than Fill rule modal itlsef".
+            let secret = matches!(field, FieldRef::Password | FieldRef::Totp);
+            field_pill_width(ui, &field.label(), secret)
+        })
+        .sum();
     let gaps = MENU_PALETTE_GAP * palette.len().saturating_sub(1) as f32;
     // **The wider of the menu's two rows, and nothing over.** It was floored
     // at the key palette's width, which left the menu wider than anything in
@@ -2795,8 +2807,9 @@ fn palette_menu_width(ui: &egui::Ui, palette: &[FieldRef]) -> f32 {
 
 /// How wide [`field_pill`] will draw for `name`, without drawing it -- the
 /// same arithmetic its own body does, over the same galley.
-fn field_pill_width(ui: &egui::Ui, name: &str) -> f32 {
-    let font = egui::FontId::new(FIELD_PILL_PX, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+fn field_pill_width(ui: &egui::Ui, name: &str, secret: bool) -> f32 {
+    let face = if secret { theme::BOLD } else { theme::SEMIBOLD };
+    let font = egui::FontId::new(FIELD_PILL_PX, egui::FontFamily::Name(face.into()));
     let galley = ui.painter().layout_no_wrap(name.to_string(), font, theme::INK);
     FIELD_PILL_PAD_X * 2.0 + FIELD_PILL_MARK + FIELD_PILL_GAP + galley.size().x
 }
@@ -3413,12 +3426,22 @@ mod tests {
         window: egui::Vec2,
         clock: std::cell::Cell<f64>,
         icon: Option<egui::TextureHandle>,
+        /// The fields the `+ Text` menu offers. Two by default, because
+        /// that is what most of these tests need on screen; the menu's own
+        /// width is about how many there are, so its test asks for four.
+        palette: Vec<FieldRef>,
     }
 
     impl Modal {
         fn over(window: egui::Vec2) -> Self {
             let ctx = egui::Context::default();
-            let modal = Self { ctx, window, clock: std::cell::Cell::new(0.0), icon: None };
+            let modal = Self {
+                ctx,
+                window,
+                clock: std::cell::Cell::new(0.0),
+                icon: None,
+                palette: vec![FieldRef::Username, FieldRef::Password],
+            };
             // A font set registered during a frame is usable from the next
             // one on, so two throwaway frames -- every harness in this crate
             // runs them.
@@ -3426,6 +3449,12 @@ mod tests {
             theme::apply(&modal.ctx);
             let _ = modal.ctx.run_ui(modal.input(&[]), |_ui| {});
             modal
+        }
+
+        /// The same harness, with these fields in the `+ Text` menu.
+        fn with_palette(mut self, palette: Vec<FieldRef>) -> Self {
+            self.palette = palette;
+            self
         }
 
         /// The same harness with a favicon for the vault item's tile.
@@ -3531,7 +3560,7 @@ mod tests {
                 repeat: false,
                 modifiers,
             };
-            let palette = vec![FieldRef::Username, FieldRef::Password];
+            let palette = self.palette.clone();
             let totp = crate::vault_window::detail::TotpState::NoSecret;
             let source = ResolveSource {
                 username: "a.novak@ledgerline.com",
@@ -3556,7 +3585,7 @@ mod tests {
         }
 
         fn frame_with_input(&self, draft: &mut SequenceDraft, input: egui::RawInput) -> Painted {
-            let palette = vec![FieldRef::Username, FieldRef::Password];
+            let palette = self.palette.clone();
             let totp = crate::vault_window::detail::TotpState::NoSecret;
             let source = ResolveSource {
                 username: "a.novak@ledgerline.com",
@@ -3985,6 +4014,58 @@ mod tests {
             "the rows start at {} and the rule ends at {}",
             first.top(),
             tint.bottom() + 1.0
+        );
+    }
+
+    /// **The value menu opens wide enough for its pills to sit on one
+    /// line**, as long as one line fits inside the card it hangs off: the
+    /// owner, of a four-field palette that wrapped, "should be one line of
+    /// pills since popup is not wider than Fill rule modal itlsef".
+    ///
+    /// Four fields, two of them secrets -- which is the case that failed:
+    /// a secret's pill is BOLD and the width was measured semibold, so the
+    /// menu came out a few points short and the last pill dropped.
+    #[test]
+    fn the_value_menu_holds_its_pills_on_one_line() {
+        let palette = vec![
+            FieldRef::Username,
+            FieldRef::Password,
+            FieldRef::Totp,
+            FieldRef::Custom("Native App Filler".to_string()),
+        ];
+        let modal = Modal::over(WINDOWS[1]).with_palette(palette.clone());
+        let mut draft = draft();
+        let painted = modal.frame(&mut draft);
+        let at = painted.rect_of(ADD_TEXT_LABEL).center();
+        let _ = modal.click(&mut draft, at);
+        let open = modal.frame(&mut draft);
+
+        // The menu's own pills, not the step list's: a run of the same name
+        // is drawn in both, and the menu is the one under the add row.
+        let floor = open.rect_of(ADD_TEXT_LABEL).bottom();
+        let in_the_menu = |name: &str| -> egui::Rect {
+            let found: Vec<egui::Rect> =
+                open.rects_of(name).into_iter().filter(|r| r.top() > floor).collect();
+            assert_eq!(found.len(), 1, "expected one {name:?} in the menu, found {}", found.len());
+            found[0]
+        };
+        let names: Vec<String> = palette.iter().map(|field| field.label()).collect();
+        let first = in_the_menu(names[0].as_str());
+        for name in &names[1..] {
+            let pill = in_the_menu(name.as_str());
+            assert!(
+                (pill.center().y - first.center().y).abs() <= 1.0,
+                "{name:?} at {pill:?} is not on the line {first:?} the first pill is on"
+            );
+        }
+        // ...and the menu is no wider than the card it belongs to.
+        let card = open.card();
+        let last = in_the_menu(names[names.len() - 1].as_str());
+        assert!(
+            last.right() - first.left() <= card.width(),
+            "the pills run {} wide against a card of {}",
+            last.right() - first.left(),
+            card.width()
         );
     }
 

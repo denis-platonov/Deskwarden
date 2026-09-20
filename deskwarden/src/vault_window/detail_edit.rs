@@ -6361,15 +6361,24 @@ pub const VIEW_TEMPLATE: &str = "Template";
 /// with, has no spelling at all here -- `^` before a literal letter is
 /// [`injector::sequence::Refusal::DanglingModifier`], and there is no `A` in
 /// [`key_sequence::KEYS`] -- so it is not offered rather than offered broken.)
+/// **Six, not eight.** `+{TAB}` is Shift+Tab -- `+` is the Shift modifier
+/// in this grammar -- and the owner, looking at the row: "what is the diff
+/// {TAB} and +{TAB}? I think only just tab should be there". A row of
+/// insertable tokens is a list of the things worth one click, not a
+/// catalogue of the grammar: Shift+Tab is two characters away for anyone
+/// who wants it, and it cost a whole chip that read as a typo.
+///
+/// One pause too -- "keep just 1 delay 500" -- where there were a pause and
+/// a typing RATE (`{DELAY=50}`, with the equals sign). The two look alike
+/// and do different things, which is precisely what made the pair of them
+/// worse than either.
 pub const TEMPLATE_CHIPS: &[&str] = &[
     "{USERNAME}",
     "{PASSWORD}",
     "{TOTP}",
     "{TAB}",
-    "+{TAB}",
     "{ENTER}",
-    "{DELAY 250}",
-    "{DELAY=50}",
+    "{DELAY 500}",
 ];
 
 /// `template` with `chip` added on the end.
@@ -8309,7 +8318,7 @@ fn template_galley(
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap;
     job.wrap.break_anywhere = true;
-    for (run, token) in template_runs(text) {
+    for (index, (run, token)) in template_runs(text).into_iter().enumerate() {
         let (background, color) = if token {
             match token_tone(run) {
                 TokenTone::Value => (theme::FOCUS_RING, theme::BLUE_DEEP),
@@ -8320,9 +8329,18 @@ fn template_galley(
         } else {
             (egui::Color32::TRANSPARENT, theme::INK)
         };
+        // **The gap between two chips, as a LEADING SPACE and not as
+        // characters.** 4c's tokens carry `padding: 2px 5px` and the
+        // design's own example has literal spaces between them; a real
+        // sequence has none, so `{ENTER}{DELAY 3000}` arrived as one
+        // unbroken grey slab. A layouter may not invent characters -- the
+        // caret and the selection are indices into the user's own string --
+        // and `LayoutJob`'s leading space is the one gap that is not text:
+        // it moves the run and stays outside the ground behind it.
+        let leading = if index == 0 { 0.0 } else { TEMPLATE_TOKEN_GAP };
         job.append(
             run,
-            0.0,
+            leading,
             egui::TextFormat {
                 font_id: font.clone(),
                 color,
@@ -8377,9 +8395,19 @@ const TEMPLATE_BOX_RADIUS: u8 = 8;
 const TEMPLATE_BOX_PAD_X: i8 = 13;
 const TEMPLATE_BOX_PAD_Y: i8 = 12;
 const TEMPLATE_TEXT_PX: f32 = 13.0;
-const TEMPLATE_LINE_HEIGHT: f32 = 1.45;
-/// How far a token's ground is grown past its glyphs -- 4c's `padding: 2px`.
-const TEMPLATE_TOKEN_PAD: f32 = 2.5;
+/// **The line box, which is also the caret.** 4c's own is `line-height:
+/// 1.9` -- room for its token chips -- and ours get that from
+/// [`TEMPLATE_TOKEN_PAD`] instead, because egui draws the caret at the line
+/// and a 1.9 line in a 13-point face is a 25-point bar. The owner, twice:
+/// "text cursor is huge".
+const TEMPLATE_LINE_HEIGHT: f32 = 1.25;
+/// How far a token's ground is grown past its glyphs -- 4c's `padding: 2px
+/// 5px`, as far as a text layout can express it (`expand_bg` is one number
+/// for all four sides).
+const TEMPLATE_TOKEN_PAD: f32 = 3.0;
+/// What separates one chip from the next. See the leading space in
+/// [`template_galley`].
+const TEMPLATE_TOKEN_GAP: f32 = 7.0;
 const TEMPLATE_GAP: f32 = 14.0;
 const TEMPLATE_CHIP_GAP: f32 = 7.0;
 const TEMPLATE_CHIP_PX: f32 = 11.0;
@@ -11994,13 +12022,15 @@ pub fn draw_detail_edit(
 /// Read at the very END of the form, after everything it draws has had the
 /// press, and refused in three cases:
 ///
-///  * **A card of this form's own is up** -- the discard confirmation, the
-///    generator, 8b's window picker -- or a menu is. Each is a thing in
-///    FRONT with an Escape of its own, and a form that took the key would
-///    close the whole screen when the user meant to close what is in front
-///    of it. `card_up` is read by the caller BEFORE the body draws: by the
-///    time this runs, the card has answered the press and shut itself, and
-///    the question "is one up" would be answered about the wrong moment.
+///  * **Anything is in front of it** -- one of this form's own cards (the
+///    discard confirmation, the generator, 8b's window picker), any other
+///    modal in the crate (4a's builder parks this form behind itself), or
+///    an open menu. Each has an Escape of its own, and a form that took the
+///    key would close the whole screen when the user meant to close what is
+///    in front of it. `card_up` is read by the caller BEFORE the body
+///    draws: by the time this runs, the card has answered the press and
+///    shut itself, and the question "is one up" would be answered about the
+///    wrong moment.
 ///  * **Something has keyboard focus.** egui gives a `TextEdit` up on
 ///    Escape and `theme::field_box`'s clearable arm empties a search box on
 ///    it; the first press belongs to the box, and the second -- by which
@@ -12012,6 +12042,15 @@ pub fn draw_detail_edit(
 /// own: the vault window's own Escape closes the detail pane.
 fn escape_cancels(ui: &egui::Ui, card_up: bool) -> bool {
     if card_up
+        // **Or ANY modal in the crate is up over this form.** 4a's builder
+        // is drawn by the vault window with this form parked behind it, so
+        // "one of my own cards" is not the whole question: the form was
+        // eating the Escape meant for the modal in front of it and the
+        // owner, with the builder open, "Fill rule doesn't close on Esc".
+        // `item_list::a_modal_is_up` is the crate's one answer to "is the
+        // window behind inert", asked here for the same reason the item
+        // list's arrow keys ask it.
+        || super::item_list::a_modal_is_up(ui.ctx())
         || egui::Popup::is_any_open(ui.ctx())
         || ui.ctx().memory(|memory| memory.focused().is_some())
     {
@@ -23288,6 +23327,53 @@ mod edit_pane_layout_tests {
             EditAction::None,
             "Escape closed the whole form out from under the generator"
         );
+    }
+
+    /// **A modal drawn OVER this form keeps its own Escape.**
+    ///
+    /// 4a's builder is a card of the vault window's, with this form parked
+    /// behind it and its actions dropped -- so the form took the press, set
+    /// its own discard question on a draft nobody could see, and the card
+    /// in front got nothing. The owner, with the builder open: "Fill rule
+    /// doesn't close on Esc".
+    ///
+    /// The scrim is shown in a frame of its own first, which is exactly how
+    /// it reaches `item_list::a_modal_is_up` in the app: every modal is
+    /// drawn after the panels, and that function reads "visible last frame
+    /// or this one".
+    #[test]
+    fn the_form_leaves_escape_to_a_modal_drawn_over_it() {
+        let ctx = styled_context(ROOMY_PANE);
+        let mut draft = opened_tallest_draft();
+        let escape = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        let _ = frame(&ctx, ROOMY_PANE, &mut draft, false, &[]);
+        let _ = ctx.run_ui(raw_input(ROOMY_PANE, &[]), |ui| {
+            theme::modal_scrim(
+                ui.ctx(),
+                egui::Area::new(egui::Id::new("sequence-builder-scrim")),
+            );
+        });
+        assert!(
+            super::super::item_list::a_modal_is_up(&ctx),
+            "the premise failed: the scrim did not register"
+        );
+        let (action, _) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut draft,
+            false,
+            &escape,
+            None,
+            &detail::TotpState::NoSecret,
+        );
+        assert_eq!(action, EditAction::None, "the form took the modal's Escape");
+        assert!(!draft.discard_prompt, "the form asked its own question behind the modal");
     }
 
     /// [`tallest_draft`] as if the form had just OPENED on it.
