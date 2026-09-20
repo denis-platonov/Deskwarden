@@ -982,12 +982,23 @@ pub fn draw_sequence_builder(
     // window picker's own Esc was wired for the same report. The owner: "Esc
     // doesn't close modal".
     //
-    // `consume_key`, so the press is taken off the queue and nothing behind
-    // the scrim reads it as its own Escape, and read HERE for the reason the
-    // save chord is: a text box with focus must not be able to swallow it. A
-    // box that wants Escape for itself takes it first -- `theme::field_box`'s
-    // clearable arm reads `lost_focus`, which happens before this.
-    let escaped = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    // **Unless one of the add menus is open, in which case the press is
+    // that menu's.** egui shuts an open `Popup` on Escape itself; taking the
+    // key here first meant a user who opened `+ Text`, thought better of it
+    // and pressed Escape lost the whole card. The owner: "Esc should close A
+    // value from this item popup first and second Esc exits Fill rule (or
+    // calls discard modal)". Asked BEFORE the body draws, because by the end
+    // of the frame the menu has answered the press and shut itself, and a
+    // question asked then would say "nothing was open" about a frame in
+    // which something was.
+    //
+    // `consume_key` otherwise, so the press is taken off the queue and
+    // nothing behind the scrim reads it as its own Escape, and read here for
+    // the reason the save chord is: a text box with focus must not be able
+    // to swallow it.
+    let menu_open = egui::Popup::is_any_open(&ctx);
+    let escaped = !menu_open
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
     // Read before the card, because `modal_card` takes the body and the
     // confirm as two closures that must not both borrow the draft.
@@ -2772,7 +2783,14 @@ fn palette_menu_width(ui: &egui::Ui, palette: &[FieldRef]) -> f32 {
     let field_row = LITERAL_BOX_WIDTH
         + theme::ROW_BUTTON_GAP
         + theme::row_button_width(ui, ADD_LITERAL_BUTTON);
-    (pills + gaps).max(field_row).min(ADD_MENU_MAX_WIDTH)
+    // **Capped at the CARD, not at a number of my own.** "the rest of values
+    // put in one line unless it becomes wider than Fill rule modal, then
+    // transfer to next line and make the popup width dinamic to the width of
+    // values": so the pills take one line for as long as one line fits
+    // inside the card this menu hangs off, and wrap inside that width after
+    // that. The menu is never wider than the thing it belongs to.
+    let ceiling = card_width(ui.ctx());
+    (pills + gaps).max(field_row).min(ceiling)
 }
 
 /// How wide [`field_pill`] will draw for `name`, without drawing it -- the
@@ -2791,10 +2809,9 @@ const ADD_ROW_GAP: f32 = 8.0;
 const ADD_ROW_LIFT: f32 = 4.0;
 
 /// How wide the KEY menu opens -- its caps wrap, so its width is a budget
-/// rather than a result -- and the widest [`palette_menu_width`] will take
-/// the value menu.
+/// rather than a result. The value menu has no number: it is as wide as its
+/// own pills, up to the card's width (see [`palette_menu_width`]).
 const ADD_MENU_WIDTH: f32 = 280.0;
-const ADD_MENU_MAX_WIDTH: f32 = 520.0;
 
 /// The literal box's own width, which is what the value menu is at least as
 /// wide as.
@@ -3971,13 +3988,14 @@ mod tests {
         );
     }
 
-    /// **Escape discards the builder**, like every other card in this app.
-    /// The owner: "Esc doesn't close modal".
+    /// **Escape discards the builder** -- "Esc doesn't close modal" -- and
+    /// **an open add menu takes the first press**: "Esc should close A value
+    /// from this item popup first and second Esc exits Fill rule".
     #[test]
-    fn escape_discards_the_builder() {
+    fn escape_shuts_an_open_menu_first_and_the_builder_second() {
         let modal = Modal::over(WINDOWS[0]);
         let mut draft = draft();
-        let _ = modal.frame(&mut draft);
+        let painted = modal.frame(&mut draft);
         assert_eq!(
             modal.key_action(&mut draft, egui::Key::Escape, egui::Modifiers::NONE),
             BuilderAction::Discard,
@@ -3987,6 +4005,26 @@ mod tests {
         assert_eq!(
             modal.key_action(&mut draft, egui::Key::A, egui::Modifiers::NONE),
             BuilderAction::None
+        );
+
+        // With `+ Text` open, the first Escape is the menu's.
+        let at = painted.rect_of(ADD_TEXT_LABEL).center();
+        let _ = modal.click(&mut draft, at);
+        assert!(
+            egui::Popup::is_any_open(&modal.ctx),
+            "the premise failed: clicking + Text opened no menu"
+        );
+        assert_eq!(
+            modal.key_action(&mut draft, egui::Key::Escape, egui::Modifiers::NONE),
+            BuilderAction::None,
+            "Escape closed the card out from under an open menu"
+        );
+        // ...and once it has shut, the next one is the card's.
+        assert!(!egui::Popup::is_any_open(&modal.ctx), "the menu did not take the press");
+        assert_eq!(
+            modal.key_action(&mut draft, egui::Key::Escape, egui::Modifiers::NONE),
+            BuilderAction::Discard,
+            "the second Escape did not close the builder"
         );
     }
 

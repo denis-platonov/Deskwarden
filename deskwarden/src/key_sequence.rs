@@ -584,7 +584,11 @@ pub fn field_palette(item: &VaultItem) -> Vec<FieldRef> {
     }
     for field in &item.fields {
         let Some(name) = field.name.as_deref() else { continue };
-        if name.is_empty() || name.starts_with("deskwarden:") || is_hidden_field(field) {
+        if name.is_empty()
+            || name.starts_with("deskwarden:")
+            || is_hidden_field(field)
+            || names_a_secret(name)
+        {
             continue;
         }
         let candidate = FieldRef::Custom(name.to_string());
@@ -594,6 +598,29 @@ pub fn field_palette(item: &VaultItem) -> Vec<FieldRef> {
     }
     out
 }
+
+/// **Whether a field's NAME says it holds a secret**, whatever type it is
+/// stored as.
+///
+/// The type rule above catches a field somebody marked hidden. It does not
+/// catch the common case: a plain-text custom field called `MFA secret`,
+/// holding an authenticator seed, which Bitwarden shows in the clear
+/// because nobody ticked the box. The owner, with exactly that pill still
+/// in the palette after the type rule shipped: "remove explicitly from the
+/// list of values from this item".
+///
+/// A word list and not a guess at meaning, so what is excluded can be read
+/// off this line. It is deliberately short and about credentials a fill
+/// rule has no business typing: an authenticator seed, a recovery code, a
+/// private key. `{S:MFA secret}` written by hand still resolves -- see
+/// [`field_palette`] -- so nothing is taken away but the offer.
+fn names_a_secret(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SECRET_WORDS.iter().any(|word| name.contains(word))
+}
+
+/// What [`names_a_secret`] looks for.
+const SECRET_WORDS: [&str; 6] = ["secret", "seed", "mfa", "2fa", "totp", "private key"];
 
 /// Whether this custom field is Bitwarden's `type: 1`, the hidden one.
 ///

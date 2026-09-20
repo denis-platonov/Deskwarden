@@ -2034,6 +2034,14 @@ pub fn bar_knob(track: Rect, phase: f32) -> Rect {
     )
 }
 
+/// The keyboard chord beside a primary button's caption: 4a's own
+/// `font-family: mono; font-size: 10px; opacity: 0.8`, and the gap before
+/// it. Quieter than the words it follows, which is what makes it read as a
+/// hint rather than as more caption.
+const BUTTON_CHORD_PX: f32 = 10.0;
+const BUTTON_CHORD_GAP: f32 = 8.0;
+const BUTTON_CHORD_ALPHA: u8 = 204;
+
 /// Height of the design's action buttons (3h Continue, 2b/3f toolbar).
 /// Named because things placed *beside* a button — the login window's
 /// in-flight indicator — have to match it, and a second hardcoded `32.0`
@@ -2453,13 +2461,6 @@ fn primary_button_with_metrics(
     enabled: bool,
 ) -> Response {
     let paint_return = kbd == Some("↵");
-    let text = match kbd {
-        // Trailing spaces reserve room for the painted arrow and the gap
-        // before it.
-        Some("↵") => format!("{label}      "),
-        Some(k) => format!("{label}  {k}"),
-        None => label.to_string(),
-    };
     // The switched-off look is painted at FULL strength and sensed as a
     // hover, rather than run through a disabled `Ui`; see [`OFF_FILL`] for
     // why the fade had to go and why removing the sense is what replaces it.
@@ -2468,8 +2469,41 @@ fn primary_button_with_metrics(
     } else {
         (OFF_INK, OFF_FILL, Stroke::new(1.0, OFF_EDGE), Sense::hover())
     };
+    // **The caption and the chord are two runs, not one string.**
+    //
+    // They were `format!("{label}  {k}")` in one 13-point semibold face, so
+    // `Save rule  CTRL+S` read as a four-word caption. Everywhere else in
+    // this app a keyboard hint is a quieter thing beside its words -- the
+    // design's own `font-family: mono; font-size: 10px; opacity: 0.8` on
+    // this very button -- and the owner, of the two set alike: "these
+    // should be diff fonts label + shortcut as usually we have".
+    let caption = |color: Color32| egui::TextFormat {
+        font_id: FontId::new(13.0, FontFamily::Name(SEMIBOLD.into())),
+        color,
+        valign: egui::Align::Center,
+        ..Default::default()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.wrap = egui::text::TextWrapping::no_max_width();
+    job.append(label, 0.0, caption(ink));
+    match kbd {
+        // Trailing spaces reserve room for the painted arrow and the gap
+        // before it.
+        Some("↵") => job.append("      ", 0.0, caption(ink)),
+        Some(chord) => job.append(
+            chord,
+            BUTTON_CHORD_GAP,
+            egui::TextFormat {
+                font_id: FontId::new(BUTTON_CHORD_PX, FontFamily::Monospace),
+                color: if enabled { Color32::from_white_alpha(BUTTON_CHORD_ALPHA) } else { ink },
+                valign: egui::Align::Center,
+                ..Default::default()
+            },
+        ),
+        None => {}
+    }
     let response = ui.add(
-        egui::Button::new(semibold(text, 13.0).color(ink))
+        egui::Button::new(job)
             .fill(fill)
             .stroke(edge)
             .sense(sense)
@@ -10065,22 +10099,28 @@ fn modal_footer_band(
             let inner = ui.available_width();
             let half = ((inner - MODAL_FOOTER_GAP) / 2.0).max(0.0);
             let (row, _) = ui.allocate_exact_size(Vec2::new(inner, BUTTON_HEIGHT), Sense::hover());
-            press.dismissed = modal_answer(
+            // **The answer on the LEFT and the way out on the right**, which
+            // is this app's own order: the edit form's footer has put `Save
+            // changes` before `Cancel` since 8a, and a card that reversed
+            // them made the two screens disagree one click apart. The owner:
+            // "Save is on the left for us a standard and Discard \ Cancel is
+            // always on the right".
+            press.confirmed = modal_answer(
                 ui,
                 Rect::from_min_size(row.min, Vec2::new(half, BUTTON_HEIGHT)),
-                |ui| secondary_button(ui, card.dismiss),
+                confirm,
             );
             // Measured from the row's RIGHT edge rather than from the left
             // one plus a gap, so the two buttons meet the card's two margins
             // exactly and any rounding error lands in the gap between them
             // where nobody can see it.
-            press.confirmed = modal_answer(
+            press.dismissed = modal_answer(
                 ui,
                 Rect::from_min_size(
                     Pos2::new(row.max.x - half, row.min.y),
                     Vec2::new(half, BUTTON_HEIGHT),
                 ),
-                confirm,
+                |ui| secondary_button(ui, card.dismiss),
             );
         });
     // The band, now that its rect is known: out to the card's edge on the
@@ -14097,26 +14137,29 @@ mod modal_card_tests {
             dismiss.height(),
             confirm.height()
         );
+        // **The answer on the left, the way out on the right** -- this
+        // app's own order, which the edit form's footer has had since 8a.
+        // The owner: "Save is on the left for us a standard and Discard         // Cancel is always on the right".
         assert!(
-            dismiss.left() < confirm.left(),
-            "the outlined answer is not the left-hand one"
+            confirm.left() < dismiss.left(),
+            "the outlined way out is not the right-hand one"
         );
         assert!(
-            (dismiss.left() - (inside.left() + f32::from(MODAL_PAD_X))).abs() < 0.5,
+            (confirm.left() - (inside.left() + f32::from(MODAL_PAD_X))).abs() < 0.5,
             "the left answer starts at {} against a card margin of {}",
-            dismiss.left(),
+            confirm.left(),
             inside.left() + f32::from(MODAL_PAD_X)
         );
         assert!(
-            (confirm.right() - (inside.right() - f32::from(MODAL_PAD_X))).abs() < 0.5,
+            (dismiss.right() - (inside.right() - f32::from(MODAL_PAD_X))).abs() < 0.5,
             "the right answer ends at {} against a card margin of {}",
-            confirm.right(),
+            dismiss.right(),
             inside.right() - f32::from(MODAL_PAD_X)
         );
         assert!(
-            (confirm.left() - dismiss.right() - MODAL_FOOTER_GAP).abs() < 1.0,
+            (dismiss.left() - confirm.right() - MODAL_FOOTER_GAP).abs() < 1.0,
             "the gap between the answers is {}, not {MODAL_FOOTER_GAP}",
-            confirm.left() - dismiss.right()
+            dismiss.left() - confirm.right()
         );
     }
 

@@ -8226,9 +8226,16 @@ fn insert_chip(ui: &mut egui::Ui, token: &str) -> egui::Response {
     };
     let font = egui::FontId::new(TEMPLATE_CHIP_PX, egui::FontFamily::Monospace);
     let galley = ui.painter().layout_no_wrap(token.to_string(), font.clone(), ink);
+    // **The FACE's line, not this string's galley.** 4c's capsule is
+    // `padding: 3px 9px` round one line of mono 11 plus its 1px border, and
+    // a height taken from the galley of `{TAB}` is a shorter capsule than
+    // one taken from `{SHIFT+TAB}` for no reason a reader could name. The
+    // owner: "measure oulls on Template modal - I believe it should be
+    // slightly taller", and "these pills should have more paddings around".
+    let row = ui.ctx().fonts_mut(|f| f.row_height(&font));
     let size = egui::vec2(
         galley.size().x + 2.0 * TEMPLATE_CHIP_PAD_X,
-        theme::ink_depth_of(ui.ctx(), &font, galley.size().y) + 2.0 * TEMPLATE_CHIP_PAD_Y,
+        row + 2.0 * TEMPLATE_CHIP_PAD_Y + 2.0,
     );
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
     if response.hovered() {
@@ -8293,6 +8300,11 @@ fn template_galley(
     wrap: f32,
 ) -> std::sync::Arc<egui::Galley> {
     let font = egui::FontId::new(TEMPLATE_TEXT_PX, egui::FontFamily::Monospace);
+    // **The caret is drawn at the LINE, so the line is not 4c's 1.9.**
+    // The design's line box exists to give its token chips room; ours get
+    // that from `expand_bg` above, and a 1.9 line left a caret 25 points
+    // tall in a 13-point face -- the owner: "text cursor is huge", which is
+    // the same complaint `theme::field_box` was built round.
     let line = TEMPLATE_TEXT_PX * TEMPLATE_LINE_HEIGHT;
     let mut job = egui::text::LayoutJob::default();
     job.wrap.max_width = wrap;
@@ -8315,6 +8327,13 @@ fn template_galley(
                 font_id: font.clone(),
                 color,
                 background,
+                // 4c's `padding: 2px 5px` round a token, as far as a text
+                // layout can give it: epaint fills a run's background to
+                // the row box and `expand_bg` grows it beyond -- there is
+                // no asymmetric padding, so this is the design's vertical
+                // number, which is the one that makes a token read as a
+                // chip rather than as a highlight.
+                expand_bg: if token { TEMPLATE_TOKEN_PAD } else { 0.0 },
                 line_height: Some(line),
                 ..Default::default()
             },
@@ -8358,12 +8377,14 @@ const TEMPLATE_BOX_RADIUS: u8 = 8;
 const TEMPLATE_BOX_PAD_X: i8 = 13;
 const TEMPLATE_BOX_PAD_Y: i8 = 12;
 const TEMPLATE_TEXT_PX: f32 = 13.0;
-const TEMPLATE_LINE_HEIGHT: f32 = 1.9;
+const TEMPLATE_LINE_HEIGHT: f32 = 1.45;
+/// How far a token's ground is grown past its glyphs -- 4c's `padding: 2px`.
+const TEMPLATE_TOKEN_PAD: f32 = 2.5;
 const TEMPLATE_GAP: f32 = 14.0;
 const TEMPLATE_CHIP_GAP: f32 = 7.0;
 const TEMPLATE_CHIP_PX: f32 = 11.0;
 const TEMPLATE_CHIP_PAD_X: f32 = 9.0;
-const TEMPLATE_CHIP_PAD_Y: f32 = 3.0;
+const TEMPLATE_CHIP_PAD_Y: f32 = 4.0;
 const TEMPLATE_CAPTION_PX: f32 = 11.0;
 const TEMPLATE_CAPTION_TRACKING: f32 = 0.08;
 const TEMPLATE_INSERT_CAPTION: &str = "INSERT";
@@ -10373,6 +10394,13 @@ pub fn draw_detail_edit(
     icon: Option<&egui::TextureHandle>,
 ) -> EditAction {
     let mut action = EditAction::None;
+    // **Read before anything draws**: by the end of the frame a card that
+    // WAS up has seen this very Escape and shut itself, and the form would
+    // then take the same press as its own and close behind it. See
+    // [`escape_cancels`].
+    let card_up = draft.discard_prompt
+        || draft.generator.modal_open
+        || draft.app.as_ref().is_some_and(|app| app.picking);
     // **The pane's ground, painted the way the READ pane paints its own.**
     //
     // This form drew nothing behind itself, so what showed between its cards
@@ -11946,7 +11974,50 @@ pub fn draw_detail_edit(
         }
     }
 
+    if action == EditAction::None && escape_cancels(ui, card_up) {
+        // **Exactly what the Cancel button does**, and through the same two
+        // branches rather than a second rule: a draft with unsaved edits
+        // asks first, an untouched one closes now.
+        if draft.is_dirty() {
+            draft.discard_prompt = true;
+        } else {
+            action = EditAction::Cancel;
+        }
+    }
+
     action
+}
+
+/// **Whether this frame's Escape is the form's own way out.** The owner:
+/// "Also Esc for Cancel on Edit screen".
+///
+/// Read at the very END of the form, after everything it draws has had the
+/// press, and refused in three cases:
+///
+///  * **A card of this form's own is up** -- the discard confirmation, the
+///    generator, 8b's window picker -- or a menu is. Each is a thing in
+///    FRONT with an Escape of its own, and a form that took the key would
+///    close the whole screen when the user meant to close what is in front
+///    of it. `card_up` is read by the caller BEFORE the body draws: by the
+///    time this runs, the card has answered the press and shut itself, and
+///    the question "is one up" would be answered about the wrong moment.
+///  * **Something has keyboard focus.** egui gives a `TextEdit` up on
+///    Escape and `theme::field_box`'s clearable arm empties a search box on
+///    it; the first press belongs to the box, and the second -- by which
+///    time nothing is focused -- closes the form. That is what every other
+///    app with a form in a dialog does.
+///  * The press is not there at all.
+///
+/// `consume_key`, so nothing behind this pane reads the same press as its
+/// own: the vault window's own Escape closes the detail pane.
+fn escape_cancels(ui: &egui::Ui, card_up: bool) -> bool {
+    if card_up
+        || egui::Popup::is_any_open(ui.ctx())
+        || ui.ctx().memory(|memory| memory.focused().is_some())
+    {
+        return false;
+    }
+    ui.ctx().input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
 }
 
 // ---------------------------------------------------------------------------
@@ -23149,6 +23220,74 @@ mod edit_pane_layout_tests {
         let at = painted.rect_of(label).center();
         acting_frame_for(ctx, ROOMY_PANE, draft, true, &click(at), None, &detail::TotpState::NoSecret)
             .0
+    }
+
+    /// **Escape is Cancel on this form** -- the owner: "Also Esc for Cancel
+    /// on Edit screen" -- through the very branches the Cancel BUTTON goes
+    /// through: an untouched draft closes, an edited one asks first.
+    ///
+    /// And it is refused while one of the form's own cards is up, because
+    /// each of those has an Escape of its own and the press belongs to the
+    /// thing in front.
+    #[test]
+    fn escape_is_the_forms_cancel_and_the_cards_in_front_of_it_keep_their_own() {
+        let ctx = styled_context(ROOMY_PANE);
+        let escape = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+
+        // An untouched form closes on the first press.
+        let mut clean = opened_tallest_draft();
+        let _ = frame(&ctx, ROOMY_PANE, &mut clean, false, &[]);
+        let (action, _) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut clean,
+            false,
+            &escape,
+            None,
+            &detail::TotpState::NoSecret,
+        );
+        assert_eq!(action, EditAction::Cancel, "Escape did not close an untouched form");
+
+        // An edited one asks, and does NOT close behind the question.
+        let mut dirty = edited_draft_full_of_secrets();
+        let _ = frame(&ctx, ROOMY_PANE, &mut dirty, false, &[]);
+        let (action, _) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut dirty,
+            false,
+            &escape,
+            None,
+            &detail::TotpState::NoSecret,
+        );
+        assert_eq!(action, EditAction::None, "Escape threw an edited form away without asking");
+        assert!(dirty.discard_prompt, "Escape on an edited form asked nothing");
+
+        // ...and with a card of the form's own up, the form keeps its hands
+        // off: the generator's own Escape is the one that answers.
+        let mut generating = opened_tallest_draft();
+        generating.generator.modal_open = true;
+        let _ = frame(&ctx, ROOMY_PANE, &mut generating, false, &[]);
+        let (action, _) = acting_frame_for(
+            &ctx,
+            ROOMY_PANE,
+            &mut generating,
+            false,
+            &escape,
+            None,
+            &detail::TotpState::NoSecret,
+        );
+        assert_eq!(
+            action,
+            EditAction::None,
+            "Escape closed the whole form out from under the generator"
+        );
     }
 
     /// [`tallest_draft`] as if the form had just OPENED on it.
