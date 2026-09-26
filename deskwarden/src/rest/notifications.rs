@@ -170,21 +170,36 @@ fn notice_for(push_type: i64) -> bool {
 ///
 /// Everything else is [`Announcement::Whole`] and gets the full sync it
 /// always got: a folder change (the folder list rides the sync payload and
-/// has no per-id read here), "sync your whole vault", an organisation's keys,
-/// a log-out, a reconnect, and any cipher push that arrives without an id.
+/// has no per-id read here), an organisation's keys, a log-out, a reconnect,
+/// and any cipher push that arrives without an id.
+///
+/// **"Sync your whole vault" is its own variant, [`Announcement::VaultAt`],
+/// because NodeWarden sends one BESIDE every single-cipher push**, stamped
+/// with the same revision -- measured on the owner's server: one item created
+/// in the Bitwarden app arrived as push type 1 and push type 5 together, and
+/// the window paid a full sync for it. A `VaultAt` whose date a cipher push in
+/// the same batch also carries is that twin, and adds nothing; one with no
+/// such partner -- NodeWarden's bulk move and bulk archive send only this --
+/// still gets the full sync.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Announcement {
     /// A cipher was created or changed; `revision` is the server's
     /// `RevisionDate` for it, when the push carried one.
     Item { id: String, revision: Option<String> },
-    /// A cipher was deleted.
-    ItemGone { id: String },
+    /// A cipher was deleted; `revision` as for [`Self::Item`].
+    ItemGone { id: String, revision: Option<String> },
+    /// "Sync your whole vault" (or its ciphers), stamped with the account
+    /// revision it describes -- the payload's `Date`.
+    VaultAt { date: String },
     /// Something only a whole-vault sync can answer.
     Whole,
 }
 
-/// Bitwarden's `PushType` numbers for the three cipher pushes.
+/// Bitwarden's `PushType` numbers for the three cipher pushes, and the two
+/// whole-vault ones.
 const PUSH_CIPHER_UPDATE: i64 = 0;
+const PUSH_SYNC_CIPHERS: i64 = 4;
+const PUSH_SYNC_VAULT: i64 = 5;
 const PUSH_CIPHER_CREATE: i64 = 1;
 const PUSH_LOGIN_DELETE: i64 = 2;
 const PUSH_CIPHER_DELETE: i64 = 9;
@@ -197,14 +212,16 @@ fn announcement_for(push_type: i64, payload: Option<&serde_json::Value>) -> Anno
             .filter(|s| !s.is_empty())
             .map(str::to_string)
     };
+    if matches!(push_type, PUSH_SYNC_CIPHERS | PUSH_SYNC_VAULT) {
+        return field("Date", "date").map_or(Announcement::Whole, |date| Announcement::VaultAt { date });
+    }
     let Some(id) = field("Id", "id") else {
         return Announcement::Whole;
     };
+    let revision = field("RevisionDate", "revisionDate");
     match push_type {
-        PUSH_CIPHER_UPDATE | PUSH_CIPHER_CREATE => {
-            Announcement::Item { id, revision: field("RevisionDate", "revisionDate") }
-        }
-        PUSH_LOGIN_DELETE | PUSH_CIPHER_DELETE => Announcement::ItemGone { id },
+        PUSH_CIPHER_UPDATE | PUSH_CIPHER_CREATE => Announcement::Item { id, revision },
+        PUSH_LOGIN_DELETE | PUSH_CIPHER_DELETE => Announcement::ItemGone { id, revision },
         _ => Announcement::Whole,
     }
 }
@@ -869,9 +886,23 @@ mod tests {
         for gone in [2, 9] {
             assert_eq!(
                 read_messages(&push(gone, with_id)),
-                [changed(gone, Announcement::ItemGone { id: "c-1".to_string() })]
+                [changed(gone, Announcement::ItemGone {
+                    id: "c-1".to_string(),
+                    revision: Some("2026-09-26T16:00:00.000Z".to_string()),
+                })]
             );
         }
+        // "Sync your whole vault" carries its revision as `Date`, which is
+        // how the window recognises the twin NodeWarden sends beside a cipher
+        // push; without one it is a plain whole sync.
+        let dated = r#"{"UserId":"u","Date":"2026-09-26T16:00:00.000Z"}"#;
+        for whole in [4, 5] {
+            assert_eq!(
+                read_messages(&push(whole, dated)),
+                [changed(whole, Announcement::VaultAt { date: "2026-09-26T16:00:00.000Z".to_string() })]
+            );
+        }
+        assert_eq!(read_messages(&push(5, r#"{"UserId":"u"}"#)), [changed(5, Announcement::Whole)]);
         // A folder change carries an id too, and is still a whole sync.
         assert_eq!(read_messages(&push(8, with_id)), [changed(8, Announcement::Whole)]);
         // A cipher push with no id, or an empty one, cannot be targeted.
@@ -1239,14 +1270,14 @@ mod tests {
     #[test]
     fn a_burst_of_notices_is_pending_only_once_it_has_settled() {
         let listener = HubListener { shared: Arc::new(Shared::default()), settle: Duration::from_secs(2) };
-        listener.shared.notice(Announcement::ItemGone { id: "a".to_string() });
+        listener.shared.notice(Announcement::ItemGone { id: "a".to_string(), revision: None });
         listener.shared.notice(Announcement::Whole);
         let now = Instant::now();
         assert!(!listener.settled(now), "pending mid-burst");
         assert!(listener.settled(now + Duration::from_secs(2)));
         assert_eq!(
             listener.take(),
-            [Announcement::ItemGone { id: "a".to_string() }, Announcement::Whole],
+            [Announcement::ItemGone { id: "a".to_string(), revision: None }, Announcement::Whole],
             "not every announcement, in order"
         );
         listener.shared.stop.store(true, Ordering::SeqCst);

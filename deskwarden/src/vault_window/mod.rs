@@ -13037,6 +13037,14 @@ const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
 /// targeted pass that did most of it would still leave that one unanswered.
 /// And only up to [`MAX_TARGETED`]: an import of a thousand items in another
 /// app is cheaper as one sync than as a thousand reads.
+///
+/// **Except the twin.** NodeWarden sends "sync your whole vault" beside every
+/// cipher push, with the same revision; a [`VaultAt`] whose date a cipher
+/// announcement in the batch carries is that twin and is dropped. One whose
+/// date nothing in the batch carries -- a bulk move, a bulk archive -- still
+/// sends the batch to the full sync.
+///
+/// [`VaultAt`]: crate::rest::notifications::Announcement::VaultAt
 fn targeted_refresh(
     push_live: bool,
     announced: &[crate::rest::notifications::Announcement],
@@ -13046,16 +13054,30 @@ fn targeted_refresh(
     if !push_live || announced.is_empty() || announced.len() > MAX_TARGETED {
         return None;
     }
-    announced
+    let cipher_revisions: Vec<&str> = announced
         .iter()
-        .map(|announcement| match announcement {
-            Announcement::Item { id, revision } => {
-                Some(Announced::Changed { id: id.clone(), revision: revision.clone() })
+        .filter_map(|announcement| match announcement {
+            Announcement::Item { revision, .. } | Announcement::ItemGone { revision, .. } => {
+                revision.as_deref()
             }
-            Announcement::ItemGone { id } => Some(Announced::Removed { id: id.clone() }),
-            Announcement::Whole => None,
+            Announcement::VaultAt { .. } | Announcement::Whole => None,
         })
-        .collect()
+        .collect();
+    let mut changes = Vec::new();
+    for announcement in announced {
+        match announcement {
+            Announcement::Item { id, revision } => {
+                changes.push(Announced::Changed { id: id.clone(), revision: revision.clone() });
+            }
+            Announcement::ItemGone { id, .. } => changes.push(Announced::Removed { id: id.clone() }),
+            Announcement::VaultAt { date } if cipher_revisions.contains(&date.as_str()) => {}
+            Announcement::VaultAt { .. } | Announcement::Whole => return None,
+        }
+    }
+    // A batch that was nothing but twins has nothing left to answer, which
+    // cannot happen -- a twin needs its partner -- but is refused rather than
+    // painted as a no-op sync if it ever does.
+    (!changes.is_empty()).then_some(changes)
 }
 /// The most announcements answered one item at a time; past it, one sync.
 const MAX_TARGETED: usize = 50;
@@ -20555,7 +20577,7 @@ mod vault_load_step_tests {
         use crate::vault_cache::Announced;
         use crate::vault_window::{targeted_refresh, MAX_TARGETED};
         let item = |id: &str| Announcement::Item { id: id.into(), revision: Some("r".into()) };
-        let gone = |id: &str| Announcement::ItemGone { id: id.into() };
+        let gone = |id: &str| Announcement::ItemGone { id: id.into(), revision: None };
 
         assert_eq!(
             targeted_refresh(true, &[item("a"), gone("b")]),
@@ -20567,6 +20589,27 @@ mod vault_load_step_tests {
         assert_eq!(targeted_refresh(false, &[item("a")]), None, "a hub that is down");
         assert_eq!(targeted_refresh(true, &[]), None, "nothing announced");
         assert_eq!(targeted_refresh(true, &[item("a"), Announcement::Whole]), None, "a whole-sync in the batch");
+        // NodeWarden's twin: one item created, announced as the cipher push
+        // AND "sync your whole vault" at the same revision -- measured on the
+        // owner's server. The twin is dropped; the item is read.
+        let twin = Announcement::VaultAt { date: "r".into() };
+        assert_eq!(
+            targeted_refresh(true, &[item("a"), twin.clone()]),
+            Some(vec![Announced::Changed { id: "a".into(), revision: Some("r".into()) }]),
+            "the twin of a cipher push sent the batch to a full sync"
+        );
+        assert_eq!(
+            targeted_refresh(true, &[twin.clone(), item("a")]),
+            Some(vec![Announced::Changed { id: "a".into(), revision: Some("r".into()) }]),
+            "order matters to the twin rule"
+        );
+        // A whole-vault push nothing in the batch explains -- a bulk move --
+        // is still the full sync.
+        assert_eq!(
+            targeted_refresh(true, &[item("a"), Announcement::VaultAt { date: "other".into() }]),
+            None
+        );
+        assert_eq!(targeted_refresh(true, &[twin]), None, "a lone whole-vault push");
         let many: Vec<_> = (0..=MAX_TARGETED).map(|n| item(&n.to_string())).collect();
         assert_eq!(targeted_refresh(true, &many), None, "past the cap");
         assert!(targeted_refresh(true, &many[..MAX_TARGETED]).is_some(), "at the cap");
