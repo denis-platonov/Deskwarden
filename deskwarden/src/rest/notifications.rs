@@ -82,10 +82,11 @@ const PING: &str = "{\"type\":6}\u{1e}";
 enum HubMessage {
     /// The answer to [`HANDSHAKE`]: `{}`, or `{"error": ..}` on a refusal.
     HandshakeAck { error: Option<String> },
-    /// A `ReceiveMessage` whose type means the vault on screen may be stale,
-    /// with that type -- for the log line, which is how "did the server say
-    /// anything?" is answered without a debugger.
-    VaultChanged(i64),
+    /// A `ReceiveMessage` whose type means the vault on screen may be stale:
+    /// what changed, as far as the message says, and the push type -- for
+    /// the log line, which is how "did the server say anything?" is
+    /// answered without a debugger.
+    VaultChanged { push_type: i64, announced: Announcement },
     /// Anything else the server may say: a keep-alive, an invocation of a
     /// type this app has no use for (a Send, a login-with-device request),
     /// a completion.
@@ -116,14 +117,17 @@ fn read_one(frame: &str) -> HubMessage {
     match kind.as_i64() {
         Some(1) => {
             let target = message.get("target").and_then(serde_json::Value::as_str);
-            let push_type = message
-                .get("arguments")
-                .and_then(|a| a.get(0))
+            let argument = message.get("arguments").and_then(|a| a.get(0));
+            let push_type = argument
                 .and_then(|a| a.get("Type").or_else(|| a.get("type")))
                 .and_then(serde_json::Value::as_i64);
             match (target, push_type) {
                 (Some("ReceiveMessage"), Some(push_type)) if notice_for(push_type) => {
-                    HubMessage::VaultChanged(push_type)
+                    let payload = argument.and_then(|a| a.get("Payload").or_else(|| a.get("payload")));
+                    HubMessage::VaultChanged {
+                        push_type,
+                        announced: announcement_for(push_type, payload),
+                    }
                 }
                 _ => HubMessage::Ignored,
             }
@@ -152,6 +156,57 @@ fn read_one(frame: &str) -> HubMessage {
 /// offer.
 fn notice_for(push_type: i64) -> bool {
     matches!(push_type, 0..=11 | 17..=19)
+}
+
+/// **What one push says changed**, as precisely as the push says it.
+///
+/// A cipher's create, update and delete carry that cipher's id -- NodeWarden
+/// and Bitwarden both put `Id` and `RevisionDate` in the payload -- and those
+/// three are what a person editing one item in another app produces. The
+/// window answers them one record at a time rather than refetching the vault:
+/// on the owner's server a whole-vault sync is about 3,400 database rows and a
+/// single cipher is one or two. The owner, of the full sync: "for 1 records
+/// is it full sync?".
+///
+/// Everything else is [`Announcement::Whole`] and gets the full sync it
+/// always got: a folder change (the folder list rides the sync payload and
+/// has no per-id read here), "sync your whole vault", an organisation's keys,
+/// a log-out, a reconnect, and any cipher push that arrives without an id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Announcement {
+    /// A cipher was created or changed; `revision` is the server's
+    /// `RevisionDate` for it, when the push carried one.
+    Item { id: String, revision: Option<String> },
+    /// A cipher was deleted.
+    ItemGone { id: String },
+    /// Something only a whole-vault sync can answer.
+    Whole,
+}
+
+/// Bitwarden's `PushType` numbers for the three cipher pushes.
+const PUSH_CIPHER_UPDATE: i64 = 0;
+const PUSH_CIPHER_CREATE: i64 = 1;
+const PUSH_LOGIN_DELETE: i64 = 2;
+const PUSH_CIPHER_DELETE: i64 = 9;
+
+fn announcement_for(push_type: i64, payload: Option<&serde_json::Value>) -> Announcement {
+    let field = |pascal: &str, camel: &str| {
+        payload
+            .and_then(|p| p.get(pascal).or_else(|| p.get(camel)))
+            .and_then(serde_json::Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let Some(id) = field("Id", "id") else {
+        return Announcement::Whole;
+    };
+    match push_type {
+        PUSH_CIPHER_UPDATE | PUSH_CIPHER_CREATE => {
+            Announcement::Item { id, revision: field("RevisionDate", "revisionDate") }
+        }
+        PUSH_LOGIN_DELETE | PUSH_CIPHER_DELETE => Announcement::ItemGone { id },
+        _ => Announcement::Whole,
+    }
 }
 
 /// The hub's websocket URL for a server root, or `None` when the root is not
@@ -299,17 +354,26 @@ struct Shared {
     stop: AtomicBool,
     /// Connected, and the hub has answered the SignalR handshake.
     live: AtomicBool,
-    /// Every notice ever received, plus one per REconnect -- a connection
-    /// that was down may have missed some, and a sync is what Bitwarden's
-    /// own clients do on reconnecting for the same reason.
-    notices: AtomicU64,
-    last_notice: Mutex<Option<Instant>>,
+    /// What the hub has announced that the window has not taken yet, plus a
+    /// [`Announcement::Whole`] per REconnect -- a connection that was down
+    /// may have missed something, and a sync is what Bitwarden's own clients
+    /// do on reconnecting for the same reason.
+    inbox: Mutex<Inbox>,
+}
+
+#[derive(Default)]
+struct Inbox {
+    announced: Vec<Announcement>,
+    /// When the latest arrived, which is what [`HubListener::settled`] waits
+    /// out.
+    last: Option<Instant>,
 }
 
 impl Shared {
-    fn notice(&self) {
-        *self.last_notice.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
-        self.notices.fetch_add(1, Ordering::SeqCst);
+    fn notice(&self, announced: Announcement) {
+        let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        inbox.announced.push(announced);
+        inbox.last = Some(Instant::now());
     }
 }
 
@@ -356,19 +420,22 @@ impl HubListener {
         self.shared.live.load(Ordering::SeqCst)
     }
 
-    /// **Notices the window has not acted on**, once they have settled:
-    /// `Some(count)` when more than `seen` have arrived and the last of them
-    /// is [`Timing::settle`] old. The window records `count` as seen when it
-    /// starts the sync, so a notice landing between this read and that one
-    /// is still counted next frame rather than lost.
-    pub fn pending(&self, seen: u64, now: Instant) -> Option<u64> {
-        let count = self.shared.notices.load(Ordering::SeqCst);
-        if count <= seen {
-            return None;
-        }
-        let last = *self.shared.last_notice.lock().unwrap_or_else(PoisonError::into_inner);
-        let settled = last.is_none_or(|at| now.saturating_duration_since(at) >= self.settle);
-        settled.then_some(count)
+    /// **Whether there are announcements waiting and the burst is over** --
+    /// the latest is [`Timing::settle`] old. Only asks; [`Self::take`] is
+    /// what empties the inbox, so the window can decide first and take
+    /// second without a notice landing between the two being lost: it is
+    /// simply taken with the rest.
+    pub fn settled(&self, now: Instant) -> bool {
+        let inbox = self.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        !inbox.announced.is_empty()
+            && inbox.last.is_none_or(|at| now.saturating_duration_since(at) >= self.settle)
+    }
+
+    /// Every announcement waiting, in arrival order, and an empty inbox.
+    pub fn take(&self) -> Vec<Announcement> {
+        let mut inbox = self.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        inbox.last = None;
+        std::mem::take(&mut inbox.announced)
     }
 }
 
@@ -594,13 +661,13 @@ fn one_connection(
                     if *connected_before {
                         // Down for a while: whatever changed meanwhile was
                         // said to nobody.
-                        shared.notice();
+                        shared.notice(Announcement::Whole);
                     }
                     *connected_before = true;
                 }
-                HubMessage::VaultChanged(push_type) if acked => {
+                HubMessage::VaultChanged { push_type, announced } if acked => {
                     log::info!("the notifications hub says the vault changed (push type {push_type})");
-                    shared.notice();
+                    shared.notice(announced);
                 }
                 HubMessage::Close => {
                     return Ended::Dropped("the hub said goodbye".to_string());
@@ -608,7 +675,7 @@ fn one_connection(
                 HubMessage::Unreadable => {
                     return Ended::Unsupported("a hub protocol other than JSON".to_string());
                 }
-                HubMessage::VaultChanged(_) | HubMessage::Ignored => {}
+                HubMessage::VaultChanged { .. } | HubMessage::Ignored => {}
             }
         }
     }
@@ -727,8 +794,8 @@ mod tests {
     fn each_message_the_hub_sends_is_read_for_what_it_means() {
         let pascal = "{\"type\":1,\"target\":\"ReceiveMessage\",\"arguments\":[{\"ContextId\":null,\"Type\":0,\"Payload\":{}}]}\u{1e}";
         let camel = "{\"type\":1,\"target\":\"ReceiveMessage\",\"arguments\":[{\"contextId\":null,\"type\":9,\"payload\":{}}]}\u{1e}";
-        assert_eq!(read_messages(pascal), [HubMessage::VaultChanged(0)]);
-        assert_eq!(read_messages(camel), [HubMessage::VaultChanged(9)]);
+        assert_eq!(read_messages(pascal), [changed(0, Announcement::Whole)]);
+        assert_eq!(read_messages(camel), [changed(9, Announcement::Whole)]);
         assert_eq!(read_messages(PING), [HubMessage::Ignored]);
         assert_eq!(read_messages("{}\u{1e}"), [HubMessage::HandshakeAck { error: None }]);
         assert_eq!(
@@ -739,7 +806,7 @@ mod tests {
         // Several records in one frame, in order.
         assert_eq!(
             read_messages(&format!("{{}}\u{1e}{PING}{pascal}")),
-            [HubMessage::HandshakeAck { error: None }, HubMessage::Ignored, HubMessage::VaultChanged(0)]
+            [HubMessage::HandshakeAck { error: None }, HubMessage::Ignored, changed(0, Announcement::Whole)]
         );
     }
 
@@ -755,9 +822,11 @@ mod tests {
             )
         };
         for push_type in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 17, 18, 19] {
-            assert_eq!(
-                read_messages(&invocation(push_type)),
-                [HubMessage::VaultChanged(push_type)],
+            assert!(
+                matches!(
+                    read_messages(&invocation(push_type))[..],
+                    [HubMessage::VaultChanged { push_type: read, .. }] if read == push_type
+                ),
                 "{push_type}"
             );
         }
@@ -769,6 +838,45 @@ mod tests {
             read_messages("{\"type\":1,\"target\":\"AuthRequestResponseRecieved\",\"arguments\":[{\"Type\":0}]}\u{1e}"),
             [HubMessage::Ignored]
         );
+    }
+
+    fn changed(push_type: i64, announced: Announcement) -> HubMessage {
+        HubMessage::VaultChanged { push_type, announced }
+    }
+
+    /// **A cipher push names its cipher**, and that is what lets the window
+    /// fetch one record instead of the vault. Both casings, as the reading
+    /// test above; a push with no id, and every other kind, is a whole sync.
+    #[test]
+    fn a_cipher_push_announces_which_cipher_and_everything_else_asks_for_the_whole_vault() {
+        let push = |push_type: i64, payload: &str| {
+            format!(
+                "{{\"type\":1,\"target\":\"ReceiveMessage\",\"arguments\":[{{\"Type\":{push_type},\"Payload\":{payload}}}]}}\u{1e}"
+            )
+        };
+        let with_id = r#"{"Id":"c-1","RevisionDate":"2026-09-26T16:00:00.000Z","UserId":"u"}"#;
+        assert_eq!(
+            read_messages(&push(0, with_id)),
+            [changed(0, Announcement::Item {
+                id: "c-1".to_string(),
+                revision: Some("2026-09-26T16:00:00.000Z".to_string()),
+            })]
+        );
+        assert_eq!(
+            read_messages(&push(1, r#"{"id":"c-2"}"#)),
+            [changed(1, Announcement::Item { id: "c-2".to_string(), revision: None })]
+        );
+        for gone in [2, 9] {
+            assert_eq!(
+                read_messages(&push(gone, with_id)),
+                [changed(gone, Announcement::ItemGone { id: "c-1".to_string() })]
+            );
+        }
+        // A folder change carries an id too, and is still a whole sync.
+        assert_eq!(read_messages(&push(8, with_id)), [changed(8, Announcement::Whole)]);
+        // A cipher push with no id, or an empty one, cannot be targeted.
+        assert_eq!(read_messages(&push(0, "{}")), [changed(0, Announcement::Whole)]);
+        assert_eq!(read_messages(&push(0, r#"{"Id":""}"#)), [changed(0, Announcement::Whole)]);
     }
 
     #[test]
@@ -925,7 +1033,7 @@ mod tests {
 
     fn push(socket: &mut tungstenite::WebSocket<TcpStream>, push_type: i64) {
         let text = format!(
-            "{{\"type\":1,\"target\":\"ReceiveMessage\",\"arguments\":[{{\"ContextId\":null,\"Type\":{push_type},\"Payload\":{{}}}}]}}\u{1e}"
+            "{{\"type\":1,\"target\":\"ReceiveMessage\",\"arguments\":[{{\"ContextId\":null,\"Type\":{push_type},\"Payload\":{{\"Id\":\"c-1\",\"RevisionDate\":\"r-1\"}}}}]}}\u{1e}"
         );
         socket.send(Message::text(text)).expect("push");
     }
@@ -946,11 +1054,13 @@ mod tests {
         );
         let probe = listen_to(&base);
         eventually("the hub is live", || probe.listener.is_live());
-        eventually("the push is pending", || {
-            probe.listener.pending(0, Instant::now()).is_some()
-        });
-        assert_eq!(probe.listener.pending(0, Instant::now()), Some(1));
-        assert_eq!(probe.listener.pending(1, Instant::now()), None, "a seen notice is not pending");
+        eventually("the push is pending", || probe.listener.settled(Instant::now()));
+        assert_eq!(
+            probe.listener.take(),
+            [Announcement::Item { id: "c-1".to_string(), revision: Some("r-1".to_string()) }]
+        );
+        assert!(!probe.listener.settled(Instant::now()), "a taken notice is still pending");
+        assert!(probe.listener.take().is_empty());
         drop(probe.listener);
         let seen = seen.recv_timeout(Duration::from_secs(5)).expect("the connection report");
         assert_eq!(seen.authorization.as_deref(), Some(TOKEN));
@@ -973,7 +1083,7 @@ mod tests {
         let probe = listen_to(&base);
         eventually("the hub is live", || probe.listener.is_live());
         std::thread::sleep(Duration::from_millis(200));
-        assert_eq!(probe.listener.pending(0, Instant::now()), None);
+        assert!(!probe.listener.settled(Instant::now()));
     }
 
     /// **The client keeps the connection alive itself**, because a
@@ -1005,7 +1115,7 @@ mod tests {
         eventually("the hub is live", || probe.listener.is_live());
         std::thread::sleep(FAST.silence + FAST.silence / 2);
         assert!(probe.listener.is_live(), "an answered connection was dropped");
-        assert_eq!(probe.listener.pending(0, Instant::now()), None, "it reconnected");
+        assert!(probe.listener.take().is_empty(), "it reconnected");
         let pings = pings.load(Ordering::SeqCst);
         assert!(pings >= 4, "only {pings} pings in {:?}", FAST.silence * 3 / 2);
     }
@@ -1051,9 +1161,8 @@ mod tests {
             false,
         );
         let probe = listen_to(&base);
-        eventually("the reconnect is a notice", || {
-            probe.listener.pending(0, Instant::now()).is_some()
-        });
+        eventually("the reconnect is a notice", || probe.listener.settled(Instant::now()));
+        assert_eq!(probe.listener.take(), [Announcement::Whole], "a reconnect is a whole sync");
         assert!(probe.listener.is_live());
     }
 
@@ -1079,9 +1188,7 @@ mod tests {
             false,
         );
         let probe = listen_to(&base);
-        eventually("a second connection", || {
-            probe.listener.pending(0, Instant::now()).is_some()
-        });
+        eventually("a second connection", || probe.listener.settled(Instant::now()));
     }
 
     /// **A hub this client cannot read stands down for good**, so the
@@ -1132,11 +1239,16 @@ mod tests {
     #[test]
     fn a_burst_of_notices_is_pending_only_once_it_has_settled() {
         let listener = HubListener { shared: Arc::new(Shared::default()), settle: Duration::from_secs(2) };
-        listener.shared.notice();
-        listener.shared.notice();
+        listener.shared.notice(Announcement::ItemGone { id: "a".to_string() });
+        listener.shared.notice(Announcement::Whole);
         let now = Instant::now();
-        assert_eq!(listener.pending(0, now), None, "pending mid-burst");
-        assert_eq!(listener.pending(0, now + Duration::from_secs(2)), Some(2));
+        assert!(!listener.settled(now), "pending mid-burst");
+        assert!(listener.settled(now + Duration::from_secs(2)));
+        assert_eq!(
+            listener.take(),
+            [Announcement::ItemGone { id: "a".to_string() }, Announcement::Whole],
+            "not every announcement, in order"
+        );
         listener.shared.stop.store(true, Ordering::SeqCst);
     }
 }

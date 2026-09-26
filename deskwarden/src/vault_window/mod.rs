@@ -940,10 +940,12 @@ pub fn build_frame_with_search(
     // runs a frame every half second, and a notice waits `Timing::settle`
     // anyway. `hub_wanted` is the switch as last acted on, so the listener
     // is started or dropped on a CHANGE and not re-made every frame;
-    // `hub_seen` is how many of its notices a sync has already answered.
+    // `announced_generation` is the load, if any, that is applying the
+    // hub's announcements one item at a time -- that load, and not a sync,
+    // is what ends `sync_in_progress` for it.
     let mut hub: Option<crate::rest::notifications::HubListener> = None;
     let mut hub_wanted: Option<bool> = None;
-    let mut hub_seen: u64 = 0;
+    let mut announced_generation: Option<u64> = None;
     // True once the auto-sync below has fired. The window's first paint
     // shows whatever's already cached locally -- exactly like the Sync
     // button, this never blocks on the sync itself -- but the vault is
@@ -1067,6 +1069,7 @@ pub fn build_frame_with_search(
             era: window_era,
             generation: load_generation,
             skip_readiness_wait,
+            announced: None,
         },
     );
     let mut items: Vec<VaultItem> = Vec::new();
@@ -1959,11 +1962,9 @@ pub fn build_frame_with_search(
             .map_or(sync_push_at_open, |settings| settings.sync_push);
         if hub_wanted != Some(push_on) {
             hub_wanted = Some(push_on);
-            // A new listener counts its notices from zero.
-            hub_seen = 0;
             hub = if push_on { (start_hub)() } else { None };
         }
-        let pushed = hub.as_ref().and_then(|hub| hub.pending(hub_seen, Instant::now()));
+        let pushed = hub.as_ref().is_some_and(|hub| hub.settled(Instant::now()));
         let hub_live = hub.as_ref().is_some_and(crate::rest::notifications::HubListener::is_live);
         let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
         let regained_focus = focused && !was_focused;
@@ -1974,7 +1975,7 @@ pub fn build_frame_with_search(
             .map_or(sync_poll_at_open, crate::settings::Settings::sync_poll_interval);
         if heartbeat_sync_due(Heartbeat {
             poll: sync_poll,
-            pushed: pushed.is_some(),
+            pushed,
             hub_live,
             sync_in_progress,
             editing: matches!(
@@ -1987,17 +1988,48 @@ pub fn build_frame_with_search(
         }) {
             sync_in_progress = true;
             last_sync_attempt = Some(Instant::now());
-            // Whatever the trigger, this sync answers every notice counted so
-            // far. The count was read BEFORE the decision, so one landing
-            // since is still ahead of `hub_seen` next frame.
-            if let Some(count) = pushed {
-                log::info!(
-                    "vault window: syncing for {} change(s) the server announced",
-                    count - hub_seen
-                );
-                hub_seen = count;
+            // Whatever the trigger, this answers everything announced so far,
+            // including anything that landed since `settled` was asked.
+            let announced = hub
+                .as_ref()
+                .map(crate::rest::notifications::HubListener::take)
+                .unwrap_or_default();
+            match targeted_refresh(pushed && hub_live, &announced) {
+                // **One item at a time**, through the load seam: the worker
+                // applies each change to the cache and then paints the
+                // snapshot from memory -- no `GET /api/sync` at all. The
+                // owner: "for 1 records is it full sync?".
+                Some(changes) => {
+                    log::info!(
+                        "vault window: applying {} change(s) the server announced, one item at \
+                         a time",
+                        changes.len()
+                    );
+                    load_generation += 1;
+                    announced_generation = Some(load_generation);
+                    (spawn_load)(
+                        cache.clone(),
+                        vault_tx.clone(),
+                        VaultLoadRequest {
+                            force_refresh: false,
+                            era: window_era,
+                            generation: load_generation,
+                            skip_readiness_wait,
+                            announced: Some(changes),
+                        },
+                    );
+                }
+                None => {
+                    if !announced.is_empty() {
+                        log::info!(
+                            "vault window: syncing the whole vault for {} change(s) the server \
+                             announced",
+                            announced.len()
+                        );
+                    }
+                    (spawn_sync)(sync_tx.clone(), session_token.to_string());
+                }
             }
-            (spawn_sync)(sync_tx.clone(), session_token.to_string());
         }
 
         if ui.ctx().input(|i| i.pointer.any_click() || !i.events.is_empty()) {
@@ -2101,6 +2133,10 @@ pub fn build_frame_with_search(
         // update lives in `apply_vault_load_result` (see its doc) so it can
         // be unit tested directly.
         if let Ok((generation, load_result)) = vault_rx.try_recv() {
+            // Read before the result is consumed: whether this is the load
+            // applying the hub's announcements, and whether it worked.
+            let answers_announced = announced_generation == Some(generation);
+            let announced_ok = load_result.is_ok();
             apply_vault_load_result(
                 generation,
                 load_generation,
@@ -2114,6 +2150,18 @@ pub fn build_frame_with_search(
                 &mut sync_status,
                 &mut totp_state,
             );
+            // That load stands in for a sync, so it ends one: the pill, the
+            // heartbeat's in-flight guard and its failure back-off all read
+            // these exactly as they read a sync's outcome.
+            if answers_announced {
+                announced_generation = None;
+                sync_in_progress = false;
+                last_sync_failed = !announced_ok;
+                if announced_ok {
+                    last_sync_at = Some(Instant::now());
+                    sync_status = Some(Ok(()));
+                }
+            }
             // `vault_loading` is cleared by `apply_vault_load_result` only for
             // a result it actually applied -- a superseded one is dropped and
             // leaves it set -- so this is the moment the spinner comes off the
@@ -2315,6 +2363,7 @@ pub fn build_frame_with_search(
                         era: window_era,
                         generation: load_generation,
                         skip_readiness_wait,
+                        announced: None,
                     },
                 );
             } else if let Err(e) = &result {
@@ -12804,6 +12853,12 @@ struct VaultLoadRequest {
     /// Skips the probe in the worker when set, the same exemption
     /// `spawn_sync` in `main.rs` already makes for the same reason.
     skip_readiness_wait: bool,
+    /// **Changes the server announced**, applied to the cache one record at
+    /// a time before the snapshot is read -- see
+    /// [`VaultCache::apply_announced`]. `None` on every load but the one the
+    /// hub's heartbeat starts. If they cannot be applied the load becomes a
+    /// forced refresh, which is what it would have been without them.
+    announced: Option<Vec<crate::vault_cache::Announced>>,
 }
 
 /// Why a vault load produced nothing to paint.
@@ -12971,6 +13026,40 @@ fn heartbeat_sync_due(beat: Heartbeat) -> bool {
 }
 /// The least time between two syncs a return to the window can cause.
 const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
+/// **Whether what the hub announced can be answered one item at a time**,
+/// and as what.
+///
+/// Only while the hub is live and a push is the reason: a hub that was down
+/// may have missed something, and a timer or a return to the window was not
+/// asked for by an announcement at all. Then only when EVERY announcement
+/// names a cipher -- one folder change, "sync your whole vault" or a
+/// reconnect in the batch and the batch gets the full sync, because a
+/// targeted pass that did most of it would still leave that one unanswered.
+/// And only up to [`MAX_TARGETED`]: an import of a thousand items in another
+/// app is cheaper as one sync than as a thousand reads.
+fn targeted_refresh(
+    push_live: bool,
+    announced: &[crate::rest::notifications::Announcement],
+) -> Option<Vec<crate::vault_cache::Announced>> {
+    use crate::rest::notifications::Announcement;
+    use crate::vault_cache::Announced;
+    if !push_live || announced.is_empty() || announced.len() > MAX_TARGETED {
+        return None;
+    }
+    announced
+        .iter()
+        .map(|announcement| match announcement {
+            Announcement::Item { id, revision } => {
+                Some(Announced::Changed { id: id.clone(), revision: revision.clone() })
+            }
+            Announcement::ItemGone { id } => Some(Announced::Removed { id: id.clone() }),
+            Announcement::Whole => None,
+        })
+        .collect()
+}
+/// The most announcements answered one item at a time; past it, one sync.
+const MAX_TARGETED: usize = 50;
+
 /// The least time between two syncs the hub's pushes can cause.
 const HEARTBEAT_PUSH_GAP: Duration = Duration::from_secs(10);
 /// How long a failed sync keeps every trigger quiet.
@@ -13059,8 +13148,29 @@ fn spawn_vault_load_with_schedule(
         era,
         generation,
         skip_readiness_wait,
+        announced,
     } = request;
     std::thread::spawn(move || {
+        // The announced changes first, so the snapshot read below already
+        // holds them; a failure turns this into the full refresh it would
+        // otherwise have been.
+        let force_refresh = match announced {
+            Some(changes) => match cache.apply_announced(&changes, era) {
+                Ok(fetched) => {
+                    log::info!(
+                        "applied {} announced change(s) with {fetched} item read(s) and no \
+                         vault sync",
+                        changes.len()
+                    );
+                    force_refresh
+                }
+                Err(why) => {
+                    log::info!("announced changes need the whole vault after all: {why}");
+                    true
+                }
+            },
+            None => force_refresh,
+        };
         // ONE lock acquisition, and the era check is inside it. This used to
         // be `force_refresh || !cache.is_populated()` here and
         // `cache.items(), cache.folders()` at the bottom -- three separate
@@ -19714,6 +19824,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 1,
                 skip_readiness_wait: false,
+                announced: None,
             },
             vec![],
         );
@@ -19723,6 +19834,92 @@ mod spawn_vault_load_tests {
         let snapshot = result.expect("bw serve was ready; load must succeed");
         assert_eq!(snapshot.items.len(), 1);
         assert!(snapshot.folders.is_empty());
+    }
+
+    /// **Announced changes are painted without a sync.** The worker applies
+    /// them to the cache and paints the snapshot from memory: the list
+    /// routes are hit once, by the populate that seeded the cache, and the
+    /// deleted item is gone from what is painted.
+    #[test]
+    fn an_announced_load_paints_the_change_without_refetching_the_vault() {
+        let mut server = crate::test_http::server();
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .expect(1)
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let (tx, rx) = mpsc::channel();
+        let era = cache.epoch().era();
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: false,
+                era,
+                generation: 7,
+                skip_readiness_wait: true,
+                announced: Some(vec![crate::vault_cache::Announced::Removed { id: "1".into() }]),
+            },
+            vec![],
+        );
+        let (generation, result) = rx.recv_timeout(Duration::from_secs(5)).expect("a report");
+        assert_eq!(generation, 7);
+        assert!(result.expect("the load paints").items.is_empty(), "the deleted item was painted");
+        items.assert();
+    }
+
+    /// **And what cannot be applied becomes the full refresh** it would have
+    /// been without the announcement: an item that cannot be read back sends
+    /// the worker to the list routes again.
+    #[test]
+    fn an_announced_load_that_cannot_be_applied_falls_back_to_a_full_refresh() {
+        let mut server = crate::test_http::server();
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body())
+            .expect(2)
+            .create();
+        let _folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .create();
+        let _broken = server.mock("GET", "/object/item/9").with_status(500).create();
+        let cache = Arc::new(VaultCache::new(VaultBridge::new(server.url())));
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        let (tx, rx) = mpsc::channel();
+        let era = cache.epoch().era();
+        spawn_vault_load_with_schedule(
+            cache,
+            tx,
+            VaultLoadRequest {
+                force_refresh: false,
+                era,
+                generation: 8,
+                skip_readiness_wait: true,
+                announced: Some(vec![crate::vault_cache::Announced::Changed {
+                    id: "9".into(),
+                    revision: None,
+                }]),
+            },
+            vec![],
+        );
+        let (_, result) = rx.recv_timeout(Duration::from_secs(5)).expect("a report");
+        assert_eq!(result.expect("the fallback paints").items.len(), 1);
+        items.assert();
     }
 
     /// Review 31's Minor 2. The reason a `VaultLoadFailure` carries is PAINTED,
@@ -19757,6 +19954,7 @@ mod spawn_vault_load_tests {
                 // own message is already prose; skipping it is what puts this
                 // test on the populate arm specifically.
                 skip_readiness_wait: true,
+                announced: None,
             },
             vec![],
         );
@@ -19790,6 +19988,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 7,
                 skip_readiness_wait: false,
+                announced: None,
             },
             vec![],
         );
@@ -19837,6 +20036,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 1,
                 skip_readiness_wait: true,
+                announced: None,
             },
             vec![],
         );
@@ -19922,6 +20122,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 1,
                 skip_readiness_wait: false,
+                announced: None,
             },
             vec![],
         );
@@ -20003,6 +20204,7 @@ mod spawn_vault_load_tests {
                 // `without_the_skip_the_readiness_probe_hits_list_items_before_populate_does`,
                 // so this is not a hopeful literal.
                 skip_readiness_wait: true,
+                announced: None,
             },
             vec![],
         );
@@ -20070,6 +20272,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 4,
                 skip_readiness_wait: true,
+                announced: None,
             },
             vec![],
         );
@@ -20090,6 +20293,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 5,
                 skip_readiness_wait: true,
+                announced: None,
             },
             vec![],
         );
@@ -20138,6 +20342,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 1,
                 skip_readiness_wait: true,
+                announced: None,
             },
             vec![],
         );
@@ -20193,6 +20398,7 @@ mod spawn_vault_load_tests {
                 era,
                 generation: 1,
                 skip_readiness_wait: true,
+                announced: None,
             },
             vec![],
         );
@@ -20337,6 +20543,33 @@ mod vault_load_step_tests {
         assert!(!heartbeat_sync_due(Heartbeat { hub_live: true, ..polling }));
         // ...and a hub that is down hands both straight back.
         assert!(heartbeat_sync_due(Heartbeat { regained_focus: false, ..polling }));
+    }
+
+    /// **Which announcements are answered one item at a time.** Cipher
+    /// changes and deletions, while the hub is live and a push is the reason,
+    /// up to the cap; anything else in the batch, a hub that is down, or a
+    /// batch past the cap, and it is the whole-vault sync.
+    #[test]
+    fn only_a_live_batch_of_cipher_changes_is_answered_item_by_item() {
+        use crate::rest::notifications::Announcement;
+        use crate::vault_cache::Announced;
+        use crate::vault_window::{targeted_refresh, MAX_TARGETED};
+        let item = |id: &str| Announcement::Item { id: id.into(), revision: Some("r".into()) };
+        let gone = |id: &str| Announcement::ItemGone { id: id.into() };
+
+        assert_eq!(
+            targeted_refresh(true, &[item("a"), gone("b")]),
+            Some(vec![
+                Announced::Changed { id: "a".into(), revision: Some("r".into()) },
+                Announced::Removed { id: "b".into() },
+            ])
+        );
+        assert_eq!(targeted_refresh(false, &[item("a")]), None, "a hub that is down");
+        assert_eq!(targeted_refresh(true, &[]), None, "nothing announced");
+        assert_eq!(targeted_refresh(true, &[item("a"), Announcement::Whole]), None, "a whole-sync in the batch");
+        let many: Vec<_> = (0..=MAX_TARGETED).map(|n| item(&n.to_string())).collect();
+        assert_eq!(targeted_refresh(true, &many), None, "past the cap");
+        assert!(targeted_refresh(true, &many[..MAX_TARGETED]).is_some(), "at the cap");
     }
 
     fn a_snapshot() -> VaultSnapshot {
@@ -21447,14 +21680,17 @@ mod window_era_placement_tests {
 
     #[test]
     fn both_spawns_are_checked_against_that_one_era() {
-        // The initial load and the post-sync forced reload. If a third spawn
-        // is ever added it must join them, and this count is what says so.
+        // The initial load, the post-sync forced reload, and -- the third,
+        // which joined them as this comment said a third must -- the load
+        // that applies the notifications hub's announcements one item at a
+        // time. That one WRITES into the cache before it paints, so it is the
+        // spawn that most needs to be refused for a session that has moved on.
         assert_eq!(
             production().matches(SPAWN_USE).count(),
-            2,
+            3,
             "{SPAWN_USE:?} must appear once per `spawn_vault_load` call in `run` (the initial \
-             load and the post-sync reload). Fewer means a spawn is checked against something \
-             other than the window's own vault session."
+             load, the post-sync reload and the announced-changes load). Fewer means a spawn is \
+             checked against something other than the window's own vault session."
         );
     }
 
@@ -21465,7 +21701,7 @@ mod window_era_placement_tests {
         // but this file is ~4900 lines and a new `impl` appended below the test
         // modules would be invisible to every guard above. Two cheap checks:
         //
-        //  * the WHOLE file holds exactly the two spawn uses the slice found,
+        //  * the WHOLE file holds exactly the three spawn uses the slice found,
         //    so a third spawn added after the marker cannot hide from
         //    `both_spawns_are_checked_against_that_one_era`;
         //  * the slice still reaches the LAST item defined above the first
@@ -21483,7 +21719,7 @@ mod window_era_placement_tests {
         let source = include_str!("mod.rs");
         assert_eq!(
             source.matches(SPAWN_USE).count(),
-            2,
+            3,
             "the whole file holds {} of {SPAWN_USE:?} but the production slice holds {}. If the \
              file has MORE, a spawn was added below the first `#[cfg(test)]` where the count \
              above cannot see it; if it has FEWER, a spawn stopped being checked against the \

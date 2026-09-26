@@ -448,6 +448,19 @@ impl Snapshot {
     }
 }
 
+/// One change to one item, as the server announced it -- see
+/// [`VaultCache::apply_announced`]. Built by the vault window from
+/// `rest::notifications::Announcement`; this module does not know where it
+/// came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Announced {
+    /// Created or changed. `revision` is the server's `revisionDate` for it,
+    /// when the announcement carried one.
+    Changed { id: String, revision: Option<String> },
+    /// Deleted.
+    Removed { id: String },
+}
+
 pub struct VaultCache {
     /// The vault backend, behind [`crate::vault_backend::VaultBackend`]
     /// rather than as the concrete `bw serve` client it used to be. The only
@@ -1590,6 +1603,93 @@ impl VaultCache {
             snapshot.note_item_write(id, true);
         }
         Ok(())
+    }
+
+    /// **Applies changes the server announced, one record at a time**, instead
+    /// of refetching the vault -- the owner: "for 1 records is it full sync?".
+    ///
+    /// An [`Announced::Changed`] item is read back by id through the backend
+    /// (`GET /api/ciphers/{id}` on the built-in client: one or two database
+    /// rows, against about 3,400 for a whole sync on the owner's server) and
+    /// put in the snapshot in place of the copy it holds, or added. One that
+    /// comes back trashed or archived leaves the live list, as a populate
+    /// would have left it out. An [`Announced::Removed`] item leaves with no
+    /// request at all. Each is recorded in the write log exactly as a local
+    /// edit is, so a populate already in flight cannot put the old copy back.
+    ///
+    /// **An announcement whose revision the snapshot already holds is skipped**
+    /// -- that is this app's own save coming back from the server, and it
+    /// costs nothing.
+    ///
+    /// `Err` means "do a full populate instead", and the caller does: the
+    /// cache is not populated, the session moved on (`era`), or a read failed.
+    /// Anything applied before a failure stays applied -- each was the
+    /// server's current record -- and the populate that follows supersedes it
+    /// all anyway.
+    pub fn apply_announced(&self, changes: &[Announced], era: VaultEra) -> Result<usize, String> {
+        self.persisting(|| self.apply_announced_writing(changes, era).map_err(VaultError::Http))
+            .map_err(|e| match e {
+                VaultError::Http(why) => why,
+                other => format!("{other:?}"),
+            })
+    }
+
+    /// [`Self::apply_announced`]'s body, separated for [`Self::persisting`]'s
+    /// reason: the disk rewrite happens once, after every change is in.
+    fn apply_announced_writing(&self, changes: &[Announced], era: VaultEra) -> Result<usize, String> {
+        let current = |snapshot: &Snapshot| snapshot.epoch().era() == era && snapshot.populated;
+        let mut fetched = 0;
+        for change in changes {
+            match change {
+                Announced::Removed { id } => {
+                    let mut snapshot = self.lock();
+                    if !current(&snapshot) {
+                        return Err("the vault session moved on".to_string());
+                    }
+                    snapshot.items.retain(|i| &i.id != id);
+                    snapshot.note_item_write(id, true);
+                }
+                Announced::Changed { id, revision } => {
+                    {
+                        let snapshot = self.lock();
+                        if !current(&snapshot) {
+                            return Err("the vault session moved on".to_string());
+                        }
+                        let held = snapshot.items.iter().find(|i| &i.id == id);
+                        let held_revision = held.and_then(|i| i.other.get("revisionDate"));
+                        if revision.is_some()
+                            && held_revision.and_then(|r| r.as_str()) == revision.as_deref()
+                        {
+                            continue;
+                        }
+                    }
+                    // The read happens with no lock held -- it is a network
+                    // round trip -- and the session is asked again after it.
+                    let item = self
+                        .bridge
+                        .get_item(id)
+                        .map_err(|e| format!("item {id} could not be read back: {e:?}"))?;
+                    fetched += 1;
+                    let mut snapshot = self.lock();
+                    if !current(&snapshot) {
+                        return Err("the vault session moved on".to_string());
+                    }
+                    let live = ["deletedDate", "archivedDate"]
+                        .iter()
+                        .all(|key| item.other.get(*key).is_none_or(serde_json::Value::is_null));
+                    match snapshot.items.iter().position(|i| &i.id == id) {
+                        Some(at) if live => snapshot.items[at] = item,
+                        Some(at) => {
+                            snapshot.items.remove(at);
+                        }
+                        None if live => snapshot.items.push(item),
+                        None => {}
+                    }
+                    snapshot.note_item_write(id, !live);
+                }
+            }
+        }
+        Ok(fetched)
     }
 
     /// The vault's trash in one call, **without the era guard** -- reachable
@@ -2954,6 +3054,150 @@ mod tests {
         let cache = cache_for(server.url());
         assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
         cache
+    }
+
+    /// A cache populated once over the list routes, with those routes
+    /// expected EXACTLY once -- so a test asserting on them proves that
+    /// nothing after the populate went back for the whole vault.
+    fn populated_once(
+        server: &mut crate::test_http::Server,
+    ) -> (VaultCache, crate::test_http::Mock, crate::test_http::Mock) {
+        let items = server
+            .mock("GET", "/list/object/items")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(items_body_with_a_revision_date())
+            .expect(1)
+            .create();
+        let folders = server
+            .mock("GET", "/list/object/folders")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(folders_body())
+            .expect(1)
+            .create();
+        let cache = cache_for(server.url());
+        assert_eq!(cache.populate().unwrap(), PopulateOutcome::Populated);
+        (cache, items, folders)
+    }
+
+    fn one_item(server: &mut crate::test_http::Server, id: &str, body: &str) -> crate::test_http::Mock {
+        server
+            .mock("GET", format!("/object/item/{id}").as_str())
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(format!(r#"{{"success":true,"data":{body}}}"#))
+            .expect(1)
+            .create()
+    }
+
+    /// **An announced change is one read, not a sync.** The owner: "for 1
+    /// records is it full sync?". A changed item is read back by id and
+    /// replaces the snapshot's copy; a created one is added; and the list
+    /// routes are hit once, by the populate, and never again.
+    #[test]
+    fn an_announced_change_reads_that_item_back_and_nothing_else() {
+        let mut server = crate::test_http::server();
+        let (cache, items, folders) = populated_once(&mut server);
+        let changed = one_item(
+            &mut server,
+            "1",
+            r#"{"id":"1","name":"Alpha, renamed elsewhere","fields":[],"type":1,"revisionDate":"R2"}"#,
+        );
+        let created = one_item(&mut server, "9", r#"{"id":"9","name":"Made elsewhere","fields":[],"type":1}"#);
+
+        let era = cache.epoch().era();
+        let fetched = cache
+            .apply_announced(
+                &[
+                    Announced::Changed { id: "1".into(), revision: Some("R2".into()) },
+                    Announced::Changed { id: "9".into(), revision: None },
+                ],
+                era,
+            )
+            .expect("two readable items apply");
+        assert_eq!(fetched, 2);
+        assert_eq!(cache.get_by_id("1").expect("still there").name, "Alpha, renamed elsewhere");
+        assert_eq!(cache.get_by_id("9").expect("added").name, "Made elsewhere");
+        changed.assert();
+        created.assert();
+        items.assert();
+        folders.assert();
+    }
+
+    /// **This app's own save, coming back from the server, costs nothing**:
+    /// the snapshot already holds that revision, so there is no read.
+    #[test]
+    fn an_announcement_of_a_revision_already_held_is_not_read() {
+        let mut server = crate::test_http::server();
+        let (cache, _items, _folders) = populated_once(&mut server);
+        let never = server.mock("GET", "/object/item/1").expect(0).create();
+        let era = cache.epoch().era();
+        let fetched = cache
+            .apply_announced(
+                &[Announced::Changed { id: "1".into(), revision: Some(FETCHED_REVISION.into()) }],
+                era,
+            )
+            .expect("an echo applies");
+        assert_eq!(fetched, 0);
+        never.assert();
+        // CONTROL: a different revision IS read.
+        let read = one_item(&mut server, "1", r#"{"id":"1","name":"A","fields":[],"type":1}"#);
+        cache
+            .apply_announced(&[Announced::Changed { id: "1".into(), revision: Some("other".into()) }], era)
+            .expect("a newer revision applies");
+        read.assert();
+    }
+
+    /// A deletion leaves with no request; an item read back TRASHED leaves
+    /// too, because the live list never holds the trash.
+    #[test]
+    fn a_deleted_or_trashed_item_leaves_the_live_list() {
+        let mut server = crate::test_http::server();
+        let (cache, _items, _folders) = populated_once(&mut server);
+        let era = cache.epoch().era();
+        cache.apply_announced(&[Announced::Removed { id: "1".into() }], era).expect("a removal applies");
+        assert!(cache.get_by_id("1").is_none(), "a deleted item is still listed");
+
+        let mut server = crate::test_http::server();
+        let (cache, _items, _folders) = populated_once(&mut server);
+        let _trashed = one_item(
+            &mut server,
+            "1",
+            r#"{"id":"1","name":"A","fields":[],"type":1,"deletedDate":"2026-09-26T16:00:00Z"}"#,
+        );
+        let era = cache.epoch().era();
+        cache
+            .apply_announced(&[Announced::Changed { id: "1".into(), revision: None }], era)
+            .expect("a trashed read-back applies");
+        assert!(cache.get_by_id("1").is_none(), "a trashed item is still listed");
+    }
+
+    /// **`Err` is "do a full populate instead"**: a read that fails, a cache
+    /// never populated, and a session that moved on each refuse, so the
+    /// caller falls back rather than painting half an answer.
+    #[test]
+    fn what_cannot_be_applied_one_item_at_a_time_is_refused() {
+        let mut server = crate::test_http::server();
+        let (cache, _items, _folders) = populated_once(&mut server);
+        let _broken = server.mock("GET", "/object/item/1").with_status(500).create();
+        let era = cache.epoch().era();
+        assert!(cache
+            .apply_announced(&[Announced::Changed { id: "1".into(), revision: None }], era)
+            .is_err());
+
+        let empty = VaultCache::new(crate::test_vault::unreachable_bridge());
+        let era = empty.epoch().era();
+        assert!(empty.apply_announced(&[Announced::Removed { id: "1".into() }], era).is_err());
+
+        let mut server = crate::test_http::server();
+        let (cache, _items, _folders) = populated_once(&mut server);
+        let era = cache.epoch().era();
+        cache.clear();
+        assert!(
+            cache.apply_announced(&[Announced::Removed { id: "1".into() }], era).is_err(),
+            "a change announced for a session that has since been locked was applied"
+        );
     }
 
     /// THE USER-REPORTED DEFECT. Favouriting is the one operation a user
