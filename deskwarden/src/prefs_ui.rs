@@ -2108,16 +2108,11 @@ fn minutes_stepper_with(
         // still accepts a click, which is precisely the "greyed out but
         // secretly live" state this is meant not to be. Nothing here is
         // interactive because there is no widget here at all.
-        let galley = ui.painter().layout_no_wrap(
-            value.to_string(),
-            FontId::new(12.0, FontFamily::Proportional),
-            theme::TEXT_GHOST,
-        );
+        let font = FontId::new(12.0, FontFamily::Proportional);
+        let ink_middle = theme::face_ink_middle(ui, &font);
+        let galley = ui.painter().layout_no_wrap(value.to_string(), font, theme::TEXT_GHOST);
         ui.painter().galley(
-            Pos2::new(
-                field.center().x - galley.size().x / 2.0,
-                field.center().y - galley.size().y / 2.0,
-            ),
+            Pos2::new(field.center().x - galley.size().x / 2.0, field.center().y - ink_middle),
             galley,
             theme::TEXT_GHOST,
         );
@@ -2149,27 +2144,30 @@ fn minutes_stepper_with(
     //
     // The rect still runs to the cell's right edge so most of the cell stays
     // clickable; only the text's left edge moves with the digit count.
-    let text_width = ui
-        .painter()
-        .layout_no_wrap(
-            buffer.clone(),
-            FontId::new(12.0, FontFamily::Proportional),
-            theme::INK,
-        )
-        .size()
-        .x;
+    //
+    // **Vertically it is placed by its INK, not by its box**, for the same
+    // reason and by the same arithmetic as the greyed branch. `Align::Center`
+    // centred the galley's box, and a 12-point row carries its descender band
+    // under the digits, so the number sat above the cell's middle -- the
+    // owner's "feels not centered", of a `5` with no descender to be centred
+    // with. `Align::Min` lands the row's top at exactly `rect.min.y`, so the
+    // top is chosen to put the face's cap-band middle on the cell's middle.
+    let font = FontId::new(12.0, FontFamily::Proportional);
+    let measured = ui.painter().layout_no_wrap(buffer.clone(), font.clone(), theme::INK);
+    let text_width = measured.size().x;
+    let row_top = field.center().y - theme::face_ink_middle(ui, &font);
     let inner = field.shrink(4.0);
     let entry = ui.put(
         Rect::from_min_max(
-            Pos2::new(field.center().x - text_width / 2.0, inner.min.y),
-            inner.max,
+            Pos2::new(field.center().x - text_width / 2.0, row_top),
+            Pos2::new(inner.max.x, row_top + measured.size().y),
         ),
         egui::TextEdit::singleline(buffer)
             .id(egui::Id::new(STEPPER_FIELD_ID))
             .frame(egui::Frame::new())
-            .font(FontId::new(12.0, FontFamily::Proportional))
+            .font(font)
             .horizontal_align(egui::Align::Min)
-            .vertical_align(egui::Align::Center)
+            .vertical_align(egui::Align::Min)
             .margin(Margin::ZERO),
     );
     if entry.lost_focus() && !stepped {
@@ -6401,6 +6399,11 @@ mod tests {
         rect: Rect,
         rows: usize,
         color: egui::Color32,
+        /// Where the glyphs actually put ink -- the union of their atlas
+        /// rects, in screen points. A galley's `rect` is its line BOX, and a
+        /// digit inks only the upper part of that box, so "is this number
+        /// centred" is a question only this can answer.
+        glyphs: Option<Rect>,
     }
 
     impl Painted {
@@ -6581,6 +6584,22 @@ mod tests {
                         .flat_map(|row| row.glyphs.iter().map(|glyph| glyph.chr))
                         .collect(),
                     rect,
+                    glyphs: {
+                        let mut ink = Rect::NOTHING;
+                        for row in &text.galley.rows {
+                            for glyph in &row.glyphs {
+                                if glyph.uv_rect.is_nothing() {
+                                    continue;
+                                }
+                                let min = text.pos
+                                    + row.pos.to_vec2()
+                                    + glyph.pos.to_vec2()
+                                    + glyph.uv_rect.offset;
+                                ink = ink.union(Rect::from_min_size(min, glyph.uv_rect.size));
+                            }
+                        }
+                        ink.is_positive().then_some(ink)
+                    },
                     rows: text.galley.rows.len(),
                     color: text.override_text_color.unwrap_or_else(|| {
                         text.galley
@@ -10000,6 +10019,14 @@ mod tests {
     /// future edit break the greyed one silently, and asserting only that the
     /// two AGREE would be satisfied by both being wrong together, so each is
     /// checked against the cell it is drawn in.
+    ///
+    /// **Measured on the glyphs' ink, not on the galley box.** This test used
+    /// to read the box, and passed while the owner looked at the Sync page's
+    /// `5` and said "feels not centered": both branches centred their line
+    /// BOX, a 12-point row carries its descender band under the digits, and
+    /// the ink sat a point above the middle -- measured, `-1.00pt`. The box
+    /// is exactly what was centred when it looked wrong, so it cannot be the
+    /// oracle.
     #[test]
     fn the_minutes_number_is_centred_in_its_cell_in_both_states() {
         let minutes = clamp_auto_lock_minutes(Settings::default().auto_lock_minutes).to_string();
@@ -10024,11 +10051,11 @@ mod tests {
                 Pos2::new(outer.min.x + STEPPER_STEP_WIDTH, outer.min.y),
                 Vec2::new(STEPPER_VALUE_WIDTH, STEPPER_HEIGHT),
             );
-            let number = painted.rect_of(&minutes);
+            let number = painted.ink_of(&minutes).glyphs.expect("the number painted no ink");
             // Half a point: the two branches lay the glyphs out by different
             // routes and their widths differ by ~0.1pt, so an exact equality
-            // would be measuring rounding rather than centring. The defect
-            // this catches was 6.0 and 3.5.
+            // would be measuring rounding rather than centring. The defects
+            // this catches were 6.0 and 3.5, and then the box-centred 1.0.
             assert!(
                 (number.center().x - cell.center().x).abs() < 0.5,
                 "{state}: the minutes number is not horizontally centred in its cell -- \
