@@ -14290,6 +14290,11 @@ fn ensure_icon_loaded(
         // fallback lives inside `favicon::fetch_icon_for`, not here: a loader
         // that re-asked `icon_source_for` after a miss would have to know
         // which hosts are allowed a second ask, which is the same rule again.
+        // Kept for the warning below: `domain` moves into the fetch, and a
+        // warning that names only an item id cannot be read against the site
+        // it tried -- the owner's `prod.beeline.com` was a monogram for a
+        // whole session with nothing in the log to say which address failed.
+        let site = domain.clone();
         let pixels = chosen.or_else(|| {
             let domain = domain?;
             let source =
@@ -14313,7 +14318,10 @@ fn ensure_icon_loaded(
             // -- an item wearing a monogram when they expected a picture --
             // and the lines above it in the log say which candidate failed
             // and how.
-            log::warn!("icon: nothing usable came back for item {item_id}; it keeps its monogram");
+            log::warn!(
+                "icon: nothing usable came back for item {item_id} ({}); it keeps its monogram",
+                site.as_deref().unwrap_or("its chosen icon URL")
+            );
         }
         let _ = tx.send(FaviconResult { item_id, pixels });
     });
