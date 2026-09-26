@@ -3253,11 +3253,28 @@ pub fn draw_detail_read(
     // Gated on the kind as well as on there being a URI: this card is the
     // autofill *targets* card, and advertising targets for an item the fill
     // path will not fill is the same false promise the Fill button was.
-    let website = login
-        .and_then(|l| l.uris.first())
-        .and_then(|u| u.uri.as_deref())
+    //
+    // **Every one of them**, because an item can have several and this card
+    // showed one: the owner, of a login with two, "So if record has two
+    // websites - only one gets shown for example Hayward OmniLogic record".
+    // The edit form has drawn a row per website since 8a and this pane drew
+    // `uris.first()`, so the two panes disagreed about what the item holds
+    // one click apart.
+    let websites: Vec<&str> = login
         .filter(|_| kind_offers_fill(kind))
-        .unwrap_or("");
+        .map(|l| {
+            l.uris
+                .iter()
+                .filter_map(|u| u.uri.as_deref())
+                .filter(|uri| !uri.trim().is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // **The chord still copies the FIRST**, which is the one this item's
+    // page is drawn from and its icon fetched from -- the edit form says so
+    // in as many words (`detail_edit::WEBSITE_FIRST_NOTE`). A chord that
+    // asked "which one" would not be a chord.
+    let website = websites.first().copied().unwrap_or("");
 
     // **The binding, derived up here beside `website` and for the same
     // reason**: CTRL+SHIFT+O is resolved before anything is drawn, and the
@@ -4207,43 +4224,53 @@ pub fn draw_detail_read(
         ui.add_space(CARD_GAP);
     }
 
-    if !website.is_empty() {
+    if !websites.is_empty() {
         card(ui, "AUTOFILL TARGETS", |ui| {
-            // **Two things one click can mean, split by where it lands.**
-            // The URL text is the link -- clicking it opens the browser --
-            // and the rest of the tile copies, like every other row on this
-            // pane. That split is safe for exactly the reason the eye's is
-            // (see `copy_row`): `row_impl` senses the tile on a `UiBuilder`
-            // background, which egui registers when the `Ui` is created and
-            // therefore *before* its children, and a click goes to the
-            // topmost widget under the pointer and to nothing else. The link
-            // is a child, so it wins its own click and does not also copy.
-            // Pinned by `clicking_the_website_link_opens_it_without_copying`,
-            // which asserts both halves in one frame.
-            let mut opened = false;
-            copy_row(
-                ui,
-                // See `copy_shortcut_label`: one string for the row and its
-                // toast.
-                copy_shortcut_label(CopyShortcut::Url),
-                |ui| {
-                    opened = theme::link_label(ui, website, ROW_VALUE_SIZE)
-                        .on_hover_text("Open in browser")
-                        .clicked();
-                },
-                |_ui| {},
-                DetailAction::CopyValue(website.to_string()),
-                Some(CopyShortcut::Url),
-                // Not a constant `true`: this card is already gated on
-                // `!website.is_empty()` above, and stating the rule through
-                // the same predicate every other row uses means the two
-                // cannot drift if that gate ever changes.
-                row_offers_copy(website),
-                &mut action,
-                RowShape::Columns,
-            );
-            if opened {
-                action = DetailAction::OpenWebsite(website.to_string());
+            for (index, uri) in websites.iter().enumerate() {
+                // **Two things one click can mean, split by where it
+                // lands.** The URL text is the link -- clicking it opens the
+                // browser -- and the rest of the tile copies, like every
+                // other row on this pane. That split is safe for exactly the
+                // reason the eye's is (see `copy_row`): `row_impl` senses
+                // the tile on a `UiBuilder` background, which egui registers
+                // when the `Ui` is created and therefore *before* its
+                // children, and a click goes to the topmost widget under the
+                // pointer and to nothing else. The link is a child, so it
+                // wins its own click and does not also copy. Pinned by
+                // `clicking_the_website_link_opens_it_without_copying`,
+                // which asserts both halves in one frame.
+                let mut opened = false;
+                copy_row(
+                    ui,
+                    // `Website`, `Website 2`, `Website 3` -- the edit form's
+                    // own numbering, so the same row is called the same
+                    // thing on the two panes. The first keeps the bare word
+                    // because `copy_shortcut_label` is what the chord's
+                    // toast says, and the chord copies that one.
+                    &super::detail_edit::website_label(index),
+                    |ui| {
+                        opened = theme::link_label(ui, uri, ROW_VALUE_SIZE)
+                            .on_hover_text("Open in browser")
+                            .clicked();
+                    },
+                    |_ui| {},
+                    DetailAction::CopyValue((*uri).to_string()),
+                    // **The chord is offered on the first row only.** It
+                    // copies one website and a chord hint on three rows
+                    // would promise it copies whichever one you are looking
+                    // at.
+                    (index == 0).then_some(CopyShortcut::Url),
+                    // Not a constant `true`: the list is already filtered to
+                    // non-empty above, and stating the rule through the same
+                    // predicate every other row uses means the two cannot
+                    // drift if that filter ever changes.
+                    row_offers_copy(uri),
+                    &mut action,
+                    RowShape::Columns,
+                );
+                if opened {
+                    action = DetailAction::OpenWebsite((*uri).to_string());
+                }
             }
         });
         ui.add_space(CARD_GAP);
@@ -17849,6 +17876,60 @@ mod tests {
             "clicking the URL reported {:?} -- the link must open the browser, and it \
              must not be the tile's copy that answered",
             clicked.action
+        );
+    }
+
+    /// **An item with several websites shows all of them**, numbered the
+    /// way the edit form numbers them, each its own link -- and the chord
+    /// still copies the first.
+    ///
+    /// This pane read `login.uris.first()` and drew one row, where the edit
+    /// form has drawn a row per website since 8a: the two panes disagreed
+    /// about what the item holds, one click apart. The owner, with a login
+    /// that has two: "So if record has two websites - only one gets shown
+    /// for example Hayward OmniLogic record".
+    #[test]
+    fn every_website_on_the_item_gets_a_row_of_its_own() {
+        const SECOND: &str = "portal.ledgerline.example";
+        let mut item = a_login();
+        item.login.as_mut().expect("a_login has login data").uris.push(
+            crate::vault_bridge::UriEntry {
+                uri: Some(SECOND.to_string()),
+                other: serde_json::Map::new(),
+            },
+        );
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+
+        for (label, uri) in [("Website", WEBSITE), ("Website 2", SECOND)] {
+            assert!(
+                laid_out.painted(label),
+                "no {label:?} row: {:?}",
+                laid_out.strings()
+            );
+            assert!(laid_out.painted(uri), "{uri:?} is not on the pane");
+        }
+
+        // The second row is a link of its own, and it opens ITS own url.
+        let clicked =
+            pane.click(&item, &TotpState::NoSecret, laid_out.rect_of(SECOND).center());
+        assert_eq!(clicked.action, DetailAction::OpenWebsite(SECOND.to_string()));
+
+        // ...and the chord copies the FIRST, which is the one this item's
+        // page is drawn from -- see `detail_edit::WEBSITE_FIRST_NOTE`.
+        let mut pane = Pane::new();
+        let _ = pane.idle(&item, &TotpState::NoSecret);
+        let chord = vec![egui::Event::Key {
+            key: egui::Key::U,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
+        }];
+        assert_eq!(
+            pane.frame(&item, &TotpState::NoSecret, chord).action,
+            DetailAction::CopyValue(WEBSITE.to_string()),
+            "the chord copied something other than the first website"
         );
     }
 
