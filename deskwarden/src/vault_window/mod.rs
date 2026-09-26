@@ -933,13 +933,16 @@ pub fn build_frame_with_search(
     let mut last_sync_failed = false;
     let mut was_focused = true;
     // **The server's own word that something changed** -- see
-    // `crate::rest::notifications`. Started on the first real frame and
-    // dropped with this closure, which closes the connection. Nothing has to
-    // wake the window when a notice lands: `FRAME_INTERVAL` already runs a
-    // frame every half second, and a notice waits `Timing::settle` anyway. `hub_seen` is how many of its
-    // notices a sync has already answered.
+    // `crate::rest::notifications`. Started on the first real frame while
+    // Preferences' "Live updates from the server" is on, dropped -- closing
+    // the connection -- when it is turned off or with this closure. Nothing
+    // has to wake the window when a notice lands: `FRAME_INTERVAL` already
+    // runs a frame every half second, and a notice waits `Timing::settle`
+    // anyway. `hub_wanted` is the switch as last acted on, so the listener
+    // is started or dropped on a CHANGE and not re-made every frame;
+    // `hub_seen` is how many of its notices a sync has already answered.
     let mut hub: Option<crate::rest::notifications::HubListener> = None;
-    let mut hub_started = false;
+    let mut hub_wanted: Option<bool> = None;
     let mut hub_seen: u64 = 0;
     // True once the auto-sync below has fired. The window's first paint
     // shows whatever's already cached locally -- exactly like the Sync
@@ -1582,6 +1585,13 @@ pub fn build_frame_with_search(
         || crate::settings::Settings::default().sync_poll_interval(),
         |path| crate::settings::Settings::load(path).sync_poll_interval(),
     );
+    // **Whether this window takes live updates** -- `Settings::sync_push`,
+    // read and live-edited exactly as the poll interval above is.
+    let sync_push_at_open = settings_path
+        .as_deref()
+        .map_or(crate::settings::Settings::default().sync_push, |path| {
+            crate::settings::Settings::load(path).sync_push
+        });
     // Whether a PUBLIC host's icon may be fetched from that host directly
     // rather than through the icon service, read the same way and
     // live-editable for the same reason. Off by default, and off when there
@@ -1943,9 +1953,15 @@ pub fn build_frame_with_search(
         // item elsewhere looks for it here; and a slow timer for a window
         // that never loses focus. The last two stand down while the push
         // channel is live.
-        if !hub_started {
-            hub_started = true;
-            hub = (start_hub)();
+        let push_on = edited_settings_for_closure
+            .borrow()
+            .as_ref()
+            .map_or(sync_push_at_open, |settings| settings.sync_push);
+        if hub_wanted != Some(push_on) {
+            hub_wanted = Some(push_on);
+            // A new listener counts its notices from zero.
+            hub_seen = 0;
+            hub = if push_on { (start_hub)() } else { None };
         }
         let pushed = hub.as_ref().and_then(|hub| hub.pending(hub_seen, Instant::now()));
         let hub_live = hub.as_ref().is_some_and(crate::rest::notifications::HubListener::is_live);
@@ -1975,6 +1991,10 @@ pub fn build_frame_with_search(
             // far. The count was read BEFORE the decision, so one landing
             // since is still ahead of `hub_seen` next frame.
             if let Some(count) = pushed {
+                log::info!(
+                    "vault window: syncing for {} change(s) the server announced",
+                    count - hub_seen
+                );
                 hub_seen = count;
             }
             (spawn_sync)(sync_tx.clone(), session_token.to_string());

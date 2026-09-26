@@ -1362,6 +1362,20 @@ pub struct Settings {
     /// preferences window greys its stepper out rather than clearing it), so
     /// turning the toggle back on restores the number the user last chose.
     pub auto_lock_minutes: u64,
+    /// **Whether an open vault window takes live updates from the server.**
+    ///
+    /// On (the default, and what an older `settings.json` without the field
+    /// parses as), the window holds a connection to the server's
+    /// notifications hub -- `crate::rest::notifications` -- and syncs within
+    /// seconds of the server announcing a change made anywhere else. The
+    /// owner: "worth adding another setting and enable this by default but
+    /// user can switch to polling". Off, the window opens no connection and
+    /// keeps itself current by [`Self::sync_polling`] alone.
+    ///
+    /// Only the built-in client can hold that connection -- on `bw serve`,
+    /// `bw` keeps the token the hub wants -- so on that backend this switch
+    /// changes nothing and polling is all there is.
+    pub sync_push: bool,
     /// **Whether an open vault window keeps itself current by asking.**
     ///
     /// The window syncs once when it opens and whenever the Sync pill is
@@ -1371,11 +1385,11 @@ pub struct Settings {
     /// see `vault_window`'s `heartbeat_sync_due`. The owner asked for it by
     /// name: "add to setting Update via polling, and interval for polling".
     ///
-    /// **Polling is the fallback to a push, not the whole story.** On the
-    /// built-in client the window holds a connection to the server's
-    /// notifications hub (`crate::rest::notifications`) and syncs when the
-    /// server says something changed; this switch does not govern that, and
-    /// polling stands down while the connection is up. On `bw serve` there is
+    /// **Polling is the fallback to a push, not the whole story.** With
+    /// [`Self::sync_push`] on, the built-in client holds a connection to the
+    /// server's notifications hub and syncs when the server says something
+    /// changed; this switch does not govern that, and polling stands down
+    /// while the connection is up. On `bw serve` there is
     /// no such connection -- `bw` holds the token the hub wants and never
     /// hands it over -- so there, and whenever the hub is unreachable, asking
     /// is all there is, and this is the switch over whether the window does.
@@ -1744,6 +1758,7 @@ impl Default for Settings {
             reveal_totp_seed: false,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
+            sync_push: true,
             sync_polling: true,
             sync_poll_minutes: DEFAULT_SYNC_POLL_MINUTES,
             clear_clipboard: true,
@@ -1888,6 +1903,7 @@ impl Settings {
             reveal_totp_seed,
             auto_lock_enabled,
             auto_lock_minutes,
+            sync_push,
             sync_polling,
             sync_poll_minutes,
             clear_clipboard,
@@ -1941,6 +1957,7 @@ impl Settings {
         on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
+        on_disk.sync_push = *sync_push;
         on_disk.sync_polling = *sync_polling;
         on_disk.sync_poll_minutes = *sync_poll_minutes;
         on_disk.clear_clipboard = *clear_clipboard;
@@ -2445,6 +2462,7 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
+            sync_push: false,
             sync_polling: false,
             sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the
@@ -2711,10 +2729,13 @@ mod tests {
 
     /// **Polling is on by default, at five minutes, and a hand-edited file
     /// cannot take it outside one minute to two hours.** Off means `None`,
-    /// which is what switches the window's heartbeat off altogether.
+    /// which is what switches the window's heartbeat off altogether. And
+    /// live updates are on by default, which is the owner's "enable this by
+    /// default".
     #[test]
     fn the_polling_interval_defaults_on_and_is_held_to_its_range() {
         let fresh = Settings::default();
+        assert!(fresh.sync_push, "a fresh install takes no live updates");
         assert!(fresh.sync_polling, "a fresh install does not poll");
         assert_eq!(
             fresh.sync_poll_interval(),
@@ -2724,6 +2745,7 @@ mod tests {
         // An older settings.json without either key parses as the default.
         let old: Settings = serde_json::from_str("{}").expect("an empty file parses");
         assert!(old.sync_polling && old.sync_poll_minutes == DEFAULT_SYNC_POLL_MINUTES);
+        assert!(old.sync_push, "an older file turns live updates off");
 
         for (stored, used) in [(0, 1), (1, 1), (17, 17), (120, 120), (500, 120), (u64::MAX, 120)] {
             let settings = Settings { sync_poll_minutes: stored, ..Settings::default() };
@@ -2773,6 +2795,7 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
+            sync_push: false,
             sync_polling: false,
             sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the
@@ -3517,6 +3540,7 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
+            sync_push: false,
             sync_polling: false,
             sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the

@@ -3920,8 +3920,21 @@ fn vault_cards(ui: &mut Ui, state: &mut PrefsState) {
 ///
 /// **On a page of its own** -- see [`Section::Sync`] for why not the
 /// Vault page's third card, which is where it was first put.
+///
+/// **Live updates sit above it**, on by default -- the owner: "worth adding
+/// another setting and enable this by default but user can switch to
+/// polling". The two are separate switches rather than one choice because
+/// they are not exclusive: with live updates on, polling is what keeps the
+/// window current while the server's connection is down.
 fn draw_sync_poll_card(ui: &mut Ui, state: &mut PrefsState) {
     card(ui, |ui| {
+        state.settings.sync_push = toggle_row(
+            ui,
+            SYNC_PUSH_LABEL,
+            SYNC_PUSH_DESCRIPTION,
+            state.settings.sync_push,
+        );
+        row_separator(ui);
         state.settings.sync_polling = toggle_row(
             ui,
             SYNC_POLL_ENABLED_LABEL,
@@ -3957,9 +3970,17 @@ const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
 /// download every five minutes when it does not.
 const SYNC_POLL_ENABLED_DESCRIPTION: &str =
     "Check for changes made in other Bitwarden apps while the vault window is open: when you \
-     switch back to it, and on the interval below. When your server announces changes itself, \
-     these checks only run while that connection is down. Off, the vault still updates when \
-     the window opens, when you press Sync, and when the server announces a change.";
+     switch back to it, and on the interval below. With live updates connected, these checks \
+     pause. Off, the vault still updates when the window opens and when you press Sync.";
+
+/// The live-updates switch, above the polling one.
+const SYNC_PUSH_LABEL: &str = "Live updates from the server";
+/// Says what it does, where it works, and what off means -- the last because
+/// "switch to polling" is the owner's own description of turning it off.
+const SYNC_PUSH_DESCRIPTION: &str =
+    "Keep a connection open so the server can announce changes made in other Bitwarden apps; \
+     the vault window updates within seconds. Needs the built-in client and a server that \
+     supports it. Off, the vault window uses polling below.";
 const SYNC_POLL_LABEL: &str = "Check every";
 const SYNC_POLL_DESCRIPTION: &str =
     "Minutes between checks while the window stays open. Each check downloads the vault, so \
@@ -8211,33 +8232,44 @@ mod tests {
         );
     }
 
+    /// **The Sync page's two switches each write their own setting.** The
+    /// owner asked for both: "add to setting Update via polling, and interval
+    /// for polling", then "worth adding another setting and enable this by
+    /// default but user can switch to polling". Live updates are the upper
+    /// switch; each click is checked to move its field and not its neighbour.
+    #[test]
+    fn the_sync_pages_two_switches_each_write_their_own_setting() {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Sync;
+        assert!(state.settings.sync_push, "the default: live updates on");
+        assert!(state.settings.sync_polling, "the default: polling on");
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        for label in [SYNC_PUSH_LABEL, SYNC_POLL_ENABLED_LABEL, SYNC_POLL_LABEL] {
+            assert!(first.contains(label), "{label:?} missing: {:?}", first.strings());
+        }
+        let pills = first.rects_of_size(TOGGLE_SIZE);
+        assert_eq!(pills.len(), 2, "the Sync page paints two switches");
+        assert!(
+            first.ink_of(SYNC_PUSH_LABEL).rect.top() < first.ink_of(SYNC_POLL_ENABLED_LABEL).rect.top(),
+            "live updates are not the upper switch"
+        );
+
+        tall_frame(&ctx, &mut state, &click(pills[0].center()));
+        assert!(!state.settings.sync_push, "the upper switch did not turn live updates off");
+        assert!(state.settings.sync_polling, "the upper switch moved polling");
+
+        tall_frame(&ctx, &mut state, &click(pills[1].center()));
+        assert!(!state.settings.sync_polling, "the lower switch did not turn polling off");
+        assert!(!state.settings.sync_push, "the lower switch moved live updates");
+    }
+
     /// **The disk-cache switch, driven at the pane.** The row exists, it is
     /// wired to `cache_vault_to_disk`, and it is wired to THAT field and not
     /// to a neighbour -- which for this row is worth pinning twice over,
     /// since the neighbour above it decides whether a background process
     /// runs and this one decides whether a decrypted vault goes on the disk.
-    /// **The Sync page's switch writes the setting it is drawn from.** The
-    /// owner: "add to setting Update via polling, and interval for polling".
-    #[test]
-    fn the_sync_pages_switch_turns_polling_off() {
-        let ctx = tall_context();
-        let mut state = PrefsState::new(Settings::default());
-        state.section = Section::Sync;
-        assert!(state.settings.sync_polling, "the default: polling on");
-
-        let first = tall_frame(&ctx, &mut state, &[]);
-        assert!(first.contains(SYNC_POLL_ENABLED_LABEL), "{:?}", first.strings());
-        assert!(first.contains(SYNC_POLL_LABEL), "{:?}", first.strings());
-        let pills = first.rects_of_size(TOGGLE_SIZE);
-        assert_eq!(pills.len(), 1, "the Sync page paints one switch");
-        tall_frame(&ctx, &mut state, &click(pills[0].center()));
-        assert!(
-            !state.settings.sync_polling,
-            "the switch did not turn polling off -- the row is painted but its value is \
-             never written back"
-        );
-    }
-
     #[test]
     fn clicking_the_disk_cache_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = tall_context();

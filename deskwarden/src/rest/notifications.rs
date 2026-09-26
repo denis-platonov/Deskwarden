@@ -82,8 +82,10 @@ const PING: &str = "{\"type\":6}\u{1e}";
 enum HubMessage {
     /// The answer to [`HANDSHAKE`]: `{}`, or `{"error": ..}` on a refusal.
     HandshakeAck { error: Option<String> },
-    /// A `ReceiveMessage` whose type means the vault on screen may be stale.
-    VaultChanged,
+    /// A `ReceiveMessage` whose type means the vault on screen may be stale,
+    /// with that type -- for the log line, which is how "did the server say
+    /// anything?" is answered without a debugger.
+    VaultChanged(i64),
     /// Anything else the server may say: a keep-alive, an invocation of a
     /// type this app has no use for (a Send, a login-with-device request),
     /// a completion.
@@ -121,7 +123,7 @@ fn read_one(frame: &str) -> HubMessage {
                 .and_then(serde_json::Value::as_i64);
             match (target, push_type) {
                 (Some("ReceiveMessage"), Some(push_type)) if notice_for(push_type) => {
-                    HubMessage::VaultChanged
+                    HubMessage::VaultChanged(push_type)
                 }
                 _ => HubMessage::Ignored,
             }
@@ -596,14 +598,17 @@ fn one_connection(
                     }
                     *connected_before = true;
                 }
-                HubMessage::VaultChanged if acked => shared.notice(),
+                HubMessage::VaultChanged(push_type) if acked => {
+                    log::info!("the notifications hub says the vault changed (push type {push_type})");
+                    shared.notice();
+                }
                 HubMessage::Close => {
                     return Ended::Dropped("the hub said goodbye".to_string());
                 }
                 HubMessage::Unreadable => {
                     return Ended::Unsupported("a hub protocol other than JSON".to_string());
                 }
-                HubMessage::VaultChanged | HubMessage::Ignored => {}
+                HubMessage::VaultChanged(_) | HubMessage::Ignored => {}
             }
         }
     }
@@ -722,8 +727,8 @@ mod tests {
     fn each_message_the_hub_sends_is_read_for_what_it_means() {
         let pascal = "{\"type\":1,\"target\":\"ReceiveMessage\",\"arguments\":[{\"ContextId\":null,\"Type\":0,\"Payload\":{}}]}\u{1e}";
         let camel = "{\"type\":1,\"target\":\"ReceiveMessage\",\"arguments\":[{\"contextId\":null,\"type\":9,\"payload\":{}}]}\u{1e}";
-        assert_eq!(read_messages(pascal), [HubMessage::VaultChanged]);
-        assert_eq!(read_messages(camel), [HubMessage::VaultChanged]);
+        assert_eq!(read_messages(pascal), [HubMessage::VaultChanged(0)]);
+        assert_eq!(read_messages(camel), [HubMessage::VaultChanged(9)]);
         assert_eq!(read_messages(PING), [HubMessage::Ignored]);
         assert_eq!(read_messages("{}\u{1e}"), [HubMessage::HandshakeAck { error: None }]);
         assert_eq!(
@@ -734,7 +739,7 @@ mod tests {
         // Several records in one frame, in order.
         assert_eq!(
             read_messages(&format!("{{}}\u{1e}{PING}{pascal}")),
-            [HubMessage::HandshakeAck { error: None }, HubMessage::Ignored, HubMessage::VaultChanged]
+            [HubMessage::HandshakeAck { error: None }, HubMessage::Ignored, HubMessage::VaultChanged(0)]
         );
     }
 
@@ -750,7 +755,11 @@ mod tests {
             )
         };
         for push_type in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 17, 18, 19] {
-            assert_eq!(read_messages(&invocation(push_type)), [HubMessage::VaultChanged], "{push_type}");
+            assert_eq!(
+                read_messages(&invocation(push_type)),
+                [HubMessage::VaultChanged(push_type)],
+                "{push_type}"
+            );
         }
         for push_type in [12, 13, 14, 15, 16, 20, 102] {
             assert_eq!(read_messages(&invocation(push_type)), [HubMessage::Ignored], "{push_type}");
