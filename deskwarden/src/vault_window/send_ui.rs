@@ -11463,6 +11463,19 @@ mod source_pins {
     /// the name (fails here, whatever the syntax around it -- a `let`, a
     /// struct field, a `match` arm, a closure) or obtain the pointer some
     /// other way, which the crate-wide map below refuses.
+    ///
+    /// **Three, since the window's heartbeat.** The third site is
+    /// `heartbeat_sync_due`'s, and it IS a `bw sync` under a per-frame `if`
+    /// -- the exact shape the paragraph above calls an unbounded stream. It
+    /// is counted here on purpose rather than routed round this pin, and
+    /// what bounds it is not its spelling: it never fires while a sync is
+    /// out, never within `HEARTBEAT_FOCUS_GAP` of the last attempt by any
+    /// door, and never within `HEARTBEAT_AFTER_FAILURE` of a failed one.
+    /// Those floors are pinned where they are decided, in
+    /// `heartbeat_sync_due`'s own tests; and the multi-frame scenarios in
+    /// this module still count exactly the syncs they expect with the
+    /// heartbeat compiled in, which is the behavioural half of "not a
+    /// stream".
     #[test]
     fn both_sync_call_sites_pass_the_windows_own_session() {
         let closure = squashed(&frame_closure());
@@ -11471,16 +11484,17 @@ mod source_pins {
         let opener = concat!("(spawn_", "sync)(");
         assert_eq!(
             closure.matches(&call).count(),
-            2,
-            "{call:?} is not written in the frame closure exactly twice. The two Sync call \
-             sites are the auto-sync on the window's first real frame and the status \
-             pill's press, and each must hand over the window's own session: a `bw sync` \
-             started with an empty `BW_SESSION` is answered `Locked` by a real vault"
+            3,
+            "{call:?} is not written in the frame closure exactly three times. The Sync \
+             call sites are the auto-sync on the window's first real frame, the window's \
+             heartbeat and the status pill's press, and each must hand over the window's \
+             own session: a `bw sync` started with an empty `BW_SESSION` is answered \
+             `Locked` by a real vault"
         );
         assert_eq!(
             closure.matches(opener).count(),
-            2,
-            "{opener:?} is called from the frame closure {} times, not twice -- there is a \
+            3,
+            "{opener:?} is called from the frame closure {} times, not three -- there is a \
              Sync call site spelled some other way, and the frame harness observes only \
              the sites it reaches",
             closure.matches(opener).count()
@@ -11502,9 +11516,9 @@ mod source_pins {
         let name = concat!("spawn_", "sync");
         assert_eq!(
             closure.matches(name).count(),
-            2,
-            "{name:?} is NAMED in the frame closure {} times, not twice. The two times it \
-             may be named are the two `(spawn_sync)(` call sites counted just above; any \
+            3,
+            "{name:?} is NAMED in the frame closure {} times, not three. The three times it \
+             may be named are the three `(spawn_sync)(` call sites counted just above; any \
              further mention -- `let sync_now = spawn_sync;`, a struct field, a `match` \
              arm, a closure that forwards to it -- is a third `bw sync` call site whose \
              spelling no literal count reaches, and one written under a per-frame `if` is \
@@ -11537,10 +11551,15 @@ mod source_pins {
         // inline would block the loop that answers the tray for up to ~30 s
         // -- the exact freeze the child was moved out to remove. The count
         // moved with a reason; it is still exact, and a fifth still fails.
+        //
+        // **And four in `vault_window/mod.rs` since the window's heartbeat**
+        // -- the binding and now THREE calls, the third being
+        // `heartbeat_sync_due`'s. See the doc on this test for what bounds
+        // it; the count moved with the same kind of reason as `main.rs`'s.
         for (needle, expected) in [
             (
                 concat!("spawn_", "sync"),
-                vec![("main.rs", 4usize), ("vault_window/mod.rs", 3)],
+                vec![("main.rs", 4usize), ("vault_window/mod.rs", 4)],
             ),
             (concat!("env.", "sync"), vec![("vault_window/mod.rs", 1)]),
             (concat!("spawn_vault_", "sync"), vec![("vault_window/mod.rs", 2)]),

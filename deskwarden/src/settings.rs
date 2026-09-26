@@ -17,6 +17,36 @@ use crate::hotkey::Chord;
 /// until the 3e preferences window exists".
 const DEFAULT_AUTO_LOCK_MINUTES: u64 = 15;
 
+/// How often an open vault window asks the server whether anything has
+/// changed, when polling is on and the stored value is absent. See
+/// [`Settings::sync_poll_interval`].
+pub const DEFAULT_SYNC_POLL_MINUTES: u64 = 5;
+
+/// The bounds [`clamp_sync_poll_minutes`] holds the stored value to.
+///
+/// **One minute at the least**, because every poll is a whole-vault `bw sync`
+/// -- about a second of network and decryption on a large vault -- and a
+/// window asking more often than that is a window doing little else. **Two
+/// hours at the most**, because past that the heartbeat is not keeping a
+/// window current, it is an occasional accident; turning polling off is the
+/// honest way to say "never".
+pub const MIN_SYNC_POLL_MINUTES: u64 = 1;
+pub const MAX_SYNC_POLL_MINUTES: u64 = 120;
+
+/// The poll interval as the window may use it: held to
+/// [`MIN_SYNC_POLL_MINUTES`]..=[`MAX_SYNC_POLL_MINUTES`] whatever a
+/// hand-edited `settings.json` says.
+#[must_use]
+pub const fn clamp_sync_poll_minutes(minutes: u64) -> u64 {
+    if minutes < MIN_SYNC_POLL_MINUTES {
+        MIN_SYNC_POLL_MINUTES
+    } else if minutes > MAX_SYNC_POLL_MINUTES {
+        MAX_SYNC_POLL_MINUTES
+    } else {
+        minutes
+    }
+}
+
 /// Floor applied to `auto_lock_minutes` by [`auto_lock_policy`], regardless of
 /// what's stored on disk.
 ///
@@ -1332,6 +1362,25 @@ pub struct Settings {
     /// preferences window greys its stepper out rather than clearing it), so
     /// turning the toggle back on restores the number the user last chose.
     pub auto_lock_minutes: u64,
+    /// **Whether an open vault window keeps itself current by asking.**
+    ///
+    /// The window syncs once when it opens and whenever the Sync pill is
+    /// pressed. With this on (the default, and what an older `settings.json`
+    /// without the field parses as) it also syncs when it is brought back to
+    /// the front and every [`Self::sync_poll_minutes`] while it stays open --
+    /// see `vault_window`'s `heartbeat_sync_due`. The owner asked for it by
+    /// name: "add to setting Update via polling, and interval for polling".
+    ///
+    /// **Polling, and not a push**, because the vault is read through
+    /// `bw serve`, the one Bitwarden client that holds no connection to the
+    /// server's notifications hub. Bitwarden's own apps are told when an
+    /// item changes; this one has to ask, and this is the switch over whether
+    /// it does.
+    pub sync_polling: bool,
+    /// Minutes between polls while [`Self::sync_polling`] is on. Retained
+    /// while polling is off, as [`Self::auto_lock_minutes`] is, so turning
+    /// it back on restores the number the user last chose.
+    pub sync_poll_minutes: u64,
     /// **The master switch over taking a copied secret back off the
     /// clipboard.**
     ///
@@ -1692,6 +1741,8 @@ impl Default for Settings {
             reveal_totp_seed: false,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
+            sync_polling: true,
+            sync_poll_minutes: DEFAULT_SYNC_POLL_MINUTES,
             clear_clipboard: true,
             clear_clipboard_on_lock: true,
             clear_clipboard_on_account_change: true,
@@ -1834,6 +1885,8 @@ impl Settings {
             reveal_totp_seed,
             auto_lock_enabled,
             auto_lock_minutes,
+            sync_polling,
+            sync_poll_minutes,
             clear_clipboard,
             clear_clipboard_on_lock,
             clear_clipboard_on_account_change,
@@ -1885,6 +1938,8 @@ impl Settings {
         on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
+        on_disk.sync_polling = *sync_polling;
+        on_disk.sync_poll_minutes = *sync_poll_minutes;
         on_disk.clear_clipboard = *clear_clipboard;
         on_disk.clear_clipboard_on_lock = *clear_clipboard_on_lock;
         on_disk.clear_clipboard_on_account_change = *clear_clipboard_on_account_change;
@@ -1972,6 +2027,20 @@ impl Settings {
     /// of the reasoning is in [`auto_lock_policy`]; this is only the lookup.
     pub fn auto_lock(&self) -> AutoLock {
         auto_lock_policy(self.auto_lock_enabled, self.auto_lock_minutes)
+    }
+
+    /// **How often an open vault window polls**, or `None` when it does not.
+    ///
+    /// `None` switches the window's heartbeat off altogether -- the timer AND
+    /// the sync on coming back to the window -- leaving the sync on open and
+    /// the Sync pill, which are the two that were there before polling was.
+    #[must_use]
+    pub fn sync_poll_interval(&self) -> Option<std::time::Duration> {
+        self.sync_polling.then(|| {
+            std::time::Duration::from_secs(
+                clamp_sync_poll_minutes(self.sync_poll_minutes).saturating_mul(60),
+            )
+        })
     }
 
     /// What this settings file means for a copied secret's life. All of the
@@ -2373,6 +2442,8 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
+            sync_polling: false,
+            sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the
             // fields above give: a writer that dropped one would round-trip to
             // the default and look identical to one that kept it. The
@@ -2635,6 +2706,35 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// **Polling is on by default, at five minutes, and a hand-edited file
+    /// cannot take it outside one minute to two hours.** Off means `None`,
+    /// which is what switches the window's heartbeat off altogether.
+    #[test]
+    fn the_polling_interval_defaults_on_and_is_held_to_its_range() {
+        let fresh = Settings::default();
+        assert!(fresh.sync_polling, "a fresh install does not poll");
+        assert_eq!(
+            fresh.sync_poll_interval(),
+            Some(Duration::from_secs(DEFAULT_SYNC_POLL_MINUTES * 60))
+        );
+
+        // An older settings.json without either key parses as the default.
+        let old: Settings = serde_json::from_str("{}").expect("an empty file parses");
+        assert!(old.sync_polling && old.sync_poll_minutes == DEFAULT_SYNC_POLL_MINUTES);
+
+        for (stored, used) in [(0, 1), (1, 1), (17, 17), (120, 120), (500, 120), (u64::MAX, 120)] {
+            let settings = Settings { sync_poll_minutes: stored, ..Settings::default() };
+            assert_eq!(
+                settings.sync_poll_interval(),
+                Some(Duration::from_secs(used * 60)),
+                "{stored} minutes on disk"
+            );
+        }
+
+        let off = Settings { sync_polling: false, ..Settings::default() };
+        assert_eq!(off.sync_poll_interval(), None, "off still polls");
+    }
+
     #[test]
     fn both_auto_lock_fields_round_trip_through_settings_json() {
         // Serialised and read back through the real file, not just through
@@ -2670,6 +2770,8 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
+            sync_polling: false,
+            sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the
             // fields above give: a writer that dropped one would round-trip to
             // the default and look identical to one that kept it. The
@@ -3412,6 +3514,8 @@ mod tests {
             reveal_totp_seed: true,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
+            sync_polling: false,
+            sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the
             // fields above give: a writer that dropped one would round-trip to
             // the default and look identical to one that kept it. The

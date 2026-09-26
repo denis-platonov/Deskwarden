@@ -1305,6 +1305,16 @@ pub enum Section {
     /// followed Security then: it is the first page a reader looking for
     /// "where does my vault come from" reaches.
     Vault,
+    /// **Whether an open vault window keeps itself current, and how often.**
+    ///
+    /// Its own page, of two rows, rather than the bottom of
+    /// [`Section::Vault`] -- which is where it was first put, and where it did
+    /// not fit: that page is measured to fit the window with no scroll region
+    /// (`the_whole_vault_page_is_readable_without_scrolling`), and a third
+    /// card ran it to 776 points in a 740-point body. A page of two rows is
+    /// this window's own precedent -- see [`Section::Lock`] -- and "how fresh
+    /// is what I am looking at" is a question with one place to go.
+    Sync,
     /// **The local HTTP API, and every key that opens it**: the switch that
     /// starts the endpoint on 127.0.0.1, the form that mints a key, the one
     /// showing of a key it has just made, the list of the keys that exist,
@@ -1364,13 +1374,18 @@ impl Section {
     /// The nav, top to bottom.
     /// **Ten, not nine.** `Section::Shortcuts` was added directly after
     /// General; see its own doc for the placement rule it was placed by.
-    pub const ALL: [Section; 10] = [
+    ///
+    /// **Eleven since `Section::Sync`**, directly after Vault, because it is
+    /// the same subject: where the vault on screen comes from, and now how
+    /// fresh it is.
+    pub const ALL: [Section; 11] = [
         Section::General,
         Section::Shortcuts,
         Section::View,
         Section::Lock,
         Section::Breaches,
         Section::Vault,
+        Section::Sync,
         Section::Api,
         Section::Clipboard,
         Section::Updates,
@@ -1387,6 +1402,7 @@ impl Section {
             Section::Lock => "Lock",
             Section::Breaches => "Breaches",
             Section::Vault => "Vault",
+            Section::Sync => "Sync",
             Section::Api => "Local API",
             Section::Clipboard => "Clipboard",
             Section::Updates => "Updates",
@@ -1450,6 +1466,10 @@ impl Section {
             Section::Vault => {
                 "Where this vault comes from, and what is kept of it on this PC."
             }
+            // The question the page answers, not the mechanism: a reader who
+            // changed an item in the Bitwarden app is asking when it shows up
+            // here.
+            Section::Sync => "When the vault window picks up changes made in other Bitwarden apps.",
             // Names the door before the keys, for the reason the page draws
             // them in that order: the keys mean nothing while nothing is
             // listening, and a reader who has not grasped that there IS an
@@ -1495,6 +1515,11 @@ pub struct PrefsState {
     /// way to "45". It is reconciled back to the committed value the moment the
     /// field loses focus (see [`minutes_stepper`]).
     auto_lock_text: String,
+    /// The same thing for the polling interval's field -- see
+    /// [`Self::auto_lock_text`], and for the same reason. Its own buffer, as
+    /// the clipboard interval's is, because the two minutes fields are on
+    /// different pages and each keeps its own committed value.
+    sync_poll_text: String,
     /// The same thing for the clipboard interval, and for the same reason:
     /// mid-edit the field may be empty, or `"0."` on the way to `"0.5"`.
     ///
@@ -1766,15 +1791,18 @@ impl PrefsState {
     /// doing.
     pub fn new(settings: Settings) -> Self {
         let minutes = clamp_auto_lock_minutes(settings.auto_lock_minutes);
+        let poll_minutes = crate::settings::clamp_sync_poll_minutes(settings.sync_poll_minutes);
         let interval = ClearInterval::from_seconds(settings.clear_clipboard_seconds);
         Self {
             settings: Settings {
                 auto_lock_minutes: minutes,
+                sync_poll_minutes: poll_minutes,
                 clear_clipboard_seconds: interval.seconds(),
                 ..settings
             },
             section: Section::General,
             auto_lock_text: minutes.to_string(),
+            sync_poll_text: poll_minutes.to_string(),
             clipboard_interval_text: interval.as_minutes_text(),
             clipboard_entry_error: None,
             // No row is listening when the window opens, and nothing has been
@@ -1961,23 +1989,29 @@ impl PrefsState {
 /// leaves the previous value alone rather than resetting to a default: the
 /// user pressing Escape's worth of nonsense should not silently change their
 /// lock timeout.
-fn parse_minutes_entry(text: &str, previous: u64) -> u64 {
+/// [`parse_minutes_entry`] held to a range of the caller's -- the stepper is
+/// shared by every minutes setting on this window, and each has its own
+/// bounds (see `settings::clamp_sync_poll_minutes`).
+fn parse_minutes_entry_with(text: &str, previous: u64, clamp: MinutesClamp) -> u64 {
     match text.trim().parse::<u64>() {
-        Ok(minutes) => clamp_auto_lock_minutes(minutes),
-        Err(_) => clamp_auto_lock_minutes(previous),
+        Ok(minutes) => clamp(minutes),
+        Err(_) => clamp(previous),
     }
 }
 
+/// The range a minutes stepper holds its value to.
+type MinutesClamp = fn(u64) -> u64;
+
 /// One step down, never below the floor.
-fn decrement_minutes(value: u64) -> u64 {
-    clamp_auto_lock_minutes(value.saturating_sub(1))
+fn decrement_minutes_with(value: u64, clamp: MinutesClamp) -> u64 {
+    clamp(value.saturating_sub(1))
 }
 
 /// One step up. `saturating_add` for the same reason `auto_lock_timeout`
 /// saturates: `u64::MAX` is reachable from a hand-edited file, and `+ 1` on it
 /// panics in a debug build.
-fn increment_minutes(value: u64) -> u64 {
-    clamp_auto_lock_minutes(value.saturating_add(1))
+fn increment_minutes_with(value: u64, clamp: MinutesClamp) -> u64 {
+    clamp(value.saturating_add(1))
 }
 
 /// `[-] [ 15 ] [+]` in 3e's segmented-control box. Returns the value after this
@@ -1993,6 +2027,17 @@ fn increment_minutes(value: u64) -> u64 {
 /// left to focus, click into, or type at. "Looks disabled" and "is disabled"
 /// are the pair this codebase keeps having to reunite.
 fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String, enabled: bool) -> u64 {
+    minutes_stepper_with(ui, value, buffer, enabled, clamp_auto_lock_minutes)
+}
+
+/// [`minutes_stepper`] over a range of the caller's -- see [`MinutesClamp`].
+fn minutes_stepper_with(
+    ui: &mut Ui,
+    value: u64,
+    buffer: &mut String,
+    enabled: bool,
+    clamp: MinutesClamp,
+) -> u64 {
     let (outer, _) = ui.allocate_exact_size(
         Vec2::new(STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH, STEPPER_HEIGHT),
         Sense::hover(),
@@ -2040,17 +2085,17 @@ fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String, enabled: bool) 
     // A step operates on what the field currently *shows*, not on the last
     // committed value, so typing 45 and then pressing `+` gives 46 rather than
     // discarding the 45 and giving 16.
-    let shown = parse_minutes_entry(buffer, value);
+    let shown = parse_minutes_entry_with(buffer, value, clamp);
     let mut next = value;
     // The floor is shown, not merely enforced: at the minimum there is nothing
     // below to step to, and a `-` that accepts the click and refuses the change
     // is the same lie as a switch that does nothing. `enabled &&` in front of
     // both, so an off toggle disables the ends for the same reason.
-    if step_button(ui, minus, "-", enabled && shown > decrement_minutes(shown)) {
-        next = decrement_minutes(shown);
+    if step_button(ui, minus, "-", enabled && shown > decrement_minutes_with(shown, clamp)) {
+        next = decrement_minutes_with(shown, clamp);
     }
-    if step_button(ui, plus, "+", enabled && shown < increment_minutes(shown)) {
-        next = increment_minutes(shown);
+    if step_button(ui, plus, "+", enabled && shown < increment_minutes_with(shown, clamp)) {
+        next = increment_minutes_with(shown, clamp);
     }
     let stepped = next != value;
     if stepped {
@@ -2128,7 +2173,7 @@ fn minutes_stepper(ui: &mut Ui, value: u64, buffer: &mut String, enabled: bool) 
             .margin(Margin::ZERO),
     );
     if entry.lost_focus() && !stepped {
-        next = parse_minutes_entry(buffer, value);
+        next = parse_minutes_entry_with(buffer, value, clamp);
     }
 
     // Reconciled only when the field is not being typed into -- otherwise every
@@ -2285,6 +2330,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
         Section::Lock => draw_lock(ui, state),
         Section::Breaches => draw_breaches(ui, state),
         Section::Vault => draw_vault(ui, state),
+        Section::Sync => draw_sync_poll_card(ui, state),
         Section::Api => draw_api(ui, state),
         Section::Clipboard => draw_clipboard(ui, state),
         Section::Updates => draw_updates(ui, state),
@@ -3865,6 +3911,53 @@ fn vault_cards(ui: &mut Ui, state: &mut PrefsState) {
     draw_backend_card(ui, state);
     draw_disk_cache_card(ui, state);
 }
+
+/// **Whether an open vault window keeps itself current, and how often.**
+///
+/// The owner: "add to setting Update via polling, and interval for polling".
+/// The same two-row shape as the lock page's -- a switch above the number it
+/// governs, and the number greyed rather than removed while the switch is
+/// off, so the value that comes back when it is turned on is the one on
+/// screen now.
+///
+/// **On a page of its own** -- see [`Section::Sync`] for why not the
+/// Vault page's third card, which is where it was first put.
+fn draw_sync_poll_card(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        state.settings.sync_polling = toggle_row(
+            ui,
+            SYNC_POLL_ENABLED_LABEL,
+            SYNC_POLL_ENABLED_DESCRIPTION,
+            state.settings.sync_polling,
+        );
+        row_separator(ui);
+        let enabled = state.settings.sync_polling;
+        control_row(ui, SYNC_POLL_LABEL, SYNC_POLL_DESCRIPTION, |ui| {
+            state.settings.sync_poll_minutes = minutes_stepper_with(
+                ui,
+                state.settings.sync_poll_minutes,
+                &mut state.sync_poll_text,
+                enabled,
+                crate::settings::clamp_sync_poll_minutes,
+            );
+        });
+    });
+}
+
+/// The switch, in the owner's own words for it.
+const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
+/// What the switch does, said as the behaviour and not as the mechanism --
+/// and saying why it is polling at all, because a reader who knows
+/// Bitwarden's own apps update instantly will otherwise wonder why this one
+/// needs a setting to.
+const SYNC_POLL_ENABLED_DESCRIPTION: &str =
+    "Check for changes made in other Bitwarden apps while the vault window is open: when you \
+     switch back to it, and on the interval below. Off, the vault updates when the window \
+     opens and when you press Sync.";
+const SYNC_POLL_LABEL: &str = "Check every";
+const SYNC_POLL_DESCRIPTION: &str =
+    "Minutes between checks while the window stays open. Each check downloads the vault, so \
+     a short interval costs more on a large one.";
 
 /// **The one page in this window that scrolls**, and it is not a precaution:
 /// the key list has no upper bound. Every other page here is a fixed set of
@@ -6253,6 +6346,22 @@ mod tests {
     //! whether the result *looks* like 3e; those are checked by eye, and no
     //! test here pretends otherwise.
     use super::*;
+
+    /// The auto-lock stepper's three helpers under the names these tests have
+    /// always used. Defined HERE rather than as `#[cfg(test)]` items beside
+    /// the production ones: this file's source pins find the test module by
+    /// its first `#[cfg(test)]`, so one written above it re-files everything
+    /// after it as test code -- measured, as three pins that suddenly found
+    /// the key store's loader and the scan button "in a test".
+    fn parse_minutes_entry(text: &str, previous: u64) -> u64 {
+        super::parse_minutes_entry_with(text, previous, super::clamp_auto_lock_minutes)
+    }
+    fn decrement_minutes(value: u64) -> u64 {
+        super::decrement_minutes_with(value, super::clamp_auto_lock_minutes)
+    }
+    fn increment_minutes(value: u64) -> u64 {
+        super::increment_minutes_with(value, super::clamp_auto_lock_minutes)
+    }
     use eframe::egui::epaint::RectShape;
 
     /// The body's own area: 3e's card minus `ChromeMetrics::LOGIN`'s 40px bar.
@@ -8080,6 +8189,28 @@ mod tests {
     /// to a neighbour -- which for this row is worth pinning twice over,
     /// since the neighbour above it decides whether a background process
     /// runs and this one decides whether a decrypted vault goes on the disk.
+    /// **The Sync page's switch writes the setting it is drawn from.** The
+    /// owner: "add to setting Update via polling, and interval for polling".
+    #[test]
+    fn the_sync_pages_switch_turns_polling_off() {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Sync;
+        assert!(state.settings.sync_polling, "the default: polling on");
+
+        let first = tall_frame(&ctx, &mut state, &[]);
+        assert!(first.contains(SYNC_POLL_ENABLED_LABEL), "{:?}", first.strings());
+        assert!(first.contains(SYNC_POLL_LABEL), "{:?}", first.strings());
+        let pills = first.rects_of_size(TOGGLE_SIZE);
+        assert_eq!(pills.len(), 1, "the Sync page paints one switch");
+        tall_frame(&ctx, &mut state, &click(pills[0].center()));
+        assert!(
+            !state.settings.sync_polling,
+            "the switch did not turn polling off -- the row is painted but its value is \
+             never written back"
+        );
+    }
+
     #[test]
     fn clicking_the_disk_cache_toggle_changes_the_setting_it_is_wired_to() {
         let ctx = tall_context();
@@ -8280,6 +8411,13 @@ mod tests {
             // cache, and a nav row has to name the whole page or the
             // settings on it are unfindable.
             "Vault",
+            // **Sync, directly after Vault**: the same subject -- where the
+            // vault on screen comes from -- asked about time rather than
+            // place. It was first put at the bottom of the Vault page, which
+            // then no longer fitted the window; see `Section::Sync`. And it is
+            // a page on which a user decides something, twice, which is the
+            // bar the removed four did not clear.
+            "Sync",
             // And directly after it, the endpoint that serves what Vault
             // decided is being served. It came off the bottom of Vault, so by
             // the rule Breaches and Updates were placed by, it lands where

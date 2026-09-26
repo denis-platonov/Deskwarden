@@ -920,6 +920,13 @@ pub fn build_frame_with_search(
     // second click can't start a second concurrent sync -- same guard
     // `main.rs` uses for its update-apply flow.
     let mut sync_in_progress = false;
+    // **The window's own heartbeat** -- see `heartbeat_sync_due`. When any
+    // sync this window started last began, whichever door it came in by, and
+    // whether that attempt failed; and whether the window had focus on the
+    // frame before this one, which is how a return to it is seen.
+    let mut last_sync_attempt: Option<Instant> = None;
+    let mut last_sync_failed = false;
+    let mut was_focused = true;
     // True once the auto-sync below has fired. The window's first paint
     // shows whatever's already cached locally -- exactly like the Sync
     // button, this never blocks on the sync itself -- but the vault is
@@ -1551,6 +1558,16 @@ pub fn build_frame_with_search(
         .as_deref()
         .map(|path| crate::settings::Settings::load(path).fetch_icons)
         .unwrap_or(true);
+    // **How often this window polls, if it does** -- `Settings::sync_poll_
+    // interval`, read the way the icon toggles here are and live-editable
+    // for the same reason: the Preferences modal's copy wins while it
+    // exists, since nothing reaches disk until this window closes. With no
+    // settings path at all a window behaves as a fresh install does, and a
+    // fresh install polls at the default.
+    let sync_poll_at_open = settings_path.as_deref().map_or_else(
+        || crate::settings::Settings::default().sync_poll_interval(),
+        |path| crate::settings::Settings::load(path).sync_poll_interval(),
+    );
     // Whether a PUBLIC host's icon may be fetched from that host directly
     // rather than through the icon service, read the same way and
     // live-editable for the same reason. Off by default, and off when there
@@ -1890,6 +1907,44 @@ pub fn build_frame_with_search(
         if !auto_synced {
             auto_synced = true;
             sync_in_progress = true;
+            last_sync_attempt = Some(Instant::now());
+            (spawn_sync)(sync_tx.clone(), session_token.to_string());
+        }
+
+        // **And again, while the window stays open.** The sync above fires
+        // once per session, so a window left open never learned of a change
+        // made in another Bitwarden client -- the owner, having removed a
+        // website in the Bitwarden app: "shouldn't it get updated
+        // automatically in Deskwarden?". Bitwarden's own clients are TOLD:
+        // they hold a websocket to the server's notifications hub. This
+        // window reads through `bw serve`, which is the one Bitwarden client
+        // that holds no such connection and has nothing to pass on, so it
+        // asks instead -- on the same path the Sync pill and the sync above
+        // already take, and applied by the same drain below.
+        //
+        // Two triggers, see `heartbeat_sync_due`: coming BACK to the window,
+        // which is the moment somebody who changed an item elsewhere looks
+        // for it here, and a slow timer for a window that never loses focus.
+        let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
+        let regained_focus = focused && !was_focused;
+        was_focused = focused;
+        let sync_poll = edited_settings_for_closure
+            .borrow()
+            .as_ref()
+            .map_or(sync_poll_at_open, crate::settings::Settings::sync_poll_interval);
+        if heartbeat_sync_due(Heartbeat {
+            poll: sync_poll,
+            sync_in_progress,
+            editing: matches!(
+                mode,
+                DetailMode::Edit(_) | DetailMode::Create(_) | DetailMode::Sequence(..)
+            ),
+            regained_focus,
+            since_last_attempt: last_sync_attempt.map(|at| at.elapsed()),
+            last_failed: last_sync_failed,
+        }) {
+            sync_in_progress = true;
+            last_sync_attempt = Some(Instant::now());
             (spawn_sync)(sync_tx.clone(), session_token.to_string());
         }
 
@@ -2145,6 +2200,7 @@ pub fn build_frame_with_search(
         // this loop never waits on it.
         if let Ok(result) = sync_rx.try_recv() {
             sync_in_progress = false;
+            last_sync_failed = result.is_err();
             if result.is_ok() {
                 last_sync_at = Some(Instant::now());
                 // Re-read on the same background path the initial load uses,
@@ -2598,6 +2654,7 @@ pub fn build_frame_with_search(
                 );
                 if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
                     sync_in_progress = true;
+                    last_sync_attempt = Some(Instant::now());
                     (spawn_sync)(sync_tx.clone(), session_token.to_string());
                 }
             },
@@ -12749,6 +12806,81 @@ const VAULT_EMPTY_AFTER_REFRESH: &str = "the vault refresh left nothing to show"
 /// with_schedule` logs it immediately before sending this.
 const VAULT_REFRESH_FAILED: &str = "the vault could not be read from the local backend";
 
+/// What [`heartbeat_sync_due`] decides from. A named struct rather than
+/// five arguments, because three of them are `bool`s and a call site that
+/// transposed two would still compile.
+#[derive(Debug, Clone, Copy)]
+struct Heartbeat {
+    /// Preferences' "Update via polling", as an interval -- `None` when it is
+    /// off, which silences this window's heartbeat altogether.
+    poll: Option<Duration>,
+    /// A sync this window started has not come back yet.
+    sync_in_progress: bool,
+    /// The detail pane holds a form -- Edit, Create, or 4a's builder.
+    editing: bool,
+    /// The window has focus this frame and did not last frame.
+    regained_focus: bool,
+    /// Since the last sync this window started, by any door. `None` before
+    /// the first one, which the window's own sync-on-open is.
+    since_last_attempt: Option<Duration>,
+    /// Whether that last attempt failed.
+    last_failed: bool,
+}
+
+/// **Whether the open vault window should start a sync of its own.**
+///
+/// There used to be a periodic refresh in the daemon and it was taken out
+/// -- review Critical 1 -- because it doubled as the thing that STARTED
+/// `bw serve`, and nothing throttled a start that kept failing: a retry
+/// storm. This is built not to be that, and every rule below is one of the
+/// ways the old one went wrong:
+///
+///  * **It only ever syncs.** It runs inside the vault window, on the
+///    window's own sync seam, against a backend the window already has. It
+///    never starts anything.
+///  * **Never two at once**: not while a sync this window started is out.
+///  * **Never under a form.** A sync that lands reloads the list, and a list
+///    re-read while somebody is typing into an edit form, a new item or the
+///    sequence builder moves the ground under them. It waits for them to
+///    leave; the next frame after they do is due at once if the timer ran
+///    out meanwhile.
+///  * **Backed off after a failure.** A failed sync is not tried again for
+///    [`HEARTBEAT_AFTER_FAILURE`], whatever the trigger, so a server that is
+///    down costs one request every few minutes and not one per focus change.
+///  * **Not before the first**: the window's sync-on-open is always the
+///    first, and this answers only after one has been attempted.
+///
+/// Two triggers. **Coming back to the window** is the one that matters --
+/// somebody who changed an item in another Bitwarden client and switched
+/// back is looking for it NOW -- throttled to one per
+/// [`HEARTBEAT_FOCUS_GAP`] so flicking between windows does not sync on
+/// every flick. **The timer** -- Preferences' polling interval,
+/// `Settings::sync_poll_minutes` -- is for the window that is simply left
+/// open and focused.
+fn heartbeat_sync_due(beat: Heartbeat) -> bool {
+    // **Off means off**: no timer, and no sync on coming back to the window
+    // either. What is left is what there was before polling -- the sync on
+    // open and the Sync pill.
+    let Some(interval) = beat.poll else {
+        return false;
+    };
+    if beat.sync_in_progress || beat.editing {
+        return false;
+    }
+    let Some(since) = beat.since_last_attempt else {
+        return false;
+    };
+    let floor = if beat.last_failed { HEARTBEAT_AFTER_FAILURE } else { HEARTBEAT_FOCUS_GAP };
+    if since < floor {
+        return false;
+    }
+    beat.regained_focus || since >= interval
+}
+/// The least time between two syncs a return to the window can cause.
+const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
+/// How long a failed sync keeps every trigger quiet.
+const HEARTBEAT_AFTER_FAILURE: Duration = Duration::from_secs(3 * 60);
+
 /// The load worker's first decision, from one call to
 /// [`VaultCache::snapshot_unless_superseded`].
 ///
@@ -19987,6 +20119,75 @@ mod vault_load_step_tests {
     // from a thread's observable behaviour.
     use super::{vault_load_step, vault_read_after_populate, VaultLoadFailure, VaultLoadStep};
     use crate::vault_cache::{VaultSnapshot, VaultUnavailable};
+
+    /// **Every rule the window's heartbeat keeps**, one at a time, each
+    /// against a beat that WOULD fire without it -- so a rule that stopped
+    /// holding fails here rather than going unnoticed behind another one.
+    ///
+    /// The periodic refresh this replaces was deleted for becoming a retry
+    /// storm; see `heartbeat_sync_due`. These are the rules that make this
+    /// one not that.
+    #[test]
+    fn the_windows_heartbeat_keeps_every_rule_it_was_built_with() {
+        use crate::vault_window::{
+            heartbeat_sync_due, Heartbeat, HEARTBEAT_AFTER_FAILURE, HEARTBEAT_FOCUS_GAP,
+        };
+        use std::time::Duration;
+        let minutes = |m: u64| Duration::from_secs(m * 60);
+        let due = Heartbeat {
+            poll: Some(minutes(5)),
+            sync_in_progress: false,
+            editing: false,
+            regained_focus: false,
+            since_last_attempt: Some(minutes(5)),
+            last_failed: false,
+        };
+        // The control: the timer has run out and nothing stands in the way.
+        assert!(heartbeat_sync_due(due), "the control beat does not fire at all");
+
+        // Polling off silences it -- both triggers.
+        assert!(!heartbeat_sync_due(Heartbeat { poll: None, ..due }));
+        assert!(!heartbeat_sync_due(Heartbeat {
+            poll: None,
+            regained_focus: true,
+            ..due
+        }));
+        // Never two at once, and never under a form.
+        assert!(!heartbeat_sync_due(Heartbeat { sync_in_progress: true, ..due }));
+        assert!(!heartbeat_sync_due(Heartbeat { editing: true, ..due }));
+        // Never before the window's own sync-on-open.
+        assert!(!heartbeat_sync_due(Heartbeat { since_last_attempt: None, ..due }));
+
+        // The timer is the setting's, not a constant.
+        let early = Heartbeat { since_last_attempt: Some(minutes(4)), ..due };
+        assert!(!heartbeat_sync_due(early), "fired before the interval ran out");
+        assert!(heartbeat_sync_due(Heartbeat { poll: Some(minutes(3)), ..early }));
+
+        // Coming back to the window fires early -- but not within the focus
+        // gap, so flicking between windows does not sync on every flick.
+        let back = Heartbeat {
+            regained_focus: true,
+            since_last_attempt: Some(HEARTBEAT_FOCUS_GAP),
+            ..due
+        };
+        assert!(heartbeat_sync_due(back), "coming back to the window did not sync");
+        assert!(!heartbeat_sync_due(Heartbeat {
+            since_last_attempt: Some(HEARTBEAT_FOCUS_GAP - Duration::from_secs(1)),
+            ..back
+        }));
+
+        // After a failure, every trigger waits out the back-off -- the rule
+        // the deleted refresh did not have.
+        let failed = Heartbeat { last_failed: true, ..back };
+        assert!(!heartbeat_sync_due(Heartbeat {
+            since_last_attempt: Some(HEARTBEAT_AFTER_FAILURE - Duration::from_secs(1)),
+            ..failed
+        }));
+        assert!(heartbeat_sync_due(Heartbeat {
+            since_last_attempt: Some(HEARTBEAT_AFTER_FAILURE),
+            ..failed
+        }));
+    }
 
     fn a_snapshot() -> VaultSnapshot {
         VaultSnapshot {
