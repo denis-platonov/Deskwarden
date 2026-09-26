@@ -23,11 +23,20 @@ use std::time::Duration;
 /// own server.
 pub fn icon_base_url(server_url: Option<&str>) -> String {
     match server_url {
-        Some(url) if !url.trim().is_empty() && !is_bitwarden_cloud_host(&host_from_url(url)) => {
+        Some(url) if serves_its_own_icons(Some(url)) => {
             format!("{}/icons", url.trim().trim_end_matches('/'))
         }
         _ => "https://icons.bitwarden.net".to_string(),
     }
+}
+
+/// Whether icons come from the account's own server rather than from
+/// Bitwarden's icon service -- [`icon_base_url`]'s one question, asked once so
+/// the base and the query built beside it cannot come to disagree.
+fn serves_its_own_icons(server_url: Option<&str>) -> bool {
+    server_url.is_some_and(|url| {
+        !url.trim().is_empty() && !is_bitwarden_cloud_host(&host_from_url(url))
+    })
 }
 
 /// Extracts just the host (no scheme, path, query, fragment, or port) from a
@@ -293,7 +302,34 @@ pub enum IconSource {
 /// spelling of this at a call site is a refresh that silently does nothing,
 /// which is indistinguishable on screen from the stuck icon it was pressed to
 /// fix.
-const REFRESH_QUERY: &str = "?refresh=1";
+const REFRESH_PARAM: &str = "refresh=1";
+
+/// The query parameter that asks a self-hosted icon proxy for a `404` rather
+/// than a placeholder picture when it has no icon.
+///
+/// **This app draws its own placeholder** -- the monogram -- and a picture of
+/// somebody else's would replace it on every item without an icon. The
+/// owner's NodeWarden answers a miss with a grey globe, as an SVG, and until
+/// SVG icons could be drawn here that globe failed to decode and fell back to
+/// the monogram by accident. `?fallback=404` is NodeWarden's own switch for a
+/// client with a fallback of its own; a server that does not know it ignores
+/// it. Not sent to Bitwarden's icon service, which is not the server this is
+/// a contract with.
+const FALLBACK_404_PARAM: &str = "fallback=404";
+
+/// The proxy URL's query string: [`FALLBACK_404_PARAM`] for the account's own
+/// server, [`REFRESH_PARAM`] when the user asked for a refresh, both joined,
+/// or nothing.
+fn proxy_query(server_url: Option<&str>, freshness: IconFreshness) -> String {
+    let mut params = Vec::new();
+    if serves_its_own_icons(server_url) {
+        params.push(FALLBACK_404_PARAM);
+    }
+    if freshness == IconFreshness::Refresh {
+        params.push(REFRESH_PARAM);
+    }
+    if params.is_empty() { String::new() } else { format!("?{}", params.join("&")) }
+}
 
 /// Whether a request is allowed to be answered out of a cache somebody else
 /// holds.
@@ -320,7 +356,7 @@ pub enum IconFreshness {
     /// on the direct path this is the only meaningful state anyway.
     Cached,
     /// The user pressed "Refresh icon". A proxied request carries
-    /// [`REFRESH_QUERY`] so the proxy re-fetches upstream and resets its own
+    /// [`REFRESH_PARAM`] so the proxy re-fetches upstream and resets its own
     /// cache window; a direct request is unchanged, because there is no
     /// server cache in front of it to bypass -- see [`icon_source_for`].
     Refresh,
@@ -337,11 +373,18 @@ pub enum IconFreshness {
 /// machine, and the honest way to find a site's declared icon -- fetch the
 /// page, parse its `<link rel="icon">` -- means fetching the page, which
 /// discloses considerably more than asking for a fixed path and is a fetch of
-/// somebody's HTML by a password manager. Three fixed paths, and then either
+/// somebody's HTML by a password manager. Fixed paths, and then either
 /// nothing (a private address, which has no other source) or the icon service
-/// (a public host, via [`IconSource::DirectThenProxy`]) -- but never a fourth
-/// guess and never that host's HTML.
-const DIRECT_ICON_PATHS: [&str; 3] = ["favicon.ico", "favicon.png", "apple-touch-icon.png"];
+/// (a public host, via [`IconSource::DirectThenProxy`]) -- but never a guess
+/// beyond this list and never that host's HTML.
+///
+/// **`/favicon.svg` is the fourth, and last.** It is the one a site with no
+/// raster icon at all has: `https://23000268.xyz/` declares only
+/// `<link rel="icon" href="/favicon.svg">` and answers the other three with a
+/// redirect to its login page. An SVG is drawn by [`decode_rgba_unscaled`]
+/// through `resvg`, which reads no file, fetches nothing and runs no script.
+const DIRECT_ICON_PATHS: [&str; 4] =
+    ["favicon.ico", "favicon.png", "apple-touch-icon.png", "favicon.svg"];
 
 /// Decides where `authority`'s icon comes from.
 ///
@@ -393,7 +436,7 @@ const DIRECT_ICON_PATHS: [&str; 3] = ["favicon.ico", "favicon.png", "apple-touch
 ///
 /// **`freshness` reaches every URL aimed at the PROXY and no URL aimed at a
 /// site, and that is not an oversight.** [`IconFreshness::Refresh`] appends
-/// [`REFRESH_QUERY`] to a proxied URL, because the thing being bypassed is the
+/// [`REFRESH_PARAM`] to a proxied URL, because the thing being bypassed is the
 /// *proxy's* cache -- and that is as true of the fallback URL inside
 /// [`IconSource::DirectThenProxy`] as of a bare [`IconSource::Proxy`]: it is
 /// the same server holding the same seven-day answer, reached down a different
@@ -425,11 +468,11 @@ pub fn icon_source_for(
         );
         return IconSource::Direct(direct_candidates(authority, &["http", "https"]));
     }
-    let refresh = match freshness {
-        IconFreshness::Cached => "",
-        IconFreshness::Refresh => REFRESH_QUERY,
-    };
-    let proxy = format!("{}/{host}/icon.png{refresh}", icon_base_url(server_url));
+    let proxy = format!(
+        "{}/{host}/icon.png{}",
+        icon_base_url(server_url),
+        proxy_query(server_url, freshness)
+    );
     if !direct_for_all_hosts {
         log::debug!(
             "icon: {authority} goes to the icon service{}",
@@ -1187,6 +1230,13 @@ pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
 /// not shared, because they are not the same question -- see
 /// `card_mark::MAX_MARK_BYTES`.
 pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    // **An SVG is drawn, not decoded**, and it is recognised by its own text
+    // rather than by a content type, as the ICO below is by its magic. The
+    // owner, of `https://23000268.xyz/`: "not getting favicon" -- that site's
+    // only icon is an SVG, and until this line every SVG was a monogram.
+    if looks_like_svg(png_bytes) {
+        return if is_placeholder_svg(png_bytes) { None } else { svg_rgba(png_bytes) };
+    }
     // **ICO first, because the direct path made it reachable.** The icon
     // proxy has always answered `icon.png` with a PNG, so until now every
     // caller here held one. A direct fetch asks a web server for
@@ -1237,6 +1287,75 @@ pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)>
     };
 
     Some((width, height, rgba))
+}
+
+/// The size an SVG icon is drawn at before [`resample_for_display`] brings
+/// it to the display size: twice [`ICON_TARGET_PX`], so the one resample that
+/// follows is a downscale, as it is for every raster icon of a useful size.
+const SVG_RASTER_PX: f32 = (ICON_TARGET_PX * 2) as f32;
+
+/// Whether `bytes` are SVG text: an `<svg` root within the first kilobyte,
+/// after at most a byte-order mark, whitespace, an XML declaration, comments
+/// and a doctype. HTML that happens to contain an inline `<svg>` is not one --
+/// it starts with `<!doctype html>` or `<html`.
+fn looks_like_svg(bytes: &[u8]) -> bool {
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(1024)]);
+    let head = head.trim_start_matches('\u{feff}').trim_start();
+    let opens_like_svg = head.starts_with("<svg")
+        || head.starts_with("<?xml")
+        || head.starts_with("<!--")
+        || head.get(..13).is_some_and(|d| d.eq_ignore_ascii_case("<!doctype svg"));
+    opens_like_svg && head.contains("<svg")
+}
+
+/// **An icon service's "no icon" picture, which is not this item's icon.**
+///
+/// The owner's NodeWarden answers a miss with a grey globe labelled `Globe
+/// icon` -- an SVG, which could not be drawn here when SVG could not, and so
+/// fell back to the monogram by accident. Drawing SVG made that an accident no
+/// longer, so it is refused by name: the monogram says "no icon" in this app's
+/// own words. [`FALLBACK_404_PARAM`] keeps the owner's server from sending it
+/// at all; this is for every copy that arrives anyway -- an older server, an
+/// edge cache still holding one, another proxy with the same habit.
+fn is_placeholder_svg(bytes: &[u8]) -> bool {
+    String::from_utf8_lossy(bytes).contains("Globe icon")
+}
+
+/// An SVG icon, drawn to straight-alpha RGBA with its longer side
+/// [`SVG_RASTER_PX`] long, or `None` for SVG `resvg` will not parse or that
+/// has no size.
+///
+/// **What drawing it can reach, which is nothing.** `resvg` is built with no
+/// default features: no text, so no font database and no read of the
+/// system's fonts; no raster images, so an embedded or linked `<image>` is
+/// skipped; and `usvg` fetches no URL and runs no script whatever the
+/// document asks for. What is left is shapes, paths, gradients and fills --
+/// what an icon is made of. Text in an SVG icon is not drawn, which is the one
+/// thing this costs.
+fn svg_rgba(bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    let tree = resvg::usvg::Tree::from_data(bytes, &resvg::usvg::Options::default()).ok()?;
+    let size = tree.size();
+    let longest = size.width().max(size.height());
+    if !(longest.is_finite() && longest > 0.0) {
+        return None;
+    }
+    let scale = SVG_RASTER_PX / longest;
+    let width = (size.width() * scale).round().max(1.0) as u32;
+    let height = (size.height() * scale).round().max(1.0) as u32;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)?;
+    resvg::render(&tree, resvg::tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    // tiny-skia holds PREmultiplied colour; everything downstream of this
+    // function -- the resample, the transparent-border trim, the texture --
+    // takes straight alpha, as the PNG and ICO decoders hand it over.
+    let rgba = pixmap
+        .pixels()
+        .iter()
+        .flat_map(|pixel| {
+            let straight = pixel.demultiply();
+            [straight.red(), straight.green(), straight.blue(), straight.alpha()]
+        })
+        .collect();
+    Some((width as usize, height as usize, rgba))
 }
 
 /// The one image picked out of a Windows `.ico` container: either a PNG
@@ -2189,7 +2308,9 @@ mod tests {
         );
         assert_eq!(
             source,
-            IconSource::Proxy("https://vault.example.eu/icons/vault.example.com/icon.png".to_string()),
+            IconSource::Proxy(
+                "https://vault.example.eu/icons/vault.example.com/icon.png?fallback=404".to_string()
+            ),
             "the proxy URL carried a port; the icon service has never taken one"
         );
         // The control: the same authority, fetched directly, DOES keep it --
@@ -2214,8 +2335,91 @@ mod tests {
         // arm and wrong on the fallback would look correct until a site with
         // a port failed its direct fetch.
         assert_eq!(
-            proxy, "https://vault.example.eu/icons/vault.example.com/icon.png",
+            proxy, "https://vault.example.eu/icons/vault.example.com/icon.png?fallback=404",
             "the fallback URL carried a port; the icon service has never taken one"
+        );
+    }
+
+    // ---- SVG icons -------------------------------------------------------
+
+    /// `https://23000268.xyz/favicon.svg`, verbatim: a rounded square in one
+    /// colour with a white line drawing on it.
+    const SITE_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64"><rect width="64" height="64" rx="14" fill="#c8431f"/><g fill="none" stroke="#ffffff" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 32 32 16l20 16"/><path d="M18 29v19h28V29"/><path d="M27 48v-9h10v9"/><path d="M42 16h5v7"/></g></svg>"##;
+
+    /// **An SVG icon is drawn, in its own colour.** The owner, of that site:
+    /// "not getting favicon". Checked on a pixel of the square's fill -- the
+    /// top-left corner inside the rounding, clear of the drawing -- so this
+    /// cannot pass on an image that merely decoded to something.
+    #[test]
+    fn an_svg_icon_is_drawn_in_its_own_colour() {
+        let (width, height, rgba) = decode_rgba(SITE_SVG.as_bytes()).expect("the site's SVG draws");
+        assert!(width > 0 && height > 0);
+        let at = |x: usize, y: usize| {
+            let i = (y * width + x) * 4;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        let [r, g, b, a] = at(width / 8, height * 7 / 8);
+        assert_eq!(a, 255, "the fill is not opaque where it is painted");
+        assert!(
+            r.abs_diff(0xc8) <= 2 && g.abs_diff(0x43) <= 2 && b.abs_diff(0x1f) <= 2,
+            "the fill came out as #{r:02x}{g:02x}{b:02x}, not the site's #c8431f"
+        );
+    }
+
+    /// The SVG is recognised by its text, after the preamble a real file may
+    /// carry; HTML with an inline SVG, and things that are not text at all,
+    /// are not SVG.
+    #[test]
+    fn only_svg_text_is_taken_for_an_svg() {
+        assert!(looks_like_svg(SITE_SVG.as_bytes()));
+        let preamble = format!("\u{feff}<?xml version=\"1.0\"?>\n<!-- icon -->\n{SITE_SVG}");
+        assert!(looks_like_svg(preamble.as_bytes()));
+        assert!(decode_rgba(preamble.as_bytes()).is_some(), "a preamble stopped it drawing");
+        assert!(!looks_like_svg(b"<!doctype html><html><body><svg></svg></body></html>"));
+        assert!(!looks_like_svg(b"<html><svg></svg></html>"));
+        assert!(!looks_like_svg(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]));
+        assert!(decode_rgba(b"<svg>not closed").is_none(), "broken SVG is an icon");
+    }
+
+    /// **`/favicon.svg` is asked for, and asked for last**: after the three
+    /// raster paths, so a site that has both is drawn from the raster one it
+    /// always was.
+    #[test]
+    fn the_direct_fetch_asks_for_the_svg_icon_last() {
+        let IconSource::Direct(urls) = icon_source_for("192.168.1.5", None, false, IconFreshness::Cached)
+        else {
+            panic!("a private host is fetched directly")
+        };
+        assert_eq!(
+            urls.iter().filter(|u| u.starts_with("http://")).cloned().collect::<Vec<_>>(),
+            [
+                "http://192.168.1.5/favicon.ico",
+                "http://192.168.1.5/favicon.png",
+                "http://192.168.1.5/apple-touch-icon.png",
+                "http://192.168.1.5/favicon.svg",
+            ]
+        );
+    }
+
+    /// **The account's own server is asked for a 404, not a placeholder.**
+    /// NodeWarden answers a miss with a grey globe drawn as an SVG, which this
+    /// app can now draw -- so without the parameter every item without an icon
+    /// would wear that globe instead of its monogram. Bitwarden's own icon
+    /// service is not sent it.
+    #[test]
+    fn the_own_server_is_asked_for_a_404_and_bitwardens_service_is_not() {
+        assert_eq!(
+            icon_source_for("chase.com", Some("https://vault.example.eu"), false, IconFreshness::Cached),
+            IconSource::Proxy("https://vault.example.eu/icons/chase.com/icon.png?fallback=404".to_string())
+        );
+        assert_eq!(
+            icon_source_for("chase.com", None, false, IconFreshness::Cached),
+            IconSource::Proxy("https://icons.bitwarden.net/chase.com/icon.png".to_string())
+        );
+        assert_eq!(
+            icon_source_for("chase.com", Some("https://vault.bitwarden.eu"), false, IconFreshness::Cached),
+            IconSource::Proxy("https://icons.bitwarden.net/chase.com/icon.png".to_string()),
+            "the EU cloud is Bitwarden's service too"
         );
     }
 
@@ -2269,7 +2473,7 @@ mod tests {
                 IconFreshness::Refresh,
             ),
             IconSource::Proxy(
-                "https://vault.example.eu/icons/chase.com/icon.png?refresh=1".to_string()
+                "https://vault.example.eu/icons/chase.com/icon.png?fallback=404&refresh=1".to_string()
             )
         );
     }
@@ -2535,7 +2739,7 @@ mod tests {
                 false,
                 IconFreshness::Cached,
             ),
-            IconSource::Proxy("https://vault.example.eu/icons/github.com/icon.png".to_string()),
+            IconSource::Proxy("https://vault.example.eu/icons/github.com/icon.png?fallback=404".to_string()),
             "a self-hosted account stopped proxying through its own server"
         );
         // The control: the SAME host with the switch on does stop being a bare
@@ -3278,6 +3482,12 @@ mod tests {
     /// better answer than a blank square, and "we added a format, so accept
     /// anything" is exactly the change this test is here to redden.
     ///
+    /// **And it did redden, when SVG became a format** -- for "not getting
+    /// favicon" on a site whose only icon is an SVG. The placeholder is now
+    /// refused by name (`is_placeholder_svg`) rather than by being an
+    /// undrawable format, and NodeWarden's own globe, verbatim, is the second
+    /// case below.
+    ///
     /// The blank PNG is asserted as **no drawable pixels** rather than as a
     /// specific shape, because `decode_rgba` currently answers
     /// `Some((0, 0, vec![]))` for it (the transparent-border trim consumes the
@@ -3287,8 +3497,14 @@ mod tests {
     fn a_placeholder_svg_and_a_blank_png_still_yield_no_icon() {
         let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
              <title>Globe icon</title><circle cx="12" cy="12" r="10"/></svg>"#;
-        assert_eq!(decode_rgba_unscaled(svg), None, "an SVG body decoded as an image");
-        assert_eq!(decode_rgba(svg), None, "an SVG body decoded as an image");
+        assert_eq!(decode_rgba_unscaled(svg), None, "a placeholder SVG decoded as an icon");
+        assert_eq!(decode_rgba(svg), None, "a placeholder SVG decoded as an icon");
+        let nodewarden = br##"<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-label="Globe icon"><circle cx="48" cy="48" r="34" fill="none" stroke="#8ea9c7" stroke-width="6"/></svg>"##;
+        assert_eq!(decode_rgba(nodewarden), None, "NodeWarden's globe decoded as an icon");
+        // CONTROL: the same shape without the label IS drawn, so the refusal
+        // above is the label's doing and not SVG being refused wholesale.
+        let unlabelled = String::from_utf8_lossy(nodewarden).replace(r#" aria-label="Globe icon""#, "");
+        assert!(decode_rgba(unlabelled.as_bytes()).is_some(), "an ordinary SVG icon was refused");
 
         // **`None`, exactly** -- and this assertion was deliberately weaker
         // when it was written. It asked only that nothing DRAWABLE came back,
@@ -3641,7 +3857,7 @@ mod tests {
         let server_url = Some("https://vault.example.eu");
         assert_eq!(
             icon_source_for("chase.com", server_url, false, IconFreshness::Cached),
-            IconSource::Proxy("https://vault.example.eu/icons/chase.com/icon.png".to_string())
+            IconSource::Proxy("https://vault.example.eu/icons/chase.com/icon.png?fallback=404".to_string())
         );
     }
 

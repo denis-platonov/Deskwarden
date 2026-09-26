@@ -2959,7 +2959,27 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (27359, 0xe52e_3c55_5c56_6cb6) exactly, so it is measuring
             // what this test measures.
-            (28098, 0xe920_8b9f_aa62_2dbc_u64),
+            // **28452 bytes, new hash: ONE DEPENDENCY ADDED.** From crates.io, with
+            // no path, no git source and no `[patch]`:
+            //
+            //  * `resvg = { version = "0.48", default-features = false }` -- SVG
+            //    favicons in `favicon.rs`. No default features: no text (so no
+            //    font database, no read of the system's fonts), no raster images,
+            //    no svgz. It fetches, reads and runs nothing.
+            //
+            // Nothing else moved: no existing dependency was re-pointed or
+            // re-featured, no `[patch]`/`[replace]`/`[workspace.dependencies]`
+            // table appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. 354 bytes longer: the one line and the
+            // comment above it in the manifest.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over the file
+            // with CRLF normalised to LF, in a separate implementation outside this
+            // crate -- rather than copied out of the failure message. That
+            // implementation was first run against the PREVIOUS pinned pair and
+            // reproduced (28098, 0xe920_8b9f_aa62_2dbc) exactly, so it is measuring
+            // what this test measures.
+            (28452, 0x5e89_fff3_3456_f7b1_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

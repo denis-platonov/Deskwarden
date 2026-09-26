@@ -167,6 +167,11 @@ tungstenite = { version = "0.30", default-features = false, features = ["handsha
 # here rather than by ureq. Already in the tree through ureq; this adds no
 # crate, only the right to name it.
 webpki-roots = "1"
+# SVG favicons (src/favicon.rs): a site whose only icon is `/favicon.svg`
+# drew a monogram. No default features: no text (so no font database and no
+# read of the system's fonts), no raster images (an `<image>` is skipped), no
+# svgz. What is left draws shapes and fetches, reads and runs nothing.
+resvg = { version = "0.48", default-features = false }
 directories = "5"
 tray-icon = "0.19"
 # 0.31+ is where egui's text rendering got visibly sharper (better gamma

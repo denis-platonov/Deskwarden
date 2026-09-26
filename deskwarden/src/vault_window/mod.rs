@@ -25689,7 +25689,9 @@ mod account_details_tests {
     /// Both halves against the same mock icon service, because the claim is a
     /// difference: the refreshing fetch carries `?refresh=1` and the ordinary
     /// one carries nothing. Either assertion alone is satisfied by a build
-    /// that always appends the query or never does.
+    /// that always appends the query or never does. Both carry
+    /// `fallback=404`, which asks the account's own server for a 404 rather
+    /// than its placeholder globe -- see `favicon::FALLBACK_404_PARAM`.
     ///
     /// The server URL is the loopback mock, so `favicon::icon_base_url` reads
     /// it as a self-hosted server and `icon_source_for` takes the PROXY arm
@@ -25702,13 +25704,13 @@ mod account_details_tests {
     fn a_refreshed_fetch_asks_the_icon_service_to_bypass_its_cache() {
         let refreshed = icon_request_query(true);
         assert_eq!(
-            refreshed, "/icons/chase.com/icon.png?refresh=1",
+            refreshed, "/icons/chase.com/icon.png?fallback=404&refresh=1",
             "the fetch a refresh caused is one the icon service cannot tell from any other, so \
              the placeholder cached at its edge is served straight back"
         );
         let ordinary = icon_request_query(false);
         assert_eq!(
-            ordinary, "/icons/chase.com/icon.png",
+            ordinary, "/icons/chase.com/icon.png?fallback=404",
             "an ordinary icon fetch carries the cache-bypassing query, which makes this app a \
              permanent cache-buster against the user's own server"
         );
