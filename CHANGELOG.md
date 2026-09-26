@@ -15,6 +15,46 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.27 - 2026-09-26
+
+### Changes made in other Bitwarden apps show up on their own
+
+An open vault window used to learn about a change made elsewhere only when it
+was opened or when Sync was pressed. It now keeps itself current.
+
+On the built-in client it holds a connection to the server's notifications
+hub, as Bitwarden's own apps do, and the server says when something changed.
+A change to one item costs one read of that item -- a deletion costs nothing
+at all -- rather than a download of the whole vault, and the item moves to the
+top of the list, where the server lists what changed most recently. A burst of
+changes (an import in another app) settles for two seconds and is answered
+once. Folder changes, bulk moves and anything else no single item describes
+still refresh the whole vault, as does a reconnect after the connection
+dropped.
+
+Where there is no such connection -- the `bw` CLI backend, or a server
+without a hub -- the window asks instead: when you switch back to it, and on
+a timer.
+
+Both are on a new **Sync** page in Preferences: `Live updates from the
+server` (on by default) and `Update via polling` with `Check every` (on, five
+minutes, one to 120). While live updates are connected, polling pauses.
+
+### SVG icons
+
+A site whose only icon is an SVG gets that icon rather than a monogram. SVG is
+drawn with nothing that can fetch, read a file or run a script; text inside an
+SVG icon is not drawn. A self-hosted server is asked for a `404` rather than
+its placeholder picture when it has no icon, so an item without one keeps its
+monogram.
+
+### Smaller
+
+- The read pane lists every website an item has, not only the first.
+- The number in the minutes steppers (Lock, Sync) sits in the middle of its
+  box.
+- When an icon cannot be fetched, the log names the site it was fetched from.
+
 ## 0.15.26 - 2026-09-20
 
 ### Design 4a: the fill rule has a builder
