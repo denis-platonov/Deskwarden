@@ -1677,13 +1677,20 @@ impl VaultCache {
                     let live = ["deletedDate", "archivedDate"]
                         .iter()
                         .all(|key| item.other.get(*key).is_none_or(serde_json::Value::is_null));
-                    match snapshot.items.iter().position(|i| &i.id == id) {
-                        Some(at) if live => snapshot.items[at] = item,
-                        Some(at) => {
-                            snapshot.items.remove(at);
-                        }
-                        None if live => snapshot.items.push(item),
-                        None => {}
+                    // **To the TOP, not where it was.** The list is painted in
+                    // the order the server sent it, and the server sends the
+                    // most recently changed first (NodeWarden: `ORDER BY
+                    // updated_at DESC`), so that is where a full sync would
+                    // have put this item. Replaced in place -- or a new one
+                    // appended -- it sat where the owner did not look: "they
+                    // not on top of the list as usually". Applied in arrival
+                    // order, so of several the latest ends up first, as the
+                    // server would have it.
+                    if let Some(at) = snapshot.items.iter().position(|i| &i.id == id) {
+                        snapshot.items.remove(at);
+                    }
+                    if live {
+                        snapshot.items.insert(0, item);
                     }
                     snapshot.note_item_write(id, !live);
                 }
@@ -3099,6 +3106,22 @@ mod tests {
     fn an_announced_change_reads_that_item_back_and_nothing_else() {
         let mut server = crate::test_http::server();
         let (cache, items, folders) = populated_once(&mut server);
+        // A second item BELOW the one that changes, so "moved to the top" is
+        // a move and not a coincidence of a one-item list.
+        cache.lock().items.push(VaultItem {
+            id: "2".into(),
+            name: "Beta".into(),
+            fields: vec![],
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        });
         let changed = one_item(
             &mut server,
             "1",
@@ -3119,6 +3142,12 @@ mod tests {
         assert_eq!(fetched, 2);
         assert_eq!(cache.get_by_id("1").expect("still there").name, "Alpha, renamed elsewhere");
         assert_eq!(cache.get_by_id("9").expect("added").name, "Made elsewhere");
+        // Where a full sync would put them: the server lists the most
+        // recently changed first, so the later announcement is on top and
+        // neither is left where it was -- the owner: "they not on top of the
+        // list as usually".
+        let order: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
+        assert_eq!(order, ["9", "1", "2"], "announced items are not at the top, newest first");
         changed.assert();
         created.assert();
         items.assert();
