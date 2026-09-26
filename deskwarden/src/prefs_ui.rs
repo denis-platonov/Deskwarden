@@ -3948,10 +3948,18 @@ const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
 /// and saying why it is polling at all, because a reader who knows
 /// Bitwarden's own apps update instantly will otherwise wonder why this one
 /// needs a setting to.
+///
+/// **And says what polling is FOR now that there is a push.** On the built-in
+/// client the server announces every change down its notifications hub, and
+/// the window's polling stands down while that connection is up -- so a
+/// reader who turns this off must not come away thinking the window stops
+/// updating, and a reader who leaves it on must not think it costs a
+/// download every five minutes when it does not.
 const SYNC_POLL_ENABLED_DESCRIPTION: &str =
     "Check for changes made in other Bitwarden apps while the vault window is open: when you \
-     switch back to it, and on the interval below. Off, the vault updates when the window \
-     opens and when you press Sync.";
+     switch back to it, and on the interval below. When your server announces changes itself, \
+     these checks only run while that connection is down. Off, the vault still updates when \
+     the window opens, when you press Sync, and when the server announces a change.";
 const SYNC_POLL_LABEL: &str = "Check every";
 const SYNC_POLL_DESCRIPTION: &str =
     "Minutes between checks while the window stays open. Each check downloads the vault, so \

@@ -1371,11 +1371,14 @@ pub struct Settings {
     /// see `vault_window`'s `heartbeat_sync_due`. The owner asked for it by
     /// name: "add to setting Update via polling, and interval for polling".
     ///
-    /// **Polling, and not a push**, because the vault is read through
-    /// `bw serve`, the one Bitwarden client that holds no connection to the
-    /// server's notifications hub. Bitwarden's own apps are told when an
-    /// item changes; this one has to ask, and this is the switch over whether
-    /// it does.
+    /// **Polling is the fallback to a push, not the whole story.** On the
+    /// built-in client the window holds a connection to the server's
+    /// notifications hub (`crate::rest::notifications`) and syncs when the
+    /// server says something changed; this switch does not govern that, and
+    /// polling stands down while the connection is up. On `bw serve` there is
+    /// no such connection -- `bw` holds the token the hub wants and never
+    /// hands it over -- so there, and whenever the hub is unreachable, asking
+    /// is all there is, and this is the switch over whether the window does.
     pub sync_polling: bool,
     /// Minutes between polls while [`Self::sync_polling`] is on. Retained
     /// while polling is off, as [`Self::auto_lock_minutes`] is, so turning

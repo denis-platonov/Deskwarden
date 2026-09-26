@@ -781,6 +781,11 @@ pub fn build_frame_with_search(
     // whatever the person running `cargo test` had copied. See
     // `VaultFrameEnv::send_copy`.
     let copy_send_url = env.send_copy;
+    // The eighth, and the one that holds a connection OPEN: the server's
+    // notifications hub. Named here for the others' reason -- behind it is a
+    // thread that dials the account's server -- so a test frame gets no
+    // listener unless it asks for one. See `VaultFrameEnv::hub`.
+    let start_hub = env.hub;
     // **This window no longer takes an `Injector` at all.** It used to clone
     // one into the `'static` update closure for exactly one consumer: the
     // row context menu's "Fill in app" entry, the last manual fill trigger,
@@ -927,6 +932,15 @@ pub fn build_frame_with_search(
     let mut last_sync_attempt: Option<Instant> = None;
     let mut last_sync_failed = false;
     let mut was_focused = true;
+    // **The server's own word that something changed** -- see
+    // `crate::rest::notifications`. Started on the first real frame and
+    // dropped with this closure, which closes the connection. Nothing has to
+    // wake the window when a notice lands: `FRAME_INTERVAL` already runs a
+    // frame every half second, and a notice waits `Timing::settle` anyway. `hub_seen` is how many of its
+    // notices a sync has already answered.
+    let mut hub: Option<crate::rest::notifications::HubListener> = None;
+    let mut hub_started = false;
+    let mut hub_seen: u64 = 0;
     // True once the auto-sync below has fired. The window's first paint
     // shows whatever's already cached locally -- exactly like the Sync
     // button, this never blocks on the sync itself -- but the vault is
@@ -1916,15 +1930,25 @@ pub fn build_frame_with_search(
         // made in another Bitwarden client -- the owner, having removed a
         // website in the Bitwarden app: "shouldn't it get updated
         // automatically in Deskwarden?". Bitwarden's own clients are TOLD:
-        // they hold a websocket to the server's notifications hub. This
-        // window reads through `bw serve`, which is the one Bitwarden client
-        // that holds no such connection and has nothing to pass on, so it
-        // asks instead -- on the same path the Sync pill and the sync above
-        // already take, and applied by the same drain below.
+        // they hold a websocket to the server's notifications hub. On the
+        // built-in client this window does too -- `hub`, below -- and syncs
+        // when the server says so. On `bw serve`, which holds no such
+        // connection and has nothing to pass on, it asks instead; and on
+        // either, it asks while the hub is down. Every trigger runs the same
+        // path the Sync pill and the sync above already take, applied by the
+        // same drain below.
         //
-        // Two triggers, see `heartbeat_sync_due`: coming BACK to the window,
-        // which is the moment somebody who changed an item elsewhere looks
-        // for it here, and a slow timer for a window that never loses focus.
+        // Three triggers, see `heartbeat_sync_due`: the server's push; coming
+        // BACK to the window, which is the moment somebody who changed an
+        // item elsewhere looks for it here; and a slow timer for a window
+        // that never loses focus. The last two stand down while the push
+        // channel is live.
+        if !hub_started {
+            hub_started = true;
+            hub = (start_hub)();
+        }
+        let pushed = hub.as_ref().and_then(|hub| hub.pending(hub_seen, Instant::now()));
+        let hub_live = hub.as_ref().is_some_and(crate::rest::notifications::HubListener::is_live);
         let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
         let regained_focus = focused && !was_focused;
         was_focused = focused;
@@ -1934,6 +1958,8 @@ pub fn build_frame_with_search(
             .map_or(sync_poll_at_open, crate::settings::Settings::sync_poll_interval);
         if heartbeat_sync_due(Heartbeat {
             poll: sync_poll,
+            pushed: pushed.is_some(),
+            hub_live,
             sync_in_progress,
             editing: matches!(
                 mode,
@@ -1945,6 +1971,12 @@ pub fn build_frame_with_search(
         }) {
             sync_in_progress = true;
             last_sync_attempt = Some(Instant::now());
+            // Whatever the trigger, this sync answers every notice counted so
+            // far. The count was read BEFORE the decision, so one landing
+            // since is still ahead of `hub_seen` next frame.
+            if let Some(count) = pushed {
+                hub_seen = count;
+            }
             (spawn_sync)(sync_tx.clone(), session_token.to_string());
         }
 
@@ -7701,6 +7733,17 @@ pub struct VaultFrameEnv {
     /// way, retained in `Win+V` and synced to the user's other devices. See
     /// [`SendCopySeam`].
     send_copy: SendCopySeam,
+    /// [`listen_for_pushes`] in production -- the connection to the server's
+    /// notifications hub, started on the window's first real frame and
+    /// closed when the window's frame closure is dropped.
+    ///
+    /// Here for every other field's reason: behind it is a thread that dials
+    /// the signed-in account's server and holds the connection open, and a
+    /// test frame that reached it would do that from `cargo test` against
+    /// whatever backend another test had just published. Stubbed, a test
+    /// window has no listener at all, and the heartbeat's push rules are
+    /// tested on `heartbeat_sync_due` directly.
+    hub: HubStart,
 }
 
 /// The production re-prompt gate: `reprompt::gate_for_account`, and nothing
@@ -7731,6 +7774,10 @@ fn reprompt_gate_for(account: Option<&crate::accounts::AccountId>) -> crate::rep
 /// seam was introduced to close.
 fn copy_send_link(url: &str) { crate::clipboard::copy_secret(url); }
 
+/// The production hub listener: `HubListener::for_this_process`, and nothing
+/// else. One line and pinned whole, for [`reprompt_gate_for`]'s reason.
+fn listen_for_pushes() -> Option<crate::rest::notifications::HubListener> { Some(crate::rest::notifications::HubListener::for_this_process()) }
+
 impl VaultFrameEnv {
     /// The real world. The only constructor a shipping build has.
     pub fn production() -> Self {
@@ -7745,6 +7792,7 @@ impl VaultFrameEnv {
             settings_path: crate::settings::default_path(),
             reprompt: reprompt_gate_for,
             send_copy: copy_send_link,
+            hub: listen_for_pushes,
         }
     }
 }
@@ -11269,6 +11317,9 @@ enum SendRowOp {
 /// precisely the leak this seam exists to have fixed.
 type SendCopySeam = fn(&str);
 
+/// [`VaultFrameEnv::hub`]'s shape: maybe a listener.
+type HubStart = fn() -> Option<crate::rest::notifications::HubListener>;
+
 /// Everything the window holds between frames for the revoke.
 ///
 /// **One struct rather than three locals in the frame closure**, because the
@@ -12812,8 +12863,15 @@ const VAULT_REFRESH_FAILED: &str = "the vault could not be read from the local b
 #[derive(Debug, Clone, Copy)]
 struct Heartbeat {
     /// Preferences' "Update via polling", as an interval -- `None` when it is
-    /// off, which silences this window's heartbeat altogether.
+    /// off, which silences the timer and the return-to-window trigger. It does
+    /// not silence a push: polling is this window ASKING, and a push is the
+    /// server telling it.
     poll: Option<Duration>,
+    /// The notifications hub has said something changed, and the burst has
+    /// settled. See `crate::rest::notifications::HubListener::pending`.
+    pushed: bool,
+    /// The hub is connected: whatever changes, it will say so.
+    hub_live: bool,
     /// A sync this window started has not come back yet.
     sync_in_progress: bool,
     /// The detail pane holds a form -- Edit, Create, or 4a's builder.
@@ -12850,34 +12908,51 @@ struct Heartbeat {
 ///  * **Not before the first**: the window's sync-on-open is always the
 ///    first, and this answers only after one has been attempted.
 ///
-/// Two triggers. **Coming back to the window** is the one that matters --
-/// somebody who changed an item in another Bitwarden client and switched
-/// back is looking for it NOW -- throttled to one per
+/// Three triggers. **A push** from the server's notifications hub is the
+/// one that makes a change elsewhere show up here in seconds; it is held to
+/// one sync per [`HEARTBEAT_PUSH_GAP`], so an import of a thousand items in
+/// another client is a handful of syncs and not a thousand. **Coming back to
+/// the window** -- somebody who changed an item in another Bitwarden client
+/// and switched back is looking for it NOW -- is throttled to one per
 /// [`HEARTBEAT_FOCUS_GAP`] so flicking between windows does not sync on
 /// every flick. **The timer** -- Preferences' polling interval,
 /// `Settings::sync_poll_minutes` -- is for the window that is simply left
 /// open and focused.
+///
+/// **While the hub is live, the last two stand down.** Each is a whole-vault
+/// download -- on the owner's server about 3,400 database rows -- asking a
+/// question the hub has already promised to answer.
 fn heartbeat_sync_due(beat: Heartbeat) -> bool {
-    // **Off means off**: no timer, and no sync on coming back to the window
-    // either. What is left is what there was before polling -- the sync on
-    // open and the Sync pill.
-    let Some(interval) = beat.poll else {
-        return false;
-    };
     if beat.sync_in_progress || beat.editing {
         return false;
     }
     let Some(since) = beat.since_last_attempt else {
         return false;
     };
-    let floor = if beat.last_failed { HEARTBEAT_AFTER_FAILURE } else { HEARTBEAT_FOCUS_GAP };
-    if since < floor {
+    if beat.last_failed && since < HEARTBEAT_AFTER_FAILURE {
+        return false;
+    }
+    if beat.pushed {
+        return since >= HEARTBEAT_PUSH_GAP;
+    }
+    if beat.hub_live {
+        return false;
+    }
+    // **Polling off means off**: no timer, and no sync on coming back to the
+    // window either. What is left is the push, the sync on open and the Sync
+    // pill.
+    let Some(interval) = beat.poll else {
+        return false;
+    };
+    if since < HEARTBEAT_FOCUS_GAP {
         return false;
     }
     beat.regained_focus || since >= interval
 }
 /// The least time between two syncs a return to the window can cause.
 const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
+/// The least time between two syncs the hub's pushes can cause.
+const HEARTBEAT_PUSH_GAP: Duration = Duration::from_secs(10);
 /// How long a failed sync keeps every trigger quiet.
 const HEARTBEAT_AFTER_FAILURE: Duration = Duration::from_secs(3 * 60);
 
@@ -20136,6 +20211,8 @@ mod vault_load_step_tests {
         let minutes = |m: u64| Duration::from_secs(m * 60);
         let due = Heartbeat {
             poll: Some(minutes(5)),
+            pushed: false,
+            hub_live: false,
             sync_in_progress: false,
             editing: false,
             regained_focus: false,
@@ -20187,6 +20264,59 @@ mod vault_load_step_tests {
             since_last_attempt: Some(HEARTBEAT_AFTER_FAILURE),
             ..failed
         }));
+    }
+
+    /// **The hub's rules**, each against a beat that would fire without it.
+    ///
+    /// A push fires on its own, with polling off, and inside the focus gap
+    /// -- but not under a form, not beside a sync already out, not inside
+    /// the failure back-off, and not twice inside the push gap. And while
+    /// the hub is live, the timer and the return to the window both stand
+    /// down, because each is a whole-vault download asking a question the
+    /// hub has promised to answer.
+    #[test]
+    fn a_push_syncs_the_window_and_a_live_hub_stands_polling_down() {
+        use crate::vault_window::{
+            heartbeat_sync_due, Heartbeat, HEARTBEAT_AFTER_FAILURE, HEARTBEAT_PUSH_GAP,
+        };
+        use std::time::Duration;
+        let push = Heartbeat {
+            poll: None,
+            pushed: true,
+            hub_live: true,
+            sync_in_progress: false,
+            editing: false,
+            regained_focus: false,
+            since_last_attempt: Some(HEARTBEAT_PUSH_GAP),
+            last_failed: false,
+        };
+        assert!(heartbeat_sync_due(push), "a push with polling off did not sync");
+        assert!(!heartbeat_sync_due(Heartbeat { editing: true, ..push }));
+        assert!(!heartbeat_sync_due(Heartbeat { sync_in_progress: true, ..push }));
+        assert!(!heartbeat_sync_due(Heartbeat {
+            since_last_attempt: Some(HEARTBEAT_PUSH_GAP - Duration::from_secs(1)),
+            ..push
+        }));
+        assert!(!heartbeat_sync_due(Heartbeat {
+            last_failed: true,
+            since_last_attempt: Some(HEARTBEAT_AFTER_FAILURE - Duration::from_secs(1)),
+            ..push
+        }));
+        assert!(!heartbeat_sync_due(Heartbeat { since_last_attempt: None, ..push }));
+
+        // A live hub silences the timer and the return to the window...
+        let polling = Heartbeat {
+            poll: Some(Duration::from_secs(60)),
+            pushed: false,
+            hub_live: false,
+            regained_focus: true,
+            since_last_attempt: Some(Duration::from_secs(60 * 60)),
+            ..push
+        };
+        assert!(heartbeat_sync_due(polling), "control: this beat polls with the hub down");
+        assert!(!heartbeat_sync_due(Heartbeat { hub_live: true, ..polling }));
+        // ...and a hub that is down hands both straight back.
+        assert!(heartbeat_sync_due(Heartbeat { regained_focus: false, ..polling }));
     }
 
     fn a_snapshot() -> VaultSnapshot {
@@ -28083,6 +28213,29 @@ mod export_wiring {
         );
     }
 
+    /// **The hub seam is one call to `HubListener::for_this_process`** -- the
+    /// whole-body equality [`every_frame_env_seam_has_a_whole_body_pin`]
+    /// requires of every seam.
+    ///
+    /// The replacement that matters is short and looks like success: `{ None
+    /// }` leaves the window polling exactly as it did before the hub existed,
+    /// which works, so no behavioural test would notice the pushes stopped.
+    #[test]
+    fn the_hub_seam_only_starts_the_process_listener() {
+        let body = spawner_body(concat!("listen_for_", "pushes"));
+        let expected = concat!(
+            "fn listen_for_",
+            "pushes() -> Option<crate::rest::notifications::HubListener> { Some(crate::rest::notifications::HubListener::for_this_process()) }"
+        );
+        assert_eq!(
+            code_squashed(expected),
+            body,
+            "the production hub seam is no longer one call to \
+             `HubListener::for_this_process`. Whatever else it now does, it does on the path \
+             that decides whether the server's pushes reach the window"
+        );
+    }
+
     /// **The Send-link copy seam is one call to `clipboard::copy_secret`** --
     /// the whole-body equality [`every_frame_env_seam_has_a_whole_body_pin`]
     /// requires of every seam field of `VaultFrameEnv`.
@@ -28891,6 +29044,7 @@ mod export_wiring {
             settings_path,
             reprompt,
             send_copy,
+            hub,
         } = VaultFrameEnv::production();
 
         // Typed `let`s rather than casts off the `fn` items, so each one is a
@@ -28913,6 +29067,7 @@ mod export_wiring {
             Option<&crate::accounts::AccountId>,
         ) -> crate::reprompt::RepromptGate = reprompt_gate_for;
         let real_send_copy: SendCopySeam = copy_send_link;
+        let real_hub: HubStart = listen_for_pushes;
 
         // **A row's NAME is its BINDING's name, spelled by the compiler.**
         // These used to be free string literals sitting beside the
@@ -28931,7 +29086,7 @@ mod export_wiring {
             };
         }
 
-        let checked: [(&str, bool); 9] = [
+        let checked: [(&str, bool); 10] = [
             seam!(sync, real_sync),
             seam!(load, real_load),
             seam!(send_list, real_send_list),
@@ -28963,6 +29118,11 @@ mod export_wiring {
             // lock, the account change, the quit or the timer. That is the
             // exact shape this app shipped with until this field existed.
             seam!(send_copy, real_send_copy),
+            // The field that holds a connection to the account's server OPEN
+            // for as long as the window is. A forwarder here that returned
+            // `None` would leave every push unheard with the window falling
+            // back to polling -- which works, so nothing else would notice.
+            seam!(hub, real_hub),
         ];
         // The tie to `VAULT_FRAME_ENV_FIELDS`, and the reason it is an
         // assertion and not a comment: the destructuring above stops a ninth
@@ -29206,7 +29366,7 @@ mod export_wiring {
     /// `send_delete_wiring` pins, both below-the-cut guards, and the rest.
     /// The struct's own doc warned about exactly this and it happened anyway,
     /// which is why the number is recorded rather than the lesson.
-    pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 10;
+    pub(super) const VAULT_FRAME_ENV_FIELDS: usize = 11;
 
     /// **`VaultFrameEnv` is exactly as WIDE as the fields this module pins --
     /// asked of the compiler, not of any source text.**
@@ -36885,6 +37045,11 @@ mod frame_env_seam {
             // the copy reads it back; every other caller records into a
             // drain nobody looks at, which costs a `String` per press.
             send_copy: record_send_copy,
+            // **No listener.** Not a refusal: every frame of every harness
+            // reaches this on its first real frame, so a panic would make
+            // opening a window fatal. And not the real one, which would dial
+            // whatever server another test had just published a backend for.
+            hub: || None,
         }
     }
 

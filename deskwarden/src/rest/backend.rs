@@ -183,7 +183,13 @@ pub struct RestBackend {
     /// token refresh, which is the behaviour wanted anyway: two threads
     /// refreshing one session concurrently is how a refresh token gets spent
     /// twice.
-    state: Mutex<Authenticated>,
+    ///
+    /// **Shared, since the notifications hub.** An `Arc` so that
+    /// [`crate::rest::notifications::publish`] can hand the hub listener a
+    /// WEAK handle to it: the hub's upgrade needs this session's bearer, a
+    /// second session would be a second login, and a weak handle cannot keep
+    /// a locked or switched-away backend's session alive.
+    state: Arc<Mutex<Authenticated>>,
     /// The vault keys the last `GET /api/sync` produced, so that reading
     /// **one** record need not fetch the whole vault to learn them.
     ///
@@ -338,12 +344,16 @@ impl RestBackend {
         // It is a clear and not a fetch, so `signed_in_with_no_sync_route`'s
         // premise -- that constructing a backend touches no network -- holds.
         crate::rest::organizations::forget();
+        let state = Arc::new(Mutex::new(authenticated));
+        // The same boundary, for the notifications hub: a listener connected
+        // under the previous account reconnects under this one.
+        crate::rest::notifications::publish(&client, &state);
         // `None`, and it must be: a constructor that pre-warmed the key cache
         // would be a constructor that fetches, which is exactly what
         // `signed_in_with_no_sync_route`'s doc relies on not happening.
         Self {
             client,
-            state: Mutex::new(authenticated),
+            state,
             keys: Mutex::new(None),
             synced: Mutex::new(None),
         }

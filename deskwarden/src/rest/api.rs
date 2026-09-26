@@ -1253,6 +1253,29 @@ impl RestClient {
         Ok(())
     }
 
+    /// **The notifications hub's `Authorization` value** --
+    /// `Bearer <access token>` -- for [`crate::rest::notifications`], which
+    /// has to put it on a websocket upgrade this module does not send.
+    ///
+    /// The same token discipline as [`Self::refreshing`], split in two
+    /// because the request it guards is not made here: a token near its
+    /// deadline is refreshed first, and `renew` -- asked for after the hub
+    /// refused the last one -- refreshes regardless, and fails if it cannot.
+    pub(crate) fn hub_bearer(
+        &self,
+        session: &mut Session,
+        renew: bool,
+    ) -> Result<Zeroizing<String>, RestError> {
+        if renew {
+            self.refresh(session)?;
+        } else if session.needs_refresh_at(Instant::now()) && session.can_refresh() {
+            // As in `refreshing`: a failed proactive refresh is not fatal, the
+            // token may have seconds left, and the hub's own 401 decides.
+            let _ = self.refresh(session);
+        }
+        Ok(Zeroizing::new(format!("Bearer {}", session.access_token.as_str())))
+    }
+
     /// `GET /api/sync`, parsed but not decrypted.
     ///
     /// `excludeDomains=true` because this client has no use for the equivalent

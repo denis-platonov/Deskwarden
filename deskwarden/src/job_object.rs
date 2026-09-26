@@ -1453,6 +1453,13 @@ mod tests {
         // the overlay so nothing it writes into can have gone away underneath
         // it.
         ("region_overlay.rs", 1),
+        // One, and it does not ship: the test hub in `rest::notifications`'
+        // tests, a `127.0.0.1` websocket server the listener is driven
+        // against, one connection per script. The listener's own thread is a
+        // `thread::Builder` -- named `notifications-hub` so it can be found in
+        // a dump -- which this census does not count, as it does not count
+        // `single_instance`'s.
+        ("rest/notifications.rs", 1),
         // Counted here like every other site, because a census with a "tests
         // don't count" rule in it is a rule-shaped exemption, which is
         // precisely what this table exists instead of.
@@ -2929,7 +2936,30 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (27355, 0xfb6a_2965_bc1a_8ee9) exactly, so it is measuring
             // what this test measures.
-            (27359, 0xe52e_3c55_5c56_6cb6_u64),
+            // **28098 bytes, new hash: TWO DEPENDENCIES ADDED, and this is the hop
+            // this pin exists for.** Both from crates.io, neither with a path, a
+            // git source, a `[patch]` or a build script of this crate's choosing:
+            //
+            //  * `tungstenite = { version = "0.30", default-features = false,
+            //    features = ["handshake"] }` -- the websocket under
+            //    `rest::notifications`, the server's notifications hub. No TLS
+            //    feature of its own; it is handed a rustls stream built here.
+            //  * `webpki-roots = "1"` -- already in the tree through ureq, named
+            //    directly so the hub's TLS config can use the same Mozilla roots.
+            //
+            // Nothing else moved: no existing dependency was re-pointed or
+            // re-featured, no `[patch]`/`[replace]`/`[workspace.dependencies]`
+            // table appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. 739 bytes longer: the two lines and the
+            // comments above them in the manifest.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over the file
+            // with CRLF normalised to LF, in a separate implementation outside this
+            // crate -- rather than copied out of the failure message. That
+            // implementation was first run against the PREVIOUS pinned pair and
+            // reproduced (27359, 0xe52e_3c55_5c56_6cb6) exactly, so it is measuring
+            // what this test measures.
+            (28098, 0xe920_8b9f_aa62_2dbc_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

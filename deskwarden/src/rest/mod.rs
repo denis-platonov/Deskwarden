@@ -144,6 +144,10 @@ pub mod export;
 /// makes; only a roster costs a request, and only for an account that has an
 /// organisation at all. Nothing here writes.
 pub mod organizations;
+/// The server's notifications hub: a websocket that says when the vault
+/// changed elsewhere, so the vault window syncs then rather than on a timer.
+/// No vault content is read from it; a notice is only a reason to sync.
+pub mod notifications;
 /// Sends over REST: the four operations `crate::send` runs the CLI for.
 pub mod send;
 /// A Send's own key hierarchy, which is not the vault's. Pure; no I/O.

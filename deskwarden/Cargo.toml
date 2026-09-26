@@ -156,6 +156,17 @@ rustls = { version = "0.23", default-features = false, features = [
     "logging",
 ] }
 rustls-pki-types = "1"
+# The server's notifications hub (src/rest/notifications.rs): the websocket
+# Bitwarden's own clients hold open so a change made in one of them reaches
+# the others without being asked for. `handshake` only -- no TLS feature of
+# its own: the stream it is handed is a rustls one built from the same ring
+# provider and the same Mozilla roots ureq verifies every other request
+# against, so the app has one TLS stack and one trust list, not two.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The trust list above, named directly because the hub's TLS config is built
+# here rather than by ureq. Already in the tree through ureq; this adds no
+# crate, only the right to name it.
+webpki-roots = "1"
 directories = "5"
 tray-icon = "0.19"
 # 0.31+ is where egui's text rendering got visibly sharper (better gamma
