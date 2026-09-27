@@ -167,6 +167,27 @@ pub struct Profile {
     pub private_key: Option<String>,
     #[serde(default)]
     pub organizations: Vec<Organization>,
+    /// The account's own id -- the material its fingerprint phrase is keyed
+    /// with, and its org-user id on NodeWarden, where members are keyed by
+    /// user id. Absent on servers that do not send it; nothing but sharing
+    /// reads it.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// The account's email, as the server spells it. Sharing names its
+    /// organisation after it (`Shared by <email>`).
+    #[serde(default)]
+    pub email: Option<String>,
+    /// NodeWarden's account role: `"admin"` for the server's administrator,
+    /// who may mint registration codes (`/api/admin/invites`). Official
+    /// servers send no such field.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Accepted AND confirmed memberships -- where official servers and
+    /// NodeWarden from slice 1 put a membership that has no key yet.
+    /// `organizations` above is confirmed only, which is why the recipient's
+    /// "waiting for X to finish sharing" can only be read from here.
+    #[serde(rename = "organizationsNew", default)]
+    pub organizations_new: Vec<Organization>,
 }
 
 /// One organisation the user is a confirmed member of.
@@ -219,6 +240,19 @@ pub struct Organization {
     /// enabled rather than inventing a reason to hide rows.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// Bitwarden's `OrganizationUserType`: 0 owner, 1 admin, 2 user,
+    /// 3 manager, 4 custom. NodeWarden sends a constant `0` here on some
+    /// routes and says the real thing in `role`, which is why [`Self::is_owner`]
+    /// reads `role` first.
+    #[serde(rename = "type", default)]
+    pub kind: Option<i64>,
+    /// NodeWarden's word for the same thing: `owner`, `admin`, `manager`,
+    /// `member`.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// 0 invited, 1 accepted, 2 confirmed.
+    #[serde(default)]
+    pub status: Option<i64>,
 }
 
 // ---- what comes out ---------------------------------------------------------
@@ -550,6 +584,27 @@ impl std::fmt::Debug for VaultKeys {
     }
 }
 
+impl Organization {
+    /// Whether this account owns the organisation: NodeWarden's `role`, when
+    /// it sent one, else the official `type == 0`.
+    #[must_use]
+    pub fn is_owner(&self) -> bool {
+        match self.role.as_deref() {
+            Some(role) => role.eq_ignore_ascii_case("owner"),
+            None => self.kind == Some(0),
+        }
+    }
+}
+
+impl Profile {
+    /// NodeWarden's server administrator. Only they may mint a registration
+    /// code; see [`Self::role`].
+    #[must_use]
+    pub fn is_server_admin(&self) -> bool {
+        self.role.as_deref().is_some_and(|role| role.eq_ignore_ascii_case("admin"))
+    }
+}
+
 impl VaultKeys {
     /// Unwraps the user key, and every organisation key reachable from it.
     ///
@@ -639,6 +694,22 @@ impl VaultKeys {
         self.owner_of(Some(id))
     }
 
+    /// These keys with one organisation's added (or replaced). For the sharing
+    /// engine's first share: the org it just created is in no profile yet.
+    ///
+    /// `#[allow(dead_code)]` until the sharing engine task wires in its first
+    /// production caller -- shipped complete and tested now rather than
+    /// alongside that caller, for the same reason `switch_to_account` and
+    /// `add_account` were in `main.rs`.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn with_organization(&self, id: &str, key: SymmetricKey) -> VaultKeys {
+        let mut orgs: Vec<(String, SymmetricKey)> =
+            self.orgs.iter().filter(|(known, _)| known != id).cloned().collect();
+        orgs.push((id.to_string(), key));
+        VaultKeys { user: self.user.clone(), orgs }
+    }
+
     /// The key a cipher's *own* key is wrapped under, or that its fields are
     /// wrapped under when it has none.
     fn owner_of(&self, organization_id: Option<&str>) -> Option<&SymmetricKey> {
@@ -650,7 +721,9 @@ impl VaultKeys {
 }
 
 /// The RSA private key's DER, decrypted under the user key.
-fn private_key_der(
+/// `pub(crate)` for the sharing engine, which derives the account's own
+/// public key from it.
+pub(crate) fn private_key_der(
     user: &SymmetricKey,
     profile: &Profile,
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
@@ -2066,5 +2139,71 @@ pub mod tests {
             &master,
         );
         assert!(vault.items.is_empty());
+    }
+
+    /// **Who the account is, and what it is to each organisation**, read off
+    /// the profile the sync (or `GET /api/accounts/profile`) already carries.
+    /// Personal sharing needs all of it: the account's id and email name its
+    /// sharing org and its fingerprint, `role` says whether it may mint a
+    /// NodeWarden invite code, and `organizationsNew` is the one place an
+    /// accepted-but-unconfirmed membership appears.
+    #[test]
+    fn a_profile_says_who_the_account_is_and_which_organisations_are_only_accepted() {
+        let profile: Profile = serde_json::from_value(serde_json::json!({
+            "id": "user-1",
+            "email": "Denis@Example.com",
+            "role": "admin",
+            "key": "2.aaa|bbb|ccc",
+            "organizations": [
+                { "id": "o1", "type": 0, "status": 2, "role": "owner", "name": "Shared by denis@example.com" }
+            ],
+            "organizationsNew": [
+                { "id": "o1", "type": 0, "status": 2 },
+                { "id": "o2", "type": 2, "status": 1, "name": "Shared by anna@example.com" }
+            ]
+        }))
+        .expect("a profile");
+        assert_eq!(profile.id.as_deref(), Some("user-1"));
+        assert_eq!(profile.email.as_deref(), Some("Denis@Example.com"));
+        assert!(profile.is_server_admin());
+        assert!(profile.organizations[0].is_owner());
+        assert_eq!(profile.organizations_new.len(), 2);
+        assert_eq!(profile.organizations_new[1].status, Some(1));
+        assert!(!profile.organizations_new[1].is_owner());
+
+        // A profile from a server that sends none of it still parses, and says
+        // nothing it was not told.
+        let bare: Profile = serde_json::from_value(serde_json::json!({ "key": "2.a|b|c" })).expect("bare");
+        assert!(bare.id.is_none() && bare.email.is_none() && bare.organizations_new.is_empty());
+        assert!(!bare.is_server_admin());
+    }
+
+    /// NodeWarden writes the role as a word, official servers as `type`; either
+    /// makes an owner.
+    #[test]
+    fn an_owner_is_recognised_by_role_or_by_type() {
+        let by_role: Organization = serde_json::from_value(serde_json::json!({ "id": "a", "role": "Owner" })).expect("org");
+        let by_type: Organization = serde_json::from_value(serde_json::json!({ "id": "b", "type": 0 })).expect("org");
+        let member: Organization = serde_json::from_value(serde_json::json!({ "id": "c", "role": "member", "type": 0 })).expect("org");
+        assert!(by_role.is_owner());
+        assert!(by_type.is_owner());
+        assert!(!member.is_owner(), "a role word wins over NodeWarden's constant `type: 0`");
+    }
+
+    /// **A just-created organisation's key, added without a second read.** The
+    /// first share makes the org and then files a record into it; nothing on
+    /// the server lists that org for this account until the next profile read,
+    /// and asking for one would be a request for a key already in hand.
+    #[test]
+    fn keys_gain_an_organisation_without_losing_the_user_key_or_the_others() {
+        let keys = keys_with_organisation(&[1u8; 64], "old", &[2u8; 64]);
+        let fresh = crate::rest::crypto::tests::key_from_64(&[3u8; 64]);
+        let more = keys.with_organization("new", fresh.clone());
+        assert_eq!(more.organization("new"), Some(&fresh));
+        assert_eq!(more.organization("old"), keys.organization("old"));
+        assert_eq!(more.user(), keys.user());
+        // Adding one that is already there replaces it rather than duplicating.
+        let replaced = more.with_organization("old", fresh.clone());
+        assert_eq!(replaced.organization("old"), Some(&fresh));
     }
 }
