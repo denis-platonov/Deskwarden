@@ -537,7 +537,10 @@ pub fn count_for(items: &[VaultItem], filter: &SidebarFilter) -> usize {
 
 /// The Sends row's label, spelled once so the rail and the tests that press
 /// it cannot drift apart.
-pub const SENDS_ROW_LABEL: &str = "Sends";
+///
+/// **`Sent`**, the owner's word for it -- "prob only have Sent and Shared with
+/// me (both ways folders) - that's it": two folders, one for each direction.
+pub const SENDS_ROW_LABEL: &str = "Sent";
 
 /// Design 5b's `Shared with me` row: the Sends **other people** sent to this
 /// user and this app imported.
@@ -1844,20 +1847,9 @@ fn screen_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'
             screens.select_sharing(SendScope::All);
         }
     }
-    // 5b's three sub-rows, indented under the parent by
-    // `SUB_ROW_EXTRA_INDENT`. The set comes from `SendScope::SUB_ROWS` rather
-    // than three literals here, so the rows the rail draws and the rows the
-    // pane can be filtered to are one list.
-    for scope in SendScope::SUB_ROWS {
-        let width = ui.available_width();
-        let on = screens.sharing_is(scope);
-        let count = lists.sends.map(|c| c.of(scope));
-        if sidebar_row(ui, scope.label(), count, on, false, width, SUB_ROW_EXTRA_INDENT)
-            .clicked()
-        {
-            screens.select_sharing(scope);
-        }
-    }
+    // **No sub-rows.** 5b draws Waiting / Used / Ended under the parent; the
+    // owner: "prob only have Sent and Shared with me (both ways folders) -
+    // that's it". Every Send is on the one list, and its pill says its state.
     // `Shared with me` is a SIBLING of the parent row, not a fourth sub-row,
     // and 5b draws it flush for that reason: the three above it are cuts of
     // one list, and this lists something else entirely -- what other people
@@ -4120,9 +4112,6 @@ mod tests {
             ("the SHARING divider", above_sharing.top()),
             (SHARING_SECTION_LABEL, top_of(SHARING_SECTION_LABEL)),
             (SENDS_ROW_LABEL, top_of(SENDS_ROW_LABEL)),
-            (SendScope::Waiting.label(), top_of(SendScope::Waiting.label())),
-            (SendScope::Used.label(), top_of(SendScope::Used.label())),
-            (ENDED_ROW_LABEL, top_of(ENDED_ROW_LABEL)),
             (RECEIVED_ROW_LABEL, top_of(RECEIVED_ROW_LABEL)),
         ];
         for pair in order.windows(2) {
@@ -4171,46 +4160,6 @@ mod tests {
                  are meant to be the same 14px boundary"
             );
         }
-    }
-
-    /// **The three sub-rows are indented and their parent is not**, which is
-    /// the whole of what says they are cuts of the row above rather than
-    /// siblings of it -- and `Shared with me` is flush, because it lists
-    /// something else entirely.
-    ///
-    /// Measured off painted glyphs rather than off the constant, so a row
-    /// that took the indent and then lost it to a clip rect still fails.
-    #[test]
-    fn the_sharing_sub_rows_are_indented_under_their_parent_and_shared_with_me_is_not() {
-        let live = three_unfiled_and_two_filed();
-        let folders = one_real_folder_and_the_virtual_bucket();
-        let (painted, _, _, _) = painted_sidebar_parts(
-            "Locks in 11:42",
-            VaultLists::live_only(&live),
-            &folders,
-        );
-        let left_of = |needle: &str| {
-            painted
-                .iter()
-                .find(|(text, _)| text == needle)
-                .map(|(_, rect)| rect.left())
-                .unwrap_or_else(|| panic!("the sidebar painted no {needle:?}: {painted:?}"))
-        };
-        let parent = left_of(SENDS_ROW_LABEL);
-        for scope in SendScope::SUB_ROWS {
-            let indented = left_of(scope.label());
-            assert!(
-                (indented - parent - SUB_ROW_EXTRA_INDENT).abs() < 0.51,
-                "{:?} starts at x={indented} and its parent at x={parent} -- the design indents \
-                 a sub-row by {SUB_ROW_EXTRA_INDENT}",
-                scope.label()
-            );
-        }
-        assert!(
-            (left_of(RECEIVED_ROW_LABEL) - parent).abs() < 0.51,
-            "`Shared with me` is indented like a sub-filter, and it is not one -- it lists what \
-             other people sent, not a cut of what this account published"
-        );
     }
 
     /// **Every Send is on exactly one sub-row, and the three add up to the
@@ -4350,9 +4299,6 @@ mod tests {
         for label in [
             health,
             SENDS_ROW_LABEL,
-            SendScope::Waiting.label(),
-            SendScope::Used.label(),
-            ENDED_ROW_LABEL,
             RECEIVED_ROW_LABEL,
         ] {
             let rect = scrolled
@@ -5485,14 +5431,10 @@ mod tests {
                 .left()
         };
 
+        // The SHARING section has no sub-rows any more (the owner: "only have
+        // Sent and Shared with me"), so the collection is held to the
+        // sub-row depth itself rather than to a row that no longer exists.
         let collection_indent = left_of("Production") - left_of("Acme Security");
-        let sharing_indent = left_of(SendScope::Waiting.label()) - left_of(SENDS_ROW_LABEL);
-        assert!(
-            (collection_indent - sharing_indent).abs() < 0.01,
-            "a collection is indented {collection_indent}pt under its organisation and a \
-             SHARING sub-row {sharing_indent}pt under its parent -- two depths of child row \
-             in one rail"
-        );
         assert!(
             (collection_indent - SUB_ROW_EXTRA_INDENT).abs() < 0.01,
             "control: neither row is indented by `SUB_ROW_EXTRA_INDENT` at all \

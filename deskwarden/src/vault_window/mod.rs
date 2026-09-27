@@ -4294,7 +4294,7 @@ pub fn build_frame_with_search(
              Refresh, Delete, Cancel and the confirmation -- is inert. See \
              `send_ui::SendUiVerdict`"
         );
-        apply_send_action(
+        let open_record = apply_send_action(
             egui::CentralPanel::default()
             // NO INNER MARGIN, and that is the fix for the band the owner
             // marked out around the detail pane: "there is another band
@@ -4332,7 +4332,7 @@ pub fn build_frame_with_search(
                 // things -- see `send_ui::pane_state`, where that decision
                 // is tested.
                 if let Some(state) = &show_sends
-                    .then(|| send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock, &crate::local_time::SystemZone))
+                    .then(|| send_ui::with_sent_facts(send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock, &crate::local_time::SystemZone), &sent_history))
                 {
                     // The pane draws and reports in one expression, and
                     // that expression IS the closure's value. A gate on
@@ -6278,6 +6278,20 @@ pub fn build_frame_with_search(
             },
             copy_send_url,
         );
+        // **`Open record`**: leave the Sent screen and show the item the Send
+        // was made from, as a click on its row in the list would -- when it is
+        // still in the vault. One that has gone since leaves the screen as it is.
+        if let Some(item_id) = open_record {
+            if items.iter().any(|item| item.id == item_id) {
+                sends_selected = false;
+                received_selected = false;
+                health_selected = false;
+                filter = SidebarFilter::All;
+                selected_id = Some(item_id);
+                detail_dismissed = false;
+                mode = DetailMode::Read;
+            }
+        }
 
         // A GENERATE FAILURE BELONGS TO AN OPEN DRAFT, AND DIES WITH IT.
         //
@@ -11628,12 +11642,16 @@ fn apply_send_action(
     spawn: SendDeleteSpawn,
     create: SendCreateWiring<'_>,
     copy: SendCopySeam,
-) {
+) -> Option<String> {
     let SendCreateWiring {
         state: create,
         tx: create_tx,
         spawn: spawn_create,
     } = create;
+    // `Open record` is the one action this function cannot carry out: the
+    // vault's selection belongs to the frame. It is handed back, and the
+    // frame opens the item.
+    let mut open_record = None;
     match action {
         // The URL comes out of the row that was clicked and is carried in the
         // action itself -- there is no second lookup here that could resolve
@@ -11806,8 +11824,10 @@ fn apply_send_action(
                 );
             }
         }
+        send_ui::SendUiAction::OpenRecord(item_id) => open_record = Some(item_id),
         send_ui::SendUiAction::None => {}
     }
+    open_record
 }
 
 /// The revoke reporting back, as a plain function for
@@ -32417,11 +32437,6 @@ mod send_delete_wiring {
             .push((id, name, session.to_string()));
     }
 
-    /// The name in the answer [`frame_send_list`] WITHHOLDS -- different from
-    /// [`FRAME_SEND_NAME`] on purpose, so that "the withheld answer was
-    /// accepted" and "the refetch answered" are two different things on
-    /// screen rather than the same list twice.
-    const FRAME_STALE_NAME: &str = "Stale Harness Send";
 
     /// Whether [`frame_send_list`] keeps its sender instead of answering, so
     /// the window is left with a fetch genuinely in flight.
@@ -32495,6 +32510,11 @@ mod send_delete_wiring {
     /// The item this harness's vault holds, whose row the last step selects.
     const FRAME_ITEM_ID: &str = "frame-harness-item-id";
     const FRAME_ITEM_NAME: &str = "Frame Harness Item";
+    /// The name in the answer the matrix's `FetchInFlight` state ABANDONS --
+    /// different from [`FRAME_SEND_NAME`] on purpose, so painting the stale
+    /// answer is a string on screen rather than a list that merely looks
+    /// right.
+    const FRAME_STALE_NAME: &str = "Stale Harness Send";
 
     /// A SECOND item, deliberately in NO folder.
     ///
@@ -32959,7 +32979,7 @@ mod send_delete_wiring {
         // which is what a user does, and which makes "the Send this acted on"
         // a real question rather than a coincidence of row order.
         output = click(&ctx, &mut frame_fn, locate(&output, FRAME_SEND_NAME));
-        let delete_at = locate(&output, send_ui::DELETE_LABEL);
+        let delete_at = locate(&output, send_ui::REVOKE_LABEL);
         let armed = click(&ctx, &mut frame_fn, delete_at);
         assert!(
             find(&armed, send_ui::CONFIRM_LABEL).is_some(),
@@ -33029,7 +33049,7 @@ mod send_delete_wiring {
         // still there is still described. Its button is not underneath the
         // card either -- so a click there reaches the control rather than the
         // overlay.
-        let delete_rect = find(&showing, send_ui::DELETE_LABEL).unwrap_or_else(|| {
+        let delete_rect = find(&showing, send_ui::REVOKE_LABEL).unwrap_or_else(|| {
             panic!(
                 "control: no Delete button is on screen with the report card up, so there is \
                  nothing to press. What was painted: {:?}",
@@ -33061,114 +33081,37 @@ mod send_delete_wiring {
         //
         // The state this covers is one the steps above cannot reach and a
         // measured shadow IS gated on: `notice_message` is `Some` for the
-        // whole of a failed Sends fetch -- `vault_window` turns the
-        // `SendError` into `NoticeSource::Sends` whether or not the band ends
-        // up drawn, and the pane suppresses the band only because it prints
-        // the same sentence itself. A shadow reading `if
-        // notice_message.is_some() { SendUiAction::None }` therefore leaves
-        // the Sends screen with no way out of an error at all: Refresh is
-        // drawn in EVERY pane state precisely so that a failure is not
-        // permanent, and under that shadow it is.
+        // whole of a failed Sends fetch, so a shadow reading `if
+        // notice_message.is_some() { SendUiAction::None }` would leave the
+        // screen with no way out of an error at all.
         //
-        // So: fail the fetch, confirm the screen really is in that state, and
-        // then press the real Refresh with the failure showing.
+        // The screen has no Refresh any more (a Send is made from a record,
+        // and the list is asked for again on every visit -- see
+        // `send_ui::should_invalidate_on_leave`), so the failure is reached
+        // the way a user reaches it: leave the Sent screen and come back with
+        // the fetch set to fail. And it is left by the failed pane's own
+        // `Try again`, pressed on the real window with the failure showing.
         FRAME_LIST_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let refresh_at = locate(&armed_again, "Refresh");
-        let failed = click(&ctx, &mut frame_fn, refresh_at);
+        let vault_at = locate(&armed_again, "All items");
+        let away = click(&ctx, &mut frame_fn, vault_at);
+        let sends_at = locate(&away, sidebar::SENDS_ROW_LABEL);
+        let failed = click(&ctx, &mut frame_fn, sends_at);
         assert!(
             find(&failed, FRAME_SEND_NAME).is_none(),
-            "control: Refresh was pressed with the fetch set to fail and {FRAME_SEND_NAME:?} \
-             is still on screen, so the screen is not in the failed state this step is \
-             about. What was painted: {:?}",
+            "control: the Sent screen was reopened with the fetch set to fail and \
+             {FRAME_SEND_NAME:?} is still on screen, so the screen is not in the failed state \
+             this step is about. What was painted: {:?}",
             texts(&failed)
         );
 
         FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
-        let refresh_at = locate(&failed, "Refresh");
-        let recovered = click(&ctx, &mut frame_fn, refresh_at);
-        assert!(
-            find(&recovered, FRAME_SEND_NAME).is_some(),
-            "Refresh was pressed on a Sends screen showing a failed fetch and the list never \
-             came back, so the only control that state offers does nothing and the error is \
-             permanent for the user. What was painted: {:?}",
-            texts(&recovered)
-        );
-
-        // 6. **AND A FETCH IN FLIGHT DOES NOT KILL THE SCREEN.**
-        //
-        // The last state a shadow can be gated on that the steps above do not
-        // reach: `send_fetch.in_flight`, true from the frame that starts a
-        // `bw send list` until the frame that drains its answer -- seconds,
-        // against a real `bw`. Refresh is drawn during it, and pressing it is
-        // how a user abandons an answer that is taking too long: it bumps the
-        // fetch's generation, which is what makes the answer already on its
-        // way STALE. Under `if send_fetch.in_flight { SendUiAction::None }`
-        // the press does nothing, the generation does not move, and the
-        // answer the user just abandoned is the one they get.
-        //
-        // So the fetch is left genuinely in flight -- the stub keeps its
-        // sender instead of answering -- Refresh is pressed, and then that
-        // withheld answer is delivered carrying a DIFFERENT name. Which name
-        // ends up on screen is the whole discrimination.
-        FRAME_LIST_WITHHOLDS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let refresh_at = locate(&recovered, "Refresh");
-        let waiting = click(&ctx, &mut frame_fn, refresh_at);
-        let (stale_tx, stale_generation) = FRAME_LIST_TX
-            .lock()
-            .expect("not poisoned")
-            .clone()
-            .expect("control: the refetch never reached the send-list stub, so no fetch is in \
-                     flight and this step is not about the state it names");
-        assert!(
-            find(&waiting, FRAME_SEND_NAME).is_none(),
-            "control: the list is still on screen with its fetch withheld, so the window is \
-             not waiting on anything. What was painted: {:?}",
-            texts(&waiting)
-        );
-
-        // The press under test.
-        let refresh_at = locate(&waiting, "Refresh");
-        let _ = click(&ctx, &mut frame_fn, refresh_at);
-
-        // The abandoned answer arrives, late, under the generation it was
-        // started with; and the refetch that follows answers normally.
-        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
-        let _ = stale_tx.send((
-            stale_generation,
-            Ok(vec![crate::send::SendSummary {
-                id: "stale-harness-send-id".to_string(),
-                name: FRAME_STALE_NAME.to_string(),
-                access_url: "https://send.example.invalid/stale".to_string(),
-                deletion_date: "2999-01-01T00:00:00.000Z".to_string(),
-                is_file: false,
-                // Live and untouched, so the row derives to Waiting.
-                max_access_count: None,
-                access_count: 0,
-                disabled: false,
-                expiration_date: String::new(),
-                has_password: false,
-            }]),
-        ));
-        // Five frames painted and five asserted: the assert used to run
-        // before the repaint at the end of the body, so the last frame the
-        // loop painted was never looked at.
-        let mut settled = ctx.run_ui(input(), |ui| frame_fn(ui));
-        for _ in 0..4 {
-            settled = ctx.run_ui(input(), |ui| frame_fn(ui));
-            assert!(
-                find(&settled, FRAME_STALE_NAME).is_none(),
-                "Refresh was pressed while a Sends fetch was in flight and the answer the \
-                 user abandoned was painted anyway ({FRAME_STALE_NAME:?}). The press did not \
-                 reach the applier, so the fetch's generation never moved and the stale list \
-                 was accepted as current. What was painted: {:?}",
-                texts(&settled)
-            );
-        }
+        let retry_at = locate(&failed, send_ui::TRY_AGAIN_LABEL);
+        let settled = click(&ctx, &mut frame_fn, retry_at);
         assert!(
             find(&settled, FRAME_SEND_NAME).is_some(),
-            "control: the stale answer was dropped and no refetch replaced it, so the screen \
-             is empty for a reason that has nothing to do with the press. What was painted: \
-             {:?}",
+            "Try again was pressed on a Sent screen showing a failed fetch and the list never \
+             came back, so the only control that state offers does nothing and the error is \
+             permanent for the user. What was painted: {:?}",
             texts(&settled)
         );
 
@@ -33186,7 +33129,7 @@ mod send_delete_wiring {
         let selected = click(&ctx, &mut frame_fn, item_at);
         let sends_at = locate(&selected, sidebar::SENDS_ROW_LABEL);
         let back_on_sends = click(&ctx, &mut frame_fn, sends_at);
-        let delete_at = locate(&back_on_sends, send_ui::DELETE_LABEL);
+        let delete_at = locate(&back_on_sends, send_ui::REVOKE_LABEL);
         let armed_with_selection = click(&ctx, &mut frame_fn, delete_at);
         assert!(
             find(&armed_with_selection, send_ui::CONFIRM_LABEL).is_some(),
@@ -33353,7 +33296,7 @@ mod send_delete_wiring {
         // not stop a row being pickable either, and this is where that would
         // show.
         let picked = click(&ctx, &mut frame_fn, locate(&on_sends, FRAME_SEND_NAME));
-        let delete_at = locate(&picked, send_ui::DELETE_LABEL);
+        let delete_at = locate(&picked, send_ui::REVOKE_LABEL);
         let armed = click(&ctx, &mut frame_fn, delete_at);
         assert!(
             find(&armed, send_ui::CONFIRM_LABEL).is_some(),
@@ -33433,23 +33376,10 @@ mod send_delete_wiring {
         /// green without this, and it makes the whole Sends screen inert for
         /// the seconds a real revoke takes.
         RevokeInFlight,
-        /// The create composer open, with the Sends screen left and returned
-        /// to since. **The draft is WINDOW state, not pane state**, and this
-        /// is the state that says so: the form is opened with the real New
-        /// Send button, the window is navigated away from it, and the matrix's
-        /// own press of the Sends row below finds the composer still there.
-        ///
-        /// It is a reachable state in its own right and not a decoration: the
-        /// composer sits ABOVE the rows, so a gate written on
-        /// `send_create.composer.open` -- the newest frame-local this window
-        /// has -- would leave every control on the Sends screen inert for as
-        /// long as a user is typing a Send, which is the whole of the time the
-        /// feature is being used.
-        ComposerOpen,
     }
 
     impl ReachableState {
-        const ALL: [Self; 11] = [
+        const ALL: [Self; 10] = [
             Self::Fresh,
             Self::EmptyVault,
             Self::FolderSelected,
@@ -33460,7 +33390,6 @@ mod send_delete_wiring {
             Self::NoticeUp,
             Self::FetchInFlight,
             Self::RevokeInFlight,
-            Self::ComposerOpen,
         ];
     }
 
@@ -33470,7 +33399,7 @@ mod send_delete_wiring {
         ///
         /// **This is what stops [`Reached::on_the_sends_screen`] being a
         /// free hatch.** Measured: with the `ItemSelected` click deleted and
-        /// its witness swapped for `send_ui::DELETE_LABEL` -- a label every
+        /// its witness swapped for `send_ui::REVOKE_LABEL` -- a label every
         /// state paints -- the matrix went green again, which is the same
         /// defect the witness was introduced to close, one indirection
         /// further out. A label that `Fresh` already paints on the Sends
@@ -33650,12 +33579,6 @@ mod send_delete_wiring {
                 Witness::BadgeResolvedOnRow { row: "Archive", other: "Trash" }
             }
             ReachableState::SearchTyped => Witness::Appeared("zq"),
-            // The composer's own heading, which nothing else on this screen
-            // paints -- and which `Fresh`'s Sends screen therefore does not,
-            // so the baseline check below is a real one.
-            ReachableState::ComposerOpen => {
-                Witness::OnTheSendsScreen(send_ui::COMPOSER_HEADING)
-            }
         }
     }
 
@@ -34242,9 +34165,9 @@ mod send_delete_wiring {
     ///
     ///  1. the Sends screen is really on screen (its own header, not just the
     ///     sidebar row that leads to it);
-    ///  2. Refresh is drawn, and pressing it really refetches -- proved in
-    ///     BOTH directions, once into a failure and once back out of it, so a
-    ///     press that does nothing cannot pass by accident;
+    ///  2. leaving and returning really refetches, and Try again really
+    ///     refetches -- once into a failure and once back out of it, so a
+    ///     control that does nothing cannot pass by accident;
     ///  3. a row's Delete really arms the confirmation and starts no revoke,
     ///     and Cancel really disarms it;
     ///  4. no verdict was dropped instead of applied.
@@ -34417,7 +34340,7 @@ mod send_delete_wiring {
         /// values, not identifiers: renaming the constant behind
         /// `FRAME_ITEM_NAME` changes nothing here, but pointing it at a
         /// different string does.
-        const MEASURED: [(ReachableState, &str); 11] = [
+        const MEASURED: [(ReachableState, &str); 10] = [
             (ReachableState::Fresh, "Baseline"),
             (ReachableState::EmptyVault, "NeverPaints|Frame Harness Item"),
             (
@@ -34437,7 +34360,6 @@ mod send_delete_wiring {
                 "OnTheSendsScreen|Asking Bitwarden for your Sends\u{2026}",
             ),
             (ReachableState::RevokeInFlight, "OwnBlock"),
-            (ReachableState::ComposerOpen, "OnTheSendsScreen|New text Send"),
         ];
 
         // The table is over EVERY state and no others. Without this an
@@ -34522,209 +34444,6 @@ mod send_delete_wiring {
                  exactly one baseline and exactly one variant with a block of its own."
             );
         }
-    }
-
-    /// Every create the frame started, as (name, text, share password,
-    /// session). A `Mutex` rather than a thread-local for [`FRAME_REVOKES`]'s
-    /// reason: the spawner is a `fn` item, so there is nowhere to capture a
-    /// recorder, and [`FRAME_LOCK`] keeps two tests out of each other's
-    /// records.
-    static FRAME_CREATES: std::sync::Mutex<Vec<(String, String, String, String)>> =
-        std::sync::Mutex::new(Vec::new());
-
-    /// The name typed into the real composer by
-    /// [`typing_a_send_and_pressing_create_really_publishes_what_was_typed`].
-    const FRAME_DRAFT_NAME: &str = "Draft From The Frame";
-    /// The body typed into it. Distinctive, so "this is what was typed and
-    /// not something the harness supplied" is a search a stray substring
-    /// cannot satisfy.
-    const FRAME_DRAFT_TEXT: &str = "obsidian-lamplight-4417";
-
-    /// A [`SendCreateSpawn`] that records instead of publishing. Production's
-    /// signature exactly, so the only difference between this run and the
-    /// shipping one is which of two `fn` pointers the env carries.
-    fn frame_create(
-        _ctx: egui::Context,
-        _tx: SendCreateSender,
-        session: zeroize::Zeroizing<String>,
-        plan: crate::send::SendPlan,
-    ) {
-        FRAME_CREATES.lock().expect("not poisoned").push((
-            plan.name.clone(),
-            plan.text.to_string(),
-            plan.password.as_deref().cloned().unwrap_or_default(),
-            session.to_string(),
-        ));
-    }
-
-    /// **THE WHOLE CREATE, ON A REAL WINDOW, DRIVEN THE WAY A USER DRIVES
-    /// IT.**
-    ///
-    /// Every other hold on this feature is about a piece of it: the state
-    /// machine (`send_create_wiring`), the child and its job, the composer's
-    /// own widgets. This is the one that says the pieces are connected --
-    /// the real sidebar row is pressed, the real New Send button is pressed,
-    /// the real text fields are focused by clicking them and filled with
-    /// real key events, the real Create button is pressed, and the publish
-    /// is observed where it leaves the frame carrying what was typed.
-    ///
-    /// It is also the only thing that can see the two shapes a source pin
-    /// cannot: a Create button that is drawn but reports nothing, and an
-    /// `apply_send_action` reached with an action that was neutralised on the
-    /// way. See [`VaultFrameEnv::send_delete`] for the measured history of
-    /// both on the revoke side.
-    ///
-    /// **The greyed-out button is checked first, and that is not decoration.**
-    /// An empty draft must publish nothing; a Create that fires on an empty
-    /// form would publish an empty Send under a public link. So the button is
-    /// pressed BEFORE anything is typed and the ledger is required to be
-    /// empty, and only then is the form filled.
-    ///
-    /// **No `bw`, no dialog, no network.** The create spawner is substituted
-    /// through the env seam; that the production pointer behind that seam is
-    /// the real `send_create_thread::spawn_send_create` is held by
-    /// `send_ui`'s `production_is_the_only_env_a_shipping_build_has` and by
-    /// `export_wiring::production_hands_the_window_the_real_functions`.
-    #[test]
-    fn typing_a_send_and_pressing_create_really_publishes_what_was_typed() {
-        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        FRAME_CREATES.lock().expect("not poisoned").clear();
-        FRAME_REVOKES.lock().expect("not poisoned").clear();
-        *FRAME_TX.lock().expect("not poisoned") = None;
-        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
-        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
-        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
-        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
-
-        let scratch = crate::test_scratch::ScratchDir::new("send-create-frame");
-
-        let (_options, mut frame_fn, _handles) = build_frame(
-            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new(
-                "http://127.0.0.1:1",
-            ))),
-            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
-            crate::login_ui::BwStatusDetails {
-                status: crate::login_ui::BwStatus::Unlocked,
-                user_email: Some("harness@example.invalid".to_string()),
-                server_url: None,
-            },
-            FRAME_SESSION.to_string(),
-            scratch.join("icons"),
-            crate::settings::AutoLock::Never,
-            true,
-            None,
-            true,
-            super::frame_env_seam::with_send_create(
-                super::frame_env_seam::stubbed(
-                    frame_sync,
-                    frame_load,
-                    frame_send_list,
-                    Some(scratch.join("settings.json")),
-                ),
-                frame_create,
-            ),
-        );
-
-        let state = ReachableState::Fresh;
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(matrix_input(), |_ui| {});
-        crate::theme::apply(&ctx);
-        let _ = ctx.run_ui(matrix_input(), |_ui| {});
-        let _ = matrix_frame(&ctx, &mut frame_fn);
-        let output = matrix_frame(&ctx, &mut frame_fn);
-
-        let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
-        let on_sends = matrix_click(&ctx, &mut frame_fn, sends_at);
-        let new_at = matrix_locate(state, &on_sends, send_ui::NEW_SEND_LABEL);
-        let mut opened = matrix_click(&ctx, &mut frame_fn, new_at);
-        assert!(
-            matrix_find(&opened, send_ui::COMPOSER_HEADING).is_some(),
-            "the New Send button was pressed and no composer appeared, so the header's one \
-             way into this feature is inert. What was painted: {:?}",
-            matrix_texts(&opened)
-        );
-
-        // **The empty form publishes nothing.** Pressed for real, before a
-        // character is typed.
-        let create_at = matrix_locate(state, &opened, send_ui::CREATE_LABEL);
-        opened = matrix_click(&ctx, &mut frame_fn, create_at);
-        assert!(
-            FRAME_CREATES.lock().expect("not poisoned").is_empty(),
-            "pressing Create on an EMPTY draft published something -- a Send with no name \
-             and no body, under a public link"
-        );
-
-        // Fill it, by focusing each field the way a user does: a click on the
-        // box, then real text events.
-        let name_at = matrix_locate(state, &opened, send_ui::NAME_HINT);
-        let focused = matrix_click(&ctx, &mut frame_fn, name_at);
-        let _ = focused;
-        let typed_name = matrix_key_text(&ctx, &mut frame_fn, FRAME_DRAFT_NAME);
-        assert!(
-            matrix_find(&typed_name, FRAME_DRAFT_NAME).is_some(),
-            "the name field did not take what was typed into it, so the rest of this test \
-             would be about an empty form. What was painted: {:?}",
-            matrix_texts(&typed_name)
-        );
-        let text_at = matrix_locate(state, &typed_name, send_ui::TEXT_HINT);
-        let _ = matrix_click(&ctx, &mut frame_fn, text_at);
-        let filled = matrix_key_text(&ctx, &mut frame_fn, FRAME_DRAFT_TEXT);
-        assert!(
-            matrix_find(&filled, FRAME_DRAFT_TEXT).is_some(),
-            "the body field did not take what was typed into it. What was painted: {:?}",
-            matrix_texts(&filled)
-        );
-
-        let create_at = matrix_locate(state, &filled, send_ui::CREATE_LABEL);
-        let published = matrix_click(&ctx, &mut frame_fn, create_at);
-
-        assert_eq!(
-            FRAME_CREATES.lock().expect("not poisoned").clone(),
-            vec![(
-                FRAME_DRAFT_NAME.to_string(),
-                FRAME_DRAFT_TEXT.to_string(),
-                String::new(),
-                FRAME_SESSION.to_string(),
-            )],
-            "pressing Create on a filled composer did not start exactly one publish carrying \
-             exactly what was typed and this window's own session. A press that reaches \
-             nothing looks identical on screen, and the whole feature is that press. What \
-             was painted: {:?}",
-            matrix_texts(&published)
-        );
-
-        // And the window knows one is running: the composer says so, which is
-        // what stops a second press.
-        assert!(
-            matrix_find(&published, send_ui::CREATING_LABEL).is_some(),
-            "the publish started and the composer does not say so, so a second press would \
-             publish the same secret again under a second link. What was painted: {:?}",
-            matrix_texts(&published)
-        );
-
-        assert_eq!(
-            send_ui::abandoned_in_this_thread(),
-            0,
-            "a Sends verdict was dropped instead of applied during this test"
-        );
-    }
-
-    /// Real text events, with no Ctrl+K first -- [`matrix_type`] is the search
-    /// box's route and focuses it on the way in, which is exactly wrong for a
-    /// field that has just been focused by a click.
-    fn matrix_key_text(
-        ctx: &egui::Context,
-        frame_fn: &mut dyn FnMut(&mut egui::Ui),
-        text: &str,
-    ) -> egui::FullOutput {
-        let _ = ctx.run_ui(
-            egui::RawInput {
-                events: vec![egui::Event::Text(text.to_string())],
-                ..matrix_input()
-            },
-            |ui| frame_fn(ui),
-        );
-        matrix_frame(ctx, frame_fn)
     }
 
     /// **THE HEADER'S ✕ REALLY HIDES THE DETAIL PANE, ON A REAL WINDOW.**
@@ -35119,33 +34838,6 @@ mod send_delete_wiring {
             ReachableState::SearchTyped => {
                 output = matrix_type(&ctx, &mut frame_fn, "zq");
             }
-            ReachableState::ComposerOpen => {
-                // **Opened on the Sends screen, then navigated away from.**
-                // The matrix presses the Sends row itself a few lines below,
-                // and the witness is checked on THAT screen -- so this arm
-                // proves the draft survives a trip to another screen, which
-                // is the property that makes losing a half-typed secret to a
-                // stray click impossible.
-                let sends_at = matrix_locate(state, &output, sidebar::SENDS_ROW_LABEL);
-                let on_sends = matrix_click(&ctx, &mut frame_fn, sends_at);
-                let new_at = matrix_locate(state, &on_sends, send_ui::NEW_SEND_LABEL);
-                let opened = matrix_click(&ctx, &mut frame_fn, new_at);
-                assert!(
-                    matrix_find(&opened, send_ui::COMPOSER_HEADING).is_some(),
-                    "control: the New Send button was pressed and no composer appeared, so this \
-                     state cannot be reached at all. What was painted: {:?}",
-                    matrix_texts(&opened)
-                );
-                let away = matrix_locate(state, &opened, "Frame Harness Folder");
-                output = matrix_click(&ctx, &mut frame_fn, away);
-                assert!(
-                    matrix_find(&output, send_ui::COMPOSER_HEADING).is_none(),
-                    "control: the composer is painted on a screen that is not the Sends screen, so \
-                     \"it is still open when we come back\" says nothing about coming back. What \
-                     was painted: {:?}",
-                    matrix_texts(&output)
-                );
-            }
         }
         let reached = Reached::proved(state, &before, &output);
 
@@ -35214,7 +34906,7 @@ mod send_delete_wiring {
                 &mut frame_fn,
                 matrix_locate(state, &output, FRAME_SEND_NAME),
             );
-            let delete_at = matrix_locate(state, &picked, send_ui::DELETE_LABEL);
+            let delete_at = matrix_locate(state, &picked, send_ui::REVOKE_LABEL);
             let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
             let confirm_at = matrix_locate(state, &armed, send_ui::CONFIRM_LABEL);
             output = matrix_click(&ctx, &mut frame_fn, confirm_at);
@@ -35233,19 +34925,23 @@ mod send_delete_wiring {
             );
         }
 
-        // The press that has to happen WHILE the fetch is in flight, for the
-        // one state that is about that. Refresh during a wait is how a user
-        // abandons an answer that is taking too long: it moves the fetch's
-        // generation, which is what makes the answer already on its way
-        // stale. A press that reaches nothing leaves the generation where it
-        // was and the abandoned list is the one the user gets.
+        // The trip that has to happen WHILE the fetch is in flight, for the
+        // one state that is about that. Leaving the Sent screen and coming
+        // back is how a user abandons an answer that is taking too long (the
+        // screen has no Refresh -- see `send_ui::should_invalidate_on_leave`):
+        // it moves the fetch's generation, which is what makes the answer
+        // already on its way stale. A trip that reaches nothing leaves the
+        // generation where it was and the abandoned list is the one the user
+        // gets.
         //
-        // (It also unsticks the window: `invalidate` deliberately does not
-        // clear `in_flight`, because a thread really is still running, so
-        // nothing refetches until that thread answers.)
+        // (`invalidate` deliberately does not clear `in_flight`, because a
+        // thread really is still running, so nothing refetches until that
+        // thread answers.)
         if matches!(state, ReachableState::FetchInFlight) {
-            let refresh_at = matrix_locate(state, &output, "Refresh");
-            let _ = matrix_click(&ctx, &mut frame_fn, refresh_at);
+            let vault_at = matrix_locate(state, &output, "All items");
+            let away = matrix_click(&ctx, &mut frame_fn, vault_at);
+            let sends_at = matrix_locate(state, &away, sidebar::SENDS_ROW_LABEL);
+            let _ = matrix_click(&ctx, &mut frame_fn, sends_at);
             FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
             let (stale_tx, stale_generation) = FRAME_LIST_TX
                 .lock()
@@ -35273,10 +34969,10 @@ mod send_delete_wiring {
                 settled = matrix_frame(&ctx, &mut frame_fn);
                 assert!(
                     matrix_find(&settled, FRAME_STALE_NAME).is_none(),
-                    "Refresh was pressed while a Sends fetch was in flight and the answer the \
-                     user abandoned was painted anyway ({FRAME_STALE_NAME:?}), so the press \
-                     reached nothing and the fetch's generation never moved. What was \
-                     painted: {:?}",
+                    "the Sent screen was left and returned to while a Sends fetch was in flight \
+                     and the answer the user abandoned was painted anyway ({FRAME_STALE_NAME:?}), \
+                     so the trip reached nothing and the fetch's generation never moved. What \
+                     was painted: {:?}",
                     matrix_texts(&settled)
                 );
             }
@@ -35289,32 +34985,34 @@ mod send_delete_wiring {
             output = settled;
         }
 
-        // 2. **REFRESH IS DRAWN AND PRESSING IT WORKS -- IN BOTH
-        //    DIRECTIONS.** Refresh is present in every pane state on purpose
-        //    (a screen whose only way out of an error is to navigate away is
-        //    a screen that says the error is permanent), so this is the one
-        //    control every state has. One press into a failure and one back
-        //    out of it: a press that reaches nothing leaves the screen where
-        //    it was, and "where it was" is a different answer in each half.
+        // 2. **THE SCREEN GOES INTO A FAILURE AND COMES BACK OUT OF IT.** The
+        //    way in is the way a user takes: leave the Sent screen and come
+        //    back, which asks for the list again. The way out is the failed
+        //    pane's own Try again (a screen whose only way out of an error is
+        //    to navigate away is a screen that says the error is permanent).
+        //    One trip into a failure and one press back out of it: a control
+        //    that reaches nothing leaves the screen where it was, and "where
+        //    it was" is a different answer in each half.
         FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
         FRAME_LIST_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let refresh_at = matrix_locate(state, &output, "Refresh");
-        let failed = matrix_click(&ctx, &mut frame_fn, refresh_at);
+        let vault_at = matrix_locate(state, &output, "All items");
+        let away = matrix_click(&ctx, &mut frame_fn, vault_at);
+        let sends_at = matrix_locate(state, &away, sidebar::SENDS_ROW_LABEL);
+        let failed = matrix_click(&ctx, &mut frame_fn, sends_at);
         assert!(
             matrix_find(&failed, send_ui::FAILED_HEADLINE).is_some(),
-            "in state {state:?} Refresh was pressed with the send list set to fail and the \
-             pane never reached its error screen, so the press reached nothing. Every \
-             control on this screen is inert in this state, for as long as the state lasts. \
-             What was painted: {:?}",
+            "in state {state:?} the Sent screen was left and returned to with the send list set \
+             to fail and the pane never reached its error screen, so the list was never asked \
+             for again. What was painted: {:?}",
             matrix_texts(&failed)
         );
 
         FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
-        let refresh_at = matrix_locate(state, &failed, "Refresh");
-        let recovered = matrix_click(&ctx, &mut frame_fn, refresh_at);
+        let retry_at = matrix_locate(state, &failed, send_ui::TRY_AGAIN_LABEL);
+        let recovered = matrix_click(&ctx, &mut frame_fn, retry_at);
         assert!(
             matrix_find(&recovered, FRAME_SEND_NAME).is_some(),
-            "in state {state:?} Refresh was pressed on a Sends screen showing a failed fetch \
+            "in state {state:?} Try again was pressed on a Sends screen showing a failed fetch \
              and the list never came back, so the error is permanent for the user. What was \
              painted: {:?}",
             matrix_texts(&recovered)
@@ -35337,38 +35035,6 @@ mod send_delete_wiring {
             }
         }
 
-        // 2c. **THE DRAFT IS PUT AWAY THE WAY A USER PUTS IT AWAY.**
-        //
-        // The composer occupies the DETAIL column -- design 5b's shape, and
-        // the vault window's own: an edit form takes the detail pane and
-        // leaves the list column live. So in the one state that has a draft
-        // open, the per-Send controls of step 3 are behind it, and the way to
-        // them is Discard.
-        //
-        // **This is a control PRESSED, not a step skipped**, and it is worth
-        // more than what it replaces. The obvious shadow for this state is a
-        // gate on `send_create.composer.open`, and under one Discard is dead:
-        // the form never goes, and the assertion below says so. Nothing here
-        // was weakened to fit the new layout -- the matrix now drives a
-        // control it never drove before.
-        if matrix_find(&output, send_ui::COMPOSER_HEADING).is_some() {
-            let discard_at = matrix_locate(state, &output, send_ui::DISCARD_LABEL);
-            output = matrix_click(&ctx, &mut frame_fn, discard_at);
-            assert!(
-                matrix_find(&output, send_ui::COMPOSER_HEADING).is_none(),
-                "in state {state:?} Discard was pressed and the composer is still on screen, \
-                 so the form cannot be put away at all -- the user is stuck on a draft with \
-                 the rest of the screen behind it. What was painted: {:?}",
-                matrix_texts(&output)
-            );
-            assert!(
-                matrix_find(&output, send_ui::NEW_SEND_LABEL).is_some(),
-                "in state {state:?} the draft was discarded and the way to start another one \
-                 never came back. What was painted: {:?}",
-                matrix_texts(&output)
-            );
-        }
-
         // 3. **THE SEND'S OWN CONTROLS.** Copy link is drawn, Delete arms the
         //    confirmation and destroys nothing, and Cancel really disarms it.
         //    All three are in the DETAIL PANE now -- design 5b puts them
@@ -35386,7 +35052,7 @@ mod send_delete_wiring {
             &mut frame_fn,
             matrix_locate(state, &output, FRAME_SECOND_SEND_NAME),
         );
-        let copy_at = matrix_locate(state, &second_picked, "Copy link");
+        let copy_at = matrix_locate(state, &second_picked, send_ui::COPY_MARKER);
         let (after_copy, copied) = matrix_click_watching_the_clipboard(&ctx, &mut frame_fn, copy_at);
         assert_eq!(
             copied.suppressed,
@@ -35428,7 +35094,7 @@ mod send_delete_wiring {
             matrix_locate(state, &after_copy, FRAME_SEND_NAME),
         );
         FRAME_REVOKES.lock().expect("not poisoned").clear();
-        let delete_at = matrix_locate(state, &output, send_ui::DELETE_LABEL);
+        let delete_at = matrix_locate(state, &output, send_ui::REVOKE_LABEL);
         let armed = matrix_click(&ctx, &mut frame_fn, delete_at);
         assert!(
             matrix_find(&armed, send_ui::CONFIRM_LABEL).is_some(),
@@ -35454,7 +35120,7 @@ mod send_delete_wiring {
             matrix_texts(&disarmed)
         );
         assert!(
-            matrix_find(&disarmed, send_ui::DELETE_LABEL).is_some(),
+            matrix_find(&disarmed, send_ui::REVOKE_LABEL).is_some(),
             "in state {state:?} Cancel left the detail pane with no Delete button at all. \
              What was painted: {:?}",
             matrix_texts(&disarmed)
@@ -37145,10 +36811,13 @@ mod send_delete_wiring {
         // offset is threaded from here exactly as `now` has been since the
         // screen shipped. Pinning the whole expression keeps that: a second
         // zone, or `SystemZone` reached for inside `send_ui`, fails here.
+        // And the sent history is laid over the rows in the same expression --
+        // `with_sent_facts`, which adds who each Send went to and from what --
+        // rather than in a binding between, for the reason above.
         let model = squashed(concat!(
-            "if let Some(state) = &show_sends .then(|| send_ui::pane_", "state(\
+            "if let Some(state) = &show_sends .then(|| send_ui::with_sent_facts(send_ui::pane_", "state(\
              send_fetch.result.as_ref(), &crate::send::SystemClock, \
-             &crate::local_time::SystemZone)) {"
+             &crate::local_time::SystemZone), &sent_history)) {"
         ));
         assert_eq!(
             squashed(&code).matches(&model).count(),
@@ -37626,16 +37295,6 @@ mod frame_env_seam {
         );
     }
 
-    /// [`stubbed`] with the create spawner named too, for [`with_send_delete`]'s
-    /// reason and more so: the harness that presses Create is one test, and
-    /// every other caller should stay unable to publish anything by accident.
-    pub(super) fn with_send_create(
-        env: VaultFrameEnv,
-        send_create: SendCreateSpawn,
-    ) -> VaultFrameEnv {
-        VaultFrameEnv { send_create, ..env }
-    }
-
     /// [`stubbed`] with the revoke spawner named too, for [`with_export`]'s
     /// reason: the harness that presses Delete is one test, and every other
     /// caller should stay unable to start a `bw send delete` by accident.
@@ -37669,10 +37328,9 @@ mod frame_env_seam {
 ///     [`the_create_child_is_spawned_into_the_job_this_window_holds`] and
 ///     [`the_drafts_secrets_reach_the_child_in_neither_argv_nor_the_environment`].
 ///
-/// And the click itself is held on a real window by
-/// `send_delete_wiring::the_sends_screen_works_in_every_state_the_user_can_reach`,
-/// whose `ComposerOpen` state opens the real form with the real button and
-/// finds it still open after a trip to another screen and back.
+/// The Sent screen no longer offers the composer (a Send is made from a
+/// record -- "Send a record"), so no window test opens it; what is held here
+/// is the create machinery the record's Send goes through.
 ///
 /// Nothing here starts a process, touches the network, reads the real vault,
 /// publishes a real Send or opens a dialog: the probe refuses before
