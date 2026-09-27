@@ -79,8 +79,10 @@
 //! doc comment carries the reasoning, and it should be read alongside
 //! [`decrypt`]'s, because the two are one composition written in two places.
 //! Writing an `EncString` back out to `type.iv|ct|mac` is [`EncString`]'s
-//! `Display`. There is no *asymmetric* encryption: type 4 needs a public key
-//! this module does not hold.
+//! `Display`. **Asymmetric encryption arrived with personal sharing**:
+//! [`encrypt_rsa`] wraps to a member's public key, and the key generators
+//! below it make an organisation's keys. They are in their own section at the
+//! end of the production half, with their reasons.
 
 use aes::Aes256;
 use argon2::{Algorithm, Argon2, ParamsBuilder, Version};
@@ -88,8 +90,9 @@ use cbc::cipher::block_padding::NoPadding;
 use cbc::cipher::{BlockDecryptMut, BlockEncryptMut, KeyIvInit};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
-use rsa::pkcs8::DecodePrivateKey;
-use rsa::{Oaep, RsaPrivateKey};
+use rsa::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
+use rsa::rand_core::OsRng;
+use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
@@ -249,6 +252,18 @@ impl SymmetricKey {
         enc.copy_from_slice(&okm[..KEY_LEN]);
         mac.copy_from_slice(&okm[KEY_LEN..]);
         Self { enc, mac }
+    }
+
+    /// The 64 bytes -- encryption key then MAC key -- **for wrapping this key
+    /// and for nothing else**. Private to this file: the only callers are
+    /// [`wrap_key_to_public`] and [`wrap_key_under`], which hand the bytes
+    /// straight to a cipher, and a bytes-out accessor anywhere else would be
+    /// the widening the test module's own comment refuses.
+    fn to_64(&self) -> Zeroizing<[u8; SYMMETRIC_KEY_LEN]> {
+        let mut out = Zeroizing::new([0u8; SYMMETRIC_KEY_LEN]);
+        out[..KEY_LEN].copy_from_slice(&*self.enc);
+        out[KEY_LEN..].copy_from_slice(&*self.mac);
+        out
     }
 
     /// The 64 bytes back, `enc || mac`. **`pub(crate)` and for vectors
@@ -929,6 +944,119 @@ pub fn decrypt_rsa(
         RsaPrivateKey::from_pkcs8_der(private_key_pkcs8_der).map_err(|_| CryptoError::Rsa)?;
     let plain = key.decrypt(Oaep::new::<sha1::Sha1>(), ct).map_err(|_| CryptoError::Rsa)?;
     Ok(Zeroizing::new(plain))
+}
+
+// ---- asymmetric encryption and key generation --------------------------------
+//
+// **Personal sharing is what put these here.** Until it, this module held no
+// public key and said so ("There is no *asymmetric* encryption"). Sharing a
+// record with a person needs three things a decrypt-only module cannot do:
+// wrap an organisation key to a member's public key (confirming them), make an
+// organisation key and its RSA pair (the first share), and re-wrap a
+// per-cipher key between the user key and an organisation's (moving a record
+// in and out). See `docs/superpowers/specs/2026-09-27-personal-sharing-design.md`
+// section 9.
+
+/// RSA modulus size for an organisation's key pair: what every Bitwarden
+/// client generates, and what type 4 (`Rsa2048_OaepSha1_B64`) is named for.
+pub const ORG_KEY_BITS: usize = 2048;
+
+/// The OS generator the `rsa` crate draws from, **asked first**.
+///
+/// `rand_core`'s `OsRng` panics if the OS refuses randomness -- the trait it
+/// implements has no error channel. This module's rule is that a failed RNG
+/// is [`CryptoError::Rng`] and never a crash (see that variant), so one byte
+/// is asked of `getrandom` directly before `rsa` is handed the generator. It
+/// is the same `getrandom` underneath, so a refusal here is the refusal
+/// `OsRng` would have met a microsecond later.
+fn os_rng_ready() -> Result<OsRng, CryptoError> {
+    let mut probe = [0u8; 1];
+    getrandom::getrandom(&mut probe).map_err(|_| CryptoError::Rng)?;
+    Ok(OsRng)
+}
+
+/// RSA-OAEP-SHA1 encryption to a public key given as SPKI DER, as a type-4
+/// [`EncString`] -- the inverse of [`decrypt_rsa`], and what an organisation
+/// key wrapped for a member is.
+pub fn encrypt_rsa(public_key_spki_der: &[u8], plain: &[u8]) -> Result<EncString, CryptoError> {
+    let key =
+        RsaPublicKey::from_public_key_der(public_key_spki_der).map_err(|_| CryptoError::Rsa)?;
+    let mut rng = os_rng_ready()?;
+    let ct = key.encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), plain).map_err(|_| CryptoError::Rsa)?;
+    Ok(EncString::Rsa2048OaepSha1B64 { ct })
+}
+
+/// A fresh 64-byte symmetric key from the OS generator: an organisation key.
+pub fn generate_symmetric_key() -> Result<SymmetricKey, CryptoError> {
+    let mut bytes = Zeroizing::new([0u8; SYMMETRIC_KEY_LEN]);
+    getrandom::getrandom(&mut *bytes).map_err(|_| CryptoError::Rng)?;
+    SymmetricKey::from_64(&*bytes)
+}
+
+/// `key` wrapped to a public key -- the organisation key a member is
+/// confirmed with, and the one the owner's own profile carries.
+pub fn wrap_key_to_public(
+    key: &SymmetricKey,
+    public_key_spki_der: &[u8],
+) -> Result<EncString, CryptoError> {
+    encrypt_rsa(public_key_spki_der, &*key.to_64())
+}
+
+/// `key` wrapped under another symmetric key (type 2) -- a per-cipher key
+/// moving between the user key and an organisation key.
+pub fn wrap_key_under(key: &SymmetricKey, wrapping: &SymmetricKey) -> Result<EncString, CryptoError> {
+    encrypt(wrapping, &*key.to_64())
+}
+
+/// The inverse of [`wrap_key_under`]. [`unwrap_user_key`] is exactly this
+/// operation under its commonest caller's name; this is the same body under the
+/// name the sharing engine reads as what it does.
+pub fn unwrap_key_under(
+    wrapped: &EncString,
+    wrapping: &SymmetricKey,
+) -> Result<SymmetricKey, CryptoError> {
+    unwrap_user_key(wrapping, wrapped)
+}
+
+/// **An organisation's RSA key pair**, as the create body carries it:
+/// `keys.publicKey` (SPKI DER, base64) and `keys.encryptedPrivateKey`
+/// (PKCS#8 DER under the organisation key, type 2). Official clients make one
+/// for every organisation; NodeWarden and Vaultwarden store it.
+pub fn generate_org_key_pair(org: &SymmetricKey) -> Result<(String, EncString), CryptoError> {
+    let mut rng = os_rng_ready()?;
+    let private = RsaPrivateKey::new(&mut rng, ORG_KEY_BITS).map_err(|_| CryptoError::Rsa)?;
+    let public = private.to_public_key().to_public_key_der().map_err(|_| CryptoError::Rsa)?;
+    // `SecretDocument` zeroizes itself on drop, so the PKCS#8 bytes live only
+    // as long as the one encryption below.
+    let pkcs8 = private.to_pkcs8_der().map_err(|_| CryptoError::Rsa)?;
+    let wrapped = encrypt(org, pkcs8.as_bytes())?;
+    let mut public_b64 = String::new();
+    base64_into(&mut public_b64, public.as_bytes());
+    Ok((public_b64, wrapped))
+}
+
+/// The SPKI DER public half of a PKCS#8 private key -- the account's own
+/// public key, read from the private key the profile already carries rather
+/// than asked of the server, so wrapping an organisation key to "myself" does
+/// not trust the server about who "myself" is.
+pub fn public_key_of(private_key_pkcs8_der: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    let key =
+        RsaPrivateKey::from_pkcs8_der(private_key_pkcs8_der).map_err(|_| CryptoError::Rsa)?;
+    let public = key.to_public_key().to_public_key_der().map_err(|_| CryptoError::Rsa)?;
+    Ok(public.as_bytes().to_vec())
+}
+
+/// A public key's pin: lowercase hex of SHA-256 over its SPKI DER. What
+/// `sharing_state.json` records the first time a person is confirmed.
+#[must_use]
+pub fn public_key_sha256_hex(public_key_spki_der: &[u8]) -> String {
+    Sha256::digest(public_key_spki_der).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A server's base64 public key, decoded. Its own error so a caller can tell
+/// "the server sent something that is not a key" from a failed encryption.
+pub fn spki_from_base64(text: &str) -> Result<Vec<u8>, CryptoError> {
+    base64_from(text.trim()).ok_or(CryptoError::Malformed("public key"))
 }
 
 #[cfg(test)]
@@ -2305,6 +2433,95 @@ pub mod tests {
             docs.contains("This holds in both directions now, and the two directions are not"),
             "the module docs no longer state that the encrypt direction carries its own \
              unverified claims, but the gaps this test enumerates are still open"
+        );
+    }
+
+    // ---- asymmetric encryption and key generation (personal sharing) ------
+
+    /// The OpenSSL fixture's PUBLIC half, as SPKI DER, derived by this module's
+    /// own [`public_key_of`] -- which the test below checks against the private
+    /// half by round-tripping through [`decrypt_rsa`], the OpenSSL-pinned side.
+    pub fn fixture_public_spki() -> Vec<u8> {
+        public_key_of(&hex(ORG_KEY_PRIVATE_PKCS8_DER)).expect("the fixture's public half")
+    }
+
+    /// **RSA-OAEP-SHA1 out, checked by the side that is pinned to OpenSSL.**
+    ///
+    /// OAEP is randomised, so there is no ciphertext to record. What makes this
+    /// external rather than circular is the other direction:
+    /// `rsa_oaep_sha1_opens_a_ciphertext_openssl_produced` pins [`decrypt_rsa`]
+    /// to OpenSSL's own output, so a ciphertext it opens was made with OAEP,
+    /// SHA-1 and MGF1-SHA-1 -- which is what every Bitwarden client unwraps an
+    /// organisation key with.
+    #[test]
+    fn an_rsa_encryption_opens_under_the_openssl_pinned_decryption() {
+        let plain: Vec<u8> = (0..64u8).collect();
+        let sealed = encrypt_rsa(&fixture_public_spki(), &plain).expect("an encryption");
+        assert!(sealed.to_string().starts_with("4."), "not a type-4 string: {sealed:?}");
+        let opened = decrypt_rsa(&hex(ORG_KEY_PRIVATE_PKCS8_DER), &sealed).expect("it opens");
+        assert_eq!(&*opened, plain.as_slice());
+        // Randomised: the same plaintext twice is two ciphertexts.
+        let again = encrypt_rsa(&fixture_public_spki(), &plain).expect("a second encryption");
+        assert_ne!(sealed.to_string(), again.to_string(), "OAEP produced the same bytes twice");
+    }
+
+    #[test]
+    fn a_public_key_that_is_not_spki_is_an_error_rather_than_a_panic() {
+        assert_eq!(encrypt_rsa(b"not a key", b"x"), Err(CryptoError::Rsa));
+        assert_eq!(spki_from_base64("not base64!"), Err(CryptoError::Malformed("public key")));
+    }
+
+    /// An organisation key, wrapped to the owner's own public key, is the
+    /// profile's `organizations[].key` -- so it must come back out through the
+    /// exact path `VaultKeys::unwrap_from` uses, [`unwrap_org_key`].
+    #[test]
+    fn a_key_wrapped_to_a_public_key_unwraps_as_an_organisation_key() {
+        let org = generate_symmetric_key().expect("64 random bytes");
+        let wrapped = wrap_key_to_public(&org, &fixture_public_spki()).expect("a wrap");
+        let back = unwrap_org_key(&hex(ORG_KEY_PRIVATE_PKCS8_DER), &wrapped).expect("an unwrap");
+        assert_eq!(back, org);
+        // Control: two generated keys differ, so the equality above is not
+        // two all-zero keys agreeing.
+        assert_ne!(generate_symmetric_key().expect("a second key"), org);
+    }
+
+    /// A per-cipher key re-wrapped from one symmetric key to another -- the
+    /// cheap half of moving a record into or out of an organisation.
+    #[test]
+    fn a_key_rewrapped_under_another_key_unwraps_under_it_and_not_the_first() {
+        let cipher_key = generate_symmetric_key().expect("a cipher key");
+        let user = key_from_64(&[3u8; 64]);
+        let org = key_from_64(&[4u8; 64]);
+        let under_user = wrap_key_under(&cipher_key, &user).expect("wrap under the user key");
+        let opened = unwrap_key_under(&under_user, &user).expect("unwrap");
+        let under_org = wrap_key_under(&opened, &org).expect("re-wrap under the org key");
+        assert_eq!(unwrap_key_under(&under_org, &org).expect("unwrap"), cipher_key);
+        assert_eq!(unwrap_key_under(&under_org, &user), Err(CryptoError::MacMismatch));
+    }
+
+    /// **The organisation's own key pair**, as the create body carries it.
+    ///
+    /// The one test in the crate that generates RSA-2048, which is seconds in
+    /// a debug build; the engine's tests hand it a fixture pair instead
+    /// (`rest::sharing`'s `SharingSetup::make_key_pair`).
+    #[test]
+    fn a_generated_org_key_pair_is_spki_and_a_pkcs8_that_opens_what_the_public_half_wraps() {
+        let org = generate_symmetric_key().expect("an org key");
+        let (public_b64, private_wrapped) = generate_org_key_pair(&org).expect("a key pair");
+        let public = spki_from_base64(&public_b64).expect("base64 SPKI");
+        let private = decrypt(&org, &private_wrapped).expect("the private key opens under org");
+        assert_eq!(public_key_of(&private).expect("its public half"), public);
+        let secret = generate_symmetric_key().expect("something to wrap");
+        let wrapped = wrap_key_to_public(&secret, &public).expect("wrap to the new public key");
+        assert_eq!(unwrap_org_key(&private, &wrapped).expect("unwrap"), secret);
+    }
+
+    #[test]
+    fn a_public_key_hash_is_lowercase_hex_of_sha256() {
+        // SHA-256("abc"), FIPS 180-2 appendix B.1.
+        assert_eq!(
+            public_key_sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 }
