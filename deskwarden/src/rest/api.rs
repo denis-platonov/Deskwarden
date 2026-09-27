@@ -1504,6 +1504,43 @@ impl RestClient {
         })
     }
 
+    /// **The one door every sharing route goes through.**
+    ///
+    /// `request` is a [`crate::rest::sharing_api::SharingRequest`], which only
+    /// that module can build -- the same argument [`MappedCipher`] makes for
+    /// the cipher endpoints, applied to a family of routes. What its body can
+    /// carry is therefore enumerable from one file: emails and ids in the
+    /// clear (they are what these routes are about), and everything else as
+    /// ciphertext -- an org key wrapped to a public key, a collection name
+    /// under the org key, and, for `/share`, a [`MappedCipher`]'s own body.
+    /// `the_only_json_bodies_this_module_sends_are_mapped_ciphers_and_the_prelogin`
+    /// names this door's one `send_json` so a second cannot hide behind it.
+    ///
+    /// Reads on the sync agent, writes on the write agent, both with the
+    /// vault's session: every sharing route is the account acting on its own
+    /// organisation, never a link a stranger pasted.
+    pub(crate) fn send_sharing(
+        &self,
+        session: &mut Session,
+        request: &crate::rest::sharing_api::SharingRequest,
+    ) -> Result<serde_json::Value, RestError> {
+        use crate::rest::sharing_api::SharingMethod;
+        let url = format!("{}{}", self.base_url, request.path());
+        self.refreshing(session, |session| {
+            let call = match request.method() {
+                SharingMethod::Get => self.bearer(self.sync_agent.get(&url), session),
+                SharingMethod::Post => self.bearer(self.write_agent.post(&url), session),
+                SharingMethod::Put => self.bearer(self.write_agent.put(&url), session),
+                SharingMethod::Delete => self.bearer(self.write_agent.delete(&url), session),
+            };
+            let response = match request.body() {
+                Some(body) => call.send_json(body),
+                None => call.call(),
+            };
+            sharing_answer(response)
+        })
+    }
+
     // ---- writing one cipher -------------------------------------------------
 
     /// `POST /api/ciphers` -- a new item.
@@ -2393,6 +2430,50 @@ fn classify_json_400(json: &serde_json::Value) -> RestError {
     RestError::Rejected { error, description }
 }
 
+/// A sharing route's outcome.
+///
+/// Its own classifier and not [`RestClient::value_from`], for two
+/// differences that both come from these routes' real answers:
+///
+/// * **An empty 200 is a success.** NodeWarden answers confirm, reinvite and
+///   leave with no body, and `value_from` would call that "not JSON".
+/// * **A 400 keeps the server's sentence wherever it wrote it.** NodeWarden
+///   writes `error` and `error_description`, official servers
+///   `ErrorModel.Message`, some routes `message` -- and the sentence is
+///   what the Share dialog shows ("User is already a member"), and what the
+///   engine matches on to treat a two-PC race as a success.
+fn sharing_answer(
+    response: Result<ureq::Response, ureq::Error>,
+) -> Result<serde_json::Value, RestError> {
+    match response {
+        Ok(ok) => {
+            let text = ok.into_string().map_err(|_| RestError::Parse("a sharing answer"))?;
+            if text.trim().is_empty() {
+                return Ok(serde_json::Value::Null);
+            }
+            serde_json::from_str(&text).map_err(|_| RestError::Parse("a sharing answer"))
+        }
+        Err(ureq::Error::Status(401, _)) => Err(RestError::Unauthorized),
+        Err(ureq::Error::Status(400, body)) => {
+            let json = json_body_of(body);
+            let said = ["error_description", "message", "error"]
+                .iter()
+                .map(|key| string_at(&json, key))
+                .find(|text| !text.is_empty())
+                .or_else(|| {
+                    json.get("ErrorModel")
+                        .and_then(|m| m.get("Message"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_default();
+            Err(RestError::Rejected { error: string_at(&json, "error"), description: said })
+        }
+        Err(ureq::Error::Status(code, _)) => Err(RestError::Status(code)),
+        Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(e.to_string())),
+    }
+}
+
 /// The `TwoFactorProviders` array as the strings the server sent, or `None`
 /// when this body is not a second-factor challenge at all.
 ///
@@ -2514,7 +2595,8 @@ fn kdf_from(parsed: &PreloginResponse) -> Result<Kdf, RestError> {
 /// GUID, so hex digits and hyphens is the whole of what a real one contains,
 /// and percent-encoding an id that is not one would send a well-formed
 /// request for a record that cannot exist. Refusing says the truer thing.
-fn is_url_path_safe(id: &str) -> bool {
+/// `pub(crate)` for `rest::sharing_api`, which builds paths from server ids by the same rule.
+pub(crate) fn is_url_path_safe(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
@@ -3712,9 +3794,14 @@ mod tests {
         // below exists to forbid, and it would have been the one carrying a
         // Send's name and text. The named assertion further down is what
         // stops an eleventh hiding behind this one.
+        //
+        // **Eleven, and the eleventh is the sharing door.** `send_sharing`
+        // sends a `SharingRequest`'s body, and that type has no constructor
+        // outside `rest::sharing_api`, so every body through it is
+        // enumerable in one file; see the door's own doc.
         assert_eq!(
             production.matches("send_json(").count(),
-            10,
+            11,
             "a new JSON body sender appeared in rest::api"
         );
         // Two of them are the cipher writers, and both send a mapped cipher.
@@ -3784,6 +3871,16 @@ mod tests {
             production.matches("send_json(update.body())").count(),
             1,
             "the Send update endpoint stopped sending a MappedSendUpdate"
+        );
+
+        // **The eleventh is the sharing door**, and it sends the body of a
+        // `SharingRequest` -- a type built only in `rest::sharing_api`, whose
+        // bodies are ids, emails and ciphertext. Named so that a twelfth
+        // cannot hide behind its allowance.
+        assert_eq!(
+            production.matches("Some(body) => call.send_json(body)").count(),
+            1,
+            "the sharing door stopped sending its request's own body, or gained a twin"
         );
 
         // And there is **no** hand-built body left anywhere: the four mapped

@@ -155,5 +155,9 @@ pub mod send_crypto;
 /// One pasted Send link, taken apart -- and refused when its host is not the
 /// account's own. Pure; no I/O.
 pub mod send_link;
+/// **NodeWarden's sharing routes, typed** -- spec §7.3's NodeWarden column.
+/// Every request goes out through `api::RestClient::send_sharing`, the one
+/// door, and is built only here. No policy: `sharing` decides what to call.
+pub mod sharing_api;
 pub mod sync;
 pub mod write;
