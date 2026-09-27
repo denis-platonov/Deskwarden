@@ -1724,12 +1724,12 @@ fn main() {
     // fill read. Both processes wait through the same readiness at the
     // same time rather than one after the other.
     //
-    // **On a direct-REST account this is the daemon's one whole-vault read
-    // of the launch**, now that the settle's probe asks the profile route
-    // instead. The window's process makes its own, and there is no third:
-    // two processes, each holding a vault, and by design nothing decrypted
-    // crosses between them -- so two is the floor for a launch that opens a
-    // window, and one for a launch that stays in the tray.
+    // **On a direct-REST account this is the launch's one whole-vault
+    // read**, now that the settle's probe asks the profile route instead --
+    // and the window's too: its process reads the vault this daemon holds,
+    // through `vault_host`, and waits on its spinner for exactly this read to
+    // land. See `docs/superpowers/specs/2026-09-26-daemon-owns-the-vault-
+    // design.md`.
     //
     // **Except when the child is still asking for the master password.**
     // Then there is nothing to be ready: the vault backend does not exist

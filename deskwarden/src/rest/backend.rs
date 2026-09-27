@@ -98,8 +98,10 @@
 //!   every Sends list, and the vault window lists the Sends on every open. It
 //!   reads [`crate::rest::api::RestClient::profile`] instead.
 //!
-//! What is left is one read per process that holds a vault: the daemon's,
-//! and the window's. Every read this backend makes logs itself -- see
+//! What is left is ONE read: the daemon's. The window used to make a second
+//! in its own process; it now reads the vault the daemon holds (see
+//! `crate::vault_host` and `docs/superpowers/specs/2026-09-26-daemon-owns-
+//! the-vault-design.md`). Every read this backend makes logs itself -- see
 //! [`RestBackend::synced`] -- so the count is a `grep` of the log.
 //!
 //! # What this backend refuses
