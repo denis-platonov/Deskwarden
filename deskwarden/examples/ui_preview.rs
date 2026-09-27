@@ -110,7 +110,7 @@ use deskwarden::vault_window::password_health;
 use deskwarden::vault_window::sidebar::{self, SidebarFilter};
 use deskwarden::vault_window::record_ui::{self, RecordDraft};
 use deskwarden::vault_window::rehearsal;
-use deskwarden::vault_window::send_ui::{self, SendComposer};
+use deskwarden::vault_window::send_ui;
 use deskwarden::otpauth::OtpRefusal;
 use deskwarden::vault_window::totp_add::{self, TotpAdd};
 use deskwarden::{app_identity::AppIdentityCache, prefs_ui, scratch_window, theme};
@@ -555,9 +555,6 @@ enum Surface {
     /// the prompt. The state the screen opens in, and therefore the one that
     /// decides whether a user's eye goes to a row or to an empty column.
     SendsList,
-    /// The same screen with the **composer open**, which takes the detail
-    /// column exactly as the vault's edit form takes the read pane.
-    SendsComposer,
     /// The account with **no Sends at all**. The empty case is a sentence,
     /// not a blank pane, and this is where whether it reads as one is looked
     /// at.
@@ -574,18 +571,6 @@ enum Surface {
     /// "something is missing", it is "the same pane reads differently", and
     /// only the pair shows that.
     SendsNarrow,
-    /// **The composer at `settings::MIN_VAULT_WINDOW_SIZE`**, which is the
-    /// only width its card has ever been in danger at.
-    ///
-    /// [`Surface::SendsComposer`] draws the form in a 590pt detail column,
-    /// where everything fits and nothing is learned. The form's real
-    /// constraint is the 298pt column -- 250 of card, and 214 inside the
-    /// card's own margins once §5a's padding is on it -- against a §5a
-    /// Access block whose label column alone is 96. A form that reads as
-    /// §5a's family at the comfortable width and elides half of itself at
-    /// the floor has not been fixed, it has been fixed in the picture
-    /// somebody looked at; this is the other picture.
-    SendsComposerNarrow,
     /// **The vault window's item list**, at the exact width the window gives
     /// it, with a card of every network this app can name in it.
     ///
@@ -890,11 +875,9 @@ const ALL: &[Surface] = &[
     Surface::VaultHealthEmptyFilter,
     Surface::SendsSelected,
     Surface::SendsList,
-    Surface::SendsComposer,
     Surface::SendsEmpty,
     Surface::SendsReceived,
     Surface::SendsNarrow,
-    Surface::SendsComposerNarrow,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
     Surface::FirstWindowLoading,
@@ -978,11 +961,9 @@ impl Surface {
             Surface::VaultHealthEmptyFilter => "vault_password_health_empty_filter",
             Surface::SendsSelected => "sends_selected",
             Surface::SendsList => "sends_list",
-            Surface::SendsComposer => "sends_composer",
             Surface::SendsEmpty => "sends_empty",
             Surface::SendsReceived => "sends_received",
             Surface::SendsNarrow => "sends_narrow",
-            Surface::SendsComposerNarrow => "sends_composer_narrow",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
             Surface::FirstWindowLoading => "first_window_loading",
@@ -1156,12 +1137,9 @@ impl Surface {
             // one picture; see [`SENDS_WIDTH`].
             Surface::SendsSelected
             | Surface::SendsList
-            | Surface::SendsComposer
             | Surface::SendsEmpty
             | Surface::SendsReceived => egui::vec2(SENDS_WIDTH, PANE_HEIGHT),
-            Surface::SendsNarrow | Surface::SendsComposerNarrow => {
-                egui::vec2(SENDS_NARROW_WIDTH, SENDS_NARROW_HEIGHT)
-            }
+            Surface::SendsNarrow => egui::vec2(SENDS_NARROW_WIDTH, SENDS_NARROW_HEIGHT),
             // The viewport's own inner size, read off the module that builds
             // it -- so a window resized in the app is a preview resized with
             // it, rather than a picture of a layout nobody ships.
@@ -1275,11 +1253,9 @@ fn main() -> eframe::Result {
         vec![
             Surface::SendsSelected,
             Surface::SendsList,
-            Surface::SendsComposer,
             Surface::SendsEmpty,
             Surface::SendsReceived,
             Surface::SendsNarrow,
-            Surface::SendsComposerNarrow,
         ]
     } else if edit {
         // Pristine first, because that is the picture the report was about;
@@ -1443,7 +1419,6 @@ fn main() -> eframe::Result {
                 // in the same picture is the one whose item has gone.
                 sends_received_selected: Some("list-0001".to_string()),
                 sends_none_selected: None,
-                sends_composer: SendComposer::default(),
                 window_height: 0.0,
                 styled: false,
                 fixtures: Fixtures::new(),
@@ -1560,11 +1535,6 @@ struct Preview {
     /// temporary would be a place a click could write to that nothing ever
     /// read back.
     sends_none_selected: Option<String>,
-    /// The composer shot's draft, held across frames because the composer is
-    /// `&mut` state the window owns and because the shot is of a form with
-    /// something typed in it -- an empty form shows neither the validation
-    /// line nor what a filled field looks like.
-    sends_composer: SendComposer,
     /// Last applied window height, for the login window's size-to-content.
     window_height: f32,
     /// Whether the theme has been applied yet. Done on the first update
@@ -1720,11 +1690,9 @@ impl eframe::App for Preview {
             }
             Surface::SendsSelected
             | Surface::SendsList
-            | Surface::SendsComposer
             | Surface::SendsEmpty
             | Surface::SendsReceived
-            | Surface::SendsNarrow
-            | Surface::SendsComposerNarrow => self.draw_sends(root, self.current()),
+            | Surface::SendsNarrow => self.draw_sends(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
             Surface::FirstWindowLoading
@@ -2683,28 +2651,6 @@ impl Preview {
     /// in a debug build -- which is the whole point of the counter, and not
     /// something an example gets an exemption from.
     fn draw_sends(&mut self, root: &mut egui::Ui, surface: Surface) {
-        // The composer's draft, seeded once and then left alone: it is `&mut`
-        // and the form writes into it, so re-seeding per frame would fight
-        // whatever the pane had just done and would re-allocate the secret
-        // body sixty times a second. `open` is the flag the shot turns on.
-        //
-        // **`open` is ASSIGNED on every surface, not just turned on for one.**
-        // One `Fixtures`-like value is shared by the whole walk, so a flag
-        // left standing put the composer on top of the surface drawn next --
-        // which is exactly what the first run of this preview showed, and is
-        // the same trap `draw_pane` records for `RevealState`.
-        let wants_composer =
-            matches!(surface, Surface::SendsComposer | Surface::SendsComposerNarrow);
-        if wants_composer && self.sends_composer.plan.name.is_empty() {
-            self.sends_composer.plan.name.push_str("Staging database");
-            self.sends_composer
-                .plan
-                .text
-                .push_str("host=db.staging.ledgerline.internal\nuser=deploy");
-            self.sends_composer.plan.max_access_count = Some(3);
-        }
-        self.sends_composer.open = wants_composer;
-
         // Which answer the CLI is pretending to have given. `Empty` is the
         // real empty ANSWER -- `Ok(vec![])` -- and not a filtered-away list,
         // because those are two different screens and `pane_state` is the one
@@ -2735,15 +2681,8 @@ impl Preview {
         // Each shot picks out of its OWN field; see `Preview::sends_selected`
         // on why one shared selection would let one picture decide another's.
         let selected: &mut Option<String> = match surface {
-            Surface::SendsSelected | Surface::SendsComposer => &mut self.sends_selected,
-            // The narrow composer takes the narrow shot's own selection, for
-            // this field's stated reason: the composer covers the detail
-            // column, so what is picked decides only which LIST row is
-            // outlined behind it -- and borrowing the wide shot's field would
-            // let this picture move that one's.
-            Surface::SendsNarrow | Surface::SendsComposerNarrow => {
-                &mut self.sends_narrow_selected
-            }
+            Surface::SendsSelected => &mut self.sends_selected,
+            Surface::SendsNarrow => &mut self.sends_narrow_selected,
             Surface::SendsReceived => &mut self.sends_received_selected,
             // `SendsList` and `SendsEmpty` are the pictures of a column with
             // nothing picked, so they are handed a selection that is None and
@@ -2751,7 +2690,6 @@ impl Preview {
             // ever reads.
             _ => &mut self.sends_none_selected,
         };
-        let composer = &mut self.sends_composer;
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(root, |ui| {
@@ -2762,10 +2700,6 @@ impl Preview {
                     send_ui::SendDeleteView::default(),
                     view,
                     selected,
-                    composer,
-                    false,
-                    &send::FixedClock(PREVIEW_MILLIS),
-                    &PREVIEW_ZONE,
                 );
                 // Taken and thrown away: a preview has no window to act on.
                 // See the doc above for why it must not simply be dropped.

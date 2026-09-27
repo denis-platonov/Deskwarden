@@ -318,11 +318,11 @@ pub struct RecordDraft {
     ///
     /// The alternative was three loose fields here and an assembly step in
     /// [`send_plan_from`], and an assembly step is precisely where the value
-    /// the form validated and the value that gets published come apart --
-    /// `send_ui::SendComposer`'s own doc records that reasoning, and it holds
-    /// a `SendPlan` for the same reason. The two Send composers in this app
-    /// now hold the same type for the same three answers, so a rule written
-    /// about one is true of the other.
+    /// the form validated and the value that gets published come apart: the
+    /// form says "7 days" and the JSON says thirty, and no test that checks
+    /// the form or the JSON alone sees it. Holding the plan's own type means
+    /// the Access block writes the very fields `send_plan_from` moves into
+    /// the plan that is published.
     ///
     /// The name and body are not filled in until [`send_plan_from`]: they are
     /// the RECORD, which is re-resolved by id at submit time precisely so
@@ -495,10 +495,9 @@ pub fn export_problem(
         return Some(NOTHING_TICKED);
     }
     // **The Access block's own refusals, in the words `crate::send` already
-    // has for them**, and delegated rather than restated for
-    // `send_ui::composer_problem`'s reason exactly: the sentence under this
-    // form's button and the refusal inside `plan_to_invocation` must be the
-    // same function, or this form can call a draft acceptable that the
+    // has for them**, and delegated rather than restated: the sentence under
+    // this form's button and the refusal inside `plan_to_invocation` must be
+    // the same function, or this form can call a draft acceptable that the
     // encoder then rejects -- after the modal has closed, on a background
     // thread, with nothing on screen to explain it.
     //
@@ -520,10 +519,9 @@ pub fn export_problem(
 
 /// Whether the export button may be pressed at all.
 ///
-/// A function of two facts rather than a condition inside a widget, for
-/// `send_ui::composer_can_submit`'s reason: `in_flight` is the lock against a
-/// second `bw send create`, and a lock written inside an `eframe` closure is a
-/// lock no test can run.
+/// A function of two facts rather than a condition inside a widget:
+/// `in_flight` is the lock against a second `bw send create`, and a lock
+/// written inside an `eframe` closure is a lock no test can run.
 pub fn export_can_submit(problem: Option<&str>, in_flight: bool) -> bool {
     problem.is_none() && !in_flight
 }
@@ -1375,9 +1373,11 @@ pub fn draw_export_form(
         // the design system that exists so a footer needing `add_enabled` has
         // no reason to leave it.
         //
-        // These are `theme::BUTTON_HEIGHT`'s 32 and not §5a's 34 -- see
-        // `send_ui::draw_composer`'s footer for the argument, which is the
-        // same one and is made once there.
+        // These are `theme::BUTTON_HEIGHT`'s 32 and not §5a's 34. The design
+        // draws this card's buttons two points taller than every other action
+        // button in the app, and `theme.rs` already refused to move those to
+        // match one outlier; this footer is an action footer like every
+        // other, so it takes the action footer's metrics.
         //
         // **And they are in §5a's footer BAND now**, which they were not:
         // the two answers used to be simply the last things in the body, with
@@ -1398,10 +1398,13 @@ pub fn draw_export_form(
             theme::form_card_caution(ui, PASSWORD_TRAVELS);
         }
         theme::form_card_footer(ui, |ui| {
-            // The footer's one right-hand slot, and the three things that
-            // want it, exactly as `send_ui::draw_composer` arranges them --
-            // the argument is made there, once, and this card obeys it rather
-            // than restating it.
+            // **§5a's footer has ONE slot at its right-hand end, and more
+            // than one thing wants it**: the standing note (`Appears in
+            // Sends`) and the sentence saying why the primary is off. They
+            // share the slot rather than stacking, and the refusal wins while
+            // there is one -- "why not" is what the reader is looking for
+            // while the form cannot be submitted, and the note is a fact
+            // about a Send that does not exist yet.
             let note_text = problem.unwrap_or(super::send_ui::APPEARS_IN_SENDS);
             let mut beside = false;
             ui.horizontal(|ui| {

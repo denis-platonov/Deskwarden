@@ -1,5 +1,4 @@
-//! The vault window's **Sends** screen: the Sends this account has published,
-//! with a composer for making a new one.
+//! The vault window's **Sent** screen: the Sends this account has published.
 //!
 //! Steps 3, 4 and 5 of five, in that order, and the order was the point. A
 //! Send is a public URL: the only outbound publishing action in this app. The
@@ -7,10 +6,11 @@
 //! publication**, so that at no commit could this app make a link it could not
 //! then show and take down.
 //!
-//! As of step 5 the screen lists every Send, copies any row's link, revokes a
-//! row in two steps, and creates a TEXT Send from the composer in
-//! [`draw_composer`]. File Sends are still made in the web vault only; see
-//! below, and [`SCOPE_SUBTEXT`], which says so on screen.
+//! The screen lists every Send, copies any Send's link, extends one, and
+//! revokes one in two steps. **It makes none.** A Send is made from a record
+//! -- `record_ui::draw_export_form`, behind the envelope on a vault item --
+//! and the text composer this screen used to carry went with its `New Send`
+//! button; see [`SCOPE_SUBTEXT`], which says where Sends come from.
 //!
 //! ## The one rule this file exists to keep
 //!
@@ -25,9 +25,9 @@
 //! ## File Sends are SHOWN, never hidden
 //!
 //! This app cannot create a file Send (`bw send create` takes a file path,
-//! and this window has no upload path -- which is why step 5's composer makes
-//! text Sends and offers no type switch at all, rather than offering one that
-//! refuses). It can list and revoke one. So a file Send made in the web vault appears here with a
+//! and this window has no upload path -- which is why a Send made from a
+//! record is always a text Send, and nothing offers a type switch that would
+//! refuse). It can list and revoke one. So a file Send made in the web vault appears here with a
 //! tag saying what it is. Filtering them out would make "your Sends" a lie in
 //! exactly the direction that matters: an unlisted public link is one the
 //! user cannot revoke from here and does not know is there.
@@ -44,12 +44,10 @@
 //!
 //! §5a — "Compose a Send" — is **not this file**. It is
 //! [`super::record_ui::draw_export_form`], whose card header is §5a's own
-//! `Send a record` and whose tick list is §5a's field-level opt-in; the
-//! composer below makes a plain text Send and has no counterpart anywhere on
-//! the design page. The lifetime run and the footer here nevertheless take
-//! their treatment from §5a, because this app has one segmented control and
-//! one pair of footer buttons and the Send screens were the last surface
-//! still drawing its own.
+//! `Send a record` and whose tick list is §5a's field-level opt-in. What this
+//! file does keep for it is §5a's ACCESS block, [`draw_access_block`], and
+//! the recipient row: they are drawn by that card, and live here because the
+//! lifetime, the view cap and the share password are questions about a Send.
 //!
 //! **§5b, "Shared folder", is a full-window frame and not a screen to build.**
 //! It wears the page's dark badge, which across the whole design marks the
@@ -897,26 +895,6 @@ pub enum SendUiAction {
     /// reasons: read off the Send that was on screen, and named again in the
     /// report after the list has been thrown away.
     Extend { id: String, name: String },
-    /// The header's New Send button was pressed: put the composer on screen.
-    OpenComposer,
-    /// The composer's Discard button was pressed: take it off screen and wipe
-    /// the draft.
-    CancelComposer,
-    /// The composer's Create button was pressed.
-    ///
-    /// **It carries nothing, and that is deliberate.** Every other variant
-    /// here carries the value it was read off, because the alternative is a
-    /// second lookup on the far side that can resolve to a different row.
-    /// The draft is different: it is a secret, and this enum derives `Debug`,
-    /// `Clone`, `PartialEq` and `Eq`. A `SubmitSend(SendPlan)` would put the
-    /// text of the Send and its share password into every `{:?}` any future
-    /// call site writes of an action -- which is exactly the leak `SendPlan`'s
-    /// hand-written `Debug` and `SendInvocation`'s exist to refuse. There is
-    /// no second-lookup hazard to trade against, either: the draft lives in
-    /// exactly one place, the window's own `SendComposer`, and
-    /// `vault_window::apply_send_action` is handed that same `&mut` -- so
-    /// there is only ever one plan and no way to name another.
-    SubmitSend,
 }
 
 /// **A [`SendUiAction`] that this pane produced, which cannot be thrown away
@@ -1611,23 +1589,26 @@ pub const SCOPE_EMPTY_DETAIL: &str = "Your other Sends are still on the Sends ro
 /// message about the SCREEN and not about either column. Putting it inside
 /// the list column would have squeezed a sentence into 390pt beside the
 /// failure headline that is already there; putting it in the detail would
-/// have made it disappear behind the composer.
+/// have made it disappear behind a Send's own detail.
 ///
 /// `notice` is the message the window's single inline band is showing this
 /// frame, already chosen by `vault_window::inline_notice` -- this function
 /// does not decide which of the window's messages wins, it only paints the
 /// one it is handed.
 ///
-/// # Ten parameters, and the reason for the attribute
+/// # Six parameters, and no clock among them
 ///
 /// `view` and `selected` joined when the screen grew a detail pane: which of
 /// the two SHARING screens is up and which of its rows the detail is
-/// describing. Both are the window's state and not this pane's, for
-/// `composer`'s reason -- a selection that reset every time the user glanced
-/// at Password health would be a detail pane that could not be left and
-/// returned to. Bundling them into a struct would move the argument count
-/// rather than reduce what this function is handed.
-#[allow(clippy::too_many_arguments)]
+/// describing. Both are the window's state and not this pane's -- a selection
+/// that reset every time the user glanced at Password health would be a
+/// detail pane that could not be left and returned to.
+///
+/// **It used to take a clock and a zone as well**, and a composer with its
+/// draft. The clock and the zone were the composer's: every date the list and
+/// the detail print is already worded by [`pane_state`], which is handed both,
+/// before this function sees a row. With the composer gone, nothing drawn
+/// here reads the time at all.
 pub fn draw_send_pane(
     ui: &mut egui::Ui,
     state: &SendPaneState,
@@ -1641,25 +1622,6 @@ pub fn draw_send_pane(
     // longer in the list draws the "nothing picked" pane rather than a stale
     // one.
     selected: &mut Option<String>,
-    // **`&mut`, and the one place the draft lives.** The pane owns no state
-    // of its own -- every other pane in this window is the same -- so the
-    // half-typed name, body and share password are the window's, survive a
-    // trip to another screen, and are wiped by exactly one thing: dropping
-    // this value. See [`SendComposer`].
-    composer: &mut SendComposer,
-    // Whether a `bw send create` started from that draft is still running.
-    creating: bool,
-    // The clock every dated sentence on this screen is worded against. A
-    // parameter for `crate::send`'s reason: nothing that decides what a date
-    // SAYS may read the wall clock for itself, or the paint tests could only
-    // assert the shape of the sentence and never its content.
-    now: &dyn SendClock,
-    // The machine's offset from UTC. A parameter beside `now`, and for
-    // exactly the same reason: the detail pane's dates are the user's OWN
-    // day, and a paint test that read the offset off the machine running it
-    // would assert a different sentence on a runner in another timezone -- or
-    // on the same runner in March.
-    zone: &dyn LocalOffset,
 ) -> SendUiVerdict {
     let mut action = SendUiAction::None;
 
@@ -1699,12 +1661,12 @@ pub fn draw_send_pane(
         });
 
     if let Some(reported) =
-        draw_send_detail(ui, state, &view, delete, selected, composer, creating, now, zone)
+        draw_send_detail(ui, state, &view, delete, selected)
     {
         // **The detail column wins an ambiguous frame.** Every destructive
         // control on this screen is in it, and the list column's own
-        // controls -- Refresh, New Send, and picking a row -- are the ones a
-        // user cannot mean by accident to have swallowed. Same rule as
+        // controls -- Try again, and picking a row -- are the ones a user
+        // cannot mean by accident to have swallowed. Same rule as
         // `draw_row`'s old ordering, one layer out.
         action = reported;
     }
@@ -2066,13 +2028,10 @@ pub const SEND_NOUN: &str = "send";
 pub const SENDS_NOUN: &str = "sends";
 pub const RECORD_NOUN: &str = "record";
 pub const RECORDS_NOUN: &str = "records";
-/// The list column's Refresh. Named because the whole-window matrix presses
-/// it, and a bare literal there was one rewording away from pressing nothing.
-pub const REFRESH_LABEL: &str = "Refresh";
-/// The failure's own retry, which is a different control in a different place
-/// from [`REFRESH_LABEL`] and deliberately not the same word: this one sits
-/// under a sentence explaining what went wrong, and "Refresh" under an error
-/// reads as a suggestion that nothing did.
+/// The failure's own retry, and the one way to ask for the list again without
+/// leaving the screen. **Not "Refresh"**, which is what the strip's own button
+/// said before it went: this one sits under a sentence explaining what went
+/// wrong, and "Refresh" under an error reads as a suggestion that nothing did.
 pub const TRY_AGAIN_LABEL: &str = "Try again";
 
 /// One Send in the list column. **No controls at all**, which is design 5b's
@@ -2448,52 +2407,8 @@ fn draw_send_detail(
     view: &SendView<'_>,
     delete: SendDeleteView<'_>,
     selected: &mut Option<String>,
-    composer: &mut SendComposer,
-    creating: bool,
-    now: &dyn SendClock,
-    zone: &dyn LocalOffset,
 ) -> Option<SendUiAction> {
     let mut action: Option<SendUiAction> = None;
-
-    // **The composer takes this column, exactly as the vault's edit form
-    // takes its detail pane.**
-    //
-    // It used to be a card stacked ABOVE the rows, and the argument for that
-    // was written down and was right at the time: with one column, a form
-    // that took the pane would have made "there is a draft open" a state in
-    // which the rest of the feature silently did not exist. 5b's caption says
-    // SAME LIST + DETAIL AS THE VAULT, and the vault answers this exact
-    // question already -- `DetailMode::Edit` replaces the read pane and
-    // leaves the item list whole -- so the shape is taken from there.
-    //
-    // **What that costs, stated rather than glossed.** While a draft is open
-    // the per-Send controls are behind it: the list is fully live, every row
-    // is still pickable and Refresh is still in the strip, but Copy link, the
-    // switch and Delete are one Discard away rather than on screen. That is a
-    // real subtraction from the old arrangement and it is accepted for two
-    // reasons. The draft is a secret being typed into three fields and a
-    // dropdown, and 390pt is not a form column -- crowding is what made the
-    // lifetime picker need a fixed box in the first place. And the old
-    // sentence's real worry does not apply: nothing is INERT here. Every
-    // control the list column has answers every press it ever did, and the
-    // way back to the others is the form's own Discard.
-    //
-    // The whole-window matrix drives that rather than skipping it: its
-    // `ComposerOpen` state presses Discard and requires the form to go before
-    // it presses the per-Send controls -- one control more than it drove
-    // before, and precisely the one a gate on `composer.open` would kill.
-    if composer.open {
-        return egui::Frame::new()
-            .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("send-composer")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| draw_composer(ui, composer, creating, now, zone))
-                    .inner
-            })
-            .inner;
-    }
 
     match view {
         SendView::Mine(scope) => {
@@ -3712,33 +3627,8 @@ pub const IN_VAULT_ROW: &str = "In your vault";
 pub const IN_VAULT_YES: &str = "Yes";
 pub const IN_VAULT_NO: &str = "No longer";
 
-/// The header button that opens the composer. Hidden while the composer is
-/// already open: two ways to reach one open form is one way too many, and the
-/// form itself is the thing on screen at that point.
-pub const NEW_SEND_LABEL: &str = "New Send";
-
-/// The composer's own heading. **The one label that appears nowhere else on
-/// this screen**, which is what makes it the witness
-/// `send_delete_wiring::ReachableState::ComposerOpen` is checked by.
-pub const COMPOSER_HEADING: &str = "New text Send";
-
-/// The eyebrow over the name field -- this composer's counterpart of §5a's
-/// `Record`. See `draw_composer` for why the two inputs are eyebrowed at all.
-pub const NAME_EYEBROW: &str = "NAME";
-/// The eyebrow over the body field -- this composer's counterpart of §5a's
-/// `Include`. **The design's own vocabulary for "what travels"**, said as the
-/// noun rather than as the verb, because a text Send's body is one thing and
-/// there is nothing to include or leave out.
-pub const TEXT_EYEBROW: &str = "TEXT";
-
-/// How many lines of the body the box shows before it scrolls. The four it
-/// has always shown -- enough for a host, a user and a note, which is what
-/// this field is used for, and short enough that the Access block below it is
-/// on screen at the window floor.
-pub const BODY_ROWS: usize = 4;
-
-/// The standing note at the footer's right-hand end: **§5a's `Appears in
-/// Shared`, in this app's own vocabulary.**
+/// The standing note at the record composer's footer's right-hand end:
+/// **§5a's `Appears in Shared`, in this app's own vocabulary.**
 ///
 /// §5a says `Shared` because the rail row its design puts a new Send into is
 /// called that. This app's is called `Sends` -- `sidebar::SENDS_ROW_LABEL` --
@@ -3747,18 +3637,11 @@ pub const BODY_ROWS: usize = 4;
 /// press the blue button", and an answer that does not match the rail is
 /// worse than none.
 ///
-/// It is `pub` and shared with `record_ui` deliberately: both composers
-/// publish a Send into the same list, so a second spelling of the same fact
-/// on the other card is exactly the defect the shared Access block and the
-/// shared footer buttons were each introduced to remove.
+/// It is `pub`, and here beside the Access block rather than in `record_ui`,
+/// because it is a fact about where a Send goes -- the list this file draws --
+/// and not about the card that makes one.
 pub const APPEARS_IN_SENDS: &str = "Appears in Sends";
 
-/// The name field's placeholder.
-pub const NAME_HINT: &str = "Name this Send";
-/// The body field's placeholder. **Says "text"**, because that is the only
-/// kind this app makes and a blank box invites a file drag that will do
-/// nothing.
-pub const TEXT_HINT: &str = "The text to share";
 /// The share-password field's placeholder. **It says what an empty box
 /// means**, because empty is both the default and the off position, and a
 /// blank box under the words "Open with" otherwise reads as something the
@@ -3767,8 +3650,8 @@ pub const PASSWORD_HINT: &str = "No password";
 
 // `PASSWORD_TOGGLE_LABEL` -- "Require a password to open the link" -- and
 // `LIFETIME_PROMPT` -- "The link stops working after" -- are DELETED here
-// rather than parked, and the deletion is the decision. Both were the
-// composer's own captions for two questions that are now asked once, in
+// rather than parked, and the deletion is the decision. Both were the old
+// text composer's own captions for two questions that are now asked once, in
 // [`ACCESS_EYEBROW`]'s block, in the row labels [`EXPIRES_LABEL`],
 // [`VIEWS_LABEL`] and [`OPEN_WITH_LABEL`]. Keeping them would have left two
 // spellings of one question in one file, which is the defect this pass
@@ -3776,84 +3659,6 @@ pub const PASSWORD_HINT: &str = "No password";
 // crate, so an unused one sits indefinitely looking like copy somebody still
 // paints. The password switch went with its label -- see
 // [`draw_access_block`] on why an empty box is the off position now.
-/// The composer's own submit. **Not "Create Send"**: what the user gets back
-/// is a link, and the noun on the button is the thing that is about to exist
-/// in the world.
-pub const CREATE_LABEL: &str = "Create link";
-/// The composer's way out. **"Discard" and not "Cancel"**, deliberately: the
-/// row's confirmation already owns [`CANCEL_LABEL`] on this same screen, and
-/// pressing this one throws typed secret text away.
-pub const DISCARD_LABEL: &str = "Discard";
-/// What the composer says while its `bw send create` is running. Every control
-/// in the form is disabled in that state, so a second press cannot start a
-/// second child.
-pub const CREATING_LABEL: &str = "Publishing\u{2026}";
-
-/// **The draft, and the whole of what the window holds for it between
-/// frames.**
-///
-/// It is a [`crate::send::SendPlan`] and not a parallel set of fields, which
-/// is the decision worth writing down. A composer holding its own `name`,
-/// `text`, `password` and `days` would need a conversion to a plan, and a
-/// conversion is a place where the validated value and the published value
-/// can differ -- the form says "7 days" and the JSON says thirty, and no test
-/// that checks the form or the JSON alone sees it. There is nothing to
-/// convert here: [`crate::send::validate_plan`] reads the same bytes
-/// `crate::send::plan_to_invocation` will encode.
-///
-/// It also means the draft costs no per-frame clone of the plaintext.
-/// Validation runs every frame the form is up, and a shape that had to build
-/// a `SendPlan` to validate would hand the secret body to the allocator sixty
-/// times a second.
-///
-/// **`Debug` is derived and that is safe here**, unlike everywhere else in
-/// this feature: the only field that carries a secret is the plan, whose own
-/// `Debug` is hand-written to print lengths rather than contents.
-///
-/// **There is no separate "wants a password" flag.** `plan.password` is
-/// `Option<Zeroizing<String>>` and the Access block's field drives that
-/// `Option` directly, so emptying the box wipes the buffer it was typed into
-/// rather than leaving a live secret behind a `false`. It used to be driven
-/// by a tick-box through `wants_password` / `set_wants_password`; those are
-/// gone with the tick-box, and [`draw_access_block`] argues why.
-#[derive(Debug, Default)]
-pub struct SendComposer {
-    /// Whether the form is on screen. **Window state, not pane state**: it
-    /// survives leaving the Sends screen and coming back, because a half-typed
-    /// secret thrown away by a stray navigation is a worse surprise than a
-    /// form that is still open.
-    pub open: bool,
-    /// The draft itself.
-    pub plan: crate::send::SendPlan,
-}
-
-/// What is wrong with the draft, phrased for the user, or `None`.
-///
-/// A one-line delegation to [`crate::send::validate_plan`] **and that is the
-/// point**: the sentence under the Create button and the refusal inside
-/// `plan_to_invocation` are the same function, so there is no draft this form
-/// calls acceptable that the encoder then rejects, and none it greys out that
-/// would in fact have published.
-/// It takes a clock for `crate::send::validate_plan`'s reason: one of the
-/// rules is that a picked date has not gone by, and the past is not a
-/// property of a draft.
-pub fn composer_problem(
-    composer: &SendComposer,
-    now: &dyn crate::send::SendClock,
-) -> Option<&'static str> {
-    crate::send::validate_plan(&composer.plan, now)
-}
-
-/// Whether the Create button may be pressed at all.
-///
-/// **Pulled out as a function of two facts rather than written into the
-/// widget**, because it is the rule that stops a second `bw send create`
-/// starting while the first is still running -- and a rule written inside an
-/// eframe closure is a rule no test in this crate can run.
-pub fn composer_can_submit(problem: Option<&str>, in_flight: bool) -> bool {
-    problem.is_none() && !in_flight
-}
-
 // ---------------------------------------------------------------------------
 // Design section 5a's ACCESS block
 // ---------------------------------------------------------------------------
@@ -3944,16 +3749,17 @@ pub fn views_note(limit: Option<u32>) -> &'static str {
 /// The three fields of a [`crate::send::SendPlan`] design §5a's Access block
 /// is a control for, borrowed rather than copied.
 ///
-/// # Why a borrow bundle and not a struct either screen owns
+/// # Why a borrow bundle and not a struct the screen owns
 ///
-/// The Sends screen's composer holds a whole `SendPlan` between frames and
-/// the record composer builds one at submit time out of a
-/// `record_ui::RecordDraft`. A shared block needs to drive both without
-/// either screen converting to the other's shape -- and a conversion is
-/// exactly where the validated value and the published value come apart,
-/// which `SendComposer`'s own doc records as the reason it holds a plan at
-/// all. Three `&mut`s cost nothing, convert nothing, and mean the block
-/// writes into the buffer that will be published.
+/// The record composer builds its plan at submit time out of a
+/// `record_ui::RecordDraft`, and this block writes three of that draft's
+/// fields as the user answers. Borrowing them is what keeps the block from
+/// owning a copy -- and a copy is exactly where the validated value and the
+/// published value come apart. Three `&mut`s cost nothing, convert nothing,
+/// and mean the block writes into the buffer that will be published. (It
+/// was shaped this way when a second screen, the Sent screen's text
+/// composer, drove it from a whole `SendPlan`; that screen went, and the
+/// shape is still the right one for the one that is left.)
 ///
 /// Named fields rather than three positional arguments because two of the
 /// three are `Option`s of different types today and could stop being so
@@ -4348,15 +4154,16 @@ pub fn draw_recipient_row(
 
 /// **Design §5a's `ACCESS` block, and the one copy of it this app has.**
 ///
-/// Both of this app's Send composers call it: `draw_composer` on the Sends
-/// screen and `record_ui::draw_export_form` in the record modal. That is the
-/// point of its existing. Two screens that publish a Send and answer "how
-/// long does this link live, who can open it, how many times" differently is
-/// the same defect this app just finished fixing in those two screens'
-/// footers, and it was already halfway present: the Sends composer had a
-/// lifetime row and a password tick-box, the record composer had neither, and
-/// neither had ever offered the view cap that `SendPlan::max_access_count`
-/// has carried and published since the feature was written.
+/// `record_ui::draw_export_form` calls it, in the record modal, and it is the
+/// only Send composer this app has: the Sent screen's text composer went with
+/// its `New Send` button, because a Send is made from a record. The block was
+/// shared while there were two, so that two screens publishing one kind of
+/// Send could not answer "how long does this link live, who can open it, how
+/// many times" differently; it is kept here, beside the Sends it describes.
+/// Before it, one composer had a lifetime row and a password tick-box, the
+/// other had neither, and neither offered the view cap that
+/// `SendPlan::max_access_count` has carried and published since the feature
+/// was written.
 ///
 /// # Three of §5a's six controls are built, and three are not
 ///
@@ -4661,217 +4468,6 @@ pub fn draw_access_block(
         }
     });
     *controls.password = (!buffer.is_empty()).then_some(buffer);
-}
-
-/// The composer card. Returns the action **this form** reported, if any.
-///
-/// `in_flight` is whether a `bw send create` started from this form is still
-/// running. Every control is disabled while it is, which is the first of the
-/// two locks against a second child; the second is in
-/// `vault_window::apply_send_action`, which refuses a submit with one in
-/// flight whatever the pane reported.
-fn draw_composer(
-    ui: &mut egui::Ui,
-    composer: &mut SendComposer,
-    in_flight: bool,
-    now: &dyn SendClock,
-    zone: &dyn LocalOffset,
-) -> Option<SendUiAction> {
-    let mut action = None;
-    let enabled = !in_flight;
-    // **§5a's card, in §5a's three bands**, drawn by the one set of functions
-    // in this app that draws them -- `record_ui`'s record composer calls the
-    // same three. See `theme::form_card` for what they are and why they are
-    // there rather than here.
-    theme::form_card(ui, |ui| {
-        theme::form_card_header(ui, COMPOSER_HEADING);
-        theme::form_card_body(ui, |ui| {
-            // **Both inputs get an eyebrow, and the decision is worth
-            // stating because the easy answer was to leave them bare.**
-            //
-            // §5a's card is three eyebrowed blocks -- `Record`, `Include`,
-            // `Access` -- and the eyebrows are not decoration: they are what
-            // makes the card read as a sequence of decisions ("which record",
-            // "what travels", "who can open it") rather than as a stack of
-            // widgets. This composer had exactly one of the three, over the
-            // Access block, because that block was lifted from §5a wholesale.
-            // One eyebrow is the worst of the three available answers: it
-            // says the card has sections and then labels only the last one,
-            // so the top half reads as preamble to the part that is properly
-            // designed.
-            //
-            // The two inputs ARE this screen's counterparts of §5a's first
-            // two blocks. A text Send has no record to pick and no field list
-            // to narrow; what it has is a name (which identifies the Send the
-            // way §5a's chip identifies its record) and a body (which is what
-            // travels, the way §5a's tick list is). Same two questions, two
-            // boxes instead of a chip and a list.
-            //
-            // The eyebrow and the placeholder overlap while the box is empty
-            // -- `NAME` over `Name this Send` -- and that is accepted rather
-            // than fixed by deleting one. The placeholder is the only thing
-            // in the box for the few seconds before the user types, and the
-            // eyebrow is the only thing left once they have; neither covers
-            // the other's half of the field's life.
-            theme::eyebrow(ui, NAME_EYEBROW);
-            ui.add_space(theme::EYEBROW_GAP);
-            ui.add_enabled_ui(enabled, |ui| {
-                theme::hinted_field(ui, &mut composer.plan.name, NAME_HINT, false);
-            });
-            ui.add_space(theme::BLOCK_GAP);
-
-            theme::eyebrow(ui, TEXT_EYEBROW);
-            ui.add_space(theme::EYEBROW_GAP);
-            // `theme::text_area` and not `egui::TextEdit::multiline`, which
-            // is what stood here. The body is the one field on this card that
-            // the design system had no box for, so it was drawn as a bare
-            // multiline -- egui's frame, egui's radius, no focus halo -- and
-            // sat directly under a name field that was drawn the same bare
-            // way. Two boxes, two chromes, neither of them this app's. The
-            // fix is a primitive in `theme.rs`, not a private one here: that
-            // rule has already paid for itself twice on this screen.
-            ui.add_enabled_ui(enabled, |ui| {
-                theme::text_area(ui, &mut composer.plan.text, TEXT_HINT, BODY_ROWS);
-            });
-
-            ui.add_space(theme::BLOCK_GAP);
-            // **Design §5a's ACCESS block, drawn by the one function that
-            // draws it.**
-            //
-            // What stood here was this screen's own arrangement of two of
-            // §5a's six Access controls: a `field_label` reading "The link
-            // stops working after" over a segmented run, then a tick-box
-            // reading "Require a password to open the link" over a masked
-            // field. The record composer in `record_ui` had neither, and
-            // neither screen had ever offered the view cap that
-            // `SendPlan::max_access_count` has published since the feature
-            // was written.
-            //
-            // **The composer gets the block too, and the argument is the one
-            // the footers were just fixed under.** The design page has no
-            // counterpart for this screen at all, so "§5a says so" is not
-            // available here and something else has to carry the decision. It
-            // is this: "how long does this link live", "who can open it" and
-            // "how many times" are questions about a Bitwarden Send, not
-            // about a screen, and this app has two screens that publish one.
-            // Two answers to one question is exactly what the matched pair of
-            // footer buttons was -- and the harm here is not cosmetic: a user
-            // who finds the view cap on the record composer and comes looking
-            // for it here would conclude the app cannot cap a text Send,
-            // which is false, and has been false since the field was plumbed.
-            //
-            // The one thing lost is this screen's own wording, and it was
-            // worth losing. "The link stops working after" is a better
-            // sentence than "Expires" and a worse LABEL: it reads as a
-            // sentence only because it sat alone above its control, and there
-            // is no arrangement of three such sentences that lines three
-            // controls up on one left edge, which is §5a's whole visual claim
-            // for this block. The sentence is not gone -- `expiry_wording`
-            // still prints "The link stops working after 7 days -- on ..."
-            // under the row, where it now carries the date as well.
-            draw_access_block(
-                ui,
-                AccessControls {
-                    lifetime: &mut composer.plan.lifetime,
-                    password: &mut composer.plan.password,
-                    max_access_count: &mut composer.plan.max_access_count,
-                },
-                enabled,
-                now,
-                zone,
-            );
-        });
-
-        let problem = composer_problem(composer, now);
-        let can_submit = composer_can_submit(problem, in_flight);
-        // **The footer's two answers are the design system's two
-        // buttons**, in the design's own footer BAND.
-        //
-        // §5a's composer ends in a filled blue `Create & copy link`
-        // beside an outlined white `Cancel`, on a tinted strip closed off
-        // from the body by a hairline -- a primary and a secondary, which
-        // is the whole of what a form footer says about which of its two
-        // answers is the one it is for. The buttons were fixed an earlier
-        // pass ago; the strip is new, and `theme::form_card_footer` argues
-        // why a row of buttons that is simply the last thing in the body
-        // is not a footer.
-        //
-        // **32 points and a 7px radius, not §5a's 34 and 8.** The design
-        // draws this card's buttons two points taller than every other
-        // action button in the app (3h's Continue, the detail pane's
-        // Save, "Fill in app"), all of which are `theme::BUTTON_HEIGHT`.
-        // `theme.rs` already refused to move those five to match one
-        // outlier and gave the outlier its own function instead
-        // (`primary_button_matching_field`, for 2b's `+ New`, which is
-        // 34/8 because it matches the *search box* it sits beside). There
-        // is no box beside this one to match: the Send composer's footer
-        // is an action footer like every other, so it takes the action
-        // footer's metrics rather than becoming the app's second
-        // almost-32.
-        theme::form_card_footer(ui, |ui| {
-            // **§5a's footer has ONE slot at its right-hand end, and three
-            // things in this app want it.** The design puts a standing note
-            // there (`Appears in Shared`); this form also has a sentence
-            // saying why the primary is off, and a word saying a publish is
-            // running. Until this pass the first did not exist, and the
-            // other two were loose `ui.label`s sitting after the buttons in
-            // the body -- prose at the end of a control row, which is what
-            // the owner saw as `Give the Send a name.` floating beside
-            // `Discard`.
-            //
-            // They share the slot rather than stacking, and the order is
-            // the order of how much the reader needs each one. A publish in
-            // flight is the only thing worth saying while it runs. A
-            // refusal is a stronger claim on the slot than the standing
-            // note is: while the form cannot be submitted, "why not" is
-            // what the reader is looking for, and `APPEARS_IN_SENDS` is a
-            // fact about a Send that does not exist yet. Once the form is
-            // submittable there is no refusal to print, and the note is
-            // what is left to say. The three are never wanted together, so
-            // one slot is not a compromise.
-            let note = if in_flight {
-                CREATING_LABEL
-            } else {
-                problem.unwrap_or(APPEARS_IN_SENDS)
-            };
-            // **Beside the answers when it fits, on its own line when it
-            // does not**, measured rather than assumed; see
-            // `theme::form_footer_note_width` for why §5a's right-hand
-            // placement cannot simply be taken at the window floor.
-            let mut beside = false;
-            ui.horizontal(|ui| {
-                if theme::primary_button_enabled(ui, CREATE_LABEL, None, can_submit).clicked()
-                {
-                    action = Some(SendUiAction::SubmitSend);
-                }
-                ui.add_space(theme::FORM_FOOTER_GAP);
-                // `add_enabled_ui` rather than `add_enabled`, because
-                // `secondary_button` is a `ui.add` with no enabled twin and
-                // the whole control -- fill, outline and label -- has to
-                // fade together.
-                if ui
-                    .add_enabled_ui(enabled, |ui| theme::secondary_button(ui, DISCARD_LABEL))
-                    .inner
-                    .clicked()
-                {
-                    action = Some(SendUiAction::CancelComposer);
-                }
-                if theme::form_footer_note_width(ui, note) + theme::FORM_FOOTER_GAP
-                    <= ui.available_width()
-                {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        theme::form_footer_note(ui, note);
-                    });
-                    beside = true;
-                }
-            });
-            if !beside {
-                ui.add_space(theme::FORM_FOOTER_GAP);
-                theme::form_footer_note(ui, note);
-            }
-        });
-    });
-    action
 }
 
 /// The inline band. Same shape the item list's band has -- one line, clicking
@@ -5618,89 +5214,6 @@ mod tests {
         assert!(fetch.result.is_none());
     }
 
-    /// **The in-flight half of [`composer_can_submit`], which nothing ran.**
-    ///
-    /// The function's own doc calls `!in_flight` "the rule that stops a
-    /// second `bw send create` starting", and it was the reason the rule was
-    /// lifted out of the eframe closure at all -- but every caller in the
-    /// crate is that closure, so deleting `&& !in_flight` outright left 2243
-    /// lib / 217 bin tests green with no warning. Measured.
-    ///
-    /// **What that mutant did and did not cost, stated exactly, because the
-    /// two-lock design is easy to mistake for redundancy.** It does NOT
-    /// double-publish: the second lock, in `vault_window::apply_send_action`,
-    /// holds and is covered. What it costs is the whole point of the FIRST
-    /// lock -- during a publish the Create button goes live and clickable, so
-    /// the user is invited to press a control that has been quietly disarmed
-    /// one layer down. The misleading live button is the defect; the two
-    /// locks exist because refusing the work and refusing the INVITATION are
-    /// different jobs.
-    ///
-    /// All four combinations, so neither argument can be ignored: a truth
-    /// table is the only thing that pins a two-input `&&`, and either input
-    /// dropped makes one of these four rows fail.
-    #[test]
-    fn the_create_button_is_dead_while_a_create_is_in_flight() {
-        let problem: Option<&str> = None;
-        let broken: Option<&str> = Some("Give the Send a name.");
-
-        assert!(
-            composer_can_submit(problem, false),
-            "a valid draft with nothing in flight could not be submitted, so the rest of \
-             this test is about a button that never goes live at all"
-        );
-        assert!(
-            !composer_can_submit(problem, true),
-            "THE MISSING CASE: a VALID draft offered a live Create button while a \
-             `bw send create` was already running. `apply_send_action`'s own lock stops \
-             the second child, so this does not double-publish -- what it does is invite \
-             the user to press a control that has been disarmed one layer down, which is \
-             the misleading state this first lock exists to prevent"
-        );
-        assert!(
-            !composer_can_submit(broken, false),
-            "a draft the form itself calls invalid offered a live Create button"
-        );
-        assert!(
-            !composer_can_submit(broken, true),
-            "control: both reasons to refuse at once still refuses"
-        );
-    }
-
-    /// Control for the test above: the `problem` it calls valid really is the
-    /// verdict the FORM reaches on a real draft, and the one it calls invalid
-    /// really is a refusal -- so neither row above is asserting about a
-    /// hand-made `Option` that no composer could ever produce.
-    #[test]
-    fn the_submit_rule_is_fed_the_forms_own_verdict() {
-        let mut composer = SendComposer::default();
-        assert!(
-            composer_problem(&composer, &FixedClock(NOW)).is_some(),
-            "control: a freshly opened composer is empty, so the form must refuse it"
-        );
-        assert!(
-            !composer_can_submit(composer_problem(&composer, &FixedClock(NOW)), false),
-            "an empty draft could be submitted, which would publish an empty Send under a \
-             public link"
-        );
-
-        composer.plan.name.push_str("a name");
-        composer.plan.text.push_str("a body");
-        assert_eq!(
-            composer_problem(&composer, &FixedClock(NOW)),
-            None,
-            "control: a filled draft is still refused, so the `None` row above is not a \
-             verdict this form ever reaches"
-        );
-        assert!(
-            composer_can_submit(composer_problem(&composer, &FixedClock(NOW)), false),
-            "a draft the form accepts could not be submitted"
-        );
-        assert!(
-            !composer_can_submit(composer_problem(&composer, &FixedClock(NOW)), true),
-            "a draft the form accepts could be submitted DURING a publish"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -5916,7 +5429,7 @@ mod verdict_linearity {
                 let _ = ctx.run_ui(Default::default(), |ui| {
                     // Deliberately dropped rather than applied: this is the
                     // shape every measured shadow reduces to.
-                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), SendView::Mine(crate::vault_window::sidebar::SendScope::All), &mut None, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0));
+                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), SendView::Mine(crate::vault_window::sidebar::SendScope::All), &mut None);
                 });
             }),
             1,
@@ -6164,7 +5677,7 @@ mod paint_tests {
         let mut selected = picked;
         let mut action = SendUiAction::None;
         let output = ctx.run_ui(input(), |ui| {
-            action = draw_send_pane(ui, state, notice, delete, SendView::Mine(ALL_SENDS), &mut selected, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            action = draw_send_pane(ui, state, notice, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
         });
 
         let mut painted = Painted::default();
@@ -6177,107 +5690,6 @@ mod paint_tests {
              against nothing"
         );
         (painted, action)
-    }
-
-    /// [`paint_with`], with the composer OPEN and in whatever draft the
-    /// caller wants.
-    ///
-    /// A fixture of its own because every other one in this module builds a
-    /// `SendComposer::default()`, which is closed -- so nothing the form
-    /// draws has ever been reachable from here, and the composer's own
-    /// controls have until now been asserted only through `vault_window`'s
-    /// whole-window matrix.
-    fn paint_composer(composer: &mut SendComposer, in_flight: bool) -> Painted {
-        // Wider than [`min_pane_size`] on purpose: the composer now lives in
-        // the DETAIL column, so a 720pt pane leaves it 330 -- and every
-        // assertion below is about the form's own internal geometry, which
-        // this file already pins against the pane floor in
-        // `every_row_of_the_lifetime_picker_fits_the_box`.
-        paint_composer_at(composer, in_flight, ROOMY_COMPOSER_PANE)
-    }
-
-    /// The comfortable pane [`paint_composer`] draws in.
-    const ROOMY_COMPOSER_PANE: egui::Vec2 =
-        egui::vec2(720.0 + crate::vault_window::LIST_WIDTH, 900.0);
-
-    /// **The two panes every assertion about the composer's CARD is made
-    /// against**, named together so a test cannot quietly be written at one
-    /// of them.
-    ///
-    /// The first is [`ROOMY_COMPOSER_PANE`]; the second is the pane floor's
-    /// own width, where the detail column is 298 points and the card is 250.
-    /// That second number is the one this form has only ever been in danger
-    /// at -- §5a's Access block does not fit inside it at the design's own
-    /// measurements, which is why `access_label_width` exists -- and it is
-    /// this file's standing rule that every new paint test on this screen is
-    /// run at it.
-    ///
-    /// The narrow pane is made TALL rather than 600 high, and that is not a
-    /// cheat: egui culls shapes entirely outside the screen rect, so a form
-    /// longer than the window would come back as missing widgets rather than
-    /// as a scroll bar, and every assertion below would be measuring the top
-    /// of the card. The axis under test is the width.
-    fn composer_panes() -> [(&'static str, egui::Vec2); 2] {
-        [
-            ("the roomy pane", ROOMY_COMPOSER_PANE),
-            ("the window floor", egui::vec2(min_pane_size().x, 1600.0)),
-        ]
-    }
-
-    /// [`paint_composer`], in a pane of the caller's choosing.
-    fn paint_composer_at(
-        composer: &mut SendComposer,
-        in_flight: bool,
-        size: egui::Vec2,
-    ) -> Painted {
-        let ctx = egui::Context::default();
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            ..Default::default()
-        };
-        let _ = ctx.run_ui(input(), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(input(), |_ui| {});
-
-        let state = SendPaneState::Empty;
-        let output = ctx.run_ui(input(), |ui| {
-            let _ = draw_send_pane(
-                ui,
-                &state,
-                None,
-                SendDeleteView::default(),
-                SendView::Mine(ALL_SENDS),
-                &mut None,
-                composer,
-                in_flight,
-                &crate::send::FixedClock(NOW),
-                &crate::local_time::FixedOffset(0),
-            )
-            .into_action();
-        });
-        let mut painted = Painted::default();
-        for clipped in &output.shapes {
-            collect(&clipped.shape, &mut painted);
-        }
-        assert!(
-            painted.has(COMPOSER_HEADING),
-            "the fixture did not open the composer at all, so every assertion below would be \
-             about the empty pane: {:?}",
-            painted.text
-        );
-        painted
-    }
-
-    /// A draft with **no name**, so the composer refuses to submit: the state
-    /// the owner screenshotted, and the one every assertion about the off
-    /// look and the refusal sentence is made in.
-    fn unfinished_composer() -> SendComposer {
-        let composer = SendComposer { open: true, ..SendComposer::default() };
-        assert!(
-            composer_problem(&composer, &FixedClock(NOW)).is_some(),
-            "the fixture wants a draft the form refuses, and this one is submittable"
-        );
-        composer
     }
 
     /// **The design-system BOX a label sits in**, and not whatever rectangle
@@ -6308,92 +5720,6 @@ mod paint_tests {
             })
     }
 
-    /// The bottom-most rectangle painted in `fill`, which for the composer's
-    /// footer band is the band: nothing else on the card is that colour, and
-    /// the modal frame's own tinted footer is not on this screen.
-    fn band_of(painted: &Painted, fill: egui::Color32) -> egui::Rect {
-        painted
-            .fills
-            .iter()
-            .filter(|(_, colour)| *colour == fill)
-            .map(|(rect, _)| *rect)
-            .max_by(|a, b| a.bottom().total_cmp(&b.bottom()))
-            .unwrap_or_else(|| panic!("nothing at all was painted in {fill:?}"))
-    }
-
-    /// **The composer is a CARD: an edge, a rounded corner and a footer band
-    /// -- not a form laid flat on the pane.**
-    ///
-    /// The defect this pins is the one the owner opened with. The form was
-    /// `Frame::new().fill(theme::CARD)` on `theme::CANVAS`, which is white on
-    /// a two-value-off grey with no border and no shadow, and its two answers
-    /// were simply the last widgets in the body. Design §5a draws a bordered,
-    /// rounded, shadowed card whose footer is a tinted strip closed off by a
-    /// hairline, and none of those four things was present.
-    ///
-    /// Asserted on the STROKE and not only on a fill, because that is what
-    /// the card's edge is: `theme::form_card` paints it last as a
-    /// transparent-filled outline, so a test that read fills alone would pass
-    /// against a card with no border at all -- which is exactly the state
-    /// being fixed.
-    #[test]
-    fn the_composer_is_a_card_with_an_edge_and_a_tinted_footer() {
-        for (where_, pane) in composer_panes() {
-            let painted = paint_composer_at(&mut open_composer(), false, pane);
-
-            let heading = painted
-                .rect_of(COMPOSER_HEADING)
-                .unwrap_or_else(|| panic!("{where_}: the heading was not painted"));
-            let edge = painted
-                .strokes
-                .iter()
-                .filter(|(rect, colour)| {
-                    *colour == theme::BORDER_STRONG && rect.contains_rect(heading)
-                })
-                .map(|(rect, _)| *rect)
-                .max_by(|a, b| {
-                    let area = |r: &egui::Rect| r.width() * r.height();
-                    area(a).total_cmp(&area(b))
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{where_}: nothing outlined in the design's card border encloses the \
-                         composer's heading -- the form is drawn flat on the pane, which is \
-                         the report this pass was opened over"
-                    )
-                });
-
-            let band = band_of(&painted, theme::CARD_TINT);
-            assert!(
-                edge.contains_rect(band),
-                "{where_}: the tinted footer band at {band:?} is not inside the card at \
-                 {edge:?}"
-            );
-            assert!(
-                (band.bottom() - edge.bottom()).abs() <= 1.5,
-                "{where_}: the footer band stops {}pt above the card's own bottom edge -- a \
-                 band that does not reach the corner is a stripe",
-                edge.bottom() - band.bottom()
-            );
-            assert!(
-                (band.width() - edge.width()).abs() <= 2.5,
-                "{where_}: the footer band is {}pt wide inside a {}pt card, so it reads as a \
-                 box in the footer rather than as the footer",
-                band.width(),
-                edge.width()
-            );
-
-            let create = painted
-                .rect_of(CREATE_LABEL)
-                .unwrap_or_else(|| panic!("{where_}: the submit was not painted"));
-            assert!(
-                band.contains_rect(create),
-                "{where_}: the submit is at {create:?}, outside the footer band at {band:?} \
-                 -- the answers are still the last things in the body"
-            );
-        }
-    }
-
     /// **§5a's Access block is three questions whose answers start on one
     /// vertical line, and for the whole life of this block they did not.**
     ///
@@ -6403,7 +5729,7 @@ mod paint_tests {
     /// points was in fact each label's own width, and `Expires`, `Views` and
     /// `Open with` being three different widths stepped their three controls
     /// rightwards down the card. It was in every screenshot ever taken of
-    /// either composer and no test could see it, because every assertion on
+    /// the block and no test could see it, because every assertion on
     /// this block was about one row at a time.
     ///
     /// The floor pane is the half of this that matters most: 96 + 14 + 150 is
@@ -6412,10 +5738,10 @@ mod paint_tests {
     /// -- it is the three agreeing.
     #[test]
     fn the_access_rows_start_their_controls_on_one_line() {
-        for (where_, pane) in composer_panes() {
-            let mut composer = open_composer();
-            let painted = paint_composer_at(&mut composer, false, pane);
-            let chosen = crate::send::lifetime_label(composer.plan.lifetime, &UTC);
+        for (where_, pane) in access_cards() {
+            let mut plan = a_plan();
+            let painted = paint_access_at(&mut plan, true, pane);
+            let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
 
             let expires = box_under(&painted, &chosen);
             let views = box_under(&painted, VIEWS_HINT);
@@ -6434,160 +5760,96 @@ mod paint_tests {
         }
     }
 
-    /// **The footer's right-hand slot carries the refusal while there is one
-    /// and the standing note once there is not.**
+    /// **§5a's ACCESS block, painted on its own card**, with whatever plan
+    /// the caller wants and the block live or inert.
     ///
-    /// §5a ends its footer with a standing note (`Appears in Shared`); this
-    /// form had none, and instead left the sentence explaining the grey
-    /// button as loose prose after the buttons -- `Give the Send a name.`
-    /// floating beside `Discard`, which is what the owner saw. Both now go in
-    /// the one place §5a defines for a note about the card, and the order
-    /// between them is argued at the call site.
-    #[test]
-    fn the_footers_note_says_the_refusal_first_and_then_where_the_send_goes() {
-        for (where_, pane) in composer_panes() {
-            let mut unfinished = unfinished_composer();
-            let refusing = paint_composer_at(&mut unfinished, false, pane);
-            let problem = composer_problem(&unfinished, &FixedClock(NOW))
-                .expect("the fixture is a refusing draft");
-            assert!(
-                refusing.has(problem),
-                "{where_}: the form refuses to submit and does not say why: {:?}",
-                refusing.text
-            );
-            assert!(
-                !refusing.has(APPEARS_IN_SENDS),
-                "{where_}: the standing note is printed beside a refusal, so the footer says \
-                 two things at once in a slot that holds one"
-            );
+    /// The block used to be reached from here only through the Sent screen's
+    /// text composer, which drew it on the same card the record composer
+    /// does; the composer went with its `New Send` button, and the block did
+    /// not -- `record_ui::draw_export_form` draws it for every Send made from
+    /// a record. So these tests draw it the way that card does, on
+    /// `theme::form_card`, through the same three `&mut`s into a
+    /// `SendPlan`, and lose none of what they measured.
+    ///
+    /// `enabled: false` is the card while a publish is running, which is the
+    /// state the record composer draws it in.
+    fn paint_access_at(
+        plan: &mut crate::send::SendPlan,
+        enabled: bool,
+        size: egui::Vec2,
+    ) -> Painted {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
 
-            let ready = paint_composer_at(&mut open_composer(), false, pane);
-            assert!(
-                ready.has(APPEARS_IN_SENDS),
-                "{where_}: a submittable draft's footer says nothing about where the Send \
-                 ends up -- §5a's standing note is the whole of what that slot is for: {:?}",
-                ready.text
-            );
-
-            let band = band_of(&ready, theme::CARD_TINT);
-            let note = ready
-                .rect_of(APPEARS_IN_SENDS)
-                .unwrap_or_else(|| panic!("{where_}: the note was not painted"));
-            assert!(
-                band.contains_rect(note),
-                "{where_}: the standing note at {note:?} is outside the footer band at \
-                 {band:?} -- it is prose after the card again"
-            );
+        let output = ctx.run_ui(input(), |ui| {
+            theme::form_card(ui, |ui| {
+                theme::form_card_body(ui, |ui| {
+                    draw_access_block(
+                        ui,
+                        AccessControls {
+                            lifetime: &mut plan.lifetime,
+                            password: &mut plan.password,
+                            max_access_count: &mut plan.max_access_count,
+                        },
+                        enabled,
+                        &crate::send::FixedClock(NOW),
+                        &UTC,
+                    );
+                });
+            });
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
         }
+        assert!(
+            painted.has(ACCESS_EYEBROW),
+            "the fixture did not draw the Access block at all, so every assertion below would \
+             be about an empty card: {:?}",
+            painted.text
+        );
+        painted
     }
 
-    /// **A `Create link` that cannot be pressed is not a pale blue one.**
-    ///
-    /// The owner's second report on this screenshot. `primary_button_enabled`
-    /// used to run its button inside a disabled `Ui`, which fades
-    /// `theme::BLUE` toward the window colour -- a washed-out version of the
-    /// live fill, which reads as the button rendered oddly rather than as an
-    /// action that is not available. The design system already had a
-    /// vocabulary for "switched off" one row up the same card
-    /// (`theme::disabled_text_field`), and this asserts the button now speaks
-    /// it: `theme::OFF_FILL`, not a blend of `BLUE`.
-    ///
-    /// The live case is asserted beside it, because "the disabled button is
-    /// grey" passes just as well on a form that has no live state at all.
-    #[test]
-    fn a_create_link_that_cannot_be_pressed_is_not_a_pale_blue_one() {
-        for (where_, pane) in composer_panes() {
-            let live = paint_composer_at(&mut open_composer(), false, pane);
-            let (_, on) = live.control_under(CREATE_LABEL);
-            assert_eq!(
-                on,
-                theme::BLUE,
-                "{where_}: a submittable composer's primary is not the design's blue"
-            );
-
-            let refusing = paint_composer_at(&mut unfinished_composer(), false, pane);
-            let (_, off) = refusing.control_under(CREATE_LABEL);
-            assert_eq!(
-                off,
-                theme::OFF_FILL,
-                "{where_}: the unpressable submit is painted {off:?} rather than the design \
-                 system's switched-off fill -- a wash of the live colour says \"this button, \
-                 dimmed\" where the user needs \"not a control right now\""
-            );
-            assert_ne!(
-                on, off,
-                "{where_}: the submit paints the same fill whether it can be pressed or not"
-            );
-        }
+    /// [`paint_access_at`] on a comfortable card.
+    fn paint_access(plan: &mut crate::send::SendPlan, enabled: bool) -> Painted {
+        paint_access_at(plan, enabled, ROOMY_ACCESS_CARD)
     }
 
-    /// **Both of the composer's own inputs are the design system's boxes**,
-    /// under §5a's eyebrows.
+    /// A card with room to spare, for the assertions about the block's own
+    /// internal geometry.
+    const ROOMY_ACCESS_CARD: egui::Vec2 = egui::vec2(720.0, 900.0);
+
+    /// **The two cards every assertion about the block's GEOMETRY is made
+    /// against**, named together so a test cannot quietly be written at one of
+    /// them.
     ///
-    /// What they were: two bare `egui::TextEdit`s, one single-line and one
-    /// multi-line, wearing egui's frame and egui's radius on a card whose
-    /// every other control came from `theme.rs`. The owner's words were that
-    /// the fields are drawn as thin outlines. The name box is now
-    /// `theme::FIELD_HEIGHT` exactly -- the measurement every input box in
-    /// this app shares, live or greyed -- and the body is
-    /// `theme::text_area`'s taller one in the same treatment.
-    ///
-    /// The eyebrows are asserted here rather than in a test of their own
-    /// because they and the boxes are one decision: the blocks are §5a's
-    /// first two, and `draw_composer` argues why this form's two inputs are
-    /// eyebrowed at all.
-    #[test]
-    fn both_of_the_composers_inputs_are_the_design_systems_boxes() {
-        for (where_, pane) in composer_panes() {
-            let painted = paint_composer_at(&mut open_composer(), false, pane);
-
-            for eyebrow in [NAME_EYEBROW, TEXT_EYEBROW, ACCESS_EYEBROW] {
-                assert!(
-                    painted.has(eyebrow),
-                    "{where_}: the {eyebrow:?} eyebrow is not on the card, so the block above \
-                     the Access rows is the only one the card admits to having: {:?}",
-                    painted.text
-                );
-            }
-
-            let name = box_under(&painted, "SAP Production");
-            assert!(
-                (name.height() - theme::FIELD_HEIGHT).abs() <= 0.5,
-                "{where_}: the name field's box is {}pt tall against the design system's \
-                 {}pt -- it is not one of this app's fields",
-                name.height(),
-                theme::FIELD_HEIGHT
-            );
-
-            let body = box_under(&painted, "hunter2");
-            assert!(
-                body.height() > name.height(),
-                "{where_}: the body box is {}pt against the name's {}pt, so the paragraph \
-                 field is not taller than the one-line one",
-                body.height(),
-                name.height()
-            );
-            assert!(
-                (body.width() - name.width()).abs() <= 1.0,
-                "{where_}: the two boxes are {}pt and {}pt wide -- they are stacked on one \
-                 card and have to share an edge",
-                name.width(),
-                body.width()
-            );
-        }
+    /// The second is the narrowest this block has ever been drawn at: the
+    /// Sent screen's detail column at the pane floor, less its padding -- the
+    /// 250 points §5a's Access block does not fit at the design's own
+    /// measurements, which is why `access_label_width` exists. Made TALL
+    /// rather than 600 high, because egui culls shapes outside the screen
+    /// rect and the axis under test is the width.
+    fn access_cards() -> [(&'static str, egui::Vec2); 2] {
+        [
+            ("the roomy card", ROOMY_ACCESS_CARD),
+            ("the narrowest card", egui::vec2(min_detail_width() - DETAIL_PAD_X_F * 2.0, 1600.0)),
+        ]
     }
 
-    /// An open composer with a valid draft, so the submit below is LIVE: a
-    /// disabled primary is faded toward the window colour, and a fill read
-    /// off one would be the fade rather than the design's blue.
-    fn open_composer() -> SendComposer {
-        SendComposer {
-            open: true,
-            plan: crate::send::SendPlan {
-                name: "SAP Production".to_string(),
-                text: zeroize::Zeroizing::new("hunter2".to_string()),
-                ..crate::send::SendPlan::default()
-            },
+    /// A plan with a name and a body, at every default -- what the record
+    /// composer hands the block before the user touches it.
+    fn a_plan() -> crate::send::SendPlan {
+        crate::send::SendPlan {
+            name: "SAP Production".to_string(),
+            text: zeroize::Zeroizing::new("hunter2".to_string()),
+            ..crate::send::SendPlan::default()
         }
     }
 
@@ -6612,9 +5874,9 @@ mod paint_tests {
     ///    the sum of its labels, and that is precisely what stopped working.
     #[test]
     fn the_lifetime_picker_is_one_fixed_box_that_states_the_answer() {
-        let mut composer = open_composer();
-        let chosen = crate::send::lifetime_label(composer.plan.lifetime, &UTC);
-        let painted = paint_composer(&mut composer, false);
+        let mut plan = a_plan();
+        let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+        let painted = paint_access(&mut plan, true);
 
         let (shut, _) = painted.control_under(&chosen);
         assert_eq!(
@@ -6776,48 +6038,12 @@ mod paint_tests {
         );
     }
 
-    /// **The composer's two answers are a primary and a secondary**, measured
-    /// on the fills.
-    ///
-    /// They used to be two bare `egui::Button`s differing only in the colour
-    /// of their text -- so on screen the publish and the throw-away were a
-    /// matched pair, and no test in this crate could say so. See
-    /// `record_ui`'s twin of this test: the same defect stood on both of this
-    /// app's Send composers.
-    #[test]
-    fn the_composers_two_answers_are_a_primary_and_a_secondary() {
-        let mut composer = open_composer();
-        assert!(
-            composer_problem(&composer, &FixedClock(NOW)).is_none(),
-            "the fixture wants a submittable draft, or the fill below is a disabled one"
-        );
-        let painted = paint_composer(&mut composer, false);
-
-        let (create, create_fill) = painted.control_under(CREATE_LABEL);
-        assert_eq!(
-            create_fill,
-            theme::BLUE,
-            "the composer's submit is not the design system's filled primary"
-        );
-        assert_eq!(create.height(), theme::BUTTON_HEIGHT);
-
-        let (discard, discard_fill) = painted.control_under(DISCARD_LABEL);
-        assert_eq!(
-            discard_fill,
-            theme::CARD,
-            "the composer's way out is not the design system's outlined secondary"
-        );
-        assert_eq!(discard.height(), theme::BUTTON_HEIGHT);
-        assert_ne!(
-            create_fill, discard_fill,
-            "the two answers paint the same fill, which is the exact defect this pass fixed"
-        );
-    }
-
     /// **While a publish is in flight the lifetime control is inert, and the
     /// answer in force is still legible.**
     ///
-    /// `theme::dropdown_disabled` is what this form draws in that state, and
+    /// The record composer draws the block with `enabled: false` while its
+    /// `bw send create` runs. `theme::dropdown_disabled` is what the block
+    /// draws in that state, and
     /// it exists for the reason its segmented-run predecessor did: the reader
     /// needs "you have this answer and cannot change it", not "you have no
     /// answer". Pinned because the alternative -- an `add_enabled_ui(false)`
@@ -6826,13 +6052,12 @@ mod paint_tests {
     /// let through on a re-layout.
     #[test]
     fn a_publish_in_flight_leaves_the_lifetime_control_inert_and_readable() {
-        let mut composer = open_composer();
-        let chosen = crate::send::lifetime_label(composer.plan.lifetime, &UTC);
-        let live = paint_composer(&mut composer, false);
+        let mut plan = a_plan();
+        let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+        let live = paint_access(&mut plan, true);
         let (_, live_fill) = live.control_under(&chosen);
-        let painted = paint_composer(&mut composer, true);
+        let painted = paint_access(&mut plan, false);
 
-        assert!(painted.has(CREATING_LABEL), "the in-flight word is not on the form");
         assert!(
             painted.has(&chosen),
             "the lifetime in force is not on the card while a publish is running, so the \
@@ -6913,17 +6138,17 @@ mod paint_tests {
         assert_ne!(NO_VIEW_LIMIT_NOTE, VIEW_LIMIT_NOTE);
     }
 
-    /// **§5a's Access block is on the text composer, with all three of its
-    /// buildable rows.**
+    /// **§5a's Access block is whole, with all three of its buildable
+    /// rows.**
     ///
-    /// The composer had a lifetime row and a password tick-box and no view
-    /// cap at all. This says the block arrived whole -- and the three
-    /// absences at the bottom say it did not bring with it the three controls
-    /// no server behind this app can honour.
+    /// The old text composer had a lifetime row and a password tick-box and
+    /// no view cap at all; the block replaced all three. This says it is
+    /// whole -- and the three absences at the bottom say it did not bring with
+    /// it the three controls no server behind this app can honour.
     #[test]
-    fn the_composer_wears_the_whole_access_block() {
-        let mut composer = open_composer();
-        let painted = paint_composer(&mut composer, false);
+    fn the_access_block_is_whole() {
+        let mut plan = a_plan();
+        let painted = paint_access(&mut plan, true);
 
         assert!(painted.has(ACCESS_EYEBROW), "the ACCESS eyebrow is missing: {:?}", painted.text);
         for label in [EXPIRES_LABEL, VIEWS_LABEL, OPEN_WITH_LABEL] {
@@ -6955,7 +6180,7 @@ mod paint_tests {
         for absent in ["Recipient", "Only this address can open it", "Tell me when it is opened"] {
             assert!(
                 !painted.has(absent),
-                "{absent:?} is drawn on the composer, and there is no server behind it"
+                "{absent:?} is drawn in the Access block, and there is no server behind it"
             );
         }
     }
@@ -6963,37 +6188,33 @@ mod paint_tests {
     /// **What is typed into the Access block reaches the plan that is
     /// published**, by the route a user actually takes.
     ///
-    /// `draw_access_block` writes through three `&mut`s into the composer's
-    /// own `SendPlan`, which is the buffer `plan_to_invocation` will encode --
-    /// there is no conversion step in between and this says so. The password
+    /// `draw_access_block` writes through three `&mut`s into the draft's own
+    /// `SendPlan` fields, which `record_ui::send_plan_from` carries into the
+    /// plan that is published -- there is no conversion step in between and
+    /// this says so. The password
     /// half is the one that matters most: a control that drew, validated and
     /// then published `None` would ship a Send anyone with the link can open,
     /// with the user's own password visible in the box they typed it into.
     #[test]
-    fn what_the_access_block_holds_is_what_the_composer_would_publish() {
-        let mut composer = open_composer();
-        composer.plan.lifetime = crate::send::SendLifetime::Hours(1);
-        composer.plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
-        composer.plan.max_access_count = Some(3);
+    fn what_the_access_block_holds_is_what_would_be_published() {
+        let mut plan = a_plan();
+        plan.lifetime = crate::send::SendLifetime::Hours(1);
+        plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
+        plan.max_access_count = Some(3);
 
-        // A frame of the real form, which is where a block that dropped what
+        // A frame of the real block, which is where a block that dropped what
         // it was handed would do the dropping.
-        let painted = paint_composer(&mut composer, false);
-        assert!(painted.has(ACCESS_EYEBROW), "control: the block did not draw");
+        let painted = paint_access(&mut plan, true);
 
+        assert_eq!(plan.lifetime, crate::send::SendLifetime::Hours(1), "a frame reset the lifetime");
         assert_eq!(
-            composer.plan.lifetime,
-            crate::send::SendLifetime::Hours(1),
-            "a frame reset the lifetime"
-        );
-        assert_eq!(
-            composer.plan.password.as_deref().map(String::as_str),
+            plan.password.as_deref().map(String::as_str),
             Some("share-pw-9271"),
-            "a frame dropped the share password, so the composer would publish an open link"
+            "a frame dropped the share password, so an open link would be published"
         );
-        assert_eq!(composer.plan.max_access_count, Some(3), "a frame dropped the view cap");
+        assert_eq!(plan.max_access_count, Some(3), "a frame dropped the view cap");
         assert_eq!(
-            composer_problem(&composer, &FixedClock(NOW)),
+            crate::send::validate_plan(&plan, &FixedClock(NOW)),
             None,
             "the draft the user typed is refused"
         );
@@ -7021,9 +6242,9 @@ mod paint_tests {
     /// notice.
     #[test]
     fn the_share_password_is_never_painted_in_the_clear() {
-        let mut composer = open_composer();
-        composer.plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
-        let painted = paint_composer(&mut composer, false);
+        let mut plan = a_plan();
+        plan.password = Some(zeroize::Zeroizing::new("share-pw-9271".to_string()));
+        let painted = paint_access(&mut plan, true);
         assert!(painted.has(OPEN_WITH_LABEL), "control: the password row did not draw");
         assert!(
             !painted.has("share-pw-9271"),
@@ -7619,7 +6840,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
 
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -7653,7 +6874,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7665,7 +6886,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
         });
         action
     }
@@ -7803,7 +7024,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None).into_action();
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -7823,7 +7044,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7836,7 +7057,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None).into_action();
         });
         assert_eq!(action, SendUiAction::DismissNotice);
     }
@@ -7866,7 +7087,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
         let _ = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
         });
         let press = egui::RawInput {
             events: vec![
@@ -7881,7 +7102,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7894,7 +7115,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, &mut SendComposer::default(), false, &crate::send::FixedClock(0), &crate::local_time::FixedOffset(0)).into_action();
+            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
         });
         action
     }
@@ -8590,10 +7811,6 @@ mod paint_tests {
                 SendDeleteView::default(),
                 SendView::Mine(scope),
                 &mut selected,
-                &mut SendComposer::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
             )
             .into_action();
         });
@@ -8789,10 +8006,6 @@ mod paint_tests {
                 SendDeleteView::default(),
                 SendView::Received(rows),
                 &mut selected,
-                &mut SendComposer::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
             )
             .into_action();
         });
@@ -8828,7 +8041,7 @@ mod paint_tests {
         assert_eq!(listed.in_list("Office WiFi"), 1);
         assert!(listed.has(NOTHING_PICKED_RECEIVED), "nothing picked and nothing said");
         // The Sends list's own machinery is nowhere on this screen.
-        for leaked in [LOADING_LABEL, REFRESH_LABEL, NEW_SEND_LABEL, SCOPE_SUBTEXT] {
+        for leaked in [LOADING_LABEL, SCOPE_SUBTEXT] {
             assert!(
                 !listed.has(leaked),
                 "{leaked:?} is drawn on the `Shared with me` screen, which asks the server \
@@ -13320,9 +12533,7 @@ mod source_pins {
         let pane = squashed(concat!(
             "send_ui::draw_send_", "pane( ui, state, notice_message.as_deref(), \
              send_delete.view(), if on_received { send_ui::SendView::Received(&received) } \
-             else { send_ui::SendView::Mine(send_scope) }, &mut selected_send, \
-             &mut send_create.composer, send_create.in_flight, &crate::send::SystemClock, \
-             &crate::local_time::SystemZone, )"
+             else { send_ui::SendView::Mine(send_scope) }, &mut selected_send, )"
         ));
         assert_eq!(
             squashed(&production).matches(pane.as_str()).count(),

@@ -144,7 +144,6 @@ impl ModalSubject {
     }
 }
 
-
 /// Which auto-lock policy a frame of the open window must honour.
 ///
 /// `opened_with` is the [`AutoLock`] `main.rs` computed from `settings.json`
@@ -1429,8 +1428,8 @@ pub fn build_frame_with_search(
     // composer that died with the frame would lose the ticks to every repaint.
     // Cleared to `None` on Cancel and on a started publish, which drops the
     // `Zeroizing` passphrase buffer rather than leaving a seed's passphrase
-    // resident behind a closed flag -- `send_ui::SendComposer`'s rule, which
-    // this borrows rather than restates.
+    // resident behind a closed flag, which would keep a secret alive for
+    // the life of the window for no one's benefit.
     //
     // **It is only ever written by one line**, the gating block below, so the
     // re-prompt cannot be bypassed by a second door -- see
@@ -4369,10 +4368,6 @@ pub fn build_frame_with_search(
                             send_ui::SendView::Mine(send_scope)
                         },
                         &mut selected_send,
-                        &mut send_create.composer,
-                        send_create.in_flight,
-                        &crate::send::SystemClock,
-                        &crate::local_time::SystemZone,
                     );
                 }
                 // Resolved from the list the selection was made in, for the
@@ -6287,11 +6282,6 @@ pub fn build_frame_with_search(
             &send_delete_tx,
             &session_token,
             spawn_send_delete,
-            SendCreateWiring {
-                state: &mut send_create,
-                tx: &send_create_tx,
-                spawn: spawn_send_create,
-            },
             copy_send_url,
         );
         // **`Open record`**: leave the Sent screen and show the item the Send
@@ -6789,8 +6779,7 @@ pub fn build_frame_with_search(
                     // value.** The draft holds a `Zeroizing` passphrase for a
                     // seed; dropping the composer wipes it, where an `open =
                     // false` would leave it resident for the life of the
-                    // window. `send_ui::SendUiAction::CancelComposer`'s rule,
-                    // borrowed rather than restated.
+                    // window.
                     record_send = None;
                 }
                 record_ui::RecordUiAction::Cancel => record_send = None,
@@ -8618,7 +8607,6 @@ fn permit_row_command(
         }
     }
 }
-
 
 /// **Whether the way this window ended means a copied secret's life is over,
 /// and if so under which of the user's switches.**
@@ -11632,14 +11620,8 @@ fn apply_send_action(
     tx: &SendDeleteSender,
     session: &zeroize::Zeroizing<String>,
     spawn: SendDeleteSpawn,
-    create: SendCreateWiring<'_>,
     copy: SendCopySeam,
 ) -> Option<String> {
-    let SendCreateWiring {
-        state: create,
-        tx: create_tx,
-        spawn: spawn_create,
-    } = create;
     // `Open record` is the one action this function cannot carry out: the
     // vault's selection belongs to the frame. It is handed back, and the
     // frame opens the item.
@@ -11744,67 +11726,6 @@ fn apply_send_action(
                 delete.extending = true;
                 delete.report = None;
                 spawn(ctx.clone(), tx.clone(), session.clone(), id, name, SendRowOp::Extend);
-            }
-        }
-        // **Opening the form destroys nothing and publishes nothing.** The
-        // previous report goes, because a banner about the last Send is not
-        // about the one being typed.
-        send_ui::SendUiAction::OpenComposer => {
-            create.composer.open = true;
-            create.report = None;
-        }
-        // **Discard is a whole-value reset, not `open = false`.** The draft
-        // holds a secret; leaving it behind a closed flag would keep the text
-        // of a Send the user decided not to publish alive in this process
-        // until the window closed. Replacing the value drops the
-        // `Zeroizing` buffers, which wipes them.
-        //
-        // It is refused while a create is in flight: the worker thread has
-        // its own clone of the plan, so wiping the draft would not recall it,
-        // and a form that vanished mid-publish would leave the user with no
-        // idea what was being published.
-        send_ui::SendUiAction::CancelComposer => {
-            if !create.in_flight {
-                create.composer = send_ui::SendComposer::default();
-            }
-        }
-        // **The only place in this program that starts a `bw send create`.**
-        send_ui::SendUiAction::SubmitSend => {
-            // Two locks, and this is the second: the composer disables every
-            // control while a create is in flight, so there is no button to
-            // press, and this refuses anyway. A second child would publish
-            // the same secret twice under two links, only one of which the
-            // user would ever see to revoke.
-            //
-            // **And the draft is validated HERE as well as beside the
-            // button.** `send_ui::composer_can_submit` greys the control out;
-            // this is what makes greying it out a rule rather than a
-            // rendering. Both call `crate::send::validate_plan`, which is
-            // also what `plan_to_invocation` refuses on, so the three cannot
-            // disagree about what a publishable draft is.
-            if !create.in_flight
-                && send_ui::composer_problem(&create.composer, &crate::send::SystemClock)
-                    .is_none()
-            {
-                create.in_flight = true;
-                create.report = None;
-                spawn_create(
-                    ctx.clone(),
-                    create_tx.clone(),
-                    // The window's own session, cloned per create into a
-                    // `Zeroizing` the worker drops. It reaches the child in
-                    // `BW_SESSION` and never in argv.
-                    session.clone(),
-                    // **The plan is CLONED and the draft stays put.** A
-                    // `mem::take` here would empty the form on the frame the
-                    // user pressed Create, and a create that then failed
-                    // would have thrown away the text they would have to
-                    // retype. The draft is wiped by `drain_send_create`, on a
-                    // confirmed success and on nothing else. The clone is one
-                    // per press, not one per frame, and every buffer in it is
-                    // `Zeroizing`.
-                    create.composer.plan.clone(),
-                );
             }
         }
         send_ui::SendUiAction::OpenRecord(item_id) => open_record = Some(item_id),
@@ -12075,19 +11996,6 @@ impl SendCreateReport {
             SendCreateReport::Created { .. } => true,
             SendCreateReport::Failed { error, .. } => error.is_ambiguous(),
         }
-    }
-
-    /// Whether the draft that produced this report may be thrown away.
-    ///
-    /// **Only on a confirmed success.** A failed create leaves the composer
-    /// open with every character still in it: the user typed a secret, this
-    /// app could not publish it, and clearing the form would make them type
-    /// it again to find out whether the failure was transient. An AMBIGUOUS
-    /// failure keeps the draft too -- the Send may exist, but this app cannot
-    /// say so, and the list it is about to refetch is where the answer will
-    /// be.
-    fn draft_is_spent(&self) -> bool {
-        matches!(self, SendCreateReport::Created { .. })
     }
 }
 
@@ -12404,39 +12312,23 @@ type SendCreateSpawn = fn(egui::Context, SendCreateSender, zeroize::Zeroizing<St
 
 /// Everything the window holds between frames for the create.
 ///
-/// [`SendDeleteState`]'s shape and its reason: the three are a state machine
-/// and the rules relating them -- a submit is refused while one is in flight,
-/// the draft outlives a failure and dies with a success, a report replaces the
-/// previous report -- are rules no test in this crate could run if they were
-/// written as `if`s between panels. They live in [`apply_send_action`] and
-/// [`drain_send_create`], which are plain functions.
+/// [`SendDeleteState`]'s shape and its reason: the two are a state machine
+/// and the rules relating them -- a publish is refused while one is in
+/// flight, a report replaces the previous report -- are rules no test in this
+/// crate could run if they were written as `if`s between panels. The report
+/// half lives in [`drain_send_create`], a plain function.
 ///
-/// **The draft is `send_ui::SendComposer` and lives HERE**, not in the pane:
-/// panes in this window own no state, and a draft that died with the frame
-/// would lose a half-typed secret to every navigation.
+/// **It holds no draft.** The Sent screen's text composer kept one here;
+/// the only Send composer now is the record one, whose draft is
+/// `record_send` in the frame and is dropped the moment Create is pressed.
 #[derive(Debug, Default)]
 struct SendCreateState {
-    /// The form, open or closed, with whatever is typed into it.
-    composer: send_ui::SendComposer,
     /// Whether a `bw send create` is running. **At most one at a time**: the
-    /// composer disables every control while it is, so there is no button to
-    /// start a second from, and [`apply_send_action`] refuses anyway.
+    /// record composer's Create is refused while it is, so a second child
+    /// would publish the same record twice under two links.
     in_flight: bool,
     /// The last report, until the user dismisses it.
     report: Option<SendCreateReport>,
-}
-
-/// The create's three arguments to [`apply_send_action`], as one value.
-///
-/// A struct and not three more parameters, because [`apply_send_action`]
-/// already carries seven and its call in the frame closure is pinned by brace
-/// depth -- an argument list that grows without bound is an argument list that
-/// gets reordered, and two `&mut` state values of different types next to two
-/// senders of different types is exactly the shape where a swap compiles.
-struct SendCreateWiring<'a> {
-    state: &'a mut SendCreateState,
-    tx: &'a SendCreateSender,
-    spawn: SendCreateSpawn,
 }
 
 /// The create reporting back, as a plain function for [`drain_send_delete`]'s
@@ -12444,14 +12336,8 @@ struct SendCreateWiring<'a> {
 ///
 /// `in_flight` is cleared FIRST and unconditionally: the thread that set it
 /// has finished, whatever became of its answer, and a conditional clear is how
-/// a flag like this latches forever -- leaving the composer painted
-/// "Publishing..." with every control disabled for the life of the window.
-///
-/// **The draft is wiped only on a confirmed success** -- see
-/// [`SendCreateReport::draft_is_spent`] -- and wiping it is a whole-value
-/// reset, so the name, the body and the share password all go back to the
-/// allocator zeroized rather than being cleared field by field and one of them
-/// forgotten.
+/// a flag like this latches forever -- leaving every "Send a record" in the
+/// window refused for the life of the window.
 fn drain_send_create(
     rx: &Receiver<SendCreateReport>,
     create: &mut SendCreateState,
@@ -12470,18 +12356,11 @@ fn drain_send_create(
         // `Debug` elides it for exactly that reason -- so it belongs under
         // the same clearing timer as a password.
         //
-        // Both composers, not just the record one. The Sends screen's button
-        // reads `Create link` and promises less than this does, which is a
-        // pleasant surprise rather than a lie; a link created there was
-        // equally unreachable.
         if let SendCreateReport::Created { access_url, .. } = &report {
             crate::clipboard::copy_secret(access_url);
         }
         if report.list_is_now_stale() {
             fetch.invalidate();
-        }
-        if report.draft_is_spent() {
-            create.composer = send_ui::SendComposer::default();
         }
         create.report = Some(report);
     }
@@ -26771,7 +26650,6 @@ mod account_details_tests {
     }
 }
 
-
 /// The Open-the-app path: the sentence a refusal shows, driven directly, and a
 /// source-text guard on the arm that runs the program.
 ///
@@ -29394,7 +29272,6 @@ mod export_wiring {
              frame's applier reads"
         );
     }
-
 
     // -----------------------------------------------------------------
     // What production's env HOLDS, by address
@@ -32367,7 +32244,6 @@ mod send_delete_wiring {
     /// Invented. No real session token appears in this file.
     const SESSION: &str = "an-invented-session-token-not-a-real-one";
 
-
     // ==================================================================
     // THE PRIMARY HOLD: the Sends row is observed at the point of effect
     // ==================================================================
@@ -32419,7 +32295,6 @@ mod send_delete_wiring {
             .expect("not poisoned")
             .push((id, name, session.to_string()));
     }
-
 
     /// Whether [`frame_send_list`] keeps its sender instead of answering, so
     /// the window is left with a fetch genuinely in flight.
@@ -35216,14 +35091,6 @@ mod send_delete_wiring {
             &tx,
             &zeroize::Zeroizing::new(SESSION.to_string()),
             recording_spawn,
-            // The create side, present and inert: none of the actions these
-            // tests drive is a create one, and a spawner that panics is what
-            // says so if that ever stops being true.
-            SendCreateWiring {
-                state: &mut SendCreateState::default(),
-                tx: &mpsc::channel().0,
-                spawn: refuses_to_create_here,
-            },
             recording_copy,
         );
         // Held so the sender cannot report "disconnected" for a reason that
@@ -35242,17 +35109,6 @@ mod send_delete_wiring {
 
     thread_local! {
         static COPIES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    }
-
-    /// The create spawner these revoke tests hand over. None of them produce
-    /// a create action, so reaching it at all is the failure.
-    fn refuses_to_create_here(
-        _: egui::Context,
-        _: SendCreateSender,
-        _: zeroize::Zeroizing<String>,
-        plan: crate::send::SendPlan,
-    ) {
-        panic!("a revoke-side action started a create: {plan:?}");
     }
 
     fn confirm() -> send_ui::SendUiAction {
@@ -36888,8 +36744,7 @@ mod send_delete_wiring {
         let tail = squashed(concat!(
             "}) .inner .into_", "action(), &mut send_delete, &mut send_fetch, \
              ui.ctx(), &send_delete_tx, &session_token, spawn_send_delete, \
-             SendCreateWiring { state: &mut send_create, tx: &send_create_tx, \
-             spawn: spawn_send_create, }, copy_send_url, );"
+             copy_send_url, );"
         ));
         assert_eq!(
             flat.matches(&tail).count(),
@@ -37755,14 +37610,6 @@ mod send_create_wiring {
         }
     }
 
-    /// A composer holding [`a_draft`], open.
-    fn an_open_composer() -> send_ui::SendComposer {
-        send_ui::SendComposer {
-            open: true,
-            plan: a_draft(),
-        }
-    }
-
     // ==================================================================
     // 3b. The report's own `Debug`
     // ==================================================================
@@ -38171,10 +38018,6 @@ mod send_create_wiring {
             "a panicked create did not invalidate the list, so a Send it may have published \
              would never appear on the only screen that can revoke it: {report:?}"
         );
-        assert!(
-            !report.draft_is_spent(),
-            "a panicked create threw the user's draft away: {report:?}"
-        );
         let (tone, _) = send_create_message(&report);
         assert_eq!(
             tone,
@@ -38187,270 +38030,16 @@ mod send_create_wiring {
     // 2. The state machine: `apply_send_action` and `drain_send_create`
     // ==================================================================
 
-    thread_local! {
-        /// Every create [`recording_create_spawn`] was asked to start, on this
-        /// thread. Thread-local because `cargo test` runs tests in parallel.
-        static CREATE_SPAWNS: RefCell<Vec<(String, String, String, crate::send::SendLifetime, String)>> =
-            const { RefCell::new(Vec::new()) };
-    }
-
-    /// A [`SendCreateSpawn`] that records instead of publishing.
-    ///
-    /// A `fn` item with the production signature, so the only difference
-    /// between the tested run and the shipping one is which of two `fn`
-    /// pointers the caller names.
-    ///
-    /// It records the plan's contents in the clear **because this is a test
-    /// and the plan is invented**; production never formats a plan, which is
-    /// what `SendPlan`'s hand-written `Debug` is for.
-    fn recording_create_spawn(
-        _ctx: egui::Context,
-        _tx: SendCreateSender,
-        session: zeroize::Zeroizing<String>,
-        plan: crate::send::SendPlan,
-    ) {
-        CREATE_SPAWNS.with(|s| {
-            s.borrow_mut().push((
-                plan.name.clone(),
-                plan.text.to_string(),
-                plan.password.as_deref().cloned().unwrap_or_default(),
-                plan.lifetime,
-                session.to_string(),
-            ));
-        });
-    }
-
-    /// Runs the production [`apply_send_action`] and answers every create it
-    /// started.
-    fn apply(
-        action: send_ui::SendUiAction,
-        create: &mut SendCreateState,
-    ) -> Vec<(String, String, String, crate::send::SendLifetime, String)> {
-        CREATE_SPAWNS.with(|s| s.borrow_mut().clear());
-        let ctx = egui::Context::default();
-        let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
-        let (delete_tx, delete_rx): (SendDeleteSender, Receiver<SendDeleteReport>) =
-            mpsc::channel();
-        let mut delete = SendDeleteState::default();
-        let mut fetch = send_ui::SendFetch::default();
-        apply_send_action(
-            action,
-            &mut delete,
-            &mut fetch,
-            &ctx,
-            &delete_tx,
-            &zeroize::Zeroizing::new(SESSION.to_string()),
-            refuses_to_revoke_here,
-            SendCreateWiring {
-                state: create,
-                tx: &tx,
-                spawn: recording_create_spawn,
-            },
-            refuses_to_copy_here,
-        );
-        // Held so neither sender can report "disconnected" for a reason that
-        // has nothing to do with what is being asserted.
-        drop(rx);
-        drop(delete_rx);
-        CREATE_SPAWNS.with(|s| s.borrow().clone())
-    }
-
-    /// The revoke spawner these tests hand over. None of them produce a
-    /// revoke action, so reaching it at all is the failure.
-    fn refuses_to_revoke_here(
-        _: egui::Context,
-        _: SendDeleteSender,
-        _: zeroize::Zeroizing<String>,
-        id: String,
-        _: String,
-        _: SendRowOp,
-    ) {
-        panic!("a create-side action started a revoke of {id:?}");
-    }
-
-    /// The copy seam these tests hand over. None of them produce a
-    /// `CopyLink`, so reaching it at all is the failure -- and reaching the
-    /// PRODUCTION one would have overwritten the clipboard of whoever ran
-    /// `cargo test`, silently.
-    fn refuses_to_copy_here(url: &str) {
-        panic!("a create-side action copied {url:?} to the clipboard");
-    }
-
-    /// **THE PUBLISH HAPPENS, ONCE, WITH WHAT THE USER TYPED.**
-    ///
-    /// The whole of the create's effect is this spawn, so a test that only
-    /// checked the composer closed or the flag latched would pass against an
-    /// `apply` that published nothing at all.
-    #[test]
-    fn pressing_create_on_a_valid_draft_starts_exactly_one_publish() {
-        let mut create = SendCreateState {
-            composer: an_open_composer(),
-            ..SendCreateState::default()
-        };
-        let started = apply(send_ui::SendUiAction::SubmitSend, &mut create);
-        assert_eq!(
-            started,
-            vec![(
-                DRAFT_NAME.to_string(),
-                SECRET.to_string(),
-                SHARE_PASSWORD.to_string(),
-                crate::send::DEFAULT_LIFETIME,
-                SESSION.to_string(),
-            )],
-            "pressing Create did not start exactly one publish carrying exactly the draft \
-             and this window's own session"
-        );
-        assert!(
-            create.in_flight,
-            "the publish started and the window does not know one is running, so the \
-             composer would still offer a Create button and a second press would publish \
-             the same secret twice under two links"
-        );
-        // **The draft survives the press.** A create that failed would
-        // otherwise have thrown away text the user has to retype -- and text
-        // the user cannot retype if it was pasted from somewhere now closed.
-        assert_eq!(
-            create.composer.plan.text.as_str(),
-            SECRET,
-            "the draft was emptied by the press, so a failed publish loses what was typed"
-        );
-        assert!(
-            create.composer.open,
-            "the composer closed on the press, so a failed publish leaves the user with no \
-             form and no draft"
-        );
-    }
-
-    /// A second press while one is in flight publishes nothing.
-    ///
-    /// The composer disables its controls while a create runs, so this is the
-    /// second lock rather than the first -- and the first is a rendering,
-    /// which is the layer a mis-laid-out button walks straight past.
-    #[test]
-    fn a_second_press_while_a_publish_is_in_flight_starts_nothing() {
-        let mut create = SendCreateState {
-            composer: an_open_composer(),
-            in_flight: true,
-            report: None,
-        };
-        let started = apply(send_ui::SendUiAction::SubmitSend, &mut create);
-        assert!(
-            started.is_empty(),
-            "a second press started another `bw send create`: the same secret would be \
-             published twice under two links, only one of which the user is ever shown to \
-             revoke -- {started:?}"
-        );
-    }
-
-    /// An invalid draft publishes nothing, whatever the pane reported.
-    ///
-    /// The button is greyed out by `send_ui::composer_can_submit`; this is
-    /// what makes greying it out a RULE. Every field of the draft here is the
-    /// default, so the problem is the one `validate_plan` names first.
-    #[test]
-    fn a_press_on_an_invalid_draft_starts_nothing() {
-        let mut create = SendCreateState {
-            composer: send_ui::SendComposer {
-                open: true,
-                ..send_ui::SendComposer::default()
-            },
-            ..SendCreateState::default()
-        };
-        assert!(
-            send_ui::composer_problem(&create.composer, &crate::send::SystemClock).is_some(),
-            "control: the empty draft is considered publishable, so this test is about \
-             nothing"
-        );
-        let started = apply(send_ui::SendUiAction::SubmitSend, &mut create);
-        assert!(
-            started.is_empty(),
-            "an unpublishable draft was handed to `bw send create` anyway: {started:?}"
-        );
-        assert!(
-            !create.in_flight,
-            "nothing was published and the window thinks something is running, so the \
-             composer is disabled for the life of the window"
-        );
-    }
-
-    /// Opening the form opens it and publishes nothing.
-    #[test]
-    fn opening_the_composer_publishes_nothing_and_clears_the_last_report() {
-        let mut create = SendCreateState {
-            report: Some(SendCreateReport::Created {
-                id: "send-id".to_string(),
-                name: "an earlier Send".to_string(),
-                access_url: "https://send.example.invalid/earlier".to_string(),
-            }),
-            ..SendCreateState::default()
-        };
-        let started = apply(send_ui::SendUiAction::OpenComposer, &mut create);
-        assert!(started.is_empty(), "opening the form published something");
-        assert!(create.composer.open, "the form did not open");
-        assert!(
-            create.report.is_none(),
-            "the banner about the LAST Send is still up over the form for the next one"
-        );
-    }
-
-    /// **DISCARD WIPES THE DRAFT RATHER THAN HIDING IT.**
-    ///
-    /// A draft left behind a closed flag is the text of a Send the user
-    /// decided not to publish, alive in this process until the window closes.
-    #[test]
-    fn discarding_the_composer_wipes_what_was_typed() {
-        let mut create = SendCreateState {
-            composer: an_open_composer(),
-            ..SendCreateState::default()
-        };
-        let started = apply(send_ui::SendUiAction::CancelComposer, &mut create);
-        assert!(started.is_empty(), "discarding the form published something");
-        assert!(!create.composer.open, "the form did not close");
-        assert_eq!(
-            create.composer.plan.text.as_str(),
-            "",
-            "the body of the discarded Send is still held by this window"
-        );
-        assert_eq!(
-            create.composer.plan.name, "",
-            "the name of the discarded Send is still held by this window"
-        );
-        assert!(
-            create.composer.plan.password.is_none(),
-            "the share password of the discarded Send is still held by this window"
-        );
-    }
-
-    /// Discard is refused while a publish is running.
-    ///
-    /// The worker holds its own clone of the plan, so wiping the draft would
-    /// not recall it -- and a form that vanished mid-publish would leave the
-    /// user with no idea what is being published.
-    #[test]
-    fn discarding_is_refused_while_a_publish_is_in_flight() {
-        let mut create = SendCreateState {
-            composer: an_open_composer(),
-            in_flight: true,
-            report: None,
-        };
-        let _ = apply(send_ui::SendUiAction::CancelComposer, &mut create);
-        assert!(
-            create.composer.open && create.composer.plan.text.as_str() == SECRET,
-            "the form was discarded out from under a publish that is still running"
-        );
-    }
-
     /// The drain, for every outcome.
     #[test]
-    fn the_drain_clears_the_flag_and_decides_the_draft_and_the_list() {
-        for (report, stale, spent) in [
+    fn the_drain_clears_the_flag_and_decides_the_list() {
+        for (report, stale) in [
             (
                 SendCreateReport::Created {
                     id: "send-id".to_string(),
                     name: DRAFT_NAME.to_string(),
                     access_url: "https://send.example.invalid/new".to_string(),
                 },
-                true,
                 true,
             ),
             (
@@ -38459,7 +38048,6 @@ mod send_create_wiring {
                     error: crate::send::SendError::TimedOut,
                 },
                 true,
-                false,
             ),
             (
                 SendCreateReport::Failed {
@@ -38467,15 +38055,10 @@ mod send_create_wiring {
                     error: crate::send::SendError::Rejected("no".to_string()),
                 },
                 false,
-                false,
             ),
         ] {
             let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
-            let mut create = SendCreateState {
-                composer: an_open_composer(),
-                in_flight: true,
-                report: None,
-            };
+            let mut create = SendCreateState { in_flight: true, report: None };
             let mut fetch = send_ui::SendFetch::default();
             fetch.result = Some(Ok(Vec::new()));
             let generation = fetch.generation();
@@ -38484,20 +38067,14 @@ mod send_create_wiring {
 
             assert!(
                 !create.in_flight,
-                "{report:?}: the in-flight flag was not cleared, so the composer is disabled \
-                 for the life of the window"
+                "{report:?}: the in-flight flag was not cleared, so every Send a record is \
+                 refused for the life of the window"
             );
             assert_eq!(
                 fetch.generation() != generation,
                 stale,
                 "{report:?}: the list was refetched when it should not have been, or was \
                  left standing when a Send that may exist is missing from it"
-            );
-            assert_eq!(
-                create.composer.plan.text.as_str() == SECRET,
-                !spent,
-                "{report:?}: the draft was kept when it should have been wiped, or thrown \
-                 away when the user still needs it"
             );
             assert!(
                 create.report.is_some(),
@@ -39643,123 +39220,6 @@ mod send_create_wiring {
         );
     }
 
-    /// **THE DRAFT'S PLAINTEXT IS WIPED WHEN THE COMPOSER LETS GO OF IT.**
-    ///
-    /// Two readings, and it is the pair that is the claim, because either one
-    /// alone has a hole the other closes:
-    ///
-    ///  1. **The draft really was let go.** After the release the composer is
-    ///     back to `default()` -- closed, with an empty body and no share
-    ///     password. Without this, a release path that merely set `open =
-    ///     false` and left the plan in place would free nothing and reading 2
-    ///     would answer "clean" about a buffer still full of the secret.
-    ///  2. **And what it let go of went back to the allocator wiped**, on the
-    ///     crate's `#[global_allocator]` probe -- the same instrument
-    ///     `send.rs`'s `the_plans_secret_fields_and_the_built_json_all_wipe`
-    ///     holds the same two fields against, and with its control asserted
-    ///     first for its reason.
-    ///
-    /// Both at the two moments the feature depends on the wipe: Discard, and
-    /// the successful publish that clears the form.
-    ///
-    /// **This used to read the buffer back through a raw pointer after the
-    /// release, and that was wrong twice.**
-    ///
-    /// It was *racy*: `apply` replaces the whole composer, so the `String`'s
-    /// allocation is not merely overwritten but FREED, and the read happened
-    /// after the free. Under a full suite at `-j 8` another thread can be
-    /// handed that block between the free and the read, and the bytes read are
-    /// then neither the plaintext nor zeros. That is the whole of the
-    /// intermittent failure this test was known for; the wipe it was
-    /// complaining about was correct every time.
-    ///
-    /// And it was *vacuous*: [`crate::login_ui::password_lifetime_tests`]'s
-    /// `Watcher::dealloc` zeroes EVERY block it frees, unconditionally and by
-    /// design. So a post-free read finds zeros whether the draft wiped itself
-    /// or not -- deleting `Zeroizing` from `SendPlan` left the old assertion
-    /// green. The probe is read INSIDE `dealloc`, before that wipe and while
-    /// the block is still unambiguously the allocator's, which is both the
-    /// deterministic observation point and the only one that can tell the two
-    /// apart.
-    #[test]
-    fn discarding_a_draft_zeroizes_the_text_and_the_share_password() {
-        use crate::login_ui::password_lifetime_tests::{
-            plaintext_reached_the_allocator, PROBE,
-        };
-
-        // **The control, first**, as every probe test in this crate does: an
-        // instrument that answered `false` to everything would make both
-        // verdicts below vacuous with nothing in the output to say so. Arming
-        // it first is also what puts the fixtures built inside the loop under
-        // this thread's hold of the probe lock.
-        let bare = PROBE.to_string();
-        assert!(
-            plaintext_reached_the_allocator(move || drop(bare)),
-            "control: the allocator probe did not see a plain `String` carrying the probe go \
-             back to the allocator, so every verdict below is meaningless"
-        );
-
-        for wipe_by_publishing in [false, true] {
-            // Built before the watch arms, so the temporaries of building the
-            // draft are not what is measured.
-            let mut create = SendCreateState {
-                composer: send_ui::SendComposer {
-                    open: true,
-                    plan: crate::send::SendPlan {
-                        name: DRAFT_NAME.to_string(),
-                        text: zeroize::Zeroizing::new(PROBE.to_string()),
-                        password: Some(zeroize::Zeroizing::new(PROBE.to_string())),
-                        ..crate::send::SendPlan::default()
-                    },
-                },
-                in_flight: wipe_by_publishing,
-                report: None,
-            };
-            let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
-            let mut fetch = send_ui::SendFetch::default();
-            if wipe_by_publishing {
-                tx.send(SendCreateReport::Created {
-                    id: "send-id".to_string(),
-                    name: DRAFT_NAME.to_string(),
-                    access_url: "https://send.example.invalid/new".to_string(),
-                })
-                .expect("the receiver is held");
-            }
-
-            let leaked = plaintext_reached_the_allocator(|| {
-                if wipe_by_publishing {
-                    drain_send_create(&rx, &mut create, &mut fetch);
-                } else {
-                    create.in_flight = false;
-                    let _ = apply(send_ui::SendUiAction::CancelComposer, &mut create);
-                }
-            });
-
-            // 1. The draft was let go of at all.
-            assert!(
-                !create.composer.open,
-                "the composer is still open after the draft was released \
-                 (publishing: {wipe_by_publishing})"
-            );
-            assert!(
-                create.composer.plan.text.is_empty(),
-                "the body of the Send is still in the composer after the draft was let go \
-                 (publishing: {wipe_by_publishing})"
-            );
-            assert!(
-                create.composer.plan.password.is_none(),
-                "the share password is still in the composer after the draft was let go \
-                 (publishing: {wipe_by_publishing})"
-            );
-
-            // 2. And its buffers reached the allocator wiped.
-            assert!(
-                !leaked,
-                "the draft handed the body of the Send or the share password back to the \
-                 allocator in the clear when it was let go (publishing: {wipe_by_publishing})"
-            );
-        }
-    }
 }
 
 #[cfg(test)]
