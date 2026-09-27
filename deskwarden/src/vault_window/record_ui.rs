@@ -331,6 +331,12 @@ pub struct RecordDraft {
     /// which is a secret about the vault -- except the share password, which
     /// is a `Zeroizing` inside the plan and dies with the draft.
     pub access: SendPlan,
+    /// Who the Send is for, as typed or picked -- filed in `sent_history`
+    /// under the Send it makes. Not secret; see that module.
+    pub recipient: String,
+    /// A suggestion whose forget mark was pressed this frame, for the window
+    /// to confirm and act on. Taken by the window.
+    pub forget: Option<String>,
 }
 
 impl Default for RecordDraft {
@@ -353,6 +359,8 @@ impl Default for RecordDraft {
             // opens on exactly this state, and the design's caption says so:
             // "the password is off until you say so".
             access: SendPlan::default(),
+            recipient: String::new(),
+            forget: None,
         }
     }
 }
@@ -1180,6 +1188,8 @@ pub fn draw_export_form(
     // Preferences' "Use advanced sharing". Off, the card sends the whole
     // record and draws one line saying so; on, it draws 5a's ticks.
     advanced: bool,
+    // Who this user has sent to before, for the Recipient row's suggestions.
+    history: &crate::sent_history::SentHistory,
     in_flight: bool,
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
@@ -1344,6 +1354,11 @@ pub fn draw_export_form(
                 now,
                 zone,
             );
+            if let super::send_ui::RecipientAnswer::Forget(email) =
+                super::send_ui::draw_recipient_row(ui, &mut draft.recipient, history, enabled)
+            {
+                draft.forget = Some(email);
+            }
         });
 
         let problem = export_problem(draft, now);
@@ -1775,6 +1790,7 @@ pub fn draw_export_modal(
     item: Option<&crate::vault_bridge::VaultItem>,
     folder: Option<&str>,
     advanced: bool,
+    history: &crate::sent_history::SentHistory,
     in_flight: bool,
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
@@ -1795,12 +1811,85 @@ pub fn draw_export_modal(
                 item,
                 folder,
                 advanced,
+                history,
                 in_flight,
                 now,
                 zone,
             )
         })
         .inner
+}
+
+/// **Forgetting a person who still holds shares is asked first.** The owner:
+/// "if records shared - we ask like these are shared, deleting will remove all
+/// shares yes\no".
+pub fn forget_title(email: &str) -> String {
+    format!("Forget {email}?")
+}
+
+/// Names the records, so the answer is given knowing what goes.
+pub fn forget_body(names: &[String]) -> String {
+    let listed = match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    };
+    let noun = if names.len() == 1 { "record is" } else { "records are" };
+    format!(
+        "{} {noun} shared with this person: {listed}. Deleting them removes all these shares; \
+         the links stop working at once.",
+        names.len()
+    )
+}
+
+/// The destructive answer, with its count.
+pub fn forget_confirm_label(count: usize) -> String {
+    format!("Yes, delete {count} share{}", if count == 1 { "" } else { "s" })
+}
+
+/// The safe answer.
+pub const FORGET_KEEP: &str = "No";
+
+/// What [`draw_forget_confirm`] was answered with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetAnswer {
+    DeleteShares,
+    Keep,
+}
+
+/// The confirmation, over a scrim, as this window's other confirmations are
+/// drawn (`detail_edit::draw_discard_confirm`). `No` answers Escape.
+pub fn draw_forget_confirm(ctx: &egui::Context, email: &str, names: &[String]) -> Option<ForgetAnswer> {
+    let mut answer = None;
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-forget-scrim")));
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-forget-modal"))).show(ctx, |ui| {
+        theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
+        egui::Frame::new()
+            .fill(theme::CARD)
+            .corner_radius(CornerRadius::same(10))
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .inner_margin(egui::Margin::same(20))
+            .show(ui, |ui| {
+                ui.set_width(380.0);
+                ui.label(theme::bold(&forget_title(email), 15.0).color(theme::INK));
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(forget_body(names)).size(12.0).color(theme::TEXT_SECONDARY));
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    if theme::destructive_button(ui, &forget_confirm_label(names.len())).clicked() {
+                        answer = Some(ForgetAnswer::DeleteShares);
+                    }
+                    ui.add_space(theme::FORM_FOOTER_GAP);
+                    if theme::secondary_button(ui, FORGET_KEEP).clicked() {
+                        answer = Some(ForgetAnswer::Keep);
+                    }
+                });
+            });
+    });
+    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = Some(ForgetAnswer::Keep);
+    }
+    answer
 }
 
 // ---------------------------------------------------------------------------
@@ -2737,6 +2826,7 @@ mod paint_tests {
                 Some(&item),
                 Some("Engineering"),
                 false,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &crate::send::FixedClock(0),
                 &crate::local_time::FixedOffset(0),
@@ -2775,6 +2865,25 @@ mod paint_tests {
         narrow.password = false;
         narrow.notes = false;
         assert_eq!(fields_travelling(&narrow, &item, true), [USERNAME_LABEL, WEBSITES_LABEL, TOTP_LABEL]);
+    }
+
+    /// **The confirmation names what goes, and counts it.** The owner: "we
+    /// ask like these are shared, deleting will remove all shares yes\no".
+    #[test]
+    fn forgetting_someone_with_shares_says_which_and_how_many() {
+        assert_eq!(forget_title("m.reyes@ledgerline.com"), "Forget m.reyes@ledgerline.com?");
+        let two = ["SAP Production".to_string(), "Postgres Prod".to_string()];
+        assert_eq!(
+            forget_body(&two),
+            "2 records are shared with this person: SAP Production and Postgres Prod. \
+             Deleting them removes all these shares; the links stop working at once."
+        );
+        assert!(forget_body(&two[..1]).starts_with("1 record is shared with this person: SAP Production."));
+        let three = ["A".to_string(), "B".to_string(), "C".to_string()];
+        assert!(forget_body(&three).contains("A, B and C."));
+        assert_eq!(forget_confirm_label(1), "Yes, delete 1 share");
+        assert_eq!(forget_confirm_label(2), "Yes, delete 2 shares");
+        assert_eq!(super::super::send_ui::sent_count_words(3), "3 sent");
     }
 
     /// **The pills are what the item has.** A record without a password
@@ -2820,6 +2929,7 @@ mod paint_tests {
                 Some(&item),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2844,6 +2954,7 @@ mod paint_tests {
                 Some(&item),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2950,6 +3061,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3022,6 +3134,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3044,6 +3157,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3091,6 +3205,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3147,6 +3262,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3205,6 +3321,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3332,6 +3449,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3389,19 +3507,19 @@ mod paint_tests {
         assert_eq!(draft.access.password, None, "a frame put a password on the Send");
         assert_eq!(draft.access.max_access_count, None, "a frame capped the Send");
 
-        // And §5a's three unbuildable rows are not on the card under any
-        // label. A control that cannot do what it says is the one thing this
-        // block must not grow, and the three are named here so that adding
-        // one reds a test rather than shipping.
-        for absent in [
-            "Recipient",
-            "Only this address can open it",
-            "Tell me when it is opened",
-        ] {
+        // **Recipient IS on the card now, and as what it is.** The owner
+        // asked for it: "if sent once - we should save the email\recepient
+        // and suggest those from the list next time". It is kept on this PC
+        // in `sent_history` and locks nothing -- which is why §5a's two
+        // toggles beneath it stay absent: each claims the link does something
+        // a Bitwarden Send does not, and adding one reds this test rather
+        // than shipping.
+        assert!(painted.has(super::super::send_ui::RECIPIENT_LABEL), "{:?}", painted.text);
+        for absent in ["Only this address can open it", "Tell me when it is opened"] {
             assert!(
                 !painted.has(absent),
                 "{absent:?} is drawn on the composer, and there is no server behind it -- see \
-                 `send_ui::draw_access_block` on why all three are absences and not to-dos"
+                 `send_ui::draw_access_block` on why these are absences and not to-dos"
             );
         }
     }
@@ -3443,6 +3561,7 @@ mod paint_tests {
                 Some(&a_login()),
                 Some("Engineering"),
                 true,
+                &crate::sent_history::SentHistory::default(),
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3787,6 +3906,7 @@ mod paint_tests {
                     Some(&a_login()),
                     Some("Engineering"),
                     true,
+                    &crate::sent_history::SentHistory::default(),
                     false,
                     &FixedClock(NOW),
                     &UTC,
@@ -3831,6 +3951,7 @@ mod paint_tests {
                     Some(&a_login()),
                     Some("Engineering"),
                     true,
+                    &crate::sent_history::SentHistory::default(),
                     in_flight,
                     &FixedClock(NOW),
                     &UTC,

@@ -2971,6 +2971,7 @@ impl Preview {
                         Some("Engineering"),
                         // The default: the whole record, not the ticks.
                         false,
+                        &deskwarden::sent_history::SentHistory::default(),
                         false,
                         &send::FixedClock(PREVIEW_MILLIS),
                         &PREVIEW_ZONE,

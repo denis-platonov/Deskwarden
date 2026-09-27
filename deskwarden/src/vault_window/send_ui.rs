@@ -983,6 +983,15 @@ pub fn revoke_from_the_read_pane(id: String, name: String) -> SendUiVerdict {
     SendUiVerdict::seal(SendUiAction::SetDisabled { id, name, disabled: true })
 }
 
+/// **One share of a person being forgotten, deleted.** The owner confirmed
+/// it ("deleting will remove all shares yes\no"), so this is the confirmed
+/// delete itself -- the same action the Sends screen's confirmation sends --
+/// sealed like every verdict so it reaches the frame's one
+/// `apply_send_action` rather than a second call beside it.
+pub fn delete_for_forgetting(id: String, name: String) -> SendUiVerdict {
+    SendUiVerdict::seal(SendUiAction::ConfirmDelete { id, name })
+}
+
 impl SendUiVerdict {
     /// Mints a verdict. Private on purpose: only this module decides what the
     /// Sends pane reported.
@@ -3978,6 +3987,156 @@ fn access_row<R>(
         body(ui)
     })
     .inner
+}
+
+/// The Recipient row's label, 5a's own word.
+pub const RECIPIENT_LABEL: &str = "Recipient";
+/// What the empty box says. Optional, and it says so: a Send needs no
+/// recipient, and naming one only files the Send under that person.
+pub const RECIPIENT_HINT: &str = "Who it is for (optional)";
+/// The eyebrow over the suggestions.
+pub const SUGGESTIONS_EYEBROW: &str = "SENT TO BEFORE";
+/// The forget mark at the end of each suggestion.
+pub const FORGET_MARK: &str = "\u{00D7}";
+
+/// A suggestion's hover wash, rounded inside the list's own 9pt corner.
+const SUGGESTION_ROW_RADIUS: CornerRadius = CornerRadius::same(6);
+
+/// How many Sends this file holds for a person, beside their address.
+pub fn sent_count_words(count: usize) -> String {
+    format!("{count} sent")
+}
+
+/// What the Recipient row reports: nothing, or that a suggestion's
+/// [`FORGET_MARK`] was pressed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipientAnswer {
+    Nothing,
+    Forget(String),
+}
+
+/// **5a's Recipient row, and the people sent to before.**
+///
+/// The owner: "if sent once - we should save the email\recepient and suggest
+/// those from the list next time, person can also click x in the list to
+/// delete a person". A box in the Access block's label column; while it has
+/// focus -- or the pointer is over the list, so a click on a suggestion is
+/// not lost to the box giving up focus on the press -- the people in
+/// `crate::sent_history` whose address contains what is typed, most recently
+/// sent first. A click fills the box; [`FORGET_MARK`] asks to forget the
+/// person, which the window confirms first when they still hold shares.
+///
+/// It is a label kept on this PC, not a lock on the link: see
+/// `crate::sent_history`.
+pub fn draw_recipient_row(
+    ui: &mut egui::Ui,
+    recipient: &mut String,
+    history: &crate::sent_history::SentHistory,
+    enabled: bool,
+) -> RecipientAnswer {
+    let mut answer = RecipientAnswer::Nothing;
+    let label_width = access_label_width(ui);
+    ui.add_space(ACCESS_ROW_SPACING);
+    let field = access_row(ui, RECIPIENT_LABEL, label_width, enabled, |ui| {
+        let width = ui.available_width();
+        ui.add_enabled_ui(enabled, |ui| theme::inline_field(ui, recipient, RECIPIENT_HINT, width, false))
+            .inner
+    });
+
+    let popup_id = egui::Id::new("record-recipient-suggestions");
+    let last: Option<egui::Rect> = ui.data(|d| d.get_temp(popup_id));
+    let pointer_in = last.is_some_and(|rect| {
+        ui.input(|i| i.pointer.hover_pos().is_some_and(|at| rect.contains(at)))
+    });
+    let people = history.suggestions(recipient);
+    if !(enabled && !people.is_empty() && (field.has_focus() || pointer_in)) {
+        ui.data_mut(|d| d.remove::<egui::Rect>(popup_id));
+        return answer;
+    }
+    let width = field.rect.width();
+    let shown = egui::Area::new(popup_id)
+        .order(egui::Order::Foreground)
+        .fixed_pos(field.rect.left_bottom() + egui::vec2(0.0, 4.0))
+        .show(ui.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(theme::CARD)
+                .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                .corner_radius(CornerRadius::same(9))
+                .inner_margin(Margin::same(5))
+                .shadow(egui::Shadow {
+                    offset: [0, 10],
+                    blur: 24,
+                    spread: 0,
+                    color: egui::Color32::from_black_alpha(40),
+                })
+                .show(ui, |ui| {
+                    let inner = (width - 10.0).max(120.0);
+                    ui.set_width(inner);
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 2.0);
+                    ui.add_space(3.0);
+                    ui.horizontal(|ui| {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(SUGGESTIONS_EYEBROW)
+                                .size(10.0)
+                                .strong()
+                                .color(theme::TEXT_GHOST),
+                        );
+                    });
+                    ui.add_space(3.0);
+                    for person in &people {
+                        let (row, pressed) =
+                            ui.allocate_exact_size(egui::vec2(inner, 30.0), egui::Sense::click());
+                        let mark = egui::Rect::from_min_size(
+                            egui::pos2(row.right() - 26.0, row.top()),
+                            egui::vec2(26.0, row.height()),
+                        );
+                        let forget = ui.interact(
+                            mark,
+                            popup_id.with(&person.email).with("forget"),
+                            egui::Sense::click(),
+                        );
+                        let p = ui.painter();
+                        if pressed.hovered() || forget.hovered() {
+                            p.rect_filled(row, SUGGESTION_ROW_RADIUS, theme::BLUE_WASH);
+                        }
+                        let text_left = row.left() + 8.0;
+                        let count = p.text(
+                            egui::pos2(mark.left() - 6.0, row.center().y),
+                            egui::Align2::RIGHT_CENTER,
+                            sent_count_words(person.send_ids.len()),
+                            egui::FontId::new(11.0, egui::FontFamily::Proportional),
+                            theme::TEXT_FAINT,
+                        );
+                        let email = elided(
+                            p,
+                            &person.email,
+                            egui::FontId::new(13.0, egui::FontFamily::Proportional),
+                            theme::INK,
+                            (count.left() - 10.0 - text_left).max(0.0),
+                        );
+                        p.galley(egui::pos2(text_left, row.center().y - email.size().y / 2.0), email, theme::INK);
+                        p.text(
+                            mark.center(),
+                            egui::Align2::CENTER_CENTER,
+                            FORGET_MARK,
+                            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+                            if forget.hovered() { theme::ERROR } else { theme::TEXT_FAINT },
+                        );
+                        if forget.hovered() || pressed.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        if forget.clicked() {
+                            answer = RecipientAnswer::Forget(person.email.clone());
+                        } else if pressed.clicked() {
+                            *recipient = person.email.clone();
+                            ui.memory_mut(|m| m.surrender_focus(field.id));
+                        }
+                    }
+                });
+        });
+    ui.data_mut(|d| d.insert_temp(popup_id, shown.response.rect));
+    answer
 }
 
 /// **Design §5a's `ACCESS` block, and the one copy of it this app has.**

@@ -1167,6 +1167,15 @@ pub fn build_frame_with_search(
     // the server answers with the new Send's id, which is what the entry is
     // filed under. A failed create drops it.
     let mut pending_sent: Option<crate::sent_history::SentRecord> = None;
+    // **A person being forgotten.** `forget_ask` is the confirmation on
+    // screen -- the person and the shares that would go with them;
+    // `forgetting` is the answer being carried out, one Send deletion at a
+    // time through the very action the Revoke button starts, and the person
+    // forgotten only once every one of those deletions came back. A deletion
+    // that fails stops it with the person kept, and its failure is reported
+    // where every revoke's is.
+    let mut forget_ask: Option<(String, Vec<(String, String)>)> = None;
+    let mut forgetting: Option<(String, Vec<(String, String)>)> = None;
     // The `u64` is the `SendFetch` generation the fetch was started under, so
     // an answer to a question the user has since navigated away from can be
     // told apart from an answer to the current one. See
@@ -6235,9 +6244,23 @@ pub fn build_frame_with_search(
                 // `apply_send_action` call would be the shape
                 // `the_frame_applies_the_sends_action_unconditionally` exists
                 // to forbid.
-                match revoke_asked {
-                    Some((id, name)) => send_ui::revoke_from_the_read_pane(id, name),
-                    None => send_ui::no_sends_screen_this_frame(),
+                // **The next share of a person being forgotten**, handed over
+                // only in a frame where nothing else asked for a revoke and no
+                // deletion is out -- so a click on the SHARING card can never
+                // cost the queue a share, and one deletion runs at a time. A
+                // deletion that failed stops the queue; see `forgetting`.
+                let forget_next = if revoke_asked.is_none()
+                    && send_delete.in_flight.is_none()
+                    && !matches!(send_delete.report, Some(SendDeleteReport::Failed { .. }))
+                {
+                    forgetting.as_mut().and_then(|(_, queue)| queue.pop())
+                } else {
+                    None
+                };
+                match (revoke_asked, forget_next) {
+                    (Some((id, name)), _) => send_ui::revoke_from_the_read_pane(id, name),
+                    (None, Some((id, name))) => send_ui::delete_for_forgetting(id, name),
+                    (None, None) => send_ui::no_sends_screen_this_frame(),
                 }
             })
             .inner
@@ -6618,16 +6641,47 @@ pub fn build_frame_with_search(
                 .borrow()
                 .as_ref()
                 .map_or(advanced_sharing_at_open, |settings| settings.advanced_sharing);
-            match record_ui::draw_export_modal(
+            let answer = record_ui::draw_export_modal(
                 ui.ctx(),
                 state,
                 sent_item,
                 sent_folder,
                 advanced_sharing,
+                &sent_history,
                 send_create.in_flight,
                 &crate::send::SystemClock,
                 &crate::local_time::SystemZone,
-            ) {
+            );
+            // **A suggestion's forget mark.** A person with no shares still
+            // on the server is forgotten at once; one with shares is asked
+            // about first. "Still on the server" is the Sends list when this
+            // window has one, and every Send filed for them when it has not.
+            if let Some(email) = state.draft.forget.take() {
+                let listed: Option<Vec<String>> = match &send_fetch.result {
+                    Some(Ok(rows)) => Some(rows.iter().map(|row| row.id.clone()).collect()),
+                    _ => None,
+                };
+                let shares: Vec<(String, String)> = sent_history
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.recipient.trim().eq_ignore_ascii_case(email.trim()))
+                    .filter(|entry| listed.as_ref().is_none_or(|ids| ids.contains(&entry.send_id)))
+                    .map(|entry| (entry.send_id.clone(), entry.name.clone()))
+                    .collect();
+                if shares.is_empty() {
+                    sent_history.forget(&email);
+                    if let Some(path) = sent_history_path.as_deref() {
+                        if let Err(e) = crate::sent_history::update(path, |h| {
+                            h.forget(&email);
+                        }) {
+                            log::warn!("a person could not be forgotten in the sent history: {e:?}");
+                        }
+                    }
+                } else {
+                    forget_ask = Some((email, shares));
+                }
+            }
+            match answer {
                 record_ui::RecordUiAction::SubmitExport => {
                     // **The Access block's three answers, TAKEN out of the
                     // draft rather than copied out of it.** One of the three
@@ -6667,7 +6721,7 @@ pub fn build_frame_with_search(
                                     &crate::send::SystemClock,
                                 ),
                                 send_id: String::new(),
-                                recipient: String::new(),
+                                recipient: state.draft.recipient.trim().to_string(),
                                 item_id: item.id.clone(),
                                 name: item.name.clone(),
                                 fields: record_ui::fields_travelling(
@@ -6737,6 +6791,43 @@ pub fn build_frame_with_search(
         // form four hundred lines above does exactly the same thing. A second
         // threading model for one of the two writes would be two ways to
         // create an item.
+        // The confirmation, and then the deletions, one at a time.
+        if let Some((email, shares)) = &forget_ask {
+            let names: Vec<String> = shares.iter().map(|(_, name)| name.clone()).collect();
+            match record_ui::draw_forget_confirm(ui.ctx(), email, &names) {
+                Some(record_ui::ForgetAnswer::DeleteShares) => {
+                    forgetting = forget_ask.take();
+                    send_delete.report = None;
+                }
+                Some(record_ui::ForgetAnswer::Keep) => forget_ask = None,
+                None => {}
+            }
+        }
+        // The deletions themselves go out through the frame's one
+        // `apply_send_action`, where the next share is handed over (see
+        // `delete_for_forgetting`). What is decided here is how it ends: a
+        // failure stops it with the person kept, and an empty queue with
+        // nothing out is every share gone, so the person is forgotten.
+        if let Some((email, queue)) = &mut forgetting {
+            if send_delete.in_flight.is_none() {
+                if matches!(send_delete.report, Some(SendDeleteReport::Failed { .. })) {
+                    log::warn!("a share could not be deleted, so its person is kept in the sent history");
+                    forgetting = None;
+                } else if queue.is_empty() {
+                    let email = email.clone();
+                    sent_history.forget(&email);
+                    if let Some(path) = sent_history_path.as_deref() {
+                        if let Err(e) = crate::sent_history::update(path, |h| {
+                            h.forget(&email);
+                        }) {
+                            log::warn!("a person could not be forgotten in the sent history: {e:?}");
+                        }
+                    }
+                    forgetting = None;
+                }
+            }
+        }
+
         if let Some(state) = &mut record_import {
             // Asked fresh every frame, from the items this frame holds. The
             // vault can be re-read between the fetch and the press, so a
