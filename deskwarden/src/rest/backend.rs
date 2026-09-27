@@ -431,43 +431,23 @@ impl RestBackend {
     ///   not a profile, a profile with no `key` in it: each of those says the
     ///   server lacks this cheap question, and answering it with "your key is
     ///   stale" would delete a working credential and ask for the master
-    ///   password on every launch. So those fall back to the probe this
-    ///   replaced -- one [`Self::synced`] -- and its answer is the verdict.
-    ///   The fallback costs what the probe always cost; only a server that
-    ///   has the route saves anything.
+    ///   password on every launch. So those fall back to a sync, which
+    ///   carries the same profile, and its answer is the verdict. The
+    ///   fallback costs what the probe always cost; only a server that has
+    ///   the route saves anything.
+    ///
+    /// **This is [`Self::keys_only`], and deliberately nothing else.** The
+    /// write paths ask the same question -- "the keys, without the vault" --
+    /// under the same fallback rule, and two copies of which refusals are
+    /// about the route would be two lists that could come to disagree about
+    /// whether a `404` deletes a stored key.
     ///
     /// # Errors
     ///
     /// Whatever the profile (or, on the fallback, the sync) was refused
     /// with, mapped as every other call in this file maps it.
     pub fn verify_stored_login(&self) -> Result<(), VaultError> {
-        let mut state = self.locked();
-        let profile = match self.client.profile(&mut state.session) {
-            Ok(profile) if profile.key.is_some() => profile,
-            Ok(_) | Err(RestError::Status(404 | 405 | 501) | RestError::Parse(_)) => {
-                drop(state);
-                log::info!(
-                    "this server did not answer the profile route with a wrapped key, so the \
-                     stored login is checked by reading the vault instead"
-                );
-                return self
-                    .synced("the stored-login check, on a server without a profile route")
-                    .map(|_| ());
-            }
-            Err(e) => return Err(rest_error(e)),
-        };
-        let (keys, failures) =
-            VaultKeys::unwrap_from(&state.master_key, &profile).map_err(crypto_error)?;
-        if !failures.is_empty() {
-            log::warn!(
-                "{} organisation key(s) on this account could not be unwrapped: {failures:?}",
-                failures.len()
-            );
-        }
-        // Released before the keys' own lock, as everywhere in this file.
-        drop(state);
-        let _ = self.remember_keys(keys);
-        Ok(())
+        self.keys_only().map(|_| ())
     }
 
     // ---- the two things every method starts with ---------------------------
@@ -484,40 +464,58 @@ impl RestBackend {
         self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// **The keys alone**, from a `GET /api/sync` and without decrypting a
-    /// single cipher.
+    /// **The keys alone**, from `GET /api/accounts/profile` -- and from a
+    /// `GET /api/sync` only on a server that does not answer that route.
     ///
-    /// [`VaultKeys::unwrap_from`] needs `response.profile` and nothing else,
-    /// so the three write paths that want a key and no items -- a folder
-    /// create, a folder rename, an item create -- were paying a whole-vault
-    /// decrypt (every field of every cipher, under every organisation key)
-    /// and then dropping the result on the floor. The round trip is the same;
-    /// what this saves is the CPU and the plaintexts that were briefly built
-    /// for nobody.
+    /// [`VaultKeys::unwrap_from`] needs a profile and nothing else, so the
+    /// write paths that want a key and no items -- a folder create, a folder
+    /// rename, an item create, and [`Self::one_record`]'s first read before
+    /// any vault has been listed -- were paying a whole-vault decrypt, and
+    /// then, once that decrypt was taken out, still a whole-vault DOWNLOAD:
+    /// the server cannot tell a sync wanted for its profile from any other,
+    /// so every item create cost the ~1,700 rows of the account's ciphers on
+    /// the owner's D1-backed server, to read one wrapped key. The profile
+    /// route is that key and nothing else; see
+    /// [`crate::rest::api::RestClient::profile`].
+    ///
+    /// # The fallback, and why it is the same rule as the probe's
+    ///
+    /// A `404`, `405` or `501`, a body that is not a profile, or a profile
+    /// with no `key`, is a server without the cheap question -- not an
+    /// answer about the key. Those take the sync this always took, and that
+    /// sync is logged as the whole-vault read it is. Anything else -- a dead
+    /// session, a transport failure -- is the answer, and is returned: the
+    /// sync would only have met it again at a thousand times the price.
     ///
     /// [`Self::synced`] is still what a *vault load* needs; an **edit** wants
     /// neither, and goes through [`Self::one_record`].
     ///
-    /// Every sync that unwraps a key stores it in [`Self::keys`] on the way
-    /// past, which is what makes the one-record path free after a vault has
-    /// been listed once. See that field for why a stored key cannot go stale
-    /// unnoticed.
+    /// Every key unwrapped here is stored in [`Self::keys`] on the way past,
+    /// which is what makes the one-record path free after it. See that field
+    /// for why a stored key cannot go stale unnoticed.
     fn keys_only(&self) -> Result<Arc<VaultKeys>, VaultError> {
         let mut state = self.locked();
-        let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
-        // The server cannot tell this sync from any other, so it costs the
-        // same rows and is logged beside `synced`'s -- see that line.
-        log::info!(
-            "whole-vault read: GET /api/sync for the vault keys alone, {} cipher(s) fetched and \
-             not decrypted",
-            response.ciphers.len()
-        );
-        let profile = response
-            .profile
-            .as_ref()
-            .ok_or_else(|| VaultError::Parse("the sync payload carries no profile".to_string()))?;
+        let profile = match self.client.profile(&mut state.session) {
+            Ok(profile) if profile.key.is_some() => profile,
+            Ok(_) | Err(RestError::Status(404 | 405 | 501) | RestError::Parse(_)) => {
+                let response =
+                    self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
+                // The server cannot tell this sync from any other, so it costs
+                // the same rows and is logged beside `synced`'s -- see that line.
+                log::info!(
+                    "whole-vault read: GET /api/sync for the vault keys alone, {} cipher(s) \
+                     fetched and not decrypted, because this server did not answer the profile \
+                     route with a wrapped key",
+                    response.ciphers.len()
+                );
+                response.profile.ok_or_else(|| {
+                    VaultError::Parse("the sync payload carries no profile".to_string())
+                })?
+            }
+            Err(e) => return Err(rest_error(e)),
+        };
         let (keys, failures) =
-            VaultKeys::unwrap_from(&state.master_key, profile).map_err(crypto_error)?;
+            VaultKeys::unwrap_from(&state.master_key, &profile).map_err(crypto_error)?;
         if !failures.is_empty() {
             log::warn!(
                 "{} organisation key(s) on this account could not be unwrapped: {failures:?}",
@@ -744,7 +742,8 @@ impl RestBackend {
 
         log::info!(
             "the cached vault keys did not open item {id} cleanly, so they are being re-derived \
-             from a fresh sync; an organisation joined since the last one reads exactly like this"
+             from a fresh profile; an organisation joined since they were taken reads exactly \
+             like this"
         );
         let fresh = self.keys_only()?;
         let (record, failures) =
@@ -2906,7 +2905,10 @@ pub mod tests {
     /// This is `app::fill_from_vault` on a cold process: nothing has loaded a
     /// vault, so nothing has unwrapped a key, and a single-cipher response
     /// carries no `profile` to unwrap one from. The first read therefore pays
-    /// for a sync it cannot avoid. **The assertion is that it pays exactly
+    /// for the keys -- here, on a fixture server with no profile route, by
+    /// the sync `keys_only` falls back to (the profile route's own cost is
+    /// `an_item_create_reads_its_keys_off_the_profile_and_syncs_nothing`).
+    /// **The assertion is that it pays exactly
     /// once**, which is what says the keys were kept rather than re-fetched
     /// per record -- the defect that would make this change worthless while
     /// looking like it worked.
@@ -3362,6 +3364,70 @@ pub mod tests {
             .create_item(&NewItem::login("Made here", "u@example.com", "p4ssw0rd", None))
             .expect("the create lands");
         post.assert();
+        assert_eq!(created.id, "brand-new");
+    }
+
+    /// **An item create costs no sync at all**, on a server with the profile
+    /// route.
+    ///
+    /// The key it encrypts under used to come off a whole `GET /api/sync`
+    /// (`keys_only`) -- every cipher on the account downloaded to read one
+    /// wrapped key, once per create. `expect(0)` on the sync route and
+    /// `expect(1)` on the profile route are the assertion; the id read back
+    /// is there so a create that never happened cannot pass by making no
+    /// requests.
+    #[test]
+    fn an_item_create_reads_its_keys_off_the_profile_and_syncs_nothing() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let profile = server
+            .mock("GET", "/api/accounts/profile")
+            .with_body(profile_body())
+            .expect(1)
+            .create();
+        let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
+        let post = server
+            .mock("POST", "/api/ciphers")
+            .with_body(cipher("brand-new", "Made here", &serde_json::json!({})).to_string())
+            .expect(1)
+            .create();
+
+        let created = backend
+            .create_item(&NewItem::login("Made here", "u@example.com", "p4ssw0rd", None))
+            .expect("the create lands");
+
+        profile.assert();
+        sync.assert();
+        post.assert();
+        assert_eq!(created.id, "brand-new");
+    }
+
+    /// **A server without the profile route still creates**, off the sync
+    /// it always paid -- one, and no more.
+    ///
+    /// The fallback is what keeps the cheap route from being a regression: a
+    /// `404` there says nothing about the login, and a create that failed
+    /// over it would be an app that cannot add an item on that server.
+    #[test]
+    fn an_item_create_on_a_server_without_the_profile_route_falls_back_to_one_sync() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let profile = server.mock("GET", "/api/accounts/profile").with_status(404).expect(1).create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        server
+            .mock("POST", "/api/ciphers")
+            .with_body(cipher("brand-new", "Made here", &serde_json::json!({})).to_string())
+            .expect(1)
+            .create();
+
+        let created = backend
+            .create_item(&NewItem::login("Made here", "u@example.com", "p4ssw0rd", None))
+            .expect("the create lands on the fallback's keys");
+
+        profile.assert();
+        sync.assert();
         assert_eq!(created.id, "brand-new");
     }
 
