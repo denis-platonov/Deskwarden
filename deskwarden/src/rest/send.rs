@@ -424,6 +424,63 @@ pub fn set_disabled(
     }
 }
 
+// ---- pushing a Send's dates out ---------------------------------------------
+
+/// One server row, as the body that writes it back with its dates moved by
+/// [`crate::send::extend_dates`] -- and the new deletion instant, for the
+/// caller to check the server's echo against.
+///
+/// **[`disabled_from_row`] does the writing**, handed the row with its dates
+/// already moved and its own `disabled` flag unchanged. Every rule that
+/// function's doc argues -- the stored password hash never echoed, e-mail
+/// gating left alone, the server's counter not stated, the key and the type
+/// copied -- is a rule about writing a Send back whole, and an Extend is a
+/// Send written back whole. A second mapper would be a second place to keep
+/// them.
+///
+/// # Errors
+///
+/// [`crate::send::extend_dates`]'s refusals, and [`disabled_from_row`]'s.
+pub fn extended_from_row(
+    row: &Value,
+    now: &dyn SendClock,
+) -> Result<(MappedSendUpdate, i64), SendError> {
+    let mut moved = row.clone();
+    let asked = crate::send::extend_dates(&mut moved, now)?;
+    let disabled = row.get("disabled").and_then(Value::as_bool).unwrap_or(false);
+    Ok((disabled_from_row(&moved, disabled)?, asked))
+}
+
+/// Pushes one Send's dates out by [`crate::send::EXTEND_BY_DAYS`].
+///
+/// [`set_disabled`]'s shape and its reasons: **no vault key and no
+/// `/api/sync`** -- nothing is encrypted or decrypted, only copied, with two
+/// dates moved -- a read and a write both [`Ambiguity::Safe`], and **the
+/// answer is checked**: the server's echoed deletion date must be the one
+/// asked for ([`crate::send::extend_confirmed`]), because a `200` on a request
+/// that did not take would otherwise be reported as a link that now lasts
+/// longer.
+pub fn extend(
+    client: &RestClient,
+    session: &mut Session,
+    id: &str,
+    now: &dyn SendClock,
+) -> Result<(), SendError> {
+    let row = client.fetch_send(session, id).map_err(|e| map_error(e, Ambiguity::Safe))?;
+    let (update, asked) = extended_from_row(&row, now)?;
+    let answer =
+        client.update_send(session, id, &update).map_err(|e| map_error(e, Ambiguity::Safe))?;
+    if crate::send::extend_confirmed(&answer, asked) {
+        Ok(())
+    } else {
+        Err(SendError::Rejected(
+            "Bitwarden accepted the change but did not confirm the new date. Check your Sends \
+             list before trying again."
+                .to_string(),
+        ))
+    }
+}
+
 /// `pub` for the same reason [`crate::rest::crypto::tests`] is: `rest::api`
 /// needs a `MappedSend` fixture, and a `MappedSend` has no constructor but
 /// [`encrypt_plan`] -- which is the whole point of the type. Sharing the
@@ -512,23 +569,22 @@ pub fn delete_on_active_account(id: &str) -> Result<(), SendError> {
     delete(&client, &mut authenticated.session, id)
 }
 
-/// Turns one Send's link off, or back on. **No sync and no key**, on
-/// [`delete_on_active_account`]'s terms exactly -- see [`set_disabled`].
+/// Pushes one Send's dates out. **No sync and no key**, on
+/// [`delete_on_active_account`]'s terms exactly -- see [`extend`].
 ///
-/// The fourth of these, and it is wired now: `vault_window`'s
-/// `backend_tasks::BackendTasks::send_set_disabled` is its one caller, and
-/// `send_ui::source_pins::the_switch_is_the_built_in_clients_and_the_cli_refuses_it_in_words`
+/// `vault_window`'s `backend_tasks::BackendTasks::send_extend` is its one
+/// caller, and
+/// `send_ui::source_pins::extend_is_one_worker_verb_and_one_door_on_each_backend`
 /// is what keeps it to one.
 ///
-/// The question this doc used to leave open -- what the `bw serve` arm should
-/// answer, given that `bw send` has no verb for `disabled` at all -- was
-/// settled where it belonged, on that trait: the CLI arm returns a
-/// [`SendError::Rejected`] naming the alternative, because a control that
-/// vanished on one backend would leave a user who had used it on the other
-/// hunting for it.
-pub fn set_disabled_on_active_account(id: &str, disabled: bool) -> Result<(), SendError> {
+/// **It took the place of the switch's entry point**, which turned a link
+/// off and back on. Revoke deletes now, so nothing in the window reached the
+/// switch; [`set_disabled`] itself stays, because [`disabled_from_row`] is
+/// the writer an Extend goes through and `rest::api`'s own tests drive the
+/// read-then-write route through it.
+pub fn extend_on_active_account(id: &str, now: &dyn SendClock) -> Result<(), SendError> {
     let (client, mut authenticated) = active_account()?;
-    set_disabled(&client, &mut authenticated.session, id, disabled)
+    extend(&client, &mut authenticated.session, id, now)
 }
 
 // ---- receiving a Send from a link -------------------------------------------
@@ -1080,6 +1136,57 @@ pub mod tests {
         row["disabled"] = json!(true);
         let body = disabled_from_row(&row, false).expect("the row maps").body().clone();
         assert_eq!(body["disabled"], json!(false), "the argument does not reach the body");
+    }
+
+    // ---- pushing a Send's dates out ------------------------------------------
+
+    /// **An Extend is the whole row written back with two dates moved a
+    /// week**, through the disable's own writer -- so every rule that writer
+    /// keeps (the stored hash never echoed, the key and the type copied) is
+    /// kept here too, and `disabled` is whatever the row already said.
+    #[test]
+    fn an_extend_writes_the_row_back_with_only_its_two_dates_moved() {
+        let keys = keys();
+        let row = full_row(&keys);
+        let (update, asked) = extended_from_row(&row, &NOW).expect("the row maps");
+        let body = update.body().clone();
+
+        // To the second: `send::parse_iso_utc_millis` reads a wire date to
+        // the second, so the row's `.148` is not carried into the new date.
+        assert_eq!(body["deletionDate"], json!("2026-09-13T00:43:17.000Z"), "not a week later");
+        assert_eq!(body["expirationDate"], json!("2026-09-12T00:00:00.000Z"), "not a week later");
+        assert_eq!(
+            Some(asked),
+            crate::send::parse_iso_utc_millis("2026-09-13T00:43:17.000Z"),
+            "the instant handed back is not the one written"
+        );
+        for field in ["type", "name", "notes", "key", "text", "file", "maxAccessCount", "hideEmail", "disabled"] {
+            assert_eq!(body[field], row[field], "`{field}` did not survive the Extend");
+        }
+        assert_eq!(body["password"], Value::Null, "`password` must be an explicit null");
+        assert!(
+            !serde_json::to_string(&body).expect("serializable").contains("STORED-PBKDF2-HASH"),
+            "an Extend echoed the stored password hash"
+        );
+
+        // A Send switched off elsewhere stays switched off.
+        let mut off = full_row(&keys);
+        off["disabled"] = json!(true);
+        let (update, _) = extended_from_row(&off, &NOW).expect("the row maps");
+        assert_eq!(update.body()["disabled"], json!(true), "an Extend switched a link back on");
+    }
+
+    /// A deletion date this client cannot read is not one it may move: the
+    /// row is refused, not re-dated from a guess.
+    #[test]
+    fn an_extend_refuses_a_row_whose_date_it_cannot_read() {
+        let keys = keys();
+        let mut row = full_row(&keys);
+        row["deletionDate"] = json!("sometime next week");
+        assert!(
+            matches!(extended_from_row(&row, &NOW), Err(SendError::Rejected(_))),
+            "a row with an unreadable deletion date was written back anyway"
+        );
     }
 
     /// **A transport failure on a create is ambiguous.** The request may have

@@ -580,12 +580,18 @@ fn utc_parts(millis: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
 /// it is [`NEVER_DELETION_DATE`] verbatim, for the reason that constant gives.
 pub(crate) fn deletion_date(lifetime: SendLifetime, now: &dyn SendClock) -> String {
     match deletion_instant(lifetime, now) {
-        Some(at) => {
-            let (y, mo, d, h, mi, s, ms) = utc_parts(at);
-            format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
-        }
+        Some(at) => wire_instant(at),
         None => NEVER_DELETION_DATE.to_string(),
     }
+}
+
+/// One UTC instant in the shape `bw send template` emits and both backends
+/// store: `2026-08-18T00:43:17.148Z`. [`deletion_date`] and [`extend_dates`]
+/// both write through it, so a created Send and an extended one carry their
+/// dates in the same bytes.
+fn wire_instant(at: i64) -> String {
+    let (y, mo, d, h, mi, s, ms) = utc_parts(at);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{ms:03}Z")
 }
 
 /// The UTC instant a lifetime resolves to, or `None` for
@@ -1147,6 +1153,34 @@ fn delete_invocation(id: &str, session: Option<&str>) -> SendInvocation {
     SendInvocation {
         args: vec!["send".to_string(), "delete".to_string(), id.to_string()],
         stdin_json_b64: Zeroizing::new(String::new()),
+        session_token: session.map(|s| Zeroizing::new(s.to_string())),
+        send_password: None,
+        args_carry_access_url: false,
+    }
+}
+
+/// The invocation that reads one Send back whole -- the first half of an
+/// Extend. Same privacy, same reason: the id is all that reaches argv.
+fn get_invocation(id: &str, session: Option<&str>) -> SendInvocation {
+    SendInvocation {
+        args: vec!["send".to_string(), "get".to_string(), id.to_string()],
+        stdin_json_b64: Zeroizing::new(String::new()),
+        session_token: session.map(|s| Zeroizing::new(s.to_string())),
+        send_password: None,
+        args_carry_access_url: false,
+    }
+}
+
+/// The invocation that writes one Send back -- the second half of an Extend.
+///
+/// **The Send travels on stdin and never in argv**, exactly as a create's
+/// plan does: `bw send edit` reads its `encodedJson` from stdin when the
+/// argument is left off, and the object it is handed carries the Send's text
+/// and its key. So argv is the two literal words `send edit`, for every Send.
+fn edit_invocation(body_b64: Zeroizing<String>, session: Option<&str>) -> SendInvocation {
+    SendInvocation {
+        args: vec!["send".to_string(), "edit".to_string()],
+        stdin_json_b64: body_b64,
         session_token: session.map(|s| Zeroizing::new(s.to_string())),
         send_password: None,
         args_carry_access_url: false,
@@ -1895,6 +1929,193 @@ pub fn delete_send<R: SendRunner>(runner: &R, id: &str) -> Result<(), SendError>
 }
 
 // ---------------------------------------------------------------------------
+// Extend: a Send's dates, pushed out
+// ---------------------------------------------------------------------------
+
+/// **How far one press of Extend pushes a Send's dates out: a week.**
+///
+/// Design 5b draws an `Extend` button and says nothing about how far it goes.
+/// Seven days is [`DEFAULT_LIFETIME`]'s own week, so an extended Send gets
+/// what a new one would have been given. One constant, read by both backends
+/// and by the button's hover text, so the words and the arithmetic cannot
+/// drift apart.
+pub const EXTEND_BY_DAYS: i64 = 7;
+
+/// What an Extend says when the Send came back without the date it was
+/// asked to carry. The change may well have been made -- which is why the
+/// window refetches the list after every Extend, whatever it reports.
+const EXTEND_UNCONFIRMED: &str = "Bitwarden accepted the change but did not confirm the new \
+                                  date. Check your Sends list before trying again.";
+
+/// Moves one Send's `deletionDate` -- and its `expirationDate`, when it has
+/// one -- [`EXTEND_BY_DAYS`] later, in place, on the object `bw send get` or
+/// `GET /api/sends/{id}` returned. Both spell the two fields the same way, so
+/// both backends move them with this one function. Answers the new deletion
+/// instant, which is what the caller checks the server's echo against.
+///
+/// **`pub(crate)`**, for [`deletion_date`]'s reason: [`crate::rest::send`]
+/// extends through it too, and two copies of this arithmetic are two answers
+/// to "when does the link die now".
+///
+/// # From the later of the date and now
+///
+/// A date that has already gone by is pushed out from NOW, not from itself:
+/// a link that stopped working yesterday, extended by a week from yesterday,
+/// would get six days where the button promised seven -- and one that
+/// stopped a month ago would be "extended" to a date still in the past, which
+/// the server refuses.
+///
+/// # What is left alone
+///
+/// A Send with no expiry of its own keeps having none: Extend moves a limit,
+/// it does not invent one. A deletion date of [`NEVER_DELETION_DATE`] stays
+/// exactly that, and no date is ever pushed past it. An expiry is never
+/// pushed past the new deletion date, because the link cannot outlive the
+/// Send. Nothing else in the object is touched; both callers write it back
+/// whole.
+///
+/// # Errors
+///
+/// [`SendError::Rejected`] when the object is not a Send, when its deletion
+/// date is missing or unreadable, or when it has an expiry this app cannot
+/// read. A date this app cannot read is not a date it may move --
+/// `send_ui::expiry_words`' rule for reading one, applied to a write.
+pub(crate) fn extend_dates(
+    send: &mut serde_json::Value,
+    now: &dyn SendClock,
+) -> Result<i64, SendError> {
+    let now = now.now_unix_millis();
+    let by = EXTEND_BY_DAYS * crate::local_time::MILLIS_PER_DAY;
+    let never = parse_iso_utc_millis(NEVER_DELETION_DATE).unwrap_or(i64::MAX);
+    let pushed = |at: i64| {
+        if at >= never {
+            never
+        } else {
+            at.max(now).saturating_add(by).min(never)
+        }
+    };
+    let on_the_wire = |at: i64| {
+        if at >= never {
+            NEVER_DELETION_DATE.to_string()
+        } else {
+            wire_instant(at)
+        }
+    };
+    let unreadable = |what: &str| {
+        SendError::Rejected(format!("This Send's {what} could not be read, so nothing was changed."))
+    };
+
+    let object = send.as_object_mut().ok_or_else(|| {
+        SendError::Rejected("Bitwarden's answer was not a Send, so nothing was changed.".to_string())
+    })?;
+    let deletion = object
+        .get("deletionDate")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_iso_utc_millis)
+        .ok_or_else(|| unreadable("deletion date"))?;
+    let expiration = match object.get("expirationDate") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(text)) if text.is_empty() => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(parse_iso_utc_millis)
+                .ok_or_else(|| unreadable("expiry date"))?,
+        ),
+    };
+
+    let new_deletion = pushed(deletion);
+    object.insert("deletionDate".to_string(), on_the_wire(new_deletion).into());
+    if let Some(at) = expiration {
+        object.insert(
+            "expirationDate".to_string(),
+            on_the_wire(pushed(at).min(new_deletion)).into(),
+        );
+    }
+    Ok(new_deletion)
+}
+
+/// Whether an answer's `deletionDate` is the one an Extend asked for.
+///
+/// **To the second, not to the millisecond.** A server is free to store a
+/// date at a coarser grain than it was sent at, and one that rounded the
+/// milliseconds away has still done what it was asked; one that kept the old
+/// date, or none, has not.
+pub(crate) fn extend_confirmed(answer: &serde_json::Value, asked: i64) -> bool {
+    answer
+        .get("deletionDate")
+        .and_then(serde_json::Value::as_str)
+        .and_then(parse_iso_utc_millis)
+        .is_some_and(|echoed| (echoed - asked).abs() < 1_000)
+}
+
+/// Extends one Send: `bw send get`, its dates moved by [`extend_dates`], and
+/// `bw send edit` with the whole object back.
+///
+/// **Private**, for [`receive_send`]'s reason: the whole of what a caller
+/// wants is [`cli_send_extend`], and this module's own tests are the ones
+/// that drive it against a substituted runner.
+///
+/// # Why the whole Send goes back
+///
+/// `bw send edit` rebuilds the Send from the object it is handed, so an object
+/// carrying only the two dates would ask it to blank everything else. The
+/// object is the one `bw send get` has just printed, so every field this app
+/// does not touch goes back as the CLI gave it -- which is what the web
+/// vault's own edit does.
+///
+/// # The Send's text passes through this process
+///
+/// `bw send get` prints the Send decrypted, text and key included, because
+/// that is the shape `bw send edit` takes back. The two captured outputs, the
+/// JSON and its base64 are all `Zeroizing`; the parsed `serde_json::Value`
+/// between them is not and cannot be -- `serde_json` allocates its own
+/// strings -- and that is the one residual here, the same one
+/// `record::payload::read_json` carries for a received Send. It lives for
+/// this one call, and none of it reaches argv or a log: the body goes to the
+/// child on stdin, as a create's does.
+///
+/// # The new date is checked, not assumed
+///
+/// `bw send edit` prints the Send it saved, and its deletion date must be the
+/// one asked for ([`extend_confirmed`]). A clean exit over an answer that
+/// says otherwise is `rest::send::set_disabled`'s case -- a status that does
+/// not carry the claim -- and it is reported as a refusal rather than as a
+/// Send that now lasts longer.
+fn extend_send<R: SendRunner>(runner: &R, id: &str, now: &dyn SendClock) -> Result<(), SendError> {
+    let unreadable =
+        || SendError::Rejected("This Send could not be read back, so nothing was changed.".to_string());
+
+    let raw = runner.run(&get_invocation(id, runner.session()))?;
+    if raw.exit_code != Some(0) {
+        return Err(classify_failure(raw.exit_code, &raw.stdout, &raw.stderr));
+    }
+    let read = Zeroizing::new(raw.stdout);
+    let mut send = unwrap_envelope(serde_json::from_str(read.trim()).map_err(|_| unreadable())?);
+    drop(read);
+    let asked = extend_dates(&mut send, now)?;
+    let json = Zeroizing::new(serde_json::to_string(&send).map_err(|_| unreadable())?);
+    drop(send);
+    let mut body = Zeroizing::new(String::with_capacity(4 * (json.len() / 3 + 2)));
+    base64_into(&mut body, json.as_bytes());
+    drop(json);
+
+    let raw = runner.run(&edit_invocation(body, runner.session()))?;
+    if raw.exit_code != Some(0) {
+        return Err(classify_failure(raw.exit_code, &raw.stdout, &raw.stderr));
+    }
+    let saved = Zeroizing::new(raw.stdout);
+    let confirmed = serde_json::from_str::<serde_json::Value>(saved.trim())
+        .map(unwrap_envelope)
+        .is_ok_and(|answer| extend_confirmed(&answer, asked));
+    if confirmed {
+        Ok(())
+    } else {
+        Err(SendError::Rejected(EXTEND_UNCONFIRMED.to_string()))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The real runner: one `bw` child per invocation
 // ---------------------------------------------------------------------------
 
@@ -2495,6 +2716,40 @@ pub fn cli_send_receive(
     password: Option<&str>,
 ) -> Result<Zeroizing<String>, SendError> {
     receive_send(&CliSendRunner::new(job, data_dir), url, password)
+}
+
+/// **The one `pub` route out of this module into a real `bw send get` and
+/// `bw send edit`** -- an Extend, and the fifth of the family
+/// [`cli_send_list`] belongs to.
+///
+/// Everything [`cli_send_list`]'s doc says about the privacy wall applies here
+/// unchanged and is not repeated. **Adding this door was not optional**, for
+/// [`cli_send_receive`]'s reason exactly: [`extend_send`] needs a
+/// [`SendRunner`], there is no `pub` implementation of that trait in this
+/// crate, and the alternative to one new door was making the runner nameable
+/// from outside -- which is the wall itself.
+///
+/// **With the session, like a delete.** Both halves are authenticated: `bw
+/// send get` decrypts the Send with the vault's key and `bw send edit`
+/// re-encrypts it. The session reaches both children in `BW_SESSION` and
+/// never in argv, and the Send itself reaches `bw send edit` on stdin --
+/// `CliSendRunner::build_command` decides both, for every invocation this
+/// module has.
+///
+/// **It blocks for up to twice [`SEND_TIMEOUT`]** -- two children, one after
+/// the other -- and it must never be called from the eframe frame closure.
+/// Its one caller is the CLI implementation of `backend_tasks::BackendTasks`,
+/// reached from the Sends worker thread, and
+/// `send_ui::source_pins::extend_is_one_worker_verb_and_one_door_on_each_backend`
+/// counts it there and nowhere else.
+pub fn cli_send_extend(
+    job: Option<&crate::job_object::KillOnCloseJob>,
+    data_dir: Option<&Path>,
+    session: &str,
+    id: &str,
+    now: &dyn SendClock,
+) -> Result<(), SendError> {
+    extend_send(&CliSendRunner::with_session(job, data_dir, session), id, now)
 }
 
 // ---------------------------------------------------------------------------
@@ -4741,6 +4996,191 @@ mod tests {
             stderr: "You are not logged in.".to_string(),
         });
         assert_eq!(delete_send(&runner, "the-id"), Err(SendError::Locked));
+    }
+
+    // -- 5b. Extend --------------------------------------------------------
+
+    /// A runner that answers each invocation with the next scripted output
+    /// and holds a session, as `CliSendRunner::with_session` does -- so what
+    /// an Extend hands each child is read off the invocations it really built.
+    struct ScriptedRunner {
+        seen: RefCell<Vec<SendInvocation>>,
+        answers: RefCell<std::collections::VecDeque<RawOutput>>,
+    }
+
+    impl ScriptedRunner {
+        fn answering(answers: Vec<RawOutput>) -> Self {
+            Self { seen: RefCell::new(Vec::new()), answers: RefCell::new(answers.into()) }
+        }
+    }
+
+    impl SendRunner for ScriptedRunner {
+        fn run(&self, inv: &SendInvocation) -> Result<RawOutput, SendError> {
+            self.seen.borrow_mut().push(inv.clone());
+            self.answers.borrow_mut().pop_front().ok_or(SendError::FailedSilently)
+        }
+        fn session(&self) -> Option<&str> {
+            Some(EXTEND_SESSION)
+        }
+    }
+
+    const EXTEND_SESSION: &str = "THE-VAULT-SESSION";
+    /// 2026-08-10T00:00:00Z.
+    const EXTEND_NOW: FixedClock = FixedClock(1_786_320_000_000);
+    const SEND_TEXT: &str = "the-secret-the-send-carries";
+    const SEND_KEY: &str = "c2VuZC1rZXktYnl0ZXM";
+
+    /// `bw send get` for a live Send with an expiry of its own. **Constructed,
+    /// not captured**, on `CREATED_JSON`'s terms: the field names are `bw`'s,
+    /// the values invented.
+    fn got_json() -> String {
+        format!(
+            r#"{{"object":"send","id":"the-id","accessId":"acc","accessUrl":"https://send.example/#/acc/{SEND_KEY}","name":"Wi-Fi password","notes":null,"key":"{SEND_KEY}","type":0,"text":{{"text":"{SEND_TEXT}","hidden":false}},"file":null,"maxAccessCount":null,"accessCount":1,"revisionDate":"2026-08-09T00:00:00.000Z","deletionDate":"2026-08-20T00:00:00.000Z","expirationDate":"2026-08-17T00:00:00.000Z","password":null,"passwordSet":false,"disabled":false,"hideEmail":false}}"#
+        )
+    }
+
+    fn exited(code: i32, stdout: &str) -> RawOutput {
+        RawOutput { exit_code: Some(code), stdout: stdout.to_string(), stderr: String::new() }
+    }
+
+    /// **An Extend reads the Send back, moves its two dates a week, and writes
+    /// the whole Send back -- on stdin, with the session off argv.**
+    ///
+    /// Everything is read off the invocations the runner was handed. The
+    /// dates are the assertion that the Extend happened; the text and the key
+    /// surviving are the assertion that it happened to the Send and did not
+    /// blank it; and the argv sweep is the one that matters most, because the
+    /// body of an edit is the Send decrypted.
+    #[test]
+    fn an_extend_reads_the_send_moves_its_dates_and_writes_it_back_whole() {
+        let runner = ScriptedRunner::answering(vec![
+            exited(0, &got_json()),
+            exited(0, r#"{"object":"send","id":"the-id","deletionDate":"2026-08-27T00:00:00.000Z"}"#),
+        ]);
+        extend_send(&runner, "the-id", &EXTEND_NOW).expect("a confirmed Extend is a success");
+
+        let seen = runner.seen.borrow();
+        assert_eq!(seen.len(), 2, "an Extend is one read and one write");
+        assert_eq!(seen[0].args(), ["send", "get", "the-id"]);
+        assert_eq!(seen[0].stdin_json_b64(), "", "the read sends nothing on stdin");
+        assert_eq!(seen[1].args(), ["send", "edit"], "the write names nothing but its verb");
+        for inv in seen.iter() {
+            assert_eq!(inv.session_token(), Some(EXTEND_SESSION), "{inv:?} carries no session");
+        }
+
+        let body: serde_json::Value =
+            serde_json::from_slice(&b64_decode(seen[1].stdin_json_b64())).expect("the body is JSON");
+        assert_eq!(body["deletionDate"], "2026-08-27T00:00:00.000Z", "the deletion date did not move a week");
+        assert_eq!(body["expirationDate"], "2026-08-24T00:00:00.000Z", "the expiry did not move a week");
+        assert_eq!(body["text"]["text"], SEND_TEXT, "the Send's text did not go back, so the edit blanks it");
+        assert_eq!(body["key"], SEND_KEY, "the Send's key did not go back");
+        assert_eq!(body["id"], "the-id");
+        assert_eq!(body["name"], "Wi-Fi password");
+
+        for inv in seen.iter() {
+            for arg in inv.args() {
+                for secret in [SEND_TEXT, SEND_KEY, EXTEND_SESSION] {
+                    assert!(!arg.contains(secret), "{secret:?} reached argv in {arg:?}");
+                }
+            }
+        }
+    }
+
+    /// **Nothing is written back over a Send that could not be read.** A read
+    /// that failed is the CLI's own failure, classified as every other one,
+    /// and there is no second child.
+    #[test]
+    fn an_extend_that_cannot_read_the_send_writes_nothing() {
+        let runner = ScriptedRunner::answering(vec![RawOutput {
+            exit_code: Some(1),
+            stdout: String::new(),
+            stderr: "You are not logged in.".to_string(),
+        }]);
+        assert_eq!(extend_send(&runner, "the-id", &EXTEND_NOW), Err(SendError::Locked));
+        assert_eq!(runner.seen.borrow().len(), 1, "an Extend wrote back a Send it could not read");
+    }
+
+    /// **A clean exit that does not carry the new date is not an Extend.**
+    /// Both shapes -- the old date echoed, and no date at all -- are driven.
+    #[test]
+    fn an_extend_the_cli_did_not_confirm_is_not_reported_as_done() {
+        for answer in [got_json(), "{}".to_string(), "not json".to_string()] {
+            let runner = ScriptedRunner::answering(vec![exited(0, &got_json()), exited(0, &answer)]);
+            assert_eq!(
+                extend_send(&runner, "the-id", &EXTEND_NOW),
+                Err(SendError::Rejected(EXTEND_UNCONFIRMED.to_string())),
+                "an answer of {answer:?} was taken as a Send that now lasts longer"
+            );
+        }
+        // Control: the date asked for, to the second, is a confirmation even
+        // when the server dropped the milliseconds.
+        let runner = ScriptedRunner::answering(vec![
+            exited(0, &got_json()),
+            exited(0, r#"{"deletionDate":"2026-08-27T00:00:00Z"}"#),
+        ]);
+        assert_eq!(extend_send(&runner, "the-id", &EXTEND_NOW), Ok(()));
+    }
+
+    /// A JSON value from its text -- the fixtures here are written as the
+    /// CLI prints them, and the `json` macro is not on the list of macros
+    /// this file may invoke (see `job_object`'s RULE 7c).
+    fn obj(text: &str) -> serde_json::Value {
+        serde_json::from_str(text).expect("the fixture is JSON")
+    }
+
+    /// **The date rules, one by one**: a past date moves from now, "never"
+    /// stays never, a Send with no expiry keeps having none, an expiry never
+    /// outlives the Send, and a date this app cannot read is not moved.
+    #[test]
+    fn extend_dates_moves_what_it_can_read_and_nothing_else() {
+        let week = EXTEND_BY_DAYS * crate::local_time::MILLIS_PER_DAY;
+        let now = EXTEND_NOW.now_unix_millis();
+
+        // Already gone by: pushed from now, not from itself.
+        let mut send = obj(r#"{"deletionDate":"2026-08-01T00:00:00.000Z"}"#);
+        let asked = extend_dates(&mut send, &EXTEND_NOW).expect("readable");
+        assert_eq!(asked, now + week);
+        assert_eq!(send["deletionDate"], "2026-08-17T00:00:00.000Z");
+        assert!(send.get("expirationDate").is_none(), "an expiry was invented");
+
+        // Null and empty expiries stay what they were.
+        for none in ["null", r#""""#] {
+            let mut send = obj(&format!(
+                r#"{{"deletionDate":"2026-08-20T00:00:00.000Z","expirationDate":{none}}}"#
+            ));
+            extend_dates(&mut send, &EXTEND_NOW).expect("readable");
+            assert_eq!(send["expirationDate"], obj(none));
+        }
+
+        // "Never" is never, and nothing is pushed past it.
+        let mut send = obj(&format!(
+            r#"{{"deletionDate":"{NEVER_DELETION_DATE}","expirationDate":"2026-08-17T00:00:00.000Z"}}"#
+        ));
+        extend_dates(&mut send, &EXTEND_NOW).expect("readable");
+        assert_eq!(send["deletionDate"], NEVER_DELETION_DATE);
+        assert_eq!(send["expirationDate"], "2026-08-24T00:00:00.000Z");
+
+        // An expiry never outlives the Send it belongs to.
+        let mut send =
+            obj(r#"{"deletionDate":"2026-08-12T00:00:00.000Z","expirationDate":"2026-08-15T00:00:00.000Z"}"#);
+        extend_dates(&mut send, &EXTEND_NOW).expect("readable");
+        assert_eq!(send["deletionDate"], "2026-08-19T00:00:00.000Z");
+        assert_eq!(send["expirationDate"], "2026-08-19T00:00:00.000Z");
+
+        // Unreadable dates are refused, and the object is left alone.
+        for bad in [
+            obj("{}"),
+            obj(r#"{"deletionDate":"next week"}"#),
+            obj(r#"{"deletionDate":"2026-08-20T00:00:00.000Z","expirationDate":7}"#),
+            obj(r#""not a Send""#),
+        ] {
+            let mut send = bad.clone();
+            assert!(
+                matches!(extend_dates(&mut send, &EXTEND_NOW), Err(SendError::Rejected(_))),
+                "{bad:?} was extended anyway"
+            );
+            assert_eq!(send, bad, "a refused Extend still changed {bad:?}");
+        }
     }
 
     // -- 6. the parsers ----------------------------------------------------

@@ -10067,6 +10067,12 @@ mod backend_tasks {
         /// here that switched a link off and kept the Send; Revoke deletes
         /// now, so nothing reached it and it went.
         fn send_delete(&self, id: &str, name: &str) -> SendDeleteReport;
+        /// **Design 5b's Extend**: this Send's dates, a week later. Both
+        /// implementations read the Send back whole, move its dates with
+        /// `send::extend_dates` and write it back whole -- `bw send get` and
+        /// `bw send edit` on one, `GET` and `PUT /api/sends/{id}` on the other
+        /// -- and both check that the new date came back.
+        fn send_extend(&self, id: &str, name: &str) -> SendDeleteReport;
         fn send_receive(&self, link: &str) -> RecordImportReport;
     }
 
@@ -10176,6 +10182,13 @@ mod backend_tasks {
             match crate::rest::send::delete_on_active_account(id) {
                 Ok(()) => SendDeleteReport::Deleted { name: name.to_string() },
                 Err(error) => SendDeleteReport::Failed { name: name.to_string(), error },
+            }
+        }
+
+        fn send_extend(&self, id: &str, name: &str) -> SendDeleteReport {
+            match crate::rest::send::extend_on_active_account(id, &crate::send::SystemClock) {
+                Ok(()) => SendDeleteReport::Extended { name: name.to_string() },
+                Err(error) => SendDeleteReport::ExtendFailed { name: name.to_string(), error },
             }
         }
 
@@ -10318,6 +10331,25 @@ mod backend_tasks {
                     name: name.to_string(),
                     error,
                 },
+            }
+        }
+
+        /// Two children, `bw send get` and then `bw send edit`, in this
+        /// window's job, for the active account, with the session in their
+        /// environment and the Send on the second one's stdin -- see
+        /// `send::cli_send_extend`. The real clock is read here and nowhere
+        /// in `send.rs`, as the create's is.
+        fn send_extend(&self, id: &str, name: &str) -> SendDeleteReport {
+            let data_dir = Self::data_dir();
+            match crate::send::cli_send_extend(
+                Self::job(),
+                data_dir.as_deref(),
+                self.session(),
+                id,
+                &crate::send::SystemClock,
+            ) {
+                Ok(()) => SendDeleteReport::Extended { name: name.to_string() },
+                Err(error) => SendDeleteReport::ExtendFailed { name: name.to_string(), error },
             }
         }
 
@@ -11280,6 +11312,18 @@ enum SendDeleteReport {
         name: String,
         error: crate::send::SendError,
     },
+    /// **An Extend, which is not a revoke** and travels this channel for
+    /// `SendRowOp`'s reason: one worker, one lock, one report band. The
+    /// server confirmed the new date; the row stays and comes back with it.
+    Extended { name: String },
+    /// The Extend did not happen, or was not confirmed. A separate variant
+    /// from [`Self::Failed`] because the sentence is about a different
+    /// thing: an Extend that failed leaves a link exactly as live as it was,
+    /// and "still live" would read as a revoke gone wrong.
+    ExtendFailed {
+        name: String,
+        error: crate::send::SendError,
+    },
 }
 
 impl SendDeleteReport {
@@ -11299,6 +11343,12 @@ impl SendDeleteReport {
         match self {
             SendDeleteReport::Deleted { .. } => true,
             SendDeleteReport::Failed { error, .. } => error.is_ambiguous(),
+            // **Every Extend refetches, whatever it reports.** The point of
+            // pressing it is the new date, and the list is where the date
+            // is shown. A failure refetches too: the one that reads "did not
+            // confirm" is a change that may well have been made, and the
+            // list is what can say so.
+            SendDeleteReport::Extended { .. } | SendDeleteReport::ExtendFailed { .. } => true,
         }
     }
 }
@@ -11326,9 +11376,10 @@ enum DeleteTone {
 /// passed, so the link may be down and may not be. Rendering that as a
 /// success is this app telling the user a public link is gone when it may be
 /// live -- the revoke-side form of the one lie the export mapping must not
-/// tell either. Every arm is compared pairwise by
+/// tell either. Every revoke arm is compared pairwise by
 /// `send_delete_wiring::every_delete_outcome_says_something_different`, and
-/// exactly one of them is [`DeleteTone::Good`].
+/// exactly one of them is [`DeleteTone::Good`]; an Extend's two are held by
+/// `send_delete_wiring::an_extend_says_how_long_and_never_that_a_link_was_revoked`.
 fn send_delete_message(report: &SendDeleteReport) -> (DeleteTone, String) {
     match report {
         SendDeleteReport::Deleted { name } => (
@@ -11347,6 +11398,24 @@ fn send_delete_message(report: &SendDeleteReport) -> (DeleteTone, String) {
             DeleteTone::Bad,
             format!(
                 "\u{201c}{name}\u{201d} was not revoked and its link is still live. {}",
+                error.user_message()
+            ),
+        ),
+        // **An Extend's two, which never say "revoked" and never say "still
+        // live".** Neither is a claim an Extend is in a position to make: it
+        // did not touch whether the link works, only for how long.
+        SendDeleteReport::Extended { name } => (
+            DeleteTone::Good,
+            format!(
+                "\u{201c}{name}\u{201d} now lasts {} more days. The list shows its new dates.",
+                crate::send::EXTEND_BY_DAYS
+            ),
+        ),
+        SendDeleteReport::ExtendFailed { name, error } => (
+            DeleteTone::Bad,
+            format!(
+                "\u{201c}{name}\u{201d} could not be extended, so its dates may be as they \
+                 were. {}",
                 error.user_message()
             ),
         ),
@@ -11431,14 +11500,20 @@ type SendDeleteSpawn =
 /// `tasks_for` call site -- and `send_ui`'s census of that call is exactly
 /// what stops this window growing a seventh hand-branch on the backend.
 ///
-/// **It used to have three verbs**, the other two switching a link off and
-/// back on. Revoke deletes now, on the Sent screen and on the record's own
-/// SHARING card alike, and nothing asked for the switch any more, so it went
-/// with its report, its sentences and its backend method.
+/// **It used to have a switch as well**, a link turned off and back on.
+/// Revoke deletes now, on the Sent screen and on the record's own SHARING
+/// card alike, and nothing asked for the switch any more, so it went with its
+/// report, its sentences and its backend method.
+///
+/// The one lock is also the mutual exclusion that matters: a Send cannot be
+/// extended while it is being deleted, or deleted while it is being extended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SendRowOp {
     /// Destroy the record. The row goes with it, and it cannot be undone.
     Delete,
+    /// Push its dates out by `send::EXTEND_BY_DAYS`. The row stays, with new
+    /// dates once the list is asked for again.
+    Extend,
 }
 
 /// The shape of "put this Send's access link on the clipboard", as a **`fn`
@@ -11479,6 +11554,11 @@ struct SendDeleteState {
     /// second `bw` child, and the pane paints no buttons at all on the row it
     /// names, so there is no control to start one from.
     in_flight: Option<String>,
+    /// Whether what `in_flight` names is an **Extend** rather than a delete.
+    /// Only the words change -- "Extending..." where a delete says
+    /// "Revoking..." -- the lock is the same one. Set by the click that
+    /// starts the work and cleared by the drain, with `in_flight`.
+    extending: bool,
     /// The last report, until the user dismisses it.
     report: Option<SendDeleteReport>,
 }
@@ -11489,6 +11569,7 @@ impl SendDeleteState {
         send_ui::SendDeleteView {
             confirming: self.confirming.as_deref(),
             in_flight: self.in_flight.as_deref(),
+            extending: self.extending,
         }
     }
 
@@ -11502,7 +11583,10 @@ impl SendDeleteState {
         send.map(|send| detail::SharedSend {
             send,
             confirming: self.confirming.as_deref() == Some(send.id.as_str()),
-            revoking: self.in_flight.as_deref() == Some(send.id.as_str()),
+            // An Extend running on this Send is not a delete, and the card
+            // has no words for one; its controls stay, and the shared lock
+            // is what refuses a delete started while it runs.
+            revoking: self.in_flight.as_deref() == Some(send.id.as_str()) && !self.extending,
         })
     }
 }
@@ -11625,6 +11709,7 @@ fn apply_send_action(
             if delete.in_flight.is_none() {
                 delete.confirming = None;
                 delete.in_flight = Some(id.clone());
+                delete.extending = false;
                 // The previous report goes with the new click, for the
                 // reason the export arm gives.
                 delete.report = None;
@@ -11641,6 +11726,24 @@ fn apply_send_action(
                     name,
                     SendRowOp::Delete,
                 );
+            }
+        }
+        // **Design 5b's Extend: the same worker, the same lock, a different
+        // verb -- and ONE step.** A confirmation exists for what cannot be
+        // undone; an Extend destroys nothing and publishes nothing new, it
+        // only lets a link the user already gave out live a week longer, so
+        // it asks nothing. What it shares with the delete is the lock:
+        // `in_flight` is the same slot, so a Send cannot be extended while it
+        // is being deleted, or twice at once.
+        send_ui::SendUiAction::Extend { id, name } => {
+            if delete.in_flight.is_none() {
+                // A confirmation standing on some Send is about a question
+                // the user has moved past, exactly as it is on a refresh.
+                delete.confirming = None;
+                delete.in_flight = Some(id.clone());
+                delete.extending = true;
+                delete.report = None;
+                spawn(ctx.clone(), tx.clone(), session.clone(), id, name, SendRowOp::Extend);
             }
         }
         // **Opening the form destroys nothing and publishes nothing.** The
@@ -11729,6 +11832,7 @@ fn drain_send_delete(
 ) {
     if let Ok(report) = rx.try_recv() {
         delete.in_flight = None;
+        delete.extending = false;
         if report.list_is_now_stale() {
             fetch.invalidate();
         }
@@ -11794,6 +11898,7 @@ mod send_delete_thread {
         let tasks = super::backend_tasks::tasks_for(Some(session));
         match op {
             SendRowOp::Delete => tasks.send_delete(id, name),
+            SendRowOp::Extend => tasks.send_extend(id, name),
         }
     }
 
@@ -35315,6 +35420,112 @@ mod send_delete_wiring {
         assert!(!delete.sharing(Some(&send)).expect("card").revoking);
     }
 
+    /// **Extend starts one operation, for the Send it names, in ONE step** --
+    /// and it is an Extend, not a delete.
+    ///
+    /// The one-step shape is the decision worth pinning, from both sides. An
+    /// Extend destroys nothing, so the mutant this exists against is the
+    /// tidy-looking one that routes it through `confirming` "for
+    /// consistency" -- a question about destroying something, asked of an
+    /// action that makes a link last longer. And the op is the assertion: an
+    /// applier that started a `SendRowOp::Delete` here would take a public
+    /// link down when the user asked for it to stay up.
+    #[test]
+    fn extending_is_one_click_and_starts_an_extend_for_the_send_it_names() {
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        delete.confirming = Some("another-send".to_string());
+        delete.report = Some(SendDeleteReport::Deleted { name: "older".to_string() });
+
+        let spawns = apply(
+            send_ui::SendUiAction::Extend {
+                id: "send-id-42".to_string(),
+                name: "quarterly numbers".to_string(),
+            },
+            &mut delete,
+            &mut fetch,
+        );
+        assert_eq!(
+            spawns,
+            vec![(
+                "send-id-42".to_string(),
+                "quarterly numbers".to_string(),
+                SESSION.to_string(),
+                SendRowOp::Extend
+            )],
+            "Extend did not start exactly one extend for the Send it names with the window's \
+             own session"
+        );
+        assert_eq!(delete.in_flight.as_deref(), Some("send-id-42"), "the Send is not marked busy");
+        assert!(delete.extending, "the busy Send would say Revoking... while it is extended");
+        assert_eq!(delete.confirming, None, "a confirmation was left standing over an Extend");
+        assert!(delete.report.is_none(), "the previous banner is still up over this one");
+    }
+
+    /// **An Extend and a revoke share one lock, deliberately**, because they
+    /// share one worker and one in-flight slot: a Send cannot be extended
+    /// while it is being deleted, or deleted while it is being extended.
+    #[test]
+    fn an_extend_and_a_revoke_cannot_run_at_the_same_time() {
+        let extend = || send_ui::SendUiAction::Extend {
+            id: "send-id-42".to_string(),
+            name: "quarterly numbers".to_string(),
+        };
+
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        assert_eq!(apply(confirm(), &mut delete, &mut fetch).len(), 1);
+        assert!(
+            apply(extend(), &mut delete, &mut fetch).is_empty(),
+            "an Extend was started while a revoke was in flight"
+        );
+        assert!(!delete.extending, "the refused Extend relabelled the running revoke");
+
+        // ...and the other way round.
+        let mut delete = SendDeleteState::default();
+        let mut fetch = send_ui::SendFetch::default();
+        assert_eq!(
+            apply(extend(), &mut delete, &mut fetch).len(),
+            1,
+            "control: the Extend started nothing, so the assertion below holds against a dead \
+             feature"
+        );
+        assert!(
+            apply(confirm(), &mut delete, &mut fetch).is_empty(),
+            "a revoke was started while an Extend was in flight"
+        );
+    }
+
+    /// **Whatever an Extend reports, the busy state ends and the list is asked
+    /// for again** -- because the new date is the whole point of pressing it,
+    /// and a failure that reads "did not confirm" may still have moved it.
+    #[test]
+    fn an_extend_report_ends_the_busy_state_and_refetches_the_list() {
+        for report in [
+            SendDeleteReport::Extended { name: "quarterly numbers".to_string() },
+            SendDeleteReport::ExtendFailed {
+                name: "quarterly numbers".to_string(),
+                error: SendError::Rejected("the server said no".to_string()),
+            },
+        ] {
+            let mut delete = SendDeleteState::default();
+            let mut fetch = send_ui::SendFetch::default();
+            delete.in_flight = Some("send-id-42".to_string());
+            delete.extending = true;
+            fetch.result = Some(Ok(Vec::new()));
+            let (tx, rx): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
+            tx.send(report.clone()).expect("the receiver is alive");
+            drain_send_delete(&rx, &mut delete, &mut fetch);
+            assert_eq!(delete.in_flight, None, "{report:?} left the Send busy");
+            assert!(!delete.extending, "{report:?} left the Extending... label armed");
+            assert!(delete.report.is_some(), "{report:?} told the user nothing");
+            assert!(
+                fetch.wants_fetch(true),
+                "{report:?} kept the old list, so the Send's new dates never appear"
+            );
+        }
+    }
+
     /// **One `bw send delete` at a time.** The pane paints no buttons on an
     /// in-flight row, so this is the second lock rather than the first --
     /// and it is the one that survives a re-layout of the pane.
@@ -36001,6 +36212,96 @@ mod send_delete_wiring {
     // The outcome mapping, and how it is painted
     // ==================================================================
 
+    /// **An Extend's first child, observed where it leaves the wiring** --
+    /// `the_revoke_child_is_spawned_into_the_job_this_window_holds`, for the
+    /// other verb this worker has.
+    ///
+    /// The probe refuses the spawn, so exactly one child is attempted: the
+    /// `bw send get` that reads the Send back. Its being refused is also what
+    /// proves the order -- nothing is written back over a Send this app could
+    /// not first read. It goes into this window's job, with the session in
+    /// its environment and only the id beside `send get` in its argv.
+    #[test]
+    fn the_extend_child_reads_the_send_in_this_windows_job_with_the_session_off_argv() {
+        let held = window_job_address().expect(
+            "this process could not create a job object at all, so the job assertion below \
+             collapses onto the `None` control and asserts nothing",
+        );
+        crate::bw_path::remember_verified_bw_exe(std::path::PathBuf::from(
+            r"C:\deskwarden-test\first\bw.exe",
+        ));
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let report = send_delete_thread::real_send_delete(
+            "send-id-42",
+            "quarterly numbers",
+            SESSION,
+            SendRowOp::Extend,
+        );
+        let attempts = probe.attempts();
+        drop(probe);
+
+        assert_eq!(
+            attempts.len(),
+            1,
+            "the Extend did not stop at its refused read: {attempts:?}"
+        );
+        assert_eq!(attempts[0].job, Some(held), "the `bw send get` child is outside this window's job");
+        assert_eq!(
+            attempts[0]
+                .args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["send".to_string(), "get".to_string(), "send-id-42".to_string()],
+            "the first child of an Extend is not a read of the Send it names"
+        );
+        assert!(
+            attempts[0].envs.iter().any(|(k, v)| k == "BW_SESSION"
+                && v.as_ref().map(|v| v == SESSION).unwrap_or(false)),
+            "the Extend's child was not given the session in its environment: {:?}",
+            attempts[0].envs
+        );
+        assert!(
+            !attempts[0].args.iter().any(|a| a.to_string_lossy().contains(SESSION)),
+            "the vault session is on the Extend child's argv: {:?}",
+            attempts[0].args
+        );
+        match &report {
+            SendDeleteReport::ExtendFailed { name, error } => {
+                assert!(
+                    error.user_message().contains(crate::job_object::spawn_probe::REFUSED),
+                    "the Extend failed for some other reason than the refused spawn: {error:?}"
+                );
+                assert_eq!(name, "quarterly numbers", "the report names the wrong Send");
+            }
+            other => panic!(
+                "the probe refused the only spawn this Extend made, yet it reported {other:?}"
+            ),
+        }
+    }
+
+    /// **A direct-REST account extends without a child**, and the REST arm
+    /// is what answered: with no credentials installed that answer is
+    /// `Locked`, reported as an Extend that failed rather than as a revoke.
+    #[test]
+    fn a_direct_rest_account_extends_without_a_child() {
+        let _installed = InstalledDirectRest::with_no_credentials();
+        let probe = crate::job_object::spawn_probe::SpawnProbe::arm();
+        let report = send_delete_thread::real_send_delete(
+            "send-id-42",
+            "quarterly numbers",
+            SESSION,
+            SendRowOp::Extend,
+        );
+        let attempts = probe.attempts();
+        drop(probe);
+        assert_eq!(attempts.len(), 0, "a direct-REST Extend spawned `bw`: {attempts:?}");
+        assert!(
+            matches!(report, SendDeleteReport::ExtendFailed { error: SendError::Locked, .. }),
+            "the REST arm was not the one that answered: {report:?}"
+        );
+    }
+
     fn every_report() -> Vec<SendDeleteReport> {
         let mut all = vec![SendDeleteReport::Deleted {
             name: "quarterly numbers".to_string(),
@@ -36092,6 +36393,48 @@ mod send_delete_wiring {
                 }
             }
         }
+    }
+
+    /// **An Extend says how long, and never that a link was revoked or is
+    /// "still live".** Neither is a claim an Extend can make: it changed for
+    /// how long the link works, not whether it does. Its success is the one
+    /// good-toned report that is not a revoke, and its failure is painted in
+    /// the error colour like every other failure on this band.
+    #[test]
+    fn an_extend_says_how_long_and_never_that_a_link_was_revoked() {
+        let done = SendDeleteReport::Extended { name: "quarterly numbers".to_string() };
+        let (tone, text) = send_delete_message(&done);
+        assert_eq!(tone, DeleteTone::Good, "a confirmed Extend reads as a failure: {text:?}");
+        assert!(text.contains("quarterly numbers"), "{text:?}");
+        assert!(
+            text.contains(&format!("{} more days", crate::send::EXTEND_BY_DAYS)),
+            "the report does not say how much longer, in the period the arithmetic used: {text:?}"
+        );
+
+        let mut failures = Vec::new();
+        for error in [SendError::Rejected("the server said no".to_string()), SendError::TimedOut] {
+            let report = SendDeleteReport::ExtendFailed { name: "quarterly numbers".to_string(), error };
+            let (tone, text) = send_delete_message(&report);
+            assert_eq!(tone, DeleteTone::Bad, "{report:?} reads as a success: {text:?}");
+            assert!(text.contains("quarterly numbers"), "{text:?}");
+            failures.push(text);
+        }
+        for text in failures.iter().chain(std::iter::once(&text)) {
+            for forbidden in ["revoked", "still live"] {
+                assert!(!text.contains(forbidden), "an Extend's report says {forbidden:?}: {text:?}");
+            }
+        }
+        // And the band paints the failure in the error ink, which is the
+        // card's own reading of the report rather than the frame's.
+        let card = painted_card(&SendDeleteReport::ExtendFailed {
+            name: "quarterly numbers".to_string(),
+            error: SendError::Offline,
+        });
+        assert!(
+            card.text_colours.iter().any(|c| *c == theme::ERROR),
+            "a failed Extend is painted like a success: {:?}",
+            card.text_colours
+        );
     }
 
     /// Colours and glyphs of one painted card.

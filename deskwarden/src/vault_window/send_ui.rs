@@ -229,6 +229,27 @@ pub struct SendRow {
     /// `Deleted` row, and the same date [`expiry`](SendRow::expiry) is worded
     /// from.
     pub deletes: String,
+    /// Whether the detail pane offers **Extend** for this Send: it has an
+    /// end this app can read and move. See [`can_extend`].
+    pub extendable: bool,
+}
+
+/// Whether a Send has an end an Extend could move: a deletion date this app
+/// can read that is not `send::NEVER_DELETION_DATE`, or an expiry of its own.
+///
+/// **A Send that lasts forever is not offered one**, rather than offered a
+/// button that changes nothing: `send::extend_dates` leaves "never" as it is,
+/// so the press would come back reading "now lasts 7 more days" over dates
+/// that did not move. A deletion date this app cannot read is not offered one
+/// either, for `extend_dates`' own rule -- it refuses to move a date it
+/// cannot read, and a button that can only fail is not a button to draw.
+pub fn can_extend(send: &SendSummary) -> bool {
+    let never = parse_iso_utc_millis(crate::send::NEVER_DELETION_DATE);
+    let Some(deletion) = parse_iso_utc_millis(&send.deletion_date) else {
+        return false;
+    };
+    let expires = !send.expiration_date.is_empty();
+    Some(deletion) != never || expires
 }
 
 /// What the pane shows this frame.
@@ -577,6 +598,7 @@ pub fn row_from(send: &SendSummary, now: &dyn SendClock, zone: &dyn LocalOffset)
         activity: activity_sentence(send, now),
         expires: date_words(&send.expiration_date, now, zone, NO_EXPIRY_OF_ITS_OWN),
         deletes: date_words(&send.deletion_date, now, zone, DELETION_DATE_UNKNOWN),
+        extendable: can_extend(send),
     }
 }
 
@@ -869,6 +891,12 @@ pub enum SendUiAction {
     /// The confirmation was declined. Its button occupies the pixels the
     /// Delete button was drawn in -- see [`draw_row`].
     CancelDelete,
+    /// **Design 5b's Extend**: push this Send's dates out by
+    /// `send::EXTEND_BY_DAYS`. One step -- it destroys nothing -- and the id
+    /// and the name travel in it for [`ConfirmDelete`](Self::ConfirmDelete)'s
+    /// reasons: read off the Send that was on screen, and named again in the
+    /// report after the list has been thrown away.
+    Extend { id: String, name: String },
     /// The header's New Send button was pressed: put the composer on screen.
     OpenComposer,
     /// The composer's Discard button was pressed: take it off screen and wipe
@@ -1099,6 +1127,21 @@ pub struct SendDeleteView<'a> {
     pub confirming: Option<&'a str>,
     /// The id of the row a `bw send delete` is running for, if any.
     pub in_flight: Option<&'a str>,
+    /// Whether the work running for `in_flight` is an **Extend** and not a
+    /// delete. The lock is the same; only the words differ.
+    pub extending: bool,
+}
+
+impl SendDeleteView<'_> {
+    /// What the Send `in_flight` names says while its work runs, in place
+    /// of its controls and of its row's subtitle.
+    fn busy_label(&self) -> &'static str {
+        if self.extending {
+            EXTENDING_LABEL
+        } else {
+            DELETING_LABEL
+        }
+    }
 }
 
 /// The detail header's **primary** control, and the one the screen is for: a
@@ -1120,6 +1163,9 @@ pub const CONFIRM_PROMPT: &str = "Revoke this link for good? It cannot be undone
 /// What a row says while its `bw send delete` is running. It has no buttons
 /// at all in that state, so a second click cannot start a second child.
 pub const DELETING_LABEL: &str = "Revoking\u{2026}";
+/// What a Send says while its Extend runs, on the same terms as
+/// [`DELETING_LABEL`]: no buttons at all in that state.
+pub const EXTENDING_LABEL: &str = "Extending\u{2026}";
 /// Design §5c's four state words, exactly as the design spells them.
 ///
 /// Public because the paint tests press on them and because the words are the
@@ -2206,7 +2252,7 @@ fn draw_row(
     // a secondary line looks like -- one step fainter, on every row, with the
     // name one weight lighter above it.
     let (second, colour) = if revoking {
-        (DELETING_LABEL, theme::TEXT_MUTED)
+        (delete.busy_label(), theme::TEXT_MUTED)
     } else {
         (row.expiry.as_str(), theme::TEXT_FAINT)
     };
@@ -2386,14 +2432,13 @@ const TAG_PAD_X: f32 = 6.0;
 /// sentence carrying the part of 5c's premise that IS derivable -- how many
 /// opens happened and what is left -- positioned where 5c put its headline.
 ///
-/// **5b's `Recipient` row and its `Extend` button** are gone for the same
-/// kind of reason and are likewise not stubbed: this client neither sets nor
-/// reads a Send's `emails`, so there is no recipient to name, and it has no
-/// edit path, so an `Extend` control would be a button that cannot do its
-/// job. The `Opens with` row takes the recipient row's place because it
-/// answers the same question the design was really asking there -- what does
-/// somebody need in order to open this -- out of a field this client does
-/// hold.
+/// **5b's `Extend` is here now, and not where 5b draws it.** It has an edit
+/// path at last -- the Send read back whole and written back whole with its
+/// dates a week later, on either backend -- so it is a button that can do
+/// its job. 5b puts it at the end of the `Expires` row; it sits in the header
+/// beside `Revoke` instead, with the Send's other actions, because that is
+/// the one row of controls this pane measures to fit at the smallest window
+/// and a button inside a card row is one it does not.
 ///
 /// **5b's `created` date** is not in `SendSummary` and is not invented. The
 /// subtitle says what kind of Send it is instead.
@@ -2671,7 +2716,7 @@ fn draw_send_card(
         ui.painter().text(
             egui::pos2(strip.left() + DETAIL_PAD_X_F, action_y + theme::ACTION_BUTTON_HEIGHT / 2.0),
             egui::Align2::LEFT_CENTER,
-            DELETING_LABEL,
+            delete.busy_label(),
             egui::FontId::new(12.0, egui::FontFamily::Proportional),
             theme::TEXT_MUTED,
         );
@@ -2691,6 +2736,16 @@ fn draw_send_card(
             x = rect.right() + BUTTON_GAP;
             rect
         });
+        // **Extend, beside Revoke and before it**: the ordinary action reads
+        // first and the one that takes something away reads last. It steps
+        // back during the confirmation for `Open record`'s reason, and keeps
+        // its slot so Cancel stays exactly where Revoke was.
+        let extend_rect = row.extendable.then(|| {
+            let w = theme::action_button_width(ui.painter(), EXTEND_LABEL, action_pad);
+            let rect = slot_at(x, w);
+            x = rect.right() + BUTTON_GAP;
+            rect
+        });
         let revoke_w = theme::action_button_width(ui.painter(), REVOKE_LABEL, action_pad);
         let revoke_rect = slot_at(x, revoke_w);
         let opened = match (&row.sent, open_rect) {
@@ -2701,6 +2756,18 @@ fn draw_send_card(
             }
             _ => None,
         };
+        let extended = match extend_rect {
+            Some(rect) if !confirming => {
+                let pressed =
+                    theme::action_button(ui, rect, EXTEND_LABEL, theme::ActionTone::Secondary)
+                        .on_hover_text(extend_hint())
+                        .clicked();
+                (pressed && has_id)
+                    .then(|| SendUiAction::Extend { id: row.id.clone(), name: row.name.clone() })
+            }
+            _ => None,
+        };
+        let opened = extended.or(opened);
         let destructive = if confirming {
             theme::action_button(ui, revoke_rect, CANCEL_LABEL, theme::ActionTone::Secondary)
                 .clicked()
@@ -3413,12 +3480,27 @@ fn elided(
 fn action_labels(row: &SendRow) -> Vec<&'static str> {
     // Design 5b's header: `Open record` beside a red `Revoke`, and `Open
     // record` only where there is a record to open.
-    let mut labels = Vec::with_capacity(2);
+    let mut labels = Vec::with_capacity(3);
     if row.sent.is_some() {
         labels.push(OPEN_RECORD_LABEL);
     }
+    if row.extendable {
+        labels.push(EXTEND_LABEL);
+    }
     labels.push(REVOKE_LABEL);
     labels
+}
+
+/// Design 5b's `Extend`: the Send's dates, `send::EXTEND_BY_DAYS` later.
+pub const EXTEND_LABEL: &str = "Extend";
+
+/// What hovering Extend says, with the period in it -- read off the same
+/// constant the arithmetic uses, so the promise and the date cannot differ.
+pub fn extend_hint() -> String {
+    format!(
+        "Keep this link working {} days longer",
+        crate::send::EXTEND_BY_DAYS
+    )
 }
 
 /// Design 5b's first header button: the vault item the Send was made from.
@@ -7217,7 +7299,7 @@ mod paint_tests {
         assert_eq!(resting.in_list(WAITING_LABEL), 1, "control: the resting row has no pill");
         assert!(!resting.has(DELETING_LABEL), "control: a resting row says it is being revoked");
 
-        let revoking = SendDeleteView { confirming: None, in_flight: Some("id0") };
+        let revoking = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: false };
         let (painted, _) = paint_with(&state, None, min_pane_size(), revoking);
         assert_eq!(
             painted.in_list(WAITING_LABEL),
@@ -7295,6 +7377,7 @@ mod paint_tests {
                 .to_string(),
             expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
             deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
+            extendable: true,
         }
     }
 
@@ -7615,6 +7698,7 @@ mod paint_tests {
                 .to_string(),
             expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
             deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
+            extendable: true,
         }]);
         let (painted, _) = paint(&state, None, min_pane_size());
         // **A Send with no link offers no Copy at all**, and says why in the
@@ -7889,7 +7973,7 @@ mod paint_tests {
     #[test]
     fn only_the_send_asked_about_shows_the_confirmation() {
         let state = rows(4);
-        let armed = SendDeleteView { confirming: Some("id2"), in_flight: None };
+        let armed = SendDeleteView { confirming: Some("id2"), in_flight: None, extending: false };
         let (painted, _) =
             paint_picking(&state, None, min_pane_size(), armed, Some("id2".to_string()));
         assert_eq!(
@@ -7969,7 +8053,7 @@ mod paint_tests {
         );
 
         // The second click, at the very same pixel, on the redrawn pane.
-        let armed = SendDeleteView { confirming: Some("id0"), in_flight: None };
+        let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
         let second = click_at_with(&state, armed, where_delete_was);
         assert_eq!(
             second,
@@ -8011,7 +8095,7 @@ mod paint_tests {
     #[test]
     fn a_send_being_revoked_has_no_buttons_and_says_so() {
         let state = rows(3);
-        let busy = SendDeleteView { confirming: None, in_flight: Some("id0") };
+        let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: false };
         let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
 
         assert_eq!(
@@ -8080,12 +8164,91 @@ mod paint_tests {
                 .to_string(),
             expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
             deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
+            extendable: true,
         }]);
         assert_eq!(
             click_nth_with(&state, SendDeleteView::default(), REVOKE_LABEL, 0),
             SendUiAction::None,
             "a row with no id asked to revoke something `bw` could not name"
         );
+    }
+
+    // ---- design 5b's Extend ------------------------------------------------
+
+    /// **Extend is on the detail header, fits at the smallest window, and
+    /// reports the Send it was pressed on in one step.** The action carries
+    /// the id and the name off the Send on screen, for `ConfirmDelete`'s
+    /// reasons, and it is `Extend` -- the mutant this exists against is a
+    /// button wired to the revoke beside it.
+    #[test]
+    fn extend_reports_the_send_it_was_pressed_on_in_one_step() {
+        let state = rows(3);
+        let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
+        assert_eq!(painted.in_detail(EXTEND_LABEL), 1, "no Extend on the detail: {:?}", painted.text);
+        assert_eq!(painted.in_list(EXTEND_LABEL), 0, "Extend leaked into the list column");
+        let at = painted.rects_of_exact(EXTEND_LABEL)[0];
+        assert!(
+            at.width() > 0.0 && at.right() <= min_pane_size().x,
+            "Extend does not fit in the detail pane at the smallest window: {at:?}"
+        );
+        assert_eq!(
+            click_nth_with(&state, SendDeleteView::default(), EXTEND_LABEL, 0),
+            SendUiAction::Extend { id: "id0".to_string(), name: "send-number-0".to_string() },
+            "Extend did not report an Extend of the Send on screen"
+        );
+    }
+
+    /// **While a revoke is being asked about, Extend steps back; while an
+    /// Extend runs, the Send says so and offers nothing.** The first is
+    /// `Open record`'s rule during the confirmation; the second is the
+    /// revoke's own busy state with its own word, so "Revoking..." is never
+    /// painted over a Send that is being made to last longer.
+    #[test]
+    fn extend_steps_back_for_the_question_and_its_busy_send_says_extending() {
+        let state = rows(3);
+        let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
+        let (asking, _) = paint_with(&state, None, min_pane_size(), armed);
+        assert_eq!(asking.count_exact(EXTEND_LABEL), 0, "Extend beside a question about destroying");
+        assert_eq!(asking.count_exact(CANCEL_LABEL), 1, "control: the question is not up");
+
+        let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: true };
+        let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
+        assert_eq!(painted.in_detail(EXTENDING_LABEL), 1, "the detail does not say: {:?}", painted.text);
+        assert_eq!(painted.in_list(EXTENDING_LABEL), 1, "the row does not say: {:?}", painted.text);
+        assert_eq!(painted.count_exact(DELETING_LABEL), 0, "an Extend is described as a revoke");
+        for label in [EXTEND_LABEL, REVOKE_LABEL, OPEN_RECORD_LABEL] {
+            assert_eq!(painted.count_exact(label), 0, "{label:?} is offered while the Extend runs");
+        }
+    }
+
+    /// **A Send that lasts forever is not offered Extend** -- the arithmetic
+    /// leaves "never" where it is, so the press would report a week that
+    /// never arrived -- and neither is one whose date this app cannot read.
+    /// One with an expiry of its own is, whatever its deletion date says.
+    #[test]
+    fn only_a_send_with_an_end_this_app_can_read_is_offered_extend() {
+        let send = |deletion: &str, expiration: &str| SendSummary {
+            id: "id0".to_string(),
+            name: "forever".to_string(),
+            access_url: "https://send.bitwarden.com/#/0".to_string(),
+            deletion_date: deletion.to_string(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: expiration.to_string(),
+            has_password: false,
+        };
+        let never = crate::send::NEVER_DELETION_DATE;
+        assert!(can_extend(&send("2026-08-17T00:00:00.000Z", "")));
+        assert!(!can_extend(&send(never, "")), "a Send with no end was offered Extend");
+        assert!(can_extend(&send(never, "2026-08-17T00:00:00.000Z")), "its expiry can move");
+        assert!(!can_extend(&send("", "")), "an unreadable date was offered Extend");
+
+        let forever = pane_state(Some(&Ok(vec![send(never, "")])), &FixedClock(NOW), &UTC);
+        let (painted, _) = paint_with(&forever, None, min_pane_size(), SendDeleteView::default());
+        assert_eq!(painted.count_exact(EXTEND_LABEL), 0, "{:?}", painted.text);
+        assert_eq!(painted.count_exact(REVOKE_LABEL), 1, "control: the detail pane is not up");
     }
 
     /// The two steps do not share a word, so the second click is a decision
@@ -8904,7 +9067,7 @@ mod paint_tests {
                 &state,
                 None,
                 size,
-                SendDeleteView { confirming: Some("id0"), in_flight: None },
+                SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false },
             );
             let delete = detail_rect(&before, REVOKE_LABEL);
             let cancel = detail_rect(&during, CANCEL_LABEL);
@@ -10673,7 +10836,8 @@ mod source_pins {
             squashed(
                 "id: &str, name: &str, session: &str, op: SendRowOp, ) -> SendDeleteReport { \
                  let tasks = super::backend_tasks::tasks_for(Some(session)); match op { \
-                 SendRowOp::Delete => tasks.send_delete(id, name), }"
+                 SendRowOp::Delete => tasks.send_delete(id, name), SendRowOp::Extend => \
+                 tasks.send_extend(id, name), }"
             ),
             "the Sends worker is no longer one backend choice followed by a branch on what \
              the row asked for. A second `tasks_for` here is a second reading of the backend \
@@ -10685,6 +10849,66 @@ mod source_pins {
             !production().contains(concat!("send_set_", "disabled")),
             "a switch is back on the Sends backend, and nothing on screen asks for one"
         );
+    }
+
+    /// **Extend is one worker verb and one door on each backend**, on
+    /// [`the_sends_worker_reads_the_backend_once_and_branches_on_the_rows_verb`]'s
+    /// terms: equalities over the two implementations, and a census of the
+    /// two doors.
+    ///
+    ///  1. **The CLI arm is one `cli_send_extend`**, in this window's job, for
+    ///     the active account, with the session and the real clock -- and a
+    ///     report of what it asked for, confirmed or not.
+    ///  2. **The built-in arm is one call to the REST client**, with the same
+    ///     clock and the same two reports.
+    ///  3. **Each door has exactly one caller.** `cli_send_extend` blocks for
+    ///     two children; a second caller is unproven ground for which thread
+    ///     it runs on. The seal that keeps `real_send_delete` off the frame
+    ///     thread holds the worker, and this holds the doors to the worker.
+    #[test]
+    fn extend_is_one_worker_verb_and_one_door_on_each_backend() {
+        assert_eq!(
+            squashed(&sanitized(&body_in(
+                &tasks_impl("impl BackendTasks for CliTasks<'_>"),
+                "send_extend",
+                "        ",
+            ))),
+            squashed(&format!(
+                "&self, id: &str, name: &str) -> SendDeleteReport {{ let data_dir = \
+                 Self::data_dir(); match crate::send::{}( Self::job(), data_dir.as_deref(), \
+                 self.session(), id, &crate::send::SystemClock, ) {{ Ok(()) => \
+                 SendDeleteReport::Extended {{ name: name.to_string() }}, Err(error) => \
+                 SendDeleteReport::ExtendFailed {{ name: name.to_string(), error }}, }}",
+                concat!("cli_send_", "extend"),
+            )),
+            "the CLI Extend is no longer exactly one `bw send get` and `bw send edit` pair, in \
+             this window's job, for the active account, reporting what it asked for"
+        );
+        assert_eq!(
+            squashed(&sanitized(&body_in(
+                &tasks_impl("impl BackendTasks for DirectRestTasks"),
+                "send_extend",
+                "        ",
+            ))),
+            squashed(&format!(
+                "&self, id: &str, name: &str) -> SendDeleteReport {{ match \
+                 crate::rest::send::{}(id, &crate::send::SystemClock) {{ Ok(()) => \
+                 SendDeleteReport::Extended {{ name: name.to_string() }}, Err(error) => \
+                 SendDeleteReport::ExtendFailed {{ name: name.to_string(), error }}, }}",
+                concat!("extend_on_active_", "account"),
+            )),
+            "the built-in Extend is no longer exactly one call to the REST client"
+        );
+        for door in [
+            concat!("crate::send::cli_send_", "extend("),
+            concat!("crate::rest::send::extend_on_active_", "account("),
+        ] {
+            assert_eq!(
+                production().matches(door).count(),
+                1,
+                "{door} is called somewhere other than its implementation of `BackendTasks`"
+            );
+        }
     }
 
     /// **`RECEIVE_NEEDS_THE_CLI` survives for the CLI and is unreachable for
@@ -11903,7 +12127,13 @@ mod source_pins {
             // `impl SendRunner for CliSendRunner<'_>` and the THREE entry
             // points -- the definitions and the three pinned constructions,
             // and no fourth.
-            (concat!("CliSendRunner", "::with_session"), 3, false, false),
+            // **And AGAIN when `cli_send_extend` landed**, on step 4's terms
+            // exactly: an Extend is authenticated at both of its halves, so
+            // its body hands a `CliSendRunner::with_session(job, data_dir,
+            // session)` to the generic extend -- one more of each. Eight is
+            // now the three definitions and the FIVE entry points, and no
+            // sixth; `CliSendRunner::new` below does not move.
+            (concat!("CliSendRunner", "::with_session"), 4, false, false),
             // **Moved by one AGAIN when `cli_send_receive` landed**, and this
             // time on the OTHER constructor, which is the whole of what makes
             // the move worth recording rather than a number that drifted: a
@@ -11913,7 +12143,7 @@ mod source_pins {
             // `pub struct CliSendRunner`, `impl<'a> CliSendRunner<'a>`,
             // `impl SendRunner for CliSendRunner<'_>` and the FOUR entry
             // points, and no fifth.
-            (concat!("CliSendRunner", ""), 7, false, false),
+            (concat!("CliSendRunner", ""), 8, false, false),
             // **One, and it was zero until the receive landed.** This row used
             // to be the whole of what refused the measured `warm_cache`
             // survivor -- a blocking `bw send list` built from the constructor
@@ -11976,6 +12206,18 @@ mod source_pins {
             (concat!("cli_send_", "receive"), 1, false, false),
             (concat!("receive_", "send"), 2, false, false),
             (concat!("receive_", "invocation"), 2, false, false),
+            // **The Extend's four, on the receive's terms.** `cli_send_extend`
+            // is its definition alone; `extend_send` is its definition plus the
+            // one call in `cli_send_extend`; `get_invocation` and
+            // `edit_invocation` are each their definition plus the one use in
+            // `extend_send`. Both builders are private, so a third mention of
+            // either is a second blocking `bw send get` or `bw send edit`
+            // written inside the privacy boundary -- and `edit_invocation` is
+            // the one that carries a whole decrypted Send on its stdin.
+            (concat!("cli_send_", "extend"), 1, false, false),
+            (concat!("extend_", "send"), 2, false, false),
+            (concat!("get_", "invocation"), 2, false, false),
+            (concat!("edit_", "invocation"), 2, false, false),
         ] {
             assert_eq!(
                 send_rs.matches(needle).count(),
@@ -12395,6 +12637,17 @@ mod source_pins {
         "send.rs: pub fn create_send<R: SendRunner>(",
         "send.rs: pub(crate) fn list_sends<R: SendRunner>(runner: &R) -> Result<Vec<SendSummary>, SendError> {",
         "send.rs: pub fn delete_send<R: SendRunner>(runner: &R, id: &str) -> Result<(), SendError> {",
+        // **Added by design 5b's Extend, deliberately, and none of the three
+        // is a door in the sense this wall guards.** The period is a number.
+        // `extend_dates` moves two date strings on a JSON object it is handed
+        // and `extend_confirmed` reads one back; both are `pub(crate)` for
+        // `deletion_date`'s reason, so `crate::rest::send` extends through the
+        // same arithmetic as the CLI path rather than a second copy of it.
+        // None reaches a runner, an invocation or a child -- the generic
+        // `extend_send` beside them is private, like `receive_send`.
+        "send.rs: pub const EXTEND_BY_DAYS: i64 = 7;",
+        "send.rs: pub(crate) fn extend_dates(",
+        "send.rs: pub(crate) fn extend_confirmed(answer: &serde_json::Value, asked: i64) -> bool {",
         "send.rs: pub const SEND_TIMEOUT: Duration = Duration::from_secs(60);",
         "send.rs: pub enum WaitDecision {",
         "send.rs: pub fn wait_decision(exited: bool, elapsed: Duration, cap: Duration) -> WaitDecision {",
@@ -12433,6 +12686,15 @@ mod source_pins {
         // `CliSendRunner::new` row in the seal above moves from 0 to 1 with
         // this commit while `CliSendRunner::with_session` does not move at all.
         "send.rs: pub fn cli_send_receive(",
+        // **Added by design 5b's Extend, deliberately**, for the four rows
+        // above's reason word for word: `extend_send` needs a `SendRunner`,
+        // there is no `pub` implementation of that trait in this crate, and
+        // the only alternative to one new door was making the runner nameable
+        // from outside -- which is the wall itself. It carries the session,
+        // like the delete and unlike the receive: both of its children are
+        // authenticated. Its one caller is sealed by
+        // `extend_is_one_worker_verb_and_one_door_on_each_backend`.
+        "send.rs: pub fn cli_send_extend(",
     ];
 
     /// **Nothing waits on the Sends channel from the frame's own thread.**
