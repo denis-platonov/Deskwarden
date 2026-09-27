@@ -10,6 +10,27 @@ hidden organisation that belongs to the sharer. The recipient gets the record
 view-only, it autofills for them, and every Bitwarden client that syncs sees
 it as an ordinary organisation item.
 
+**Owner's decisions after review (2026-09-27), which override the text
+below wherever they differ:**
+- **NodeWarden first, official servers later.** Slices 1–3 target NodeWarden
+  only. On official Bitwarden and Vaultwarden, Share is not offered yet; it
+  offers a Send instead. Official support becomes its own later slice, with
+  the limits in section 8: the user creates the org, recipients can see each
+  other's emails (the dialog warns), and invites arrive as a pasted link.
+- **Every open question in section 16 takes its recommendation.** In
+  particular:
+  - NodeWarden's direct add (no accept step) stays.
+  - For a recipient without an account, Deskwarden says so and, if the sharer
+    is the admin, mints an invite code for them.
+  - The email lookup is rate-limited.
+  - A recipient is not notified when a share stops (v1).
+  - A record moved back to the personal vault takes a new id.
+  - An emptied person collection is kept.
+  - Records with attachments that have no per-item key are refused.
+- **Mock points not yet reviewed** (subtitle wording, six header controls,
+  group labels in Shared with me): the mock's choices stand until the owner
+  says otherwise.
+
 ---
 
 ## 1. Goals and non-goals
