@@ -148,12 +148,29 @@ pub struct VaultApi {
     feed: Arc<ChangeFeed>,
     grants: Mutex<Vec<Grant>>,
     long_poll: Duration,
+    /// The server revision the copy stands at after the hub worker's last
+    /// one-record-at-a-time apply, in the era it was applied in. See
+    /// [`Self::sync`].
+    applied: Mutex<Option<(VaultEra, i64)>>,
 }
 
 impl VaultApi {
     #[must_use]
     pub fn new(cache: Arc<VaultCache>, feed: Arc<ChangeFeed>) -> Self {
-        Self { cache, feed, grants: Mutex::new(Vec::new()), long_poll: LONG_POLL }
+        Self {
+            cache,
+            feed,
+            grants: Mutex::new(Vec::new()),
+            long_poll: LONG_POLL,
+            applied: Mutex::new(None),
+        }
+    }
+
+    /// The vault this API answers out of -- for the daemon's hub worker, which
+    /// applies announcements to it.
+    #[must_use]
+    pub fn cache(&self) -> &Arc<VaultCache> {
+        &self.cache
     }
 
     /// The same API with a shorter long-poll, for a test that must not wait
@@ -284,30 +301,67 @@ impl VaultApi {
         }
     }
 
-    /// **A client asking the daemon to make sure its vault is current.**
+    /// **A client asking the daemon to make sure its vault is current** --
+    /// the Sync pill, a window's sync-on-open, its polling timer.
     ///
-    /// While the daemon's notifications hub is live, it already is: every
-    /// change the server announces has been applied to the daemon's copy
-    /// before any client hears of it, and a hub that drops and comes back is
-    /// a whole reload. So the answer is "synced" and the server is not asked
-    /// -- the same rule a window's heartbeat has always applied to its own
-    /// timer and focus syncs while its hub was live, and the one that keeps a
-    /// window opened after a day of pushes from reading the whole vault for
-    /// the revision those pushes moved.
+    /// The server IS asked, every time, and it is asked the cheap question
+    /// first: the account's revision, one row. If it names the revision the
+    /// daemon's copy stands at, the copy is current and nothing more is read.
+    /// Only a revision that moved is followed by the read that picks the
+    /// change up. Never a blind whole read.
     ///
-    /// With no live hub, the daemon re-reads -- behind the backend's revision
-    /// gate, so one row when nothing moved.
+    /// # Which revision the copy stands at
+    ///
+    /// The last whole read's, as the backend filed it -- unless the hub worker
+    /// has since applied announced changes one record at a time, which moved
+    /// the server's revision without a whole read. Then it is the revision the
+    /// worker read BEFORE applying them ([`Self::note_applied`]): never newer
+    /// than the copy, so a change landing in between is seen as a move and
+    /// read, rather than filed as already held. A whole read made here
+    /// forgets that note, because the backend's own is newer.
     fn sync(&self) -> ApiResponse {
         let synced =
             ApiResponse::ok(serde_json::json!({ "object": "message", "title": "Syncing complete." }));
-        if self.feed.is_live() && self.cache.is_populated() {
-            return synced;
+        let era = self.cache.epoch().era();
+        if self.cache.is_populated() {
+            if let Some(now) = self.cache.bridge().revision_now() {
+                let held = self
+                    .applied_in(era)
+                    .or_else(|| self.cache.bridge().revision_of_last_read());
+                if held == Some(now) {
+                    return synced;
+                }
+            }
         }
         match self.cache.populate() {
-            Ok(PopulateOutcome::Populated) => synced,
+            Ok(PopulateOutcome::Populated) => {
+                self.forget_applied();
+                synced
+            }
             Ok(PopulateOutcome::DiscardedStale) => not_ready(),
             Err(e) => failed(&e),
         }
+    }
+
+    fn applied(&self) -> std::sync::MutexGuard<'_, Option<(VaultEra, i64)>> {
+        self.applied.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn applied_in(&self, era: VaultEra) -> Option<i64> {
+        self.applied().filter(|(at, _)| *at == era).map(|(_, revision)| revision)
+    }
+
+    /// **The hub worker applied announced changes to the copy**, having read
+    /// the server's revision as `revision` just before it did. See
+    /// [`Self::sync`] for what this is read by, and why "before".
+    pub fn note_applied(&self, era: VaultEra, revision: Option<i64>) {
+        *self.applied() = revision.map(|revision| (era, revision));
+    }
+
+    /// A whole read superseded any note: the backend's own revision is the
+    /// copy's now.
+    pub fn forget_applied(&self) {
+        *self.applied() = None;
     }
 
     fn list_items(&self, query: &Query<'_>) -> ApiResponse {
@@ -531,10 +585,10 @@ pub(crate) mod tests {
         assert_eq!(folders["data"]["data"][0]["name"], "Work");
     }
 
-    /// **A client's Sync costs the server nothing while the daemon's hub is
-    /// live**, and one revision question while it is not.
+    /// **A Sync with nothing changed on the server: one revision question,
+    /// and no whole read** -- whether or not the daemon's hub is live.
     #[test]
-    fn a_sync_is_answered_by_the_hub_while_it_is_live() {
+    fn a_sync_with_nothing_changed_asks_one_revision_and_reads_nothing() {
         let (mut server, _cache, api, token) = a_daemon();
         let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
         let revision = server
@@ -544,12 +598,47 @@ pub(crate) mod tests {
             .create();
         api.feed().set_live(true);
         assert_eq!(ask(&api, "POST", "/sync", Some(&token), "").status, 200);
-        api.feed().set_live(false);
-        assert_eq!(ask(&api, "POST", "/sync", Some(&token), "").status, 200);
-        // One revision question, for the second Sync alone; no sync for
-        // either, because the vault the daemon read at start has not moved.
         revision.assert();
         sync.assert();
+    }
+
+    /// **A revision that moved is followed by the read**, and only then.
+    #[test]
+    fn a_sync_after_the_server_moved_reads_the_vault_once() {
+        let (mut server, cache, api, token) = a_daemon();
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000999")
+            .expect_at_least(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        assert_eq!(ask(&api, "POST", "/sync", Some(&token), "").status, 200);
+        sync.assert();
+        assert_eq!(cache.items().len(), 1, "the read was applied");
+    }
+
+    /// **Changes the hub applied one record at a time are the copy's**: a Sync
+    /// after them asks the revision and finds it held, where the backend's own
+    /// last read would have called it moved.
+    #[test]
+    fn a_sync_after_the_hub_applied_changes_reads_nothing() {
+        let (mut server, cache, api, token) = a_daemon();
+        let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000555")
+            .expect_at_least(1)
+            .create();
+        api.note_applied(cache.epoch().era(), Some(1_700_000_000_555));
+        assert_eq!(ask(&api, "POST", "/sync", Some(&token), "").status, 200);
+        sync.assert();
+        // A note from another era is not the copy's.
+        cache.clear();
+        assert_eq!(api.applied_in(cache.epoch().era()), None);
     }
 
     /// Nothing but the routes above, and a wrong method on one of them is a

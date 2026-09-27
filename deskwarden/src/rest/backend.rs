@@ -1445,6 +1445,18 @@ impl VaultBackend for RestBackend {
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         generate_here(request)
     }
+    /// `GET /api/accounts/revision-date`: **one row**. The same question
+    /// [`Self::synced`]'s gate asks, asked on its own so the daemon can
+    /// decide whether a Sync owes a whole read before it starts one.
+    fn revision_now(&self) -> Option<i64> {
+        let mut state = self.locked();
+        self.client.revision_date(&mut state.session).ok()
+    }
+    /// The revision the last `GET /api/sync` was filed under, if one was --
+    /// the one [`Self::synced`] re-validates against. Asks nothing.
+    fn revision_of_last_read(&self) -> Option<i64> {
+        self.synced.lock().ok()?.as_ref().map(|cached| cached.revision)
+    }
 }
 
 /// [`RestBackend::generate`]'s body, as a function: a generated secret and the
@@ -2041,6 +2053,21 @@ pub mod tests {
             _ => "A live item",
         };
         cipher(id, name, &extra).to_string()
+    }
+
+    /// `GET /api/ciphers/{id}`'s answer for `id` carrying one custom field --
+    /// `name` and `value` sealed under the fixture user key exactly as a real
+    /// server holds them. For a caller that needs a record the sync does not
+    /// have: the one a push announces, changed since the vault was read.
+    pub fn fixture_cipher_with_field(id: &str, name: &str, field: &str, value: &str) -> String {
+        cipher(
+            id,
+            name,
+            &serde_json::json!({
+                "fields": [{ "type": 0, "name": enc(field), "value": enc(value) }]
+            }),
+        )
+        .to_string()
     }
 
     /// [`logged_in`] with **the sync route not declared at all**, for a caller

@@ -276,6 +276,13 @@ impl VaultBackend for DaemonBackend {
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         crate::rest::backend::generate_here(request)
     }
+    /// No revision question to ask: the daemon owns the vault and asks the server on the window's behalf, through `POST /sync`.
+    fn revision_now(&self) -> Option<i64> {
+        None
+    }
+    fn revision_of_last_read(&self) -> Option<i64> {
+        None
+    }
 }
 
 #[cfg(test)]

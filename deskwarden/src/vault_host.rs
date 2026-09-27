@@ -38,10 +38,9 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use crate::change_feed::{Change, ChangeFeed};
+use crate::change_feed::Change;
 use crate::rest::notifications::HubListener;
 use crate::vault_api::{ApiRequest, VaultApi};
-use crate::vault_cache::VaultCache;
 
 /// How many requests the daemon answers at once. One long-poll per open
 /// client plus room for its reads; two clients is the most this app has.
@@ -204,17 +203,17 @@ impl Drop for HubWorker {
 }
 
 impl HubWorker {
-    /// Starts the worker over `listener`, applying to `cache` and publishing
-    /// to `feed`.
+    /// Starts the worker over `listener`, applying to the vault `api` answers
+    /// out of and publishing to its feed.
     #[must_use]
-    pub fn start(listener: HubListener, cache: Arc<VaultCache>, feed: Arc<ChangeFeed>) -> Self {
+    pub fn start(listener: HubListener, api: Arc<VaultApi>) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
         std::thread::Builder::new()
             .name("vault-hub".to_string())
             .spawn(move || {
                 while !thread_stop.load(Ordering::SeqCst) {
-                    hub_tick(&listener, &cache, &feed, Instant::now());
+                    hub_tick(&listener, &api, Instant::now());
                     std::thread::sleep(HUB_TICK);
                 }
             })
@@ -232,11 +231,15 @@ impl HubWorker {
 /// * A settled batch of Send pushes is one `Change::Sends`.
 /// * A settled vault batch is applied -- one record per announced cipher when
 ///   `targeted_changes` says it can be, otherwise a revision-gated reload --
-///   and then published as it arrived.
+///   and then published as it arrived. The server's revision is read (one
+///   row) BEFORE a one-record apply and noted with the API, so a later Sync
+///   knows the copy stands at it -- see `VaultApi::sync`.
 /// * **A vault that is not loaded takes nothing.** A lock empties the cache,
 ///   and a push arriving after it must not be the thing that fills it again:
 ///   the batch is dropped, and the next unlock loads a vault that has it.
-fn hub_tick(listener: &HubListener, cache: &VaultCache, feed: &ChangeFeed, now: Instant) {
+fn hub_tick(listener: &HubListener, api: &VaultApi, now: Instant) {
+    let cache = api.cache();
+    let feed = api.feed();
     feed.set_live(listener.is_live());
     if listener.sends_changed(now) {
         feed.publish([Change::Sends]);
@@ -255,25 +258,30 @@ fn hub_tick(listener: &HubListener, cache: &VaultCache, feed: &ChangeFeed, now: 
     }
     let era = cache.epoch().era();
     let applied = match crate::rest::notifications::targeted_changes(listener.is_live(), &announced) {
-        Some(changes) => match cache.apply_announced(&changes, era) {
-            Ok(fetched) => {
-                log::info!(
-                    "the daemon applied {} announced change(s) with {fetched} item read(s) and no \
-                     vault sync",
-                    changes.len()
-                );
-                true
+        Some(changes) => {
+            let before = cache.bridge().revision_now();
+            match cache.apply_announced(&changes, era) {
+                Ok(fetched) => {
+                    log::info!(
+                        "the daemon applied {} announced change(s) with {fetched} item read(s) and \
+                         no vault sync",
+                        changes.len()
+                    );
+                    api.note_applied(era, before);
+                    true
+                }
+                Err(why) => {
+                    log::info!("announced changes need the whole vault after all: {why}");
+                    false
+                }
             }
-            Err(why) => {
-                log::info!("announced changes need the whole vault after all: {why}");
-                false
-            }
-        },
+        }
         None => false,
     };
     if !applied {
-        if let Err(e) = cache.populate() {
-            log::warn!("the daemon could not re-read the vault after an announcement: {e:?}");
+        match cache.populate() {
+            Ok(_) => api.forget_applied(),
+            Err(e) => log::warn!("the daemon could not re-read the vault after an announcement: {e:?}"),
         }
     }
     feed.publish(announced.into_iter().map(Change::Vault));
@@ -282,11 +290,11 @@ fn hub_tick(listener: &HubListener, cache: &VaultCache, feed: &ChangeFeed, now: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::change_feed::LONG_POLL;
+    use crate::change_feed::{ChangeFeed, LONG_POLL};
     use crate::daemon_link::DaemonLink;
     use crate::rest::backend::tests::{declare_the_per_id_cipher_route, fixture_cipher_for, signed_in_with_no_sync_route, sync_payload};
     use crate::rest::notifications::{tests::a_listener_the_test_can_push_to, Announcement, Timing};
-    use crate::vault_cache::PopulateOutcome;
+    use crate::vault_cache::{PopulateOutcome, VaultCache};
 
     /// A timing for a listener that follows a feed in a test: no settle, and
     /// retries measured in milliseconds.
@@ -377,7 +385,7 @@ mod tests {
         let host = VaultHost::start(Arc::clone(&api)).expect("a loopback port");
         let (hub, pushes) = a_listener_the_test_can_push_to();
         pushes.go_live(true);
-        let _worker = HubWorker::start(hub, Arc::clone(&daemon), Arc::clone(&feed));
+        let _worker = HubWorker::start(hub, Arc::clone(&api));
 
         // ---- the window's open --------------------------------------------
         let link = DaemonLink::from_line(&host.link_line_for("window")).expect("the daemon's line");
@@ -418,13 +426,12 @@ mod tests {
     fn a_send_push_is_published_to_the_feed_and_reads_nothing() {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
-        let daemon = VaultCache::new(backend);
-        let feed = ChangeFeed::with_instance(1);
+        let api = an_api_over(VaultCache::new(backend));
         let (hub, pushes) = a_listener_the_test_can_push_to();
         pushes.hear_one();
         pushes.hear_one();
-        hub_tick(&hub, &daemon, &feed, Instant::now());
-        let page = feed.wait_after(Some(0), false, Duration::ZERO);
+        hub_tick(&hub, &api, Instant::now());
+        let page = api.feed().wait_after(Some(0), false, Duration::ZERO);
         assert_eq!(page.changes, vec![Change::Sends], "two Send pushes, one change");
         sync.assert();
     }
@@ -436,14 +443,17 @@ mod tests {
     fn a_push_to_a_locked_daemon_is_dropped() {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
-        let daemon = VaultCache::new(backend);
-        let feed = ChangeFeed::with_instance(1);
+        let api = an_api_over(VaultCache::new(backend));
         let (hub, pushes) = a_listener_the_test_can_push_to();
         pushes.hear_vault(Announcement::Whole);
-        hub_tick(&hub, &daemon, &feed, Instant::now());
-        assert!(!daemon.is_populated(), "a push re-filled a locked vault");
-        assert!(feed.wait_after(Some(0), false, Duration::ZERO).changes.is_empty());
+        hub_tick(&hub, &api, Instant::now());
+        assert!(!api.cache().is_populated(), "a push re-filled a locked vault");
+        assert!(api.feed().wait_after(Some(0), false, Duration::ZERO).changes.is_empty());
         sync.assert();
+    }
+
+    fn an_api_over(cache: VaultCache) -> VaultApi {
+        VaultApi::new(Arc::new(cache), Arc::new(ChangeFeed::with_instance(1)))
     }
 
     /// The listener binds loopback and nothing else, through the one address

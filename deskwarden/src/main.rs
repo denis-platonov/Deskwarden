@@ -1015,10 +1015,11 @@ fn main() {
     // gets no line on its stdin and reads the vault the way it did before
     // this existed.
     let change_feed = Arc::new(deskwarden::change_feed::ChangeFeed::new());
-    match deskwarden::vault_host::VaultHost::start(Arc::new(deskwarden::vault_api::VaultApi::new(
+    let vault_api = Arc::new(deskwarden::vault_api::VaultApi::new(
         Arc::clone(&cache),
         Arc::clone(&change_feed),
-    ))) {
+    ));
+    match deskwarden::vault_host::VaultHost::start(Arc::clone(&vault_api)) {
         Ok(host) => {
             log::info!("the vault this daemon holds is served to its windows at {}", host.base_url());
             if !deskwarden::vault_host::install_env(host) {
@@ -1034,8 +1035,7 @@ fn main() {
     // from: dropping it is what would stop the worker.
     let _vault_hub = deskwarden::vault_host::HubWorker::start(
         deskwarden::rest::notifications::HubListener::for_this_process(),
-        Arc::clone(&cache),
-        change_feed,
+        vault_api,
     );
     // **Before anything spawns `bw serve`.** A usable file means the vault
     // window has something to paint and the match engine has something to
