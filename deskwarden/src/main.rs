@@ -11971,7 +11971,8 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // which is the only one the daemon writes for; see `daemon_link`.
     let mut daemon_link = (choice == backend_policy::VaultBackendChoice::DirectRest)
         .then(deskwarden::daemon_link::DaemonLink::from_stdin)
-        .flatten();
+        .flatten()
+        .map(|link| link.when_refused(the_daemon_let_this_window_go));
     let cache = Arc::new(
         match choice {
             backend_policy::VaultBackendChoice::DirectRest => {
@@ -12809,6 +12810,34 @@ fn hand_the_bw_serve_sign_in_to_the_daemon(
         );
     }
     answered
+}
+
+/// **The daemon this window reads the vault through has let it go** -- it
+/// refused the grant (a lock, a sign-out, an account switch) or has stopped
+/// answering altogether (it restarted, which an update does, and a restarted
+/// daemon neither knows this grant nor listens on this port).
+///
+/// The window closes, and says why first. It cannot stay: every read and
+/// every save it could make would be refused, so what it shows is a vault it
+/// can no longer keep, and an edit typed into it would be lost on Save. It
+/// must not fall back to reading the server itself, which is the one thing a
+/// linked window never does. And it cannot be handed a fresh grant: the
+/// daemon that could mint one did not start this process and has no pipe to
+/// it. So: the clipboard is cleared if it holds a secret this window copied,
+/// the user is told how to get the vault back, and the process exits --
+/// which is also what takes the decrypted copy out of memory.
+///
+/// Called from the change-feed listener's thread, which is always polling.
+/// Exit code 0: nothing for a daemon that reaps it to act on.
+fn the_daemon_let_this_window_go() {
+    deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Quit);
+    message_box(
+        "Deskwarden",
+        "This vault window lost its connection to Deskwarden -- the vault was locked, or \
+         Deskwarden restarted. Open the vault again from the Deskwarden tray icon.",
+        MB_ICONWARNING | MB_OK,
+    );
+    std::process::exit(0);
 }
 
 /// Whether anything is listening on `bw serve`'s constant port.
@@ -15761,6 +15790,17 @@ mod tests {
             window.contains("Some(_) if daemon_link.is_some() =>"),
             "the window no longer prefers the daemon's vault over a read of its own"
         );
+        // And a link the daemon stops honouring closes the window, rather
+        // than leaving it on a vault it can no longer read or save.
+        assert!(
+            window.contains(".map(|link| link.when_refused(the_daemon_let_this_window_go));"),
+            "the window's link no longer says what to do when the daemon lets it go"
+        );
+        let farewell = body_of(production, "fn the_daemon_let_this_window_go() {");
+        assert!(
+            farewell.contains("std::process::exit(0);") && farewell.contains("message_box("),
+            "a window whose daemon let it go no longer says so and closes: {farewell}"
+        );
         // And the grant never goes the other way: onto the command line.
         assert!(!spawn.contains("command.env("), "the spawn puts something in the environment");
     }
@@ -16051,14 +16091,14 @@ mod tests {
             source
                 .matches(concat!("clipboard::clear_if_still_ours_", "for("))
                 .count(),
-            5,
+            6,
             "expected the tray Quit, the shutdown-for-update path, the takeover handover, \
-             the walked-away lock and the UI process's own before-install clear, and no \
-             others"
+             the walked-away lock, the UI process's own before-install clear and a linked \
+             window closing because its daemon let it go, and no others"
         );
         assert_eq!(
             source.matches(concat!("clipboard::ClearTrigger::Qu", "it")).count(),
-            4,
+            5,
             "a shutdown path is clearing under some trigger other than `Quit`"
         );
         // **The walked-away lock clears under `Lock`, the same trigger the

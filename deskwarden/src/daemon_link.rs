@@ -51,7 +51,19 @@ const SYNC_DEADLINE: Duration = Duration::from_secs(120);
 pub struct DaemonLink {
     base_url: String,
     grant: Zeroizing<String>,
+    /// What this process does when the daemon stops honouring the grant --
+    /// see [`Self::when_refused`]. Nothing, until something says otherwise.
+    on_refused: fn(),
 }
+
+/// How many polls of the feed in a row may fail without a refusal before the
+/// daemon is taken to be gone. With the listener's back-off that is about half
+/// a minute in production: long enough for a daemon that is merely busy, and
+/// a daemon on this machine that has not answered for that long is not
+/// coming back on this port -- a restarted one listens on another.
+pub const GONE_AFTER_FAILED_POLLS: u32 = 3;
+
+fn ignore_refusal() {}
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Line {
@@ -84,7 +96,24 @@ impl DaemonLink {
         if grant.len() != 64 || !grant.bytes().all(|b| b.is_ascii_hexdigit()) {
             return None;
         }
-        Some(Self { base_url: url, grant })
+        Some(Self { base_url: url, grant, on_refused: ignore_refusal })
+    }
+
+    /// **What to do when this link is dead** -- the daemon answered the grant
+    /// `401`, or has not answered at all for [`GONE_AFTER_FAILED_POLLS`]
+    /// polls in a row.
+    ///
+    /// Both mean the vault this window shows can no longer be read or
+    /// written: the daemon locked it, signed out, switched account, or
+    /// restarted (an update does), and a restarted daemon neither knows this
+    /// grant nor listens on this port. The window must not go on showing a
+    /// vault it cannot save, and it must not fall back to reading the server
+    /// itself; the vault window's host supplies the one safe answer -- say so,
+    /// and close. Noticed by the change-feed listener, which is always polling.
+    #[must_use]
+    pub fn when_refused(mut self, on_refused: fn()) -> Self {
+        self.on_refused = on_refused;
+        self
     }
 
     /// The link this process's parent wrote down its stdin, if it wrote one.
@@ -142,17 +171,39 @@ impl DaemonLink {
             self.grant.clone(),
         );
         let url = format!("{}/changes", self.base_url);
+        let on_refused = self.on_refused;
+        let mut failed_in_a_row: u32 = 0;
         Box::new(move |after: Option<u64>, live_seen: bool| -> Result<FeedPage, String> {
             let mut request = agent.get(&url).query("live", if live_seen { "true" } else { "false" });
             if let Some(after) = after {
                 request = request.query("after", &after.to_string());
             }
-            let body = request
-                .call()
-                .map_err(|e| e.to_string())?
-                .into_string()
-                .map_err(|e| e.to_string())?;
-            crate::change_feed::page_from_body(&body)
+            let page = match request.call() {
+                Ok(response) => response
+                    .into_string()
+                    .map_err(|e| e.to_string())
+                    .and_then(|body| crate::change_feed::page_from_body(&body)),
+                Err(ureq::Error::Status(401, _)) => {
+                    log::warn!("the daemon no longer honours this window's grant");
+                    on_refused();
+                    return Err("the daemon refused this window's grant".to_string());
+                }
+                Err(e) => Err(e.to_string()),
+            };
+            match &page {
+                Ok(_) => failed_in_a_row = 0,
+                Err(_) => {
+                    failed_in_a_row += 1;
+                    if failed_in_a_row >= GONE_AFTER_FAILED_POLLS {
+                        log::warn!(
+                            "the daemon has not answered this window for {failed_in_a_row} polls \
+                             in a row; taking it to be gone"
+                        );
+                        on_refused();
+                    }
+                }
+            }
+            page
         })
     }
 }
@@ -313,6 +364,90 @@ mod tests {
         ] {
             assert!(DaemonLink::from_line(&refused).is_none(), "{:?} was accepted", refused.as_str());
         }
+    }
+
+    /// Links built by the refusal tests, and how many times each was refused.
+    /// Thread-local-free on purpose: the feed follower calls the hook on its
+    /// own thread, so these are statics -- one per test, so the two cannot
+    /// read each other's count.
+    static REVOKED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static GONE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn count_revoked() {
+        REVOKED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn count_gone() {
+        GONE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    const FAST: crate::rest::notifications::Timing = crate::rest::notifications::Timing {
+        connect: Duration::from_secs(3),
+        poll: Duration::from_millis(20),
+        ping_every: Duration::from_millis(150),
+        silence: Duration::from_millis(600),
+        no_source_wait: Duration::from_millis(20),
+        retry_floor: Duration::from_millis(20),
+        retry_ceiling: Duration::from_millis(100),
+        settle: Duration::ZERO,
+    };
+
+    fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < until {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("never happened: {what}");
+    }
+
+    fn a_live_daemon() -> (crate::test_http::MockServer, crate::vault_host::VaultHost) {
+        let (server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
+        let api = std::sync::Arc::new(
+            crate::vault_api::VaultApi::new(
+                std::sync::Arc::new(crate::vault_cache::VaultCache::new(backend)),
+                std::sync::Arc::new(crate::change_feed::ChangeFeed::new()),
+            )
+            .with_long_poll(Duration::from_millis(100)),
+        );
+        (server, crate::vault_host::VaultHost::start(api).expect("a loopback port"))
+    }
+
+    /// **A grant the daemon stops honouring closes the window's link** -- a
+    /// lock, a sign-out, an account switch -- and the window is told once the
+    /// feed is refused, not left showing a vault it cannot save.
+    #[test]
+    fn a_refused_grant_is_reported_to_the_window() {
+        let (_server, host) = a_live_daemon();
+        let link = DaemonLink::from_line(&host.link_line_for("window"))
+            .expect("the daemon's line")
+            .when_refused(count_revoked);
+        let _listener = crate::rest::notifications::HubListener::following(link.feed_poll(), FAST);
+        // Several polls answered while the grant is good, and no refusal.
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(REVOKED.load(std::sync::atomic::Ordering::SeqCst), 0, "refused while honoured");
+        host.api().revoke("window");
+        eventually("the refusal reaches the window", || {
+            REVOKED.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+    }
+
+    /// **A daemon that is gone is reported too** -- a restart, which listens on
+    /// another port and would answer this one with nothing at all.
+    #[test]
+    fn a_daemon_that_went_away_is_reported_to_the_window() {
+        let (_server, host) = a_live_daemon();
+        let link = DaemonLink::from_line(&host.link_line_for("window"))
+            .expect("the daemon's line")
+            .when_refused(count_gone);
+        let listener = crate::rest::notifications::HubListener::following(link.feed_poll(), FAST);
+        drop(host);
+        eventually("the daemon's absence reaches the window", || {
+            GONE.load(std::sync::atomic::Ordering::SeqCst) > 0
+        });
+        assert!(!listener.is_live(), "a window whose daemon is gone still calls itself live");
     }
 
     /// The daemon's backend can un-file an item, because what answers behind
