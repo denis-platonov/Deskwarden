@@ -66,8 +66,20 @@ publishes the batch to the change feed. The window's `HubListener` follows
 the feed instead of a websocket, so the frame's heartbeat is untouched: an
 announced item is read back **from the daemon**, which already holds it --
 moved to the top of the list, as before -- and a whole-vault announcement
-becomes the window's ordinary sync, which is `POST /sync` to the daemon
-(revision-gated there: one row when nothing moved).
+becomes the window's ordinary sync, which is `POST /sync` to the daemon.
+
+`POST /sync` always asks the server, and always the cheap question first: the
+account's revision, one row. Only a revision that moved is followed by a
+whole read. The revision the daemon's copy stands at is the last whole read's,
+unless the hub worker has since applied changes one record at a time -- then it
+is the revision the worker read just BEFORE applying them, so a change landing
+in between reads as a move rather than as held.
+
+After each applied batch the daemon's own loop rebuilds its match engine from
+the cache (one rebuild per settled burst), so a pushed app match is armed for
+autofill without a reload. The sharing directory (organisations, collections,
+rosters) the daemon's read built is served as `GET /organizations`, and a
+window holds it with the vault it loads.
 
 Send pushes (12/13/14) are a separate kind of change on the same feed, and
 the window's answer to them is to drop its Sends list. They never reach the
@@ -129,11 +141,21 @@ Three layers, so that a second kind of client can use the first two:
 ## Lifecycle
 
 - The daemon starts the listener before any window can be opened.
-- A daemon restart (an update) leaves an open window holding a grant nobody
-  knows: its requests are refused and it shows its locked state, which is what
-  a lock would have shown. The next *Open Vault* mints a fresh one.
-- A window with no link -- a `bw serve` account, or a window that signed in on
-  its own card because there was no stored key -- behaves exactly as it did.
+- A window whose grant is refused (a lock, a sign-out, an account switch) or
+  whose daemon stops answering (a restart, which an update does -- a restarted
+  daemon listens on another port and knows no old grant) says so and closes:
+  its change-feed poll notices, on a `401` at once or after three polls in a
+  row with no answer, and the window clears the clipboard if it holds a
+  secret it copied, tells the user to open the vault again from the tray, and
+  exits. It never falls back to reading the server itself. Relinking was
+  rejected as the harder safe choice: the new daemon did not start this
+  process and has no pipe to hand it a grant down.
+- A window that has to sign in first (the first launch, or after a sign-out)
+  keeps its line: its sign-in stores the key and puts the daemon's backend in
+  its slot, its existing ring tells the daemon to adopt the key and make the
+  one whole read, and its vault waits on its spinner for that read.
+- A window with no link -- a `bw serve` account, or a daemon whose listener
+  could not be bound -- behaves exactly as it did.
 
 ## Counts
 
@@ -143,7 +165,10 @@ Proved by request-counting tests against a mock server, through the real
 
 - a launch with a window open: **one** `GET /api/sync`, the daemon's;
 - an item edit from the window: **no** sync;
-- a push reaching the window: **no** sync.
+- a push reaching the window: **no** sync;
+- a Sync with nothing changed: **no** sync, **one** revision question;
+- a first launch that signs in in the window: **one** `GET /api/sync`, the
+  daemon's.
 
 ## Future clients
 
