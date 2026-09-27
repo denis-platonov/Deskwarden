@@ -12045,6 +12045,23 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                              the sign-in card and derives one"
                         );
                         sign_in_here = true;
+                        // **And then reads the vault the daemon loads with
+                        // it.** The sign-in's key is written where the daemon
+                        // reads it, the ring below tells the daemon to adopt
+                        // it and make the one whole read, and the slot this
+                        // cache reads through is filled with the daemon's
+                        // backend rather than a second reader of the server.
+                        // See `child_sign_in_backend_env`.
+                        if let Some(link) = daemon_link.take() {
+                            log::info!(
+                                "after the sign-in this window will read the vault the daemon \
+                                 holds, at {}",
+                                link.base_url()
+                            );
+                            if !deskwarden::daemon_link::install(link) {
+                                log::error!("this window's line to the daemon was installed twice");
+                            }
+                        }
                         VaultCache::with_disk_cache(
                             Arc::clone(&vault_slot),
                             disk,
@@ -12469,13 +12486,20 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                     // it.
                     //
                     // The owner's rule: "both should work at the same time".
-                    hand_the_bw_serve_sign_in_to_the_daemon(
+                    let rang = hand_the_bw_serve_sign_in_to_the_daemon(
                         &config_dir,
                         &session_path,
                         &token,
                         identity.as_ref(),
                         signing_in_over_bw_serve,
-                    )
+                    );
+                    // **A window reading the daemon's vault waits for the
+                    // daemon to load it** -- the ring above is what starts
+                    // that load -- so it is not told it may skip the wait,
+                    // whatever the ring answered. The vault stage's own
+                    // readiness wait keeps it on its spinner through the
+                    // daemon's one read.
+                    rang && deskwarden::daemon_link::installed().is_none()
                 }
             },
             move |token, work: &mut bool, signed_in| {
@@ -14224,6 +14248,17 @@ fn child_sign_in_backend_env(
                 ),
                 Err(e) => log::warn!("the derived master key could not be stored ({e})"),
             }
+            // **A window the daemon started reads the daemon's vault**, even
+            // one that had to sign in first: the key just stored is the one
+            // the daemon adopts when this window rings it, and its read is
+            // the launch's one. The session this login produced is dropped
+            // here unused -- the daemon refreshes its own from the stored key.
+            if let Some(link) = deskwarden::daemon_link::installed() {
+                drop(authenticated);
+                slot.adopt(Box::new(link.backend()));
+                log::info!("this window reads the vault the daemon adopts from this sign-in");
+                return;
+            }
             slot.adopt(build(authenticated));
             log::info!("the direct-REST vault backend is live in this window");
         }) as std::sync::Arc<dyn Fn(rest::api::Authenticated) + Send + Sync>
@@ -15803,6 +15838,37 @@ mod tests {
         );
         // And the grant never goes the other way: onto the command line.
         assert!(!spawn.contains("command.env("), "the spawn puts something in the environment");
+    }
+
+    /// **A window that signs in reads the vault the daemon adopts from that
+    /// sign-in**, and waits for it.
+    ///
+    /// `vault_host`'s `a_sign_in_in_the_window_costs_one_read_and_it_is_the_
+    /// daemons` makes the steps by hand; these are the three places this file
+    /// takes them, any one of which, undone, puts a second whole read back on
+    /// a first launch: the sign-in arm keeps the line, the sign-in's sink puts
+    /// the daemon's backend in the slot, and the stage between the card and
+    /// the vault does not let a linked window skip its wait.
+    #[test]
+    fn a_window_that_signs_in_reads_the_daemons_vault() {
+        let production = production_half_of_this_file();
+        let window = body_of(production, "fn run_as_a_ui_process(surface: Surface) -> i32 {");
+        assert!(
+            window.contains("if let Some(link) = daemon_link.take() {")
+                && window.matches(concat!("deskwarden::daemon_link::", "install(link)")).count() == 2,
+            "the sign-in arm no longer keeps this window's line to the daemon"
+        );
+        assert!(
+            window.contains("rang && deskwarden::daemon_link::installed().is_none()"),
+            "a linked window that signed in may skip its wait, and reads a vault the daemon has \
+             not loaded yet"
+        );
+        let sink = body_of(production, "fn child_sign_in_backend_env(");
+        assert!(
+            sink.contains("if let Some(link) = deskwarden::daemon_link::installed() {")
+                && sink.contains("slot.adopt(Box::new(link.backend()));"),
+            "the sign-in's sink no longer reads through the daemon when it can: {sink}"
+        );
     }
 
     /// **The daemon's loop re-arms the match engine when the hub changed the

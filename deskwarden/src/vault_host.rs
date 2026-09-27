@@ -447,6 +447,78 @@ mod tests {
         drop(host);
     }
 
+    /// **A window that has to sign in first still costs one read, and it is
+    /// the daemon's.**
+    ///
+    /// The first launch, or the one after a sign-out: the daemon has no key,
+    /// so it starts the window with a grant and an empty vault. The window
+    /// takes the master password, stores the key, puts the DAEMON's backend
+    /// in its slot, and rings; the daemon adopts the stored key -- the profile
+    /// check -- and makes the one whole read. `main.rs` does those steps in
+    /// two processes and no test can run it, so they are made here in its
+    /// order, and `main.rs`'s pins hold that it still takes them.
+    #[test]
+    fn a_sign_in_in_the_window_costs_one_read_and_it_is_the_daemons() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000000")
+            .expect_at_least(0)
+            .create();
+        server
+            .mock("GET", "/api/accounts/profile")
+            .with_body(
+                serde_json::json!({
+                    "key": serde_json::from_str::<serde_json::Value>(&sync_payload())
+                        .expect("json")["profile"]["key"],
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+
+        // The daemon at launch: no key, so an empty slot and an empty vault.
+        let daemon_slot: crate::vault_backend::SharedLateBoundBackend =
+            Arc::new(crate::vault_backend::LateBoundBackend::empty());
+        let daemon = Arc::new(VaultCache::new(Arc::clone(&daemon_slot)));
+        let api = Arc::new(
+            VaultApi::new(Arc::clone(&daemon), Arc::new(ChangeFeed::with_instance(4)))
+                .with_long_poll(Duration::from_millis(100)),
+        );
+        let host = VaultHost::start(Arc::clone(&api)).expect("a loopback port");
+        // The window it starts, with its line minted then.
+        let link = DaemonLink::from_line(&host.link_line_for("window")).expect("the daemon's line");
+        let window_slot: crate::vault_backend::SharedLateBoundBackend =
+            Arc::new(crate::vault_backend::LateBoundBackend::empty());
+        let window = VaultCache::new(Arc::clone(&window_slot));
+
+        // The window's sign-in succeeds: its slot takes the daemon's backend.
+        window_slot.adopt(Box::new(link.backend()));
+        assert!(
+            crate::bw_serve::wait_for_vault_ready(window.bridge(), &[]).is_err(),
+            "the window read a vault before the daemon had loaded one"
+        );
+
+        // The ring: the daemon adopts the stored key and makes the one read.
+        backend.verify_stored_login().expect("the key the window just stored");
+        daemon_slot.adopt(Box::new(backend));
+        let epoch = daemon.epoch();
+        let items = daemon.bridge().list_items().expect("the daemon's read");
+        assert_eq!(daemon.populate_with(items, epoch).expect("seeded"), PopulateOutcome::Populated);
+
+        // The window's readiness wait now passes, and it loads from the daemon.
+        crate::bw_serve::wait_for_vault_ready(window.bridge(), &[]).expect("ready");
+        assert_eq!(window.populate().expect("the window's load"), PopulateOutcome::Populated);
+        assert_eq!(window.items().len(), 1);
+
+        sync.assert();
+    }
+
     /// **A Send push reaches a client as a Send change, and the daemon's vault
     /// is not touched.**
     #[test]
