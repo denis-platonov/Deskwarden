@@ -152,6 +152,11 @@ pub struct VaultApi {
     /// one-record-at-a-time apply, in the era it was applied in. See
     /// [`Self::sync`].
     applied: Mutex<Option<(VaultEra, i64)>>,
+    /// Where the sharing directory comes from:
+    /// `rest::organizations::current`, which the daemon's backend fills on
+    /// every whole read. A seam only because that is a process-wide slot a
+    /// test cannot hold still.
+    directory: fn() -> Arc<crate::rest::organizations::Directory>,
 }
 
 impl VaultApi {
@@ -163,7 +168,16 @@ impl VaultApi {
             grants: Mutex::new(Vec::new()),
             long_poll: LONG_POLL,
             applied: Mutex::new(None),
+            directory: crate::rest::organizations::current,
         }
+    }
+
+    /// The same API reading its sharing directory from `directory`, for a
+    /// test.
+    #[must_use]
+    pub fn with_directory(mut self, directory: fn() -> Arc<crate::rest::organizations::Directory>) -> Self {
+        self.directory = directory;
+        self
     }
 
     /// The vault this API answers out of -- for the daemon's hub worker, which
@@ -287,12 +301,18 @@ impl VaultApi {
                 self.cache.delete_folder(id).map_or_else(|e| failed(&e), |()| ApiResponse::done())
             }
             ("POST", ["sync"]) => self.sync(),
+            // **The sharing directory the daemon's own whole read built**:
+            // organisations, collection names, who is in them. A client that
+            // reads the vault here makes no sync of its own, so this is the
+            // only way it can draw the same organisations rail -- and answer
+            // "who else can see this item" -- as one that does.
+            ("GET", ["organizations"]) => ApiResponse::ok((self.directory)().to_body()),
             ("GET", ["changes"]) => {
                 let after = query.get("after").and_then(|after| after.parse().ok());
                 let page = self.feed.wait_after(after, query.is("live", "true"), self.long_poll);
                 ApiResponse { status: 200, body: crate::change_feed::page_body(&page) }
             }
-            (_, ["status" | "sync" | "changes"])
+            (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
             | (_, ["restore" | "archive", "item", _])

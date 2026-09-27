@@ -139,7 +139,15 @@ impl DaemonLink {
     /// words.
     #[must_use]
     pub fn backend(&self) -> DaemonBackend {
-        DaemonBackend { bridge: VaultBridge::with_bearer(self.base_url.clone(), &self.grant) }
+        DaemonBackend {
+            bridge: VaultBridge::with_bearer(self.base_url.clone(), &self.grant),
+            directory_url: format!("{}/organizations", self.base_url),
+            directory_agent: crate::http_agent::bounded_total_with_bearer(
+                CONNECT,
+                DIRECTORY_DEADLINE,
+                self.grant.clone(),
+            ),
+        }
     }
 
     /// Asks the daemon to re-check the server -- the window's Sync, its
@@ -244,6 +252,35 @@ pub fn feed_poll() -> Option<crate::rest::notifications::FollowPoll> {
 /// both say why.
 pub struct DaemonBackend {
     bridge: VaultBridge,
+    /// `GET /organizations` -- the one route here that is not `bw serve`'s,
+    /// so the one the bridge does not know.
+    directory_url: String,
+    directory_agent: crate::http_agent::TotalBounded,
+}
+
+/// How long the sharing directory may take: a loopback answer out of memory.
+const DIRECTORY_DEADLINE: Duration = Duration::from_secs(10);
+
+impl DaemonBackend {
+    /// **The daemon's sharing directory** -- organisations, collections and
+    /// who is in them, as its own whole read built them.
+    ///
+    /// # Errors
+    ///
+    /// The daemon did not answer, or answered with something that is not a
+    /// directory.
+    pub fn directory(&self) -> Result<crate::rest::organizations::Directory, String> {
+        let body: serde_json::Value = self
+            .directory_agent
+            .get(&self.directory_url)
+            .call()
+            .map_err(|e| e.to_string())?
+            .into_json()
+            .map_err(|e| e.to_string())?;
+        crate::rest::organizations::Directory::from_body(
+            body.get("data").cloned().unwrap_or(serde_json::Value::Null),
+        )
+    }
 }
 
 impl VaultBackend for DaemonBackend {
@@ -257,9 +294,19 @@ impl VaultBackend for DaemonBackend {
         self.bridge.list_folders()
     }
     /// Two loopback requests, and no server round trip behind either.
+    ///
+    /// **And the sharing directory with them**, held for this process exactly
+    /// as a backend that synced for itself holds the one its sync built -- so
+    /// the organisations rail and every "shared with" answer describe the
+    /// vault just loaded. A daemon that cannot say leaves the directory as it
+    /// was; the vault itself has loaded.
     fn list_vault(&self) -> Result<VaultSnapshot, VaultError> {
         let items = self.bridge.list_items()?;
         let folders = self.bridge.list_folders()?;
+        match self.directory() {
+            Ok(directory) => crate::rest::organizations::remember(directory),
+            Err(why) => log::warn!("the daemon's sharing directory could not be read ({why})"),
+        }
         Ok(VaultSnapshot { items, folders })
     }
     fn set_app_match(&self, item: &VaultItem, m: &AppMatch) -> Result<VaultItem, VaultError> {
@@ -413,6 +460,44 @@ mod tests {
             .with_long_poll(Duration::from_millis(100)),
         );
         (server, crate::vault_host::VaultHost::start(api).expect("a loopback port"))
+    }
+
+    fn engineering() -> std::sync::Arc<crate::rest::organizations::Directory> {
+        std::sync::Arc::new(
+            crate::rest::organizations::Directory::from_body(serde_json::json!({
+                "organisations": [{ "id": "org-1", "name": "Engineering", "enabled": true }],
+                "collections": [{ "id": "c-1", "organizationId": "org-1", "name": "Shared" }],
+                "rosters": [{ "organizationId": "org-1", "members": [
+                    { "id": "u-1", "email": "owner@example.invalid", "name": null,
+                      "role": "owner", "confirmed": true, "collections": [] }
+                ] }]
+            }))
+            .expect("a directory"),
+        )
+    }
+
+    /// **The organisations rail of a window reading the daemon's vault is
+    /// the daemon's**: the directory its own whole read built, over the API,
+    /// whole -- organisations, collections and who is in them.
+    #[test]
+    fn a_linked_window_is_handed_the_daemons_sharing_directory() {
+        let (_server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
+        let api = std::sync::Arc::new(
+            crate::vault_api::VaultApi::new(
+                std::sync::Arc::new(crate::vault_cache::VaultCache::new(backend)),
+                std::sync::Arc::new(crate::change_feed::ChangeFeed::new()),
+            )
+            .with_directory(engineering),
+        );
+        let host = crate::vault_host::VaultHost::start(api).expect("a loopback port");
+        let link = DaemonLink::from_line(&host.link_line_for("window")).expect("the daemon's line");
+        let directory = link.backend().directory().expect("the daemon's directory");
+        assert_eq!(&directory, engineering().as_ref());
+        assert_eq!(directory.organisations()[0].label(), "Engineering");
+        assert_eq!(directory.collections_of("org-1")[0].label(), "Shared");
+        // And only for a client the daemon granted.
+        host.api().revoke("window");
+        assert!(link.backend().directory().is_err(), "an ungranted client read the directory");
     }
 
     /// **A grant the daemon stops honouring closes the window's link** -- a

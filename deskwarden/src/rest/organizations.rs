@@ -663,6 +663,158 @@ fn map_member(raw: &Value) -> Option<Member> {
     })
 }
 
+// ---- the directory on the wire ----------------------------------------------
+//
+// **The daemon owns the vault, and so it owns this too.** A window reading the
+// daemon's vault (`crate::daemon_link`) makes no sync of its own, so nothing
+// in its process ever builds a directory -- and its rail drew no
+// organisations at all. The daemon serves its own as `GET /organizations`
+// (`crate::vault_api`), in this one shape, and the window holds what it is
+// handed exactly as it would hold one it had built.
+//
+// Everything a directory holds crosses: the collection names already
+// decrypted, and the rosters -- member emails and roles -- because `audience_
+// of` is the question a client asks of it, and a directory without them
+// answers "unknown" where an unlinked window answers a count. Nothing here is
+// a key or a vault item. A client-agnostic shape: organisations, collections,
+// rosters, and nothing about which surface draws them.
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireDirectory {
+    organisations: Vec<WireOrganisation>,
+    collections: Vec<WireCollection>,
+    rosters: Vec<WireRoster>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireOrganisation {
+    id: String,
+    name: Option<String>,
+    enabled: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireCollection {
+    id: String,
+    organization_id: String,
+    name: Option<String>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireRoster {
+    organization_id: String,
+    /// `None` is [`Roster::Unknown`] -- not an empty list, for that type's
+    /// whole reason.
+    members: Option<Vec<WireMember>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireMember {
+    id: String,
+    email: String,
+    name: Option<String>,
+    role: String,
+    confirmed: bool,
+    collections: Vec<String>,
+}
+
+impl Directory {
+    /// This directory as the JSON `GET /organizations` answers with.
+    #[must_use]
+    pub fn to_body(&self) -> Value {
+        let wire = WireDirectory {
+            organisations: self
+                .organisations
+                .iter()
+                .map(|o| WireOrganisation { id: o.id.clone(), name: o.name.clone(), enabled: o.enabled })
+                .collect(),
+            collections: self
+                .collections
+                .iter()
+                .map(|c| WireCollection {
+                    id: c.id.clone(),
+                    organization_id: c.organization_id.clone(),
+                    name: c.name.clone(),
+                })
+                .collect(),
+            rosters: self
+                .rosters
+                .iter()
+                .map(|(organization_id, roster)| WireRoster {
+                    organization_id: organization_id.clone(),
+                    members: match roster {
+                        Roster::Unknown => None,
+                        Roster::Known(members) => Some(
+                            members
+                                .iter()
+                                .map(|m| WireMember {
+                                    id: m.id.clone(),
+                                    email: m.email.clone(),
+                                    name: m.name.clone(),
+                                    role: m.role.clone(),
+                                    confirmed: m.confirmed,
+                                    collections: m.collections.clone(),
+                                })
+                                .collect(),
+                        ),
+                    },
+                })
+                .collect(),
+        };
+        serde_json::to_value(wire).unwrap_or(Value::Null)
+    }
+
+    /// A directory read back out of [`Self::to_body`]'s JSON.
+    ///
+    /// # Errors
+    ///
+    /// A body that is not a directory.
+    pub fn from_body(body: Value) -> Result<Self, String> {
+        let wire: WireDirectory =
+            serde_json::from_value(body).map_err(|e| format!("not a sharing directory: {e}"))?;
+        Ok(Self {
+            organisations: wire
+                .organisations
+                .into_iter()
+                .map(|o| Organisation { id: o.id, name: o.name, enabled: o.enabled })
+                .collect(),
+            collections: wire
+                .collections
+                .into_iter()
+                .map(|c| Collection { id: c.id, organization_id: c.organization_id, name: c.name })
+                .collect(),
+            rosters: wire
+                .rosters
+                .into_iter()
+                .map(|r| {
+                    let roster = match r.members {
+                        None => Roster::Unknown,
+                        Some(members) => Roster::Known(
+                            members
+                                .into_iter()
+                                .map(|m| Member {
+                                    id: m.id,
+                                    email: m.email,
+                                    name: m.name,
+                                    role: m.role,
+                                    confirmed: m.confirmed,
+                                    collections: m.collections,
+                                })
+                                .collect(),
+                        ),
+                    };
+                    (r.organization_id, roster)
+                })
+                .collect(),
+        })
+    }
+}
+
 // ---- where the directory is held --------------------------------------------
 
 /// The one held directory. See the module docs for why it is here rather than
@@ -671,9 +823,11 @@ static HELD: Mutex<Option<Arc<Directory>>> = Mutex::new(None);
 
 /// Stores `directory` as this process's current one.
 ///
-/// Called by [`crate::rest::backend::RestBackend::synced`] and by nothing
-/// else, which is what makes "the directory describes the vault the window is
-/// drawing" true by construction rather than by scheduling.
+/// Called by [`crate::rest::backend::RestBackend::synced`], which builds it,
+/// and by `crate::daemon_link`'s backend, which is handed the daemon's own
+/// alongside the vault it loads -- so in both kinds of process "the directory
+/// describes the vault the window is drawing" is true by construction rather
+/// than by scheduling.
 pub fn remember(directory: Directory) {
     let mut held = HELD.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     *held = Some(Arc::new(directory));
@@ -914,6 +1068,35 @@ mod tests {
         };
         assert!(collections.is_empty());
         assert_eq!(others, Some(0));
+    }
+
+    /// **The directory survives the wire whole** -- organisations, decrypted
+    /// collection names, a known roster and an unknown one -- so a window
+    /// reading the daemon's vault answers `audience_of` exactly as a window
+    /// that synced for itself does.
+    #[test]
+    fn a_directory_read_back_off_the_wire_is_the_same_directory() {
+        let mut directory = Directory::from_sync(&sync_payload("Shared credentials"), &keys());
+        directory.rosters.push(("org-unknown".to_string(), Roster::Unknown));
+        directory.set_roster(
+            ORG,
+            &json!({ "object": "list", "data": [
+                { "id": "u-owner", "email": "owner@example.invalid", "name": "Owner",
+                  "role": "owner", "status": 1, "collections": [] },
+                { "id": "u-in", "email": "in@example.invalid", "role": "member",
+                  "status": 1, "collections": [COLLECTION] }
+            ]}),
+        );
+        let back = Directory::from_body(directory.to_body()).expect("reads back");
+        assert_eq!(back, directory);
+        assert_eq!(back.roster_of("org-unknown"), &Roster::Unknown, "unknown became known");
+        assert_eq!(
+            back.audience_of(&item(Some(ORG), &[COLLECTION])),
+            directory.audience_of(&item(Some(ORG), &[COLLECTION]))
+        );
+        // And an empty one is empty, which is the owner's own account.
+        assert!(Directory::from_body(Directory::empty().to_body()).expect("reads back").is_empty());
+        assert!(Directory::from_body(json!({ "nope": 1 })).is_err());
     }
 
     /// **An unknown roster is not a roster of nobody**, and this is the whole
