@@ -439,6 +439,32 @@ pub fn whole_record_fields(
     fields
 }
 
+/// **The names of the fields that go with this Send**, for
+/// `sent_history`: what the selection asks for AND the item has, in the
+/// whole-record line's order, plus the seed when it travels sealed. Labels
+/// only -- never a value.
+pub fn fields_travelling(
+    selection: &RecordSelection,
+    item: &crate::vault_bridge::VaultItem,
+    seed_sealed: bool,
+) -> Vec<String> {
+    let mut labels: Vec<String> = whole_record_fields(Some(item))
+        .into_iter()
+        .filter(|(label, _)| match *label {
+            USERNAME_LABEL => selection.username,
+            PASSWORD_LABEL => selection.password,
+            WEBSITES_LABEL => selection.uri,
+            NOTES_LABEL => selection.notes,
+            _ => false,
+        })
+        .map(|(label, _)| label.to_string())
+        .collect();
+    if seed_sealed {
+        labels.push(TOTP_LABEL.to_string());
+    }
+    labels
+}
+
 /// What is wrong with the export draft, phrased for the user, or `None`.
 ///
 /// The seed rule is first because it is the dangerous one: a ticked seed with
@@ -2733,6 +2759,22 @@ mod paint_tests {
         );
         assert!(!draft.selection.totp, "the seed went with the whole record");
         assert!(draft.passphrase.is_empty(), "the seed's passphrase outlived the untick");
+    }
+
+    /// **What the sent log files is what actually went**: the fields the
+    /// selection asks for AND the item has, the seed only when it travels
+    /// sealed. Labels, never values.
+    #[test]
+    fn the_fields_filed_are_the_ones_that_went() {
+        let item = a_login();
+        assert_eq!(
+            fields_travelling(&whole_record_selection(), &item, false),
+            [USERNAME_LABEL, PASSWORD_LABEL, WEBSITES_LABEL, NOTES_LABEL]
+        );
+        let mut narrow = whole_record_selection();
+        narrow.password = false;
+        narrow.notes = false;
+        assert_eq!(fields_travelling(&narrow, &item, true), [USERNAME_LABEL, WEBSITES_LABEL, TOTP_LABEL]);
     }
 
     /// **The pills are what the item has.** A record without a password

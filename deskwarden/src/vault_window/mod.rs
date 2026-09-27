@@ -1143,6 +1143,30 @@ pub fn build_frame_with_search(
         .as_deref()
         .map(crate::receive_history::ReceiveHistory::load)
         .unwrap_or_default();
+    // **What this user sent from a record, and to whom** -- the other
+    // direction, in its own file: see `crate::sent_history`, which argues why
+    // it holds a Send's server id and never its link. It backs the composer's
+    // recipient suggestions and the Sent screen's `to ...`, `Open record` and
+    // `WHAT WAS SHARED`.
+    //
+    // Beside `settings.json` -- the directory this window was handed -- and
+    // not `sent_history::default_path()`: in production the two are the same
+    // folder, and in a test the settings path is the test's own scratch
+    // directory, so no test that presses Create writes to the real one.
+    let sent_history_path = env
+        .settings_path
+        .as_deref()
+        .and_then(std::path::Path::parent)
+        .map(|dir| dir.join(crate::sent_history::SENT_HISTORY_FILE_NAME));
+    let mut sent_history = sent_history_path
+        .as_deref()
+        .map(crate::sent_history::SentHistory::load)
+        .unwrap_or_default();
+    // The Send being made from a record right now -- who it is for and what
+    // of the record goes -- held from the press of "Create & copy link" until
+    // the server answers with the new Send's id, which is what the entry is
+    // filed under. A failed create drops it.
+    let mut pending_sent: Option<crate::sent_history::SentRecord> = None;
     // The `u64` is the `SendFetch` generation the fetch was started under, so
     // an answer to a question the user has since navigated away from can be
     // told apart from an answer to the current one. See
@@ -2299,6 +2323,25 @@ pub fn build_frame_with_search(
         // The create's answer, on the same terms and for the same reason: a
         // published Send is a row the list on screen does not have.
         drain_send_create(&send_create_rx, &mut send_create, &mut send_fetch);
+        // **The Send made from a record exists now**: file what was sent, and
+        // to whom, under the id the server gave it. Taken, so it is filed
+        // once however many frames the report stays on screen; a failed
+        // create drops it, since there is no Send to file it under.
+        match &send_create.report {
+            Some(SendCreateReport::Created { id, .. }) => {
+                if let Some(mut entry) = pending_sent.take() {
+                    entry.send_id = id.clone();
+                    sent_history.record(entry.clone());
+                    if let Some(path) = sent_history_path.as_deref() {
+                        if let Err(e) = crate::sent_history::update(path, |h| h.record(entry)) {
+                            log::warn!("a Send was made but could not be added to the sent history: {e:?}");
+                        }
+                    }
+                }
+            }
+            Some(SendCreateReport::Failed { .. }) => pending_sent = None,
+            None => {}
+        }
         drain_record_import(&record_import_rx, &mut record_import);
 
         // Non-blocking, like the favicon drain above: the sync thread
@@ -6598,6 +6641,7 @@ pub fn build_frame_with_search(
                     // item turns out to be gone the taken plan is simply
                     // dropped, which wipes it.
                     let access = std::mem::take(&mut state.draft.access);
+                    let mut pending = None;
                     // Re-resolved by id: the vault may have been re-read
                     // between the open and this press, and the item that
                     // should be published is the one the window is holding
@@ -6616,10 +6660,26 @@ pub fn build_frame_with_search(
                                 item.login.as_ref().and_then(|l| {
                                     l.totp.as_ref().map(|t| t.as_str())
                                 });
+                            let totp = state.draft.totp_to_send(seed);
+                            let seed_sealed = matches!(totp, crate::record::TotpToSend::Sealed { .. });
+                            pending = Some(crate::sent_history::SentRecord {
+                                sent_at_unix_millis: crate::send::SendClock::now_unix_millis(
+                                    &crate::send::SystemClock,
+                                ),
+                                send_id: String::new(),
+                                recipient: String::new(),
+                                item_id: item.id.clone(),
+                                name: item.name.clone(),
+                                fields: record_ui::fields_travelling(
+                                    &state.draft.selection,
+                                    item,
+                                    seed_sealed,
+                                ),
+                            });
                             let record = crate::record::record_from(
                                 item,
                                 &state.draft.selection,
-                                state.draft.totp_to_send(seed),
+                                totp,
                                 // No expiry claim on the payload: the importer
                                 // deliberately does not gate on `not_after`,
                                 // and a field that reads as an expiry the
@@ -6631,6 +6691,7 @@ pub fn build_frame_with_search(
                             record_ui::send_plan_from(&record, access)
                         });
                     if let Some(plan) = plan {
+                        pending_sent = pending;
                         send_create.in_flight = true;
                         send_create.report = None;
                         spawn_send_create(
@@ -9994,7 +10055,7 @@ mod backend_tasks {
             // stamp the same instant: the one the user pressed Create at.
             match crate::rest::send::create_on_active_account(plan, &crate::send::SystemClock) {
                 Ok(created) => {
-                    SendCreateReport::Created { name, access_url: created.access_url }
+                    SendCreateReport::Created { name, id: created.id, access_url: created.access_url }
                 }
                 Err(error) => SendCreateReport::Failed { name, error },
             }
@@ -10133,6 +10194,7 @@ mod backend_tasks {
             ) {
                 Ok(created) => SendCreateReport::Created {
                     name,
+                    id: created.id,
                     access_url: created.access_url,
                 },
                 Err(error) => SendCreateReport::Failed { name, error },
@@ -11871,7 +11933,10 @@ where
 #[derive(Clone)]
 enum SendCreateReport {
     /// `bw send create` exited zero and its answer parsed. The link is live.
-    Created { name: String, access_url: String },
+    /// `id` is the new Send's server id -- what `sent_history` keys its
+    /// entry on, because the link carries the Send's key and never goes to
+    /// disk.
+    Created { name: String, id: String, access_url: String },
     /// It did not, and this is why.
     Failed {
         name: String,
@@ -11886,7 +11951,7 @@ enum SendCreateReport {
 impl std::fmt::Debug for SendCreateReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SendCreateReport::Created { name, access_url: _ } => f
+            SendCreateReport::Created { name, id: _, access_url: _ } => f
                 .debug_struct("Created")
                 .field("name", name)
                 .field("access_url", &crate::send::ElidedAccessUrl)
@@ -11960,7 +12025,7 @@ enum CreateTone {
 /// exactly one of them is [`CreateTone::Good`].
 fn send_create_message(report: &SendCreateReport) -> (CreateTone, String) {
     match report {
-        SendCreateReport::Created { name, access_url } => (
+        SendCreateReport::Created { name, access_url, .. } => (
             CreateTone::Good,
             format!(
                 "\u{201c}{name}\u{201d} is published and its link is on your clipboard. \
@@ -37772,6 +37837,7 @@ mod send_create_wiring {
     #[test]
     fn a_created_reports_debug_does_not_print_the_access_url() {
         let report = SendCreateReport::Created {
+            id: "send-id".to_string(),
             name: DRAFT_NAME.to_string(),
             access_url: CREATED_URL.to_string(),
         };
@@ -37795,6 +37861,7 @@ mod send_create_wiring {
     #[test]
     fn a_created_reports_debug_still_identifies_the_report_it_redacted() {
         let report = SendCreateReport::Created {
+            id: "send-id".to_string(),
             name: DRAFT_NAME.to_string(),
             access_url: CREATED_URL.to_string(),
         };
@@ -38118,6 +38185,7 @@ mod send_create_wiring {
         let (tx, rx): (SendCreateSender, Receiver<SendCreateReport>) = mpsc::channel();
         let here = std::thread::current().id();
         send_create_thread::spawn_send_create_with(ctx, tx, move || SendCreateReport::Created {
+            id: "send-id".to_string(),
             name: format!("{:?}", std::thread::current().id()),
             access_url: "https://send.example.invalid/x".to_string(),
         });
@@ -38364,6 +38432,7 @@ mod send_create_wiring {
     fn opening_the_composer_publishes_nothing_and_clears_the_last_report() {
         let mut create = SendCreateState {
             report: Some(SendCreateReport::Created {
+                id: "send-id".to_string(),
                 name: "an earlier Send".to_string(),
                 access_url: "https://send.example.invalid/earlier".to_string(),
             }),
@@ -38431,6 +38500,7 @@ mod send_create_wiring {
         for (report, stale, spent) in [
             (
                 SendCreateReport::Created {
+                    id: "send-id".to_string(),
                     name: DRAFT_NAME.to_string(),
                     access_url: "https://send.example.invalid/new".to_string(),
                 },
@@ -38501,6 +38571,7 @@ mod send_create_wiring {
     fn every_create_outcome_says_something_different() {
         let reports = [
             SendCreateReport::Created {
+                id: "send-id".to_string(),
                 name: DRAFT_NAME.to_string(),
                 access_url: "https://send.example.invalid/new".to_string(),
             },
@@ -38601,6 +38672,7 @@ mod send_create_wiring {
 
         for report in [
             SendCreateReport::Created {
+                id: "send-id".to_string(),
                 name: DRAFT_NAME.to_string(),
                 access_url: "https://send.example.invalid/new".to_string(),
             },
@@ -39701,6 +39773,7 @@ mod send_create_wiring {
             let mut fetch = send_ui::SendFetch::default();
             if wipe_by_publishing {
                 tx.send(SendCreateReport::Created {
+                    id: "send-id".to_string(),
                     name: DRAFT_NAME.to_string(),
                     access_url: "https://send.example.invalid/new".to_string(),
                 })
