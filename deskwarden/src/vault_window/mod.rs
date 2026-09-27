@@ -2003,6 +2003,12 @@ pub fn build_frame_with_search(
             hub_wanted = Some(push_on);
             hub = if push_on { (start_hub)() } else { None };
         }
+        // **A Send changed** -- created, edited, revoked, or opened by its
+        // recipient. The Sends list is dropped, so this frame asks for it
+        // again; the vault is not touched. See `HubListener::sends_changed`.
+        if hub.as_ref().is_some_and(|hub| hub.sends_changed(Instant::now())) {
+            send_fetch.invalidate();
+        }
         let pushed = hub.as_ref().is_some_and(|hub| hub.settled(Instant::now()));
         let hub_live = hub.as_ref().is_some_and(crate::rest::notifications::HubListener::is_live);
         let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
@@ -32395,6 +32401,151 @@ mod export_wiring {
                 "this file mentions {banned:?} -- a second export format, or a password on \
                  argv, is reachable from the menu"
             );
+        }
+    }
+
+    /// **A Send push refreshes the Sends list, and costs no vault read.**
+    ///
+    /// The owner opened a Send link twice and the Sent screen still said "opened
+    /// once": NodeWarden pushes `SyncSendUpdate` on every access, and the hub
+    /// listener dropped it. It now reaches the frame as
+    /// `HubListener::sends_changed`, and the frame's whole answer is
+    /// `send_fetch.invalidate()`. This drives real frames through
+    /// [`build_frame`] with every outward spawn substituted, pushes a burst of
+    /// three, and counts what reached the seams.
+    ///
+    /// Nested in this module, whose frame harness it is shaped after, rather
+    /// than a top-level one: the count of top-level test modules is a control
+    /// `nothing_but_gated_test_modules_lives_below_the_guards_cut` holds, and
+    /// a test about one frame statement is not a new area of this file.
+    mod send_push_refresh {
+        use super::*;
+        use crate::rest::notifications::tests::{SendPushes, a_listener_the_test_can_push_to};
+        use std::cell::{Cell, RefCell};
+        use std::sync::Arc;
+
+        thread_local! {
+            /// What each seam was asked for on THIS thread. Thread-local rather
+            /// than `static`: the stubs below answer inline, on the frame's own
+            /// thread, and a second frame test running beside this one would
+            /// otherwise be counted here.
+            static SYNCS: Cell<usize> = const { Cell::new(0) };
+            static LOADS: Cell<usize> = const { Cell::new(0) };
+            static SEND_LISTS: Cell<usize> = const { Cell::new(0) };
+            /// The test's end of the listener the frame started.
+            static PUSHES: RefCell<Option<SendPushes>> = const { RefCell::new(None) };
+        }
+
+        fn counts_the_sync(tx: mpsc::Sender<Result<(), String>>, _session: String) {
+            SYNCS.with(|n| n.set(n.get() + 1));
+            let _ = tx.send(Ok(()));
+        }
+
+        fn counts_the_load(
+            _cache: Arc<VaultCache>,
+            tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+            request: VaultLoadRequest,
+        ) {
+            LOADS.with(|n| n.set(n.get() + 1));
+            let _ = tx.send((
+                request.generation,
+                Ok(VaultSnapshot { items: Vec::new(), folders: Vec::new() }),
+            ));
+        }
+
+        fn answers_the_send_list(
+            _ctx: egui::Context,
+            tx: SendListSender,
+            generation: u64,
+            _session: zeroize::Zeroizing<String>,
+        ) {
+            SEND_LISTS.with(|n| n.set(n.get() + 1));
+            let _ = tx.send((generation, Ok(Vec::new())));
+        }
+
+        fn a_hub_the_test_pushes_to() -> Option<crate::rest::notifications::HubListener> {
+            let (listener, pushes) = a_listener_the_test_can_push_to();
+            PUSHES.with(|slot| *slot.borrow_mut() = Some(pushes));
+            Some(listener)
+        }
+
+        fn counts() -> (usize, usize, usize) {
+            (SYNCS.with(Cell::get), LOADS.with(Cell::get), SEND_LISTS.with(Cell::get))
+        }
+
+        #[test]
+        fn a_burst_of_send_pushes_refetches_the_sends_list_once_and_syncs_nothing() {
+            let dir = crate::test_scratch::ScratchDir::new("frame-send-push");
+            let env = VaultFrameEnv {
+                hub: a_hub_the_test_pushes_to,
+                ..super::super::frame_env_seam::stubbed(
+                    counts_the_sync,
+                    counts_the_load,
+                    answers_the_send_list,
+                    Some(dir.join("settings.json")),
+                )
+            };
+            let (_options, mut frame_fn, _handles) = build_frame(
+                Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new("http://127.0.0.1:1"))),
+                crate::fill_stats::FillStats::new(dir.join("fill-stats.json")),
+                crate::login_ui::BwStatusDetails {
+                    status: crate::login_ui::BwStatus::Unlocked,
+                    user_email: Some("harness@example.invalid".to_string()),
+                    server_url: None,
+                },
+                "harness-session-token".to_string(),
+                dir.join("icons"),
+                AutoLock::Never,
+                true,
+                Some(crate::accounts::one_available_account("harness@example.invalid")),
+                true,
+                env,
+            );
+            let ctx = egui::Context::default();
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input(), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(input(), |_ui| {});
+            let mut frames = |n: usize| {
+                for _ in 0..n {
+                    let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+                }
+            };
+
+            // The window's open, and then quiet: the list is asked for once and
+            // not again. Without this control, a list refetched on every frame
+            // would pass the assertion below.
+            frames(4);
+            let (syncs, loads, lists) = counts();
+            assert_eq!(lists, 1, "the window's open did not ask for the Sends list exactly once");
+            frames(3);
+            assert_eq!(counts(), (syncs, loads, lists), "a quiet window asked for something again");
+
+            // A recipient opens a link, twice, and the owner revokes another.
+            let pushes = PUSHES
+                .with(|slot| slot.borrow_mut().take())
+                .expect("control: the frame never started the hub listener");
+            for _ in 0..3 {
+                pushes.hear_one();
+            }
+            frames(3);
+
+            let (after_syncs, after_loads, after_lists) = counts();
+            assert_eq!(
+                after_lists,
+                lists + 1,
+                "a burst of three Send pushes did not refetch the Sends list exactly once"
+            );
+            assert_eq!(
+                (after_syncs, after_loads),
+                (syncs, loads),
+                "a Send push reached the vault -- a sync or a reload, each a whole-vault read on a \
+                 direct-REST account, for a list the vault does not contain"
+            );
+            assert_eq!(pushes.vault_announcements_waiting(), 0, "a Send push entered the vault inbox");
         }
     }
 }

@@ -87,6 +87,10 @@ enum HubMessage {
     /// the log line, which is how "did the server say anything?" is
     /// answered without a debugger.
     VaultChanged { push_type: i64, announced: Announcement },
+    /// A `ReceiveMessage` about a Send -- see [`sends_notice_for`]. Carries
+    /// nothing but its type, for the log line: what it causes is a refetch of
+    /// the Sends list, never a look at the vault.
+    SendsChanged { push_type: i64 },
     /// Anything else the server may say: a keep-alive, an invocation of a
     /// type this app has no use for (a Send, a login-with-device request),
     /// a completion.
@@ -129,6 +133,9 @@ fn read_one(frame: &str) -> HubMessage {
                         announced: announcement_for(push_type, payload),
                     }
                 }
+                (Some("ReceiveMessage"), Some(push_type)) if sends_notice_for(push_type) => {
+                    HubMessage::SendsChanged { push_type }
+                }
                 _ => HubMessage::Ignored,
             }
         }
@@ -152,10 +159,25 @@ fn read_one(frame: &str) -> HubMessage {
 /// Not the Sends (`12`-`14`): the Sends screen fetches its own list and a
 /// vault sync would not refresh it, so a Send notice would buy a whole-vault
 /// download for nothing -- on the owner's server, about 3,400 database rows.
+/// Those are [`sends_notice_for`]'s, and go to a channel of their own.
 /// Not a login-with-device request (`15`, `16`), which this app does not
 /// offer.
 fn notice_for(push_type: i64) -> bool {
     matches!(push_type, 0..=11 | 17..=19)
+}
+
+/// **Which pushes mean "the Sends list is stale"**: `SyncSendCreate`,
+/// `SyncSendUpdate` and `SyncSendDelete`.
+///
+/// NodeWarden sends the update on every ACCESS, too -- a recipient opening a
+/// link moves the Send's access count -- and that is the case the owner
+/// reported: a link opened twice, and a Sent screen still saying "opened
+/// once". Bitwarden's own clients refetch the Sends on these; so does this
+/// one, and ONLY the Sends. They never enter the vault inbox: an announcement
+/// there makes the heartbeat due, and whatever it cannot target is a
+/// whole-vault sync. See [`HubListener::sends_changed`].
+fn sends_notice_for(push_type: i64) -> bool {
+    matches!(push_type, 12..=14)
 }
 
 /// **What one push says changed**, as precisely as the push says it.
@@ -384,6 +406,14 @@ struct Inbox {
     /// When the latest arrived, which is what [`HubListener::settled`] waits
     /// out.
     last: Option<Instant>,
+    /// When the latest Send push arrived, if one has not been taken yet.
+    ///
+    /// **A time and not a list**, because a Send push has nothing to say
+    /// but "the list moved": a burst of ten -- a recipient opening a link
+    /// is one each, and so is every create, edit and revoke -- is answered by
+    /// ONE refetch, and the time is all [`HubListener::sends_changed`] needs
+    /// to wait the burst out.
+    sends: Option<Instant>,
 }
 
 impl Shared {
@@ -391,6 +421,10 @@ impl Shared {
         let mut inbox = self.inbox.lock().unwrap_or_else(PoisonError::into_inner);
         inbox.announced.push(announced);
         inbox.last = Some(Instant::now());
+    }
+
+    fn notice_sends(&self) {
+        self.inbox.lock().unwrap_or_else(PoisonError::into_inner).sends = Some(Instant::now());
     }
 }
 
@@ -453,6 +487,31 @@ impl HubListener {
         let mut inbox = self.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
         inbox.last = None;
         std::mem::take(&mut inbox.announced)
+    }
+
+    /// **Whether a Send changed on the server** -- asked and answered in one
+    /// call: `true` once, when the latest Send push is [`Timing::settle`]
+    /// old, and `false` after that until another arrives.
+    ///
+    /// Separate from [`Self::settled`] and [`Self::take`] on purpose. Those
+    /// feed the window's heartbeat, whose answer to anything it cannot apply
+    /// one item at a time is a whole-vault sync; a Send push that reached
+    /// them would be ~1,700 rows on the owner's server to refresh a list the
+    /// vault does not even contain. The window's only answer to THIS one is
+    /// to drop its Sends list, so the next frame asks for it again.
+    ///
+    /// Taking and asking are one call here, unlike the vault pair: there is
+    /// no decision between them for a late push to fall into, and a push
+    /// landing after this answered is simply the next `true`.
+    pub fn sends_changed(&self, now: Instant) -> bool {
+        let mut inbox = self.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        match inbox.sends {
+            Some(at) if now.saturating_duration_since(at) >= self.settle => {
+                inbox.sends = None;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -677,8 +736,10 @@ fn one_connection(
                     log::info!("the notifications hub is connected");
                     if *connected_before {
                         // Down for a while: whatever changed meanwhile was
-                        // said to nobody.
+                        // said to nobody -- the Sends included, which cost a
+                        // list and not a vault.
                         shared.notice(Announcement::Whole);
+                        shared.notice_sends();
                     }
                     *connected_before = true;
                 }
@@ -686,13 +747,19 @@ fn one_connection(
                     log::info!("the notifications hub says the vault changed (push type {push_type})");
                     shared.notice(announced);
                 }
+                HubMessage::SendsChanged { push_type } if acked => {
+                    log::info!("the notifications hub says a Send changed (push type {push_type})");
+                    shared.notice_sends();
+                }
                 HubMessage::Close => {
                     return Ended::Dropped("the hub said goodbye".to_string());
                 }
                 HubMessage::Unreadable => {
                     return Ended::Unsupported("a hub protocol other than JSON".to_string());
                 }
-                HubMessage::VaultChanged { .. } | HubMessage::Ignored => {}
+                HubMessage::VaultChanged { .. }
+                | HubMessage::SendsChanged { .. }
+                | HubMessage::Ignored => {}
             }
         }
     }
@@ -795,9 +862,47 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
     }))
 }
 
+/// `pub(crate)` for one sibling: `vault_window`'s frame harness, which needs
+/// a listener it can make hear a Send push without a websocket. See
+/// [`tests::a_listener_the_test_can_push_to`].
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// The test's end of a [`HubListener`] that is connected to nothing.
+    pub(crate) struct SendPushes(Arc<Shared>);
+
+    impl SendPushes {
+        /// What [`one_connection`] does on hearing push type 12, 13 or 14.
+        pub(crate) fn hear_one(&self) {
+            self.shared().notice_sends();
+        }
+
+        /// The vault inbox the same listener feeds the heartbeat from, so a
+        /// harness can say that a Send push put nothing in it.
+        pub(crate) fn vault_announcements_waiting(&self) -> usize {
+            self.shared().inbox.lock().unwrap_or_else(PoisonError::into_inner).announced.len()
+        }
+
+        fn shared(&self) -> &Shared {
+            &self.0
+        }
+    }
+
+    /// **A listener with no thread and no socket**, whose pushes the test
+    /// delivers itself through the returned [`SendPushes`].
+    ///
+    /// `settle` is zero, so a delivered push is answered on the next frame
+    /// -- the burst rule is `a_burst_of_send_pushes_is_one_refetch`'s to
+    /// hold, with a real settle, and a frame harness measuring it again would
+    /// be measuring a clock.
+    pub(crate) fn a_listener_the_test_can_push_to() -> (HubListener, SendPushes) {
+        let shared = Arc::new(Shared::default());
+        (
+            HubListener { shared: Arc::clone(&shared), settle: Duration::ZERO },
+            SendPushes(shared),
+        )
+    }
     use std::net::TcpListener;
     use std::sync::mpsc;
     use tungstenite::handshake::server::{ErrorResponse, Request, Response};
@@ -830,7 +935,8 @@ mod tests {
     /// **Which pushes cost a sync.** A Send or a login-with-device request
     /// does not: each would be a whole-vault download that changes nothing
     /// on screen. A log-out does, because the sync's 401 is what signs the
-    /// window out.
+    /// window out. The three Send pushes are read -- as `SendsChanged`, which
+    /// is a list refetch and never a sync -- and the rest are still ignored.
     #[test]
     fn only_a_push_that_can_change_the_vault_on_screen_asks_for_a_sync() {
         let invocation = |push_type: i64| {
@@ -847,7 +953,14 @@ mod tests {
                 "{push_type}"
             );
         }
-        for push_type in [12, 13, 14, 15, 16, 20, 102] {
+        for push_type in [12, 13, 14] {
+            assert_eq!(
+                read_messages(&invocation(push_type)),
+                [HubMessage::SendsChanged { push_type }],
+                "{push_type}"
+            );
+        }
+        for push_type in [15, 16, 20, 102] {
             assert_eq!(read_messages(&invocation(push_type)), [HubMessage::Ignored], "{push_type}");
         }
         // Another target entirely is not a vault change, whatever it carries.
@@ -1100,21 +1213,54 @@ mod tests {
         assert_eq!(seen.texts.first().map(String::as_str), Some(HANDSHAKE));
     }
 
-    /// A push of a kind that does not change the vault is not a notice.
+    /// **A Send push is not a vault notice -- it marks the Sends stale**, and
+    /// only them.
+    ///
+    /// `settled` staying false is the half about cost: it is what the
+    /// window's heartbeat asks, and a push that reached it would end in a
+    /// whole-vault sync. `sends_changed` answering once is the half the owner
+    /// reported missing -- a link opened, and the Sent screen never told.
     #[test]
-    fn a_send_push_is_not_a_notice() {
+    fn a_send_push_is_not_a_vault_notice_but_marks_the_sends_stale() {
         let (base, _seen) = hub(
             vec![Box::new(|socket| {
                 ack(socket);
-                push(socket, 12);
+                push(socket, 13);
                 std::thread::sleep(Duration::from_millis(300));
             })],
             false,
         );
         let probe = listen_to(&base);
         eventually("the hub is live", || probe.listener.is_live());
-        std::thread::sleep(Duration::from_millis(200));
-        assert!(!probe.listener.settled(Instant::now()));
+        eventually("the Send push is heard", || probe.listener.sends_changed(Instant::now()));
+        assert!(!probe.listener.settled(Instant::now()), "a Send push became a vault notice");
+        assert!(probe.listener.take().is_empty(), "a Send push reached the vault inbox");
+        assert!(
+            !probe.listener.sends_changed(Instant::now()),
+            "one push answered twice, so one link opening would refetch the list forever"
+        );
+    }
+
+    /// **A burst of Send pushes is one refetch**, once it has settled.
+    ///
+    /// A recipient opening a link is one push; a bulk revoke is one per Send.
+    /// A list refetched per push would be a handful of requests where one
+    /// does, so the pushes coalesce exactly as the vault's do.
+    #[test]
+    fn a_burst_of_send_pushes_is_one_refetch() {
+        let listener = HubListener { shared: Arc::new(Shared::default()), settle: Duration::from_secs(2) };
+        for _ in 0..3 {
+            listener.shared.notice_sends();
+        }
+        let now = Instant::now();
+        assert!(!listener.sends_changed(now), "answered mid-burst");
+        assert!(listener.sends_changed(now + Duration::from_secs(2)), "never answered");
+        assert!(
+            !listener.sends_changed(now + Duration::from_secs(3)),
+            "three pushes were answered twice"
+        );
+        assert!(!listener.settled(now + Duration::from_secs(3)), "a Send burst became a sync");
+        listener.shared.stop.store(true, Ordering::SeqCst);
     }
 
     /// **The client keeps the connection alive itself**, because a
@@ -1194,6 +1340,8 @@ mod tests {
         let probe = listen_to(&base);
         eventually("the reconnect is a notice", || probe.listener.settled(Instant::now()));
         assert_eq!(probe.listener.take(), [Announcement::Whole], "a reconnect is a whole sync");
+        // And the Sends were said to nobody too; theirs is a list refetch.
+        assert!(probe.listener.sends_changed(Instant::now()), "a reconnect left the Sends list as it was");
         assert!(probe.listener.is_live());
     }
 
