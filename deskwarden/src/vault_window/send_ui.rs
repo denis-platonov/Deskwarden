@@ -612,12 +612,13 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
         n => format!("Opened {n} times"),
     };
     match crate::send::send_state(send, now) {
-        // The one state a person caused, and the only one with an undo, so
-        // the sentence names the undo. `SWITCH_ON_LABEL` rather than the word
-        // "revoke": see that constant for why this screen does not spend that
-        // word here.
+        // Somebody switched the link off -- in another Bitwarden app, since
+        // this one no longer does: its Revoke deletes the Send. There is no
+        // undo to name here, so the sentence says what is true of the link
+        // and stops. Not the word "revoke", which on this screen means the
+        // Send is gone rather than switched off.
         crate::send::SendState::Revoked => {
-            format!("{opened}. You turned the link off -- {SWITCH_ON_LABEL} to let it work again.")
+            format!("{opened}. The link was switched off, so it no longer answers.")
         }
         crate::send::SendState::Used => {
             format!("{opened}. Every permitted view is spent, so the link is dead.")
@@ -868,19 +869,6 @@ pub enum SendUiAction {
     /// The confirmation was declined. Its button occupies the pixels the
     /// Delete button was drawn in -- see [`draw_row`].
     CancelDelete,
-    /// **Design §5c's Revoke, and its undo**: switch this row's link off
-    /// (`disabled: true`) or back on.
-    ///
-    /// `disabled` is what the row ASKED for rather than what it currently is,
-    /// which is the same rule the id and the name follow here and for the
-    /// same reason: everything the far side needs is read off the row that
-    /// was clicked, so no second lookup can resolve to a different Send or to
-    /// a stale reading of this one.
-    ///
-    /// **One step, where a delete is two.** See
-    /// `vault_window::apply_send_action`: a confirmation exists because a
-    /// delete cannot be undone, and this can -- by pressing the button again.
-    SetDisabled { id: String, name: String, disabled: bool },
     /// The header's New Send button was pressed: put the composer on screen.
     OpenComposer,
     /// The composer's Discard button was pressed: take it off screen and wipe
@@ -1034,11 +1022,33 @@ pub fn no_sends_screen_this_frame() -> SendUiVerdict {
 /// the same `in_flight` lock and reporting through the same band as a Revoke
 /// pressed on the Sends screen itself.
 ///
-/// It carries exactly one action, named here, with the id and the name the
-/// caller found; `SendUiVerdict::seal` and the field stay private, so this is
-/// still not a door to substituting an arbitrary action for a drawn pane's.
-pub fn revoke_from_the_read_pane(id: String, name: String) -> SendUiVerdict {
-    SendUiVerdict::seal(SendUiAction::SetDisabled { id, name, disabled: true })
+/// It carries exactly one action, chosen here from the three the card can ask
+/// for, with the id and the name the caller found; `SendUiVerdict::seal` and
+/// the field stay private, so this is still not a door to substituting an
+/// arbitrary action for a drawn pane's.
+///
+/// **Revoke is a delete, and asks first**, exactly as on the Sent screen: the
+/// three requests map onto that screen's own three actions, so the card arms,
+/// answers and disarms the same confirmation the Sent screen does.
+pub fn revoke_from_the_read_pane(asked: ReadPaneRevoke) -> SendUiVerdict {
+    SendUiVerdict::seal(match asked {
+        ReadPaneRevoke::Ask(id) => SendUiAction::AskDelete(id),
+        ReadPaneRevoke::Confirm { id, name } => SendUiAction::ConfirmDelete { id, name },
+        ReadPaneRevoke::Cancel => SendUiAction::CancelDelete,
+    })
+}
+
+/// What the read pane's `SHARING` card asked of its Send this frame -- the
+/// Sent screen's two steps and their way out, and nothing else. See
+/// [`revoke_from_the_read_pane`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadPaneRevoke {
+    /// Revoke was pressed: arm the confirmation on this Send.
+    Ask(String),
+    /// `Delete permanently` was pressed: delete this Send.
+    Confirm { id: String, name: String },
+    /// The confirmation was declined.
+    Cancel,
 }
 
 /// **One share of a person being forgotten, deleted.** The owner confirmed
@@ -1091,25 +1101,6 @@ pub struct SendDeleteView<'a> {
     pub in_flight: Option<&'a str>,
 }
 
-/// **Design §5c's Revoke, under a name this screen can use.**
-///
-/// The design calls the `disabled` flag Revoke, and this screen cannot: the
-/// word is already spoken for. `REVOKE_LABEL`'s own confirmation reads
-/// "Revoke this link for good? It cannot be undone", and every sentence,
-/// constant and test around the delete path in this crate calls it the
-/// revoke. Two controls on one row both called Revoke, one of which is
-/// permanent and one of which is not, is the worst outcome available here.
-///
-/// So the two say what they do to the link, which is also the one thing that
-/// distinguishes them from Delete: this takes the link down and keeps the
-/// Send, and it can be pressed again. **This is a departure from the design
-/// and it is the owner's to settle** -- the other way to resolve it is to
-/// rename the destructive path, which is a bigger change than a label and
-/// touches wording this screen's tests are pinned to.
-pub const SWITCH_OFF_LABEL: &str = "Switch off";
-/// The undo of [`SWITCH_OFF_LABEL`]. Drawn only on a row whose state is
-/// already `Revoked`, so the two are never offered at once.
-pub const SWITCH_ON_LABEL: &str = "Switch on";
 /// The detail header's **primary** control, and the one the screen is for: a
 /// Send exists so that a link can be handed to somebody.
 ///
@@ -5944,12 +5935,10 @@ mod paint_tests {
         ///
         /// **Exact and not `contains`, which is what the two above do.** That
         /// is right for a sentence -- "is this paragraph on screen" -- and
-        /// wrong for a control, and the difference is now load-bearing: the
-        /// detail pane's activity line for a revoked Send reads "You turned
-        /// the link off -- Switch on to let it work again", so a substring
-        /// count of `Switch on` cannot tell the sentence from the button it
-        /// names. Naming the button in prose is good writing and the test
-        /// has to be the thing that adapts.
+        /// wrong for a control: a sentence that names a button contains the
+        /// button's label, so a substring count cannot tell the sentence from
+        /// the button it names. Naming the button in prose is good writing
+        /// and the test has to be the thing that adapts.
         fn rects_of_exact(&self, label: &str) -> Vec<egui::Rect> {
             self.text_rects
                 .iter()
@@ -8739,7 +8728,7 @@ mod paint_tests {
             (SendSummary { access_count: 1, max_access_count: None, ..base.clone() }, SendState::Waiting, "Opened once"),
             (SendSummary { access_count: 3, max_access_count: Some(10), ..base.clone() }, SendState::Waiting, "7 views left"),
             (SendSummary { access_count: 1, max_access_count: Some(1), ..base.clone() }, SendState::Used, "spent"),
-            (SendSummary { disabled: true, ..base.clone() }, SendState::Revoked, SWITCH_ON_LABEL),
+            (SendSummary { disabled: true, ..base.clone() }, SendState::Revoked, "switched off"),
             (
                 SendSummary {
                     deletion_date: "2026-08-01T00:00:00.000Z".to_string(),
@@ -10661,115 +10650,40 @@ mod source_pins {
         );
     }
 
-    /// **The switch is three equalities**, on
+    /// **The Sends worker asks `tasks_for` ONCE and then branches on what the
+    /// ROW wanted** -- on
     /// [`the_delegated_fetch_is_a_real_bw_send_list_for_the_active_account`]'s
-    /// terms and for its reasons, plus the census that keeps the REST entry
-    /// point to one caller.
+    /// terms and for its reasons.
     ///
-    /// What each one holds:
+    /// This is the property that makes another operation free:
+    /// `the_backend_is_chosen_in_exactly_one_place` counts `tasks_for(`, and a
+    /// verb that asked again would be one more -- a second reading of the
+    /// backend, which is the shape all six of this window's original defects
+    /// had. A branch on `backend_policy::selected()` written in here fails
+    /// this equality and that census at once.
     ///
-    ///  1. **The worker asks `tasks_for` ONCE and then branches on what the
-    ///     ROW wanted.** This is the property that makes a seventh operation
-    ///     free: `the_backend_is_chosen_in_exactly_one_place` counts
-    ///     `tasks_for(` at seven, and a switch that asked again would be an
-    ///     eighth -- a second reading of the backend, which is the shape all
-    ///     six of this window's original defects had. A branch on
-    ///     `backend_policy::selected()` written in here fails this equality
-    ///     and that census at once.
-    ///  2. **The built-in arm is one call to the REST client**, and it reports
-    ///     what was ASKED for rather than what the server used to hold --
-    ///     `rest::send::set_disabled` already refuses to return `Ok` unless
-    ///     the server echoed the flag back, so `disabled` here is confirmed
-    ///     and not assumed.
-    ///  3. **The CLI arm is a refusal and nothing else.** It names no `bw`
-    ///     entry point, starts no child, and cannot: `bw send` has no verb
-    ///     for `disabled`. The equality is what stops that becoming a quiet
-    ///     `Ok(())` -- which would tell a `bw serve` user their link is off
-    ///     while it stayed live, the exact lie `rest::send::set_disabled`'s
-    ///     own doc is written against.
+    /// **It used to pin a switch as well**, a link turned off and on through
+    /// the built-in client and refused in words by the CLI. Revoke deletes
+    /// now, on the Sent screen and on a record's SHARING card alike, and the
+    /// switch went with everything that reached it.
     #[test]
-    fn the_switch_is_the_built_in_clients_and_the_cli_refuses_it_in_words() {
-        // 1. One backend read, then a branch on the row's own verb.
+    fn the_sends_worker_reads_the_backend_once_and_branches_on_the_rows_verb() {
         assert_eq!(
             squashed(&sanitized(&body_of(concat!("real_send_", "delete"), "    "))),
             squashed(
                 "id: &str, name: &str, session: &str, op: SendRowOp, ) -> SendDeleteReport { \
                  let tasks = super::backend_tasks::tasks_for(Some(session)); match op { \
-                 SendRowOp::Delete => tasks.send_delete(id, name), SendRowOp::Disable => \
-                 tasks.send_set_disabled(id, name, true), SendRowOp::Enable => \
-                 tasks.send_set_disabled(id, name, false), }"
+                 SendRowOp::Delete => tasks.send_delete(id, name), }"
             ),
             "the Sends worker is no longer one backend choice followed by a branch on what \
              the row asked for. A second `tasks_for` here is a second reading of the backend \
              between the frame and the thread, and an account switch happens in that gap"
         );
-
-        // 2. The built-in arm.
-        assert_eq!(
-            squashed(&sanitized(&body_in(
-                &tasks_impl("impl BackendTasks for DirectRestTasks"),
-                "send_set_disabled",
-                "        ",
-            ))),
-            squashed(&format!(
-                "&self, id: &str, name: &str, disabled: bool) -> SendDeleteReport {{ match \
-                 crate::rest::send::{}(id, disabled) {{ Ok(()) => \
-                 SendDeleteReport::Switched {{ name: name.to_string(), disabled }}, \
-                 Err(error) => {{ SendDeleteReport::SwitchFailed {{ name: name.to_string(), \
-                 disabled, error }} }} }}",
-                concat!("set_disabled_on_active_", "account"),
-            )),
-            "the built-in switch is no longer exactly one call to the REST client reporting \
-             the flag it asked for"
-        );
-
-        // 3. The CLI arm: a refusal, with no `bw` in it.
-        let cli = sanitized(&tasks_impl("impl BackendTasks for CliTasks<'_>"));
-        let body = squashed(&sanitized(&body_in(
-            &tasks_impl("impl BackendTasks for CliTasks<'_>"),
-            "send_set_disabled",
-            "        ",
-        )));
-        assert_eq!(
-            body,
-            squashed(
-                "&self, _id: &str, name: &str, disabled: bool) -> SendDeleteReport { \
-                 SendDeleteReport::SwitchFailed { name: name.to_string(), disabled, error: \
-                 crate::send::SendError::Rejected( \" \" .to_string(), ), }"
-            ),
-            "the CLI switch is no longer exactly a refusal. `bw send` has no verb that sets \
-             `disabled`, so anything here that is not a refusal either starts a child that \
-             cannot do the job or reports a success that did not happen"
-        );
-        // It takes the id by `_id` because there is nothing to name it TO --
-        // a body that started using it is a body that found something to run.
+        // Nothing in production reaches for the switch any more, on either
+        // side of the trait.
         assert!(
-            body.contains("_id: &str"),
-            "the CLI switch has found a use for the Send's id, which means it is doing \
-             something with it: {body}"
-        );
-        assert!(
-            !body.contains(concat!("cli_send_", "")) && !body.contains(concat!("Self::", "job")),
-            "the CLI switch names a `bw send` entry point or this window's job: {body}"
-        );
-        // Control: the same impl really does spawn for its other operations,
-        // so the absence above is about this method and not about a slice
-        // that found nothing.
-        assert!(
-            cli.contains(concat!("cli_send_", "delete")),
-            "control: the `bw serve` implementation no longer spawns anything at all"
-        );
-
-        // 4. The REST entry point has exactly one caller. A second is
-        // unproven ground for which thread it runs on and which backend the
-        // account is on.
-        assert_eq!(
-            production()
-                .matches(concat!("crate::rest::send::set_disabled_on_active_", "account("))
-                .count(),
-            1,
-            "`set_disabled_on_active_account` is called somewhere other than the built-in \
-             implementation of `BackendTasks`"
+            !production().contains(concat!("send_set_", "disabled")),
+            "a switch is back on the Sends backend, and nothing on screen asks for one"
         );
     }
 

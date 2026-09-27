@@ -22,6 +22,7 @@
 
 use super::record_ui;
 use super::relative_time;
+use super::send_ui;
 use super::totp_add;
 use super::sidebar::OutOfVault;
 use crate::app_match::AppMatch;
@@ -583,18 +584,26 @@ pub const MAX_HISTORY_ROWS: usize = 8;
 pub enum DetailAction {
     None,
     Edit,
-    /// **Design 5d** -- turn off the live Send this record has out.
+    /// **Design 5d** -- the SHARING card's Revoke was pressed: ask whether to
+    /// delete the live Send this record has out. **Step one of two, and it
+    /// destroys nothing**; it arms the same confirmation the Sent screen's
+    /// Revoke arms, and the card redraws with the question.
     ///
     /// Carries nothing: the window re-finds the Send the card was drawn from,
-    /// the same way `Edit` and `Clone` re-find the item. And it is a REVOKE
-    /// and not a delete -- `SendSummary::disabled`'s own note -- so the Send
-    /// stays in the Sends screen's list, revoked, where it can be switched
-    /// back on.
+    /// the same way `Edit` and `Clone` re-find the item. **Revoke is a
+    /// delete**, on this card as on the Sent screen: it used to switch the
+    /// link off and leave the Send behind, and the owner's word for what a
+    /// Revoke does is that the Send is gone.
     ///
-    /// On the **non**-exposing side of `detail_action_exposes_secrets`: it
-    /// takes a link away. Nothing is read out of the item, painted, or
-    /// copied.
+    /// On the **non**-exposing side of `detail_action_exposes_secrets`, with
+    /// its two siblings below: all three take a link away or decline to.
+    /// Nothing is read out of the item, painted, or copied.
     RevokeSend,
+    /// **Step two**: the confirmation's `Delete permanently` was pressed.
+    ConfirmRevokeSend,
+    /// The confirmation's way out. Drawn where Revoke was, so a second rapid
+    /// click lands on it rather than on the destructive button.
+    CancelRevokeSend,
     /// **Design 4a** -- open the sequence builder on this item's fill rule.
     ///
     /// Its own act rather than a corner of [`Self::Edit`], because it opens a
@@ -3180,8 +3189,9 @@ pub fn draw_detail_read(
     // **Design 5d**: the Send this record has out right now, or `None`.
     // Resolved by the window from the Sends list it already fetches -- see
     // `send_ui::live_send_named`, which owns the question of what links a Send
-    // to a record and why the link is the name.
-    shared: Option<&crate::send::SendSummary>,
+    // to a record and why the link is the name. It carries where that Send's
+    // revoke has got to, too; see [`SharedSend`].
+    shared: Option<SharedSend<'_>>,
     // `Settings::check_breaches`, as the window has it THIS frame -- the
     // preference is off by default and this pane is its first and only
     // reader. A bool rather than the whole `Settings` because that is the
@@ -4307,9 +4317,9 @@ pub fn draw_detail_read(
     // promise: "it always means someone can open this right now, never 'was
     // shared once'". A card that stood empty saying "not shared" would be the
     // opposite -- a permanent row about a thing that is not happening.
-    if let Some(send) = shared {
+    if let Some(shared) = shared {
         card(ui, SHARING_CARD_HEADING, |ui| {
-            sharing_card(ui, send, &crate::send::SystemClock, &mut action);
+            sharing_card(ui, shared, &crate::send::SystemClock, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -5826,6 +5836,23 @@ pub const SEND_REACH: &str = "Anyone with the link";
 pub const SHARING_NOTE: &str =
     "The pill disappears on its own when the Send expires or is revoked \u{2014} it always      means someone can open this right now, never \"was shared once\".";
 
+/// **The live Send the SHARING card is about, and where its revoke has got
+/// to.**
+///
+/// The two flags are the window's `SendDeleteState` read for THIS Send's id,
+/// so the card and the Sent screen draw one confirmation and one busy state
+/// between them rather than two that can disagree. A Revoke armed here and
+/// then looked at on the Sent screen is the same question in both places,
+/// answered once.
+#[derive(Debug, Clone, Copy)]
+pub struct SharedSend<'a> {
+    pub send: &'a crate::send::SendSummary,
+    /// This Send's confirmation is up: the card asks before it deletes.
+    pub confirming: bool,
+    /// A delete of this Send is running: the card has no controls at all.
+    pub revoking: bool,
+}
+
 /// **Design 5d's card body.**
 ///
 /// Three facts and two controls, and every one of the three is read off the
@@ -5840,12 +5867,23 @@ pub const SHARING_NOTE: &str =
 /// line true on one machine and absent on the others, which is worse than not
 /// claiming it, because a card that says nothing is read as "not shown" and a
 /// card that says it here and not there is read as "different Sends".
+///
+/// # Revoke deletes, and asks first
+///
+/// The Sent screen's two steps, in the Sent screen's words: Revoke arms the
+/// question, `Delete permanently` answers it, and Cancel is drawn **exactly
+/// where Revoke was**, with `Send again` stepping back but keeping its room,
+/// so a second rapid click on Revoke lands on the way out. The question and
+/// the destructive button go UNDER the controls rather than above them, for
+/// the same reason: anything inserted above would push the row down and put
+/// something else under the pointer.
 fn sharing_card(
     ui: &mut egui::Ui,
-    send: &crate::send::SendSummary,
+    shared: SharedSend<'_>,
     now: &dyn crate::send::SendClock,
     action: &mut DetailAction,
 ) {
+    let send = shared.send;
     row(
         ui,
         ACTIVE_SEND_LABEL,
@@ -5868,8 +5906,31 @@ fn sharing_card(
         .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
         .show(ui, |ui| {
             ui.set_width(line);
+            if shared.revoking {
+                // **No widget of any kind** while the delete runs, which is
+                // the Sent screen's rule for the same state: a disabled
+                // button is still a button the layout has to hold, and one
+                // more click here would be a second child for one Send.
+                ui.label(
+                    RichText::new(send_ui::DELETING_LABEL)
+                        .size(ROW_HINT_SIZE)
+                        .color(theme::TEXT_MUTED),
+                );
+                return;
+            }
             ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                if shared.confirming {
+                    // `Send again` steps back and its room is kept, so Cancel
+                    // starts at the very pixel Revoke did. `add_space` adds
+                    // no item spacing of its own, so the gap is added here.
+                    let room = theme::row_button_width(ui, SEND_AGAIN_LABEL) + CONTROL_GAP;
+                    ui.add_space(room);
+                    if theme::row_button(ui, send_ui::CANCEL_LABEL).clicked() {
+                        *action = DetailAction::CancelRevokeSend;
+                    }
+                    return;
+                }
                 // **Send again first, Revoke second**, which is the order the
                 // app card's footer uses for the same reason: the ordinary
                 // action reads first and the one that takes something away
@@ -5880,14 +5941,29 @@ fn sharing_card(
                 {
                     *action = DetailAction::SendRecord;
                 }
-                if theme::row_button(ui, REVOKE_LABEL)
-                    .on_hover_text("Turn this link off. It stays in Sends and can be switched \
-                                    back on")
+                // In the danger ink now that it deletes, as the Sent screen's
+                // Revoke is red; step one still destroys nothing.
+                if theme::row_button_danger(ui, REVOKE_LABEL)
+                    .on_hover_text("Delete this Send, so its link stops working for good")
                     .clicked()
                 {
                     *action = DetailAction::RevokeSend;
                 }
             });
+            if shared.confirming {
+                ui.add_space(10.0);
+                ui.label(
+                    theme::semibold(send_ui::CONFIRM_PROMPT, ROW_VALUE_SIZE).color(theme::ERROR),
+                );
+                ui.add_space(8.0);
+                // Cancel wins an ambiguous frame: the safe answer to one on a
+                // destructive control is not to destroy.
+                if theme::destructive_button(ui, send_ui::CONFIRM_LABEL).clicked()
+                    && *action != DetailAction::CancelRevokeSend
+                {
+                    *action = DetailAction::ConfirmRevokeSend;
+                }
+            }
         });
     row(
         ui,
@@ -9794,6 +9870,11 @@ mod tests {
         /// default, so every existing test here keeps measuring the pane a
         /// user gets out of the box.
         reveal_totp_seed: bool,
+        /// Design 5d's live Send and where its revoke has got to --
+        /// `(send, confirming, revoking)`, as `SendDeleteState::sharing` would
+        /// hand the pane one. `None` unless a test sets it (see
+        /// [`Pane::sharing`]), which is every pane with no Send out.
+        shared: Option<(crate::send::SendSummary, bool, bool)>,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -10227,7 +10308,15 @@ mod tests {
                 folders: Vec::new(),
                 apps: crate::app_identity::AppIdentityCache::default(),
                 reveal_totp_seed: false,
+                shared: None,
             }
+        }
+
+        /// The same pane, on a record with a live Send out, its revoke at the
+        /// step the two flags name.
+        fn sharing(mut self, send: crate::send::SendSummary, confirming: bool, revoking: bool) -> Self {
+            self.shared = Some((send, confirming, revoking));
+            self
         }
 
         /// The same pane, on a machine where the executable at `path` really
@@ -10297,7 +10386,11 @@ mod tests {
                         &mut self.reveal,
                         None,
                         &mut self.apps,
-                None,
+                        self.shared.as_ref().map(|(send, confirming, revoking)| SharedSend {
+                            send,
+                            confirming: *confirming,
+                            revoking: *revoking,
+                        }),
                         false,
                         self.reveal_totp_seed,
                         &mut inert_breach_cache());
@@ -18526,6 +18619,108 @@ mod tests {
                 eyes[0].left()
             );
         }
+    }
+
+    // ------------------------------------------------ 5d's SHARING card
+
+    /// A live Send, as the SHARING card is handed one: nobody has opened it,
+    /// and it is years from being deleted, so every reading of it is `Waiting`.
+    fn a_live_send() -> crate::send::SendSummary {
+        crate::send::SendSummary {
+            id: "send-on-the-card".to_string(),
+            name: "Ledgerline".to_string(),
+            access_url: "https://send.example/#/abc/key".to_string(),
+            deletion_date: "2099-01-01T00:00:00.000Z".to_string(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
+        }
+    }
+
+    /// **The card's Revoke deletes the Send, and asks first -- the Sent
+    /// screen's two steps, in its words.**
+    ///
+    /// It used to switch the link off in one click. The mutant this exists
+    /// against is the tidy one-step delete: a Revoke that reports the
+    /// CONFIRMED action on its first press destroys a public link on a
+    /// mis-aimed click, with no undo. So the first press must report only the
+    /// question, the confirmation must put Cancel under the pointer that
+    /// pressed Revoke, and only the confirmation's own button may delete.
+    #[test]
+    fn the_sharing_cards_revoke_asks_first_and_only_its_confirmation_deletes() {
+        let item = a_login();
+        let totp = TotpState::NoSecret;
+
+        // Idle: both controls, and no question.
+        let mut idle_pane = Pane::new().sharing(a_live_send(), false, false);
+        let idle = idle_pane.idle(&item, &totp);
+        assert!(idle.painted(SHARING_CARD_HEADING), "no SHARING card: {:?}", idle.strings());
+        assert!(idle.painted(SEND_AGAIN_LABEL), "{:?}", idle.strings());
+        assert!(!idle.painted(send_ui::CONFIRM_LABEL), "{:?}", idle.strings());
+        let revoke_at = idle.rect_of(REVOKE_LABEL).center();
+        let pressed = idle_pane.click(&item, &totp, revoke_at);
+        assert_eq!(
+            pressed.action,
+            DetailAction::RevokeSend,
+            "Revoke did not ask; it must arm the confirmation and destroy nothing"
+        );
+
+        // Confirming: the question, the destructive button, and Cancel under
+        // the pointer that pressed Revoke.
+        let mut asking_pane = Pane::new().sharing(a_live_send(), true, false);
+        let asking = asking_pane.idle(&item, &totp);
+        assert!(asking.painted(send_ui::CONFIRM_PROMPT), "{:?}", asking.strings());
+        assert!(!asking.painted(REVOKE_LABEL), "Revoke is still offered while it asks");
+        assert!(
+            !asking.painted(SEND_AGAIN_LABEL),
+            "Send again stayed beside a question about destroying the link: {:?}",
+            asking.strings()
+        );
+        let (cancel_box, _) = asking.menu_row_of(send_ui::CANCEL_LABEL);
+        assert!(
+            cancel_box.contains(revoke_at),
+            "Cancel ({cancel_box:?}) is not where Revoke was ({revoke_at:?}), so a second \
+             rapid click lands on something else"
+        );
+        let (delete_box, _) = asking.menu_row_of(send_ui::CONFIRM_LABEL);
+        assert!(
+            !delete_box.contains(revoke_at),
+            "the destructive button sits under the pointer that pressed Revoke"
+        );
+        assert!(
+            delete_box.top() > cancel_box.bottom(),
+            "the question was drawn above the controls, which moves them"
+        );
+        let second_click = asking_pane.click(&item, &totp, revoke_at);
+        assert_eq!(
+            second_click.action,
+            DetailAction::CancelRevokeSend,
+            "a second click where Revoke was did not land on Cancel"
+        );
+        let mut answering_pane = Pane::new().sharing(a_live_send(), true, false);
+        let answering = answering_pane.idle(&item, &totp);
+        let confirm_at = answering.rect_of(send_ui::CONFIRM_LABEL).center();
+        assert_eq!(
+            answering_pane.click(&item, &totp, confirm_at).action,
+            DetailAction::ConfirmRevokeSend,
+            "the confirmation's own button did not ask for the delete"
+        );
+
+        // Deleting: it says so, and there is nothing left to press.
+        let mut busy_pane = Pane::new().sharing(a_live_send(), false, true);
+        let busy = busy_pane.idle(&item, &totp);
+        assert!(busy.painted(send_ui::DELETING_LABEL), "{:?}", busy.strings());
+        for label in [REVOKE_LABEL, SEND_AGAIN_LABEL, send_ui::CANCEL_LABEL, send_ui::CONFIRM_LABEL] {
+            assert!(!busy.painted(label), "{label:?} is offered while the Send is being deleted");
+        }
+        assert_eq!(
+            busy_pane.click(&item, &totp, revoke_at).action,
+            DetailAction::None,
+            "a click where Revoke was reported something while the delete runs"
+        );
     }
 
     fn a_login() -> VaultItem {
