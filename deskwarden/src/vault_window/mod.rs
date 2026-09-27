@@ -2002,6 +2002,12 @@ pub fn build_frame_with_search(
             hub_wanted = Some(push_on);
             hub = if push_on { (start_hub)() } else { None };
         }
+        // **A Send changed** -- created, edited, revoked, or opened by its
+        // recipient. The Sends list is dropped, so this frame asks for it
+        // again; the vault is not touched. See `HubListener::sends_changed`.
+        if hub.as_ref().is_some_and(|hub| hub.sends_changed(Instant::now())) {
+            send_fetch.invalidate();
+        }
         let pushed = hub.as_ref().is_some_and(|hub| hub.settled(Instant::now()));
         let hub_live = hub.as_ref().is_some_and(crate::rest::notifications::HubListener::is_live);
         let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
@@ -10124,8 +10130,14 @@ mod backend_tasks {
         /// than asserted: if that forced reload fails,
         /// `apply_vault_load_result` turns this `Ok` into an `Err` and the
         /// pill says so.
+        ///
+        /// **In a window the daemon started, Sync is the daemon's.** The
+        /// daemon owns the vault this window reads, so the re-fetch above
+        /// would only re-read the daemon's copy; `POST /sync` asks the daemon
+        /// to re-check the server first (behind its revision gate, one row
+        /// when nothing moved). A window with no link is unchanged.
         fn sync(&self) -> Result<(), String> {
-            Ok(())
+            crate::daemon_link::sync_through_the_daemon().unwrap_or(Ok(()))
         }
 
         /// The direct-REST runner: it builds the archive in this process and
@@ -13111,7 +13123,7 @@ const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
 /// names a cipher -- one folder change, "sync your whole vault" or a
 /// reconnect in the batch and the batch gets the full sync, because a
 /// targeted pass that did most of it would still leave that one unanswered.
-/// And only up to [`MAX_TARGETED`]: an import of a thousand items in another
+/// And only up to [`crate::rest::notifications::MAX_TARGETED`]: an import of a thousand items in another
 /// app is cheaper as one sync than as a thousand reads.
 ///
 /// **Except the twin.** NodeWarden sends "sync your whole vault" beside every
@@ -13121,42 +13133,17 @@ const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
 /// sends the batch to the full sync.
 ///
 /// [`VaultAt`]: crate::rest::notifications::Announcement::VaultAt
+///
+/// **The rule itself is `rest::notifications::targeted_changes`**, and this
+/// is its one call from the window. The daemon applies the same batches to
+/// the vault it owns before a window ever hears of them, and two copies of
+/// "which pushes are targetable" would be two answers to one question.
 fn targeted_refresh(
     push_live: bool,
     announced: &[crate::rest::notifications::Announcement],
 ) -> Option<Vec<crate::vault_cache::Announced>> {
-    use crate::rest::notifications::Announcement;
-    use crate::vault_cache::Announced;
-    if !push_live || announced.is_empty() || announced.len() > MAX_TARGETED {
-        return None;
-    }
-    let cipher_revisions: Vec<&str> = announced
-        .iter()
-        .filter_map(|announcement| match announcement {
-            Announcement::Item { revision, .. } | Announcement::ItemGone { revision, .. } => {
-                revision.as_deref()
-            }
-            Announcement::VaultAt { .. } | Announcement::Whole => None,
-        })
-        .collect();
-    let mut changes = Vec::new();
-    for announcement in announced {
-        match announcement {
-            Announcement::Item { id, revision } => {
-                changes.push(Announced::Changed { id: id.clone(), revision: revision.clone() });
-            }
-            Announcement::ItemGone { id, .. } => changes.push(Announced::Removed { id: id.clone() }),
-            Announcement::VaultAt { date } if cipher_revisions.contains(&date.as_str()) => {}
-            Announcement::VaultAt { .. } | Announcement::Whole => return None,
-        }
-    }
-    // A batch that was nothing but twins has nothing left to answer, which
-    // cannot happen -- a twin needs its partner -- but is refused rather than
-    // painted as a no-op sync if it ever does.
-    (!changes.is_empty()).then_some(changes)
+    crate::rest::notifications::targeted_changes(push_live, announced)
 }
-/// The most announcements answered one item at a time; past it, one sync.
-const MAX_TARGETED: usize = 50;
 
 /// The least time between two syncs the hub's pushes can cause.
 const HEARTBEAT_PUSH_GAP: Duration = Duration::from_secs(10);
@@ -20333,6 +20320,68 @@ mod spawn_vault_load_tests {
         assert_eq!(snapshot.folders[0].name, "Work");
     }
 
+    /// **A window's whole open, not only its first load: still one sync.**
+    ///
+    /// The test above spawns the initial load and stops. `run` does not: on
+    /// its first real frame it fires the sync-on-open, whose direct-REST arm
+    /// (`DirectRestTasks::sync`) answers `Ok(())` at once, and the `sync_rx`
+    /// drain then spawns a FORCED reload -- so a window opens with two loads in
+    /// flight, the second a few frames behind the first. Both are spawned
+    /// here, with `run`'s own requests and generations, against a server whose
+    /// sync is slow enough that the second really does arrive mid-read.
+    ///
+    /// **One sync, and the revision route is what the second is answered
+    /// from.** The server says the vault has not moved, so the forced reload
+    /// costs one row; `RestBackend::fetching` is what guarantees it asks only
+    /// once the first read is filed, rather than in the gap before it, where
+    /// the answer was a second whole vault.
+    #[test]
+    fn a_windows_open_with_its_sync_on_open_reads_the_vault_once() {
+        let (mut server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000000")
+            .expect_at_least(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body_from_request(|_| {
+                std::thread::sleep(Duration::from_millis(300));
+                crate::rest::backend::tests::sync_payload().into_bytes()
+            })
+            .expect(1)
+            .create();
+
+        let cache = Arc::new(VaultCache::new(backend));
+        let era = cache.epoch().era();
+        let (tx, rx) = mpsc::channel();
+        for (generation, force_refresh) in [(1, false), (2, true)] {
+            spawn_vault_load_with_schedule(
+                Arc::clone(&cache),
+                tx.clone(),
+                VaultLoadRequest {
+                    force_refresh,
+                    era,
+                    generation,
+                    skip_readiness_wait: true,
+                    announced: None,
+                },
+                vec![],
+            );
+            // The first frame, roughly: the sync-on-open is not in the same
+            // instant as the spawn that precedes the window.
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        for _ in 0..2 {
+            let (generation, result) =
+                rx.recv_timeout(Duration::from_secs(30)).expect("both loads must report back");
+            let snapshot = result.unwrap_or_else(|e| panic!("load {generation} failed: {e:?}"));
+            assert_eq!(snapshot.items.len(), 1, "load {generation} painted the wrong vault");
+        }
+        sync.assert();
+    }
+
     #[test]
     fn a_superseded_era_neither_fetches_nor_paints() {
         // REVIEW 26'S RECORDED PRODUCER, the whole point of the `era`
@@ -20659,7 +20708,8 @@ mod vault_load_step_tests {
     fn only_a_live_batch_of_cipher_changes_is_answered_item_by_item() {
         use crate::rest::notifications::Announcement;
         use crate::vault_cache::Announced;
-        use crate::vault_window::{targeted_refresh, MAX_TARGETED};
+        use crate::rest::notifications::MAX_TARGETED;
+        use crate::vault_window::targeted_refresh;
         let item = |id: &str| Announcement::Item { id: id.into(), revision: Some("r".into()) };
         let gone = |id: &str| Announcement::ItemGone { id: id.into(), revision: None };
 
@@ -28711,11 +28761,17 @@ mod export_wiring {
                  function is a seventh copy of a decision that is meant to be made once",
             ),
             (
-                concat!("fn ", "sync(&self) -> Result<(), String> { Ok(()) }"),
-                "the built-in client's sync is no longer exactly `Ok(())`. If it runs \
-                 something it is the `os error 3` the owner reported on every press of Sync; \
-                 if it returns an error the window paints a red `Sync failed` pill and skips \
-                 the forced reload, so the button does nothing and says so",
+                concat!(
+                    "fn ", "sync(&self) -> Result<(), String> { \
+                     crate::daemon_link::sync_through_the_daemon().unwrap_or(Ok(())) }"
+                ),
+                "the built-in client's sync is no longer exactly the daemon's sync -- or \
+                 `Ok(())` in a window with no line to the daemon. If it runs anything else it \
+                 is the `os error 3` the owner reported on every press of Sync, or a window \
+                 reading the server's vault itself behind the daemon that owns it; if it \
+                 returns an error where there is no daemon the window paints a red `Sync \
+                 failed` pill and skips the forced reload, so the button does nothing and says \
+                 so",
             ),
             (
                 concat!(
@@ -32220,6 +32276,151 @@ mod export_wiring {
                 "this file mentions {banned:?} -- a second export format, or a password on \
                  argv, is reachable from the menu"
             );
+        }
+    }
+
+    /// **A Send push refreshes the Sends list, and costs no vault read.**
+    ///
+    /// The owner opened a Send link twice and the Sent screen still said "opened
+    /// once": NodeWarden pushes `SyncSendUpdate` on every access, and the hub
+    /// listener dropped it. It now reaches the frame as
+    /// `HubListener::sends_changed`, and the frame's whole answer is
+    /// `send_fetch.invalidate()`. This drives real frames through
+    /// [`build_frame`] with every outward spawn substituted, pushes a burst of
+    /// three, and counts what reached the seams.
+    ///
+    /// Nested in this module, whose frame harness it is shaped after, rather
+    /// than a top-level one: the count of top-level test modules is a control
+    /// `nothing_but_gated_test_modules_lives_below_the_guards_cut` holds, and
+    /// a test about one frame statement is not a new area of this file.
+    mod send_push_refresh {
+        use super::*;
+        use crate::rest::notifications::tests::{SendPushes, a_listener_the_test_can_push_to};
+        use std::cell::{Cell, RefCell};
+        use std::sync::Arc;
+
+        thread_local! {
+            /// What each seam was asked for on THIS thread. Thread-local rather
+            /// than `static`: the stubs below answer inline, on the frame's own
+            /// thread, and a second frame test running beside this one would
+            /// otherwise be counted here.
+            static SYNCS: Cell<usize> = const { Cell::new(0) };
+            static LOADS: Cell<usize> = const { Cell::new(0) };
+            static SEND_LISTS: Cell<usize> = const { Cell::new(0) };
+            /// The test's end of the listener the frame started.
+            static PUSHES: RefCell<Option<SendPushes>> = const { RefCell::new(None) };
+        }
+
+        fn counts_the_sync(tx: mpsc::Sender<Result<(), String>>, _session: String) {
+            SYNCS.with(|n| n.set(n.get() + 1));
+            let _ = tx.send(Ok(()));
+        }
+
+        fn counts_the_load(
+            _cache: Arc<VaultCache>,
+            tx: mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
+            request: VaultLoadRequest,
+        ) {
+            LOADS.with(|n| n.set(n.get() + 1));
+            let _ = tx.send((
+                request.generation,
+                Ok(VaultSnapshot { items: Vec::new(), folders: Vec::new() }),
+            ));
+        }
+
+        fn answers_the_send_list(
+            _ctx: egui::Context,
+            tx: SendListSender,
+            generation: u64,
+            _session: zeroize::Zeroizing<String>,
+        ) {
+            SEND_LISTS.with(|n| n.set(n.get() + 1));
+            let _ = tx.send((generation, Ok(Vec::new())));
+        }
+
+        fn a_hub_the_test_pushes_to() -> Option<crate::rest::notifications::HubListener> {
+            let (listener, pushes) = a_listener_the_test_can_push_to();
+            PUSHES.with(|slot| *slot.borrow_mut() = Some(pushes));
+            Some(listener)
+        }
+
+        fn counts() -> (usize, usize, usize) {
+            (SYNCS.with(Cell::get), LOADS.with(Cell::get), SEND_LISTS.with(Cell::get))
+        }
+
+        #[test]
+        fn a_burst_of_send_pushes_refetches_the_sends_list_once_and_syncs_nothing() {
+            let dir = crate::test_scratch::ScratchDir::new("frame-send-push");
+            let env = VaultFrameEnv {
+                hub: a_hub_the_test_pushes_to,
+                ..super::super::frame_env_seam::stubbed(
+                    counts_the_sync,
+                    counts_the_load,
+                    answers_the_send_list,
+                    Some(dir.join("settings.json")),
+                )
+            };
+            let (_options, mut frame_fn, _handles) = build_frame(
+                Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new("http://127.0.0.1:1"))),
+                crate::fill_stats::FillStats::new(dir.join("fill-stats.json")),
+                crate::login_ui::BwStatusDetails {
+                    status: crate::login_ui::BwStatus::Unlocked,
+                    user_email: Some("harness@example.invalid".to_string()),
+                    server_url: None,
+                },
+                "harness-session-token".to_string(),
+                dir.join("icons"),
+                AutoLock::Never,
+                true,
+                Some(crate::accounts::one_available_account("harness@example.invalid")),
+                true,
+                env,
+            );
+            let ctx = egui::Context::default();
+            let input = || egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input(), |_ui| {});
+            theme::apply(&ctx);
+            let _ = ctx.run_ui(input(), |_ui| {});
+            let mut frames = |n: usize| {
+                for _ in 0..n {
+                    let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
+                }
+            };
+
+            // The window's open, and then quiet: the list is asked for once and
+            // not again. Without this control, a list refetched on every frame
+            // would pass the assertion below.
+            frames(4);
+            let (syncs, loads, lists) = counts();
+            assert_eq!(lists, 1, "the window's open did not ask for the Sends list exactly once");
+            frames(3);
+            assert_eq!(counts(), (syncs, loads, lists), "a quiet window asked for something again");
+
+            // A recipient opens a link, twice, and the owner revokes another.
+            let pushes = PUSHES
+                .with(|slot| slot.borrow_mut().take())
+                .expect("control: the frame never started the hub listener");
+            for _ in 0..3 {
+                pushes.hear_one();
+            }
+            frames(3);
+
+            let (after_syncs, after_loads, after_lists) = counts();
+            assert_eq!(
+                after_lists,
+                lists + 1,
+                "a burst of three Send pushes did not refetch the Sends list exactly once"
+            );
+            assert_eq!(
+                (after_syncs, after_loads),
+                (syncs, loads),
+                "a Send push reached the vault -- a sync or a reload, each a whole-vault read on a \
+                 direct-REST account, for a list the vault does not contain"
+            );
+            assert_eq!(pushes.vault_announcements_waiting(), 0, "a Send push entered the vault inbox");
         }
     }
 }

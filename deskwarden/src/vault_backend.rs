@@ -154,6 +154,19 @@ pub trait VaultBackend: Send + Sync {
     fn get_totp(&self, id: &str) -> Result<Option<String>, VaultError>;
     /// **No server endpoint exists for this at all.** See the module docs.
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError>;
+    /// **The account's revision on the server, asked now** -- one row on the
+    /// owner's D1-backed server, where a whole read is ~1,700.
+    ///
+    /// `None` from a backend that has no such question (`bw serve`, a client of
+    /// the daemon) and from a server that would not answer it. The daemon's
+    /// Sync asks this before deciding whether a whole read is owed at all; see
+    /// `crate::vault_api`. **Required, not defaulted**, for `list_vault`'s
+    /// reason: a forwarding impl that inherited `None` would quietly turn every
+    /// Sync into a whole read.
+    fn revision_now(&self) -> Option<i64>;
+    /// **The revision the backend's last whole read was taken at**, without
+    /// asking anything. `None` when it has made none, or has no such notion.
+    fn revision_of_last_read(&self) -> Option<i64>;
 }
 
 /// `bw serve`, as a backend.
@@ -253,6 +266,13 @@ impl VaultBackend for VaultBridge {
     }
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         VaultBridge::generate(self, request)
+    }
+    /// No revision question to ask: `bw serve` answers out of its own local copy, and a sync of that is `bw sync`'s.
+    fn revision_now(&self) -> Option<i64> {
+        None
+    }
+    fn revision_of_last_read(&self) -> Option<i64> {
+        None
     }
 }
 
@@ -417,6 +437,12 @@ impl VaultBackend for CachingBackend {
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         self.inner.generate(request)
     }
+    fn revision_now(&self) -> Option<i64> {
+        self.inner.revision_now()
+    }
+    fn revision_of_last_read(&self) -> Option<i64> {
+        self.inner.revision_of_last_read()
+    }
 }
 
 impl VaultBackend for Box<dyn VaultBackend> {
@@ -488,6 +514,12 @@ impl VaultBackend for Box<dyn VaultBackend> {
     }
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         (**self).generate(request)
+    }
+    fn revision_now(&self) -> Option<i64> {
+        (**self).revision_now()
+    }
+    fn revision_of_last_read(&self) -> Option<i64> {
+        (**self).revision_of_last_read()
     }
 }
 
@@ -682,6 +714,13 @@ impl VaultBackend for LateBoundBackend {
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         self.with(|b| b.generate(request))
     }
+    /// Asked of whatever is bound now; `None` before anything is.
+    fn revision_now(&self) -> Option<i64> {
+        self.read(|slot| slot.as_ref().and_then(|b| b.revision_now()))
+    }
+    fn revision_of_last_read(&self) -> Option<i64> {
+        self.read(|slot| slot.as_ref().and_then(|b| b.revision_of_last_read()))
+    }
 }
 
 /// A shared handle to one [`LateBoundBackend`].
@@ -764,6 +803,12 @@ impl VaultBackend for SharedLateBoundBackend {
     }
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
         (**self).generate(request)
+    }
+    fn revision_now(&self) -> Option<i64> {
+        (**self).revision_now()
+    }
+    fn revision_of_last_read(&self) -> Option<i64> {
+        (**self).revision_of_last_read()
     }
 }
 
@@ -875,6 +920,12 @@ mod late_bound_tests {
         }
         fn generate(&self, _request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
             Ok(Zeroizing::new("generated".to_string()))
+        }
+        fn revision_now(&self) -> Option<i64> {
+            None
+        }
+        fn revision_of_last_read(&self) -> Option<i64> {
+            None
         }
     }
 
@@ -1082,6 +1133,12 @@ mod caching_backend_tests {
         }
         fn generate(&self, _r: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
             Ok(Zeroizing::new(String::new()))
+        }
+        fn revision_now(&self) -> Option<i64> {
+            None
+        }
+        fn revision_of_last_read(&self) -> Option<i64> {
+            None
         }
     }
 

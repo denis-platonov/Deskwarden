@@ -54,7 +54,14 @@ pub mod bw_path;
 pub mod bw_serve;
 pub mod card_brand;
 pub mod card_mark;
+/// What changed in the vault the daemon holds, as a sequence-numbered feed a
+/// client long-polls. No transport, no window: `vault_api` serves it.
+pub mod change_feed;
 pub mod clipboard;
+/// A client's line to the vault the daemon owns: where it is, the grant that
+/// admits this client (read off stdin, never argv or the environment), and
+/// the backend, sync and change-feed poll built on them.
+pub mod daemon_link;
 pub mod dispatch;
 pub mod favicon;
 pub mod file_picker;
@@ -206,7 +213,15 @@ pub mod user_key_store;
 /// the direct-REST backend. Nothing about what any call does over the wire
 /// lives here.
 pub mod vault_backend;
+/// The vault the daemon owns, as questions any client may ask: `bw serve`'s
+/// routes answered out of the daemon's cache, plus the change feed. A request
+/// in, a status and a body out -- no socket, no notion of which client.
+pub mod vault_api;
 pub mod vault_bridge;
+/// The daemon's door to the vault it owns: `vault_api` on a loopback port, and
+/// the worker that applies the notifications hub to the daemon's vault before
+/// publishing it to the feed.
+pub mod vault_host;
 pub mod ui_show;
 pub mod vault_cache;
 pub mod vault_disk_cache;

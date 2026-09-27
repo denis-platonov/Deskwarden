@@ -1370,6 +1370,76 @@ pub enum NewItem {
         uri: Option<String>,
         notes: Option<Zeroizing<String>>,
     },
+    /// **A create another process already built**, relayed as it arrived.
+    ///
+    /// The daemon owns the vault, and a window's create reaches it as the
+    /// body [`NewItem::to_payload`] produced in the window -- see
+    /// `crate::vault_api`. Rebuilding one of the variants above from that body
+    /// would be a second, lossy reading of a shape this enum exists to make
+    /// unambiguous; relaying it keeps the window's own `to_payload` as the one
+    /// author of the bytes. [`RelayedItem::from_payload`] is the only way to
+    /// make one, and it refuses a body that breaks this enum's rule -- exactly
+    /// one type object, matching its `type`.
+    Relayed(RelayedItem),
+}
+
+/// A create payload checked against [`NewItem`]'s one rule, and nothing else.
+///
+/// The fields are private and there is no constructor but
+/// [`Self::from_payload`], so a `RelayedItem` that carries two type objects,
+/// or none, cannot exist.
+#[derive(Clone)]
+pub struct RelayedItem {
+    name: String,
+    folder_id: Option<String>,
+    payload: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The item types this app creates, by number, and the key of each one's type
+/// object. The same table [`NewItem::to_payload`] writes from.
+const TYPE_OBJECTS: [(i64, &str); 5] =
+    [(1, "login"), (2, "secureNote"), (3, "card"), (4, "identity"), (5, "sshKey")];
+
+impl RelayedItem {
+    /// A relayed create, if `payload` is one.
+    ///
+    /// # Errors
+    ///
+    /// A sentence naming what is wrong, for the refusal the relaying process
+    /// answers with. Nothing from the payload is quoted in it.
+    pub fn from_payload(payload: serde_json::Value) -> Result<Self, &'static str> {
+        let serde_json::Value::Object(payload) = payload else {
+            return Err("a create body must be a JSON object");
+        };
+        let name = payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("a create body must name the item")?
+            .to_string();
+        let folder_id = match payload.get("folderId") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(id)) => Some(id.clone()),
+            Some(_) => return Err("a create body's folderId must be a string or null"),
+        };
+        let type_number = payload
+            .get("type")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or("a create body must say what type of item it is")?;
+        let Some((_, type_key)) = TYPE_OBJECTS.iter().find(|(number, _)| *number == type_number)
+        else {
+            return Err("a create body's type is not one this app creates");
+        };
+        let present: Vec<&str> = TYPE_OBJECTS
+            .iter()
+            .map(|(_, key)| *key)
+            .filter(|key| payload.get(*key).is_some_and(|value| !value.is_null()))
+            .collect();
+        if present != [*type_key] || !payload.get(*type_key).is_some_and(serde_json::Value::is_object)
+        {
+            return Err("a create body must carry exactly one type object, matching its type");
+        }
+        Ok(Self { name, folder_id, payload })
+    }
 }
 
 /// Hand-written so no secret this enum carries reaches a formatter.
@@ -1454,6 +1524,14 @@ impl std::fmt::Debug for NewItem {
                 .field("uri", uri)
                 .field("notes", &notes.as_ref().map(|_| Elided))
                 .finish(),
+            // The payload is elided whole: it is every field of a new item,
+            // secrets included, and which of them it carries is its business.
+            NewItem::Relayed(relayed) => f
+                .debug_struct("NewItem::Relayed")
+                .field("name", &relayed.name)
+                .field("folder_id", &relayed.folder_id)
+                .field("payload", &Elided)
+                .finish(),
         }
     }
 }
@@ -1520,6 +1598,7 @@ impl NewItem {
             | NewItem::Identity { name, .. }
             | NewItem::SshKey { name, .. }
             | NewItem::ImportedRecord { name, .. } => name,
+            NewItem::Relayed(relayed) => &relayed.name,
         }
     }
 
@@ -1531,6 +1610,7 @@ impl NewItem {
             | NewItem::Identity { folder_id, .. }
             | NewItem::SshKey { folder_id, .. }
             | NewItem::ImportedRecord { folder_id, .. } => folder_id.as_deref(),
+            NewItem::Relayed(relayed) => relayed.folder_id.as_deref(),
         }
     }
 
@@ -1556,7 +1636,13 @@ impl NewItem {
     /// `bw serve` has always accepted, so keeping it is also the option that
     /// changes nothing about a request the server is known to like.
     pub fn to_payload(&self) -> serde_json::Value {
+        // Relayed verbatim: it IS a payload this function wrote, in the
+        // process that relayed it, and was checked on the way in.
+        if let NewItem::Relayed(relayed) = self {
+            return serde_json::Value::Object(relayed.payload.clone());
+        }
         let (type_number, type_key, type_object, notes) = match self {
+            NewItem::Relayed(_) => unreachable!("answered above"),
             NewItem::Login { username, password, .. } => {
                 let mut login = serde_json::Map::new();
                 login.insert("username".to_string(), serde_json::json!(username));
@@ -1960,6 +2046,29 @@ impl VaultBridge {
             base_url: base_url.into(),
             read_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, READ_DEADLINE),
             write_agent: crate::http_agent::bounded_total(CONNECT_TIMEOUT, WRITE_DEADLINE),
+        }
+    }
+
+    /// **The same client, presenting `grant` on every request** -- for the
+    /// daemon's vault, which answers `bw serve`'s routes out of the vault it
+    /// owns and admits only a client it granted. See `crate::vault_api`.
+    ///
+    /// The grant rides on both agents rather than on each route, so every
+    /// route below is byte-for-byte the one `bw serve` has always been asked
+    /// with; see [`crate::http_agent::bounded_total_with_bearer`].
+    pub fn with_bearer(base_url: impl Into<String>, grant: &Zeroizing<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            read_agent: crate::http_agent::bounded_total_with_bearer(
+                CONNECT_TIMEOUT,
+                READ_DEADLINE,
+                grant.clone(),
+            ),
+            write_agent: crate::http_agent::bounded_total_with_bearer(
+                CONNECT_TIMEOUT,
+                WRITE_DEADLINE,
+                grant.clone(),
+            ),
         }
     }
 

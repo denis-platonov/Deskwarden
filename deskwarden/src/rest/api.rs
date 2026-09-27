@@ -1406,6 +1406,45 @@ impl RestClient {
             })
     }
 
+    /// `GET /api/accounts/profile` -- **the account's wrapped keys, without
+    /// the vault they open.**
+    ///
+    /// # Why this exists, in rows
+    ///
+    /// Two callers wanted a key and nothing else, and both paid for it with a
+    /// whole `GET /api/sync`: the daemon's startup probe, which asked "does
+    /// the stored master key still open this account?", and the Sends worker,
+    /// which unwraps the user key before every list and every create. The
+    /// vault window lists the Sends on every open, so that second one was a
+    /// full read on every launch that nobody had counted -- ~1,700 rows out of
+    /// `ciphers` on the owner's D1-backed server, to read one wrapped key.
+    ///
+    /// The profile is exactly the part of the sync those two read. It is the
+    /// same [`crate::rest::sync::Profile`] the sync carries -- NodeWarden
+    /// builds both answers with one `buildProfileResponse`, and Bitwarden's
+    /// sync embeds its own `ProfileResponseModel` -- so
+    /// [`crate::rest::sync::VaultKeys::unwrap_from`] reads it unchanged. On
+    /// that server it is the user's row and their organisation memberships: a
+    /// handful of rows, none of them a cipher.
+    ///
+    /// # A server that does not answer it
+    ///
+    /// Every caller treats a refusal that is about the ROUTE -- a `404`, a
+    /// body that is not a profile -- as "ask the sync instead", never as a
+    /// verdict on the credential. A `401` is still a verdict: it is the same
+    /// dead session the sync would have met. See
+    /// [`crate::rest::backend::RestBackend::verify_stored_login`].
+    ///
+    /// `sync_agent`, for [`Self::fetch_cipher`]'s reason: a read of account
+    /// data, on the deadline written for one.
+    pub fn profile(&self, session: &mut Session) -> Result<crate::rest::sync::Profile, RestError> {
+        let url = format!("{}/api/accounts/profile", self.base_url);
+        let value = self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
+        })?;
+        serde_json::from_value(value).map_err(|_| RestError::Parse("the account profile"))
+    }
+
     // ---- reading an organisation's roster -----------------------------------
 
     /// `GET /api/organizations/{id}/members` -- **who else is in this
