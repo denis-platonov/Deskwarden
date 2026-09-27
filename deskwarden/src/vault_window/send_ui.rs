@@ -1596,7 +1596,7 @@ pub const SCOPE_EMPTY_DETAIL: &str = "Your other Sends are still on the Sends ro
 /// does not decide which of the window's messages wins, it only paints the
 /// one it is handed.
 ///
-/// # Six parameters, and no clock among them
+/// # Seven parameters, and no clock among them
 ///
 /// `view` and `selected` joined when the screen grew a detail pane: which of
 /// the two SHARING screens is up and which of its rows the detail is
@@ -1622,6 +1622,9 @@ pub fn draw_send_pane(
     // longer in the list draws the "nothing picked" pane rather than a stale
     // one.
     selected: &mut Option<String>,
+    // The vault's records and their icons, for the tiles: a Send made from a
+    // record wears that record's tile. See [`RecordTiles`].
+    records: RecordTiles<'_>,
 ) -> SendUiVerdict {
     let mut action = SendUiAction::None;
 
@@ -1655,13 +1658,13 @@ pub fn draw_send_pane(
         // different padding beneath, and one panel margin cannot be both.
         .frame(egui::Frame::new().fill(theme::CANVAS))
         .show(ui, |ui| {
-            if let Some(reported) = draw_send_list(ui, state, &view, delete, selected) {
+            if let Some(reported) = draw_send_list(ui, state, &view, delete, selected, records) {
                 action = reported;
             }
         });
 
     if let Some(reported) =
-        draw_send_detail(ui, state, &view, delete, selected)
+        draw_send_detail(ui, state, &view, delete, selected, records)
     {
         // **The detail column wins an ambiguous frame.** Every destructive
         // control on this screen is in it, and the list column's own
@@ -1686,6 +1689,7 @@ fn draw_send_list(
     view: &SendView<'_>,
     delete: SendDeleteView<'_>,
     selected: &mut Option<String>,
+    records: RecordTiles<'_>,
 ) -> Option<SendUiAction> {
     let mut action: Option<SendUiAction> = None;
     let width = ui.available_width();
@@ -1704,17 +1708,34 @@ fn draw_send_list(
     };
 
     // --- the strip ------------------------------------------------------
-    let (strip, _) =
-        ui.allocate_exact_size(egui::vec2(width, LIST_STRIP_HEIGHT), egui::Sense::hover());
-    ui.painter().rect_filled(strip, CornerRadius::ZERO, theme::CARD);
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(strip.left(), strip.bottom() - 1.0),
-            egui::pos2(strip.right(), strip.bottom()),
-        ),
-        CornerRadius::ZERO,
-        theme::HAIRLINE,
-    );
+    //
+    // **The records list's own strip, drawn by the records list's own
+    // function** -- `item_list::list_strip`: its white tile, its 12pt of
+    // padding round a row the search box's height, and its 1pt hairline at
+    // its foot. This was a second strip built here by hand, 56pt tall against
+    // that one's 58, and the owner saw the two headers were not one thing
+    // when the columns swapped. What is in it is this screen's: 5b's heading,
+    // the count, and the sort -- no buttons. A Send is made from a record
+    // ("for simplicity let's just send from the record itself"), so `New
+    // Send` went; and the list is asked for again whenever the screen is
+    // opened, so `Refresh` went with it.
+    //
+    // The list butts straight against it, for `draw_item_list`'s reason:
+    // egui adds `item_spacing.y` after each allocation AS it is made, so the
+    // spacing is zeroed before the strip is drawn and put back after it --
+    // leaving `LIST_PAD` the only space above the first row, as it is on the
+    // records list. It was 8pt more here, which is part of why the two
+    // columns did not line up.
+    let spacing = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let strip = super::item_list::list_strip(ui, |ui| {
+        ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), theme::SEARCH_FIELD_HEIGHT),
+            egui::Sense::hover(),
+        )
+        .0
+    });
+    ui.spacing_mut().item_spacing.y = spacing;
     let eyebrow = ui.painter().layout_job(theme::letterspaced(
         view.heading(),
         theme::EYEBROW_PX,
@@ -1724,7 +1745,7 @@ fn draw_send_list(
     ));
     let eyebrow_size = eyebrow.size();
     ui.painter().galley(
-        egui::pos2(strip.left() + STRIP_PAD_X, strip.center().y - eyebrow_size.y / 2.0),
+        egui::pos2(strip.left(), strip.center().y - eyebrow_size.y / 2.0),
         eyebrow,
         theme::TEXT_MUTED,
     );
@@ -1746,54 +1767,25 @@ fn draw_send_list(
         Some(n) => format!("{n} {many}"),
         None => format!("{} {many}", crate::vault_window::sidebar::UNKNOWN_COUNT),
     };
+    // At the records header's own type size -- `theme::SEARCH_TEXT_PX`, the
+    // search box's -- rather than a 12px of this strip's own.
+    let strip_font = egui::FontId::new(theme::SEARCH_TEXT_PX, egui::FontFamily::Proportional);
     ui.painter().text(
-        egui::pos2(strip.left() + STRIP_PAD_X + eyebrow_size.x + STRIP_GAP, strip.center().y),
+        egui::pos2(strip.left() + eyebrow_size.x + STRIP_GAP, strip.center().y),
         egui::Align2::LEFT_CENTER,
         &noun,
-        egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        strip_font.clone(),
         theme::TEXT_GHOST,
     );
-    // Refresh and New Send live in the strip, and **Refresh is drawn in every
-    // state including `Failed`**: a screen whose only way back from an error
-    // is to navigate away and return is a screen that tells the user the
-    // error is permanent.
-    //
-    // Neither is drawn on `Shared with me`. Refresh would re-ask a question
-    // that screen does not ask -- its rows come from a local file, not a
-    // fetch -- and a control that visibly does nothing is worse than one that
-    // is not there.
-    //
-    // **One of them is the primary and the other is not, which is the whole
-    // of what changed here.** Both used to be bare `egui::Button`s at 12px in
-    // egui's own grey, and laid beside the item list -- the column this one
-    // swaps places with -- the difference is not subtle: that column's strip
-    // carries a search field and ONE solid blue `+ New`, and this one carried
-    // two identical grey boxes taking up half its width and outweighing every
-    // row beneath them. A strip with two equal emphases has no emphasis.
-    //
-    // New Send is the primary because it is what the screen is for. Refresh
-    // is `Secondary` and not quieter still, because it is the only way back
-    // from a stale list and 5b's own strip keeps a control in that corner.
-    // **5b's strip: the heading, the count, and the sort -- no buttons.** A
-    // Send is made from a record ("for simplicity let's just send from the
-    // record itself"), so `New Send` went; and the list is asked for again
-    // whenever the screen is opened, so `Refresh` went with it.
     if let SendView::Mine(_) = view {
         ui.painter().text(
-            egui::pos2(strip.right() - STRIP_PAD_X, strip.center().y),
+            egui::pos2(strip.right(), strip.center().y),
             egui::Align2::RIGHT_CENTER,
             NEWEST_LABEL,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+            strip_font,
             theme::TEXT_FAINT,
         );
     }
-
-    // The strip's two controls are `put` INSIDE the band allocated above, and
-    // `Ui::put` advances the cursor to the rect it drew at -- backwards, in
-    // this case, from the strip's foot to the buttons'. Everything below is
-    // laid out from the cursor, so it is put back where the strip left it.
-    // See the same note in `draw_send_card`.
-    ui.advance_cursor_after_rect(strip);
 
     // --- the standing explanations, UNDER the column --------------------
     //
@@ -1879,14 +1871,30 @@ fn draw_send_list(
     // --- the rows -------------------------------------------------------
     ui.add_space(LIST_PAD);
     let row_width = (width - LIST_PAD * 2.0).max(0.0);
-    let rows_area = |ui: &mut egui::Ui, body: &mut dyn FnMut(&mut egui::Ui)| {
-        egui::ScrollArea::vertical()
-            .id_salt("send-list")
-            .auto_shrink([false, false])
+    // **The records list's own list frame, around the rows.** The rows were
+    // `LIST_PAD` narrower than the column but started flush against its left
+    // edge, so they sat 10pt left of where a record's row sits; the frame
+    // puts that padding on the left, and -- exactly as `draw_item_list` does
+    // -- the right padding IS the scroll bar's lane (`scrollbar_in_gutter`),
+    // painted only when the rows overflow, so the rows keep one width.
+    let rows_area = |ui: &mut egui::Ui, rows: usize, body: &mut dyn FnMut(&mut egui::Ui)| {
+        egui::Frame::new()
+            .inner_margin(Margin { left: LIST_PAD as i8, right: 0, top: 0, bottom: LIST_PAD as i8 })
             .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = LIST_ROW_GAP;
-                ui.add_space(0.0);
-                body(ui);
+                let content = rows as f32 * ROW_HEIGHT
+                    + rows.saturating_sub(1) as f32 * LIST_ROW_GAP;
+                theme::scrollbar_in_gutter(ui, LIST_PAD);
+                if content < ui.available_height() {
+                    theme::hide_scrollbar(ui);
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("send-list")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = LIST_ROW_GAP;
+                        ui.add_space(0.0);
+                        body(ui);
+                    });
             });
     };
     let headline = |ui: &mut egui::Ui, head: &str, detail: &str, colour: egui::Color32| {
@@ -1910,7 +1918,7 @@ fn draw_send_list(
             if rows.is_empty() {
                 headline(ui, RECEIVED_EMPTY_HEADLINE, RECEIVED_EMPTY_DETAIL, theme::INK);
             } else {
-                rows_area(ui, &mut |ui| {
+                rows_area(ui, rows.len(), &mut |ui| {
                     for row in rows.iter() {
                         draw_received_row(ui, row, row_width, selected);
                     }
@@ -1974,9 +1982,9 @@ fn draw_send_list(
                     let head = scope_empty_headline(*scope);
                     headline(ui, &head, SCOPE_EMPTY_DETAIL, theme::INK);
                 } else {
-                    rows_area(ui, &mut |ui| {
+                    rows_area(ui, in_scope.len(), &mut |ui| {
                         for row in &in_scope {
-                            draw_row(ui, row, row_width, delete, selected);
+                            draw_row(ui, row, row_width, delete, selected, records);
                         }
                     });
                 }
@@ -1987,30 +1995,15 @@ fn draw_send_list(
     action
 }
 
-/// The list column's strip: design 5b's `padding: 12px` on a 12px line, with
-/// room for the 26pt controls that sit in it.
-///
-/// **56 and not 38**, and the arithmetic is the page's content box. `padding:
-/// 12px` around a 12px line box (~15pt drawn) is 12 + 15 + 12 = 39 plus the
-/// 1px bottom rule, which is what a strip of TEXT would be; this strip also
-/// holds two `theme::ACTION_BUTTON_HEIGHT` controls, and 12 + 32 + 12 = 56 is
-/// the same padding around the taller thing in it. Sizing it to the text and
-/// letting the buttons overhang is the slip this file has paid for before.
-///
-/// It was 50 while those controls were 26pt boxes of egui's own making. They
-/// come from the design system now -- see `theme::action_button` -- and the
-/// design system's action is 32, so the strip around them grew by the same
-/// six points rather than cropping them.
-const LIST_STRIP_HEIGHT: f32 = 56.0;
-/// Design 5b's `padding: 12px` on the list strip.
-const STRIP_PAD_X: f32 = 12.0;
 /// The gap between the strip's eyebrow and the count beside it: 5b's own
 /// `gap: 10px`.
 const STRIP_GAP: f32 = 10.0;
-/// Design 5b's `padding: 10px` on the list column's row container.
-const LIST_PAD: f32 = 10.0;
-/// Design 5b's `gap: 6px` between two rows.
-const LIST_ROW_GAP: f32 = 6.0;
+/// The row container's `padding: 10px`: the records list's own
+/// `LIST_PADDING`, read rather than spelled, for the reason the row
+/// geometry below is.
+const LIST_PAD: f32 = super::item_list::LIST_PADDING;
+/// The `gap: 6px` between two rows -- the records list's.
+const LIST_ROW_GAP: f32 = super::item_list::ROW_GAP;
 /// The list column's footnote: the rail's own footer size, because it is the
 /// same kind of line in the same kind of place. See the footnote's own
 /// argument in [`draw_send_list`].
@@ -2067,6 +2060,7 @@ fn draw_row(
     width: f32,
     delete: SendDeleteView<'_>,
     selected: &mut Option<String>,
+    records: RecordTiles<'_>,
 ) {
     let (rect, response) =
         ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
@@ -2100,7 +2094,10 @@ fn draw_row(
     let fade = if ended && !picked { theme::ENDED_ROW_OPACITY } else { 1.0 };
     let dim = |colour: egui::Color32| theme::faded(colour, fade);
 
-    let painter = ui.painter();
+    // A clone, so the tile below can be drawn by a child `Ui` while the rest
+    // of the row is still being painted through this.
+    let painter = ui.painter().clone();
+    let painter = &painter;
     // **The design's selected-row shadow, from `theme` and not from a second
     // spelling.** The item list has drawn one under its picked row since
     // design 2b; this row, rebuilt by hand, had none -- so two rows in the
@@ -2119,7 +2116,8 @@ fn draw_row(
         egui::StrokeKind::Inside,
     );
 
-    let small_font = egui::FontId::new(11.0, egui::FontFamily::Proportional);
+    let small_font =
+        egui::FontId::new(super::item_list::SUBTITLE_SIZE, egui::FontFamily::Proportional);
 
     // The pill first: it is right-aligned, and its measured width is what
     // bounds how far the name and the subtitle may run. Measured through
@@ -2136,21 +2134,17 @@ fn draw_row(
     let pill_width = theme::state_pill_width(painter, tone, label);
     theme::state_pill(
         painter,
-        egui::pos2(rect.right() - ROW_PAD_X - pill_width, rect.center().y),
+        egui::pos2(rect.right() - ROW_INSET - pill_width, rect.center().y),
         tone,
         label,
     );
-    let text_right = rect.right() - ROW_PAD_X - pill_width - ROW_TEXT_GAP;
+    let text_right = rect.right() - ROW_INSET - pill_width - ROW_TEXT_GAP;
 
-    // The initials tile. Painted rather than `theme::avatar`ed, for this
-    // file's standing reason: every cell of this row goes into an explicit
-    // rectangle against a painter, because a nested layout is what has
-    // repeatedly pushed something off this pane.
-    let tile = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + ROW_PAD_X, rect.center().y - ROW_TILE / 2.0),
-        egui::Vec2::splat(ROW_TILE),
-    );
-    paint_tile_faded(painter, tile, &row.name, picked, 12.0, fade);
+    // The tile, where the records row puts its tile, drawn by the records
+    // row's own function -- the record's favicon when this Send was made from
+    // a record that has one. See [`paint_send_tile`].
+    let tile = row_tile_rect(rect);
+    paint_send_tile(ui, tile, records, row.sent.as_ref(), &row.name, picked, fade);
 
     let text_left = tile.right() + ROW_TEXT_GAP;
     let text_area = egui::Rect::from_min_max(
@@ -2158,10 +2152,22 @@ fn draw_row(
         egui::pos2(text_right.max(text_left), rect.bottom()),
     );
     let clip = painter.with_clip_rect(text_area.intersect(ui.clip_rect()));
+    // The records row's text column, measured by the records row's own
+    // function: the name over the subtitle, `TITLE_GAP_Y` apart, the pair
+    // centred on the band.
+    let column_top = rect.center().y
+        - super::item_list::text_column_height(ui, "subtitle", picked) / 2.0;
+    let name_height = ui.ctx().fonts_mut(|f| {
+        f.row_height(&egui::FontId::new(
+            super::item_list::TITLE_SIZE,
+            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
+        ))
+    });
+    let subtitle_top = column_top + name_height + super::item_list::TITLE_GAP_Y;
 
     let name_rect = clip.text(
-        egui::pos2(text_area.left(), rect.center().y - 2.0),
-        egui::Align2::LEFT_BOTTOM,
+        egui::pos2(text_area.left(), column_top),
+        egui::Align2::LEFT_TOP,
         &row.name,
         // **`SEMIBOLD` unselected, not the plain proportional face**, which is
         // the single most visible way this row differed from the item row it
@@ -2173,7 +2179,7 @@ fn draw_row(
         // identically. A weight is not a measurement, which is exactly why
         // no rect assertion ever saw it.
         egui::FontId::new(
-            13.0,
+            super::item_list::TITLE_SIZE,
             egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
         ),
         dim(if picked { theme::BLUE_DEEP } else { theme::INK }),
@@ -2216,7 +2222,7 @@ fn draw_row(
         (row.expiry.as_str(), theme::TEXT_FAINT)
     };
     clip.text(
-        egui::pos2(text_area.left(), rect.center().y + 3.0),
+        egui::pos2(text_area.left(), subtitle_top),
         egui::Align2::LEFT_TOP,
         second,
         small_font,
@@ -2243,7 +2249,8 @@ fn draw_received_row(
     if response.clicked() {
         *selected = Some(row.key.clone());
     }
-    let painter = ui.painter();
+    let painter = ui.painter().clone();
+    let painter = &painter;
     // The same selection treatment the Send row and the item row wear; see
     // `theme::SELECTED_ROW_SHADOW`.
     if picked {
@@ -2258,105 +2265,146 @@ fn draw_received_row(
         egui::Stroke::new(1.0, if picked { theme::BLUE } else { theme::HAIRLINE }),
         egui::StrokeKind::Inside,
     );
-    let tile = egui::Rect::from_min_size(
-        egui::pos2(rect.left() + ROW_PAD_X, rect.center().y - ROW_TILE / 2.0),
-        egui::Vec2::splat(ROW_TILE),
-    );
-    paint_tile(painter, tile, &row.name, picked, 12.0);
+    let tile = row_tile_rect(rect);
+    paint_send_tile(ui, tile, RecordTiles::default(), None, &row.name, picked, 1.0);
     let text_area = egui::Rect::from_min_max(
         egui::pos2(tile.right() + ROW_TEXT_GAP, rect.top()),
-        egui::pos2(rect.right() - ROW_PAD_X, rect.bottom()),
+        egui::pos2(rect.right() - ROW_INSET, rect.bottom()),
     );
     let clip = painter.with_clip_rect(text_area.intersect(ui.clip_rect()));
+    let column_top = rect.center().y
+        - super::item_list::text_column_height(ui, "subtitle", picked) / 2.0;
+    let name_height = ui.ctx().fonts_mut(|f| {
+        f.row_height(&egui::FontId::new(
+            super::item_list::TITLE_SIZE,
+            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
+        ))
+    });
     // `SEMIBOLD`/`TEXT_FAINT`, exactly as `draw_row` above and as the item
     // row beside both: a received record is a row in the same column, and
     // there is no reason for it to be typeset a third way.
     clip.text(
-        egui::pos2(text_area.left(), rect.center().y - 2.0),
-        egui::Align2::LEFT_BOTTOM,
+        egui::pos2(text_area.left(), column_top),
+        egui::Align2::LEFT_TOP,
         &row.name,
         egui::FontId::new(
-            13.0,
+            super::item_list::TITLE_SIZE,
             egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
         ),
         if picked { theme::BLUE_DEEP } else { theme::INK },
     );
     clip.text(
-        egui::pos2(text_area.left(), rect.center().y + 3.0),
+        egui::pos2(text_area.left(), column_top + name_height + super::item_list::TITLE_GAP_Y),
         egui::Align2::LEFT_TOP,
         &row.when,
-        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        egui::FontId::new(super::item_list::SUBTITLE_SIZE, egui::FontFamily::Proportional),
         theme::TEXT_FAINT,
     );
 }
 
-/// The initials tile design 5b puts in front of every row and at the head of
-/// the detail pane.
+/// **The records this screen's tiles are drawn from**: the vault's items and
+/// the icon cache's textures, both the window's, both borrowed.
 ///
-/// `theme::initials` is the app's own letter pair -- the same one the picker
-/// and the item list fall back to -- so a Send called "Remote Desktop —
-/// Bastion" reads `RD` here exactly as it would anywhere else.
-fn paint_tile(
-    painter: &egui::Painter,
-    tile: egui::Rect,
-    name: &str,
-    emphasised: bool,
-    text_px: f32,
-) {
-    paint_tile_faded(painter, tile, name, emphasised, text_px, 1.0);
+/// A Send made from a record knows that record through the sent history
+/// ([`SentFacts::item_id`]), and the owner's report was that its row showed
+/// the monogram `2X` where the records list shows the same record's favicon.
+/// So the row asks this for the record, and draws what the records list would
+/// draw for it: its icon when the cache has one, its kind's tile when it does
+/// not. A Send made anywhere else, or whose record has since gone, has no
+/// record here and wears the monogram of its own name.
+///
+/// `Default` is the answer for a caller with no vault to hand -- a paint test
+/// about something else, or `Shared with me`, whose rows are imports and not
+/// Sends -- and it draws every tile as a monogram.
+#[derive(Clone, Copy, Default)]
+pub struct RecordTiles<'a> {
+    pub items: &'a [crate::vault_bridge::VaultItem],
+    pub icons: Option<&'a std::collections::HashMap<String, egui::TextureHandle>>,
 }
 
-/// [`paint_tile`], at design 5b's row opacity.
+impl<'a> RecordTiles<'a> {
+    /// The record a Send was made from, when this PC filed one and it is
+    /// still in the vault.
+    fn record(&self, sent: Option<&SentFacts>) -> Option<&'a crate::vault_bridge::VaultItem> {
+        let id = sent?.item_id.as_str();
+        self.items.iter().find(|item| item.id == id)
+    }
+}
+
+/// Where a row's tile goes: the records row's own place for it, one border
+/// and one padding in from the band's left edge and centred on its height.
+fn row_tile_rect(row: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(row.left() + ROW_INSET, row.center().y - ROW_TILE / 2.0),
+        egui::Vec2::splat(ROW_TILE),
+    )
+}
+
+/// One tile, in `tile`, **drawn by `item_list::row_tile`** -- the records
+/// list's own tile, so a Send's tile and a record's are one thing: the same
+/// unfilled box, the same monogram face and size, the same favicon treatment.
+/// This screen used to paint its own: a filled box with a bold 12px pair of
+/// initials, visibly not the tile beside it.
 ///
-/// A separate entry point rather than a sixth argument on every call site,
-/// because exactly one caller has a faded row and the other three are the
-/// detail headers, which never do. See [`theme::ENDED_ROW_OPACITY`].
-fn paint_tile_faded(
-    painter: &egui::Painter,
+/// Drawn by a child `Ui` placed exactly on `tile`, because the records tile is
+/// a widget that allocates, and this screen lays its rows out against explicit
+/// rectangles. `opacity` is design 5b's faded row (see
+/// [`theme::ENDED_ROW_OPACITY`]), applied to the child as a whole so the tile
+/// recedes with its row whatever is drawn in it.
+fn paint_send_tile(
+    ui: &mut egui::Ui,
     tile: egui::Rect,
+    records: RecordTiles<'_>,
+    sent: Option<&SentFacts>,
     name: &str,
     emphasised: bool,
-    text_px: f32,
     opacity: f32,
 ) {
-    let (fill, edge, ink) = if emphasised {
-        (theme::BLUE_WASH, theme::BLUE_EDGE, theme::BLUE)
-    } else {
-        (theme::CANVAS, theme::HAIRLINE, theme::TEXT_MUTED)
-    };
-    let dim = |colour: egui::Color32| theme::faded(colour, opacity);
-    let radius = CornerRadius::same((tile.width() / 4.0).round() as u8);
-    painter.rect_filled(tile, radius, dim(fill));
-    painter.rect_stroke(
-        tile,
-        radius,
-        egui::Stroke::new(1.0, dim(edge)),
-        egui::StrokeKind::Inside,
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(tile)
+            .layout(egui::Layout::left_to_right(egui::Align::Min)),
     );
-    painter.text(
-        tile.center(),
-        egui::Align2::CENTER_CENTER,
-        theme::initials(name),
-        egui::FontId::new(text_px, egui::FontFamily::Name(theme::BOLD.into())),
-        dim(ink),
-    );
+    child.multiply_opacity(opacity);
+    match records.record(sent) {
+        Some(item) => super::item_list::row_tile(
+            &mut child,
+            records.icons.and_then(|icons| icons.get(&item.id)),
+            crate::vault_bridge::ItemKind::of(item),
+            &item.name,
+            tile.width(),
+            emphasised,
+        ),
+        None => super::item_list::row_tile(
+            &mut child,
+            None,
+            crate::vault_bridge::ItemKind::Login,
+            name,
+            tile.width(),
+            emphasised,
+        ),
+    }
 }
 
-/// Row geometry, from design 5b's own CSS and measured as a border box.
+/// **Row geometry: the records row's, every number of it.**
 ///
-/// The row declares `padding: 10px 12px` inside a `1px` border around a
-/// 32pt tile, so 1 + 10 + 32 + 10 + 1 = 54. The two text lines it holds
-/// beside the tile come to the same 32 (a 13px name's ~16pt line box, the
-/// design's 3px gap, an 11px subtitle's ~13pt box), which is why the tile and
-/// the text block are both simply centred on the band.
-const ROW_HEIGHT: f32 = 54.0;
-/// 5b's `padding: ... 12px`, and `border-radius: 10px`.
-const ROW_PAD_X: f32 = 12.0;
-const ROW_RADIUS: u8 = 10;
-/// The tile, and 5b's `gap: 11px` beside it -- also the gap between the text
+/// This row was its own: 54pt with a 32pt tile, drawn to design 5b's CSS,
+/// beside a records row of 62pt with a 40pt one -- in the column the two
+/// lists swap places in. The owner's report was that a Send's row was not a
+/// record's row, down to the tile not sitting where a record's does. So the
+/// height, the padding, the border, the radius, the tile and the gap beside
+/// it are `item_list`'s own constants, read here and not restated, and the
+/// tile is drawn by `item_list::row_tile` -- the records list's own tile.
+const ROW_HEIGHT: f32 = super::item_list::ROW_TILE_HEIGHT;
+/// The row's `padding: 10px 12px` inside its 1pt border: where the tile, the
+/// text and the pill start, measured from the band's own edge.
+const ROW_PAD_X: f32 = super::item_list::ROW_PAD_X;
+const ROW_INSET: f32 = super::item_list::ROW_BORDER + ROW_PAD_X;
+const ROW_RADIUS: u8 = super::item_list::ROW_RADIUS;
+/// The tile, and the `gap: 11px` beside it -- also the gap between the text
 /// block and the state pill, so the row has one rhythm rather than two.
-const ROW_TILE: f32 = 32.0;
-const ROW_TEXT_GAP: f32 = 11.0;
+const ROW_TILE: f32 = super::item_list::AVATAR_SIZE;
+const ROW_TEXT_GAP: f32 = super::item_list::ROW_GAP_X;
 /// The gap between two controls in a row.
 const BUTTON_GAP: f32 = 8.0;
 /// The gap between the row's name and its FILE tag, and between the tag's
@@ -2407,6 +2455,7 @@ fn draw_send_detail(
     view: &SendView<'_>,
     delete: SendDeleteView<'_>,
     selected: &mut Option<String>,
+    records: RecordTiles<'_>,
 ) -> Option<SendUiAction> {
     let mut action: Option<SendUiAction> = None;
 
@@ -2438,7 +2487,7 @@ fn draw_send_detail(
                 // failed, and that case is unchanged.
                 None if in_scope.is_empty() => {}
                 None => detail_prompt(ui, NOTHING_PICKED),
-                Some(row) => action = draw_send_card(ui, row, delete),
+                Some(row) => action = draw_send_card(ui, row, delete, records),
             }
         }
         SendView::Received(rows) => {
@@ -2472,6 +2521,7 @@ fn draw_send_card(
     ui: &mut egui::Ui,
     row: &SendRow,
     delete: SendDeleteView<'_>,
+    records: RecordTiles<'_>,
 ) -> Option<SendUiAction> {
     let mut action: Option<SendUiAction> = None;
     let width = ui.available_width();
@@ -2522,7 +2572,9 @@ fn draw_send_card(
     };
     let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
     {
-        let p = ui.painter();
+        // A clone, so the tile can be drawn by a child `Ui` mid-block.
+        let p = ui.painter().clone();
+        let p = &p;
         p.rect_filled(strip, CornerRadius::ZERO, theme::CARD);
         p.rect_filled(
             egui::Rect::from_min_max(
@@ -2540,7 +2592,9 @@ fn draw_send_card(
             ),
             egui::Vec2::splat(HEADER_TILE),
         );
-        paint_tile(p, tile, &row.name, true, 14.0);
+        // The record's own tile, as its read pane draws it, when the Send
+        // was made from one that has an icon; its monogram otherwise.
+        paint_send_tile(ui, tile, records, row.sent.as_ref(), &row.name, true, 1.0);
 
         let text_left = tile.right() + ROW_TEXT_GAP;
         // The text column stops where the actions begin when they are on this
@@ -2806,7 +2860,9 @@ fn draw_received_detail(ui: &mut egui::Ui, row: &ReceivedRow) {
     let strip_height = DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK;
     let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
     {
-        let p = ui.painter();
+        // A clone, so the tile can be drawn by a child `Ui` mid-block.
+        let p = ui.painter().clone();
+        let p = &p;
         p.rect_filled(strip, CornerRadius::ZERO, theme::CARD);
         p.rect_filled(
             egui::Rect::from_min_max(
@@ -2824,7 +2880,7 @@ fn draw_received_detail(ui: &mut egui::Ui, row: &ReceivedRow) {
             ),
             egui::Vec2::splat(HEADER_TILE),
         );
-        paint_tile(p, tile, &row.name, true, 14.0);
+        paint_send_tile(ui, tile, RecordTiles::default(), None, &row.name, true, 1.0);
         let text_left = tile.right() + ROW_TEXT_GAP;
         let clip = p.with_clip_rect(
             egui::Rect::from_min_max(
@@ -5429,7 +5485,7 @@ mod verdict_linearity {
                 let _ = ctx.run_ui(Default::default(), |ui| {
                     // Deliberately dropped rather than applied: this is the
                     // shape every measured shadow reduces to.
-                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), SendView::Mine(crate::vault_window::sidebar::SendScope::All), &mut None);
+                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), SendView::Mine(crate::vault_window::sidebar::SendScope::All), &mut None, RecordTiles::default());
                 });
             }),
             1,
@@ -5510,6 +5566,9 @@ mod paint_tests {
         /// border arrives as a shape with no fill at all and would be
         /// invisible to every assertion in this module.
         strokes: Vec<(egui::Rect, egui::Color32)>,
+        /// Every textured rectangle -- a favicon is the only picture this
+        /// screen paints, and it paints no string and no plain fill.
+        images: Vec<egui::Rect>,
     }
 
     impl Painted {
@@ -5607,6 +5666,9 @@ mod paint_tests {
                 out.rects.push(rect.rect);
                 out.fills.push((rect.rect, rect.fill));
                 out.strokes.push((rect.rect, rect.stroke.color));
+                if rect.brush.is_some() {
+                    out.images.push(rect.rect);
+                }
             }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
@@ -5677,7 +5739,7 @@ mod paint_tests {
         let mut selected = picked;
         let mut action = SendUiAction::None;
         let output = ctx.run_ui(input(), |ui| {
-            action = draw_send_pane(ui, state, notice, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
+            action = draw_send_pane(ui, state, notice, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
         });
 
         let mut painted = Painted::default();
@@ -6840,7 +6902,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
 
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -6874,7 +6936,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -6886,7 +6948,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
+            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
         });
         action
     }
@@ -7024,7 +7086,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default()).into_action();
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -7044,7 +7106,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default()).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7057,7 +7119,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None).into_action();
+            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default()).into_action();
         });
         assert_eq!(action, SendUiAction::DismissNotice);
     }
@@ -7087,7 +7149,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
         let _ = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
         });
         let press = egui::RawInput {
             events: vec![
@@ -7102,7 +7164,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7115,7 +7177,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected).into_action();
+            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
         });
         action
     }
@@ -7472,6 +7534,352 @@ mod paint_tests {
         assert_eq!(painted.count_exact(REVOKE_LABEL), 1, "control: the detail pane is not up");
     }
 
+    // ---- the records list's shape ----------------------------------------------
+
+    /// A record as the vault holds one: a login with a username, so its row
+    /// has two lines like a Send's, and its tile with no icon is its name's
+    /// monogram.
+    fn a_record(id: &str, name: &str) -> crate::vault_bridge::VaultItem {
+        crate::vault_bridge::VaultItem {
+            id: id.to_string(),
+            name: name.to_string(),
+            fields: Vec::new(),
+            login: Some(crate::vault_bridge::LoginData {
+                username: Some("dancefront".to_string()),
+                password: None,
+                totp: None,
+                uris: Vec::new(),
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    /// One live Send, made from `record` and filed as such, as the Sent
+    /// list's single row.
+    fn a_send_made_from(record: &crate::vault_bridge::VaultItem) -> SendPaneState {
+        let send = SendSummary {
+            id: "send-of-the-record".to_string(),
+            name: record.name.clone(),
+            access_url: "https://send.bitwarden.com/#/r".to_string(),
+            deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
+        };
+        let mut history = crate::sent_history::SentHistory::default();
+        history.record(crate::sent_history::SentRecord {
+            sent_at_unix_millis: NOW,
+            send_id: send.id.clone(),
+            recipient: "dancefront".to_string(),
+            item_id: record.id.clone(),
+            name: record.name.clone(),
+            fields: Vec::new(),
+        });
+        with_sent_facts(pane_state(Some(&Ok(vec![send])), &FixedClock(NOW), &UTC), &history)
+    }
+
+    /// A 2x2 texture, because what is asserted is that the record's picture
+    /// is painted and where, never what is in it.
+    fn a_texture(ctx: &egui::Context) -> egui::TextureHandle {
+        ctx.load_texture(
+            "the-records-icon",
+            egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8; 16]),
+            egui::TextureOptions::default(),
+        )
+    }
+
+    /// The Sent screen, with the first row picked, drawn with `records` for
+    /// its tiles.
+    fn paint_sent_with(
+        state: &SendPaneState,
+        size: egui::Vec2,
+        records: impl Fn(&egui::Context) -> (Vec<crate::vault_bridge::VaultItem>, Option<egui::TextureHandle>),
+    ) -> Painted {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let (items, texture) = records(&ctx);
+        let icons: std::collections::HashMap<String, egui::TextureHandle> = texture
+            .into_iter()
+            .flat_map(|t| items.iter().map(move |item| (item.id.clone(), t.clone())))
+            .collect();
+        let mut selected = first_row_id(state);
+        let output = ctx.run_ui(input(), |ui| {
+            let _ = draw_send_pane(
+                ui,
+                state,
+                None,
+                SendDeleteView::default(),
+                SendView::Mine(ALL_SENDS),
+                &mut selected,
+                RecordTiles { items: &items, icons: Some(&icons) },
+            )
+            .into_action();
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    /// The records list, as the window draws it -- its own panel at the
+    /// column's width, no margin -- with `record` in it and picked.
+    fn paint_records_list(record: &crate::vault_bridge::VaultItem, size: egui::Vec2) -> Painted {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let items = vec![record.clone()];
+        let mut search = String::new();
+        let mut selected = Some(record.id.clone());
+        let mut visible = Vec::new();
+        let mut opened = false;
+        let icons = crate::vault_window::item_list::IconCache::default();
+        let output = ctx.run_ui(input(), |ui| {
+            egui::Panel::left("the-records-list")
+                .exact_size(crate::vault_window::LIST_WIDTH)
+                .resizable(false)
+                .show_separator_line(false)
+                .frame(egui::Frame::new().fill(theme::CANVAS))
+                .show(ui, |ui| {
+                    let _ = crate::vault_window::item_list::draw_item_list(
+                        ui,
+                        Some(&items),
+                        &[],
+                        &crate::vault_window::sidebar::SidebarFilter::All,
+                        &mut search,
+                        &mut selected,
+                        &icons,
+                        false,
+                        &mut visible,
+                        None,
+                        false,
+                        &mut opened,
+                        &std::collections::HashSet::new(),
+                    );
+                });
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    /// The pieces of a list column's header and first row, **as painted**:
+    /// the strip, its hairline, the row's band and its tile.
+    struct ListShape {
+        strip: egui::Rect,
+        hairline: egui::Rect,
+        row: egui::Rect,
+        row_edge: egui::Color32,
+        tile: egui::Rect,
+    }
+
+    fn list_shape(painted: &Painted, what: &str) -> ListShape {
+        let in_column = |r: &egui::Rect| r.center().x < crate::vault_window::LIST_WIDTH;
+        let strip = painted
+            .fills
+            .iter()
+            .filter(|(r, fill)| *fill == theme::CARD && r.top() <= 0.5 && in_column(r))
+            .map(|(r, _)| *r)
+            .reduce(egui::Rect::union)
+            .unwrap_or_else(|| panic!("{what}: no white header strip at the column's top"));
+        let hairline = painted
+            .fills
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::HAIRLINE && in_column(r) && (r.bottom() - strip.bottom()).abs() < 0.5
+            })
+            .map(|(r, _)| *r)
+            .next()
+            .unwrap_or_else(|| panic!("{what}: no hairline at the strip's foot"));
+        let row = painted
+            .fills
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::CARD && in_column(r) && r.top() > strip.bottom() && r.height() > 40.0
+            })
+            .map(|(r, _)| *r)
+            .next()
+            .unwrap_or_else(|| panic!("{what}: no row band under the strip"));
+        // The band's edge, whichever shape carries it: a `Frame` paints fill
+        // and stroke as one rect, a painter as two.
+        let row_edge = painted
+            .strokes
+            .iter()
+            .filter(|(r, edge)| {
+                (r.min - row.min).length() < 0.51
+                    && (r.max - row.max).length() < 0.51
+                    && *edge != egui::Color32::TRANSPARENT
+            })
+            .map(|(_, edge)| *edge)
+            .next()
+            .unwrap_or_else(|| panic!("{what}: the row band has no edge"));
+        let tile = painted
+            .strokes
+            .iter()
+            .filter(|(r, _)| {
+                row.contains_rect(*r) && (r.width() - r.height()).abs() < 0.5 && r.width() > 20.0
+            })
+            .map(|(r, _)| *r)
+            .next()
+            .unwrap_or_else(|| panic!("{what}: no square tile inside the row"));
+        ListShape { strip, hairline, row, row_edge, tile }
+    }
+
+    /// **The Sent list is drawn to the records list's shape: the same header
+    /// strip and rule, the same row band, the same tile in the same place,
+    /// the same selected edge -- measured off what each list PAINTS.**
+    ///
+    /// The owner put the two side by side: a 56pt strip against a 58pt one,
+    /// a 54pt row with a 32pt tile against a 62pt row with a 40pt one. The
+    /// Sent list now reads the records list's constants and draws through its
+    /// functions, and this is what says the result is the same picture -- not
+    /// a constant compared with itself, but two rendered columns compared
+    /// rect for rect, which catches a shared number used in a different way
+    /// as surely as a different number.
+    #[test]
+    fn the_sent_list_is_drawn_to_the_records_lists_shape() {
+        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+        let record = a_record("rec-1", "SAP Production");
+        let records_painted = paint_records_list(&record, size);
+        let sent_painted =
+            paint_sent_with(&a_send_made_from(&record), size, |_| (vec![record.clone()], None));
+        let records = list_shape(&records_painted, "the records list");
+        let sent = list_shape(&sent_painted, "the Sent list");
+
+        // The name, where each list sets it: the records row's text gap
+        // beside the tile, and the same line.
+        let name_in = |painted: &Painted, what: &str| {
+            *painted
+                .text_rects
+                .iter()
+                .filter(|(t, r)| t == &record.name && r.center().x < crate::vault_window::LIST_WIDTH)
+                .map(|(_, r)| r)
+                .next()
+                .unwrap_or_else(|| panic!("{what} painted no name in its row"))
+        };
+        let (r_name, s_name) = (name_in(&records_painted, "the records list"), name_in(&sent_painted, "the Sent list"));
+        assert!(
+            (r_name.left() - s_name.left()).abs() < 0.51,
+            "the name starts at {} on the Sent row and {} on the records row",
+            s_name.left(),
+            r_name.left()
+        );
+        assert!(
+            (r_name.top() - s_name.top()).abs() < 1.01,
+            "the name sits at {} on the Sent row and {} on the records row",
+            s_name.top(),
+            r_name.top()
+        );
+
+        let close = |a: egui::Rect, b: egui::Rect| {
+            (a.min - b.min).length() < 0.51 && (a.max - b.max).length() < 0.51
+        };
+        for (part, r, s) in [
+            ("header strip", records.strip, sent.strip),
+            ("strip's hairline", records.hairline, sent.hairline),
+            ("row band", records.row, sent.row),
+            ("row tile", records.tile, sent.tile),
+        ] {
+            assert!(close(r, s), "the {part} is {s:?} on the Sent list and {r:?} on the records list");
+        }
+        assert_eq!(sent.hairline.height(), 1.0, "the strip's rule is not one point");
+        assert_eq!(
+            sent.row_edge, records.row_edge,
+            "a picked Send's row is edged differently from a picked record's"
+        );
+        assert_eq!(sent.row_edge, theme::BLUE, "control: the picked row is not the blue-edged one");
+    }
+
+    /// **The tile sits in the middle of its row**, one border and one padding
+    /// in from the band's left edge -- which is where the records row puts
+    /// its tile, and which the Sent row's 32pt tile was not.
+    #[test]
+    fn a_sends_tile_is_centred_in_its_row() {
+        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+        let record = a_record("rec-1", "SAP Production");
+        let shape = list_shape(
+            &paint_sent_with(&a_send_made_from(&record), size, |_| (Vec::new(), None)),
+            "the Sent list",
+        );
+        assert!(
+            (shape.tile.center().y - shape.row.center().y).abs() < 0.51,
+            "the tile's centre is at {} in a row centred at {}",
+            shape.tile.center().y,
+            shape.row.center().y
+        );
+        let inset = crate::vault_window::item_list::ROW_BORDER + crate::vault_window::item_list::ROW_PAD_X;
+        assert!(
+            (shape.tile.left() - shape.row.left() - inset).abs() < 0.51,
+            "the tile starts {}pt into its row, not the records row's {inset}",
+            shape.tile.left() - shape.row.left()
+        );
+        assert!(
+            (shape.row.bottom() - shape.tile.bottom() - (shape.tile.top() - shape.row.top())).abs() < 0.51,
+            "the tile has more room above it than below"
+        );
+    }
+
+    /// **A Send made from a record wears that record's icon**, in its row and
+    /// at the head of its detail -- where the owner saw `2X` -- and falls back
+    /// to the monogram only when the record has no icon.
+    #[test]
+    fn a_send_made_from_a_record_with_an_icon_wears_the_icon() {
+        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+        let record = a_record("rec-1", "23000268.xyz");
+        let state = a_send_made_from(&record);
+
+        let with_icon = paint_sent_with(&state, size, |ctx| (vec![record.clone()], Some(a_texture(ctx))));
+        let row = list_shape(&with_icon, "the Sent list");
+        let in_row: Vec<&egui::Rect> =
+            with_icon.images.iter().filter(|r| row.tile.expand(0.5).contains_rect(**r)).collect();
+        assert_eq!(in_row.len(), 1, "the row's tile holds no picture: {:?}", with_icon.images);
+        assert!(
+            with_icon.images.iter().any(|r| r.center().x > crate::vault_window::LIST_WIDTH),
+            "the detail header's tile holds no picture: {:?}",
+            with_icon.images
+        );
+        assert!(
+            !with_icon.text.iter().any(|t| t == &theme::initials(&record.name)),
+            "the monogram was painted as well as the icon: {:?}",
+            with_icon.text
+        );
+
+        // The control: the same Send, its record with no icon, is the
+        // monogram -- so the picture above came from the record's icon and
+        // from nothing else.
+        let without = paint_sent_with(&state, size, |_| (vec![record.clone()], None));
+        assert!(without.images.is_empty(), "a picture with no icon: {:?}", without.images);
+        assert!(
+            without.text.iter().any(|t| t == &theme::initials(&record.name)),
+            "no monogram when the record has no icon: {:?}",
+            without.text
+        );
+    }
+
     /// The two steps do not share a word, so the second click is a decision
     /// rather than muscle memory.
     #[test]
@@ -7811,6 +8219,7 @@ mod paint_tests {
                 SendDeleteView::default(),
                 SendView::Mine(scope),
                 &mut selected,
+                RecordTiles::default(),
             )
             .into_action();
         });
@@ -8006,6 +8415,7 @@ mod paint_tests {
                 SendDeleteView::default(),
                 SendView::Received(rows),
                 &mut selected,
+                RecordTiles::default(),
             )
             .into_action();
         });
@@ -12533,7 +12943,8 @@ mod source_pins {
         let pane = squashed(concat!(
             "send_ui::draw_send_", "pane( ui, state, notice_message.as_deref(), \
              send_delete.view(), if on_received { send_ui::SendView::Received(&received) } \
-             else { send_ui::SendView::Mine(send_scope) }, &mut selected_send, )"
+             else { send_ui::SendView::Mine(send_scope) }, &mut selected_send, \
+             send_ui::RecordTiles { items: &items, icons: Some(&icons.textures) }, )"
         ));
         assert_eq!(
             squashed(&production).matches(pane.as_str()).count(),

@@ -2700,6 +2700,8 @@ impl Preview {
                     send_ui::SendDeleteView::default(),
                     view,
                     selected,
+                    // No vault behind the preview: every tile a monogram.
+                    send_ui::RecordTiles::default(),
                 );
                 // Taken and thrown away: a preview has no window to act on.
                 // See the doc above for why it must not simply be dropped.

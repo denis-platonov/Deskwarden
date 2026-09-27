@@ -1245,13 +1245,22 @@ fn mark_ink_drop(ui: &egui::Ui, brand: CardBrand, selected: bool) -> f32 {
 /// one_design_gap_apart_and_span_the_pane` asserts that from painted output
 /// rather than trusting the arithmetic above.
 pub(crate) const ROW_TILE_HEIGHT: f32 = AVATAR_SIZE + 2.0 * ROW_PAD_Y + 2.0 * ROW_BORDER;
-const ROW_PAD_Y: f32 = 10.0;
-const ROW_PAD_X: f32 = 12.0;
-const ROW_BORDER: f32 = 1.0;
+/// The row's `padding: 10px 12px` and its border. **`pub(crate)`, with the
+/// three below it, because the Sent list is drawn to
+/// this row's shape.** The two columns swap places in one window, and the
+/// owner's report was that a Send's row was not a record's row -- a 54pt band
+/// with a 32pt tile beside a 62pt band with a 40pt one, its own padding, its
+/// own radius. `send_ui` reads these rather than spelling its own, so the two
+/// rows cannot drift apart again.
+pub(crate) const ROW_PAD_Y: f32 = 10.0;
+pub(crate) const ROW_PAD_X: f32 = 12.0;
+pub(crate) const ROW_BORDER: f32 = 1.0;
 /// The row's `gap: 11px`, between the avatar, the title column and the badge.
-const ROW_GAP_X: f32 = 11.0;
+pub(crate) const ROW_GAP_X: f32 = 11.0;
+/// The row's `border-radius: 10px`.
+pub(crate) const ROW_RADIUS: u8 = 10;
 /// The list container's `gap: 6px`.
-const ROW_GAP: f32 = 6.0;
+pub(crate) const ROW_GAP: f32 = 6.0;
 /// The list container's `padding: 10px`.
 ///
 /// `pub(crate)` because the **Password health** screen takes this same column
@@ -1595,102 +1604,86 @@ pub fn draw_item_list(
     // for this pane carries NO inner margin and the padding is applied here
     // instead -- 12 for this header, 10 for the list below it (design 2b's
     // two different paddings, which a single panel margin could not express).
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .inner_margin(Margin::same(12))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 8.0;
-                // `+ New` is added FIRST, right-to-left, so the search box
-                // gets `flex: 1`: laid out left-to-right the button would
-                // have to be given a width up front, and the search box the
-                // remainder minus a guess at it -- which is exactly the
-                // `available_width() - 70.0` guess this replaces.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // ALWAYS opens the menu; the button itself creates
-                    // nothing. That is the user's explicit choice over the
-                    // alternative ("+ New" makes a login, a separate caret
-                    // opens the list), and it is the reason the click is not
-                    // also reported as an action here.
-                    //
-                    // `Popup::menu` draws into its own `Area`, so nothing in
-                    // the closure below allocates in this strip -- which is
-                    // what keeps the list beneath it in register with the
-                    // fixed pitch `show_rows` virtualizes against. Pinned by
-                    // `the_new_menu_does_not_change_the_rows_below_it`.
-                    let new = theme::primary_button_matching_field(ui, "+ New");
-                    egui::Popup::menu(&new).show(|ui| {
-                        // Built FROM `CREATABLE_KINDS`, never from a list
-                        // written out here. That array is one of the three
-                        // doors keeping `ItemKind::Unknown` -- "a type this
-                        // build does not understand" -- unreachable from
-                        // creation, and a hand-written list is precisely the
-                        // door that would leak: it would keep compiling, and
-                        // keep offering whatever it said, after the array
-                        // moved on.
-                        for kind in super::detail_edit::CREATABLE_KINDS {
-                            if ui.button(kind.label()).clicked() {
-                                action = ItemListAction::NewItem(kind);
-                                ui.close();
-                            }
-                        }
-                        // **The import, below a separator, and NOT a row of
-                        // the loop above.** It is not a kind: it makes an
-                        // item whose type comes from the payload, not from
-                        // this menu, so putting it in `CREATABLE_KINDS`
-                        // would have added a fake `ItemKind` to the one
-                        // array three doors depend on for keeping
-                        // `ItemKind::Unknown` out of creation.
-                        //
-                        // Here rather than in the titlebar beside "Send a
-                        // record" -- see `record_ui::IMPORT_FROM_SEND_LABEL`
-                        // for the argument. The short of it: this control is
-                        // "make me a new item", and the import is one, while
-                        // the send narrows an item already selected.
-                        ui.separator();
-                        if ui.button(super::record_ui::IMPORT_FROM_SEND_LABEL).clicked() {
-                            action = ItemListAction::ImportFromSend;
+    // The strip, its padding and its hairline are `list_strip`'s, which the
+    // Sent list's header is drawn by too.
+    list_strip(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            // `+ New` is added FIRST, right-to-left, so the search box
+            // gets `flex: 1`: laid out left-to-right the button would
+            // have to be given a width up front, and the search box the
+            // remainder minus a guess at it -- which is exactly the
+            // `available_width() - 70.0` guess this replaces.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // ALWAYS opens the menu; the button itself creates
+                // nothing. That is the user's explicit choice over the
+                // alternative ("+ New" makes a login, a separate caret
+                // opens the list), and it is the reason the click is not
+                // also reported as an action here.
+                //
+                // `Popup::menu` draws into its own `Area`, so nothing in
+                // the closure below allocates in this strip -- which is
+                // what keeps the list beneath it in register with the
+                // fixed pitch `show_rows` virtualizes against. Pinned by
+                // `the_new_menu_does_not_change_the_rows_below_it`.
+                let new = theme::primary_button_matching_field(ui, "+ New");
+                egui::Popup::menu(&new).show(|ui| {
+                    // Built FROM `CREATABLE_KINDS`, never from a list
+                    // written out here. That array is one of the three
+                    // doors keeping `ItemKind::Unknown` -- "a type this
+                    // build does not understand" -- unreachable from
+                    // creation, and a hand-written list is precisely the
+                    // door that would leak: it would keep compiling, and
+                    // keep offering whatever it said, after the array
+                    // moved on.
+                    for kind in super::detail_edit::CREATABLE_KINDS {
+                        if ui.button(kind.label()).clicked() {
+                            action = ItemListAction::NewItem(kind);
                             ui.close();
                         }
-                    });
-                    // "Search 180 logins" -- see `search_hint`, which owns
-                    // both the count's source and the per-filter noun.
-                    let hint = search_hint(
-                        items.map(|items| super::sidebar::count_for(items, filter)),
-                        filter,
-                    );
-                    theme::search_field(
-                        ui,
-                        search,
-                        &hint,
-                        "CTRL+K",
-                        // Stable id so `Ctrl+K` (wired in
-                        // `vault_window::mod`) can request focus on this
-                        // field from outside this function. MUST NOT CHANGE.
-                        // Spelled once, in `search_field_id` -- the arrow-key
-                        // block below has to ask about this same field's
-                        // focus, and two literals would be two things to
-                        // rename.
-                        search_field_id(),
-                    );
+                    }
+                    // **The import, below a separator, and NOT a row of
+                    // the loop above.** It is not a kind: it makes an
+                    // item whose type comes from the payload, not from
+                    // this menu, so putting it in `CREATABLE_KINDS`
+                    // would have added a fake `ItemKind` to the one
+                    // array three doors depend on for keeping
+                    // `ItemKind::Unknown` out of creation.
+                    //
+                    // Here rather than in the titlebar beside "Send a
+                    // record" -- see `record_ui::IMPORT_FROM_SEND_LABEL`
+                    // for the argument. The short of it: this control is
+                    // "make me a new item", and the import is one, while
+                    // the send narrows an item already selected.
+                    ui.separator();
+                    if ui.button(super::record_ui::IMPORT_FROM_SEND_LABEL).clicked() {
+                        action = ItemListAction::ImportFromSend;
+                        ui.close();
+                    }
                 });
+                // "Search 180 logins" -- see `search_hint`, which owns
+                // both the count's source and the per-filter noun.
+                let hint = search_hint(
+                    items.map(|items| super::sidebar::count_for(items, filter)),
+                    filter,
+                );
+                theme::search_field(
+                    ui,
+                    search,
+                    &hint,
+                    "CTRL+K",
+                    // Stable id so `Ctrl+K` (wired in
+                    // `vault_window::mod`) can request focus on this
+                    // field from outside this function. MUST NOT CHANGE.
+                    // Spelled once, in `search_field_id` -- the arrow-key
+                    // block below has to ask about this same field's
+                    // focus, and two literals would be two things to
+                    // rename.
+                    search_field_id(),
+                );
             });
         });
-    // The design's `border-bottom` under the strip. Painted here rather than
-    // as a `Frame` stroke so it is only on the bottom edge -- a full-box
-    // stroke would draw a second line down the pane's own right edge, on top
-    // of `Panel`'s separator, which is the exact doubling the sidebar's frame
-    // comment warns about.
-    let strip_bottom = ui.min_rect().bottom();
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::Pos2::new(ui.min_rect().left(), strip_bottom - 1.0),
-            egui::Pos2::new(ui.min_rect().right(), strip_bottom),
-        ),
-        CornerRadius::ZERO,
-        theme::HAIRLINE,
-    );
+    });
 
     // A drag-to-folder that did not happen, said out loud. Drawn here --
     // between the toolbar strip and the list -- because this is the pane the
@@ -2035,10 +2028,11 @@ pub const SHARED_PILL: &str = "shared";
 /// Design 2b's row title (`font-size: 13px`) and subtitle
 /// (`font-size: 11px`), and the `gap: 2px` between them. Named because
 /// [`text_column_height`] has to measure exactly what [`item_row`] then
-/// draws; a size stated twice would drift.
-const TITLE_SIZE: f32 = 13.0;
-const SUBTITLE_SIZE: f32 = 11.0;
-const TITLE_GAP_Y: f32 = 2.0;
+/// draws; a size stated twice would drift. `pub(crate)` for the row geometry's
+/// reason: the Sent list's rows set their two lines in these.
+pub(crate) const TITLE_SIZE: f32 = 13.0;
+pub(crate) const SUBTITLE_SIZE: f32 = 11.0;
+pub(crate) const TITLE_GAP_Y: f32 = 2.0;
 
 /// The space between a card row's name and its `(*4545)` suffix. A word gap,
 /// not a column gap: the suffix qualifies the name it follows, and the row's
@@ -2060,7 +2054,7 @@ const TITLE_SUFFIX_GAP_X: f32 = 4.0;
 /// `the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top`
 /// and its single-line sibling: a family here that did not match the one
 /// drawn would mis-measure the column and shift it off centre.
-fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) -> f32 {
+pub(crate) fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) -> f32 {
     let family = if selected { theme::BOLD } else { theme::SEMIBOLD };
     let title = egui::FontId::new(TITLE_SIZE, egui::FontFamily::Name(family.into()));
     let mut height = ui.ctx().fonts_mut(|f| f.row_height(&title));
@@ -2184,6 +2178,82 @@ struct RowOutcome {
     command: Option<RowCommand>,
 }
 
+/// **The tile at the head of a row: the record's favicon, or what its kind
+/// draws when it has none.**
+///
+/// Its own function because two lists draw it: this one, and the Sent list,
+/// whose row for a Send made from a record wears THAT record's tile -- the
+/// owner's "it shows 2X when it should show the record's image". One function
+/// is one answer to "what does this record look like", rather than a second
+/// copy of the branch that could disagree about a card or a note.
+///
+/// With a favicon, it is the SAME box the monogram fallback draws -- bordered,
+/// with the tile's radius -- with the artwork FILLING it, clipped to the
+/// tile's own corner radius and with the border re-drawn over the top.
+/// `theme::avatar_image` carries the reasoning, and the history: this was
+/// edge-to-edge, then inset 4pt, and is edge-to-edge again because the design
+/// says the image takes the tile.
+///
+/// Without one, the item's KIND draws the tile. A login and an unsupported
+/// kind still get the name's monogram -- `kind_mark::avatar` is the one place
+/// that branch is made, and its module doc carries why a card's tile is the
+/// generic card mark while `VISA` stays out on the trailing pill.
+pub(crate) fn row_tile(
+    ui: &mut egui::Ui,
+    icon: Option<&egui::TextureHandle>,
+    kind: ItemKind,
+    name: &str,
+    size: f32,
+    selected: bool,
+) {
+    match icon {
+        Some(tex) => {
+            let tile = theme::avatar_artwork_tile(ui, size, selected);
+            theme::avatar_image(ui, tile, tex, selected);
+        }
+        None => kind_mark::avatar(ui, kind, name, size, selected),
+    }
+}
+
+/// **Design 2b's list header strip**: a white tile the full width of the
+/// column, `padding: 12px` around a row the search box's own 34pt tall, and a
+/// 1pt hairline along its foot -- drawn by one function for both lists that
+/// take this column.
+///
+/// The Sent list's header was a second strip built by hand: 56pt against this
+/// one's 58, its own padding and its own rule, and the owner could see the two
+/// headers were not one thing when the columns swapped. So the records list
+/// and the Sent list both draw their headers through here, and what goes IN
+/// the strip is theirs: the search box and `+ New` here, the heading, the
+/// count and the sort there.
+///
+/// The hairline is painted rather than stroked so it is on the bottom edge
+/// only -- a full-box stroke would draw a second line down the pane's own
+/// right edge, on top of `Panel`'s separator.
+pub(crate) fn list_strip<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let shown = egui::Frame::new()
+        .fill(theme::CARD)
+        .inner_margin(Margin::same(LIST_STRIP_PAD))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(theme::SEARCH_FIELD_HEIGHT);
+            add(ui)
+        });
+    let strip = shown.response.rect;
+    ui.painter().rect_filled(
+        egui::Rect::from_min_max(
+            egui::Pos2::new(strip.left(), strip.bottom() - 1.0),
+            strip.right_bottom(),
+        ),
+        CornerRadius::ZERO,
+        theme::HAIRLINE,
+    );
+    shown.inner
+}
+
+/// Design 2b's `padding: 12px` on the list header strip.
+pub(crate) const LIST_STRIP_PAD: i8 = 12;
+
 fn item_row(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -2236,7 +2306,7 @@ fn item_row(
         ))
         // `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)`, selected only.
         .shadow(if selected { SELECTED_ROW_SHADOW } else { egui::Shadow::NONE })
-        .corner_radius(CornerRadius::same(10))
+        .corner_radius(CornerRadius::same(ROW_RADIUS))
         .inner_margin(Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -2249,33 +2319,7 @@ fn item_row(
                 // mark moved to the trailing edge, no fourth element beside
                 // it either. The row now reads tile, then text, then the
                 // trailing chips, on every row of every kind.
-                match icon {
-                    Some(tex) => {
-                        // The SAME box the monogram fallback draws -- filled,
-                        // bordered, 8px radius -- with the artwork FILLING it,
-                        // clipped to the tile's own corner radius and with the
-                        // border re-drawn over the top. `theme::avatar_image`
-                        // carries the reasoning, and the history: this was
-                        // edge-to-edge, then inset 4pt, and is edge-to-edge
-                        // again because the design says the image takes the
-                        // tile.
-                        let tile = theme::avatar_artwork_tile(ui, AVATAR_SIZE, selected);
-                        theme::avatar_image(ui, tile, tex, selected);
-                    }
-                    // No favicon: the item's KIND draws the tile. A login and
-                    // an unsupported kind still get the name's monogram --
-                    // `kind_mark::avatar` is the one place that branch is
-                    // made, and its module doc carries why a card's tile is
-                    // the generic card mark while `VISA` stays out on the
-                    // trailing pill.
-                    None => kind_mark::avatar(
-                        ui,
-                        ItemKind::of(item),
-                        &item.name,
-                        AVATAR_SIZE,
-                        selected,
-                    ),
-                }
+                row_tile(ui, icon, ItemKind::of(item), &item.name, AVATAR_SIZE, selected);
                 // The design's title column is `flex: 1` with the chips
                 // trailing it. Laid out right-to-left so the chips take their
                 // own width off the right edge and the column gets the

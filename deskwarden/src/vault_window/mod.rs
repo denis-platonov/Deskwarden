@@ -3799,6 +3799,32 @@ pub fn build_frame_with_search(
                 );
             }
         }
+        // **And the records behind the Sent screen's rows**, whose tiles are
+        // those records' own (`send_ui::RecordTiles`). The records list is
+        // not drawn while the Sent screen is up, so nothing above asks for
+        // them; a Send made from a record the user has not scrolled past this
+        // session would otherwise wear its monogram. One lookup per listed
+        // Send and a set check per record after the first -- see
+        // `ensure_icon_loaded`'s doc. Guarded by `icon_base_known` for the
+        // loop above's reason.
+        if show_sends && icon_base_known {
+            if let Some(Ok(sends)) = &send_fetch.result {
+                for send in sends {
+                    let Some(filed) = sent_history.for_send(&send.id) else { continue };
+                    if let Some(item) = items.iter().find(|i| i.id == filed.item_id) {
+                        ensure_icon_loaded(
+                            ui.ctx(),
+                            item,
+                            &icon_cache_dir,
+                            &icon_fetch,
+                            &favicon_tx,
+                            &mut favicon_requested,
+                            &mut icons,
+                        );
+                    }
+                }
+            }
+        }
 
         // `draw_item_list` above is the only place `selected_id` can change
         // (a row click). When it does, everything below is state that was
@@ -4368,6 +4394,7 @@ pub fn build_frame_with_search(
                             send_ui::SendView::Mine(send_scope)
                         },
                         &mut selected_send,
+                        send_ui::RecordTiles { items: &items, icons: Some(&icons.textures) },
                     );
                 }
                 // Resolved from the list the selection was made in, for the
@@ -25374,10 +25401,10 @@ mod account_details_tests {
             .collect();
         assert_eq!(
             sites.len(),
-            2,
-            "expected the two icon call sites (the visible rows and the detail pane); found \
-             {} -- if one was added, it needs the same guard, and if one was removed this \
-             test is checking less than it says",
+            3,
+            "expected the three icon call sites (the visible rows, the detail pane, and the \
+             records behind the Sent screen's rows); found {} -- if one was added, it needs \
+             the same guard, and if one was removed this test is checking less than it says",
             sites.len()
         );
         for at in sites {

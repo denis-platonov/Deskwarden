@@ -6265,6 +6265,12 @@ pub fn disabled_field_label(ui: &mut Ui, text: &str) {
 /// the form fields' [`FIELD_HEIGHT`] and is its own value for that reason.
 pub const SEARCH_FIELD_HEIGHT: f32 = 34.0;
 
+/// The type size of design 2b's search box, and so of the list header strip
+/// it sits in. The Sent list's header prints its count and its sort at this
+/// size, because it is the same strip in the same column and the owner could
+/// see a 12px header beside a 13px one.
+pub const SEARCH_TEXT_PX: f32 = 13.0;
+
 /// Paints the design's magnifier into `rect`.
 ///
 /// STROKED, NOT TYPED, and not an SVG either. The design draws it as inline
@@ -6399,7 +6405,7 @@ pub fn search_field(
     // The text row sits between the icon and the shortcut, centred on the
     // glyphs rather than the box for the same optical reason `field_box`
     // documents.
-    let font = FontId::new(13.0, FontFamily::Proportional);
+    let font = FontId::new(SEARCH_TEXT_PX, FontFamily::Proportional);
     let row_height = ui.ctx().fonts_mut(|f| f.row_height(&font));
     let text_left = icon_rect.right() + GAP;
     let text_right = outer.max.x - PAD_X - shortcut_width - GAP;
@@ -6414,7 +6420,7 @@ pub fn search_field(
         inner,
         egui::TextEdit::singleline(value)
             .id(id)
-            .hint_text(RichText::new(hint).size(13.0).color(TEXT_GHOST))
+            .hint_text(RichText::new(hint).size(SEARCH_TEXT_PX).color(TEXT_GHOST))
             .frame(egui::Frame::new())
             .font(font)
             .margin(Margin::ZERO)
