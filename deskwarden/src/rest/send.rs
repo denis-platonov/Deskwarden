@@ -443,9 +443,24 @@ fn active_account() -> Result<(RestClient, crate::rest::api::Authenticated), Sen
     Ok((RestClient::new(login.server_url), authenticated))
 }
 
-/// The user key, unwrapped from a fresh `/api/sync`.
+/// The user key, unwrapped from a fresh `GET /api/accounts/profile`.
 ///
-/// **`sync_refreshing`, and the plain `sync` here was the whole of bug 2.**
+/// # This was a whole `/api/sync`, and it was a read on every launch
+///
+/// A `GET /api/sync` carries the profile this unwraps, and it also carries
+/// every cipher on the account, which this function has never read. The
+/// vault window lists the Sends on EVERY open -- the `shared` pill and the
+/// read pane's `SHARING` card both read that list -- so every window open
+/// paid a whole-vault read for one wrapped key: ~1,700 rows on the owner's
+/// D1-backed server, beside the one read that actually fills the window. It
+/// was the third of a launch's three, and the only one nothing logged.
+///
+/// The profile route is the same [`crate::rest::sync::Profile`] -- see
+/// [`RestClient::profile`] -- so [`VaultKeys::unwrap_from`] is unchanged, and
+/// a server that does not answer it is asked the sync instead, which is what
+/// this always cost there.
+///
+/// **Refreshing, and the plain `sync` here was the whole of bug 2.**
 /// The credential this runs on comes off disk through
 /// [`crate::user_key_store::UserKeyStore::load`], whose own doc says what it
 /// hands back: a [`crate::rest::api::Session`] that "holds no access token at
@@ -469,14 +484,23 @@ fn vault_keys(
     authenticated: &mut crate::rest::api::Authenticated,
     ambiguity: Ambiguity,
 ) -> Result<VaultKeys, SendError> {
-    let response = client
-        .sync_refreshing(&mut authenticated.session)
-        .map_err(|e| map_error(e, ambiguity))?;
-    let profile = response
-        .profile
-        .as_ref()
-        .ok_or_else(|| SendError::Rejected("Bitwarden's answer carried no profile.".to_string()))?;
-    let (keys, _) = VaultKeys::unwrap_from(&authenticated.master_key, profile)
+    let profile = match client.profile(&mut authenticated.session) {
+        Ok(profile) if profile.key.is_some() => profile,
+        // **The route, not the credential.** A server without the profile
+        // route -- or one whose answer carries no wrapped key -- has said
+        // nothing about this login, and a Send list that failed over it would
+        // be a screen that never loads on that server. The sync carries the
+        // same profile; it is what this always paid there.
+        Ok(_) | Err(RestError::Status(404 | 405 | 501) | RestError::Parse(_)) => client
+            .sync_refreshing(&mut authenticated.session)
+            .map_err(|e| map_error(e, ambiguity))?
+            .profile
+            .ok_or_else(|| {
+                SendError::Rejected("Bitwarden's answer carried no profile.".to_string())
+            })?,
+        Err(e) => return Err(map_error(e, ambiguity)),
+    };
+    let (keys, _) = VaultKeys::unwrap_from(&authenticated.master_key, &profile)
         .map_err(|_| SendError::Locked)?;
     Ok(keys)
 }
@@ -1677,7 +1701,14 @@ mod a_stored_credential_can_list_sends {
         answer
     }
 
-    /// **The whole path, end to end, on a credential that came off disk.**
+    /// **The whole path, end to end, on a credential that came off disk** --
+    /// and **no whole-vault read in it.**
+    ///
+    /// `expect(0)` on the sync route is the half of this that is about cost.
+    /// The key used to come off a `GET /api/sync`, and the vault window lists
+    /// the Sends on every open, so that was a full read on every launch beside
+    /// the one that fills the window. The profile route carries the same key
+    /// for a handful of rows; see `vault_keys`.
     #[test]
     fn listing_sends_on_a_stored_credential_returns_the_rows() {
         let dir = crate::test_scratch::ScratchDir::new("sends-stored-credential");
@@ -1691,14 +1722,21 @@ mod a_stored_credential_can_list_sends {
             .with_body(r#"{"access_token":"a-fresh-access-token","expires_in":3600}"#)
             .expect(1)
             .create();
-        let sync = server
-            .mock("GET", "/api/sync")
-            .match_query("excludeDomains=true")
+        let profile = server
+            .mock("GET", "/api/accounts/profile")
             .match_header("authorization", "Bearer a-fresh-access-token")
             .with_status(200)
             .with_header("content-type", "application/json")
-            .with_body(json!({ "profile": { "key": protected_user_key() } }).to_string())
+            .with_body(json!({ "key": protected_user_key(), "object": "profile" }).to_string())
             .expect(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync")
+            .match_query("excludeDomains=true")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "profile": { "key": protected_user_key() } }).to_string())
+            .expect(0)
             .create();
         let sends = server
             .mock("GET", "/api/sends")
@@ -1719,8 +1757,58 @@ mod a_stored_credential_can_list_sends {
             "the rows came back but were not the ones the server sent, decrypted"
         );
         refresh.assert();
+        profile.assert();
         sync.assert();
         sends.assert();
+    }
+
+    /// **A server without the profile route still lists its Sends**, by the
+    /// sync this always paid there.
+    ///
+    /// The other half of `vault_keys`' fallback, and the half that keeps the
+    /// cheap route from being a regression: a `404` from the profile route is
+    /// a statement about the server, and a Sends screen that said "locked"
+    /// over it would be telling the user something false about their vault.
+    #[test]
+    fn a_server_without_the_profile_route_lists_its_sends_off_the_sync() {
+        let dir = crate::test_scratch::ScratchDir::new("sends-no-profile-route");
+        let store = a_stored_credential(dir.path());
+        let mut server = crate::test_http::server();
+
+        server
+            .mock("POST", "/identity/connect/token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"access_token":"a-fresh-access-token","expires_in":3600}"#)
+            .expect(1)
+            .create();
+        let profile = server.mock("GET", "/api/accounts/profile").with_status(404).expect(1).create();
+        let sync = server
+            .mock("GET", "/api/sync")
+            .match_query("excludeDomains=true")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "profile": { "key": protected_user_key() } }).to_string())
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/api/sends")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(json!({ "data": [a_row(&keys())] }).to_string())
+            .expect(1)
+            .create();
+
+        let url = server.url();
+        let listed = with_the_stored_credential(&url, store, list_on_active_account);
+
+        assert_eq!(
+            listed.expect("the fallback did not list the Sends").len(),
+            1,
+            "the one row the server sent"
+        );
+        profile.assert();
+        sync.assert();
     }
 
     /// The control that says the test above is about the refresh and not about

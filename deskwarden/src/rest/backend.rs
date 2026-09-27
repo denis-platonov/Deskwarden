@@ -86,6 +86,22 @@
 //! one on a cold vault window; on the owner's 1,668-item account that was
 //! about fifteen seconds against about one.
 //!
+//! **A launch was three again, counted on the server this time** -- ~5,100 D1
+//! rows, each whole sync ~1,700 -- and two of the three were syncs taken for
+//! a KEY:
+//!
+//! * The daemon's startup probe was a `list_items`, for a yes-or-no about the
+//!   stored login. It is [`RestBackend::verify_stored_login`] now: the
+//!   profile route and an unwrap, no cipher read. The daemon's one read is
+//!   the readiness wait that follows it.
+//! * [`crate::rest::send`] unwrapped the user key off a whole sync before
+//!   every Sends list, and the vault window lists the Sends on every open. It
+//!   reads [`crate::rest::api::RestClient::profile`] instead.
+//!
+//! What is left is one read per process that holds a vault: the daemon's,
+//! and the window's. Every read this backend makes logs itself -- see
+//! [`RestBackend::synced`] -- so the count is a `grep` of the log.
+//!
 //! # What this backend refuses
 //!
 //! **Nothing.** All twenty-one operations are implemented.
@@ -298,6 +314,33 @@ pub struct RestBackend {
     /// copying a vault. The two callers that need to own the folder list clone
     /// that list alone.
     synced: Mutex<Option<CachedSync>>,
+    /// **One whole-vault read at a time**, held across the whole of
+    /// [`Self::synced`]: the revision check, the sync, and the filing of its
+    /// answer in [`Self::synced`]'s cache.
+    ///
+    /// # The read it stops
+    ///
+    /// The vault window opens with two loads in flight at once: its initial
+    /// load, and the forced reload its sync-on-open starts a frame later --
+    /// which on this backend answers at once, because there is no `bw sync`
+    /// to run first. Both reach `synced`, and the revision gate only saves the
+    /// second if the first has FILED its sync by the time the second asks. The
+    /// state lock alone does not arrange that: it is released between the
+    /// revision check and the sync, so the second load could take its turn in
+    /// that gap, find nothing filed, and pay for the whole vault a second
+    /// time, one second after the first. Rarely -- the first thread usually
+    /// re-takes the lock before the second has even been woken -- but a count
+    /// that rests on which thread the scheduler runs first is not a count.
+    ///
+    /// Held here, the second caller waits for the first to finish and then
+    /// asks the one-row question against a sync that is already filed. It
+    /// would have waited on the state lock anyway, for the same second.
+    ///
+    /// **Taken before the state lock and never inside it**, and nothing else
+    /// in this file takes it -- so there is one order, and it cannot invert.
+    /// The writers, `one_record` and `keys_only` never touch it: they are
+    /// not whole-vault reads, and a write must not queue behind one.
+    fetching: Mutex<()>,
 }
 
 /// One sync, and the revision the server reported immediately before it.
@@ -356,7 +399,75 @@ impl RestBackend {
             state,
             keys: Mutex::new(None),
             synced: Mutex::new(None),
+            fetching: Mutex::new(()),
         }
+    }
+
+    /// **Does the stored login still open this account?** -- asked without
+    /// reading the vault.
+    ///
+    /// The daemon's startup probe. It used to be a `list_items`, which is a
+    /// whole `GET /api/sync` and a decryption of every cipher, taken for its
+    /// yes-or-no and then thrown away -- and taken on the launch's critical
+    /// path, before the vault window's process had even been started.
+    ///
+    /// What the probe has to establish is two things, and neither is a
+    /// cipher: that the session can still be refreshed (the server answers
+    /// at all, with this refresh token), and that the stored master key still
+    /// opens the account's user key. `GET /api/accounts/profile` answers both
+    /// -- it is authenticated, and it carries the wrapped key -- so this
+    /// unwraps [`VaultKeys`] from it exactly as a sync's profile would be.
+    /// The keys are then REMEMBERED ([`Self::keys`]), so the first edit after
+    /// the launch reads its one record and no sync.
+    ///
+    /// # The verdicts, and the one thing that is not a verdict
+    ///
+    /// * A `401` the refresh could not cure is a dead session, and a master
+    ///   key that does not open `profile.key` is a stale key. Both are `Err`,
+    ///   as the sync would have been, and the caller deletes the stored key
+    ///   on either -- the same evidence it always acted on.
+    /// * **A server that does not answer the ROUTE is not evidence of
+    ///   anything about the key.** A `404`, a `405`, a `501`, a body that is
+    ///   not a profile, a profile with no `key` in it: each of those says the
+    ///   server lacks this cheap question, and answering it with "your key is
+    ///   stale" would delete a working credential and ask for the master
+    ///   password on every launch. So those fall back to the probe this
+    ///   replaced -- one [`Self::synced`] -- and its answer is the verdict.
+    ///   The fallback costs what the probe always cost; only a server that
+    ///   has the route saves anything.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the profile (or, on the fallback, the sync) was refused
+    /// with, mapped as every other call in this file maps it.
+    pub fn verify_stored_login(&self) -> Result<(), VaultError> {
+        let mut state = self.locked();
+        let profile = match self.client.profile(&mut state.session) {
+            Ok(profile) if profile.key.is_some() => profile,
+            Ok(_) | Err(RestError::Status(404 | 405 | 501) | RestError::Parse(_)) => {
+                drop(state);
+                log::info!(
+                    "this server did not answer the profile route with a wrapped key, so the \
+                     stored login is checked by reading the vault instead"
+                );
+                return self
+                    .synced("the stored-login check, on a server without a profile route")
+                    .map(|_| ());
+            }
+            Err(e) => return Err(rest_error(e)),
+        };
+        let (keys, failures) =
+            VaultKeys::unwrap_from(&state.master_key, &profile).map_err(crypto_error)?;
+        if !failures.is_empty() {
+            log::warn!(
+                "{} organisation key(s) on this account could not be unwrapped: {failures:?}",
+                failures.len()
+            );
+        }
+        // Released before the keys' own lock, as everywhere in this file.
+        drop(state);
+        let _ = self.remember_keys(keys);
+        Ok(())
     }
 
     // ---- the two things every method starts with ---------------------------
@@ -394,6 +505,13 @@ impl RestBackend {
     fn keys_only(&self) -> Result<Arc<VaultKeys>, VaultError> {
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
+        // The server cannot tell this sync from any other, so it costs the
+        // same rows and is logged beside `synced`'s -- see that line.
+        log::info!(
+            "whole-vault read: GET /api/sync for the vault keys alone, {} cipher(s) fetched and \
+             not decrypted",
+            response.ciphers.len()
+        );
         let profile = response
             .profile
             .as_ref()
@@ -427,7 +545,20 @@ impl RestBackend {
     /// dropped on the floor. The log carries **counts and field names only**
     /// -- [`crate::rest::sync::DecryptFailure`] holds nothing else by
     /// construction.
-    fn synced(&self) -> Result<(Arc<DecryptedVault>, Arc<VaultKeys>), VaultError> {
+    ///
+    /// `why` is the caller's own name for the question, and it is spent on
+    /// one log line: **every whole-vault read this backend actually makes says
+    /// so, and says what for.** A launch's cost in database rows is a count of
+    /// those lines, which is how "three reads where one would do" becomes a
+    /// fact read off the log rather than a guess off a server's billing page.
+    /// A revision hit is not a read and logs nothing.
+    fn synced(&self, why: &str) -> Result<(Arc<DecryptedVault>, Arc<VaultKeys>), VaultError> {
+        // **One at a time, and first.** See `Self::fetching`: a second caller
+        // waits here for the first to FILE its sync, and then the revision
+        // check below answers it for one row.
+        let _one_read_at_a_time =
+            self.fetching.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+
         // **The revision FIRST, and with no other lock held.** One row on the
         // server, against the ~1,686 the sync below costs. Read before the
         // sync so the recorded revision can never be newer than the vault it
@@ -440,18 +571,26 @@ impl RestBackend {
             let mut state = self.locked();
             self.client.revision_date(&mut state.session).ok()
         };
+        let mut because = "nothing was read before it";
         if let Some(revision) = revision {
             if let Ok(held) = self.synced.lock() {
                 if let Some(cached) = held.as_ref() {
                     if cached.revision == revision {
                         return Ok((Arc::clone(&cached.vault), Arc::clone(&cached.keys)));
                     }
+                    because = "the server's revision moved since the last one";
                 }
             }
+        } else {
+            because = "the server did not say what revision it is at";
         }
 
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
+        log::info!(
+            "whole-vault read: GET /api/sync for {why}, {} cipher(s), because {because}",
+            response.ciphers.len()
+        );
         let vault = decrypt_vault(&response, &state.master_key).map_err(crypto_error)?;
         let profile = response
             .profile
@@ -738,7 +877,7 @@ impl VaultBackend for RestBackend {
     /// **Cost: one full sync.** Every live item, in one WAN round trip plus a
     /// whole-vault decryption. See the module docs.
     fn list_items(&self) -> Result<Vec<VaultItem>, VaultError> {
-        let (vault, _) = self.synced()?;
+        let (vault, _) = self.synced("the live items")?;
         Ok(Self::live(&vault))
     }
 
@@ -778,7 +917,7 @@ impl VaultBackend for RestBackend {
     /// ciphers and cannot be asked for on their own, so a `populate` that
     /// wants items and folders pays for the vault twice.
     fn list_folders(&self) -> Result<Vec<Folder>, VaultError> {
-        let (vault, _) = self.synced()?;
+        let (vault, _) = self.synced("the folder list")?;
         // Cloned, because the vault behind this is shared -- see the
         // `synced` field. A folder list is a handful of names; the alternative
         // was copying every item beside them on every cache hit.
@@ -801,7 +940,7 @@ impl VaultBackend for RestBackend {
     /// single-sync path would paint deleted items that the two-call path
     /// hides.
     fn list_vault(&self) -> Result<crate::vault_cache::VaultSnapshot, VaultError> {
-        let (vault, _) = self.synced()?;
+        let (vault, _) = self.synced("a vault load, items and folders")?;
         Ok(crate::vault_cache::VaultSnapshot {
             items: Self::live(&vault),
             folders: vault.folders.clone(),
@@ -1075,7 +1214,7 @@ impl VaultBackend for RestBackend {
     /// `list_items` above carries the other half of the same filter, and the
     /// two must stay complementary.
     fn list_trash(&self) -> Result<Vec<VaultItem>, VaultError> {
-        let (vault, _) = self.synced()?;
+        let (vault, _) = self.synced("the Trash")?;
         Ok(vault.items.iter().filter(|d| is_trashed(&d.item)).map(|d| d.item.clone()).collect())
     }
 
@@ -1092,7 +1231,7 @@ impl VaultBackend for RestBackend {
     /// against documents a good deal as not implemented; if `archivedDate`
     /// never appears, no item is archived, and saying so is correct.
     fn list_archive(&self) -> Result<Vec<VaultItem>, VaultError> {
-        let (vault, _) = self.synced()?;
+        let (vault, _) = self.synced("the Archive")?;
         Ok(vault.items.iter().filter(|d| is_archived(&d.item)).map(|d| d.item.clone()).collect())
     }
 
@@ -3509,6 +3648,194 @@ pub mod tests {
 
         sync.assert();
     }
+
+    // ---- the stored-login check, and what a launch reads -------------------
+
+    /// `GET /api/accounts/profile` as the fixture account answers it: the
+    /// same `profile` object [`sync_body`] carries, on its own.
+    fn profile_body() -> String {
+        serde_json::json!({
+            "object": "profile",
+            "key": protected_user_key(),
+            "privateKey": null,
+            "organizations": []
+        })
+        .to_string()
+    }
+
+    /// The revision route, answering the same number however often it is
+    /// asked -- a vault nobody is editing, which is a launch's normal case.
+    fn an_unchanging_revision(server: &mut crate::test_http::MockServer) {
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000000")
+            .expect_at_least(0)
+            .create();
+    }
+
+    /// **The daemon's startup probe reads no vault.**
+    ///
+    /// It was a `list_items`: one whole `GET /api/sync` and a decryption of
+    /// every cipher, for a yes-or-no. `expect(0)` on the sync route is the
+    /// assertion; the `get_item` after it is the proof that the check did
+    /// more than return `Ok` -- the keys it unwrapped were remembered, so
+    /// reading one record needs no sync to learn them either.
+    #[test]
+    fn the_stored_login_is_checked_without_reading_the_vault() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let profile = server
+            .mock("GET", "/api/accounts/profile")
+            .with_body(profile_body())
+            .expect(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(0)
+            .create();
+        declare_the_per_id_cipher_route(&mut server);
+
+        backend.verify_stored_login().expect("the fixture login opens the fixture account");
+        let item = backend.get_item("live-1").expect("one record, on the keys the check kept");
+
+        profile.assert();
+        sync.assert();
+        assert_eq!(item.name, "A live item", "the record did not decrypt on the remembered keys");
+    }
+
+    /// **A master key that does not open the account is still a verdict**,
+    /// and still reached without the vault.
+    ///
+    /// The caller deletes the stored key on this answer, so it must be the
+    /// same answer the sync-based probe gave: a key sealed under somebody
+    /// else's master key does not unwrap, and that is an `Err`.
+    #[test]
+    fn a_master_key_the_profile_does_not_open_is_refused() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let elsewhere = master_key(b"not the master password", EMAIL, Kdf::Pbkdf2 { iterations: 1 })
+            .expect("one iteration");
+        server
+            .mock("GET", "/api/accounts/profile")
+            .with_body(
+                serde_json::json!({ "key": seal(&elsewhere.stretch(), &user_key_bytes()) })
+                    .to_string(),
+            )
+            .expect(1)
+            .create();
+        let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
+
+        backend.verify_stored_login().expect_err("a key sealed under another master key");
+        sync.assert();
+    }
+
+    /// **A dead session is a verdict too**, and the profile route meets it
+    /// exactly as the sync did: the refresh is tried once, and a second `401`
+    /// is [`VaultError::Unauthorized`] -- not a fallback to the sync, which
+    /// would only have met the same refusal at seventeen hundred times the
+    /// price.
+    #[test]
+    fn a_dead_session_is_refused_by_the_profile_without_a_sync() {
+        let mut server = crate::test_http::server();
+        server
+            .mock("POST", "/identity/accounts/prelogin")
+            .with_body(r#"{"kdf":0,"kdfIterations":1}"#)
+            .create();
+        let grant = server
+            .mock("POST", "/identity/connect/token")
+            .with_body(r#"{"access_token":"AT-1","refresh_token":"RT-1","expires_in":3600}"#)
+            .create();
+        let client = RestClient::new(server.url());
+        let authenticated = fixture_login(&client);
+        drop(grant);
+
+        server.mock("POST", "/identity/connect/token").with_status(401).create();
+        server.mock("GET", "/api/accounts/profile").with_status(401).create();
+        let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
+
+        let backend = RestBackend::new(client, authenticated);
+        let err = backend.verify_stored_login().expect_err("a dead session");
+        assert!(matches!(err, VaultError::Unauthorized), "{err:?}");
+        sync.assert();
+    }
+
+    /// **A server without the profile route is probed the old way**, and its
+    /// stored key is NOT deleted over the missing route.
+    ///
+    /// A `404` here is a fact about the server. Read as a verdict on the key
+    /// it would delete a working credential and ask for the master password
+    /// on every launch against that server -- so it falls back to the one
+    /// sync the probe always cost, and that sync's answer is the verdict.
+    #[test]
+    fn a_server_without_the_profile_route_is_checked_by_the_sync_instead() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let profile = server.mock("GET", "/api/accounts/profile").with_status(404).expect(1).create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+
+        backend
+            .verify_stored_login()
+            .expect("a missing route is not a stale key, and the sync says the key is good");
+        profile.assert();
+        sync.assert();
+    }
+
+    /// **The daemon's launch, end to end: one whole-vault read.**
+    ///
+    /// The sequence `main.rs` runs for a direct-REST account with a stored
+    /// key, in its order and through its shapes: the probe on the concrete
+    /// backend, the backend adopted into the late-bound slot, the cache built
+    /// over the slot, the readiness wait's `list_items` through the cache's
+    /// handle, and the seeding `populate_with`, which asks the folder list.
+    ///
+    /// Three questions about the vault and ONE sync. The probe asks the
+    /// profile; the readiness wait is the read; the folder list is the
+    /// revision gate's one-row hit on the sync the wait just filed. Before
+    /// this the probe was the read and the wait was the hit -- the same count
+    /// in this process, paid before the vault window's process was started.
+    #[test]
+    fn the_daemons_launch_reads_the_vault_once() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        an_unchanging_revision(&mut server);
+        let profile = server
+            .mock("GET", "/api/accounts/profile")
+            .with_body(profile_body())
+            .expect(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+
+        backend.verify_stored_login().expect("the probe");
+        let slot: crate::vault_backend::SharedLateBoundBackend =
+            Arc::new(crate::vault_backend::LateBoundBackend::empty());
+        slot.adopt(Box::new(backend));
+        let cache = crate::vault_cache::VaultCache::new(Arc::clone(&slot));
+        let epoch = cache.epoch();
+        let items = crate::bw_serve::wait_for_vault_ready(cache.bridge(), &[])
+            .expect("the readiness wait");
+        assert_eq!(
+            cache.populate_with(items, epoch).expect("the seeding populate"),
+            crate::vault_cache::PopulateOutcome::Populated,
+            "the seeding populate was discarded, so the counts below describe no launch"
+        );
+
+        profile.assert();
+        sync.assert();
+        assert_eq!(cache.items().len(), 1, "the cache was not filled by the one read");
+        assert_eq!(cache.folders().len(), 1, "the folders did not come off the same read");
+    }
+
+    // **Two loads in flight at once** -- the case `Self::fetching` exists for
+    // -- is asserted beside the code that puts them in flight, through its
+    // own spawner: `vault_window`'s
+    // `a_windows_open_with_its_sync_on_open_reads_the_vault_once`. A thread
+    // started here would be one more entry in `job_object`'s spawn census for
+    // a test that the window's own seam can already drive.
 
     /// This backend has to be usable from the threads `VaultCache` hands it
     /// to. A compile-time assertion, because [`VaultBackend`]'s own doc says

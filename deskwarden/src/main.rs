@@ -1686,6 +1686,13 @@ fn main() {
     // fill read. Both processes wait through the same readiness at the
     // same time rather than one after the other.
     //
+    // **On a direct-REST account this is the daemon's one whole-vault read
+    // of the launch**, now that the settle's probe asks the profile route
+    // instead. The window's process makes its own, and there is no third:
+    // two processes, each holding a vault, and by design nothing decrypted
+    // crosses between them -- so two is the floor for a launch that opens a
+    // window, and one for a launch that stays in the tray.
+    //
     // **Except when the child is still asking for the master password.**
     // Then there is nothing to be ready: the vault backend does not exist
     // until that card is answered, so this probe would fail on every
@@ -4200,8 +4207,10 @@ fn adopt_startup_prefetch(
 /// # At [`WhenSettling::JustProvenByASignIn`], which is the whole reason that
 /// enum exists
 ///
-/// That settle probes the server with a live `list_items`, and on a plain
-/// failure it DELETES `userkey.bin` and asks for the master password again.
+/// That settle probes the server -- the profile route now, a live
+/// `list_items` until the launch's whole-vault reads were counted -- and on a
+/// plain failure it DELETES `userkey.bin` and asks for the master password
+/// again.
 /// Here that would be catastrophic in a quiet way: the key was derived from a
 /// master password seconds ago and used in the child to read this very vault,
 /// so a probe that fails at this moment means the network blinked between two
@@ -13596,9 +13605,10 @@ fn device_id_for(id: &accounts::AccountId) -> String {
 ///   answers an [`Authenticated`] whose session holds no access token and is
 ///   expired by construction, so the probe below is what finds out whether the
 ///   refresh token and the master key are both still good. That probe is one
-///   `GET /api/sync` -- the same round trip `bw sync` made on the other path
-///   -- and it is made **eagerly, here, before the window**, because the whole
-///   point is to learn the answer at a moment when asking again is normal.
+///   `GET /api/accounts/profile` and an unwrap of the user key -- it used to
+///   be a whole `GET /api/sync`, see `RestBackend::verify_stored_login` -- and
+///   it is made **eagerly, here, before the window**, because the whole point
+///   is to learn the answer at a moment when asking again is normal.
 /// * **No stored key, or one the server refused.** The file is deleted and the
 ///   slot is left empty. The caller's next act is to drop its cached `bw`
 ///   session so that this launch shows the sign-in card, and the sign-in's own
@@ -13724,31 +13734,45 @@ fn settle_the_vault_backend_when(
     // The one construction, used by both ways in. A closure rather than two
     // copies, so the stored-key path and the fresh-sign-in path cannot come to
     // build different backends against different clients.
+    //
+    // **Concrete, and boxed where it is adopted**, because the probe below
+    // asks it something that is not a vault operation and so is not on the
+    // trait: whether the stored login still works.
     let build = {
         let server_url = server_url.clone();
         move |authenticated| {
-            Box::new(rest::backend::RestBackend::new(
+            rest::backend::RestBackend::new(
                 rest::api::RestClient::new(server_url.clone()),
                 authenticated,
-            )) as Box<dyn vault_backend::VaultBackend>
+            )
         }
     };
 
     if let Some(authenticated) = key_store.load() {
         let backend = build(authenticated);
-        // **The probe.** One `list_items`, which is one `GET /api/sync` and a
-        // decryption of the whole vault. Its answer is discarded: the cache
-        // populates itself a moment later through its own epoch-guarded path,
-        // and a second opinion about the vault stored here would be a second
-        // cache. What is kept is the yes-or-no.
-        match backend.list_items() {
-            Ok(items) => {
+        // **The probe, and it no longer reads the vault.** It was one
+        // `list_items` -- a whole `GET /api/sync` and a decryption of every
+        // cipher -- whose answer was discarded, taken on the launch's
+        // critical path before the vault window's process was even started.
+        // What it has to establish is a refreshable session and a master key
+        // that opens the account, and the profile route answers both for a
+        // handful of rows. See `RestBackend::verify_stored_login`, which also
+        // says why a server without that route is not read as a stale key.
+        //
+        // The vault itself is read once, by whatever fills the cache next --
+        // the readiness wait on a launch, `spawn_sync` after a sign-in. That
+        // read used to find the probe's copy already filed and cost one row,
+        // so the daemon's count was the same; what moves is WHEN it is paid:
+        // no longer before the window's process is started, and no longer
+        // resting on the revision gate matching across the two.
+        match backend.verify_stored_login() {
+            Ok(()) => {
                 log::info!(
-                    "the stored master key for this account still works ({} item(s) fetched \
-                     directly from the server); `bw serve` will not be started this launch",
-                    items.len()
+                    "the stored master key for this account still works (checked against the \
+                     server's profile, without reading the vault); `bw serve` will not be \
+                     started this launch"
                 );
-                slot.adopt(backend);
+                slot.adopt(Box::new(backend));
             }
             // **The message, not the key**: `VaultError`'s `Display` carries
             // a status and a route. See `debug_leak_guard`.
@@ -13805,7 +13829,7 @@ fn settle_the_vault_backend_when(
                 ),
                 Err(e) => log::warn!("the derived master key could not be stored ({e})"),
             }
-            slot.adopt(build(authenticated));
+            slot.adopt(Box::new(build(authenticated)));
             log::info!("the direct-REST vault backend is live for this account");
         }) as std::sync::Arc<dyn Fn(rest::api::Authenticated) + Send + Sync>
     };
@@ -15545,6 +15569,34 @@ mod tests {
                 refusal.contains(expected),
                 "the refusal does not mention {expected:?}, so the owner is told it failed \
                  without being told what to do: {refusal}"
+            );
+        }
+    }
+
+    /// **The startup probe asks the profile, and reads no vault.**
+    ///
+    /// `RestBackend::verify_stored_login` is tested for what it costs in
+    /// `rest::backend` -- no sync, against a mock server -- and the daemon's
+    /// whole launch sequence beside it (`the_daemons_launch_reads_the_vault_
+    /// once`). What neither can see is that THIS function still calls it: a
+    /// settle that went back to `backend.list_items()` compiles, passes every
+    /// value-level test in this file, and puts a whole-vault read back on the
+    /// launch's critical path, ahead of the window's process. `fn main` cannot
+    /// be run by a test, and `settle_the_vault_backend` needs a key sealed for
+    /// a fixture vault this binary cannot build, so the call is pinned here.
+    #[test]
+    fn the_startup_probe_checks_the_login_without_reading_the_vault() {
+        let body = body_of(production_half_of_this_file(), "fn settle_the_vault_backend_when(");
+        assert_eq!(
+            body.matches(concat!("backend.", "verify_stored_login()")).count(),
+            1,
+            "the settle no longer probes the stored login through the profile route: {body}"
+        );
+        for read in [".list_items()", ".list_vault()", ".list_folders()"] {
+            assert!(
+                !body.contains(read),
+                "the settle reads the vault again ({read}); the daemon's one read is the \
+                 readiness wait that follows it, and this would be a second: {body}"
             );
         }
     }

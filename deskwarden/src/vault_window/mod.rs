@@ -20444,6 +20444,68 @@ mod spawn_vault_load_tests {
         assert_eq!(snapshot.folders[0].name, "Work");
     }
 
+    /// **A window's whole open, not only its first load: still one sync.**
+    ///
+    /// The test above spawns the initial load and stops. `run` does not: on
+    /// its first real frame it fires the sync-on-open, whose direct-REST arm
+    /// (`DirectRestTasks::sync`) answers `Ok(())` at once, and the `sync_rx`
+    /// drain then spawns a FORCED reload -- so a window opens with two loads in
+    /// flight, the second a few frames behind the first. Both are spawned
+    /// here, with `run`'s own requests and generations, against a server whose
+    /// sync is slow enough that the second really does arrive mid-read.
+    ///
+    /// **One sync, and the revision route is what the second is answered
+    /// from.** The server says the vault has not moved, so the forced reload
+    /// costs one row; `RestBackend::fetching` is what guarantees it asks only
+    /// once the first read is filed, rather than in the gap before it, where
+    /// the answer was a second whole vault.
+    #[test]
+    fn a_windows_open_with_its_sync_on_open_reads_the_vault_once() {
+        let (mut server, backend) = crate::rest::backend::tests::signed_in_with_no_sync_route();
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000000")
+            .expect_at_least(1)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body_from_request(|_| {
+                std::thread::sleep(Duration::from_millis(300));
+                crate::rest::backend::tests::sync_payload().into_bytes()
+            })
+            .expect(1)
+            .create();
+
+        let cache = Arc::new(VaultCache::new(backend));
+        let era = cache.epoch().era();
+        let (tx, rx) = mpsc::channel();
+        for (generation, force_refresh) in [(1, false), (2, true)] {
+            spawn_vault_load_with_schedule(
+                Arc::clone(&cache),
+                tx.clone(),
+                VaultLoadRequest {
+                    force_refresh,
+                    era,
+                    generation,
+                    skip_readiness_wait: true,
+                    announced: None,
+                },
+                vec![],
+            );
+            // The first frame, roughly: the sync-on-open is not in the same
+            // instant as the spawn that precedes the window.
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        for _ in 0..2 {
+            let (generation, result) =
+                rx.recv_timeout(Duration::from_secs(30)).expect("both loads must report back");
+            let snapshot = result.unwrap_or_else(|e| panic!("load {generation} failed: {e:?}"));
+            assert_eq!(snapshot.items.len(), 1, "load {generation} painted the wrong vault");
+        }
+        sync.assert();
+    }
+
     #[test]
     fn a_superseded_era_neither_fetches_nor_paints() {
         // REVIEW 26'S RECORDED PRODUCER, the whole point of the `era`
