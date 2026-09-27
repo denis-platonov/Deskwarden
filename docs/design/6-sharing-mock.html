@@ -1,0 +1,846 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Personal sharing mock (6)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  /* ----------------------------------------------------------------
+     Deskwarden's palette, straight off src/theme.rs (and the Send tones
+     off vault_window/send_ui.rs::state_tone). Nothing here is compiled
+     into the app; change a number, reload, look.
+     ---------------------------------------------------------------- */
+  :root {
+    --ink:        #201e1d;
+    --secondary:  #444141;
+    --muted:      #605d5d;
+    --faint:      #7d7979;
+    --ghost:      #9b9797;
+    --canvas:     #f3f2f2;
+    --window:     #f7f6f5;
+    --card:       #ffffff;
+    --tint:       #fbfaf9;
+    --border:     #dedbd9;
+    --hairline:   #eae7e7;
+    --strong:     #d7d3d3;
+    --blue-deep:  #14307a;
+    --blue:       #1b3fa0;
+    --blue-bright:#3b74e8;
+    --blue-soft:  #7fa4ef;
+    --wash:       #eef2fc;
+    --edge:       #b8c7ea;
+    --focus:      #dbe4f7;
+    --error:      #b42318;
+    --danger-wash:#fdf3f2;
+    --danger-edge:#e8a9a2;
+    --danger-ink: #8c3c33;
+    --caution-wash:#fef6e7;
+    --caution-edge:#f2d99b;
+    --caution-mark:#8a5a06;
+    --caution-ink: #7a4f05;
+    --done-wash:  #e8f3ec;
+    --done-edge:  #a9d2ba;
+    --done-ink:   #17673a;
+    --done-mark:  #1b7a3f;
+    --mono: ui-monospace, Consolas, SFMono-Regular, Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #f1f0ef; font-family: Archivo, system-ui, sans-serif; color: var(--ink); -webkit-font-smoothing: antialiased; }
+  .mono { font-family: var(--mono); }
+  .page { padding: 32px 32px 72px; min-width: 1304px; }
+
+  /* ---------- page furniture (the design canvas's own, not the app's) ---------- */
+  .lockup { display: flex; align-items: center; gap: 12px; }
+  .lockup .word { font-size: 13px; font-weight: 700; letter-spacing: 0.18em; text-transform: uppercase; }
+  .lockup .turn { font-family: var(--mono); font-size: 11px; color: var(--muted); letter-spacing: 0.06em; }
+  .rule { height: 1px; background: var(--border); margin: 16px 0; max-width: 1240px; }
+  h1 { margin: 0; font-size: 42px; line-height: 1.03; font-weight: 800; letter-spacing: -0.02em; max-width: 26ch; }
+  .lead { margin: 14px 0 0; font-size: 15px; line-height: 1.55; max-width: 76ch; color: var(--secondary); }
+  .lead b { color: var(--ink); }
+  .controls { display: flex; align-items: center; gap: 22px; margin: 26px 0 0; flex-wrap: wrap; }
+  .tabs { display: inline-flex; border: 1px solid var(--strong); border-radius: 7px; overflow: hidden; background: #fff; }
+  .tabs button, .seg button { font: inherit; font-size: 12px; border: 0; border-left: 1px solid var(--strong); background: #fff; color: var(--ink); cursor: pointer; padding: 6px 13px; display: flex; align-items: center; gap: 7px; }
+  .tabs button:first-child, .seg button:first-child { border-left: 0; }
+  .tabs button .t { font-family: var(--mono); font-size: 10px; font-weight: 700; color: var(--faint); }
+  .tabs button.on, .seg button.on { background: var(--blue); color: #fff; font-weight: 600; }
+  .tabs button.on .t { color: #fff; opacity: 0.8; }
+  .newtoggle { display: flex; align-items: center; gap: 9px; font-size: 12px; color: var(--muted); cursor: pointer; user-select: none; }
+  .tg { width: 40px; height: 22px; border-radius: 999px; background: #e4e2e0; position: relative; transition: background .12s; }
+  .tg::after { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 999px; background: #fff; transition: left .12s; box-shadow: 0 1px 2px rgba(0,0,0,.15); }
+  .tg.on { background: var(--blue); }
+  .tg.on::after { left: 20px; }
+  .newkey { display: inline-block; width: 18px; height: 12px; outline: 2px dashed #e8a33d; outline-offset: -2px; border-radius: 3px; vertical-align: -1px; margin-right: 2px; }
+
+  .screen { display: none; }
+  .screen.on { display: block; }
+  .shead { display: flex; align-items: baseline; gap: 12px; margin: 30px 0 10px; }
+  .tag { background: var(--blue); color: #fff; padding: 3px 9px; border-radius: 6px; font-family: var(--mono); font-size: 12px; font-weight: 700; }
+  .shead h2 { margin: 0; font-size: 18px; font-weight: 800; letter-spacing: -0.01em; }
+  .cap { font-family: var(--mono); font-size: 11px; color: var(--faint); }
+  .note { max-width: 1240px; margin: 0 0 14px; font-size: 13px; color: var(--muted); line-height: 1.55; }
+  .note b { color: var(--ink); }
+  .stateline { display: flex; align-items: center; gap: 12px; margin: 0 0 14px; }
+  .stateline .lbl { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--ghost); }
+  .seg { display: inline-flex; border: 1px solid var(--strong); border-radius: 7px; overflow: hidden; background: #fff; }
+  .statecap { font-size: 12px; color: var(--faint); }
+  body.shownew .new { outline: 2px dashed #e8a33d; outline-offset: 2px; }
+
+  /* ---------- the window ---------- */
+  .win { width: 1240px; height: 820px; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; background: var(--window); box-shadow: 0 10px 30px rgba(45, 43, 43, 0.14); display: flex; flex-direction: column; position: relative; }
+  .tbar { height: 46px; background: #fff; border-bottom: 1px solid var(--hairline); display: flex; align-items: center; gap: 10px; padding-left: 16px; flex-shrink: 0; }
+  .tbar .name { font-size: 14px; font-weight: 800; letter-spacing: -0.01em; }
+  .tbar .me { width: 28px; height: 28px; border-radius: 999px; background: var(--ink); color: #fff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+  .tbar .wc { display: flex; font-size: 11px; color: var(--faint); margin-left: 10px; }
+  .tbar .wc div { width: 42px; text-align: center; }
+  .panes { flex: 1; display: grid; grid-template-columns: 212px 400px 1fr; min-height: 0; }
+
+  /* rail -- sidebar.rs: 32pt rows, 8pt radius, 13px, counts 11px ghost */
+  .rail { background: #fff; border-right: 1px solid var(--hairline); display: flex; flex-direction: column; min-height: 0; }
+  .rail-scroll { flex: 1; min-height: 0; overflow: hidden; display: flex; flex-direction: column; justify-content: flex-end; padding: 0 10px; }
+  .rsec { height: 20px; display: flex; align-items: center; padding: 0 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.11em; color: var(--ghost); margin-bottom: 8px; flex-shrink: 0; }
+  .rsec .plus { margin-left: auto; font-size: 15px; font-weight: 400; letter-spacing: 0; }
+  .r { height: 32px; display: flex; align-items: center; gap: 7px; padding: 0 10px; border-radius: 8px; font-size: 13px; margin-bottom: 2px; flex-shrink: 0; }
+  .r .n { margin-left: auto; font-size: 11px; color: var(--ghost); font-weight: 400; }
+  .r.on { background: var(--wash); color: var(--blue-deep); font-weight: 700; }
+  .r .pend { width: 6px; height: 6px; border-radius: 999px; background: var(--blue); }
+  .rhl { height: 1px; background: var(--hairline); margin: 12px 8px 14px; flex-shrink: 0; }
+  .lockin { padding: 10px 20px; font-size: 11px; color: var(--ghost); flex-shrink: 0; }
+
+  /* list -- item_list.rs: 62pt rows, 40pt tiles, 12pt strip */
+  .list { border-right: 1px solid var(--hairline); display: flex; flex-direction: column; min-height: 0; }
+  .strip { background: #fff; border-bottom: 1px solid var(--hairline); padding: 12px; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  .strip .inner { height: 34px; flex: 1; display: flex; align-items: center; gap: 10px; }
+  .search { flex: 1; height: 34px; border: 1px solid var(--strong); border-radius: 8px; display: flex; align-items: center; gap: 8px; padding: 0 10px; font-size: 13px; color: var(--ghost); background: #fff; }
+  .search .k { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--ghost); }
+  .newbtn { height: 34px; padding: 0 14px; border-radius: 8px; background: var(--blue); color: #fff; font-size: 13px; font-weight: 600; display: flex; align-items: center; }
+  .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 0.11em; color: var(--muted); }
+  .count { font-size: 13px; color: var(--ghost); }
+  .sort { margin-left: auto; font-size: 13px; color: var(--faint); }
+  .rows { padding: 10px; display: flex; flex-direction: column; gap: 6px; overflow: hidden; flex: 1; min-height: 0; }
+  .row { height: 62px; flex-shrink: 0; display: flex; align-items: center; gap: 11px; padding: 0 12px; background: #fff; border: 1px solid var(--hairline); border-radius: 10px; }
+  .row.sel { border-color: var(--blue); box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06); }
+  .row.sel .rt { font-weight: 700; color: var(--blue-deep); }
+  .row.ended { opacity: 0.72; }
+  .tile { width: 40px; height: 40px; border-radius: 10px; border: 1px solid var(--hairline); background: #fff; display: flex; align-items: center; justify-content: center; font-size: 16px; font-weight: 600; color: var(--muted); flex-shrink: 0; }
+  .tile.emph { border-color: var(--edge); color: var(--blue); }
+  .rtext { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .rt { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rs { font-size: 11px; color: var(--faint); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rs svg { vertical-align: -1px; margin-right: 4px; }
+  .chips { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+  .chip { font-size: 10px; color: var(--muted); background: var(--canvas); border-radius: 5px; padding: 2px 6px; }
+  .row.sel .chip { background: var(--focus); color: var(--blue-deep); }
+  .spill { display: inline-flex; align-items: center; gap: 5px; background: var(--blue); border-radius: 5px; padding: 2px 7px; font-size: 10px; font-weight: 700; color: #fff; }
+  .lgroup { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; color: var(--ghost); padding: 6px 4px 0; flex-shrink: 0; }
+  .lnote { background: var(--canvas); padding: 10px; flex-shrink: 0; }
+  .lnote .ln { height: 1px; background: var(--hairline); margin-bottom: 10px; }
+  .lnote p { margin: 0; font-size: 11px; color: var(--ghost); line-height: 1.45; }
+
+  /* invite row: the list's one row that asks for something */
+  .invite { flex-shrink: 0; background: var(--wash); border: 1px solid var(--edge); border-radius: 10px; padding: 11px 12px; display: flex; flex-direction: column; gap: 10px; }
+  .invite.sel { border-color: var(--blue); }
+  .invite .top { display: flex; align-items: center; gap: 11px; }
+  .invite .t1 { font-size: 13px; font-weight: 700; color: var(--blue-deep); }
+  .invite .t2 { font-size: 11px; color: var(--muted); }
+  .invite .acts { display: flex; gap: 8px; padding-left: 51px; }
+
+  /* state pill -- theme::state_pill: 20 tall, 999px, 10px bold */
+  .pill { display: inline-flex; align-items: center; gap: 6px; height: 20px; border-radius: 999px; padding: 0 8px; font-size: 10px; font-weight: 700; border: 1px solid; white-space: nowrap; flex-shrink: 0; }
+  .pill .dot { width: 5px; height: 5px; border-radius: 999px; }
+  .p-waiting { background: var(--wash); border-color: var(--edge); color: var(--blue-deep); }
+  .p-waiting .dot { background: var(--blue); }
+  .p-opened { background: var(--done-wash); border-color: var(--done-edge); color: var(--done-ink); }
+  .p-opened .dot { background: var(--done-mark); }
+  .p-used { background: var(--done-wash); border-color: var(--done-edge); color: var(--done-ink); }
+  .p-expired { background: var(--canvas); border-color: var(--border); color: var(--faint); }
+  .p-revoked { background: var(--danger-wash); border-color: var(--danger-edge); color: var(--danger-ink); }
+
+  /* share pill -- NEW: a person, not a link. 5pt corners (the `shared` chip's), a person mark */
+  .sp { display: inline-flex; align-items: center; gap: 5px; height: 20px; border-radius: 5px; padding: 0 7px; font-size: 10px; font-weight: 700; border: 1px solid; white-space: nowrap; flex-shrink: 0; }
+  .s-shared { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .s-invited { background: var(--wash); border-color: var(--edge); color: var(--blue-deep); }
+  .s-account { background: var(--caution-wash); border-color: var(--caution-edge); color: var(--caution-ink); }
+  .s-expired { background: var(--canvas); border-color: var(--border); color: var(--faint); }
+
+  /* detail -- detail.rs: 24/20 header, 40pt tile, 22px title, 34pt square controls */
+  .detail { display: flex; flex-direction: column; min-height: 0; position: relative; }
+  .dhead { background: #fff; border-bottom: 1px solid var(--hairline); padding: 20px 24px; display: flex; align-items: center; gap: 14px; flex-shrink: 0; }
+  .dtext { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .dtitle { font-size: 22px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .dsub { font-size: 12px; color: var(--faint); display: flex; align-items: center; gap: 8px; white-space: nowrap; }
+  .dsub .by { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+  .hctls { display: flex; gap: 2px; align-items: center; flex-shrink: 0; }
+  .hctl { width: 34px; height: 34px; display: flex; align-items: center; justify-content: center; color: var(--secondary); border-radius: 8px; position: relative; }
+  .hctl.hov { color: var(--ink); background: var(--tint); }
+  .tip { position: absolute; top: 40px; right: -6px; background: #fff; border: 1px solid var(--border); border-radius: 6px; padding: 5px 9px; font-size: 12px; color: var(--ink); box-shadow: 0 6px 16px rgba(45,43,43,.14); white-space: nowrap; z-index: 4; font-weight: 400; }
+  .dacts { display: flex; gap: 8px; flex-shrink: 0; }
+  .dbody { padding: 18px 24px; display: flex; flex-direction: column; gap: 14px; overflow: hidden; flex: 1; min-height: 0; }
+  .card { background: #fff; border: 1px solid var(--hairline); border-radius: 10px; overflow: hidden; flex-shrink: 0; }
+  .chead { padding: 11px 16px; border-bottom: 1px solid var(--hairline); font-size: 12px; font-weight: 700; letter-spacing: 0.06em; color: var(--muted); display: flex; align-items: center; gap: 10px; }
+  .chead .side { margin-left: auto; font-size: 11px; font-weight: 400; letter-spacing: 0; color: var(--ghost); }
+  .crow { display: flex; align-items: center; gap: 16px; padding: 13px 16px; border-bottom: 1px solid var(--canvas); min-height: 54px; }
+  .crow:last-child { border-bottom: 0; }
+  .clabel { width: 130px; font-size: 12px; color: var(--faint); flex-shrink: 0; }
+  .cval { flex: 1; min-width: 0; font-size: 14px; }
+  .cval .h { font-size: 11px; color: var(--faint); margin-top: 2px; }
+  .cctl { display: flex; gap: 8px; align-items: center; flex-shrink: 0; }
+  .rbtn { height: 28px; padding: 0 10px; border: 1px solid var(--strong); border-radius: 7px; background: #fff; display: inline-flex; align-items: center; font-size: 12px; color: var(--ink); white-space: nowrap; flex-shrink: 0; }
+  .rbtn.danger { color: var(--danger-ink); }
+  .btn { height: 32px; padding: 0 14px; border-radius: 8px; display: inline-flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; white-space: nowrap; flex-shrink: 0; border: 1px solid var(--strong); background: #fff; color: var(--ink); }
+  .btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  .btn.danger { background: var(--error); border-color: var(--error); color: #fff; font-weight: 700; }
+  .btn.f34 { height: 34px; }
+  .btn.sm { height: 28px; padding: 0 11px; font-size: 12px; border-radius: 7px; }
+  .btn .kbd { font-family: var(--mono); font-size: 10px; opacity: 0.8; }
+  .link { font-size: 12px; font-weight: 600; color: var(--blue-deep); white-space: nowrap; }
+  .masked { font-family: var(--mono); font-size: 15px; letter-spacing: 0.08em; }
+  .totp { display: flex; align-items: center; gap: 12px; }
+  .totp .code { font-family: var(--mono); font-size: 17px; letter-spacing: 0.12em; color: var(--blue-deep); font-weight: 600; }
+  .bar { width: 96px; height: 4px; border-radius: 2px; background: var(--edge); }
+  .bar div { height: 4px; border-radius: 2px; background: var(--blue); }
+  .meta { font-size: 12px; color: var(--faint); padding: 0 2px; flex-shrink: 0; }
+  .apppill { font-family: var(--mono); font-size: 11px; border: 1px solid var(--hairline); background: var(--tint); border-radius: 999px; padding: 3px 9px; color: var(--secondary); }
+
+  /* SHARING card blocks: stacked label, then entries */
+  .cblock { padding: 12px 16px 6px; border-bottom: 1px solid var(--canvas); }
+  .cblock .bl { font-size: 12px; color: var(--faint); margin-bottom: 2px; display: flex; align-items: center; gap: 8px; }
+  .pe { display: flex; align-items: center; gap: 11px; padding: 9px 0; }
+  .pe + .pe, .pe + .extra + .pe { border-top: 1px solid var(--canvas); }
+  .pav { width: 28px; height: 28px; border-radius: 999px; border: 1px solid var(--hairline); background: #fff; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: var(--muted); flex-shrink: 0; }
+  .pav.lg { width: 40px; height: 40px; font-size: 15px; }
+  .pav.emph { border-color: var(--edge); color: var(--blue); background: #fff; }
+  .stile { width: 28px; height: 28px; border-radius: 7px; border: 1px solid var(--hairline); background: #fff; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .who { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+  .who .l1 { display: flex; align-items: center; gap: 8px; font-size: 14px; white-space: nowrap; }
+  .who .l2 { font-size: 11px; color: var(--faint); white-space: nowrap; display: flex; gap: 4px; align-items: center; }
+  .who .l2 .link { font-size: 11px; }
+  .extra { padding: 0 0 12px 39px; }
+  .confirm .q { font-size: 14px; font-weight: 600; color: var(--error); line-height: 1.4; }
+  .confirm .h { font-size: 11px; color: var(--faint); margin-top: 4px; }
+  .confirm .btn { margin-top: 10px; }
+  .fp { background: var(--wash); border: 1px solid var(--edge); border-radius: 8px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
+  .fp .words { font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--blue-deep); letter-spacing: 0.02em; }
+  .fp .t { font-size: 11px; color: var(--blue-deep); line-height: 1.45; }
+  .cnote { padding: 12px 16px 13px; font-size: 11px; color: var(--ghost); line-height: 1.5; }
+
+  /* modal -- record_ui.rs: form card header 12pt pad, 14px bold, 690 wide there */
+  .scrim { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.35); display: flex; align-items: flex-start; justify-content: center; padding-top: 118px; z-index: 5; }
+  .modal { width: 560px; background: #fff; border: 1px solid var(--strong); border-radius: 12px; box-shadow: 0 14px 34px rgba(45, 43, 43, 0.18); }
+  .mhead { padding: 12px 18px; border-bottom: 1px solid var(--hairline); display: flex; align-items: center; gap: 10px; }
+  .mhead .ti { font-size: 14px; font-weight: 700; }
+  .mhead .x { margin-left: auto; color: var(--ghost); display: flex; }
+  .mbody { padding: 16px 18px 18px; display: flex; flex-direction: column; gap: 16px; }
+  .meb { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; color: var(--ghost); margin-bottom: 8px; }
+  .rchip { display: flex; align-items: center; gap: 11px; padding: 10px 12px; border: 1px solid var(--edge); border-radius: 10px; background: var(--wash); }
+  .rchip .tile { width: 32px; height: 32px; border-radius: 8px; font-size: 12px; font-weight: 700; }
+  .field { height: 32px; border: 1px solid var(--strong); border-radius: 7px; display: flex; align-items: center; padding: 0 10px; font-size: 13px; background: #fff; }
+  .field.focus { border-color: var(--blue); box-shadow: 0 0 0 3px var(--focus); }
+  .field .ph { color: var(--ghost); }
+  .caret { width: 1.5px; height: 16px; background: var(--blue); margin-left: 1px; }
+  .sugg { position: absolute; top: 37px; left: 0; right: 0; background: #fff; border: 1px solid var(--border); border-radius: 9px; box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16); padding: 5px; z-index: 2; }
+  .sugg .eb { padding: 4px 8px 5px; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; color: var(--ghost); }
+  .sg { height: 30px; display: flex; align-items: center; gap: 10px; padding-left: 8px; border-radius: 6px; margin-top: 2px; }
+  .sg.hov { background: var(--wash); }
+  .sg .e { flex: 1; font-size: 13px; }
+  .sg .c { font-size: 11px; color: var(--faint); }
+  .sg .x { width: 26px; text-align: center; font-size: 14px; color: var(--faint); }
+  .access { display: flex; gap: 10px; align-items: flex-start; }
+  .access .t { font-size: 12px; color: var(--secondary); line-height: 1.5; }
+  .access .t b { font-weight: 600; color: var(--ink); }
+  .mband { padding: 12px 18px; border-top: 1px solid var(--caution-edge); background: var(--caution-wash); display: flex; gap: 9px; align-items: flex-start; }
+  .mband .t { font-size: 12px; color: var(--caution-ink); line-height: 1.5; }
+  .mband .t b { font-weight: 700; }
+  .mfoot { padding: 13px 18px; border-top: 1px solid var(--hairline); background: var(--tint); display: flex; align-items: center; gap: 8px; border-radius: 0 0 12px 12px; }
+  .mfoot .hint { margin-left: auto; font-size: 12px; color: var(--ghost); }
+
+  .toast { position: absolute; right: 20px; bottom: 20px; background: var(--ink); color: #fff; font-size: 13px; padding: 10px 14px; border-radius: 8px; z-index: 3; }
+  .menu { position: absolute; top: 76px; right: 58px; width: 250px; background: #fff; border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 10px 24px rgba(45,43,43,.16); padding: 5px; z-index: 4; }
+  .menu .mi { height: 28px; display: flex; align-items: center; padding: 0 9px; font-size: 13px; border-radius: 5px; }
+  .menu .mi.hov { background: var(--wash); }
+  .menu .mi .ar { margin-left: auto; color: var(--ghost); }
+  .menu .sep { height: 1px; background: var(--hairline); margin: 4px 2px; }
+  .menu .foot { padding: 6px 9px 4px; font-size: 11px; color: var(--ghost); line-height: 1.45; }
+
+  /* header-controls inset for 6a */
+  .inset { display: flex; align-items: flex-end; gap: 26px; background: #fff; border: 1px solid var(--border); border-radius: 12px; padding: 16px 22px; width: max-content; margin: 0 0 16px; }
+  .inset .c { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  .inset .c .lab { font-size: 11px; color: var(--faint); }
+  .inset .c.new .lab { color: var(--blue-deep); font-weight: 700; }
+
+  /* 6e */
+  .ref { width: 1240px; display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  .rcard { background: #fff; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .rcard .rh { padding: 12px 16px; border-bottom: 1px solid var(--hairline); display: flex; align-items: baseline; gap: 10px; }
+  .rcard .rh .ti { font-size: 12px; font-weight: 700; letter-spacing: 0.06em; color: var(--muted); }
+  .rcard .rh .s { font-size: 12px; color: var(--ghost); }
+  .rline { display: flex; align-items: center; gap: 14px; padding: 11px 16px; border-bottom: 1px solid var(--canvas); }
+  .rline:last-child { border-bottom: 0; }
+  .rline .k { width: 150px; font-size: 12px; color: var(--faint); flex-shrink: 0; }
+  .rline .v { flex: 1; font-size: 13px; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .rline .w { font-size: 12px; color: var(--faint); }
+  .tl { font-size: 11px; color: var(--faint); }
+  .wide { grid-column: 1 / -1; }
+</style>
+</head>
+<body class="shownew">
+<div class="page">
+
+  <div class="lockup">
+    <div style="width: 26px; height: 26px"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"/><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"/><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"/><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"/></svg></div>
+    <div class="word">Deskwarden</div>
+    <div class="turn">TURN 6 · PERSONAL SHARING</div>
+  </div>
+  <div class="rule"></div>
+  <h1>Share a record with a person, not a link</h1>
+  <p class="lead">You type someone's email, and the record shows up in their vault, like Keeper does. They can <b>see, copy and autofill it, but not edit or delete it</b>, and it changes when you edit it.
+    Under the hood this is a hidden Bitwarden organisation. <b>No organisation, collection or organisation name appears anywhere below</b>, and the rail's ORGANISATIONS section leaves it out.
+    A <b>Send is a link</b> (square tile, paper plane, round-ended state pills). A <b>share is a person</b> (round avatar, person mark, square-cornered share pills).
+    Mock only. Nothing is wired up, and the data is made up.</p>
+
+  <div class="controls">
+    <div class="tabs" id="tabs"></div>
+    <div class="newtoggle" id="newtoggle"><div class="tg on" id="tg"></div><span><span class="newkey"></span> Outline what is new</span></div>
+  </div>
+
+  <div id="screens"></div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------ icons */
+  var P = {
+    plane: '<path d="M4 4l16 8-16 8 3-8z"/>',
+    person: '<circle cx="12" cy="8" r="4"/><path d="M4.5 21c.6-4 3.6-6.4 7.5-6.4s6.9 2.4 7.5 6.4"/>',
+    share: '<circle cx="9.5" cy="8.2" r="3.7"/><path d="M3 20.2c.5-3.8 3.1-6 6.5-6 1.3 0 2.5.3 3.5.9"/><path d="M18 12.8v7M14.5 16.3h7"/>',
+    star: '<path d="M12 3.6l2.55 5.2 5.7.83-4.13 4.02.98 5.68L12 16.64l-5.1 2.69.98-5.68L3.75 9.63l5.7-.83z"/>',
+    clock: '<circle cx="12" cy="12" r="8.5"/><path d="M12 12V6.8M12 12h4.2"/>',
+    env: '<rect x="3" y="5.5" width="18" height="13"/><path d="M3 5.5l9 8.3 9-8.3"/>',
+    close: '<path d="M5.5 5.5l13 13M18.5 5.5l-13 13"/>',
+    search: '<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>',
+    eye: '<path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3"/>',
+    lock: '<rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+    check: '<path d="M20 6 9 17l-5-5"/>',
+    warn: '<path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2.4 18a1.9 1.9 0 0 0 1.7 2.9h15.8a1.9 1.9 0 0 0 1.7-2.9L13.7 3.9a1.9 1.9 0 0 0-3.4 0Z"/>',
+    info: '<circle cx="12" cy="12" r="9"/><path d="M12 8h.01"/><path d="M11 12h1v5h1"/>',
+    rotate: '<path d="M3 21 21 3M14 3h7v7"/>'
+  };
+  function ic(name, size, color, sw, extra) {
+    return '<svg width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="' + color +
+      '" stroke-width="' + sw + '" stroke-linecap="round" stroke-linejoin="round"' + (extra || '') + '>' + P[name] + '</svg>';
+  }
+  var kebab = '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="6" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="12" cy="18" r="1.7"/></svg>';
+  var mark = '<svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"/><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"/><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"/><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"/></svg>';
+
+  /* ------------------------------------------------------------ pills */
+  function pill(kind) {
+    var m = {
+      waiting: ['p-waiting', '<span class="dot"></span>', 'Waiting'],
+      opened: ['p-opened', '<span class="dot"></span>', 'Opened'],
+      used: ['p-used', ic('check', 10, '#1b7a3f', 3), 'Used'],
+      expired: ['p-expired', '', 'Expired'],
+      revoked: ['p-revoked', '', 'Revoked']
+    }[kind];
+    return '<span class="pill ' + m[0] + '">' + m[1] + m[2] + '</span>';
+  }
+  // The share pill: a person, 5pt corners. Short words; the status line carries the long form.
+  function sp(kind, isNew) {
+    var m = {
+      shared: ['s-shared', '#ffffff', 'Shared'],
+      invited: ['s-invited', '#1b3fa0', 'Invited'],
+      account: ['s-account', '#8a5a06', 'No account yet'],
+      expired: ['s-expired', '#7d7979', 'Invite expired']
+    }[kind];
+    return '<span class="sp ' + m[0] + (isNew ? ' new' : '') + '">' + ic('person', 10, m[1], 2.6) + m[2] + '</span>';
+  }
+  function sharedChip(kind) {
+    // 5d's filled `shared` chip. Plane = a live Send (today); person = shared with a person (new).
+    return '<span class="spill' + (kind === 'person' ? ' new' : '') + '">' + ic(kind === 'person' ? 'person' : 'plane', 9, '#ffffff', 2.6) + 'shared</span>';
+  }
+
+  /* ------------------------------------------------------------ window pieces */
+  function titlebar(initials) {
+    return '<div class="tbar"><div style="width:22px;height:22px">' + mark + '</div><div class="name">Deskwarden</div>' +
+      '<div style="flex:1"></div><div class="me">' + initials + '</div>' +
+      '<div class="wc"><div>—</div><div>▢</div><div>✕</div></div></div>';
+  }
+
+  function rail(sel, o) {
+    o = o || {};
+    var h = '<div class="rail"><div class="rail-scroll">';
+    h += '<div class="rsec">VAULT</div>';
+    [['All items', 1672, 'all'], ['Favorites', 12], ['Apps', 38], ['Logins', 1540], ['Passkeys', 9], ['Cards', 4],
+     ['Identities', 6], ['Secure notes', 21], ['SSH keys', 3], ['Archive', 18], ['Trash', 6]].forEach(function (r) {
+      var n = r[1];
+      if (r[2] === 'all' && o.allCount) n = o.allCount;
+      h += '<div class="r' + (sel === r[2] ? ' on' : '') + '">' + r[0] + '<span class="n">' + n + '</span></div>';
+    });
+    h += '<div class="rhl"></div><div class="rsec">FOLDERS<span class="plus">+</span></div>';
+    [['Personal', 98], ['Work', 64], ['No folder', 7]].forEach(function (r) {
+      h += '<div class="r">' + r[0] + '<span class="n">' + r[1] + '</span></div>';
+    });
+    h += '<div class="rhl"></div><div class="r">Password health<span class="n">14</span></div>';
+    h += '<div class="rhl"></div><div class="rsec">SHARING</div>';
+    h += '<div class="r' + (sel === 'sent' ? ' on' : '') + '">Sent<span class="n">' + (o.sent || 6) + '</span></div>';
+    h += '<div class="r' + (sel === 'shared' ? ' on' : '') + '">Shared with me' +
+      (o.pending ? '<span class="pend new" title="An invitation is waiting" style="margin-left:auto"></span><span class="n" style="margin-left:6px">' : '<span class="n">') +
+      (o.shared || 2) + '</span></div>';
+    h += '</div><div class="lockin">Locks in 11:42</div></div>';
+    return h;
+  }
+
+  var OWNER_ROWS = [
+    { m: 'AV', t: 'Acme VPN', s: 'denis@example.com', chips: ['app', '2FA'], share: 'person' },
+    { m: 'AR', t: 'AWS root', s: 'root@example.com', chips: ['2FA'], share: 'person' },
+    { m: 'BS', t: 'Build server', s: 'deploy', chips: ['app'] },
+    { m: 'GH', t: 'GitHub', s: 'denis-example', chips: ['2FA'] },
+    { m: 'OW', t: 'Office Wi-Fi', s: 'Guest network', share: 'plane' },
+    { m: 'PP', t: 'Postgres — Prod', s: 'postgres', chips: ['app'] },
+    { m: 'PA', t: 'Printer admin', s: 'admin' },
+    { m: 'SD', t: 'Staging DB', s: 'app_user', chips: ['app'] },
+    { m: 'TR', t: 'Tracker', s: 'denis@example.com' },
+    { m: 'VB', t: 'VPN — Backup', s: 'denis@example.com', chips: ['app'] }
+  ];
+
+  function vaultList(selName, opts) {
+    opts = opts || {};
+    var h = '<div class="list"><div class="strip"><div class="inner">' +
+      '<div class="search">' + ic('search', 15, '#9b9797', 2) + 'Search 1672 items<span class="k">CTRL+K</span></div>' +
+      '<div class="newbtn">+ New</div></div></div><div class="rows">';
+    OWNER_ROWS.forEach(function (r) {
+      var sel = r.t === selName;
+      var share = r.share;
+      if (opts.unshared && r.t === 'Acme VPN') share = null;
+      h += '<div class="row' + (sel ? ' sel' : '') + '"><div class="tile' + (sel ? ' emph' : '') + '">' + r.m + '</div>' +
+        '<div class="rtext"><div class="rt">' + r.t + '</div><div class="rs">' + r.s + '</div></div><div class="chips">';
+      (r.chips || []).forEach(function (c) { h += '<span class="chip">' + c + '</span>'; });
+      if (share) h += sharedChip(share);
+      h += '</div></div>';
+    });
+    h += '</div></div>';
+    return h;
+  }
+
+  function win(initials, railHtml, listHtml, detailHtml, overlay) {
+    return '<div class="win">' + titlebar(initials) + '<div class="panes">' + railHtml + listHtml + detailHtml + '</div>' + (overlay || '') + '</div>';
+  }
+
+  /* ------------------------------------------------------------ detail: owner */
+  function ownerHeader(o) {
+    o = o || {};
+    var shareCtl = '<div class="hctl new' + (o.shareHover ? ' hov' : '') + '">' + ic('share', 21, 'currentColor', 1.5) +
+      (o.shareHover ? '<div class="tip">Share with a person · view-only</div>' : '') + '</div>';
+    return '<div class="dhead"><div class="tile">AV</div><div class="dtext"><div class="dtitle">Acme VPN</div>' +
+      '<div class="dsub">Login · Work</div></div><div class="hctls">' +
+      '<div class="hctl">' + ic('star', 20, 'currentColor', 1.5) + '</div>' +
+      '<div class="hctl">' + ic('clock', 20, 'currentColor', 1.5) + '</div>' +
+      '<div class="hctl">' + ic('env', 20, 'currentColor', 1.5) + '</div>' +
+      shareCtl +
+      '<div class="hctl">' + kebab + '</div>' +
+      '<div class="hctl">' + ic('close', 18, 'currentColor', 1.6) + '</div></div></div>';
+  }
+
+  function loginCard(user, rows) {
+    rows = rows || 3;
+    var h = '<div class="card"><div class="chead">LOGIN CREDENTIALS</div>' +
+      '<div class="crow"><div class="clabel">Username</div><div class="cval">' + user + '</div><div class="cctl"><span class="rbtn">Copy</span></div></div>' +
+      '<div class="crow"><div class="clabel">Password</div><div class="cval masked">••••••••••</div><div class="cctl"><span class="link" style="margin-right:6px">Reveal</span><span class="rbtn">Copy</span></div></div>';
+    if (rows > 2) h += '<div class="crow"><div class="clabel">One-time code</div><div class="cval totp"><span class="code">482 913</span><div class="bar"><div style="width:62%"></div></div><span style="font-size:12px;color:#7d7979">18s</span></div><div class="cctl"><span class="rbtn">Copy</span></div></div>';
+    return h + '</div>';
+  }
+
+  function targetsCard() {
+    return '<div class="card"><div class="chead">AUTOFILL TARGETS</div>' +
+      '<div class="crow"><div class="clabel">Website</div><div class="cval">vpn.acme.example</div><div class="cctl"><span class="rbtn">Open</span></div></div>' +
+      '<div class="crow"><div class="clabel">Native apps</div><div class="cval"><span class="apppill">AcmeVPN.exe</span></div></div></div>';
+  }
+
+  // One person on the SHARING card.
+  function personEntry(p) {
+    var h = '<div class="pe' + (p.isNew ? ' new' : '') + '"><div class="pav">' + p.email.charAt(0).toUpperCase() + '</div>' +
+      '<div class="who"><div class="l1">' + p.email + sp(p.state) + '</div><div class="l2">' + p.line + '</div></div>' +
+      '<div class="cctl">';
+    if (p.confirming) {
+      if (p.reinvite) h += '<span class="rbtn" style="visibility:hidden">Re-invite</span>';
+      h += '<span class="rbtn">Cancel</span>';
+    } else {
+      if (p.reinvite) h += '<span class="rbtn">Re-invite</span>';
+      h += '<span class="rbtn danger">Stop sharing</span>';
+    }
+    h += '</div></div>';
+    if (p.confirming) {
+      h += '<div class="extra confirm"><div class="q">Stop sharing Acme VPN with ' + p.email + '? It leaves their vault at once.</div>' +
+        '<div class="h">Anything they already copied stays with them. If that matters, change the password afterwards.</div>' +
+        '<span class="btn danger">Remove from their vault</span></div>';
+    }
+    if (p.fingerprint) {
+      h += '<div class="extra"><div class="fp"><div style="display:flex;align-items:center;gap:8px"><span style="font-size:11px;font-weight:700;letter-spacing:.08em;color:#14307a">FINGERPRINT</span><span class="link" style="margin-left:auto;font-size:11px">Hide</span></div>' +
+        '<div class="words">tundra-plaza-cobalt-mingle-sparrow</div>' +
+        '<div class="t">This should match the phrase ' + p.email + ' sees under Account › Fingerprint phrase. If it does not, stop sharing: the record went to a key that is not theirs.</div></div></div>';
+    }
+    return h;
+  }
+
+  function sendEntry(o) {
+    o = o || {};
+    return '<div class="pe"><div class="stile">' + ic('plane', 14, '#605d5d', 2.2) + '</div>' +
+      '<div class="who"><div class="l1">Anyone with the link' + pill('waiting') + '</div><div class="l2">Password required · expires in 23 hours</div></div>' +
+      '<div class="cctl"><span class="rbtn">Send again</span><span class="rbtn danger">Revoke</span></div></div>';
+  }
+
+  function sharingCard(people, withSend, noteText) {
+    var h = '<div class="card new"><div class="chead">SHARING<span class="side">people: view-only, updates when you edit</span></div>';
+    h += '<div class="cblock"><div class="bl">' + ic('person', 12, '#7d7979', 2.2) + 'People</div>';
+    people.forEach(function (p) { h += personEntry(p); });
+    h += '</div>';
+    if (withSend) {
+      h += '<div class="cblock"><div class="bl">' + ic('plane', 12, '#7d7979', 2.2) + 'Active Send</div>' + sendEntry() + '</div>';
+    }
+    h += '<div class="cnote">' + (noteText ||
+      'A person keeps a view-only copy in their own vault that follows your edits, until you stop sharing. A Send is a link: anyone who has it can open it until it expires or you revoke it.') + '</div>';
+    return h + '</div>';
+  }
+
+  var ANNA = { email: 'anna@example.com', state: 'shared', line: 'Shared · since 14 Sep · <span class="link">Show fingerprint</span>' };
+  var BOB = { email: 'bob@example.com', state: 'invited', line: 'Waiting to accept · invited 25 Sep · Bitwarden emailed the invitation' };
+  var CAROL = { email: 'carol@example.com', state: 'account', line: 'Waiting to create an account · 6 days left', reinvite: true };
+  function clone(o, extra) { var r = {}; var k; for (k in o) r[k] = o[k]; for (k in extra) r[k] = extra[k]; return r; }
+
+  function ownerDetail(body, o) {
+    return '<div class="detail">' + ownerHeader(o) + '<div class="dbody">' + body + '</div>' + ((o && o.toast) || '') + '</div>';
+  }
+
+  /* ------------------------------------------------------------ 6a */
+  function shareModal(result) {
+    var h = '<div class="scrim"><div class="modal new">' +
+      '<div class="mhead">' + ic('share', 18, '#1b3fa0', 2) + '<div class="ti">Share Acme VPN</div><div class="x">' + ic('close', 13, '#9b9797', 2) + '</div></div>' +
+      '<div class="mbody">' +
+      '<div><div class="meb">RECORD</div><div class="rchip"><div class="tile" style="border-color:#b8c7ea;color:#1b3fa0">AV</div>' +
+      '<div style="display:flex;flex-direction:column;gap:2px"><div style="font-size:13px;font-weight:700;color:#14307a">Acme VPN</div><div style="font-size:11px;color:#605d5d">Login · Work</div></div></div></div>';
+    if (result === 'account') {
+      h += '<div><div class="meb">WITH</div><div class="field" style="background:#fbfaf9;color:#605d5d">anna@example.com</div></div>';
+    } else {
+      h += '<div><div class="meb">WITH</div><div style="position:relative">' +
+        '<div class="field focus">an<span class="caret"></span></div>' +
+        '<div class="sugg"><div class="eb">SHARED WITH BEFORE</div>' +
+        '<div class="sg hov"><div class="e" style="color:#14307a"><b>an</b>na@example.com</div><div class="c">2 shared</div><div class="x">×</div></div>' +
+        '<div class="sg"><div class="e"><b>an</b>dre@example.com</div><div class="c">3 sent</div><div class="x">×</div></div>' +
+        '</div></div></div>';
+    }
+    h += '<div class="access" style="' + (result === 'account' ? '' : 'margin-top:84px') + '">' + ic('eye', 16, '#605d5d', 1.8, ' style="flex-shrink:0;margin-top:1px"') +
+      '<div class="t">They get <b>view-only</b> access: they can see, copy and autofill it, but not edit, delete or share it on. ' +
+      'When you edit Acme VPN, their copy changes too. You can stop sharing at any time from the record.</div></div>' +
+      '</div>';
+    if (result === 'account') {
+      h += '<div class="mband">' + ic('info', 15, '#8a5a06', 2.2, ' style="flex-shrink:0;margin-top:1px"') +
+        '<div class="t"><b>Waiting for anna@example.com to create an account · invite expires in 7 days.</b><br>' +
+        'Bitwarden has emailed them an invitation. Acme VPN reaches their vault after they sign up, and you can re-invite them from the record.</div></div>' +
+        '<div class="mfoot"><span class="btn primary f34">Done</span><span class="hint">Appears in Sent</span></div>';
+    } else {
+      h += '<div class="mfoot"><span class="btn primary f34">Share <span class="kbd">↵</span></span><span class="btn f34">Cancel</span><span class="hint">Appears in Sent</span></div>';
+    }
+    return h + '</div></div>';
+  }
+
+  function screen6a(state) {
+    // 5d's rule: the list chip means someone can open it right now, so an invite that
+    // nobody has taken up yet does not light it.
+    var list = vaultList('Acme VPN', { unshared: state !== 'has' });
+    var r = rail('all');
+    var basicBody = loginCard('denis@example.com') + targetsCard() + '<div class="meta">Updated 3 days ago · Filled 41 times · Strength: strong</div>';
+    if (state === 'dialog' || state === 'account') {
+      return win('DE', r, list, ownerDetail(basicBody), shareModal(state === 'account' ? 'account' : null));
+    }
+    if (state === 'has') {
+      var body = loginCard('denis@example.com') + sharingCard([clone(ANNA, { isNew: true })], false) +
+        '<div class="meta">Updated 3 days ago · Filled 41 times · Strength: strong</div>';
+      return win('DE', r, list, ownerDetail(body, { toast: '<div class="toast">Shared with anna@example.com. It is in their vault now.</div>' }));
+    }
+    // invited
+    var body2 = loginCard('denis@example.com') + sharingCard([{ email: 'anna@example.com', state: 'invited', isNew: true,
+      line: 'Waiting to accept · invited just now · Bitwarden emailed the invitation' }], false) +
+      '<div class="meta">Updated 3 days ago · Filled 41 times · Strength: strong</div>';
+    return win('DE', r, list, ownerDetail(body2, { toast: '<div class="toast">Invitation sent to anna@example.com. Acme VPN appears once they accept.</div>' }));
+  }
+
+  /* ------------------------------------------------------------ 6b */
+  function screen6b(state) {
+    var people = [ANNA, BOB, CAROL];
+    if (state === 'confirm') people = [clone(ANNA, { confirming: true }), BOB, CAROL];
+    if (state === 'fp') people = [clone(ANNA, { fingerprint: true, line: 'Shared · since 14 Sep · <span class="link">Hide fingerprint</span>' }), BOB, CAROL];
+    if (state === 'expired') people = [ANNA, BOB, clone(CAROL, { state: 'expired', line: 'The invite ran out on 3 Oct · they never created an account' })];
+    var body = loginCard('denis@example.com', state === 'rest' || state === 'expired' ? 3 : 2) + sharingCard(people, true);
+    return win('DE', rail('all'), vaultList('Acme VPN'), ownerDetail(body, { shareHover: state === 'rest' }));
+  }
+
+  /* ------------------------------------------------------------ 6c */
+  var SENT_ROWS = [
+    { m: 'AV', t: 'Acme VPN', s: 'to anna@example.com · Shared', p: sp('shared'), person: true, sel: true },
+    { m: 'AR', t: 'AWS root', s: 'to anna@example.com · Shared', p: sp('shared'), person: true },
+    { m: 'OW', t: 'Office Wi-Fi', s: '3 of 10 views · expires in 6 days', p: pill('opened') },
+    { m: 'AV', t: 'Acme VPN', s: 'to bob@example.com · Waiting to accept', p: sp('invited'), person: true },
+    { m: 'AV', t: 'Acme VPN', s: 'Password required · expires in 23 hours', p: pill('waiting') },
+    { m: 'AV', t: 'Acme VPN', s: 'to carol@example.com · 6 days left', p: sp('account'), person: true },
+    { m: 'BS', t: 'Build server', s: 'Password required · 1 of 1 views', p: pill('used') },
+    { m: 'SD', t: 'Staging DB', s: 'opened 2 times', p: pill('expired'), ended: true },
+    { m: 'GH', t: 'GitHub', s: 'opened once', p: pill('revoked'), ended: true }
+  ];
+
+  function sentList() {
+    var h = '<div class="list"><div class="strip"><div class="inner"><span class="eyebrow">SENT</span><span class="count">9 items</span><span class="sort">Newest</span></div></div><div class="rows">';
+    SENT_ROWS.forEach(function (r) {
+      h += '<div class="row' + (r.sel ? ' sel' : '') + (r.ended ? ' ended' : '') + (r.person ? ' new' : '') + '"><div class="tile' + (r.sel ? ' emph' : '') + '">' + r.m + '</div>' +
+        '<div class="rtext"><div class="rt">' + r.t + '</div><div class="rs">' + (r.person ? ic('person', 10, '#7d7979', 2.4) : '') + r.s + '</div></div>' + r.p + '</div>';
+    });
+    h += '</div><div class="lnote"><div class="ln"></div><p>Sends and shares are both made from a record: open it and choose Send (a link) or Share (a person). Sends made in other Bitwarden apps are listed here too.</p></div></div>';
+    return h;
+  }
+
+  function screen6c(state) {
+    var confirming = state === 'confirm';
+    var head = '<div class="dhead"><div class="tile emph">AV</div><div class="dtext"><div class="dtitle">Acme VPN</div>' +
+      '<div class="dsub">Shared with a person' + sp('shared') + '</div></div><div class="dacts">' +
+      (confirming ? '<span class="btn">Cancel</span>' : '<span class="btn">Open record</span><span class="btn danger new">Stop sharing</span>') + '</div></div>';
+    var body = '';
+    if (confirming) {
+      body += '<div class="confirm" style="flex-shrink:0"><div class="q">Stop sharing Acme VPN with anna@example.com? It leaves their vault at once.</div>' +
+        '<div class="h">Anything they already copied stays with them. If that matters, change the password afterwards.</div>' +
+        '<span class="btn danger">Remove from their vault</span></div>';
+    }
+    body += '<div class="card new"><div class="chead">PERSON</div>' +
+      '<div class="crow"><div class="clabel">Shared with</div><div class="cval" style="display:flex;align-items:center;gap:10px"><div class="pav">A</div>anna@example.com</div></div>' +
+      '<div class="crow"><div class="clabel">Since</div><div class="cval">14 Sep, 10:02 <span style="color:#7d7979">· 13 days</span></div></div>' +
+      '<div class="crow"><div class="clabel">Access</div><div class="cval">View-only<div class="h">They can see, copy and autofill it. They cannot edit, delete or share it on.</div></div></div>' +
+      '<div class="crow"><div class="clabel">Their copy</div><div class="cval">Follows your edits<div class="h">Last changed 3 days ago, when you edited the record</div></div></div>' +
+      '<div class="crow"><div class="clabel">Fingerprint</div><div class="cval"><span class="link">Show fingerprint</span></div></div>' +
+      '</div>';
+    body += '<div class="card"><div class="chead">WHAT THEY SEE</div><div class="crow" style="gap:10px;flex-wrap:wrap">' +
+      '<span class="pill p-waiting" style="font-size:11px;font-weight:600;padding:0 9px">Username</span>' +
+      '<span class="pill p-revoked" style="font-size:11px;padding:0 9px">' + ic('lock', 11, '#b42318', 2.4) + 'Password</span>' +
+      '<span class="pill p-waiting" style="font-size:11px;font-weight:600;padding:0 9px">One-time code</span>' +
+      '<span class="pill p-waiting" style="font-size:11px;font-weight:600;padding:0 9px">Websites</span>' +
+      '<span class="pill p-waiting" style="font-size:11px;font-weight:600;padding:0 9px">Notes</span>' +
+      '<div style="font-size:12px;color:#7d7979">The whole record, now and after every edit.</div></div></div>';
+    body += '<div class="meta">Acme VPN is also shared with bob@example.com and carol@example.com, and has one live Send. Open record to see all of them.</div>';
+    var detail = '<div class="detail">' + head + '<div class="dbody">' + body + '</div></div>';
+    return win('DE', rail('sent', { sent: 9 }), sentList(), detail);
+  }
+
+  /* ------------------------------------------------------------ 6d */
+  function receivedList(state) {
+    var pending = state === 'pending';
+    var h = '<div class="list"><div class="strip"><div class="inner"><span class="eyebrow">SHARED WITH ME</span><span class="count">' + (pending ? '2 records' : '4 records') + '</span></div></div><div class="rows">';
+    if (pending) {
+      h += '<div class="invite sel new"><div class="top"><div class="pav lg emph">D</div><div class="rtext"><div class="t1">denis@example.com wants to share with you</div>' +
+        '<div class="t2">Nothing reaches your vault until you accept.</div></div></div>' +
+        '<div class="acts"><span class="btn primary sm">Accept</span><span class="btn sm">Decline</span></div></div>';
+    } else {
+      h += '<div class="lgroup new">FROM PEOPLE</div>';
+      h += '<div class="row sel new"><div class="tile emph">AV</div><div class="rtext"><div class="rt">Acme VPN</div><div class="rs">' + ic('person', 10, '#7d7979', 2.4) + 'from denis@example.com · view-only</div></div></div>';
+      h += '<div class="row new"><div class="tile">AR</div><div class="rtext"><div class="rt">AWS root</div><div class="rs">' + ic('person', 10, '#7d7979', 2.4) + 'from denis@example.com · view-only</div></div></div>';
+    }
+    h += '<div class="lgroup new">IMPORTED FROM SENDS</div>';
+    h += '<div class="row"><div class="tile">OW</div><div class="rtext"><div class="rt">Office Wi-Fi — Guest</div><div class="rs">12 Sep, 09:14</div></div></div>';
+    h += '<div class="row"><div class="tile">PA</div><div class="rtext"><div class="rt">Printer admin</div><div class="rs">3 Sep, 16:40</div></div></div>';
+    h += '</div><div class="lnote"><div class="ln"></div><p>Records people share with you arrive here and in your vault, view-only, and change when they edit them. A Send you read with Import a record is your own copy; it is listed here too.</p></div></div>';
+    return h;
+  }
+
+  function recipientDetail(state) {
+    if (state === 'pending') {
+      return '<div class="detail"><div class="dhead"><div class="pav lg emph">D</div><div class="dtext"><div class="dtitle">denis@example.com</div>' +
+        '<div class="dsub">wants to share records with you</div></div><div class="dacts"><span class="btn primary">Accept</span><span class="btn">Decline</span></div></div>' +
+        '<div class="dbody"><div class="card new"><div class="chead">IF YOU ACCEPT</div>' +
+        '<div class="crow"><div class="clabel">You get</div><div class="cval">The records denis@example.com shares with you, now and later</div></div>' +
+        '<div class="crow"><div class="clabel">Access</div><div class="cval">View-only<div class="h">You can see, copy and autofill them. You cannot edit or delete them.</div></div></div>' +
+        '<div class="crow"><div class="clabel">They change</div><div class="cval">When denis@example.com edits them</div></div>' +
+        '<div class="crow"><div class="clabel">Invite expires</div><div class="cval">in 6 days</div></div>' +
+        '</div><div class="meta">If you decline, nothing is added to your vault. denis@example.com can invite you again later.</div></div></div>';
+    }
+    var head = '<div class="dhead"><div class="tile">AV</div><div class="dtext"><div class="dtitle">Acme VPN</div>' +
+      '<div class="dsub">Login<span class="by new">·&nbsp;' + ic('person', 11, '#605d5d', 2.4) + 'Shared by denis@example.com · view-only</span></div></div>' +
+      '<div class="hctls"><div class="hctl">' + ic('star', 20, 'currentColor', 1.5) + '</div>' +
+      '<div class="hctl' + (state === 'menu' ? ' hov' : '') + '">' + kebab + '</div>' +
+      '<div class="hctl">' + ic('close', 18, 'currentColor', 1.6) + '</div></div></div>';
+    var body = loginCard('anna@acme.example') + targetsCard() +
+      '<div class="meta">Changed 3 days ago by denis@example.com · Filled 3 times · Strength: strong</div>';
+    var menu = '';
+    if (state === 'menu') {
+      menu = '<div class="menu new"><div class="mi hov">Move to folder<span class="ar">›</span></div><div class="mi">Refresh icon</div><div class="sep"></div>' +
+        '<div class="foot">Shared by denis@example.com, view-only. Only they can edit or delete it.</div></div>';
+    }
+    return '<div class="detail">' + head + '<div class="dbody">' + body + '</div>' + menu + '</div>';
+  }
+
+  function screen6d(state) {
+    return win('AN', rail('shared', { shared: state === 'pending' ? 2 : 4, pending: state === 'pending', allCount: state === 'pending' ? 214 : 216 }),
+      receivedList(state), recipientDetail(state));
+  }
+
+  /* ------------------------------------------------------------ 6e */
+  function screen6e() {
+    var h = '<div class="ref">';
+    h += '<div class="rcard new"><div class="rh"><span class="ti">SHARE PILLS</span><span class="s">new · a person · 5pt corners, person mark</span></div>' +
+      '<div class="rline"><div class="k">Shared</div><div class="v">' + sp('shared') + '<span class="w">In their vault now. Blue and filled, like the list\'s <b>shared</b> chip.</span></div></div>' +
+      '<div class="rline"><div class="k">Invited</div><div class="v">' + sp('invited') + '<span class="w">Servers with the official flow: they have to accept first.</span></div></div>' +
+      '<div class="rline"><div class="k">No account yet</div><div class="v">' + sp('account') + '<span class="w">Invited to sign up. The invite runs 7 days.</span></div></div>' +
+      '<div class="rline"><div class="k">Invite expired</div><div class="v">' + sp('expired') + '<span class="w">7 days passed. Re-invite, or stop sharing.</span></div></div></div>';
+    h += '<div class="rcard"><div class="rh"><span class="ti">SEND PILLS</span><span class="s">existing · a link · stadium, dot or tick</span></div>' +
+      '<div class="rline"><div class="k">Waiting</div><div class="v">' + pill('waiting') + '<span class="w">The link is live and nobody has opened it yet.</span></div></div>' +
+      '<div class="rline"><div class="k">Opened</div><div class="v">' + pill('opened') + '<span class="w">The link is live and someone has opened it.</span></div></div>' +
+      '<div class="rline"><div class="k">Used</div><div class="v">' + pill('used') + '<span class="w">Every permitted view has been used.</span></div></div>' +
+      '<div class="rline"><div class="k">Expired · Revoked</div><div class="v">' + pill('expired') + pill('revoked') + '<span class="w">Ended. The row fades to 72%.</span></div></div></div>';
+    h += '<div class="rcard"><div class="rh"><span class="ti">LIST CHIPS</span><span class="s">trailing run on a vault row</span></div>' +
+      '<div class="rline"><div class="k">What it is</div><div class="v"><span class="chip">app</span><span class="chip">2FA</span><span class="w">Outlined grey, unchanged.</span></div></div>' +
+      '<div class="rline"><div class="k">A live Send</div><div class="v">' + sharedChip('plane') + '<span class="w">5d, unchanged.</span></div></div>' +
+      '<div class="rline"><div class="k">Shared with people</div><div class="v">' + sharedChip('person') + '<span class="w">Same chip, person mark. It wins when the record has both.</span></div></div>' +
+      '<div class="rline"><div class="k">Recipient\'s vault</div><div class="v"><span class="chip new">view-only</span><span class="w">On rows others share with you, in All items and elsewhere.</span></div></div></div>';
+    h += '<div class="rcard"><div class="rh"><span class="ti">TILES</span><span class="s">what the leading mark says</span></div>' +
+      '<div class="rline"><div class="k">A person</div><div class="v"><div class="pav">A</div><div class="pav lg emph">D</div><span class="w">Round, with one initial. A share is a person.</span></div></div>' +
+      '<div class="rline"><div class="k">A link</div><div class="v"><div class="stile">' + ic('plane', 14, '#605d5d', 2.2) + '</div><span class="w">Square, with a paper plane. A Send is a link.</span></div></div>' +
+      '<div class="rline"><div class="k">Header control</div><div class="v"><div class="hctl">' + ic('env', 20, '#444141', 1.5) + '</div><div class="hctl new">' + ic('share', 21, '#444141', 1.5) + '</div><span class="w">Send a record, then Share, both borderless at 34pt.</span></div></div></div>';
+
+    var lines = [
+      ['Sent list row', 'to anna@example.com · Shared'],
+      ['', 'to bob@example.com · Waiting to accept'],
+      ['', 'to carol@example.com · 6 days left'],
+      ['SHARING card', 'Shared · since 14 Sep · Show fingerprint'],
+      ['', 'Waiting to accept · invited 25 Sep · Bitwarden emailed the invitation'],
+      ['', 'Waiting to create an account · 6 days left'],
+      ['', 'The invite ran out on 3 Oct · they never created an account'],
+      ['Share dialog, no account', 'Waiting for anna@example.com to create an account · invite expires in 7 days'],
+      ['Share dialog, access', 'They get view-only access: they can see, copy and autofill it, but not edit, delete or share it on.'],
+      ['Toasts', 'Shared with anna@example.com. It is in their vault now.'],
+      ['', 'Invitation sent to anna@example.com. Acme VPN appears once they accept.'],
+      ['Stop sharing, step 2', '<span style="color:#b42318;font-weight:600">Stop sharing Acme VPN with anna@example.com? It leaves their vault at once.</span> <span class="btn danger sm" style="margin-left:6px">Remove from their vault</span>'],
+      ['Stop sharing, running', '<span style="color:#605d5d">Stopping…</span>'],
+      ['Recipient row', 'from denis@example.com · view-only'],
+      ['Recipient header', 'Shared by denis@example.com · view-only'],
+      ['Pending invite', 'denis@example.com wants to share with you · Accept / Decline']
+    ];
+    h += '<div class="rcard wide"><div class="rh"><span class="ti">STATUS LINES</span><span class="s">every sentence the screens above use, in the size and colour each is drawn at</span></div>';
+    lines.forEach(function (l) {
+      var big = l[0].indexOf('Stop sharing') === 0 || l[0].indexOf('Recipient header') === 0;
+      h += '<div class="rline"><div class="k">' + l[0] + '</div><div class="v"><span class="' + (big ? '' : 'tl') + '" style="' + (big ? 'font-size:13px' : '') + '">' + l[1] + '</span></div></div>';
+    });
+    h += '</div>';
+    h += '<div class="rcard wide"><div class="rh"><span class="ti">LIGHT AND DARK</span></div><div class="rline"><div class="v"><span class="w">Light only. theme.rs has one palette and the app has no dark theme; 5b and the design canvas are light only too. A dark set would be a new design decision, not part of this feature.</span></div></div></div>';
+    return h + '</div>';
+  }
+
+  /* ------------------------------------------------------------ screens */
+  var SCREENS = [
+    { id: '6a', title: 'Share dialog', cap: 'OWNER · FROM THE READ PANE',
+      note: '<b>Share</b> is a new square control in the read pane\'s header, straight after the ✉ that opens "Send a record". It opens a modal styled like Send a record, narrower because it has one field. ' +
+        'The WITH field suggests people from the address list this PC already keeps for Sends ("SENT TO BEFORE"), now called <b>SHARED WITH BEFORE</b> and fed by both. The count says which kind; <b>×</b> forgets a person, with the same confirmation 5a uses when they still have live shares. ' +
+        'The dialog cannot know ahead of time which of the three results you will get: that depends on the person and the server.',
+      inset: true,
+      states: [['dialog', 'Dialog'], ['has', 'Has an account'], ['invited', 'Invited, awaiting accept'], ['account', 'No account']],
+      caps: { dialog: 'Typing "an". The first suggestion is highlighted.', has: 'The modal closes, a toast confirms, and the SHARING card appears with anna: Shared.', invited: 'Only on servers with the official flow. The modal closes and the card says it is waiting for them to accept.', account: 'The modal stays open to say so: nothing has reached anyone yet. Done closes it; the card then shows carol\'s kind of row (6b).' },
+      render: screen6a },
+    { id: '6b', title: 'The record\'s SHARING card', cap: 'OWNER · READ PANE',
+      note: 'The card 5d built for a live Send, now listing <b>People</b> first (round avatar, share pill, person mark) and the <b>Active Send</b> under them (square plane tile, stadium state pill, Send again and Revoke, unchanged). ' +
+        '<b>Stop sharing</b> uses the app\'s two-step pattern: the button\'s slot turns into Cancel, and a red question and a differently worded red button appear under the row. ' +
+        '<b>Show fingerprint</b> appears only for someone whose key we hold (they have accepted), so bob and carol do not have it. In the list, Acme VPN\'s <b>shared</b> chip now carries the person mark. Login credentials are cut to two rows in two states so the card fits.',
+      states: [['rest', 'At rest'], ['confirm', 'Stop sharing: confirm'], ['fp', 'Fingerprint shown'], ['expired', 'Invite expired']],
+      caps: { rest: 'Pointer over the new Share control, showing its tooltip.', confirm: 'Step two of Stop sharing for anna. Cancel sits where Stop sharing was.', fp: 'Five words, to compare with the phrase anna sees in her own app.', expired: 'After 7 days carol\'s invite runs out. Re-invite and Stop sharing stay.' },
+      render: screen6b },
+    { id: '6c', title: 'Sent, with shares mixed in', cap: 'OWNER · SHARING › SENT',
+      note: 'One list, newest first. <b>One row for each record and person pair</b>, so a record shared with three people and sent once has four rows, just as each Send is its own row today. ' +
+        'Share rows put a person mark before the subtitle and end in a square-cornered share pill; Send rows keep their stadium pills. The subtitle "to anna@example.com · Shared" is as agreed, although the pill already says Shared. ' +
+        'The detail pane for a share replaces LINK and ACTIVITY with <b>PERSON</b> and <b>WHAT THEY SEE</b>, and its header keeps 5b\'s layout: Open record, then the red Stop sharing.',
+      states: [['rest', 'Shared record'], ['confirm', 'Stop sharing: confirm']],
+      caps: { rest: 'anna\'s share of Acme VPN is selected.', confirm: 'The same two-step as a Send\'s Revoke: Open record is hidden, the red button\'s slot shows Cancel, and the question sits above the cards.' },
+      render: screen6c },
+    { id: '6d', title: 'Shared with me', cap: 'RECIPIENT · SHARING › SHARED WITH ME',
+      note: 'This is anna\'s PC. The list has two groups: <b>FROM PEOPLE</b> (live, view-only, changes when denis edits) and <b>IMPORTED FROM SENDS</b> (a copy anna owns; the rows are the same as today). ' +
+        'The read pane is the ordinary one with less in it: no ⏱, no ✉, no Share, and no Edit, Clone or Delete in the ⋮ menu. The subtitle line says who shared it. Copy, Reveal, Open and autofill all still work. ' +
+        'On servers where an invite has to be accepted, the invitation is the first row in the list and a small dot marks the rail row.',
+      states: [['accepted', 'View-only record'], ['menu', '⋮ menu open'], ['pending', 'Invite pending']],
+      caps: { accepted: 'Acme VPN, shared by denis, open view-only.', menu: 'Only what a view-only record allows: folders are yours, so Move to folder stays.', pending: 'Before anna accepts: the invitation, what accepting means, and nothing from denis yet.' },
+      render: screen6d },
+    { id: '6e', title: 'States strip', cap: 'REFERENCE',
+      note: 'Every pill, chip, tile and status line used above, side by side with the Send states they must not be confused with.',
+      states: null, render: screen6e }
+  ];
+
+  var current = { tab: '6a', state: {} };
+
+  function renderTabs() {
+    var h = '';
+    SCREENS.forEach(function (s) {
+      h += '<button data-tab="' + s.id + '" class="' + (current.tab === s.id ? 'on' : '') + '"><span class="t">' + s.id + '</span>' + s.title + '</button>';
+    });
+    document.getElementById('tabs').innerHTML = h;
+  }
+
+  function insetHtml() {
+    function c(icon, label, isNew) {
+      return '<div class="c' + (isNew ? ' new' : '') + '"><div class="hctl' + (isNew ? ' new' : '') + '" style="transform:scale(1.35);margin:8px">' + icon + '</div><div class="lab">' + label + '</div></div>';
+    }
+    return '<div class="inset">' +
+      c(ic('star', 20, '#444141', 1.5), 'Favorite') + c(ic('clock', 20, '#444141', 1.5), 'Add a code') +
+      c(ic('env', 20, '#444141', 1.5), 'Send a record') + c(ic('share', 21, '#444141', 1.5), 'Share', true) +
+      c('<span style="color:#444141">' + kebab + '</span>', 'More') + c(ic('close', 18, '#444141', 1.6), 'Close') +
+      '<div style="font-size:12px;color:#7d7979;max-width:300px;line-height:1.5;padding-bottom:4px">The header\'s controls, enlarged. Share sits right after the envelope and is drawn the same way: 1.3pt stroke, no border, darkening to ink on hover.</div></div>';
+  }
+
+  function renderScreen() {
+    var s = SCREENS.filter(function (x) { return x.id === current.tab; })[0];
+    var st = current.state[s.id] || (s.states ? s.states[0][0] : null);
+    var h = '<div class="screen on"><div class="shead"><span class="tag">' + s.id + '</span><h2>' + s.title + '</h2><span class="cap">' + s.cap + '</span></div>' +
+      '<p class="note">' + s.note + '</p>';
+    if (s.inset) h += insetHtml();
+    if (s.states) {
+      h += '<div class="stateline"><span class="lbl">State</span><div class="seg">';
+      s.states.forEach(function (x) {
+        h += '<button data-state="' + x[0] + '" class="' + (x[0] === st ? 'on' : '') + '">' + x[1] + '</button>';
+      });
+      h += '</div><span class="statecap">' + (s.caps[st] || '') + '</span></div>';
+    }
+    h += s.render(st) + '</div>';
+    document.getElementById('screens').innerHTML = h;
+  }
+
+  function writeHash() {
+    var st = current.state[current.tab];
+    var want = '#' + current.tab + (st ? '/' + st : '');
+    if (location.hash !== want) history.replaceState(null, '', want);
+  }
+
+  function readHash() {
+    var m = /^#(6[a-e])(?:\/([a-z]+))?$/.exec(location.hash || '');
+    if (!m) return;
+    current.tab = m[1];
+    if (m[2]) current.state[m[1]] = m[2];
+  }
+
+  document.getElementById('tabs').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-tab]');
+    if (!b) return;
+    current.tab = b.getAttribute('data-tab');
+    renderTabs(); renderScreen(); writeHash();
+  });
+  document.getElementById('screens').addEventListener('click', function (e) {
+    var b = e.target.closest('button[data-state]');
+    if (!b) return;
+    current.state[current.tab] = b.getAttribute('data-state');
+    renderScreen(); writeHash();
+  });
+  document.getElementById('newtoggle').addEventListener('click', function () {
+    var on = document.body.classList.toggle('shownew');
+    document.getElementById('tg').classList.toggle('on', on);
+  });
+  window.addEventListener('hashchange', function () { readHash(); renderTabs(); renderScreen(); });
+
+  readHash();
+  renderTabs();
+  renderScreen();
+})();
+</script>
+</body>
+</html>
