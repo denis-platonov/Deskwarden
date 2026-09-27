@@ -92,6 +92,9 @@ struct Log {
     seq: u64,
     changes: VecDeque<(u64, Change)>,
     live: bool,
+    /// How many published batches carried a vault change -- what the daemon's
+    /// own match engine watches, through `vault_host::VaultChangeWatch`.
+    vault_batches: u64,
 }
 
 /// The log, and the condition a long-poll waits on.
@@ -117,7 +120,7 @@ impl ChangeFeed {
     pub fn with_instance(instance: u64) -> Self {
         Self {
             instance,
-            log: Mutex::new(Log { seq: 0, changes: VecDeque::new(), live: false }),
+            log: Mutex::new(Log { seq: 0, changes: VecDeque::new(), live: false, vault_batches: 0 }),
             arrived: Condvar::new(),
         }
     }
@@ -130,10 +133,15 @@ impl ChangeFeed {
     pub fn publish(&self, changes: impl IntoIterator<Item = Change>) {
         let mut log = self.log();
         let before = log.seq;
+        let mut touches_the_vault = false;
         for change in changes {
+            touches_the_vault |= matches!(change, Change::Vault(_));
             log.seq += 1;
             let seq = log.seq;
             log.changes.push_back((seq, change));
+        }
+        if touches_the_vault {
+            log.vault_batches += 1;
         }
         while log.changes.len() > RETAINED {
             log.changes.pop_front();
@@ -152,6 +160,14 @@ impl ChangeFeed {
             log.live = live;
             self.arrived.notify_all();
         }
+    }
+
+    /// How many published batches have carried a vault change. A count, so a
+    /// watcher that missed several between two looks still sees that
+    /// something moved -- see `vault_host::VaultChangeWatch`.
+    #[must_use]
+    pub fn vault_batches(&self) -> u64 {
+        self.log().vault_batches
     }
 
     /// Whether the daemon's hub is connected, as last recorded.

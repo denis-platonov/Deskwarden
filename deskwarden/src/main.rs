@@ -1037,6 +1037,12 @@ fn main() {
         deskwarden::rest::notifications::HubListener::for_this_process(),
         vault_api,
     );
+    // **And the match engine follows what the worker applies**: the loop
+    // below asks this once per pass and rebuilds the engine from the cache
+    // when a batch has landed -- one rebuild per settled burst -- so a push
+    // that adds or changes an app match is armed without waiting for a
+    // reload. See `vault_host::VaultChangeWatch`.
+    let mut vault_changes = deskwarden::vault_host::VaultChangeWatch::new(&change_feed);
     // **Before anything spawns `bw serve`.** A usable file means the vault
     // window has something to paint and the match engine has something to
     // arm from in milliseconds, instead of after the backend's ~8 s cold
@@ -2708,6 +2714,24 @@ fn main() {
     }
 
     loop {
+        // **What the notifications hub changed, armed.** The hub worker has
+        // already applied it to the cache (on its own thread, which cannot
+        // touch the engine); this is the half that belongs to the loop. From
+        // the era-checked snapshot, so a lock landing between the two leaves
+        // the engine to whatever cleared it.
+        if vault_changes.due(&change_feed) {
+            if let Ok(snapshot) =
+                estate.cache.snapshot_unless_superseded(estate.cache.epoch().era())
+            {
+                let entries = match_entries(&snapshot.items);
+                log::info!(
+                    "the notifications hub changed the vault; match engine refreshed: {} app \
+                     match(es)",
+                    entries.len()
+                );
+                estate.engine.rebuild(&entries);
+            }
+        }
         // **The fifth door into the vault window's dispatcher, and the one
         // that opens no window at all: a UI process that has just ended.**
         //
@@ -15739,6 +15763,26 @@ mod tests {
         );
         // And the grant never goes the other way: onto the command line.
         assert!(!spawn.contains("command.env("), "the spawn puts something in the environment");
+    }
+
+    /// **The daemon's loop re-arms the match engine when the hub changed the
+    /// vault.** `vault_host`'s `a_push_that_changes_an_app_match_is_armed_
+    /// without_a_reload` drives the watch and the rebuild by hand, because the
+    /// loop cannot be run by a test; this is the pin that the loop really asks.
+    #[test]
+    fn the_loop_rebuilds_the_engine_after_the_hub_changes_the_vault() {
+        let body = production_half_of_this_file();
+        assert_eq!(
+            body.matches("if vault_changes.due(&change_feed) {").count(),
+            1,
+            "the daemon's loop no longer asks whether the hub changed the vault, so a pushed app \
+             match is not armed until the next reload"
+        );
+        let at = body.find("if vault_changes.due(&change_feed) {").expect("counted one");
+        assert!(
+            body[at..].find("estate.engine.rebuild(&entries);").is_some_and(|off| off < 900),
+            "the loop asks whether the hub changed the vault and then does not rebuild the engine"
+        );
     }
 
     /// **The gate is read before the vault key is**, and that ordering is the

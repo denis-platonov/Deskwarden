@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
-use crate::change_feed::Change;
+use crate::change_feed::{Change, ChangeFeed};
 use crate::rest::notifications::HubListener;
 use crate::vault_api::{ApiRequest, VaultApi};
 
@@ -287,6 +287,33 @@ fn hub_tick(listener: &HubListener, api: &VaultApi, now: Instant) {
     feed.publish(announced.into_iter().map(Change::Vault));
 }
 
+/// **Whether the daemon's vault changed under its match engine** since the
+/// last time this was asked -- the daemon's loop asks once per pass.
+///
+/// The hub worker publishes one batch per settled burst, so however many
+/// pushes a burst held, this answers `true` once for it: one rebuild. A pass
+/// that finds several batches waiting rebuilds once for all of them.
+pub struct VaultChangeWatch {
+    seen: u64,
+}
+
+impl VaultChangeWatch {
+    /// A watch that has seen everything published so far.
+    #[must_use]
+    pub fn new(feed: &ChangeFeed) -> Self {
+        Self { seen: feed.vault_batches() }
+    }
+
+    /// `true` once for every run of vault batches published since the last
+    /// `true`.
+    pub fn due(&mut self, feed: &ChangeFeed) -> bool {
+        let now = feed.vault_batches();
+        let due = now != self.seen;
+        self.seen = now;
+        due
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +477,81 @@ mod tests {
         assert!(!api.cache().is_populated(), "a push re-filled a locked vault");
         assert!(api.feed().wait_after(Some(0), false, Duration::ZERO).changes.is_empty());
         sync.assert();
+    }
+
+    /// **A push that changes what an item matches is armed in the daemon's
+    /// engine without a reload** -- and a burst is one rebuild.
+    ///
+    /// The engine matches applications, by the app-match field an item
+    /// carries (URIs are the browser's, and autofill reads those straight
+    /// from the cache the worker already updated). So the push here gives
+    /// `live-1` an app match it did not have when the vault was read; the
+    /// daemon's loop, asking `VaultChangeWatch` as it does on every pass,
+    /// rebuilds from the snapshot, and the engine then answers for that app.
+    /// One sync in all: the vault read. The pushes cost a record each.
+    #[test]
+    fn a_push_that_changes_an_app_match_is_armed_without_a_reload() {
+        use crate::app_match::{AppMatch, TriggerMode, APP_MATCH_FIELD_NAME};
+        use crate::match_engine::MatchEngine;
+        use crate::window_watch::ForegroundEvent;
+
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        server
+            .mock("GET", "/api/accounts/revision-date")
+            .with_body("1700000000000")
+            .expect_at_least(0)
+            .create();
+        let sync = server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(sync_payload())
+            .expect(1)
+            .create();
+        declare_the_per_id_cipher_route(&mut server);
+        let matched = AppMatch::for_process("Speedtest.exe", TriggerMode::Hotkey).to_field_value();
+        let record = server
+            .mock("GET", "/api/ciphers/live-1")
+            .with_body(crate::rest::backend::tests::fixture_cipher_with_field(
+                "live-1",
+                "A live item",
+                APP_MATCH_FIELD_NAME,
+                &matched,
+            ))
+            // One read per announcement, as `apply_announced` has always
+            // made them: the burst below is two pushes of one item.
+            .expect(2)
+            .create();
+
+        let api = an_api_over(VaultCache::new(backend));
+        assert_eq!(api.cache().populate().expect("the vault read"), PopulateOutcome::Populated);
+        let mut watch = VaultChangeWatch::new(api.feed());
+        let mut engine = MatchEngine::new();
+        engine.rebuild(&crate::app::match_entries(&api.cache().items()));
+        let speedtest = ForegroundEvent {
+            hwnd: 1,
+            pid: 1,
+            exe_name: "Speedtest.exe".to_string(),
+            title: String::new(),
+        };
+        assert!(engine.lookup(&speedtest).is_none(), "control: nothing matched it yet");
+
+        let (hub, pushes) = a_listener_the_test_can_push_to();
+        pushes.go_live(true);
+        pushes.hear_vault(Announcement::Item { id: "live-1".to_string(), revision: None });
+        pushes.hear_vault(Announcement::Item { id: "live-1".to_string(), revision: None });
+        hub_tick(&hub, &api, Instant::now());
+
+        // The daemon's loop, one pass.
+        assert!(watch.due(api.feed()), "the loop was not told the vault changed");
+        engine.rebuild(&crate::app::match_entries(&api.cache().items()));
+        assert_eq!(
+            engine.lookup(&speedtest).map(|(id, _)| id.to_string()),
+            Some("live-1".to_string()),
+            "the push's app match is not armed"
+        );
+        assert!(!watch.due(api.feed()), "one burst, but the loop was told twice");
+
+        sync.assert();
+        record.assert();
     }
 
     fn an_api_over(cache: VaultCache) -> VaultApi {
