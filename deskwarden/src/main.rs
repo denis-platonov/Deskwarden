@@ -999,6 +999,44 @@ fn main() {
     // moved in above, which is why nothing below can reach for the concrete
     // type by accident.
     let vault = cache.backend_handle();
+    // **THE DOOR TO THE VAULT THIS DAEMON OWNS**, opened before any window
+    // can be. See `docs/superpowers/specs/2026-09-26-daemon-owns-the-vault-
+    // design.md`: the vault window reads and writes this cache through it
+    // instead of reading the server itself, so a launch that opens a window
+    // reads the vault once -- here -- and not once per process.
+    //
+    // Two halves. The listener (`vault_host`) answers `vault_api` on a
+    // loopback port, to clients holding a grant this daemon minted for a
+    // process it started. The hub worker holds the notifications listener --
+    // which now runs in this process and in no window -- applies what it
+    // hears to this cache, and only then tells the clients.
+    //
+    // A listener that cannot be bound is logged and survived: a window then
+    // gets no line on its stdin and reads the vault the way it did before
+    // this existed.
+    let change_feed = Arc::new(deskwarden::change_feed::ChangeFeed::new());
+    match deskwarden::vault_host::VaultHost::start(Arc::new(deskwarden::vault_api::VaultApi::new(
+        Arc::clone(&cache),
+        Arc::clone(&change_feed),
+    ))) {
+        Ok(host) => {
+            log::info!("the vault this daemon holds is served to its windows at {}", host.base_url());
+            if !deskwarden::vault_host::install_env(host) {
+                log::error!("the vault listener was installed twice; the first one stands");
+            }
+        }
+        Err(e) => log::error!(
+            "the vault listener could not be started ({e}); a vault window will read the server \
+             itself, as it did before the daemon served it"
+        ),
+    }
+    // Held by `main` for the life of the process, which `main` never returns
+    // from: dropping it is what would stop the worker.
+    let _vault_hub = deskwarden::vault_host::HubWorker::start(
+        deskwarden::rest::notifications::HubListener::for_this_process(),
+        Arc::clone(&cache),
+        change_feed,
+    );
     // **Before anything spawns `bw serve`.** A usable file means the vault
     // window has something to paint and the match engine has something to
     // arm from in milliseconds, instead of after the backend's ~8 s cold
@@ -7262,6 +7300,10 @@ impl UiWindows {
                      being locked behind it, but that process may still be showing it"
                 );
             }
+            // And whether or not it died, it reads nothing more from this
+            // daemon's vault. The lock behind this clears the vault's era,
+            // which ends the grant anyway; this does not wait for that.
+            deskwarden::vault_host::revoke(&pid.to_string());
             deskwarden::ui_process::forget_result(&deskwarden::ui_process::result_path(
                 config_dir, pid,
             ));
@@ -7371,6 +7413,8 @@ impl UiWindows {
             deskwarden::ui_process::Reap::Keep => None,
             deskwarden::ui_process::Reap::Take { code } => {
                 let open = self.vault.take().expect("polled through `as_mut` a line above");
+                // Its grant to this daemon's vault goes with it.
+                deskwarden::vault_host::revoke(&open.pid.to_string());
                 log::info!(
                     "the vault window (process {}) lasted {:?}",
                     open.pid,
@@ -7458,6 +7502,11 @@ fn spawn_the_vault_window_in_its_own_process(
     let spawned = deskwarden::ui_process::spawn_out_of_any_job(|breakaway| {
         let mut command = std::process::Command::new(&plan.program);
         command.args(&plan.args);
+        // **The one channel the child's line to the vault arrives on.** Not
+        // the command line and not the environment, both of which other
+        // processes can read; see `daemon_link`. Piped on every spawn, and a
+        // spawn that has nothing to say closes it unwritten.
+        command.stdin(std::process::Stdio::piped());
         command.creation_flags(if breakaway {
             bw_path::CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB
         } else {
@@ -7467,7 +7516,7 @@ fn spawn_the_vault_window_in_its_own_process(
         // is the line the whole split turns on.
         command.spawn()
     });
-    let child = match spawned {
+    let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
             log::error!(
@@ -7479,6 +7528,29 @@ fn spawn_the_vault_window_in_its_own_process(
         }
     };
     let pid = child.id();
+    // **The window's line to the vault this daemon owns**: the listener's
+    // address and a grant minted for this process alone, written as one line
+    // and the pipe closed behind it. Only for an account whose vault is
+    // served over REST -- a `bw serve` window reads `bw serve`, as it always
+    // has -- and only if the listener is up. The grant dies with the vault
+    // era it was minted in, and is revoked when this process is reaped.
+    if let Some(mut stdin) = child.stdin.take() {
+        let line = (backend_policy::selected() == backend_policy::VaultBackendChoice::DirectRest)
+            .then(|| deskwarden::vault_host::link_line_for(&pid.to_string()))
+            .flatten();
+        if let Some(line) = line {
+            use std::io::Write as _;
+            if let Err(e) = stdin.write_all(line.as_bytes()) {
+                log::warn!(
+                    "could not hand the vault window (process {pid}) its line to this daemon's \
+                     vault ({e}); it will read the server itself"
+                );
+                deskwarden::vault_host::revoke(&pid.to_string());
+            }
+        }
+        // Dropped here either way: the child reads end-of-file after the
+        // line, or at once.
+    }
     log::info!(
         "the vault window is process {pid} ({} {}), outside the kill-on-close job so a daemon \
          restart cannot close it. The daemon's loop goes on running beside it",
@@ -11870,6 +11942,12 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // vault.** Decided here, where the stored key is read, and spent once
     // below to pick the host.
     let mut sign_in_here = false;
+    // **The line to the vault the daemon owns**, if the daemon that started
+    // this window wrote one down its stdin. Read on the direct-REST arm only,
+    // which is the only one the daemon writes for; see `daemon_link`.
+    let mut daemon_link = (choice == backend_policy::VaultBackendChoice::DirectRest)
+        .then(deskwarden::daemon_link::DaemonLink::from_stdin)
+        .flatten();
     let cache = Arc::new(
         match choice {
             backend_policy::VaultBackendChoice::DirectRest => {
@@ -11899,6 +11977,25 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
                     return failure.exit_code();
                 };
                 match stored {
+                    // **The daemon owns the vault, and this window is its
+                    // client.** Every read is answered out of the daemon's
+                    // copy and every write goes through it, so the window
+                    // never reads the server's vault itself: a launch that
+                    // opens a window reads the vault once, in the daemon.
+                    // The stored credential is still what the Sends and the
+                    // export sign with; it is not what reads the vault.
+                    Some(_) if daemon_link.is_some() => {
+                        let link = daemon_link.take().expect("tested by the guard");
+                        log::info!(
+                            "this window reads the vault the daemon holds, at {}",
+                            link.base_url()
+                        );
+                        let backend = link.backend();
+                        if !deskwarden::daemon_link::install(link) {
+                            log::error!("this window's line to the daemon was installed twice");
+                        }
+                        VaultCache::with_disk_cache(backend, disk, fingerprint, to_disk)
+                    }
                     Some(authenticated) => {
                         log::info!(
                             "this window reads the vault directly over REST at {server_url}"
@@ -12136,10 +12233,17 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // so this alone said "wait for the backend" forever and bought an
     // eight-second whole-vault sync on every window open. See
     // `may_skip_the_readiness_probe`.
-    let skip_readiness_wait = backend_policy::may_skip_the_readiness_probe(
-        backend_policy::bw_serve_is_selected(),
-        backend_is_listening(),
-    );
+    //
+    // **And a window reading the daemon's vault always waits**, whatever the
+    // two halves above say: the daemon answers "not loaded yet" while its own
+    // read is in flight, and the wait is what keeps this window on its
+    // spinner through that rather than painting an error -- or falling back
+    // to a read of its own, which is the one thing it must not do.
+    let skip_readiness_wait = deskwarden::daemon_link::installed().is_none()
+        && backend_policy::may_skip_the_readiness_probe(
+            backend_policy::bw_serve_is_selected(),
+            backend_is_listening(),
+        );
 
     // **What this process does instead of exiting, when the setting says
     // it may stay loaded.**
@@ -15599,6 +15703,42 @@ mod tests {
                  readiness wait that follows it, and this would be a second: {body}"
             );
         }
+    }
+
+    /// **The window reads the vault the daemon owns, and learns where it is
+    /// from its stdin.**
+    ///
+    /// `vault_host`'s tests prove the count on real sockets -- one sync for a
+    /// launch with a window open -- through a daemon and a window assembled by
+    /// hand, because `fn main` and `run_as_a_ui_process` cannot be run by a
+    /// test. What they cannot see is that THIS file assembles them that way:
+    /// a spawn that stopped piping the line, or a window that stopped taking
+    /// the daemon's backend over its own, compiles and passes every one of
+    /// them while the app goes back to reading the vault twice. So the three
+    /// joints are pinned here.
+    #[test]
+    fn the_window_is_handed_the_daemons_vault_and_takes_it() {
+        let production = production_half_of_this_file();
+        let spawn = body_of(production, "fn spawn_the_vault_window_in_its_own_process(");
+        assert!(
+            spawn.contains("command.stdin(std::process::Stdio::piped());"),
+            "the window is no longer started with a pipe for its line to the daemon: {spawn}"
+        );
+        assert!(
+            spawn.contains(concat!("vault_host::", "link_line_for(&pid.to_string())")),
+            "the window is no longer handed a grant to the daemon's vault: {spawn}"
+        );
+        let window = body_of(production, "fn run_as_a_ui_process(surface: Surface) -> i32 {");
+        assert!(
+            window.contains(concat!("DaemonLink::", "from_stdin")),
+            "the window no longer reads its line to the daemon"
+        );
+        assert!(
+            window.contains("Some(_) if daemon_link.is_some() =>"),
+            "the window no longer prefers the daemon's vault over a read of its own"
+        );
+        // And the grant never goes the other way: onto the command line.
+        assert!(!spawn.contains("command.env("), "the spawn puts something in the environment");
     }
 
     /// **The gate is read before the vault key is**, and that ordering is the

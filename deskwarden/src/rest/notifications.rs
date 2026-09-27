@@ -248,6 +248,66 @@ fn announcement_for(push_type: i64, payload: Option<&serde_json::Value>) -> Anno
     }
 }
 
+/// The most announcements answered one item at a time; past it, one sync.
+pub const MAX_TARGETED: usize = 50;
+
+/// **Whether what the hub announced can be answered one item at a time**,
+/// and as what.
+///
+/// Only while the hub is live and a push is the reason: a hub that was down
+/// may have missed something. Then only when EVERY announcement names a
+/// cipher -- one folder change, "sync your whole vault" or a reconnect in the
+/// batch and the batch gets the full sync, because a targeted pass that did
+/// most of it would still leave that one unanswered. And only up to
+/// [`MAX_TARGETED`]: an import of a thousand items in another app is cheaper
+/// as one sync than as a thousand reads.
+///
+/// **Except the twin.** NodeWarden sends "sync your whole vault" beside every
+/// cipher push, with the same revision; a [`Announcement::VaultAt`] whose date
+/// a cipher announcement in the batch carries is that twin and is dropped. One
+/// whose date nothing in the batch carries -- a bulk move, a bulk archive --
+/// still sends the batch to the full sync.
+///
+/// **One rule for both of its callers.** The daemon applies each settled batch
+/// to the vault it owns with it, and the vault window applies the same batch,
+/// forwarded on the daemon's change feed, to its own copy -- reading the
+/// records back from the daemon, which already holds them. It lived in the
+/// window while the window was the only listener.
+#[must_use]
+pub fn targeted_changes(
+    push_live: bool,
+    announced: &[Announcement],
+) -> Option<Vec<crate::vault_cache::Announced>> {
+    use crate::vault_cache::Announced;
+    if !push_live || announced.is_empty() || announced.len() > MAX_TARGETED {
+        return None;
+    }
+    let cipher_revisions: Vec<&str> = announced
+        .iter()
+        .filter_map(|announcement| match announcement {
+            Announcement::Item { revision, .. } | Announcement::ItemGone { revision, .. } => {
+                revision.as_deref()
+            }
+            Announcement::VaultAt { .. } | Announcement::Whole => None,
+        })
+        .collect();
+    let mut changes = Vec::new();
+    for announcement in announced {
+        match announcement {
+            Announcement::Item { id, revision } => {
+                changes.push(Announced::Changed { id: id.clone(), revision: revision.clone() });
+            }
+            Announcement::ItemGone { id, .. } => changes.push(Announced::Removed { id: id.clone() }),
+            Announcement::VaultAt { date } if cipher_revisions.contains(&date.as_str()) => {}
+            Announcement::VaultAt { .. } | Announcement::Whole => return None,
+        }
+    }
+    // A batch that was nothing but twins has nothing left to answer, which
+    // cannot happen -- a twin needs its partner -- but is refused rather than
+    // painted as a no-op sync if it ever does.
+    (!changes.is_empty()).then_some(changes)
+}
+
 /// The hub's websocket URL for a server root, or `None` when the root is not
 /// an `http(s)` URL. A root with a path -- a server mounted under
 /// `https://host/vault` -- keeps it, as every other route in
@@ -428,8 +488,11 @@ impl Shared {
     }
 }
 
-/// **The open vault window's connection to the hub**, on a thread of its
-/// own. Dropping it asks the thread to stop; the thread notices within one
+/// **A connection to the hub**, on a thread of its own -- the daemon's, which
+/// applies what it hears to the vault it owns (`crate::vault_host`); or, in a
+/// window the daemon did not start, the window's own. A window the daemon
+/// started holds one of these too, fed by the daemon's change feed instead
+/// ([`HubListener::following`]). Dropping it asks the thread to stop; the thread notices within one
 /// [`Timing::poll`] (or one connect timeout, if it is mid-connect) and sends
 /// the server a close.
 pub struct HubListener {
@@ -443,7 +506,17 @@ impl HubListener {
     /// a window that opens on its sign-in card publishes a backend a minute
     /// later -- and that thread costs one mutex read per
     /// [`Timing::no_source_wait`] until something is.
+    ///
+    /// **In a window the daemon started, it follows the daemon instead.** The
+    /// hub runs in the daemon, which owns the vault; a window handed a
+    /// [`crate::daemon_link`] hears the same announcements from the daemon's
+    /// change feed, after the daemon has applied them. Everything the window
+    /// asks of this listener -- `settled`, `take`, `sends_changed`, `is_live`
+    /// -- means what it always meant.
     pub fn for_this_process() -> Self {
+        if let Some(poll) = crate::daemon_link::feed_poll() {
+            return Self::following(poll, Timing::PRODUCTION);
+        }
         Self::start(
             Feed {
                 tickets: Box::new(published_ticket),
@@ -451,6 +524,30 @@ impl HubListener {
             },
             Timing::PRODUCTION,
         )
+    }
+
+    /// **A listener fed by a change feed rather than a websocket** -- the
+    /// daemon's, read through `poll`.
+    ///
+    /// `poll(after, live_seen)` is one long-poll of the feed: the changes
+    /// after sequence number `after` (`None` for "where are you?"), answered
+    /// early if the feed's `live` differs from `live_seen`. What arrives is
+    /// fed into the same inbox the websocket feeds, so a window cannot tell
+    /// the two apart -- except that nothing it reads back costs the server
+    /// anything, because the daemon already holds it.
+    ///
+    /// A page that says `reset`, or comes from a feed with a different
+    /// `instance` than the last one (a restarted daemon), is answered as a
+    /// reconnect is: a whole sync, and the Sends list dropped.
+    pub fn following(poll: FollowPoll, timing: Timing) -> Self {
+        let shared = Arc::new(Shared::default());
+        let thread_shared = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("vault-feed".to_string())
+            .spawn(move || follow(poll, timing, &thread_shared))
+            .map_err(|e| log::warn!("the change-feed thread could not start: {e}"))
+            .ok();
+        Self { shared, settle: timing.settle }
     }
 
     pub fn start(feed: Feed, timing: Timing) -> Self {
@@ -601,6 +698,63 @@ fn listen(mut feed: Feed, timing: Timing, shared: &Shared) {
                 failures = failures.saturating_add(1);
                 let wait = backoff(timing, failures);
                 log::warn!("the notifications hub could not connect ({why}); retrying in {wait:?}");
+                pause(shared, wait);
+            }
+        }
+    }
+}
+
+/// One long-poll of a change feed: the changes after `after` (`None` for
+/// "where are you?"), answered early when the feed's `live` differs from the
+/// second argument. See [`HubListener::following`].
+pub type FollowPoll =
+    Box<dyn FnMut(Option<u64>, bool) -> Result<crate::change_feed::FeedPage, String> + Send>;
+
+/// The feed follower's thread body.
+///
+/// A failed poll -- the daemon busy restarting, a grant it no longer honours
+/// -- marks the listener not live, so the window's polling fallback takes
+/// over, and backs off as the websocket loop does. The next page that
+/// arrives carries on from `after`: nothing the feed said in between is
+/// lost, and a feed that cannot say what was (a restart, a client too far
+/// behind) says `reset`.
+fn follow(mut poll: FollowPoll, timing: Timing, shared: &Shared) {
+    use crate::change_feed::Change;
+    let mut after: Option<u64> = None;
+    let mut instance: Option<u64> = None;
+    let mut live_seen = false;
+    let mut failures: u32 = 0;
+    while !shared.stop.load(Ordering::SeqCst) {
+        match poll(after, live_seen) {
+            Ok(page) => {
+                if failures > 0 || instance.is_none() {
+                    log::info!("following the daemon's change feed");
+                }
+                failures = 0;
+                let restarted = instance.is_some_and(|seen| seen != page.instance);
+                if page.reset || restarted {
+                    shared.notice(Announcement::Whole);
+                    shared.notice_sends();
+                } else {
+                    for change in page.changes {
+                        match change {
+                            Change::Vault(announced) => shared.notice(announced),
+                            Change::Sends => shared.notice_sends(),
+                        }
+                    }
+                }
+                instance = Some(page.instance);
+                after = Some(page.seq);
+                live_seen = page.live;
+                shared.live.store(page.live, Ordering::SeqCst);
+            }
+            Err(why) => {
+                shared.live.store(false, Ordering::SeqCst);
+                failures = failures.saturating_add(1);
+                let wait = backoff(timing, failures);
+                if failures == 1 {
+                    log::warn!("the daemon's change feed did not answer ({why}); retrying");
+                }
                 pause(shared, wait);
             }
         }
@@ -876,6 +1030,18 @@ pub(crate) mod tests {
         /// What [`one_connection`] does on hearing push type 12, 13 or 14.
         pub(crate) fn hear_one(&self) {
             self.shared().notice_sends();
+        }
+
+        /// What [`one_connection`] does on hearing a vault push -- for the
+        /// daemon's hub worker, which is driven by one of these in
+        /// `crate::vault_host`'s tests.
+        pub(crate) fn hear_vault(&self, announced: Announcement) {
+            self.shared().notice(announced);
+        }
+
+        /// A connected, handshaken hub, or not.
+        pub(crate) fn go_live(&self, live: bool) {
+            self.shared().live.store(live, Ordering::SeqCst);
         }
 
         /// The vault inbox the same listener feeds the heartbeat from, so a

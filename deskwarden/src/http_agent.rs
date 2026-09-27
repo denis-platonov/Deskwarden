@@ -133,6 +133,41 @@ pub fn bounded_total(connect: Duration, total: Duration) -> TotalBounded {
     )
 }
 
+/// [`bounded_total`], **with one credential on every request it makes**.
+///
+/// For a client of the daemon's vault (`crate::daemon_link`), whose every
+/// route wants the same grant. Put on the agent rather than on each request
+/// so the client it is handed to -- [`crate::vault_bridge::VaultBridge`], a
+/// complete `bw serve` client with a score of routes and source guards over
+/// how each one is spelled -- needs no change to any of them, and so no route
+/// can be the one that forgot it.
+///
+/// **No redirects**, for [`bounded_total_plain`]'s reason turned inward: the
+/// only server this talks to is the daemon on loopback, and a redirect is the
+/// one way a credential on every request could be carried somewhere else.
+///
+/// The bearer is moved in and lives in the agent until the agent is dropped.
+/// `ureq` copies it into each request's head, which this crate does not own
+/// and cannot wipe -- the limit `rest::api::RestClient::sync` states for its
+/// own bearer.
+pub fn bounded_total_with_bearer(
+    connect: Duration,
+    total: Duration,
+    bearer: zeroize::Zeroizing<String>,
+) -> TotalBounded {
+    let header = zeroize::Zeroizing::new(format!("Bearer {}", bearer.as_str()));
+    TotalBounded(
+        ureq::AgentBuilder::new()
+            .timeout_connect(connect)
+            .timeout(total)
+            .redirects(0)
+            .middleware(move |request: ureq::Request, next: ureq::MiddlewareNext<'_>| {
+                next.handle(request.set("Authorization", header.as_str()))
+            })
+            .build(),
+    )
+}
+
 /// [`bounded_total`], plus two refusals: **no redirects are followed**, and
 /// the `User-Agent` is a caller-chosen constant rather than ureq's default.
 ///

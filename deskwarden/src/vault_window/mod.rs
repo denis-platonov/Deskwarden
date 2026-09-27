@@ -10103,8 +10103,14 @@ mod backend_tasks {
         /// than asserted: if that forced reload fails,
         /// `apply_vault_load_result` turns this `Ok` into an `Err` and the
         /// pill says so.
+        ///
+        /// **In a window the daemon started, Sync is the daemon's.** The
+        /// daemon owns the vault this window reads, so the re-fetch above
+        /// would only re-read the daemon's copy; `POST /sync` asks the daemon
+        /// to re-check the server first (behind its revision gate, one row
+        /// when nothing moved). A window with no link is unchanged.
         fn sync(&self) -> Result<(), String> {
-            Ok(())
+            crate::daemon_link::sync_through_the_daemon().unwrap_or(Ok(()))
         }
 
         /// The direct-REST runner: it builds the archive in this process and
@@ -13228,7 +13234,7 @@ const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
 /// names a cipher -- one folder change, "sync your whole vault" or a
 /// reconnect in the batch and the batch gets the full sync, because a
 /// targeted pass that did most of it would still leave that one unanswered.
-/// And only up to [`MAX_TARGETED`]: an import of a thousand items in another
+/// And only up to [`crate::rest::notifications::MAX_TARGETED`]: an import of a thousand items in another
 /// app is cheaper as one sync than as a thousand reads.
 ///
 /// **Except the twin.** NodeWarden sends "sync your whole vault" beside every
@@ -13238,42 +13244,17 @@ const HEARTBEAT_FOCUS_GAP: Duration = Duration::from_secs(30);
 /// sends the batch to the full sync.
 ///
 /// [`VaultAt`]: crate::rest::notifications::Announcement::VaultAt
+///
+/// **The rule itself is `rest::notifications::targeted_changes`**, and this
+/// is its one call from the window. The daemon applies the same batches to
+/// the vault it owns before a window ever hears of them, and two copies of
+/// "which pushes are targetable" would be two answers to one question.
 fn targeted_refresh(
     push_live: bool,
     announced: &[crate::rest::notifications::Announcement],
 ) -> Option<Vec<crate::vault_cache::Announced>> {
-    use crate::rest::notifications::Announcement;
-    use crate::vault_cache::Announced;
-    if !push_live || announced.is_empty() || announced.len() > MAX_TARGETED {
-        return None;
-    }
-    let cipher_revisions: Vec<&str> = announced
-        .iter()
-        .filter_map(|announcement| match announcement {
-            Announcement::Item { revision, .. } | Announcement::ItemGone { revision, .. } => {
-                revision.as_deref()
-            }
-            Announcement::VaultAt { .. } | Announcement::Whole => None,
-        })
-        .collect();
-    let mut changes = Vec::new();
-    for announcement in announced {
-        match announcement {
-            Announcement::Item { id, revision } => {
-                changes.push(Announced::Changed { id: id.clone(), revision: revision.clone() });
-            }
-            Announcement::ItemGone { id, .. } => changes.push(Announced::Removed { id: id.clone() }),
-            Announcement::VaultAt { date } if cipher_revisions.contains(&date.as_str()) => {}
-            Announcement::VaultAt { .. } | Announcement::Whole => return None,
-        }
-    }
-    // A batch that was nothing but twins has nothing left to answer, which
-    // cannot happen -- a twin needs its partner -- but is refused rather than
-    // painted as a no-op sync if it ever does.
-    (!changes.is_empty()).then_some(changes)
+    crate::rest::notifications::targeted_changes(push_live, announced)
 }
-/// The most announcements answered one item at a time; past it, one sync.
-const MAX_TARGETED: usize = 50;
 
 /// The least time between two syncs the hub's pushes can cause.
 const HEARTBEAT_PUSH_GAP: Duration = Duration::from_secs(10);
@@ -20838,7 +20819,8 @@ mod vault_load_step_tests {
     fn only_a_live_batch_of_cipher_changes_is_answered_item_by_item() {
         use crate::rest::notifications::Announcement;
         use crate::vault_cache::Announced;
-        use crate::vault_window::{targeted_refresh, MAX_TARGETED};
+        use crate::rest::notifications::MAX_TARGETED;
+        use crate::vault_window::targeted_refresh;
         let item = |id: &str| Announcement::Item { id: id.into(), revision: Some("r".into()) };
         let gone = |id: &str| Announcement::ItemGone { id: id.into(), revision: None };
 
@@ -28891,11 +28873,17 @@ mod export_wiring {
                  function is a seventh copy of a decision that is meant to be made once",
             ),
             (
-                concat!("fn ", "sync(&self) -> Result<(), String> { Ok(()) }"),
-                "the built-in client's sync is no longer exactly `Ok(())`. If it runs \
-                 something it is the `os error 3` the owner reported on every press of Sync; \
-                 if it returns an error the window paints a red `Sync failed` pill and skips \
-                 the forced reload, so the button does nothing and says so",
+                concat!(
+                    "fn ", "sync(&self) -> Result<(), String> { \
+                     crate::daemon_link::sync_through_the_daemon().unwrap_or(Ok(())) }"
+                ),
+                "the built-in client's sync is no longer exactly the daemon's sync -- or \
+                 `Ok(())` in a window with no line to the daemon. If it runs anything else it \
+                 is the `os error 3` the owner reported on every press of Sync, or a window \
+                 reading the server's vault itself behind the daemon that owns it; if it \
+                 returns an error where there is no daemon the window paints a red `Sync \
+                 failed` pill and skips the forced reload, so the button does nothing and says \
+                 so",
             ),
             (
                 concat!(

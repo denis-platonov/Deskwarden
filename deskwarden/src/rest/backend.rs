@@ -1441,36 +1441,49 @@ impl VaultBackend for RestBackend {
     /// **None of the three is mapped to a weaker passphrase**, which is the
     /// only mapping that would actually be wrong.
     fn generate(&self, request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
-        crate::password_gen::generate(request).map_err(|e| match e {
-            // Not `Unsupported`: the operation *is* supported and no decision
-            // is missing -- this machine's CSPRNG failed, which is a fault a
-            // caller may retry. `Unsupported` would tell it never to.
-            PasswordGenError::Rng => VaultError::Http(e.to_string()),
-            PasswordGenError::WordlistMissing => VaultError::Unsupported {
-                backend: BACKEND,
-                operation: "generate (passphrase)",
-                why: "the word list a passphrase is built from is not installed beside this \
-                      application; generating from an improvised one would produce a passphrase \
-                      far weaker than it looks",
-            },
-            PasswordGenError::WordlistUnusable => VaultError::Unsupported {
-                backend: BACKEND,
-                operation: "generate (passphrase)",
-                why: "the word list installed beside this application is not the one it ships; \
-                      generating from a short or altered list would produce a passphrase far \
-                      weaker than it looks",
-            },
-            // Not `Unsupported`, for exactly the reason `Rng` is not: this is
-            // an installation that CAN generate a passphrase, and the only
-            // thing wrong is the instant it was asked. `Unsupported` tells a
-            // caller never to retry and the window says the backend cannot do
-            // it at all -- both wrong, and both told the user their word list
-            // was broken when an updater merely had it open. `Http` is the
-            // crate's retryable failure, and `e.to_string()` carries the
-            // sentence saying trying again may work.
-            PasswordGenError::WordlistUnreadable => VaultError::Http(e.to_string()),
-        })
+        generate_here(request)
     }
+}
+
+/// [`RestBackend::generate`]'s body, as a function: a generated secret and the
+/// mapping of each way generating one can fail.
+///
+/// **Shared with `crate::daemon_link`'s backend**, which serves a window whose
+/// vault the daemon holds. Generating is not a vault operation -- no server
+/// has an endpoint for it -- so that backend generates in the window's own
+/// process rather than asking the daemon, and it must reach the same
+/// generator through the same mapping, or one app would have two answers to
+/// what a refused passphrase means.
+pub(crate) fn generate_here(request: &GenerateRequest) -> Result<Zeroizing<String>, VaultError> {
+    crate::password_gen::generate(request).map_err(|e| match e {
+        // Not `Unsupported`: the operation *is* supported and no decision
+        // is missing -- this machine's CSPRNG failed, which is a fault a
+        // caller may retry. `Unsupported` would tell it never to.
+        PasswordGenError::Rng => VaultError::Http(e.to_string()),
+        PasswordGenError::WordlistMissing => VaultError::Unsupported {
+            backend: BACKEND,
+            operation: "generate (passphrase)",
+            why: "the word list a passphrase is built from is not installed beside this \
+                  application; generating from an improvised one would produce a passphrase \
+                  far weaker than it looks",
+        },
+        PasswordGenError::WordlistUnusable => VaultError::Unsupported {
+            backend: BACKEND,
+            operation: "generate (passphrase)",
+            why: "the word list installed beside this application is not the one it ships; \
+                  generating from a short or altered list would produce a passphrase far \
+                  weaker than it looks",
+        },
+        // Not `Unsupported`, for exactly the reason `Rng` is not: this is
+        // an installation that CAN generate a passphrase, and the only
+        // thing wrong is the instant it was asked. `Unsupported` tells a
+        // caller never to retry and the window says the backend cannot do
+        // it at all -- both wrong, and both told the user their word list
+        // was broken when an updater merely had it open. `Http` is the
+        // crate's retryable failure, and `e.to_string()` carries the
+        // sentence saying trying again may work.
+        PasswordGenError::WordlistUnreadable => VaultError::Http(e.to_string()),
+    })
 }
 
 // ---- the small shared pieces -------------------------------------------------

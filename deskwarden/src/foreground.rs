@@ -1420,7 +1420,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 82] = [
+        const OPENS_NO_WINDOW: [&str; 86] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1492,6 +1492,12 @@ mod tests {
             // system clipboard, which is not a window: it opens nothing,
             // paints nothing, and has no title for `raise_window` to match.
             "clipboard",
+            // The daemon's vault, and a client's line to it: a change log, a
+            // request-and-answer API, a loopback listener and the client
+            // backend over it. Sockets, threads and JSON -- no window, and
+            // nothing a window of theirs could be raised by.
+            "change_feed",
+            "daemon_link",
             "dispatch",
             "favicon",
             // **Judgement call, recorded rather than assumed.** It puts the
@@ -1686,6 +1692,9 @@ mod tests {
             // moves calls that already existed, unchanged, behind a name
             // that does not mention `bw`.
             "vault_backend",
+            // `change_feed`'s neighbours: see there.
+            "vault_api",
+            "vault_host",
             "vault_bridge",
             "vault_cache",
             // **Judgement call, recorded rather than assumed**, and exactly
