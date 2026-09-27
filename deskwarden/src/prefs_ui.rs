@@ -1315,6 +1315,12 @@ pub enum Section {
     /// this window's own precedent -- see [`Section::Lock`] -- and "how fresh
     /// is what I am looking at" is a question with one place to go.
     Sync,
+    /// **How a record is sent from the vault window.** One switch today:
+    /// whether "Send a record" offers the record's fields one by one. Its own
+    /// page, directly after Sync, for [`Section::Sync`]'s reason -- the pages
+    /// beside it are full, and "what does a Send carry" is a question with
+    /// one place to go.
+    Sharing,
     /// **The local HTTP API, and every key that opens it**: the switch that
     /// starts the endpoint on 127.0.0.1, the form that mints a key, the one
     /// showing of a key it has just made, the list of the keys that exist,
@@ -1378,7 +1384,9 @@ impl Section {
     /// **Eleven since `Section::Sync`**, directly after Vault, because it is
     /// the same subject: where the vault on screen comes from, and now how
     /// fresh it is.
-    pub const ALL: [Section; 11] = [
+    ///
+    /// **Twelve since `Section::Sharing`**, directly after Sync.
+    pub const ALL: [Section; 12] = [
         Section::General,
         Section::Shortcuts,
         Section::View,
@@ -1386,6 +1394,7 @@ impl Section {
         Section::Breaches,
         Section::Vault,
         Section::Sync,
+        Section::Sharing,
         Section::Api,
         Section::Clipboard,
         Section::Updates,
@@ -1403,6 +1412,7 @@ impl Section {
             Section::Breaches => "Breaches",
             Section::Vault => "Vault",
             Section::Sync => "Sync",
+            Section::Sharing => "Sharing",
             Section::Api => "Local API",
             Section::Clipboard => "Clipboard",
             Section::Updates => "Updates",
@@ -1470,6 +1480,7 @@ impl Section {
             // changed an item in the Bitwarden app is asking when it shows up
             // here.
             Section::Sync => "When the vault window picks up changes made in other Bitwarden apps.",
+            Section::Sharing => "What a Send made from a record carries.",
             // Names the door before the keys, for the reason the page draws
             // them in that order: the keys mean nothing while nothing is
             // listening, and a reader who has not grasped that there IS an
@@ -2329,6 +2340,7 @@ fn draw_section(ui: &mut Ui, state: &mut PrefsState) {
         Section::Breaches => draw_breaches(ui, state),
         Section::Vault => draw_vault(ui, state),
         Section::Sync => draw_sync_poll_card(ui, state),
+        Section::Sharing => draw_sharing_card(ui, state),
         Section::Api => draw_api(ui, state),
         Section::Clipboard => draw_clipboard(ui, state),
         Section::Updates => draw_updates(ui, state),
@@ -3954,6 +3966,26 @@ fn draw_sync_poll_card(ui: &mut Ui, state: &mut PrefsState) {
         });
     });
 }
+
+/// **The Sharing page: one switch.** See [`Section::Sharing`].
+fn draw_sharing_card(ui: &mut Ui, state: &mut PrefsState) {
+    card(ui, |ui| {
+        state.settings.advanced_sharing = toggle_row(
+            ui,
+            ADVANCED_SHARING_LABEL,
+            ADVANCED_SHARING_DESCRIPTION,
+            state.settings.advanced_sharing,
+        );
+    });
+}
+
+/// The switch, in the owner's words for it.
+const ADVANCED_SHARING_LABEL: &str = "Use advanced sharing";
+/// What each position does -- and what the default sends, spelled out,
+/// because the default sends the password.
+const ADVANCED_SHARING_DESCRIPTION: &str =
+    "Choose which fields of a record a Send carries. Off, a Send carries the whole record: \
+     username, password, websites and notes.";
 
 /// The switch, in the owner's own words for it.
 const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
@@ -8232,6 +8264,21 @@ mod tests {
         );
     }
 
+    /// **The Sharing page's switch writes `advanced_sharing`**, and starts off.
+    #[test]
+    fn the_sharing_pages_switch_turns_advanced_sharing_on() {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::Sharing;
+        assert!(!state.settings.advanced_sharing, "the default: the whole record");
+        let first = tall_frame(&ctx, &mut state, &[]);
+        assert!(first.contains(ADVANCED_SHARING_LABEL), "{:?}", first.strings());
+        let pills = first.rects_of_size(TOGGLE_SIZE);
+        assert_eq!(pills.len(), 1, "the Sharing page paints one switch");
+        tall_frame(&ctx, &mut state, &click(pills[0].center()));
+        assert!(state.settings.advanced_sharing, "the switch did not turn advanced sharing on");
+    }
+
     /// **The Sync page's two switches each write their own setting.** The
     /// owner asked for both: "add to setting Update via polling, and interval
     /// for polling", then "worth adding another setting and enable this by
@@ -8477,6 +8524,9 @@ mod tests {
             // a page on which a user decides something, twice, which is the
             // bar the removed four did not clear.
             "Sync",
+            // **Sharing, directly after Sync**: what a Send made from a record
+            // carries. One switch, and one a user decides.
+            "Sharing",
             // And directly after it, the endpoint that serves what Vault
             // decided is being served. It came off the bottom of Vault, so by
             // the rule Breaches and Updates were placed by, it lands where

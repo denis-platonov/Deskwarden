@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sends mock (5b)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+<style>
+  body { margin: 0; padding: 32px; background: #f1f0ef; font-family: Archivo, system-ui, sans-serif; color: #201e1d; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .note { max-width: 1240px; margin: 0 0 14px; font-size: 13px; color: #605d5d; line-height: 1.5; }
+  .note b { color: #201e1d; }
+  .row { display: flex; align-items: center; gap: 11px; padding: 10px 12px; background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; }
+  .tile { width: 32px; height: 32px; border-radius: 8px; background: #f3f2f2; border: 1px solid #eae7e7; font-size: 12px; font-weight: 700; color: #605d5d; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .rtext { display: flex; flex-direction: column; gap: 3px; flex: 1; min-width: 0; }
+  .rtitle { font-size: 13px; font-weight: 600; }
+  .rsub { font-size: 11px; color: #7d7979; }
+  .pill { display: flex; align-items: center; gap: 6px; border-radius: 999px; padding: 3px 8px; font-size: 10px; font-weight: 700; }
+  .waiting { background: #eef2fc; border: 1px solid #b8c7ea; color: #14307a; }
+  .used { background: #e8f3ec; border: 1px solid #a9d2ba; color: #17673a; }
+  .expired { background: #f3f2f2; border: 1px solid #dedbd9; color: #7d7979; }
+  .revoked { background: #fdf3f2; border: 1px solid #e8a9a2; color: #8c3c33; }
+  .dot { width: 5px; height: 5px; border-radius: 999px; background: #1b3fa0; }
+  .card { background: #ffffff; border: 1px solid #eae7e7; border-radius: 10px; overflow: hidden; }
+  .chead { padding: 11px 16px; border-bottom: 1px solid #eae7e7; font-size: 12px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: #605d5d; }
+  .crow { display: flex; align-items: center; gap: 14px; padding: 13px 16px; border-bottom: 1px solid #f3f2f2; }
+  .crow:last-child { border-bottom: 0; }
+  .clabel { width: 120px; font-size: 12px; color: #7d7979; flex-shrink: 0; }
+  .cvalue { flex: 1; font-size: 13px; }
+  .cside { font-size: 12px; color: #9b9797; }
+  .btn { height: 28px; padding: 0 10px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; font-size: 12px; background: #fff; }
+  .side { display: flex; align-items: center; justify-content: space-between; padding: 8px 10px; border-radius: 8px; font-size: 13px; }
+  .side span { font-size: 11px; color: #9b9797; }
+  .sub { padding-left: 33px; color: #444141; }
+  .fake { outline: 2px dashed #e8a33d; outline-offset: 2px; }
+</style>
+</head>
+<body>
+
+<p class="note"><b>Mock of design 5b, filled only with what a Bitwarden Send records.</b> Differences from the canvas are deliberate:
+no creation date (a Send has none) so the subtitle names the kind; no Recipient row (a Send stores none) so the slot says what opens it;
+the Activity card lists only facts a Send keeps (views used, expiry, deletion) -- no per-view timeline. Revoke deletes the Send, after a confirmation.
+A Send is made only from a record (its detail pane's Send); the sidebar has two folders, <b>Sent</b> and <b>Shared with me</b>.
+Nothing here is clickable.</p>
+
+<div style="width: 1240px; border: 1px solid #dedbd9; border-radius: 12px; overflow: hidden; background: #f7f6f5; box-shadow: 0 10px 30px rgba(45, 43, 43, 0.14); display: flex; flex-direction: column; height: 760px">
+  <!-- titlebar: the design's "Send a record" pill stays off, as the owner asked -->
+  <div style="height: 46px; background: #ffffff; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; gap: 10px; padding: 0 0 0 16px">
+    <div style="width: 22px; height: 22px"><svg width="100%" height="100%" viewBox="0 0 24 28" fill="none"><path d="M12 2H4.4A2.4 2.4 0 0 0 2 4.4V14h10Z" fill="#14307a"/><path d="M12 2h7.6A2.4 2.4 0 0 1 22 4.4V14H12Z" fill="#1b3fa0"/><path d="M2 14h10v12C6.6 23.2 3.2 19.4 2 14Z" fill="#3b74e8"/><path d="M12 14h10c-1.2 5.4-4.6 9.2-10 12Z" fill="#7fa4ef"/></svg></div>
+    <div style="font-size: 14px; font-weight: 800; letter-spacing: -0.01em">Deskwarden</div>
+    <div style="flex: 1"></div>
+    <div style="width: 28px; height: 28px; border-radius: 999px; background: #201e1d; color: #ffffff; font-size: 11px; font-weight: 700; display: flex; align-items: center; justify-content: center">DP</div>
+    <div style="display: flex; font-size: 11px; color: #7d7979; margin-left: 10px"><div style="width: 42px; text-align: center">—</div><div style="width: 42px; text-align: center">▢</div><div style="width: 42px; text-align: center">✕</div></div>
+  </div>
+
+  <div style="flex: 1; display: grid; grid-template-columns: 212px 400px 1fr; min-height: 0">
+    <!-- sidebar -->
+    <div style="background: #ffffff; border-right: 1px solid #eae7e7; padding: 14px 10px; display: flex; flex-direction: column; gap: 2px">
+      <div style="padding: 0 8px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Vault</div>
+      <div class="side">All items <span>1672</span></div>
+      <div class="side">Favorites <span>12</span></div>
+      <div class="side">Logins <span>1540</span></div>
+      <div class="side">Cards <span>4</span></div>
+      <div class="side">Secure notes <span>21</span></div>
+      <div style="height: 1px; background: #eae7e7; margin: 12px 8px"></div>
+      <div style="padding: 0 8px 8px; font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Sharing</div>
+      <div style="display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: 8px; background: #eef2fc; color: #14307a; font-size: 13px; font-weight: 700">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#1b3fa0" stroke-width="2.2"><path d="M4 4l16 8-16 8 3-8z"/></svg>
+        <div style="flex: 1">Sent</div><div style="font-size: 11px">6</div>
+      </div>
+      <div class="side" style="gap: 9px; justify-content: flex-start"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7d7979" stroke-width="2.2" style="transform: scaleX(-1)"><path d="M4 4l16 8-16 8 3-8z"/></svg><div style="flex: 1">Shared with me</div><span>3</span></div>
+      <div style="flex: 1"></div>
+      <div style="padding: 10px; font-size: 11px; color: #9b9797">Locks in 11:42</div>
+    </div>
+
+    <!-- list -->
+    <div style="border-right: 1px solid #eae7e7; display: flex; flex-direction: column; min-height: 0">
+      <div style="padding: 12px; border-bottom: 1px solid #eae7e7; background: #ffffff; display: flex; align-items: center; gap: 10px; height: 32px">
+        <div style="font-size: 12px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: #605d5d">Sent</div>
+        <div style="font-size: 12px; color: #9b9797">6 sends</div>
+        <div style="flex: 1"></div>
+        <div style="font-size: 12px; color: #7d7979">Newest</div>
+      </div>
+      <div style="padding: 10px; display: flex; flex-direction: column; gap: 6px; overflow: hidden">
+        <div class="row" style="border-color: #1b3fa0">
+          <div class="tile" style="background: #eef2fc; border-color: #b8c7ea; color: #1b3fa0">SP</div>
+          <div class="rtext"><div class="rtitle" style="font-weight: 700; color: #14307a">SAP Production</div><div class="rsub">to m.reyes · password · 1 of 1 views</div></div>
+          <div class="pill used"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#1b7a3f" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg>Used</div>
+        </div>
+        <div class="row">
+          <div class="tile">WF</div>
+          <div class="rtext"><div class="rtitle">Office WiFi — Guest</div><div class="rsub">link only · 3 of 10 views · 6 d left</div></div>
+          <div class="pill waiting"><span class="dot"></span>Waiting</div>
+        </div>
+        <div class="row">
+          <div class="tile">PG</div>
+          <div class="rtext"><div class="rtitle">Postgres — Prod</div><div class="rsub">to j.abara · password · expires in 3 h</div></div>
+          <div class="pill waiting"><span class="dot"></span>Waiting</div>
+        </div>
+        <div class="row">
+          <div class="tile">QB</div>
+          <div class="rtext"><div class="rtitle">Q3 board pack.pdf <span class="mono" style="font-size: 10px; border: 1px solid #dedbd9; border-radius: 4px; padding: 0 4px; color: #7d7979; font-weight: 500">FILE</span></div><div class="rsub">link only · 0 of 2 views · 6 d left</div></div>
+          <div class="pill waiting"><span class="dot"></span>Waiting</div>
+        </div>
+        <div class="row" style="opacity: 0.72">
+          <div class="tile">RD</div>
+          <div class="rtext"><div class="rtitle">Remote Desktop — Bastion</div><div class="rsub">to contractor@vantage.io · never opened</div></div>
+          <div class="pill expired">Expired</div>
+        </div>
+        <div class="row" style="opacity: 0.72">
+          <div class="tile">AT</div>
+          <div class="rtext"><div class="rtitle">Atlas Studio</div><div class="rsub">switched off · opened 2 times</div></div>
+          <div class="pill revoked">Revoked</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- detail -->
+    <div style="display: flex; flex-direction: column; min-height: 0">
+      <div style="padding: 18px 24px; background: #ffffff; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; gap: 14px">
+        <div style="width: 42px; height: 42px; border-radius: 10px; background: #eef2fc; border: 1px solid #b8c7ea; color: #1b3fa0; font-size: 14px; font-weight: 700; display: flex; align-items: center; justify-content: center">SP</div>
+        <div style="display: flex; flex-direction: column; gap: 4px; flex: 1">
+          <div style="font-size: 21px; font-weight: 800; letter-spacing: -0.02em; line-height: 1.1">SAP Production</div>
+          <div style="display: flex; align-items: center; gap: 8px">
+            <div style="font-size: 12px; color: #7d7979">Send from a record</div>
+            <div class="pill used" style="padding: 2px 8px"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#1b7a3f" stroke-width="3"><path d="M20 6 9 17l-5-5"/></svg>Used</div>
+          </div>
+        </div>
+        <div style="height: 32px; padding: 0 14px; border: 1px solid #d7d3d3; border-radius: 8px; background: #ffffff; display: flex; align-items: center; font-size: 13px; font-weight: 600">Open record</div>
+        <div style="height: 32px; padding: 0 14px; border-radius: 8px; background: #b42318; color: #ffffff; display: flex; align-items: center; font-size: 13px; font-weight: 700">Revoke</div>
+      </div>
+
+      <div style="padding: 18px 24px; display: flex; flex-direction: column; gap: 14px; overflow: hidden">
+        <div class="card">
+          <div class="chead">Link</div>
+          <div class="crow"><div class="clabel">Address</div><div class="cvalue mono" style="font-size: 12px; color: #9b9797; text-decoration: line-through">nw37.powernapps.net/send/#g7HqK2…</div><div class="cside">dead</div></div>
+          <div class="crow"><div class="clabel">Recipient</div><div class="cvalue">m.reyes@ledgerline.com</div><div class="cside">kept on this PC</div></div>
+          <div class="crow"><div class="clabel">Opens with</div><div class="cvalue">Password required</div></div>
+          <div class="crow"><div class="clabel">Views</div><div class="cvalue" style="display: flex; align-items: center; gap: 12px"><b style="font-weight: 600">1 of 1</b><div style="width: 90px; height: 4px; border-radius: 2px; background: #eae7e7"><div style="width: 100%; height: 4px; border-radius: 2px; background: #1b3fa0"></div></div></div></div>
+          <div class="crow"><div class="clabel">Expires</div><div class="cvalue">17 Aug, 14:20 <span style="color: #7d7979">· in 23 h</span></div><div class="btn">Extend</div></div>
+        </div>
+
+        <div class="card">
+          <div class="chead">What was shared</div>
+          <div class="crow" style="gap: 10px; flex-wrap: wrap">
+            <div class="pill waiting" style="font-size: 11px; font-weight: 600; padding: 3px 9px">Username</div>
+            <div class="pill revoked" style="font-size: 11px; padding: 3px 9px"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#b42318" stroke-width="2.4"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Password</div>
+            <div style="font-size: 12px; color: #7d7979">Notes, one-time code and website were not included.</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="chead">Activity</div>
+          <div class="crow" style="padding: 12px 16px"><div style="font-size: 13px; font-weight: 700">Opened once — every permitted view is spent, so the link is dead.</div></div>
+          <div class="crow" style="padding: 12px 16px"><div class="clabel">1 of 1</div><div class="cvalue">Opened</div><div class="cside" style="color: #7d7979">Bitwarden records counts, not times</div></div>
+          <div class="crow" style="padding: 12px 16px"><div class="clabel">17 Aug, 14:20</div><div class="cvalue">Expires</div></div>
+          <div class="crow" style="padding: 12px 16px"><div class="clabel">23 Aug, 14:20</div><div class="cvalue">Deleted from the server</div><div class="cside" style="color: #7d7979">automatically</div></div>
+          <div style="background: #fdf6e7; border-top: 1px solid #f1dfb6; padding: 12px 16px; display: flex; gap: 9px; align-items: flex-start">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#8a5a00" stroke-width="2"><path d="M3 21 21 3M14 3h7v7"/></svg>
+            <div style="display: flex; flex-direction: column; gap: 6px"><div style="font-size: 12px; font-weight: 600; color: #7a4e00">This password has been seen by someone else</div><div style="font-size: 12px; font-weight: 700; color: #7a4e00">Rotate it now</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="note" style="margin-top: 40px"><b>5a, Send a record: the whole record, with Recipient.</b> The recipient is typed or picked from people this PC has sent to before (newest first).
+It is a label kept on this PC, not an access lock. <b>&times;</b> forgets a person; if they still have live Sends, the confirmation on the right comes first.</p>
+<div style="display: flex; gap: 28px; align-items: flex-start">
+<div style="width: 690px; background: #ffffff; border: 1px solid #d7d3d3; border-radius: 12px; box-shadow: 0 14px 34px rgba(45, 43, 43, 0.18)">
+  <div style="padding: 15px 18px; border-bottom: 1px solid #eae7e7; display: flex; align-items: center; gap: 10px">
+    <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="#1b3fa0" stroke-width="2.2"><path d="M4 4l16 8-16 8 3-8z"/></svg>
+    <div style="font-size: 15px; font-weight: 800; letter-spacing: -0.01em">Send a record</div>
+    <div style="flex: 1"></div><div style="font-size: 13px; color: #9b9797">&#x2715;</div>
+  </div>
+  <div style="padding: 16px 18px; display: flex; flex-direction: column; gap: 16px">
+    <div style="display: flex; flex-direction: column; gap: 8px">
+      <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Record</div>
+      <div style="display: flex; align-items: center; gap: 11px; padding: 10px 12px; border: 1px solid #b8c7ea; border-radius: 10px; background: #eef2fc">
+        <div class="tile" style="background: #fff; border-color: #b8c7ea; color: #1b3fa0">SP</div>
+        <div style="display: flex; flex-direction: column; gap: 2px; flex: 1"><div style="font-size: 13px; font-weight: 700; color: #14307a">SAP Production</div><div style="font-size: 11px; color: #605d5d">Login · Engineering</div></div>
+      </div>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 8px">
+      <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Sends</div>
+      <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid #eae7e7; border-radius: 10px">
+        <div style="font-size: 13px">The whole record:</div>
+        <div class="pill waiting" style="font-size: 11px; font-weight: 600; padding: 3px 9px">Username</div>
+        <div class="pill revoked" style="font-size: 11px; padding: 3px 9px">Password</div>
+        <div class="pill waiting" style="font-size: 11px; font-weight: 600; padding: 3px 9px">One-time code</div>
+        <div class="pill waiting" style="font-size: 11px; font-weight: 600; padding: 3px 9px">Websites</div>
+        <div class="pill waiting" style="font-size: 11px; font-weight: 600; padding: 3px 9px">Notes</div>
+      </div>
+      <div style="font-size: 11px; color: #9b9797">Choosing fields one by one is Preferences &rsaquo; Sharing &rsaquo; <b style="font-weight: 600">Use advanced sharing</b>, off by default.</div>
+    </div>
+    <div style="display: flex; flex-direction: column; gap: 10px">
+      <div style="font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Access</div>
+      <div style="display: flex; align-items: center; gap: 14px"><div style="width: 96px; font-size: 13px; color: #444141">Expires</div>
+        <div style="display: flex; border: 1px solid #d7d3d3; border-radius: 7px; overflow: hidden"><div style="padding: 5px 12px; font-size: 12px">1 h</div><div style="padding: 5px 12px; border-left: 1px solid #d7d3d3; background: #1b3fa0; color: #fff; font-size: 12px; font-weight: 600">24 h</div><div style="padding: 5px 12px; border-left: 1px solid #d7d3d3; font-size: 12px">7 d</div><div style="padding: 5px 12px; border-left: 1px solid #d7d3d3; font-size: 12px">30 d</div></div>
+        <div style="font-size: 12px; color: #9b9797">17 Aug, 14:20</div></div>
+      <div style="display: flex; align-items: center; gap: 14px"><div style="width: 96px; font-size: 13px; color: #444141">Views</div><div style="width: 58px; height: 30px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; padding: 0 9px; font-size: 13px; font-weight: 600">1</div><div style="font-size: 12px; color: #7d7979">then the link dies</div></div>
+      <div style="display: flex; align-items: center; gap: 14px"><div style="width: 96px; font-size: 13px; color: #444141">Open with</div><div class="mono" style="flex: 1; height: 30px; border: 1px solid #d7d3d3; border-radius: 7px; display: flex; align-items: center; padding: 0 10px">••••••</div><div style="font-size: 12px; font-weight: 600; color: #14307a">Generate</div></div>
+      <div style="display: flex; align-items: flex-start; gap: 14px">
+        <div style="width: 96px; font-size: 13px; color: #444141; line-height: 30px">Recipient</div>
+        <div style="flex: 1; position: relative">
+          <div style="height: 30px; border: 1px solid #1b3fa0; box-shadow: 0 0 0 3px #eef2fc; border-radius: 7px; display: flex; align-items: center; padding: 0 10px; font-size: 13px">m.re<span style="width: 1.5px; height: 16px; background: #1b3fa0; margin-left: 1px"></span></div>
+          <div style="position: absolute; top: 36px; left: 0; right: 0; background: #fff; border: 1px solid #d7d3d3; border-radius: 9px; box-shadow: 0 10px 24px rgba(45,43,43,0.16); padding: 5px; z-index: 2">
+            <div style="padding: 4px 8px 6px; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #9b9797">Sent to before</div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 6px; background: #eef2fc">
+              <div style="flex: 1; font-size: 13px; color: #14307a"><b>m.re</b>yes@ledgerline.com</div><div style="font-size: 11px; color: #7d7979">2 live</div><div style="width: 18px; text-align: center; color: #7d7979">&times;</div></div>
+            <div style="display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 6px">
+              <div style="flex: 1; font-size: 13px"><b>m.re</b>nard@vantage.io</div><div style="font-size: 11px; color: #9b9797">last 3 weeks ago</div><div style="width: 18px; text-align: center; color: #9b9797">&times;</div></div>
+          </div>
+        </div>
+      </div>
+      <div style="height: 64px"></div>
+    </div>
+  </div>
+  <div style="padding: 13px 18px; border-top: 1px solid #eae7e7; background: #fdf3f2; display: flex; align-items: flex-start; gap: 9px">
+    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#b42318" stroke-width="2.2" style="margin-top: 1px; flex-shrink: 0"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 2.4 18a1.9 1.9 0 0 0 1.7 2.9h15.8a1.9 1.9 0 0 0 1.7-2.9L13.7 3.9a1.9 1.9 0 0 0-3.4 0Z"/></svg>
+    <div style="font-size: 12px; color: #8c3c33; line-height: 1.5">This Send contains the password. Anyone with the link can read it until the link dies.</div>
+  </div>
+  <div style="padding: 13px 18px; border-top: 1px solid #eae7e7; background: #fbfaf9; display: flex; align-items: center; gap: 9px; border-radius: 0 0 12px 12px">
+    <div style="height: 34px; padding: 0 14px; border-radius: 8px; background: #1b3fa0; color: #fff; display: flex; align-items: center; font-size: 13px; font-weight: 700">Create &amp; copy link</div>
+    <div style="height: 34px; padding: 0 14px; border: 1px solid #d7d3d3; border-radius: 8px; background: #fff; display: flex; align-items: center; font-size: 13px; font-weight: 600">Cancel</div>
+    <div style="flex: 1"></div><div style="font-size: 12px; color: #9b9797">Appears in Sent</div>
+  </div>
+</div>
+
+<div style="width: 420px; background: #ffffff; border: 1px solid #d7d3d3; border-radius: 12px; box-shadow: 0 14px 34px rgba(45, 43, 43, 0.18)">
+  <div style="padding: 18px 18px 6px; font-size: 15px; font-weight: 800">Forget m.reyes@ledgerline.com?</div>
+  <div style="padding: 0 18px 14px; font-size: 13px; color: #444141; line-height: 1.5">2 records are shared with this person right now: <b>SAP Production</b> and <b>Postgres — Prod</b>. Deleting them removes all these shares; the links stop working at once.</div>
+  <div style="padding: 13px 18px; border-top: 1px solid #eae7e7; background: #fbfaf9; display: flex; gap: 9px; border-radius: 0 0 12px 12px">
+    <div style="height: 34px; padding: 0 14px; border-radius: 8px; background: #b42318; color: #fff; display: flex; align-items: center; font-size: 13px; font-weight: 700">Yes, delete 2 shares</div>
+    <div style="height: 34px; padding: 0 14px; border: 1px solid #d7d3d3; border-radius: 8px; display: flex; align-items: center; font-size: 13px; font-weight: 600">No <span class="mono" style="font-size: 10px; color: #9b9797; margin-left: 8px">ESC</span></div>
+  </div>
+</div>
+</div>
+</body>
+</html>

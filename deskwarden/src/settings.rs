@@ -1376,6 +1376,16 @@ pub struct Settings {
     /// `bw` keeps the token the hub wants -- so on that backend this switch
     /// changes nothing and polling is all there is.
     pub sync_push: bool,
+    /// **Whether "Send a record" offers the record's fields one by one.**
+    ///
+    /// Off (the default, and what an older `settings.json` without the field
+    /// parses as), a Send made from a record carries the whole record --
+    /// username, password, websites and notes -- and the card says so. The
+    /// owner: "we may skip which fields to share for now - share the whole
+    /// thing", then "add setting - use advanced sharing to offer fields, off
+    /// by default". On, the card offers the ticks design 5a draws, one-time
+    /// code seed included.
+    pub advanced_sharing: bool,
     /// **Whether an open vault window keeps itself current by asking.**
     ///
     /// The window syncs once when it opens and whenever the Sync pill is
@@ -1759,6 +1769,7 @@ impl Default for Settings {
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             sync_push: true,
+            advanced_sharing: false,
             sync_polling: true,
             sync_poll_minutes: DEFAULT_SYNC_POLL_MINUTES,
             clear_clipboard: true,
@@ -1904,6 +1915,7 @@ impl Settings {
             auto_lock_enabled,
             auto_lock_minutes,
             sync_push,
+            advanced_sharing,
             sync_polling,
             sync_poll_minutes,
             clear_clipboard,
@@ -1958,6 +1970,7 @@ impl Settings {
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
         on_disk.sync_push = *sync_push;
+        on_disk.advanced_sharing = *advanced_sharing;
         on_disk.sync_polling = *sync_polling;
         on_disk.sync_poll_minutes = *sync_poll_minutes;
         on_disk.clear_clipboard = *clear_clipboard;
@@ -2463,6 +2476,7 @@ mod tests {
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             sync_push: false,
+            advanced_sharing: true,
             sync_polling: false,
             sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the
@@ -2746,6 +2760,8 @@ mod tests {
         let old: Settings = serde_json::from_str("{}").expect("an empty file parses");
         assert!(old.sync_polling && old.sync_poll_minutes == DEFAULT_SYNC_POLL_MINUTES);
         assert!(old.sync_push, "an older file turns live updates off");
+        assert!(!old.advanced_sharing, "an older file turns advanced sharing on");
+        assert!(!fresh.advanced_sharing, "a fresh install offers fields one by one");
 
         for (stored, used) in [(0, 1), (1, 1), (17, 17), (120, 120), (500, 120), (u64::MAX, 120)] {
             let settings = Settings { sync_poll_minutes: stored, ..Settings::default() };
@@ -2796,6 +2812,7 @@ mod tests {
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
             sync_push: false,
+            advanced_sharing: true,
             sync_polling: false,
             sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the
@@ -3541,6 +3558,7 @@ mod tests {
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             sync_push: false,
+            advanced_sharing: true,
             sync_polling: false,
             sync_poll_minutes: 17,
             // Every one the OPPOSITE of its own default, for the reason the

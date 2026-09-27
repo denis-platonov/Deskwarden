@@ -1590,6 +1590,12 @@ pub fn build_frame_with_search(
     );
     // **Whether this window takes live updates** -- `Settings::sync_push`,
     // read and live-edited exactly as the poll interval above is.
+    // "Use advanced sharing", read and live-edited as the two above are.
+    let advanced_sharing_at_open = settings_path
+        .as_deref()
+        .map_or(crate::settings::Settings::default().advanced_sharing, |path| {
+            crate::settings::Settings::load(path).advanced_sharing
+        });
     let sync_push_at_open = settings_path
         .as_deref()
         .map_or(crate::settings::Settings::default().sync_push, |path| {
@@ -6565,11 +6571,16 @@ pub fn build_frame_with_search(
             let sent_item = items.iter().find(|i| i.id == state.item_id);
             let sent_folder = sent_item
                 .and_then(|item| sidebar::folder_name(&folders, item.folder_id.as_deref()));
+            let advanced_sharing = edited_settings_for_closure
+                .borrow()
+                .as_ref()
+                .map_or(advanced_sharing_at_open, |settings| settings.advanced_sharing);
             match record_ui::draw_export_modal(
                 ui.ctx(),
                 state,
                 sent_item,
                 sent_folder,
+                advanced_sharing,
                 send_create.in_flight,
                 &crate::send::SystemClock,
                 &crate::local_time::SystemZone,

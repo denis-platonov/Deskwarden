@@ -388,6 +388,57 @@ impl RecordDraft {
     }
 }
 
+/// **What a whole-record Send carries**: username, password, websites and
+/// notes -- and not the one-time code's seed. See [`WHOLE_RECORD_LEAD`].
+///
+/// The seed is left out because sending one is cloning the authenticator,
+/// which the card warns about and seals under a passphrase the sender types
+/// ([`SEED_WARNING`]); a default that did that without asking would be the
+/// one thing the whole-record default must not do. It travels only with
+/// advanced sharing, where it is a tick of its own.
+pub fn whole_record_selection() -> RecordSelection {
+    RecordSelection { username: true, password: true, uri: true, notes: true, totp: false }
+}
+
+/// The lead-in on the whole-record line, before its pills.
+pub const WHOLE_RECORD_LEAD: &str = "The whole record";
+
+/// The pill for a record's websites on the whole-record line. The tick list
+/// calls the same field [`URI_LABEL`]; a pill is a noun for what travels.
+pub const WEBSITES_LABEL: &str = "Websites";
+
+/// Said under the whole-record line when the record has a seed that is not
+/// going with it.
+pub const SEED_STAYS_NOTE: &str = "The one-time code's seed is not included. Turn on Use \
+    advanced sharing in Preferences to send it, sealed.";
+
+/// **The whole-record line's pills: what this item actually has**, in the
+/// order the tick list draws them, with the password marked secret. An item
+/// without a password shows no password pill, because none travels.
+pub fn whole_record_fields(
+    item: Option<&crate::vault_bridge::VaultItem>,
+) -> Vec<(&'static str, bool)> {
+    let Some(item) = item else {
+        return Vec::new();
+    };
+    let login = item.login.as_ref();
+    let filled = |value: Option<&str>| value.is_some_and(|v| !v.trim().is_empty());
+    let mut fields = Vec::new();
+    if filled(login.and_then(|l| l.username.as_deref())) {
+        fields.push((USERNAME_LABEL, false));
+    }
+    if filled(login.and_then(|l| l.password.as_ref().map(|p| p.as_str()))) {
+        fields.push((PASSWORD_LABEL, true));
+    }
+    if login.is_some_and(|l| l.uris.iter().any(|u| filled(u.uri.as_deref()))) {
+        fields.push((WEBSITES_LABEL, false));
+    }
+    if filled(item.notes.as_ref().map(|n| n.as_str())) {
+        fields.push((NOTES_LABEL, false));
+    }
+    fields
+}
+
 /// What is wrong with the export draft, phrased for the user, or `None`.
 ///
 /// The seed rule is first because it is the dangerous one: a ticked seed with
@@ -1100,12 +1151,21 @@ pub fn draw_export_form(
     // `detail::draw_detail_read`, which takes it for the same line and the
     // same reason.
     folder: Option<&str>,
+    // Preferences' "Use advanced sharing". Off, the card sends the whole
+    // record and draws one line saying so; on, it draws 5a's ticks.
+    advanced: bool,
     in_flight: bool,
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
 ) -> RecordUiAction {
     let mut action = RecordUiAction::None;
     let enabled = !in_flight;
+    if !advanced {
+        // Every frame, so a draft opened with the setting on and continued
+        // with it off cannot keep a narrower choice nobody can see.
+        draft.selection = whole_record_selection();
+        draft.set_totp(false);
+    }
     let (card_rect, title) = card(ui, |ui| {
         // **§5a's paper plane**, which only this card wears: the import form
         // below is the same band without one, because the design draws the
@@ -1132,9 +1192,30 @@ pub fn draw_export_form(
             record_chip(ui, item_name, &chip_subtitle(item, folder));
             ui.add_space(theme::BLOCK_GAP);
 
+            // **The whole record, by default** -- one line naming what travels,
+            // in place of 5a's ticks. The owner: "we may skip which fields to
+            // share for now - share the whole thing".
+            if !advanced {
+                theme::eyebrow(ui, INCLUDE_EYEBROW);
+                ui.add_space(theme::EYEBROW_GAP);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new(WHOLE_RECORD_LEAD).size(13.0).color(theme::INK));
+                    ui.add_space(4.0);
+                    super::send_ui::field_pills(ui, &whole_record_fields(item));
+                });
+                let has_seed = item
+                    .and_then(|i| i.login.as_ref())
+                    .and_then(|l| l.totp.as_ref())
+                    .is_some_and(|seed| !seed.trim().is_empty());
+                if has_seed {
+                    ui.add_space(6.0);
+                    note(ui, SEED_STAYS_NOTE, theme::TEXT_FAINT);
+                }
+            }
             // **§5a's `INCLUDE` block**, with the design's own running count
             // beside its eyebrow. See [`include_counter`] for why the number is
             // worth having and why it is a pure function.
+            if advanced {
             ui.horizontal(|ui| {
                 theme::eyebrow(ui, INCLUDE_EYEBROW);
                 ui.add_space(10.0);
@@ -1208,6 +1289,7 @@ pub fn draw_export_form(
                 });
                 ui.add_space(4.0);
                 note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
+            }
             }
 
             // **§5a's `ACCESS` block**, drawn by the one function in this app that
@@ -1666,6 +1748,7 @@ pub fn draw_export_modal(
     // every frame and borrowed for the paint -- see [`draw_export_form`].
     item: Option<&crate::vault_bridge::VaultItem>,
     folder: Option<&str>,
+    advanced: bool,
     in_flight: bool,
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
@@ -1685,6 +1768,7 @@ pub fn draw_export_modal(
                 &state.item_name,
                 item,
                 folder,
+                advanced,
                 in_flight,
                 now,
                 zone,
@@ -2606,6 +2690,67 @@ mod paint_tests {
         );
     }
 
+    /// **By default the card sends the whole record and says so, with no
+    /// ticks.** The owner: "we may skip which fields to share for now - share
+    /// the whole thing", then "use advanced sharing to offer fields, off by
+    /// default". The line names what this record has, the password among it;
+    /// the tick rows are gone; the draft publishes every field but the seed;
+    /// and the record's seed is said to be staying behind.
+    #[test]
+    fn by_default_the_whole_record_goes_and_the_card_says_what_that_is() {
+        let item = a_login();
+        let mut draft = RecordDraft::default();
+        // A narrower choice from before the setting went off must not survive.
+        draft.selection.notes = false;
+        draft.set_totp(true);
+        let painted = paint(|ui| {
+            draw_export_form(
+                ui,
+                &mut draft,
+                "SAP Production",
+                Some(&item),
+                Some("Engineering"),
+                false,
+                false,
+                &crate::send::FixedClock(0),
+                &crate::local_time::FixedOffset(0),
+            );
+        });
+        assert!(painted.text.iter().any(|t| t == WHOLE_RECORD_LEAD), "{:?}", painted.text);
+        for pill in [USERNAME_LABEL, PASSWORD_LABEL, WEBSITES_LABEL, NOTES_LABEL] {
+            assert!(painted.text.iter().any(|t| t == pill), "no {pill} pill: {:?}", painted.text);
+        }
+        assert!(
+            !painted.text.iter().any(|t| t == TOTP_LABEL || t == URI_LABEL),
+            "the tick rows are still drawn: {:?}",
+            painted.text
+        );
+        assert!(painted.text.iter().any(|t| t == SEED_STAYS_NOTE), "the seed note is missing");
+        assert_eq!(
+            (draft.selection.username, draft.selection.password, draft.selection.uri, draft.selection.notes),
+            (true, true, true, true),
+            "the draft does not send the whole record"
+        );
+        assert!(!draft.selection.totp, "the seed went with the whole record");
+        assert!(draft.passphrase.is_empty(), "the seed's passphrase outlived the untick");
+    }
+
+    /// **The pills are what the item has.** A record without a password
+    /// shows no password pill, because none travels; no item, no pills.
+    #[test]
+    fn the_whole_record_pills_are_only_what_the_record_holds() {
+        assert_eq!(
+            whole_record_fields(Some(&a_login())),
+            [(USERNAME_LABEL, false), (PASSWORD_LABEL, true), (WEBSITES_LABEL, false), (NOTES_LABEL, false)]
+        );
+        let bare: crate::vault_bridge::VaultItem = serde_json::from_str(
+            r#"{"id":"b","type":1,"name":"Bare","fields":[],"login":{"username":"u","uris":[]}}"#,
+        )
+        .expect("valid item JSON");
+        assert_eq!(whole_record_fields(Some(&bare)), [(USERNAME_LABEL, false)]);
+        assert!(whole_record_fields(None).is_empty());
+    }
+
     /// **The password row is red in all three of §5a's ways**, and only when
     /// it is really going.
     ///
@@ -2632,6 +2777,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&item),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2655,6 +2801,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&item),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2760,6 +2907,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2831,6 +2979,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2852,6 +3001,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2898,6 +3048,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -2953,6 +3104,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3010,6 +3162,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3136,6 +3289,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3246,6 +3400,7 @@ mod paint_tests {
                 "SAP Production",
                 Some(&a_login()),
                 Some("Engineering"),
+                true,
                 false,
                 &FixedClock(NOW),
                 &UTC,
@@ -3589,6 +3744,7 @@ mod paint_tests {
                     state,
                     Some(&a_login()),
                     Some("Engineering"),
+                    true,
                     false,
                     &FixedClock(NOW),
                     &UTC,
@@ -3632,6 +3788,7 @@ mod paint_tests {
                     state,
                     Some(&a_login()),
                     Some("Engineering"),
+                    true,
                     in_flight,
                     &FixedClock(NOW),
                     &UTC,

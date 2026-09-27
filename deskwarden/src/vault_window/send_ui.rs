@@ -1128,6 +1128,39 @@ pub fn state_tone(state: crate::send::SendState) -> theme::PillTone {
     }
 }
 
+/// **A record's fields as a row of pills** -- design 5b's `WHAT WAS SHARED`
+/// and the whole-record line of 5a's card both draw one. Blue for an ordinary
+/// field, red for a secret one (the password), as the design draws them.
+/// Wraps when the row runs out of width.
+pub fn field_pills(ui: &mut egui::Ui, fields: &[(&str, bool)]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+        for (label, secret) in fields {
+            let tone = if *secret { SECRET_FIELD_TONE } else { FIELD_TONE };
+            let width = theme::state_pill_width(ui.painter(), tone, label);
+            let (rect, _) =
+                ui.allocate_exact_size(egui::vec2(width, theme::PILL_HEIGHT), egui::Sense::hover());
+            theme::state_pill(ui.painter(), egui::pos2(rect.left(), rect.center().y), tone, label);
+        }
+    });
+}
+
+/// An ordinary field's pill: the blue the `Waiting` pill wears, without its dot.
+pub const FIELD_TONE: theme::PillTone = theme::PillTone {
+    fill: theme::BLUE_WASH,
+    edge: theme::BLUE_EDGE,
+    ink: theme::BLUE_DEEP,
+    mark: theme::PillMark::None,
+};
+
+/// A secret field's pill: the red the `Revoked` pill wears.
+pub const SECRET_FIELD_TONE: theme::PillTone = theme::PillTone {
+    fill: theme::DANGER_WASH,
+    edge: theme::DANGER_EDGE,
+    ink: theme::DANGER_INK,
+    mark: theme::PillMark::None,
+};
+
 /// The heading the Sends PANE paints in its list column's strip.
 ///
 /// **It is no longer the same string as `sidebar::SENDS_ROW_LABEL`, and that

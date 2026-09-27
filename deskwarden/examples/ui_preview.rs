@@ -2969,6 +2969,8 @@ impl Preview {
                         // name with the user name glued on the end of it.
                         Some(&fixtures.login),
                         Some("Engineering"),
+                        // The default: the whole record, not the ticks.
+                        false,
                         false,
                         &send::FixedClock(PREVIEW_MILLIS),
                         &PREVIEW_ZONE,
