@@ -439,8 +439,12 @@ mod tests {
         settle: Duration::ZERO,
     };
 
+    /// Thirty seconds, because a connection refused on Windows is not
+    /// immediate -- the stack retries the SYN, so each failed poll against a
+    /// closed port costs about a second -- and the full suite runs these
+    /// beside five thousand others.
     fn eventually(what: &str, mut condition: impl FnMut() -> bool) {
-        let until = std::time::Instant::now() + Duration::from_secs(10);
+        let until = std::time::Instant::now() + Duration::from_secs(30);
         while std::time::Instant::now() < until {
             if condition() {
                 return;
