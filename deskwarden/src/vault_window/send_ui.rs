@@ -646,7 +646,14 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
         crate::send::SendState::Expired => {
             format!("{opened}. The link ran out of time, so it no longer answers.")
         }
-        crate::send::SendState::Waiting => match (send.max_access_count, send.access_count) {
+        // Both live states say the same kind of thing -- what has been
+        // opened and what is left -- because the first half of the sentence
+        // is already the difference between them ("Nobody has opened this
+        // link" against "Opened twice").
+        crate::send::SendState::Waiting | crate::send::SendState::Opened => match (
+            send.max_access_count,
+            send.access_count,
+        ) {
             // The remaining budget, which is the fact a live capped link is
             // actually about. Saturating rather than wrapping: a server that
             // reported more opens than the cap while still calling the Send
@@ -795,7 +802,7 @@ pub fn row_subtitle(send: &SendSummary, now: &dyn SendClock) -> String {
         (None, 1) => parts.push("opened once".to_string()),
         (None, used) => parts.push(format!("opened {used} times")),
     }
-    if crate::send::send_state(send, now) == crate::send::SendState::Waiting {
+    if crate::send::send_state(send, now).is_live() {
         parts.push(expiry_words(&send.deletion_date, now));
     }
     parts.join(" \u{00b7} ")
@@ -1150,6 +1157,10 @@ pub const EXTENDING_LABEL: &str = "Extending\u{2026}";
 /// whole of what a pill says -- a state pill whose label drifted from the
 /// design would be a pill nobody could look up.
 pub const WAITING_LABEL: &str = "Waiting";
+/// **Not one of §5c's four.** A live link somebody has opened; see
+/// `crate::send::SendState`, where why the owner needed a fifth word is
+/// argued.
+pub const OPENED_LABEL: &str = "Opened";
 pub const USED_LABEL: &str = "Used";
 pub const EXPIRED_LABEL: &str = "Expired";
 pub const REVOKED_LABEL: &str = "Revoked";
@@ -1158,6 +1169,7 @@ pub const REVOKED_LABEL: &str = "Revoked";
 pub fn state_label(state: crate::send::SendState) -> &'static str {
     match state {
         crate::send::SendState::Waiting => WAITING_LABEL,
+        crate::send::SendState::Opened => OPENED_LABEL,
         crate::send::SendState::Used => USED_LABEL,
         crate::send::SendState::Expired => EXPIRED_LABEL,
         crate::send::SendState::Revoked => REVOKED_LABEL,
@@ -1184,6 +1196,17 @@ pub fn state_tone(state: crate::send::SendState) -> theme::PillTone {
             edge: theme::BLUE_EDGE,
             ink: theme::BLUE_DEEP,
             mark: theme::PillMark::Dot(theme::BLUE),
+        },
+        // **`Opened` is green with a dot**: the design's "done" wash, because
+        // a link somebody has opened has done what it was sent to do, and the
+        // live state's dot, because it still works. Distinct from `Waiting`'s
+        // blue at a glance, and from `Used` -- the same green -- by its mark:
+        // a dot is a link still answering, the tick is one that is spent.
+        crate::send::SendState::Opened => theme::PillTone {
+            fill: theme::DONE_WASH,
+            edge: theme::DONE_EDGE,
+            ink: theme::DONE_INK,
+            mark: theme::PillMark::Dot(theme::DONE_MARK),
         },
         crate::send::SendState::Used => theme::PillTone {
             fill: theme::DONE_WASH,
@@ -1313,7 +1336,7 @@ pub fn live_send_named<'a>(
 ) -> Option<&'a SendSummary> {
     sends
         .iter()
-        .find(|send| send.name == name && crate::send::send_state(send, now) == crate::send::SendState::Waiting)
+        .find(|send| send.name == name && crate::send::send_state(send, now).is_live())
 }
 
 /// [`live_send_named`] against the fetch's own answer, which is three states
@@ -1349,7 +1372,7 @@ pub fn shared_names(
     };
     sends
         .iter()
-        .filter(|send| crate::send::send_state(send, now) == crate::send::SendState::Waiting)
+        .filter(|send| crate::send::send_state(send, now).is_live())
         .map(|send| send.name.clone())
         .collect()
 }
@@ -2968,7 +2991,7 @@ fn draw_link_card(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
     } else {
         CardValue::Address {
             url: row.access_url.as_str(),
-            dead: row.state != crate::send::SendState::Waiting,
+            dead: !row.state.is_live(),
         }
     };
     let mut rows = vec![(ADDRESS_ROW, address)];
@@ -6358,6 +6381,7 @@ mod paint_tests {
         };
         let send = match state {
             SendState::Waiting => base,
+            SendState::Opened => SendSummary { access_count: 2, ..base },
             SendState::Used => SendSummary {
                 max_access_count: Some(1),
                 access_count: 1,
@@ -7880,6 +7904,34 @@ mod paint_tests {
         );
     }
 
+    /// **A Send somebody has opened says `Opened`, in a pill that is not
+    /// `Waiting`'s** -- on its row, which is where the owner looked and saw
+    /// `Waiting` over a link opened twice.
+    ///
+    /// The tone is held apart from both of its neighbours: not `Waiting`'s
+    /// blue, which is the colour of "nobody has looked", and not `Used`'s
+    /// tick, which is the mark of a link that is spent.
+    #[test]
+    fn an_opened_send_says_opened_in_its_own_pill() {
+        use crate::send::SendState;
+        let painted = paint(&one_row(SendState::Opened), None, min_pane_size()).0;
+        assert_eq!(painted.in_list(OPENED_LABEL), 1, "the row's pill: {:?}", painted.text);
+        assert_eq!(painted.in_list(WAITING_LABEL), 0, "an opened link still says Waiting");
+
+        let opened = state_tone(SendState::Opened);
+        let waiting = state_tone(SendState::Waiting);
+        let used = state_tone(SendState::Used);
+        assert_ne!(opened.fill, waiting.fill, "Opened is painted in Waiting's colour");
+        assert!(
+            matches!(opened.mark, theme::PillMark::Dot(_)),
+            "an opened link is still live, and the dot is the live mark"
+        );
+        assert!(
+            matches!(used.mark, theme::PillMark::Check(_)),
+            "control: Used no longer carries the tick that sets it apart from Opened"
+        );
+    }
+
     /// The two steps do not share a word, so the second click is a decision
     /// rather than muscle memory.
     #[test]
@@ -7936,13 +7988,16 @@ mod paint_tests {
         let (painted, _) = detail_of(a_fully_described_send());
         // The Link card's own rows, once each; `Opened` and `Deleted` are the
         // Activity card's; `Expires` is on both, because it is both "how long
-        // the link answers" and a date in what happened to it.
+        // the link answers" and a date in what happened to it. `Opened` is
+        // painted twice in the detail for this Send, and the second is not a
+        // card's: the fixture has been opened, so the header's pill says so.
+        assert_eq!(OPENED_ROW, OPENED_LABEL, "control: the row and the pill are one word");
         for (label, times) in [
             (LINK_CARD_TITLE, 1),
             (ADDRESS_ROW, 1),
             (OPENS_WITH_ROW, 1),
             (VIEWS_ROW, 1),
-            (OPENED_ROW, 1),
+            (OPENED_ROW, 2),
             (EXPIRES_ROW, 2),
             (DELETED_ROW, 1),
         ] {
@@ -8169,6 +8224,7 @@ mod paint_tests {
         .map(|(i, state)| {
             let send = match state {
                 SendState::Waiting => base.clone(),
+                SendState::Opened => SendSummary { access_count: 2, ..base.clone() },
                 SendState::Used => SendSummary {
                     max_access_count: Some(1),
                     access_count: 1,
@@ -8511,8 +8567,8 @@ mod paint_tests {
         let base = a_fully_described_send();
         let cases = [
             (SendSummary { access_count: 0, max_access_count: None, ..base.clone() }, SendState::Waiting, "Nobody has opened this link"),
-            (SendSummary { access_count: 1, max_access_count: None, ..base.clone() }, SendState::Waiting, "Opened once"),
-            (SendSummary { access_count: 3, max_access_count: Some(10), ..base.clone() }, SendState::Waiting, "7 views left"),
+            (SendSummary { access_count: 1, max_access_count: None, ..base.clone() }, SendState::Opened, "Opened once"),
+            (SendSummary { access_count: 3, max_access_count: Some(10), ..base.clone() }, SendState::Opened, "7 views left"),
             (SendSummary { access_count: 1, max_access_count: Some(1), ..base.clone() }, SendState::Used, "spent"),
             (SendSummary { disabled: true, ..base.clone() }, SendState::Revoked, "switched off"),
             (
@@ -12223,6 +12279,11 @@ mod source_pins {
         // -- and it is in THIS module rather than in `send_ui` so that the
         // rule lives beside the fields it reads.
         "send.rs: pub enum SendState {",
+        // **`is_live`, added with `Opened`, deliberately.** A `bool` read off
+        // a fieldless enum: "does this link still answer" asked once, rather
+        // than `== Waiting` in five places that would each have called an
+        // opened link dead. No runner, no invocation, no child.
+        "send.rs: pub fn is_live(self) -> bool {",
         "send.rs: pub fn send_state(send: &SendSummary, now: &dyn SendClock) -> SendState {",
         // **Moved here from `send_ui`, and the move is the point.** It was
         // the Sends screen's own date parser, and `send_state` needs the same

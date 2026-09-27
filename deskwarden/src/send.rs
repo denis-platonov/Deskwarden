@@ -1314,63 +1314,85 @@ pub struct SendSummary {
     pub has_password: bool,
 }
 
-/// What has become of one Send: design §5c's four states, and only those
-/// four.
+/// What has become of one Send: design §5c's four states, and `Opened`.
 ///
 /// # Why this is derived rather than recorded
 ///
-/// Nothing in this app writes a Send's state down. Every one of these four is
+/// Nothing in this app writes a Send's state down. Every one of these five is
 /// a reading of fields the server already puts on the wire and this client
 /// used to throw away -- `disabled`, `accessCount`, `maxAccessCount`,
 /// `expirationDate`, `deletionDate` -- so the state cannot drift from the
-/// Send, and there is no fifth "we think it is still live" to go stale.
+/// Send, and there is no sixth "we think it is still live" to go stale.
 ///
 /// # The names are the design's, and one of them is not what it sounds like
 ///
 /// **`Revoked` means `disabled`, NOT deleted.** 5b lists a revoked Send in
 /// among the live ones ("Atlas Studio - revoked by you - 2 d ago"), which a
 /// deleted Send could never be: `bw send delete` removes the record, and a
-/// removed record is not in the list to carry a pill. So the state that
-/// exists here is the one the `disabled` flag describes, and the row that
-/// carries it can be turned back on. See [`SendSummary::disabled`].
+/// removed record is not in the list to carry a pill. This app's own Revoke
+/// deletes, so a Send wears this pill only when it was switched off in
+/// another Bitwarden app. See [`SendSummary::disabled`].
 ///
-/// **`Waiting` means "the link is live", not "nobody has opened it".** 5c's
-/// gloss says the latter, and 5b's own second row contradicts it: "3 of 10
-/// views - 6 d left" is drawn `Waiting`. The gloss describes the common case;
-/// the rule is the one that makes the four states total.
+/// # `Waiting` means nobody has opened it, and `Opened` means somebody has
+///
+/// **The owner's question is "has it been opened?"**, and a pill that could
+/// not answer it was the defect: `Waiting` used to mean only "the link is
+/// live", so a link opened twice with no view cap still said `Waiting` --
+/// which reads as "nobody has looked yet", the opposite of what had happened.
+/// 5c's own gloss is the reading people have ("the link is live, and nobody
+/// has opened it yet"), so the rule now matches it: `Waiting` is live and
+/// never opened, and `Opened` is live with at least one view spent. 5b's
+/// "3 of 10 views - 6 d left" row, which it drew `Waiting`, is `Opened` here,
+/// and that departure from the mock is the point. Both are live -- see
+/// [`SendState::is_live`] -- and every reader that asked "is this link still
+/// working?" asks that, not "is it `Waiting`?".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendState {
-    /// The link works. Somebody may or may not have opened it already.
+    /// The link works, and nobody has opened it yet.
     Waiting,
+    /// The link works, and somebody has opened it -- once or more, with views
+    /// left or no cap at all.
+    Opened,
     /// Every permitted view is spent. The link is dead and no date will
     /// revive it.
     Used,
     /// Out of time -- past the expiry the owner set, or past the deletion
     /// date the server holds it to.
     Expired,
-    /// The owner turned it off. The one state a person caused, and the one
-    /// state that can be undone.
+    /// Somebody turned the link off -- in another Bitwarden app, since this
+    /// one's Revoke deletes the Send.
     Revoked,
+}
+
+impl SendState {
+    /// Whether the link still answers: [`Self::Waiting`] or [`Self::Opened`].
+    ///
+    /// **The question every "live" reader asks**, answered once. Before
+    /// `Opened` existed that question was spelled `== Waiting` in five
+    /// places, and each of them would have quietly called an opened link
+    /// dead -- no expiry on its row, no SHARING card, no `shared` pill.
+    pub fn is_live(self) -> bool {
+        matches!(self, SendState::Waiting | SendState::Opened)
+    }
 }
 
 /// [`SendState`] for one row, at one instant.
 ///
 /// # The precedence, and why it is this order
 ///
-/// Several of the four can be true of one Send at once -- a disabled Send
+/// Several of the five can be true of one Send at once -- a disabled Send
 /// that is also out of views, an exhausted Send that has also expired -- so
 /// the order below is the whole of the answer, and it is deliberate:
+/// **Revoked, then Used, then Expired, then Opened, then Waiting.**
 ///
 /// 1. **`Revoked` first, over everything.** It is the only state a person
-///    caused, the only one that is news, and the only one with an action
-///    behind it: a revoked Send can be switched back on, and the row
-///    re-derives to whatever it then is. The argument against -- that
-///    switching a used-up Send back on will not make it openable, so `Used`
-///    is the more useful warning -- is real, and it is answered one state
-///    later rather than here: the moment the owner re-enables it the row says
-///    `Used`, which is the same warning at the moment it is actionable. What
-///    the other order would cost is worse: a link the owner deliberately
-///    pulled back would be described by a state nobody chose.
+///    caused and the only one that is news: somebody deliberately pulled the
+///    link back. The argument against -- that a used-up Send switched back on
+///    would still not open, so `Used` is the more useful warning -- is real,
+///    and it is answered one state later rather than here: the moment it is
+///    re-enabled the row says `Used`. What the other order would cost is
+///    worse: a link somebody deliberately pulled back would be described by a
+///    state nobody chose.
 ///
 /// 2. **`Used` over `Expired`.** 5c's own subtitle says the question people
 ///    actually have is whether it was used, and "views exhausted" answers it
@@ -1378,8 +1400,14 @@ pub enum SendState {
 ///    expired was ended by the cap; the expiry that arrived afterwards
 ///    changed nothing about it.
 ///
-/// 3. **`Expired` over `Waiting`**, which is not a choice so much as the
-///    definition of `Waiting`.
+/// 3. **`Expired` over both live states**, which is not a choice so much as
+///    what "live" means: a link out of time is not waiting for anybody, and
+///    whether it was opened before it died is the activity line's to say.
+///
+/// 4. **`Opened` over `Waiting`**, and `Waiting` last: of two live links, the
+///    one somebody has opened is the one whose pill has news. A single view
+///    spent is enough -- the question is whether anybody has looked, not how
+///    often.
 ///
 /// # What "out of time" reads
 ///
@@ -1408,6 +1436,9 @@ pub fn send_state(send: &SendSummary, now: &dyn SendClock) -> SendState {
     let passed = |date: &str| parse_iso_utc_millis(date).is_some_and(|when| when <= at);
     if passed(&send.expiration_date) || passed(&send.deletion_date) {
         return SendState::Expired;
+    }
+    if send.access_count > 0 {
+        return SendState::Opened;
     }
     SendState::Waiting
 }
@@ -5430,20 +5461,65 @@ mod tests {
     /// reader moving between the two files is reading one clock.
     const STATE_NOW: FixedClock = FixedClock(1_786_320_000_000);
 
+    /// **A live Send is `Waiting` until somebody opens it, and `Opened` from
+    /// the first view on** -- capped or not, and whatever is left.
+    ///
+    /// This used to assert the opposite: that a live link stayed `Waiting`
+    /// however often it was opened, on the strength of 5b drawing "3 of 10
+    /// views - 6 d left" as `Waiting`. The owner opened a link twice and saw
+    /// `Waiting`, which reads as "nobody has looked", and asked for the pill
+    /// to answer the question it is read as answering. The mutant this holds
+    /// out is the old rule coming back: an uncapped link, opened, `Waiting`.
     #[test]
-    fn a_live_send_is_waiting_whether_or_not_anyone_has_opened_it() {
+    fn a_live_send_is_waiting_until_somebody_opens_it_and_opened_after() {
         assert_eq!(send_state(&waiting(), &STATE_NOW), SendState::Waiting);
-        // **The design's own second row.** 5b draws "3 of 10 views - 6 d
-        // left" as `Waiting`, which is what makes 5c's gloss ("nobody has
-        // opened it") an illustration rather than the rule. A derivation that
-        // read the gloss literally would call this one `Used`.
-        assert_eq!(
-            send_state(
-                &SendSummary { max_access_count: Some(10), access_count: 3, ..waiting() },
-                &STATE_NOW
+        for (why, send) in [
+            ("uncapped, opened twice", SendSummary { access_count: 2, ..waiting() }),
+            ("uncapped, opened once", SendSummary { access_count: 1, ..waiting() }),
+            (
+                "5b's own \"3 of 10 views\" row",
+                SendSummary { max_access_count: Some(10), access_count: 3, ..waiting() },
             ),
+        ] {
+            let state = send_state(&send, &STATE_NOW);
+            assert_eq!(state, SendState::Opened, "{why}: a live link somebody opened says {state:?}");
+            assert!(state.is_live(), "{why}: an opened link is not live");
+        }
+        // A capped link with views left and none spent is still `Waiting`:
+        // the cap is not the question, the opening is.
+        assert_eq!(
+            send_state(&SendSummary { max_access_count: Some(10), ..waiting() }, &STATE_NOW),
             SendState::Waiting
         );
+        assert!(SendState::Waiting.is_live());
+        for dead in [SendState::Used, SendState::Expired, SendState::Revoked] {
+            assert!(!dead.is_live(), "{dead:?} counts as a live link");
+        }
+    }
+
+    /// **The precedence, with `Opened` in it: Revoked, Used, Expired,
+    /// Opened, Waiting.** An opened link that is also switched off, spent or
+    /// out of time says that, not `Opened` -- a pill that said a dead link
+    /// had been opened would read as a live one.
+    #[test]
+    fn opened_gives_way_to_every_state_that_ends_the_link() {
+        let opened = SendSummary { access_count: 2, ..waiting() };
+        assert_eq!(
+            send_state(&SendSummary { disabled: true, ..opened.clone() }, &STATE_NOW),
+            SendState::Revoked
+        );
+        assert_eq!(
+            send_state(&SendSummary { max_access_count: Some(2), ..opened.clone() }, &STATE_NOW),
+            SendState::Used
+        );
+        assert_eq!(
+            send_state(
+                &SendSummary { deletion_date: "2026-08-01T00:00:00.000Z".to_string(), ..opened.clone() },
+                &STATE_NOW
+            ),
+            SendState::Expired
+        );
+        assert_eq!(send_state(&opened, &STATE_NOW), SendState::Opened, "control");
     }
 
     #[test]

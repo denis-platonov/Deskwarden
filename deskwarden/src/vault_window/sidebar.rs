@@ -575,13 +575,15 @@ pub const SHARING_SECTION_LABEL: &str = "SHARING";
 /// would silently stop fetching. The axes stay separate and the pane reads
 /// both.
 ///
-/// # `Ended` is not one of `SendState`'s four, and that is deliberate
+/// # `Ended` is not one of `SendState`'s five, and that is deliberate
 ///
-/// [`crate::send::SendState`] has four members and this has three, because
-/// `Ended` merges `Expired` and `Revoked`. 5b's own counts confirm the
-/// partition rather than merely allowing it: 2 + 1 + 2 = 5, the parent row's
-/// number, so every Send is on exactly one sub-row and the three add up to
-/// the whole.
+/// [`crate::send::SendState`] has five members and this has four sub-rows,
+/// because `Ended` merges `Expired` and `Revoked`. 5b's own counts confirm the
+/// partition rather than merely allowing it: its sub-rows add up to the
+/// parent row's number, so every Send is on exactly one sub-row. `Opened` has
+/// a sub-row of its own since it became a state -- a live link somebody has
+/// opened is not waiting for anybody, and folding it back into `Waiting`
+/// would put it under the gloss "nobody has opened it yet".
 ///
 /// **The rail and the pill therefore say different words about the same
 /// Send, on purpose.** A pill names *what happened to this link* -- the
@@ -604,6 +606,8 @@ pub enum SendScope {
     All,
     /// [`crate::send::SendState::Waiting`].
     Waiting,
+    /// [`crate::send::SendState::Opened`].
+    Opened,
     /// [`crate::send::SendState::Used`].
     Used,
     /// [`crate::send::SendState::Expired`] **and**
@@ -612,10 +616,11 @@ pub enum SendScope {
 }
 
 impl SendScope {
-    /// The three sub-rows, in the order 5b draws them. A constant rather than
-    /// three literals at the draw site, so the row loop, the count check and
-    /// the tests cannot come to disagree about which rows exist.
-    pub const SUB_ROWS: [SendScope; 3] = [Self::Waiting, Self::Used, Self::Ended];
+    /// The four sub-rows, in the order 5b draws its three, with `Opened`
+    /// after `Waiting` -- the order a link moves through them. A constant
+    /// rather than literals at the draw site, so the row loop, the count check
+    /// and the tests cannot come to disagree about which rows exist.
+    pub const SUB_ROWS: [SendScope; 4] = [Self::Waiting, Self::Opened, Self::Used, Self::Ended];
 
     /// The word the rail prints.
     ///
@@ -628,6 +633,7 @@ impl SendScope {
         match self {
             SendScope::All => SENDS_ROW_LABEL,
             SendScope::Waiting => send_ui::WAITING_LABEL,
+            SendScope::Opened => send_ui::OPENED_LABEL,
             SendScope::Used => send_ui::USED_LABEL,
             SendScope::Ended => ENDED_ROW_LABEL,
         }
@@ -643,6 +649,7 @@ impl SendScope {
         match self {
             SendScope::All => true,
             SendScope::Waiting => state == SendState::Waiting,
+            SendScope::Opened => state == SendState::Opened,
             SendScope::Used => state == SendState::Used,
             SendScope::Ended => matches!(state, SendState::Expired | SendState::Revoked),
         }
@@ -658,6 +665,7 @@ impl SendScope {
         match self {
             SendScope::All => crate::vault_window::send_ui::SENDS_HEADING,
             SendScope::Waiting => "WAITING",
+            SendScope::Opened => "OPENED",
             SendScope::Used => "USED",
             SendScope::Ended => "ENDED",
         }
@@ -679,6 +687,7 @@ impl SendScope {
         match self {
             SendScope::All => None,
             SendScope::Waiting => Some("The link is live, and nobody has opened it yet."),
+            SendScope::Opened => Some("The link is live, and somebody has opened it."),
             SendScope::Used => Some("Opened, with every permitted view spent."),
             SendScope::Ended => {
                 Some("Out of time or turned off -- expired and revoked links together.")
@@ -692,7 +701,7 @@ impl SendScope {
 /// rather than an oversight.
 pub const ENDED_ROW_LABEL: &str = "Ended";
 
-/// How many Sends fall on the parent row and on each of its three sub-rows.
+/// How many Sends fall on the parent row and on each of its four sub-rows.
 ///
 /// **One value carrying four numbers rather than four `Option<usize>`s**, so
 /// the rail cannot draw a parent count from one reading of the list and a
@@ -704,6 +713,7 @@ pub const ENDED_ROW_LABEL: &str = "Ended";
 pub struct SendCounts {
     pub all: usize,
     pub waiting: usize,
+    pub opened: usize,
     pub used: usize,
     pub ended: usize,
 }
@@ -738,6 +748,9 @@ impl SendCounts {
             if SendScope::Waiting.admits(state) {
                 counts.waiting += 1;
             }
+            if SendScope::Opened.admits(state) {
+                counts.opened += 1;
+            }
             if SendScope::Used.admits(state) {
                 counts.used += 1;
             }
@@ -753,6 +766,7 @@ impl SendCounts {
         match scope {
             SendScope::All => self.all,
             SendScope::Waiting => self.waiting,
+            SendScope::Opened => self.opened,
             SendScope::Used => self.used,
             SendScope::Ended => self.ended,
         }
@@ -4162,19 +4176,25 @@ mod tests {
         }
     }
 
-    /// **Every Send is on exactly one sub-row, and the three add up to the
+    /// **Every Send is on exactly one sub-row, and the sub-rows add up to the
     /// parent.**
     ///
     /// Design 5b's own counts say so -- 2 + 1 + 2 = 5 -- and that is the only
     /// thing that makes merging `Expired` and `Revoked` into `Ended` a
-    /// partition rather than an overlap. Asserted over all four states rather
-    /// than over a fixture, so a fifth state added to `SendState` without a
-    /// row fails here instead of quietly going uncounted.
+    /// partition rather than an overlap. Asserted over every state rather
+    /// than over a fixture, so a state added to `SendState` without a row
+    /// fails here instead of quietly going uncounted -- which is how
+    /// `Opened` got its row.
     #[test]
-    fn the_three_sharing_sub_rows_partition_every_send_state() {
+    fn the_sharing_sub_rows_partition_every_send_state() {
         use crate::send::SendState;
-        for state in [SendState::Waiting, SendState::Used, SendState::Expired, SendState::Revoked]
-        {
+        for state in [
+            SendState::Waiting,
+            SendState::Opened,
+            SendState::Used,
+            SendState::Expired,
+            SendState::Revoked,
+        ] {
             let on: Vec<&str> = SendScope::SUB_ROWS
                 .iter()
                 .filter(|scope| scope.admits(state))
@@ -4183,7 +4203,7 @@ mod tests {
             assert_eq!(
                 on.len(),
                 1,
-                "{state:?} is on {} sub-rows ({on:?}) -- the three are meant to be a partition, \
+                "{state:?} is on {} sub-rows ({on:?}) -- they are meant to be a partition, \
                  so a Send is listed once and the counts add up",
                 on.len()
             );
@@ -4204,10 +4224,15 @@ mod tests {
         // 5b's own numbers, from 5b's own list.
         assert_eq!((counts.waiting, counts.used, counts.ended, counts.all), (2, 1, 2, 5));
         assert_eq!(
-            counts.waiting + counts.used + counts.ended,
+            counts.waiting + counts.opened + counts.used + counts.ended,
             counts.all,
             "the sub-rows do not add up to their parent: {counts:?}"
         );
+
+        // And an opened live link is counted on its own row, not as waiting.
+        let counts = SendCounts::over([SendState::Waiting, SendState::Opened, SendState::Opened]);
+        assert_eq!((counts.waiting, counts.opened, counts.all), (1, 2, 3), "{counts:?}");
+        assert_eq!(SendScope::Opened.label(), crate::vault_window::send_ui::OPENED_LABEL);
     }
 
     /// **The rail's `Ended` and the pill's `Expired`/`Revoked` are different
