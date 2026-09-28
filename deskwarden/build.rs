@@ -14,6 +14,7 @@
 fn main() {
     println!("cargo:rerun-if-changed=assets/deskwarden.ico");
     println!("cargo:rerun-if-changed=assets/wordlist.txt");
+    println!("cargo:rerun-if-changed=assets/eff_large_wordlist.txt");
     println!("cargo:rerun-if-changed=build.rs");
 
     copy_wordlist_beside_the_built_binary();
@@ -48,7 +49,7 @@ fn main() {
     }
 }
 
-/// Puts `assets/wordlist.txt` next to the built `deskwarden.exe`.
+/// Puts `assets/wordlist.txt` and `assets/eff_large_wordlist.txt` next to the built `deskwarden.exe`.
 ///
 /// `src/password_gen.rs` reads the passphrase word list from a file beside the
 /// binary, which is where the installer's `[Files]` section puts it. Without
@@ -78,20 +79,22 @@ fn copy_wordlist_beside_the_built_binary() {
         println!("cargo:warning=could not locate the build output directory for the word list");
         return;
     };
-    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/wordlist.txt");
-    // BOTH the binary's own directory and `deps/` beside it. The first is
-    // where `cargo run` puts `deskwarden.exe` and mirrors the installed
-    // layout; the second is where cargo puts TEST binaries, and putting the
-    // list there is what lets `password_gen`'s passphrase tests exercise the
-    // real `generate_passphrase` -- file search, verification and all --
-    // rather than a decomposed half of it.
-    for directory in [binary_dir.to_path_buf(), binary_dir.join("deps")] {
-        let _ = std::fs::create_dir_all(&directory);
-        if let Err(e) = std::fs::copy(&source, directory.join("wordlist.txt")) {
-            println!(
-                "cargo:warning=could not copy the passphrase word list to {}: {e}",
-                directory.display()
-            );
+    // Two lists now: the passphrase words `password_gen` reads, and the EFF
+    // long list `rest::eff_wordlist` reads for the fingerprint phrase. Both are
+    // looked for beside the binary, so both are put there.
+    for name in ["wordlist.txt", "eff_large_wordlist.txt"] {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join(name);
+        // BOTH the binary's own directory and `deps/` beside it. The first is
+        // where `cargo run` puts `deskwarden.exe` and mirrors the installed
+        // layout; the second is where cargo puts TEST binaries.
+        for directory in [binary_dir.to_path_buf(), binary_dir.join("deps")] {
+            let _ = std::fs::create_dir_all(&directory);
+            if let Err(e) = std::fs::copy(&source, directory.join(name)) {
+                println!(
+                    "cargo:warning=could not copy the word list {name} to {}: {e}",
+                    directory.display()
+                );
+            }
         }
     }
 }

@@ -124,6 +124,10 @@ Source: "..\target\release\Deskwarden.exe"; DestDir: "{app}"; Flags: ignoreversi
 ; spelling, and `the_installer_ships_the_wordlist_this_module_reads` reads
 ; THIS FILE to hold the two together so the name cannot drift.
 Source: "..\assets\wordlist.txt"; DestDir: "{app}"; Flags: ignoreversion
+; The EFF long list the fingerprint phrase is drawn from. `rest::eff_wordlist`
+; reads it from beside the executable when Show fingerprint is pressed, and
+; `the_installer_ships_the_eff_list_beside_the_executable` reads this line.
+Source: "..\assets\eff_large_wordlist.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Deskwarden"; Filename: "{app}\deskwarden.exe"

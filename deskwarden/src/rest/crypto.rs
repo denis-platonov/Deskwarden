@@ -1059,6 +1059,50 @@ pub fn spki_from_base64(text: &str) -> Result<Vec<u8>, CryptoError> {
     base64_from(text.trim()).ok_or(CryptoError::Malformed("public key"))
 }
 
+/// How many words a fingerprint phrase has: Bitwarden's `hashPhrase` takes
+/// `ceil(64 / log2(7776))` = 5, for at least 64 bits.
+pub const FINGERPRINT_WORDS: usize = 5;
+
+/// **Bitwarden's fingerprint phrase** for a user and their public key.
+///
+/// `HKDF-Expand(PRK = SHA-256(spki), info = material, L = 32)`, read as a
+/// big-endian integer, then five words by repeated `mod 7776` / `div 7776`,
+/// joined with `-`. `material` is the user id whose key this is -- the phrase
+/// that user's own app shows. Pinned by
+/// `the_fingerprint_phrase_matches_bitwardens_published_vector`.
+pub fn fingerprint_phrase(
+    material: &str,
+    public_key_spki_der: &[u8],
+    words: &crate::rest::eff_wordlist::EffLongList,
+) -> Result<String, CryptoError> {
+    let prk = Sha256::digest(public_key_spki_der);
+    let hkdf = Hkdf::<Sha256>::from_prk(&prk)
+        .map_err(|_| CryptoError::KeyLength { expected: KEY_LEN, got: prk.len() })?;
+    let mut number = [0u8; KEY_LEN];
+    hkdf.expand(material.as_bytes(), &mut number)
+        .map_err(|_| CryptoError::KeyLength { expected: KEY_LEN, got: 0 })?;
+    let mut phrase = Vec::with_capacity(FINGERPRINT_WORDS);
+    for _ in 0..FINGERPRINT_WORDS {
+        let index = divide_in_place(&mut number, crate::rest::eff_wordlist::EFF_WORDS as u32);
+        phrase.push(words.word(index as usize));
+    }
+    Ok(phrase.join("-"))
+}
+
+/// Divides a big-endian unsigned integer by `divisor` in place and returns the
+/// remainder: schoolbook long division, one byte at a time. The remainder is
+/// always `< divisor`, so `rem << 8 | byte` stays below `divisor * 256`, which
+/// fits `u32` for any divisor under 2^24 -- 7,776 is far under it.
+fn divide_in_place(number: &mut [u8], divisor: u32) -> u32 {
+    let mut remainder: u32 = 0;
+    for byte in number.iter_mut() {
+        let accumulated = (remainder << 8) | u32::from(*byte);
+        *byte = (accumulated / divisor) as u8;
+        remainder = accumulated % divisor;
+    }
+    remainder
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -2522,6 +2566,57 @@ pub mod tests {
         assert_eq!(
             public_key_sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// Bitwarden's SDK fingerprint vector: the user id, and that user's
+    /// 294-byte SPKI public key. `pub` so the sharing engine's fingerprint
+    /// test can serve the same key from a mock server.
+    pub const SDK_FINGERPRINT_USER: &str = "a09726a0-9590-49d1-a5f5-afe300b6a515";
+    pub const SDK_FINGERPRINT_KEY: &[u8] = &[
+        48, 130, 1, 34, 48, 13, 6, 9, 42, 134, 72, 134, 247, 13, 1, 1, 1, 5, 0, 3, 130, 1, 15,
+        0, 48, 130, 1, 10, 2, 130, 1, 1, 0, 187, 38, 44, 241, 110, 205, 89, 253, 25, 191, 126,
+        84, 121, 202, 61, 223, 189, 244, 118, 212, 74, 139, 130, 97, 115, 164, 167, 106, 191,
+        188, 233, 218, 196, 250, 187, 146, 125, 160, 150, 49, 198, 224, 176, 10, 0, 143, 99,
+        230, 232, 160, 51, 104, 154, 211, 33, 80, 170, 4, 68, 80, 219, 115, 167, 114, 156, 227,
+        125, 193, 128, 123, 39, 254, 191, 124, 63, 129, 44, 63, 18, 56, 161, 48, 158, 0, 27,
+        146, 2, 99, 136, 75, 21, 135, 6, 118, 12, 26, 251, 184, 172, 249, 53, 78, 210, 46, 143,
+        17, 104, 202, 65, 173, 229, 219, 233, 144, 163, 101, 216, 238, 152, 54, 158, 1, 195,
+        50, 203, 21, 226, 12, 82, 170, 175, 170, 160, 21, 247, 248, 80, 97, 123, 0, 152, 116,
+        229, 126, 221, 199, 155, 194, 192, 51, 207, 177, 240, 160, 84, 241, 41, 88, 176, 53,
+        111, 28, 173, 177, 232, 158, 22, 79, 133, 152, 31, 32, 12, 196, 147, 58, 57, 50, 252,
+        208, 131, 150, 179, 132, 178, 150, 234, 251, 143, 125, 163, 144, 20, 46, 71, 168, 252,
+        164, 86, 120, 124, 56, 252, 206, 210, 236, 212, 139, 127, 189, 236, 40, 46, 2, 238, 13,
+        216, 40, 48, 85, 133, 229, 181, 155, 176, 217, 241, 154, 153, 213, 112, 222, 72, 219,
+        197, 3, 219, 56, 77, 109, 47, 72, 251, 131, 36, 240, 96, 169, 31, 82, 93, 166, 242, 3,
+        33, 213, 2, 3, 1, 0, 1,
+    ];
+    pub const SDK_FINGERPRINT_PHRASE: &str = "turban-deftly-anime-chatroom-unselfish";
+
+    /// **Bitwarden's own published fingerprint vector**, from the SDK:
+    /// `sdk-internal/crates/bitwarden-crypto/src/fingerprint.rs`,
+    /// `test_fingerprint`. A user id, that user's 294-byte SPKI public key,
+    /// and the phrase every Bitwarden app shows under Account > Fingerprint
+    /// phrase for them. The SDK keys HKDF with the raw SPKI; HMAC hashes a key
+    /// longer than its block first, so that is `PRK = SHA-256(spki)` exactly as
+    /// this module computes it -- which is the point of pinning it here.
+    #[test]
+    fn the_fingerprint_phrase_matches_bitwardens_published_vector() {
+        let key = SDK_FINGERPRINT_KEY;
+        let words = crate::rest::eff_wordlist::verify(
+            &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/eff_large_wordlist.txt"))
+                .expect("the committed EFF list"),
+        )
+        .expect("it verifies");
+        assert_eq!(
+            fingerprint_phrase(SDK_FINGERPRINT_USER, key, &words).expect("a phrase"),
+            SDK_FINGERPRINT_PHRASE
+        );
+        // Control: another user id with the same key is another phrase, so
+        // the material really reaches the HKDF.
+        assert_ne!(
+            fingerprint_phrase("b09726a0-9590-49d1-a5f5-afe300b6a515", key, &words).expect("a phrase"),
+            SDK_FINGERPRINT_PHRASE
         );
     }
 }

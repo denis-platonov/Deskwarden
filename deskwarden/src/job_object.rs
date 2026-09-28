@@ -2079,7 +2079,13 @@ mod tests {
         let build_pinned = build_raw.replace("\r\n", "\n");
         assert_eq!(
             (build_pinned.len(), fnv1a64(&build_pinned)),
-            (5143, 0x4731_8eb9_4c5c_f817_u64),
+            // Re-pinned for personal sharing: `build.rs` now copies a second
+            // list, `assets/eff_large_wordlist.txt`, beside the binary, in the
+            // same loop and with the same best-effort warning. Nothing else
+            // changed; no new call, no new dependency. Recomputed with a
+            // separate FNV-1a/64 implementation (CRLF normalised to LF) that
+            // first reproduced the previous pair (5143, 0x4731_8eb9_4c5c_f817).
+            (5358, 0x6bd3_93e7_6f09_1641_u64),
             "`build.rs` is not the file this module pinned. It runs at BUILD time, outside \
              every fence here and outside the job object entirely, and all it is supposed to \
              do is embed an icon resource. Read the diff: if the change is genuinely an icon \
@@ -3330,6 +3336,10 @@ mod tests {
                 "LICENSE",
                 "README.md",
                 "assets/deskwarden.ico",
+                // The EFF long list `rest::eff_wordlist` reads for the
+                // fingerprint phrase. Data, not a module: 7,776 words, pinned
+                // by SHA-256 in `EFF_WORDLIST_SHA256`.
+                "assets/eff_large_wordlist.txt",
                 "assets/fonts/Archivo-Bold.ttf",
                 "assets/fonts/Archivo-ExtraBold.ttf",
                 "assets/fonts/Archivo-Regular.ttf",

@@ -136,6 +136,9 @@ pub mod api;
 /// rather than faked. See its own docs for what one call costs.
 pub mod backend;
 pub mod crypto;
+/// The EFF long word list the fingerprint phrase is drawn from: a file beside
+/// the executable, counted and hashed before use, as `password_gen`'s is.
+pub mod eff_wordlist;
 /// One `encrypted_json` vault export, built from the ciphertext a sync
 /// already carries. Pure but for a single `GET /api/sync`; no request body.
 pub mod export;
