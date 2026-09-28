@@ -2343,6 +2343,7 @@ mod drag_and_drop_tests {
                                 // arming is covered where it lives.
                                 &mut false,
                         &std::collections::HashSet::new(),
+                        &crate::vault_window::item_list::RowPeople::default(),
                     );
                         },
                     );
@@ -2575,6 +2576,7 @@ mod drag_and_drop_tests {
                                 // arming is covered where it lives.
                                 &mut false,
                         &std::collections::HashSet::new(),
+                        &crate::vault_window::item_list::RowPeople::default(),
                     );
                         },
                     );
@@ -2748,6 +2750,7 @@ mod drag_and_drop_tests {
                                 // arming is covered where it lives.
                                 &mut false,
                         &std::collections::HashSet::new(),
+                        &crate::vault_window::item_list::RowPeople::default(),
                     );
                         },
                     );

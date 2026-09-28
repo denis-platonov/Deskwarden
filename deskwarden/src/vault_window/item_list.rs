@@ -190,6 +190,42 @@ impl RowCommand {
     pub(super) fn is_destructive(&self) -> bool {
         matches!(self, Self::Delete | Self::PurgeForever)
     }
+
+    /// Whether the command writes to the record -- every one a received,
+    /// view-only record refuses (spec 6.9). A refreshed favicon is a local
+    /// cache, not the record; choosing or clearing one writes a custom field.
+    ///
+    /// **Move to folder is here although the mock keeps it** on a received
+    /// record ("folders are yours, so Move to folder stays"). A folder is
+    /// per-user on the wire, but NodeWarden's slice 1 refuses every write to a
+    /// read-only collection's cipher, `partial` included (spec 10.3), so the
+    /// move would meet a refusal -- the plan's decision 5 hides it until the
+    /// server has a per-user folder route.
+    ///
+    /// **The writers are listed, not the readers.** A new command forgotten
+    /// here is offered on a view-only record and the server refuses it -- the
+    /// courtesy `vault_bridge::may_edit` describes, lost for one command. A
+    /// reader list forgotten the same way would silently take a harmless Copy
+    /// off every received record's menu, which nobody would report as a bug.
+    // Called from `vault_window::mod`'s row-command gate in Task 19 (a
+    // received record is view-only); until then only this module's tests ask.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn writes_the_record(&self) -> bool {
+        matches!(
+            self,
+            Self::SelectIcon
+                | Self::ClearIcon
+                | Self::Edit
+                | Self::MoveToFolder(_)
+                | Self::Unfile
+                | Self::Delete
+                | Self::Archive
+                | Self::Unarchive
+                | Self::Restore
+                | Self::PurgeForever
+        )
+    }
 }
 
 /// What an item row puts on egui's drag-and-drop clipboard while it is being
@@ -1565,6 +1601,9 @@ pub fn draw_item_list(
     // NAMES and not of ids, which is `send_ui::live_send_named`'s decision
     // and is argued there.
     shared: &std::collections::HashSet<String>,
+    // **Design 6**: which records are shared with people and who shares the
+    // received ones. Asked per row by id -- a share IS a record, unlike a Send.
+    people: &RowPeople,
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
     visible_ids.clear();
@@ -1912,7 +1951,11 @@ pub fn draw_item_list(
                                     icons.textures.get(&item.id),
                                     may_unfile,
                                     filter.source(),
-                                    shared.contains(&item.name),
+                                    RowMarks {
+                                        send: shared.contains(&item.name),
+                                        person: people.shared.contains(&item.id),
+                                        from: people.from(&item.id),
+                                    },
                                 )
                             })
                             .inner;
@@ -1995,7 +2038,13 @@ fn row_badge(ui: &mut egui::Ui, text: &str, selected: bool) {
 /// focus halo there, because a grey chip on a blue-tinted row would vanish;
 /// this one is already the strongest thing in the run and a second treatment
 /// would make the pill mean two things.
-fn shared_pill(ui: &mut egui::Ui) {
+///
+/// **`person` swaps the plane for the person mark** (design 6e, LIST CHIPS:
+/// "Same chip, person mark"). One chip with two marks rather than two chips,
+/// because the word is the same promise either way -- someone can open this
+/// record right now -- and a row shared both ways would otherwise carry the
+/// word twice.
+fn shared_pill_marked(ui: &mut egui::Ui, person: bool) {
     const PAD_X: f32 = 7.0;
     const PAD_Y: f32 = 2.0;
     const GAP: f32 = 5.0;
@@ -2014,7 +2063,13 @@ fn shared_pill(ui: &mut egui::Ui) {
         egui::pos2(rect.min.x + PAD_X, rect.center().y - MARK / 2.0),
         egui::Vec2::splat(MARK),
     );
-    theme::paint_send_plane(ui.painter(), mark, theme::CARD);
+    // The plane for a live Send (5d), the person for a person share (6e):
+    // "same chip, person mark. It wins when the record has both."
+    if person {
+        theme::paint_person_mark(ui.painter(), mark, theme::CARD);
+    } else {
+        theme::paint_send_plane(ui.painter(), mark, theme::CARD);
+    }
     ui.painter().galley(
         egui::pos2(mark.right() + GAP, rect.min.y + PAD_Y),
         galley,
@@ -2024,6 +2079,72 @@ fn shared_pill(ui: &mut egui::Ui) {
 
 /// 5d's own word. Lower case, like the two chips beside it.
 pub const SHARED_PILL: &str = "shared";
+
+/// The chip on a row someone shares with this account (mock 6e). Lower case
+/// and drawn by `row_badge`, like `app` and `2FA`: it says what the record IS
+/// on this PC, not what is happening to it, so it is an outlined grey and not
+/// the filled `shared` pill.
+pub const VIEW_ONLY_CHIP: &str = "view-only";
+
+/// **What sharing says about each row**: which records this account shares
+/// with someone who has them now, and who shares each received record. Built
+/// once per frame from the sharing view, and asked per row by id.
+///
+/// **Ids, where the Send set beside it is names.** A Send is a copy with no
+/// link back to its record, which is why `send_ui::live_send_named` matches
+/// by name; a person share IS the record, moved under the org key with its
+/// id intact, so the id answers exactly and two records with one name are
+/// never confused.
+#[derive(Debug, Clone, Default)]
+pub struct RowPeople {
+    pub shared: std::collections::HashSet<String>,
+    pub received: std::collections::HashMap<String, String>,
+}
+
+impl RowPeople {
+    /// From the daemon's view; empty without one.
+    ///
+    /// `shared` holds only the records someone has NOW (spec 6.1's pill
+    /// promise, `SharingView::shared_with_someone`) -- an invitation still
+    /// waiting is not a person who can open the record, which is 5d's own
+    /// rule for the chip ("someone can open it right now").
+    #[must_use]
+    pub fn from_view(view: Option<&crate::rest::sharing::SharingView>) -> Self {
+        let Some(view) = view else {
+            return Self::default();
+        };
+        Self {
+            shared: view
+                .records
+                .iter()
+                .filter(|r| view.shared_with_someone(&r.item_id))
+                .map(|r| r.item_id.clone())
+                .collect(),
+            received: view.received.iter().map(|r| (r.item_id.clone(), r.from.clone())).collect(),
+        }
+    }
+
+    /// Who shares a received record.
+    #[must_use]
+    pub fn from(&self, item_id: &str) -> Option<&str> {
+        self.received.get(item_id).map(String::as_str)
+    }
+}
+
+/// A row's trailing marks: a live Send, a person share, a received record.
+///
+/// A struct rather than three more parameters on `item_row`, which already
+/// carries eight, and because the three are one question -- what is
+/// happening to this record between people -- asked once per row.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RowMarks<'a> {
+    /// 5d: a Send somebody can open right now.
+    pub send: bool,
+    /// 6e: a person has this record in their vault now.
+    pub person: bool,
+    /// 6e: who shares this record with this account, when someone does.
+    pub from: Option<&'a str>,
+}
 
 /// Design 2b's row title (`font-size: 13px`) and subtitle
 /// (`font-size: 11px`), and the `gap: 2px` between them. Named because
@@ -2265,11 +2386,12 @@ fn item_row(
     // Which list this row was drawn from -- the row's menu is entirely
     // different for a trashed or archived item. See `menu_entries`.
     source: FilterSource,
-    // **Design 5d**: this record has a Send somebody can open right now. A
-    // `bool` decided by the caller rather than a list searched here, because
-    // this function runs per visible row per frame -- see
-    // `send_ui::shared_names`.
-    shared: bool,
+    // **Designs 5d and 6e**: this record has a Send somebody can open right
+    // now, a person who has it, or a person who shares it with this account.
+    // Decided by the caller rather than a list searched here, because this
+    // function runs per visible row per frame -- see `send_ui::shared_names`
+    // and `RowPeople`.
+    marks: RowMarks<'_>,
 ) -> RowOutcome {
     let username = item.login.as_ref().and_then(|l| l.username.as_deref()).unwrap_or("");
     // Design 2b's two trailing chips. Neither is decorative and neither is
@@ -2366,8 +2488,18 @@ fn item_row(
                     // `2FA`, `shared` in reading order, so `shared` is the
                     // last of the three read and the first of the three
                     // drawn.
-                    if shared {
-                        shared_pill(ui);
+                    if marks.person || marks.send {
+                        shared_pill_marked(ui, marks.person);
+                    }
+                    // **6e's `view-only`**, next in: to the left of where the
+                    // `shared` pill would stand and to the right of `app` and
+                    // `2FA`, which say what the record is and so read first.
+                    // Rarely beside the pill: a record someone shares with
+                    // this account is not one it can share on (the engine
+                    // refuses it, `rest::sharing::OTHER_ORG`), so only a live
+                    // Send of it -- matched by name -- puts the two together.
+                    if marks.from.is_some() {
+                        row_badge(ui, VIEW_ONLY_CHIP, selected);
                     }
                     for chip in chips.iter().rev().flatten() {
                         row_badge(ui, chip, selected);
@@ -4099,7 +4231,7 @@ mod row_tile_tests {
                     None,
                     false,
                     FilterSource::LiveVault,
-                    shared,
+                    RowMarks { send: shared, ..RowMarks::default() },
                 );
             });
             let mut texts = Vec::new();
@@ -4159,6 +4291,97 @@ mod row_tile_tests {
             "the item list no longer asks {needle:?} -- every row is being given the same \
              answer, or none"
         );
+    }
+
+    /// **A person-shared record wears the `shared` pill with a person mark**,
+    /// a received one the `view-only` chip (mock 6e, LIST CHIPS). The person
+    /// mark wins when a record has both a person and a live Send.
+    #[test]
+    fn a_shared_record_wears_the_person_pill_and_a_received_one_says_view_only() {
+        let view = crate::rest::sharing::SharingView {
+            available: true,
+            people: vec![crate::rest::sharing::PersonEntry { email: "anna@x.io".into(), state: crate::rest::sharing::PersonState::Shared, expires_at: None }],
+            records: vec![crate::rest::sharing::RecordEntry { item_id: "mine".into(), people: vec!["anna@x.io".into()] }],
+            received: vec![crate::rest::sharing::ReceivedEntry { item_id: "theirs".into(), from: "denis@x.io".into() }],
+            ..Default::default()
+        };
+        let people = RowPeople::from_view(Some(&view));
+        assert!(people.shared.contains("mine"));
+        assert_eq!(people.from("theirs"), Some("denis@x.io"));
+        assert_eq!(people.from("mine"), None);
+
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let icons = IconCache::default();
+            item_row(ui, &login("theirs", "u"), &[], false, icons.textures.get("theirs"), false, FilterSource::LiveVault,
+                RowMarks { send: false, person: false, from: people.from("theirs") });
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        assert!(texts.iter().any(|t| t == VIEW_ONLY_CHIP), "{texts:?}");
+    }
+
+    /// **The person mark wins, and the plane is what it replaces** -- read
+    /// off the chip's white strokes. The plane is `paint_send_plane`'s closed
+    /// four-point outline; the person is a ring (the head) and an open path.
+    /// Nothing else on a login row strokes in white, so the counts are the
+    /// chip's alone -- and the no-marks row is the control for that.
+    #[test]
+    fn the_shared_pill_wears_the_person_when_a_person_has_the_record() {
+        fn walk(shape: &egui::Shape, planes: &mut usize, heads: &mut usize) {
+            match shape {
+                egui::Shape::Path(p)
+                    if p.closed
+                        && p.points.len() == 4
+                        && p.stroke.color == egui::epaint::ColorMode::Solid(theme::CARD) =>
+                {
+                    *planes += 1;
+                }
+                egui::Shape::Circle(c) if c.stroke.width > 0.0 && c.stroke.color == theme::CARD => {
+                    *heads += 1;
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, planes, heads)),
+                _ => {}
+            }
+        }
+        let item = login("Acme VPN", "denis@example.com");
+        let marks_of = |marks: RowMarks<'_>| -> (usize, usize) {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+            crate::theme::apply(&ctx);
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                let _ = item_row(ui, &item, &[], false, None, false, FilterSource::LiveVault, marks);
+            });
+            let (mut planes, mut heads) = (0, 0);
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut planes, &mut heads);
+            }
+            (planes, heads)
+        };
+        assert_eq!(marks_of(RowMarks::default()), (0, 0), "control: a plain row strokes something white");
+        assert_eq!(marks_of(RowMarks { send: true, ..RowMarks::default() }), (1, 0), "a live Send wears the plane");
+        assert_eq!(marks_of(RowMarks { person: true, ..RowMarks::default() }), (0, 1), "a person share wears the person");
+        assert_eq!(
+            marks_of(RowMarks { send: true, person: true, from: None }),
+            (0, 1),
+            "one chip, and the person wins over the plane (mock 6e)"
+        );
+    }
+
+    /// Which row commands write to a record -- the ones a received,
+    /// view-only record refuses (spec 6.9).
+    #[test]
+    fn a_view_only_record_refuses_every_command_that_writes() {
+        assert!(RowCommand::Edit.writes_the_record());
+        assert!(RowCommand::Delete.writes_the_record());
+        assert!(RowCommand::MoveToFolder("f".into()).writes_the_record());
+        assert!(RowCommand::SelectIcon.writes_the_record());
+        assert!(!RowCommand::CopyPassword.writes_the_record());
+        assert!(!RowCommand::RefreshIcon.writes_the_record(), "a refresh forgets a cached favicon; the record is untouched");
     }
 
     fn login(name: &str, username: &str) -> VaultItem {
@@ -4461,6 +4684,7 @@ mod row_tile_tests {
                     false,
                     &mut row_opened,
                                 &std::collections::HashSet::new(),
+                                &RowPeople::default(),
                             );
             })
         };
@@ -9051,6 +9275,7 @@ mod toolbar_strip_tests {
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
                                 &std::collections::HashSet::new(),
+                                &RowPeople::default(),
                             );
             })
         };
@@ -9501,6 +9726,7 @@ mod move_error_band_tests {
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
                                 &std::collections::HashSet::new(),
+                                &RowPeople::default(),
                             );
             })
         };
@@ -9906,6 +10132,7 @@ mod list_placeholder_paint_tests {
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
                                 &std::collections::HashSet::new(),
+                                &RowPeople::default(),
                             );
             })
         };
@@ -10236,6 +10463,7 @@ mod keyboard_selection_tests {
                     // covered by `the_open_gesture_tests` and the pin in `vault_window::mod`.
                     &mut false,
                                 &std::collections::HashSet::new(),
+                                &RowPeople::default(),
                             );
                 // AFTER the pane, where the window really draws them -- so the
                 // gate is being tested through the one-frame-late

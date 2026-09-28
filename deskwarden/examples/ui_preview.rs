@@ -2408,6 +2408,9 @@ impl Preview {
                     // before that list has been answered, which is the
                     // state every shot of this screen has been taken in.
                     &std::collections::HashSet::new(),
+                    // Design 6's person marks: a preview holds no sharing view,
+                    // so no row wears a person or a `view-only` chip.
+                    &item_list::RowPeople::default(),
                 );
             });
     }
@@ -2454,6 +2457,9 @@ impl Preview {
                     // before that list has been answered, which is the
                     // state every shot of this screen has been taken in.
                     &std::collections::HashSet::new(),
+                    // Design 6's person marks: a preview holds no sharing view,
+                    // so no row wears a person or a `view-only` chip.
+                    &item_list::RowPeople::default(),
                 );
             });
     }
@@ -2499,6 +2505,9 @@ impl Preview {
                     // before that list has been answered, which is the
                     // state every shot of this screen has been taken in.
                     &std::collections::HashSet::new(),
+                    // Design 6's person marks: a preview holds no sharing view,
+                    // so no row wears a person or a `view-only` chip.
+                    &item_list::RowPeople::default(),
                 );
             });
     }

@@ -821,6 +821,26 @@ pub fn reprompt_protected(item: &VaultItem) -> bool {
     }
 }
 
+/// **Whether this app may write to the item** -- `false` for a record someone
+/// shares with this account, which their server hands over with
+/// `edit: false` (spec 6.9, 10.3). A missing field is editable: every
+/// personal item, and every item a server that predates the field sends.
+///
+/// A courtesy, not security: the server refuses the write whatever this says.
+/// What this stops is the user pressing Edit and meeting a refusal.
+///
+/// Read through [`VaultItem::other`] and not a field, [`REPROMPT_KEY`]'s
+/// reason: the REST mapper already carries `edit` through untouched (see
+/// `rest::sync`'s round-trip test, which names it), and `bw serve` never sends
+/// it -- which is the "missing" case, and correctly editable. Only a literal
+/// `false` is view-only; a `null` or a shape nobody documented is not
+/// evidence the user may not edit their own record, and the cost of reading
+/// it wrong that way is an Edit the server then refuses, not a leak.
+#[must_use]
+pub fn may_edit(item: &VaultItem) -> bool {
+    item.other.get("edit").and_then(serde_json::Value::as_bool) != Some(false)
+}
+
 /// The request body for a move: the item's ordinary write shape, with
 /// `folderId` **stated explicitly** -- present, and `null` when the item is
 /// being un-filed.
@@ -6309,5 +6329,19 @@ mod tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+
+    /// **View-only is the server's `edit: false`** on a cipher (spec 6.9,
+    /// 10.3). Missing or true is editable -- every personal item.
+    #[test]
+    fn an_item_the_server_says_is_not_editable_is_view_only() {
+        let item = |other: serde_json::Value| -> VaultItem {
+            let mut value = serde_json::json!({ "id": "a", "name": "a" });
+            value.as_object_mut().expect("object").extend(other.as_object().expect("object").clone());
+            serde_json::from_value(value).expect("item")
+        };
+        assert!(may_edit(&item(serde_json::json!({}))));
+        assert!(may_edit(&item(serde_json::json!({ "edit": true }))));
+        assert!(!may_edit(&item(serde_json::json!({ "edit": false }))));
     }
 }

@@ -7872,6 +7872,226 @@ const SEND_PLANE: f32 = 17.0;
 /// See [`SEND_PLANE`].
 const SEND_PLANE_GAP: f32 = 10.0;
 
+// ---- personal sharing's marks (design 6, tab 6e) ------------------------------
+//
+// A Send is a link: a square tile, a paper plane, a stadium pill. A share is a
+// person: a round avatar, a person mark, a pill with 5-point corners. The two
+// must not be confused, so every mark here differs from its Send sibling in
+// shape and not only in colour.
+
+/// A cubic from the mock's SVG, flattened into the points of one open path.
+///
+/// **The real curve rather than a hand-picked polyline through it.** The
+/// first cut of these marks eyeballed six or nine points along each path, and
+/// on the Share control's shoulder that put the line a third of a point off
+/// the mock's curve -- at 21 points, on a strip whose owner compares it to the
+/// mock side by side. epaint's own flattening walks the Bezier to `0.05` of a
+/// point, which is well under what a 1.3-point stroke can show. Still one
+/// `Shape::line` per stroke, so the marks stay open paths: nothing here is a
+/// closed or filled path a probe in `icon_probe` counts.
+fn flattened_cubic(points: [Pos2; 4]) -> Vec<Pos2> {
+    egui::epaint::CubicBezierShape::from_points_stroke(points, false, Color32::TRANSPARENT, Stroke::NONE)
+        .flatten(Some(0.05))
+}
+
+/// The person mark: a head and shoulders, in a 24-unit box scaled to `rect`
+/// -- the mock's `<circle cx=12 cy=8 r=4/><path d="M4.5 21c.6-4 ...">`,
+/// stroked, never filled (a filled path would read as a star to
+/// `icon_probe::stars`).
+///
+/// The shoulders are the mock's two cubics -- `c.6-4 3.6-6.4 7.5-6.4` and its
+/// mirror `s6.9 2.4 7.5 6.4` -- flattened by [`flattened_cubic`] and drawn as
+/// ONE open path, so the crown at `(12, 14.6)` is a joint in a line and not
+/// two butt ends meeting.
+///
+/// `stroke-width: 2.4` in the same 24-unit box, the mock's weight for this
+/// mark at the size the list's subtitles draw it; the pill and chip draw it
+/// at 2.6 there, a twelfth of a point apart at 10 points, and one weight for
+/// the mark keeps it one drawing wherever it is.
+pub fn paint_person_mark(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let unit = rect.width() / 24.0;
+    let at = |ux: f32, uy: f32| rect.min + Vec2::new(ux * unit, uy * unit);
+    let stroke = Stroke::new(2.4 * unit, color);
+    painter.circle_stroke(at(12.0, 8.0), 4.0 * unit, stroke);
+    let mut shoulders = flattened_cubic([at(4.5, 21.0), at(5.1, 17.0), at(8.1, 14.6), at(12.0, 14.6)]);
+    // `s6.9 2.4 7.5 6.4`: the first control point is the reflection of the
+    // previous curve's second, `(15.9, 14.6)`. `skip(1)` because the crown is
+    // already the last point of the left half.
+    shoulders.extend(
+        flattened_cubic([at(12.0, 14.6), at(15.9, 14.6), at(18.9, 17.0), at(19.5, 21.0)])
+            .into_iter()
+            .skip(1),
+    );
+    painter.add(egui::Shape::line(shoulders, stroke));
+}
+
+/// **The header's Share control** (mock 6a): a person with a plus, drawn as
+/// the envelope beside it is -- 34 points, borderless, `ICON_STROKE`,
+/// darkening to ink on hover. Shares a record with a person; see
+/// `vault_window::share_ui`.
+///
+/// The mock's `ic('share', 21, 'currentColor', 1.5)`: a 21-point glyph whose
+/// 1.5-unit stroke is 1.31 points, which is [`ICON_STROKE`] -- the weight of
+/// the star, the envelope and the kebab it stands among, so the four read as
+/// one family and not as three and a guest.
+///
+/// **A person with a plus, not a person**: the bare person is the mark that
+/// SAYS a record is shared (the pills, the list's chip); this control DOES
+/// the sharing, and the plus is the difference between the two. Drawn, not a
+/// glyph, for [`send_record_button`]'s reason.
+pub fn share_record_button(ui: &mut Ui) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    // The strip's resting grey and its hover ink, the envelope's own pair.
+    let color = if response.hovered() { INK } else { TEXT_SECONDARY };
+    let stroke = Stroke::new(ICON_STROKE, color);
+    // The mock's 21px glyph in a 24-unit box, centred in the 34pt control.
+    let size = SHARE_GLYPH;
+    let unit = size / 24.0;
+    let origin = rect.center() - Vec2::splat(size / 2.0);
+    let at = |ux: f32, uy: f32| origin + Vec2::new(ux * unit, uy * unit);
+    let painter = ui.painter();
+    painter.circle_stroke(at(9.5, 8.2), 3.7 * unit, stroke);
+    // `M3 20.2c.5-3.8 3.1-6 6.5-6 1.3 0 2.5.3 3.5.9`: a shoulder that stops
+    // short on the right, where the plus stands. One open path for the
+    // reason the person mark's shoulders are one.
+    let mut shoulder = flattened_cubic([at(3.0, 20.2), at(3.5, 16.4), at(6.1, 14.2), at(9.5, 14.2)]);
+    shoulder.extend(
+        flattened_cubic([at(9.5, 14.2), at(10.8, 14.2), at(12.0, 14.5), at(13.0, 15.1)])
+            .into_iter()
+            .skip(1),
+    );
+    painter.add(egui::Shape::line(shoulder, stroke));
+    // `M18 12.8v7M14.5 16.3h7`. Two segments, axis-aligned and 6.1 points
+    // long: no probe in `icon_probe` matches that extent -- the mixer's
+    // tracks are 16.7 and the ✕ arms are diagonal.
+    painter.line_segment([at(18.0, 12.8), at(18.0, 19.8)], stroke);
+    painter.line_segment([at(14.5, 16.3), at(21.5, 16.3)], stroke);
+    response
+}
+
+/// The mock's `ic('share', 21, ...)`: the Share control's glyph box.
+const SHARE_GLYPH: f32 = 21.0;
+
+/// Where one person stands, as a pill says it. Short words; the status line
+/// beside the pill carries the long form (mock 6e, SHARE PILLS).
+///
+/// Four of the six are the mock's. [`Self::KeyChanged`] and [`Self::Gone`]
+/// are the engine's own states (`rest::sharing::PersonState`) that the mock's
+/// strip does not draw: a changed key is the danger wash, because nothing is
+/// sent to that person until it is looked at, and a person no membership
+/// reaches any more is the expired grey, because both mean "not receiving
+/// this" and neither asks for anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharePillKind {
+    Shared,
+    Invited,
+    NoAccount,
+    Expired,
+    KeyChanged,
+    Gone,
+}
+
+impl SharePillKind {
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Shared => "Shared",
+            Self::Invited => "Invited",
+            Self::NoAccount => "No account yet",
+            Self::Expired => "Invite expired",
+            Self::KeyChanged => "Key changed",
+            Self::Gone => "Not receiving",
+        }
+    }
+
+    /// Shared is filled blue, like the list's `shared` chip; the waits are the
+    /// Send pills' own washes; a changed key is the danger wash.
+    ///
+    /// `mark` is [`PillMark::None`] because a share pill's mark is never a dot
+    /// or a tick: it is always the person, in [`Self::mark_ink`].
+    #[must_use]
+    pub fn tone(self) -> PillTone {
+        let tone = |fill, edge, ink| PillTone { fill, edge, ink, mark: PillMark::None };
+        match self {
+            Self::Shared => tone(BLUE, BLUE, CARD),
+            Self::Invited => tone(BLUE_WASH, BLUE_EDGE, BLUE_DEEP),
+            Self::NoAccount => tone(CAUTION_WASH, CAUTION_EDGE, CAUTION_INK),
+            Self::Expired | Self::Gone => tone(CANVAS, BORDER, TEXT_FAINT),
+            Self::KeyChanged => tone(DANGER_WASH, DANGER_EDGE, DANGER_INK),
+        }
+    }
+
+    /// **The person mark's colour, which is not always the word's.** The
+    /// mock's `sp()` strokes Invited's person in `#1b3fa0` beside a
+    /// `#14307a` word, and No account yet's in `#8a5a06` beside `#7a4f05` --
+    /// the same mark-a-shade-brighter-than-its-word pairing the Send pills'
+    /// dots use (`p-waiting .dot` is [`BLUE`] on [`BLUE_DEEP`] text). Shared
+    /// and the greys stroke it in the word's own colour.
+    #[must_use]
+    pub fn mark_ink(self) -> Color32 {
+        match self {
+            Self::Invited => BLUE,
+            Self::NoAccount => CAUTION_MARK,
+            _ => self.tone().ink,
+        }
+    }
+}
+
+/// `.sp`'s `padding: 0 7px` -- a point tighter than a Send pill's 8, as the
+/// list's `shared` chip is, because both carry a mark.
+const SHARE_PILL_PAD_X: f32 = 7.0;
+/// The mock's `ic('person', 10, ...)` inside a share pill.
+const SHARE_PILL_MARK: f32 = 10.0;
+/// `.sp`'s `gap: 5px`.
+const SHARE_PILL_GAP: f32 = 5.0;
+/// `.sp`'s `border-radius: 5px` -- the list chips' corner, and the shape that
+/// is not a Send pill's stadium.
+const SHARE_PILL_RADIUS: u8 = 5;
+
+/// A share pill's width, for right-aligning it -- [`state_pill_width`]'s
+/// reason, and its `+ 2.0` for the border.
+#[must_use]
+pub fn share_pill_width(painter: &egui::Painter, kind: SharePillKind) -> f32 {
+    let galley = painter.layout_no_wrap(
+        kind.label().to_string(),
+        FontId::new(PILL_TEXT_PX, FontFamily::Name(BOLD.into())),
+        kind.tone().ink,
+    );
+    SHARE_PILL_PAD_X * 2.0 + SHARE_PILL_MARK + SHARE_PILL_GAP + galley.size().x + 2.0
+}
+
+/// **A share pill**: 20 tall like a Send pill, but 5-point corners and a
+/// person mark where a Send pill has a dot.
+///
+/// A painter and an anchor, not a `Ui`, for [`state_pill`]'s reason: the
+/// Sent list places its cells into explicit rectangles. The word is set
+/// optically centred by [`centred_galley_top`], the rule every pill in this
+/// file follows since box-centring put their labels high.
+pub fn share_pill(painter: &egui::Painter, left_center: Pos2, kind: SharePillKind) -> Rect {
+    let tone = kind.tone();
+    let width = share_pill_width(painter, kind);
+    let rect = Rect::from_min_size(
+        Pos2::new(left_center.x, left_center.y - PILL_HEIGHT / 2.0),
+        Vec2::new(width, PILL_HEIGHT),
+    );
+    let rounding = CornerRadius::same(SHARE_PILL_RADIUS);
+    painter.rect_filled(rect, rounding, tone.fill);
+    painter.rect_stroke(rect, rounding, Stroke::new(1.0, tone.edge), StrokeKind::Inside);
+    let mark = Rect::from_min_size(
+        Pos2::new(rect.min.x + 1.0 + SHARE_PILL_PAD_X, rect.center().y - SHARE_PILL_MARK / 2.0),
+        Vec2::splat(SHARE_PILL_MARK),
+    );
+    paint_person_mark(painter, mark, kind.mark_ink());
+    let font = FontId::new(PILL_TEXT_PX, FontFamily::Name(BOLD.into()));
+    let galley = painter.layout_no_wrap(kind.label().to_string(), font.clone(), tone.ink);
+    let x = mark.right() + SHARE_PILL_GAP;
+    painter.galley(centred_galley_top(painter.ctx(), rect, &galley, &font, x), galley, tone.ink);
+    rect
+}
+
 /// The card's middle band: everything the form is actually asking, at the
 /// card's padding.
 pub fn form_card_body<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
@@ -11924,6 +12144,87 @@ mod tests {
             !body.contains("Sense::click()"),
             "the disabled run senses clicks, so a cell a user cannot change is pressable"
         );
+    }
+
+    /// Every share pill says its word and is wider than its word: the person
+    /// mark and the padding are really laid out. Five-point corners are the
+    /// shape that tells it from a Send's stadium pill (mock 6e).
+    #[test]
+    fn a_share_pill_is_its_word_and_a_person_mark() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        apply(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            for kind in [SharePillKind::Shared, SharePillKind::Invited, SharePillKind::NoAccount, SharePillKind::Expired, SharePillKind::KeyChanged, SharePillKind::Gone] {
+                let rect = share_pill(ui.painter(), egui::pos2(10.0, 20.0), kind);
+                assert_eq!(rect.height(), PILL_HEIGHT);
+                assert!(rect.width() > share_pill_width(ui.painter(), kind) - 0.5 && rect.width() > 30.0);
+            }
+        });
+        assert_eq!(SharePillKind::Shared.label(), "Shared");
+        assert_eq!(SharePillKind::NoAccount.label(), "No account yet");
+        assert_eq!(SharePillKind::Expired.label(), "Invite expired");
+        assert_eq!(SharePillKind::Shared.tone().fill, BLUE, "Shared is the filled blue of the list's `shared` chip");
+    }
+
+    /// The Share control is a 34-point header control that reports a click,
+    /// as every control in that strip does.
+    #[test]
+    fn the_share_control_is_a_header_sized_button() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        apply(&ctx);
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let response = share_record_button(ui);
+            assert_eq!(response.rect.size(), Vec2::splat(HEADER_BUTTON_HEIGHT));
+        });
+    }
+
+    /// **The shape is what tells a share from a Send** (mock 6e: "a person ·
+    /// 5pt corners, person mark"), so it is read back off the painted frame
+    /// rather than trusted to a constant: a share pill's ground is rounded at
+    /// five points where a Send pill's is a stadium, and it carries a stroked
+    /// ring -- the person's head -- in the mock's mark colour, which on
+    /// Invited is a shade brighter than the word.
+    #[test]
+    fn a_share_pill_is_square_cornered_and_carries_a_head_where_a_send_pill_does_not() {
+        fn walk(shape: &egui::Shape, rects: &mut Vec<egui::epaint::RectShape>, rings: &mut Vec<Color32>) {
+            match shape {
+                egui::Shape::Rect(rect) => rects.push(rect.clone()),
+                egui::Shape::Circle(c) if c.stroke.width > 0.0 => rings.push(c.stroke.color),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, rects, rings)),
+                _ => {}
+            }
+        }
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        apply(&ctx);
+        let painted = |draw: &dyn Fn(&egui::Painter)| {
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| draw(ui.painter()));
+            let (mut rects, mut rings) = (Vec::new(), Vec::new());
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut rects, &mut rings);
+            }
+            (rects, rings)
+        };
+
+        let kind = SharePillKind::Invited;
+        let (rects, rings) = painted(&|p| {
+            let _ = share_pill(p, egui::pos2(10.0, 20.0), kind);
+        });
+        let ground = rects.iter().find(|r| r.fill == kind.tone().fill).expect("the pill painted no ground");
+        assert_eq!(ground.corner_radius, CornerRadius::same(5), "a share pill is not 5-point cornered");
+        assert_eq!(rings, vec![BLUE], "Invited's person is stroked in the mock's #1b3fa0, once");
+        assert_ne!(kind.mark_ink(), kind.tone().ink, "control: the mark and the word share a colour here");
+
+        // The control: a Send pill in the same wash is a stadium and has no head.
+        let tone = kind.tone();
+        let (rects, rings) = painted(&|p| {
+            let _ = state_pill(p, egui::pos2(10.0, 20.0), tone, "Waiting");
+        });
+        let ground = rects.iter().find(|r| r.fill == tone.fill).expect("the Send pill painted no ground");
+        assert_eq!(ground.corner_radius, CornerRadius::same((PILL_HEIGHT / 2.0) as u8));
+        assert!(rings.is_empty(), "a Send pill painted a ring: {rings:?}");
     }
 }
 

@@ -2949,6 +2949,7 @@ mod tests {
                     // covered where it lives.
                     &mut false,
                         &std::collections::HashSet::new(),
+                        &item_list::RowPeople::default(),
                     );
             });
             if frame == 2 {

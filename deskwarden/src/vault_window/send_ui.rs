@@ -7702,6 +7702,7 @@ mod paint_tests {
                         false,
                         &mut opened,
                         &std::collections::HashSet::new(),
+                        &crate::vault_window::item_list::RowPeople::default(),
                     );
                 });
         });

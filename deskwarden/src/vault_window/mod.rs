@@ -3624,6 +3624,10 @@ pub fn build_frame_with_search(
                         aux_error.is_some(),
                         &mut row_opened,
                         &shared_names,
+                        // Design 6's person marks. Empty until the window
+                        // holds the sharing view (Task 15), so no row wears a
+                        // person or a `view-only` chip before then.
+                        &item_list::RowPeople::default(),
                     ) {
                         // The kind the `+ New` menu was clicked on -- `empty_of`,
                         // not `empty`, which would open a login form whatever row
