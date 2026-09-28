@@ -1861,19 +1861,22 @@ fn screen_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'
     section_label(ui, SHARING_SECTION_LABEL);
     ui.add_space(SECTION_LABEL_INSET);
     ui.spacing_mut().item_spacing.y = ROW_GAP;
-    // Every badge in this section is `lists.sends`, which is `None` for a
-    // fetch that FAILED as well as for one that has not happened, so all four
-    // draw `UNKNOWN_COUNT` together rather than a `0` that would read as
-    // "nothing of yours is published". Taking them from ONE value is what
-    // makes "all four say the same thing about a failure" structural rather
-    // than a rule four call sites have to keep. See
-    // `send_ui::SendFetch::counts` and [`SendCounts`].
+    // Sent's Sends half is `lists.sends`, which is `None` for a fetch that
+    // FAILED as well as for one that has not happened, so it draws
+    // `UNKNOWN_COUNT` rather than a `0` that would read as "nothing of yours
+    // is published" -- see `send_ui::SendFetch::counts` and [`SendCounts`].
+    // Shared with me's count is never unknown (its reason is below).
     {
         let width = ui.available_width();
         let on = screens.sharing_is(SendScope::All);
         // Sends and person shares in one count (spec 6.10). Unknown Sends
         // with no shares stay unknown; unknown Sends with shares count the
         // shares -- they are known.
+        //
+        // That last arm is a PARTIAL count, knowingly: with the Sends
+        // unknown, "3" is the shares alone and says nothing of the Sends.
+        // Chosen over an en dash, which would hide shares the window does
+        // know about.
         let count = match (lists.sends.map(|c| c.all), lists.shared_records) {
             (Some(sends), shares) => Some(sends + shares),
             (None, 0) => None,
@@ -1962,6 +1965,17 @@ fn inset_hairline(ui: &mut egui::Ui, inset: f32) {
     ui.painter().rect_filled(line, CornerRadius::ZERO, theme::HAIRLINE);
 }
 
+/// A row's count, laid out as [`sidebar_row`] paints it -- one place for its
+/// font, so whatever sits beside the count (Shared with me's invitation dot)
+/// measures the same text the row drew.
+fn count_galley(ui: &egui::Ui, count: Option<usize>) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        badge_text(count),
+        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        theme::TEXT_GHOST,
+    )
+}
+
 /// One VAULT/FOLDERS row: label left, right-aligned count, allocated at
 /// exactly `width` wide (not necessarily all of `ui.available_width()` --
 /// see `FOLDER_EDIT_BUTTON_WIDTH`) and `ROW_HEIGHT` tall. Returns the row's
@@ -1992,17 +2006,6 @@ fn inset_hairline(ui: &mut egui::Ui, inset: f32) {
 /// the text and nothing else, and because a click target that shrank with the
 /// indent would make a sub-row harder to hit than the row above it. See
 /// [`SUB_ROW_EXTRA_INDENT`].
-/// A row's count, laid out as [`sidebar_row`] paints it -- one place for its
-/// font, so whatever sits beside the count (Shared with me's invitation dot)
-/// measures the same text the row drew.
-fn count_galley(ui: &egui::Ui, count: Option<usize>) -> std::sync::Arc<egui::Galley> {
-    ui.painter().layout_no_wrap(
-        badge_text(count),
-        egui::FontId::new(11.0, egui::FontFamily::Proportional),
-        theme::TEXT_GHOST,
-    )
-}
-
 fn sidebar_row(
     ui: &mut egui::Ui,
     label: &str,

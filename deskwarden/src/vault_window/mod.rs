@@ -1168,6 +1168,10 @@ pub fn build_frame_with_search(
     // the server answers with the new Send's id, which is what the entry is
     // filed under. A failed create drops it.
     let mut pending_sent: Option<crate::sent_history::SentRecord> = None;
+    // Changes to `sent_history` whose save to the file failed. Kept so the
+    // re-read on a sharing change retries them rather than losing them; see
+    // `share_ui::reload_sent_history`.
+    let mut sent_unsaved: Vec<share_ui::UnsavedSent> = Vec::new();
     // **A person being forgotten.** `forget_ask` is the confirmation on
     // screen -- the person and the shares that would go with them;
     // `forgetting` is the answer being carried out, one Send deletion at a
@@ -2019,10 +2023,12 @@ pub fn build_frame_with_search(
         }
         // The daemon said the sharing view moved: ask for it again, and re-read
         // the address book -- the daemon re-keys it when a record comes home.
+        // This window's own changes that never reached the file are saved
+        // again first, and kept if they still cannot be.
         if hub.as_ref().is_some_and(|hub| hub.sharing_changed(Instant::now())) {
             sharing.invalidate();
             if let Some(path) = sent_history_path.as_deref() {
-                sent_history = crate::sent_history::SentHistory::load(path);
+                sent_history = share_ui::reload_sent_history(path, &mut sent_unsaved);
             }
         }
         let pushed = hub.as_ref().is_some_and(|hub| hub.settled(Instant::now()));
@@ -2357,9 +2363,12 @@ pub fn build_frame_with_search(
         // The sharing worker's reports, and the view when it is stale -- one
         // read at a time (`SharingPane::wants_view`), never in a window with
         // no line to the daemon, whose Share control offers a Send.
-        share_ui::drain(&sharing_rx, &mut sharing, ui.ctx().input(|i| i.time));
-        if sharing.wants_view() && sharing_client.is_some() {
-            share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, share_ui::SharingCall::View);
+        let sharing_now = ui.ctx().input(|i| i.time);
+        share_ui::drain(&sharing_rx, &mut sharing, sharing_now);
+        if sharing.wants_view(sharing_now) && sharing_client.is_some() {
+            // A view read is refused only with no line, which was just ruled
+            // out; nothing is waiting on this one to take a spinner down.
+            let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, share_ui::SharingCall::View);
         }
         // **The Send made from a record exists now**: file what was sent, and
         // to whom, under the id the server gave it. Taken, so it is filed
@@ -2371,8 +2380,9 @@ pub fn build_frame_with_search(
                     entry.send_id = id.clone();
                     sent_history.record(entry.clone());
                     if let Some(path) = sent_history_path.as_deref() {
-                        if let Err(e) = crate::sent_history::update(path, |h| h.record(entry)) {
+                        if let Err(e) = crate::sent_history::update(path, |h| h.record(entry.clone())) {
                             log::warn!("a Send was made but could not be added to the sent history: {e:?}");
+                            sent_unsaved.push(share_ui::UnsavedSent::Record(entry));
                         }
                     }
                 }
@@ -6766,6 +6776,7 @@ pub fn build_frame_with_search(
                             h.forget(&email);
                         }) {
                             log::warn!("a person could not be forgotten in the sent history: {e:?}");
+                            sent_unsaved.push(share_ui::UnsavedSent::Forget(email.clone()));
                         }
                     }
                 } else {
@@ -6912,6 +6923,7 @@ pub fn build_frame_with_search(
                             h.forget(&email);
                         }) {
                             log::warn!("a person could not be forgotten in the sent history: {e:?}");
+                            sent_unsaved.push(share_ui::UnsavedSent::Forget(email.clone()));
                         }
                     }
                     forgetting = None;

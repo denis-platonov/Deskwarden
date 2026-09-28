@@ -50,6 +50,9 @@ pub(crate) const SHARE_UNAVAILABLE_TOOLTIP: &str =
 pub(crate) const CHECK_FINGERPRINT_FIRST: &str = "Show their fingerprint and compare it before sharing anyway.";
 /// A worker that panicked: the call's own kind of failure, in words.
 pub(crate) const PANICKED: &str = "Sharing stopped unexpectedly. Try again.";
+/// A write asked for while another is still out -- see [`request`], which
+/// says this rather than dropping the second one without a word.
+pub(crate) const BUSY: &str = "Another sharing change is still running. Try again when it finishes.";
 
 pub(crate) fn shared_toast(email: &str) -> String {
     format!("Shared with {email}. It is in their vault now.")
@@ -57,6 +60,13 @@ pub(crate) fn shared_toast(email: &str) -> String {
 
 pub(crate) fn waiting_toast(email: &str, record: &str) -> String {
     format!("{email} was added. {record} appears in their vault once they accept.")
+}
+
+/// A share that left an invitation for an address with no account, said as a
+/// toast when no dialog is open to say it (mock 6e's dialog line, without
+/// the expiry the report does not carry).
+pub(crate) fn waiting_account_toast(email: &str) -> String {
+    format!("Waiting for {email} to create an account.")
 }
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -234,9 +244,11 @@ pub(crate) struct SharingPane {
     pub(crate) view: Option<SharingView>,
     stale: bool,
     fetching: bool,
-    /// The last view read failed. See [`Self::wants_view`].
-    read_failed: bool,
-    /// A write is in flight; one at a time.
+    /// The last view read failed: when, in egui seconds, to try again. See
+    /// [`Self::wants_view`].
+    retry_at: Option<f64>,
+    /// A write is in flight; one at a time. A fingerprint is a read and
+    /// does not take the slot -- see [`request`].
     busy: bool,
     /// The Share dialog, while it is open.
     pub(crate) dialog: Option<ShareDialog>,
@@ -261,6 +273,11 @@ pub(crate) struct SharingPane {
 /// How long a toast stays.
 const TOAST_SECONDS: f64 = 5.0;
 
+/// How long after a failed view read the window asks again, unasked. The
+/// vault window's own frame schedule already wakes it at least every half
+/// second, so the check needs no timer of its own.
+pub(crate) const VIEW_RETRY_SECONDS: f64 = 30.0;
+
 impl SharingPane {
     /// The daemon said the view changed, or this window changed it.
     pub(crate) fn invalidate(&mut self) {
@@ -270,13 +287,20 @@ impl SharingPane {
     /// **Whether the frame should ask for the view now**: once at the start,
     /// and again whenever it went stale -- never while a read is out.
     ///
-    /// A window with no view whose read FAILED does not ask again until
-    /// something invalidates it (the feed, or a write's report). "No view
-    /// yet" alone would re-ask on the very next frame, and the worker's own
-    /// repaint makes that frame come at once: a daemon answering 401 would be
-    /// asked hundreds of times a second for as long as the window is open.
-    pub(crate) fn wants_view(&self) -> bool {
-        !self.fetching && (self.stale || (self.view.is_none() && !self.read_failed))
+    /// **A read that FAILED is asked again [`VIEW_RETRY_SECONDS`] later**, or
+    /// sooner when something invalidates the view (the feed, or a write's
+    /// report). Not on the next frame: "no view yet" alone would re-ask at
+    /// once, and the worker's own repaint makes that frame come at once -- a
+    /// daemon answering 401 would be asked hundreds of times a second. And not
+    /// never: with push off, or no sharing change for hours, a window whose
+    /// first read failed would sit with no view, a rail that counts nothing
+    /// shared and no Share control. `now_seconds` is egui's input time.
+    pub(crate) fn wants_view(&self, now_seconds: f64) -> bool {
+        let due = match self.retry_at {
+            Some(at) => now_seconds >= at,
+            None => self.view.is_none(),
+        };
+        !self.fetching && (self.stale || due)
     }
 
     /// A view request was started.
@@ -430,7 +454,9 @@ impl SharingCall {
         let err = sentence.to_string();
         match self {
             Self::View => SharingReport::View(Err(err)),
-            Self::Share { email, .. } => SharingReport::Shared { email: email.clone(), result: Err(err) },
+            Self::Share { email, item_name, .. } => {
+                SharingReport::Shared { email: email.clone(), item_name: item_name.clone(), result: Err(err) }
+            }
             Self::Stop { email, .. } => SharingReport::Stopped { email: email.clone(), result: Err(err) },
             Self::Forget(_) => SharingReport::Forgot(Err(err)),
             Self::Fingerprint(email) => SharingReport::Fingerprint { email: email.clone(), result: Err(err) },
@@ -446,7 +472,9 @@ impl SharingCall {
 /// for the pane only -- see the module doc, and this type's `Debug` below.
 pub(crate) enum SharingReport {
     View(Result<SharingView, String>),
-    Shared { email: String, result: Result<ShareResult, String> },
+    /// `item_name` is the call's own, so a toast can name the record
+    /// whether or not the dialog is still open when the answer comes.
+    Shared { email: String, item_name: String, result: Result<ShareResult, String> },
     Stopped { email: String, result: Result<Option<String>, String> },
     Done(Result<(), String>),
     /// The names of the records a forget stopped -- decrypted names.
@@ -483,9 +511,9 @@ impl std::fmt::Debug for SharingReport {
 pub(crate) fn run(client: &SharingClient, call: SharingCall) -> SharingReport {
     match call {
         SharingCall::View => SharingReport::View(client.view()),
-        SharingCall::Share { item_id, email, .. } => {
+        SharingCall::Share { item_id, item_name, email } => {
             let result = client.share(&item_id, &email);
-            SharingReport::Shared { email, result }
+            SharingReport::Shared { email, item_name, result }
         }
         SharingCall::Stop { item_id, email } => {
             let result = client.stop(&item_id, &email);
@@ -529,29 +557,43 @@ pub(crate) fn spawn_sharing_call(
 /// at a time, a Confirm only for the key that was shown, and a window with no
 /// line to the daemon is told why.
 ///
+/// **`true` when the call was started**, and `false` -- with a sentence in
+/// [`SharingPane::notice`] -- when it was refused. A caller that raised a
+/// spinner before asking takes it down on `false`: a refused call has no
+/// report coming, so nothing else ever would. A refusal is never silent.
+///
 /// The Confirm check comes first, before the line is looked at: a Confirm
 /// that does not match the held fingerprint is a mistake in the caller
 /// whatever the line, and is refused without spending the fingerprint.
+///
+/// **Show fingerprint does not take the write slot.** It is a read -- the
+/// daemon hashes a key it holds -- so it may run beside a write, and its
+/// report leaves `busy` and the view alone (see [`apply`]).
+#[must_use]
 pub(crate) fn request(
     pane: &mut SharingPane,
     client: Option<&SharingClient>,
     ctx: &egui::Context,
     tx: &mpsc::Sender<SharingReport>,
     call: SharingCall,
-) {
+) -> bool {
     if let SharingCall::Confirm { email, key_sha256 } = &call {
         if !pane.was_shown(email, key_sha256) {
             pane.notice = Some(CHECK_FINGERPRINT_FIRST.to_string());
-            return;
+            return false;
         }
     }
     let Some(client) = client else {
         pane.notice = Some(SHARE_UNAVAILABLE_TOOLTIP.to_string());
-        return;
+        return false;
     };
     match &call {
         SharingCall::View => pane.begin_view(),
-        _ if pane.busy => return,
+        SharingCall::Fingerprint(_) => {}
+        _ if pane.busy => {
+            pane.notice = Some(BUSY.to_string());
+            return false;
+        }
         SharingCall::Stop { item_id, email } => {
             pane.busy = true;
             pane.stopping = Some((item_id.clone(), email.clone()));
@@ -573,6 +615,7 @@ pub(crate) fn request(
         pane.notice = None;
     }
     spawn_sharing_call(ctx.clone(), tx.clone(), client.clone(), call);
+    true
 }
 
 /// Takes every report that has arrived. Called once per frame.
@@ -591,31 +634,49 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
     match report {
         SharingReport::View(result) => {
             pane.fetching = false;
-            pane.read_failed = result.is_err();
             match result {
-                Ok(view) => pane.view = Some(view),
+                Ok(view) => {
+                    pane.view = Some(view);
+                    pane.retry_at = None;
+                }
                 // The reason is NOT in the line: it is the daemon's sentence
                 // (module doc). The view on screen stays as it was, and the
-                // next change on the feed asks again.
-                Err(_) => log::info!("the sharing view could not be read from the daemon"),
+                // next change on the feed -- or the retry -- asks again.
+                Err(_) => {
+                    pane.retry_at = Some(now_seconds + VIEW_RETRY_SECONDS);
+                    log::info!("the sharing view could not be read from the daemon");
+                }
             }
             return;
         }
-        SharingReport::Shared { email, result } => match result {
+        // **A fingerprint is a read**: it took no write slot (see
+        // [`request`]), so its answer must not free one a write still holds,
+        // and it changed nothing the view shows.
+        SharingReport::Fingerprint { email, result } => {
+            match result {
+                Ok(fingerprint) => pane.fingerprint = Some((normalise_email(&email), fingerprint)),
+                Err(sentence) => pane.notice = Some(sentence),
+            }
+            return;
+        }
+        SharingReport::Shared { email, item_name, result } => match result {
             Ok(ShareResult::Shared) => {
                 pane.dialog = None;
                 toast(pane, shared_toast(&email));
             }
             Ok(ShareResult::WaitingAccept) => {
-                let record = pane.dialog.take().map(|d| d.item_name).unwrap_or_default();
-                toast(pane, waiting_toast(&email, &record));
+                pane.dialog = None;
+                toast(pane, waiting_toast(&email, &item_name));
             }
-            Ok(ShareResult::WaitingAccount) => {
-                if let Some(dialog) = pane.dialog.as_mut() {
+            // The open dialog says it in its own words (mock 6a); with the
+            // dialog closed before the answer came, a toast does.
+            Ok(ShareResult::WaitingAccount) => match pane.dialog.as_mut() {
+                Some(dialog) => {
                     dialog.in_flight = false;
                     dialog.waiting_account = Some(email);
                 }
-            }
+                None => toast(pane, waiting_account_toast(&email)),
+            },
             Err(sentence) => {
                 if let Some(dialog) = pane.dialog.as_mut() {
                     dialog.in_flight = false;
@@ -643,10 +704,6 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                 pane.notice = Some(sentence);
             }
         }
-        SharingReport::Fingerprint { email, result } => match result {
-            Ok(fingerprint) => pane.fingerprint = Some((normalise_email(&email), fingerprint)),
-            Err(sentence) => pane.notice = Some(sentence),
-        },
         SharingReport::InviteCode(result) => {
             if let Some(dialog) = pane.dialog.as_mut() {
                 dialog.minting = false;
@@ -662,6 +719,53 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
     }
     pane.busy = false;
     pane.stale = true;
+}
+
+// ---- the address book, re-read when sharing moves ------------------------------------
+
+/// **A change this window made to the sent history and could not save.**
+/// Held so a re-read of the file -- which the window does when the daemon
+/// says sharing moved, because the daemon re-keys the file when a record
+/// comes home -- does not quietly undo it: the file never heard of it.
+pub(crate) enum UnsavedSent {
+    Record(crate::sent_history::SentRecord),
+    Forget(String),
+}
+
+impl UnsavedSent {
+    fn apply_to(&self, history: &mut SentHistory) {
+        match self {
+            Self::Record(entry) => history.record(entry.clone()),
+            Self::Forget(email) => {
+                history.forget(email);
+            }
+        }
+    }
+}
+
+/// **The sent history as the file has it now, with this window's unsaved
+/// changes kept.**
+///
+/// The unsaved changes are saved first -- one more attempt, through
+/// `sent_history::update`'s read-modify-write, so they land on top of the
+/// daemon's re-keyed file rather than over it -- and cleared when that
+/// works. Then the file is read. Whatever still could not be saved is
+/// applied to what was read, in memory, and kept for the next attempt.
+///
+/// The alternatives were worse both ways: re-reading alone drops a Send the
+/// user just made from the Recipient suggestions (and brings back a person
+/// they just forgot), and saving the WHOLE in-memory history would write the
+/// pre-re-key item ids back over the daemon's.
+pub(crate) fn reload_sent_history(path: &std::path::Path, unsaved: &mut Vec<UnsavedSent>) -> SentHistory {
+    if !unsaved.is_empty() {
+        match crate::sent_history::update(path, |history| unsaved.iter().for_each(|change| change.apply_to(history))) {
+            Ok(_) => unsaved.clear(),
+            Err(e) => log::warn!("the sent history still could not be saved: {e:?}"),
+        }
+    }
+    let mut history = SentHistory::load(path);
+    unsaved.iter().for_each(|change| change.apply_to(&mut history));
+    history
 }
 
 #[cfg(test)]
@@ -757,18 +861,18 @@ mod tests {
     #[test]
     fn reports_update_the_pane_the_way_the_mock_says() {
         let mut pane = SharingPane::default();
-        assert!(pane.wants_view(), "a window starts by asking");
+        assert!(pane.wants_view(0.0), "a window starts by asking");
         pane.begin_view();
-        assert!(!pane.wants_view(), "one question at a time");
+        assert!(!pane.wants_view(0.0), "one question at a time");
         apply(&mut pane, SharingReport::View(Ok(view(vec![("anna@x.io", PersonState::Shared, None)], vec![("r1", vec!["anna@x.io"])]))), 0.0);
         assert_eq!(pane.sent_pairs(), 1);
         pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
-        apply(&mut pane, SharingReport::Shared { email: "anna@x.io".into(), result: Ok(ShareResult::Shared) }, 1.0);
+        apply(&mut pane, SharingReport::Shared { email: "anna@x.io".into(), item_name: "Acme VPN".into(), result: Ok(ShareResult::Shared) }, 1.0);
         assert!(pane.dialog.is_none());
         assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Shared with anna@x.io. It is in their vault now."));
-        assert!(pane.wants_view(), "a write makes the view stale");
+        assert!(pane.wants_view(0.0), "a write makes the view stale");
         pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
-        apply(&mut pane, SharingReport::Shared { email: "b@x.io".into(), result: Err("Couldn't share the record. It's still in your vault.".into()) }, 2.0);
+        apply(&mut pane, SharingReport::Shared { email: "b@x.io".into(), item_name: "Acme VPN".into(), result: Err("Couldn't share the record. It's still in your vault.".into()) }, 2.0);
         assert_eq!(pane.dialog.as_ref().and_then(|d| d.error.as_deref()), Some("Couldn't share the record. It's still in your vault."));
     }
 
@@ -797,21 +901,21 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let forged = SharingCall::Confirm { email: "eve@x.io".into(), key_sha256: "ffff".into() };
-        request(&mut pane, None, &ctx, &tx, forged);
+        assert!(!request(&mut pane, None, &ctx, &tx, forged));
         assert_eq!(pane.notice.as_deref(), Some(CHECK_FINGERPRINT_FIRST));
         assert!(pane.fingerprint.is_some(), "a refused forgery spends nothing");
         let unseen = SharingCall::Confirm { email: "bob@x.io".into(), key_sha256: "ab12".into() };
-        request(&mut pane, None, &ctx, &tx, unseen);
+        assert!(!request(&mut pane, None, &ctx, &tx, unseen));
         assert_eq!(pane.notice.as_deref(), Some(CHECK_FINGERPRINT_FIRST));
         assert!(rx.try_recv().is_err(), "nothing was started");
 
         let call = pane.share_anyway("eve@x.io").expect("a Confirm");
-        request(&mut pane, None, &ctx, &tx, call);
+        assert!(!request(&mut pane, None, &ctx, &tx, call));
         assert_eq!(pane.notice.as_deref(), Some(SHARE_UNAVAILABLE_TOOLTIP), "the matching Confirm reaches the line check");
         assert!(pane.fingerprint.is_some(), "nothing was sent, so nothing was spent");
 
         let call = pane.share_anyway("eve@x.io").expect("a Confirm");
-        request(&mut pane, Some(&dead_line()), &ctx, &tx, call);
+        assert!(request(&mut pane, Some(&dead_line()), &ctx, &tx, call));
         assert!(pane.notice.is_none(), "a write clears the last sentence");
         assert!(pane.fingerprint.is_none(), "a Confirm spends the fingerprint it was built from");
         assert!(pane.share_anyway("eve@x.io").is_none());
@@ -837,19 +941,19 @@ mod tests {
         let mut pane = SharingPane::default();
         pane.view = Some(SharingView { available: true, ..SharingView::default() });
         apply(&mut pane, SharingReport::Done(Err("Couldn't stop sharing.".into())), 0.0);
-        assert!(pane.wants_view());
+        assert!(pane.wants_view(0.0));
         let (tx, rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let line = dead_line();
-        request(&mut pane, Some(&line), &ctx, &tx, SharingCall::View);
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::View));
         assert_eq!(pane.notice.as_deref(), Some("Couldn't stop sharing."));
-        assert!(!pane.wants_view(), "one view read at a time");
+        assert!(!pane.wants_view(0.0), "one view read at a time");
         let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
         assert!(matches!(report, SharingReport::View(Err(_))), "{report:?}");
         apply(&mut pane, report, 1.0);
         assert_eq!(pane.notice.as_deref(), Some("Couldn't stop sharing."), "a failed view read says nothing over it");
         assert!(pane.view.is_some(), "the view on screen stays");
-        request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Reinvite("anna@x.io".into()));
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Reinvite("anna@x.io".into())));
         assert!(pane.notice.is_none(), "the next write clears it");
         let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
     }
@@ -863,7 +967,7 @@ mod tests {
         let secret = "Couldn't stop sharing Acme VPN with anna@x.io";
         let reports = [
             SharingReport::View(Err(secret.into())),
-            SharingReport::Shared { email: "anna@x.io".into(), result: Err(secret.into()) },
+            SharingReport::Shared { email: "anna@x.io".into(), item_name: "Acme VPN".into(), result: Err(secret.into()) },
             SharingReport::Stopped { email: "anna@x.io".into(), result: Err(secret.into()) },
             SharingReport::Done(Err(secret.into())),
             SharingReport::Forgot(Err(secret.into())),
@@ -888,9 +992,9 @@ mod tests {
         let mut pane = SharingPane::default();
         pane.begin_view();
         apply(&mut pane, SharingCall::View.failed(PANICKED), 0.0);
-        assert!(!pane.wants_view(), "a failed read is not retried every frame");
+        assert!(!pane.wants_view(0.0), "a failed read is not retried every frame");
         pane.invalidate();
-        assert!(pane.wants_view(), "the next change asks again: the read is not stuck in flight");
+        assert!(pane.wants_view(0.0), "the next change asks again: the read is not stuck in flight");
         assert!(pane.notice.is_none(), "a view that could not be read says nothing on the card");
 
         pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
@@ -941,6 +1045,130 @@ mod tests {
         let v = view(vec![("anna@x.io", PersonState::Shared, None)], vec![("r1", vec!["anna@x.io"]), ("r2", vec![])]);
         assert_eq!(records_shared_with(Some(&v), "Anna@X.io", &items), vec!["Acme VPN".to_string()]);
         assert!(records_shared_with(None, "anna@x.io", &items).is_empty());
+    }
+
+    /// **A second write while one is running is refused out loud**: no
+    /// thread, `false` back so the caller can take its spinner down, and the
+    /// reason on the card. Show fingerprint is a read and runs beside the
+    /// write -- and its answer neither frees the write's slot nor marks the
+    /// view stale.
+    #[test]
+    fn a_second_write_while_one_is_running_is_refused_out_loud() {
+        let mut pane = SharingPane::default();
+        pane.view = Some(view(vec![], vec![]));
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let line = dead_line();
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Reinvite("anna@x.io".into())));
+        let stop = SharingCall::Stop { item_id: "r1".into(), email: "bob@x.io".into() };
+        assert!(!request(&mut pane, Some(&line), &ctx, &tx, stop), "a second write is refused");
+        assert_eq!(pane.notice.as_deref(), Some(BUSY));
+        assert!(pane.stopping_for("r1").is_none(), "a refused stop raises no spinner");
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Fingerprint("anna@x.io".into())), "a read runs beside the write");
+
+        let wait = std::time::Duration::from_secs(30);
+        let reports = [rx.recv_timeout(wait).expect("a report"), rx.recv_timeout(wait).expect("a report")];
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(3)).is_err(), "the refused stop started nothing");
+        let [a, b] = reports;
+        let (fingerprint, write) = if matches!(a, SharingReport::Fingerprint { .. }) { (a, b) } else { (b, a) };
+        assert!(matches!(fingerprint, SharingReport::Fingerprint { .. }), "{fingerprint:?}");
+        assert!(matches!(write, SharingReport::Done(_)), "{write:?}");
+
+        apply(&mut pane, fingerprint, 0.0);
+        assert!(!pane.wants_view(0.0), "a fingerprint changes nothing the view shows");
+        assert!(!request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Reinvite("bob@x.io".into())), "the write still holds the slot");
+        apply(&mut pane, write, 1.0);
+        assert!(pane.wants_view(1.0), "a write's answer does mark the view stale");
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Reinvite("bob@x.io".into())), "and frees the slot");
+        let _ = rx.recv_timeout(wait);
+    }
+
+    /// **A failed view read is asked again after [`VIEW_RETRY_SECONDS`]** --
+    /// not on the next frame (that is a busy loop against a failing daemon)
+    /// and not never (with push off, nothing else would ask). A read that
+    /// works clears the retry; a refresh of a view already held that fails is
+    /// retried the same way.
+    #[test]
+    fn a_failed_view_read_is_asked_again_after_the_retry_interval() {
+        let mut pane = SharingPane::default();
+        assert!(pane.wants_view(0.0));
+        pane.begin_view();
+        apply(&mut pane, SharingReport::View(Err("no".into())), 100.0);
+        assert!(!pane.wants_view(100.0), "not on the next frame");
+        assert!(!pane.wants_view(100.0 + VIEW_RETRY_SECONDS - 0.5), "not before the interval");
+        assert!(pane.wants_view(100.0 + VIEW_RETRY_SECONDS), "once it has passed");
+        pane.begin_view();
+        assert!(!pane.wants_view(1_000.0), "one read at a time, however late");
+        apply(&mut pane, SharingReport::View(Err("no".into())), 131.0);
+        assert!(!pane.wants_view(131.0 + VIEW_RETRY_SECONDS - 0.5), "a second failure waits again");
+        pane.begin_view();
+        apply(&mut pane, SharingReport::View(Ok(view(vec![], vec![]))), 170.0);
+        assert!(!pane.wants_view(1_000_000.0), "a view in hand is not re-read on a timer");
+
+        pane.invalidate();
+        pane.begin_view();
+        apply(&mut pane, SharingReport::View(Err("no".into())), 200.0);
+        assert!(pane.view.is_some(), "the view on screen stays");
+        assert!(!pane.wants_view(200.0 + VIEW_RETRY_SECONDS - 0.5));
+        assert!(pane.wants_view(200.0 + VIEW_RETRY_SECONDS), "a failed refresh is retried too");
+    }
+
+    /// **A share's answer says where it stands even with the dialog closed**:
+    /// the record's name travels with the call, and "no account yet" -- which
+    /// the open dialog says in its own words -- becomes a toast.
+    #[test]
+    fn a_share_answer_with_the_dialog_closed_still_says_where_it_stands() {
+        let mut pane = SharingPane::default();
+        let shared = |email: &str, result| SharingReport::Shared { email: email.into(), item_name: "Acme VPN".into(), result: Ok(result) };
+        apply(&mut pane, shared("bob@x.io", ShareResult::WaitingAccept), 0.0);
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("bob@x.io was added. Acme VPN appears in their vault once they accept."));
+        apply(&mut pane, shared("carol@x.io", ShareResult::WaitingAccount), 1.0);
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Waiting for carol@x.io to create an account."));
+
+        pane.toast = None;
+        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        apply(&mut pane, shared("carol@x.io", ShareResult::WaitingAccount), 2.0);
+        assert!(pane.toast.is_none(), "the open dialog says it instead");
+        assert_eq!(pane.dialog.as_ref().and_then(|d| d.waiting_account.as_deref()), Some("carol@x.io"));
+    }
+
+    /// **Re-reading the address book keeps what this window could not
+    /// save.** The daemon's re-keyed file is read, this window's unsaved
+    /// Send is saved on top of it (not over it), and a forget that never
+    /// reached the file is carried out there too. Where the file still
+    /// cannot be written, the changes are applied in memory and kept for the
+    /// next attempt.
+    #[test]
+    fn reloading_the_sent_history_keeps_what_this_window_could_not_save() {
+        use crate::sent_history::SentRecord;
+        let entry = |id: &str, to: &str| SentRecord { item_id: id.into(), recipient: to.into(), send_id: format!("s-{id}"), ..SentRecord::default() };
+        let dir = crate::test_scratch::ScratchDir::new("share-ui-sent-reload");
+        let path = dir.path().join("sent.json");
+        crate::sent_history::update(&path, |h| {
+            h.record(entry("rekeyed", "anna@x.io"));
+            h.record(entry("old", "gone@x.io"));
+        })
+        .expect("the daemon's file");
+        let mut unsaved = vec![UnsavedSent::Record(entry("mine", "bob@x.io")), UnsavedSent::Forget("gone@x.io".into())];
+        let history = reload_sent_history(&path, &mut unsaved);
+        let ids = |h: &SentHistory| {
+            let mut ids: Vec<String> = h.entries.iter().map(|e| e.item_id.clone()).collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(ids(&history), vec!["mine".to_string(), "rekeyed".to_string()]);
+        assert!(unsaved.is_empty(), "saved, so nothing is held");
+        assert_eq!(ids(&SentHistory::load(&path)), ids(&history), "and the file has them");
+
+        // A path under a FILE cannot be written: the change stays held, and
+        // what the window shows still has it.
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"x").expect("a file");
+        let stuck = blocker.join("sent.json");
+        let mut unsaved = vec![UnsavedSent::Record(entry("mine", "bob@x.io"))];
+        let history = reload_sent_history(&stuck, &mut unsaved);
+        assert_eq!(ids(&history), vec!["mine".to_string()]);
+        assert_eq!(unsaved.len(), 1, "kept for the next attempt");
     }
 
     /// **The worker reaches the daemon** through the real loopback listener:
