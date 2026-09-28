@@ -196,9 +196,16 @@ pub const ROSTER_UNREADABLE: &str = "Deskwarden couldn't read who you share with
 /// A stop's refusal opens with this; the person who can still see the record
 /// follows it.
 pub const STOP_FAILED_PREFIX: &str = "Couldn't stop sharing.";
-/// The last person was stopped and the personal copy could not be made, or
-/// the record cannot come home whole. Nothing was changed.
+/// The last person was stopped and the personal copy could not be made.
+/// Nothing was changed.
 pub const MOVE_BACK_FAILED: &str = "Couldn't move the record back to your vault. It is still shared.";
+/// The last person was stopped and the record has an attachment, which the
+/// delete that ends a move back would destroy (see [`Sharing::move_back`]).
+pub const MOVE_BACK_ATTACHMENTS: &str =
+    "This record has attachments, so Deskwarden can't move it back to your vault. It is still shared.";
+/// The last person was stopped from a record in the trash or the archive: it
+/// would come home as a live personal record.
+pub const STOP_IN_TRASH: &str = "This record is in the trash or the archive. Restore it before you stop sharing it.";
 /// **An account with no key pair** -- one made before its server kept keys,
 /// and never opened since in an app that makes them. The probe leaves sharing
 /// on for it (NodeWarden answers its own-key question with a 404 that says
@@ -748,6 +755,14 @@ impl Sharing {
     /// file read when nothing is pending. The confirm pass joins it in its
     /// own task.
     ///
+    /// **A failed invitations read does not end the pass.** It used to, with
+    /// `?`, and so a transient error there skipped the unfinished moves too:
+    /// an org copy nobody was retrying, one pass at a time. It is logged, the
+    /// incoming list keeps what it held, and the rest of the pass runs. It
+    /// cannot run FIRST instead: a pass that finished a move and then failed
+    /// on the invitations would return the error and drop the outcome, and
+    /// the daemon would never be told the org copy is gone.
+    ///
     /// # Errors
     ///
     /// The probe could not be made; a later pass tries again.
@@ -760,11 +775,15 @@ impl Sharing {
             return Ok(pass);
         }
         if had_probe && matches!(trigger, Trigger::WholeRead | Trigger::Timer) {
-            if let Some(list) = self.call(|client, auth| sharing_api::my_invitations(client, &mut auth.session))? {
-                let mut held = self.held();
-                let before: Vec<String> = held.incoming.iter().map(|i| i.id.clone()).collect();
-                pass.changed |= before != list.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
-                held.incoming = list;
+            match self.call(|client, auth| sharing_api::my_invitations(client, &mut auth.session)) {
+                Ok(Some(list)) => {
+                    let mut held = self.held();
+                    let before: Vec<String> = held.incoming.iter().map(|i| i.id.clone()).collect();
+                    pass.changed |= before != list.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
+                    held.incoming = list;
+                }
+                Ok(None) => {}
+                Err(e) => log::info!("the incoming invitations could not be read this pass: {e}"),
             }
         }
         pass.outcome = self.finish_unfinished();
@@ -843,11 +862,10 @@ fn refuse_unmovable(
     failures: &[crate::rest::sync::DecryptFailure],
     my_org: Option<&str>,
 ) -> Result<(), SharingError> {
-    let set = |key: &str| record.item.other.get(key).is_some_and(|v| !v.is_null());
-    if set("deletedDate") || set("archivedDate") {
+    if in_trash_or_archive(&record.item) {
         return Err(SharingError::Refused(IN_TRASH.to_string()));
     }
-    if record.item.other.get("attachments").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty()) {
+    if has_attachments(&record.item) {
         return Err(SharingError::Refused(HAS_ATTACHMENTS.to_string()));
     }
     if !failures.is_empty() {
@@ -857,6 +875,19 @@ fn refuse_unmovable(
         Some(org) if Some(org) != my_org => Err(SharingError::Refused(OTHER_ORG.to_string())),
         _ => Ok(()),
     }
+}
+
+/// The record carries an attachment. Asked by the share (decision 3) and by
+/// the move back, for the same reason from either side: an attachment belongs
+/// to one cipher id, and neither direction keeps the id.
+fn has_attachments(item: &VaultItem) -> bool {
+    item.other.get("attachments").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty())
+}
+
+/// The record is in the trash or the archive -- neither is a record to move.
+fn in_trash_or_archive(item: &VaultItem) -> bool {
+    let set = |key: &str| item.other.get(key).is_some_and(|v| !v.is_null());
+    set("deletedDate") || set("archivedDate")
 }
 
 /// The account the profile just named, refused when it has no key pair --
@@ -1308,9 +1339,21 @@ impl Sharing {
     /// move that lands is never without it). It is dropped here, the one
     /// place that reads the record and can tell. [`Self::move_back`] reads
     /// that entry, and is only reached past this check.
+    ///
+    /// **A record already on its way home is finished, never moved again.**
+    /// A move back whose second half failed has its personal copy made and
+    /// its `moves` entry spent; the org copy may still be filed for the
+    /// person, so the view -- rightly -- still shows them on it, and a second
+    /// Stop (or `forget`) will come. Moving it again would make a second
+    /// personal copy, without the folder and star, and a second pending
+    /// purge. So `unfinished` is read FIRST, whoever is named: that move was
+    /// the last person's, so finishing it is the whole of any stop on it.
     pub(crate) fn stop_with(&self, ctx: &Ctx, item_id: &str, email: &str) -> Result<StopOutcome, SharingError> {
         let email = normalise_email(email);
         let refused = format!("{STOP_FAILED_PREFIX} {email} can still see it.");
+        if let Some(personal_id) = self.pending_move(&ctx.account.id, item_id) {
+            return self.finish_pending(ctx, item_id, &personal_id, &refused);
+        }
         let nothing = || StopOutcome { moved_to: None, changed: SharingOutcome::default() };
         let Some(collection) = ctx.collection_for(&email).map(str::to_string) else {
             return Ok(nothing());
@@ -1333,7 +1376,7 @@ impl Sharing {
                 .ok_or_else(|| SharingError::Refused(refused.clone()))?;
             return Ok(StopOutcome { moved_to: None, changed: SharingOutcome { upserted: vec![written.item], removed: Vec::new() } });
         }
-        self.move_back(ctx, &record, &failures)
+        self.move_back(ctx, &record, &failures, &refused)
     }
 
     /// **The last person stopped: the record comes home** (spec 9.4).
@@ -1343,6 +1386,26 @@ impl Sharing {
     /// copy is filed in nothing -- invisible to everyone but the owner -- and
     /// deleted. A failed delete is remembered and retried every pass
     /// (`unfinished`), and the record is already home either way.
+    ///
+    /// # What the answer says when the second half fails
+    ///
+    /// Only what is true. Unfiled but not deleted: the person has lost it,
+    /// so the stop succeeded -- and the unfiled org copy rides in `changed`
+    /// beside the personal one, so the daemon does not keep showing it in
+    /// the person's collection. Neither unfiled nor deleted: the person can
+    /// still see it, so the stop is refused with the stop's own sentence, and
+    /// the view keeps them on the record. The personal copy exists and the
+    /// move is pending; the next pass finishes it, and so does a retry of the
+    /// stop -- through [`Self::finish_pending`], which makes no second copy.
+    ///
+    /// # The create's answer is read in full
+    ///
+    /// A reply that does not decrypt cleanly, is not personal, or names no
+    /// id is refused as the pre-send check refuses a record: nothing is
+    /// unfiled or deleted, so the org copy stays exactly as it was. A copy
+    /// the server did make (its reply names an id, and not the org copy's)
+    /// is deleted before the refusal, so a failed move back leaves no
+    /// duplicate behind.
     ///
     /// # Nothing comes home under the org key
     ///
@@ -1359,24 +1422,38 @@ impl Sharing {
     ///
     /// # What cannot come home whole is not moved
     ///
-    /// A leaf under neither key, a field that did not decrypt, or an
-    /// attachment refuses the move with [`MOVE_BACK_FAILED`] before anything
-    /// is written. The first two would arrive unreadable; an attachment
-    /// belongs to the org cipher's id (decision 3's reason, from the other
-    /// side), and the delete that ends a move back would destroy it. The
-    /// share refuses attachments, but the web vault can add one to a record
-    /// already shared.
+    /// Each refused before anything is written, with its own sentence:
+    ///
+    /// * **The trash or the archive** ([`STOP_IN_TRASH`]): it would come home
+    ///   live. Only here, at the move back -- taking one of several people
+    ///   off a trashed record moves nothing, and `forget` must still be able
+    ///   to.
+    /// * **An attachment** ([`MOVE_BACK_ATTACHMENTS`]): it belongs to the org
+    ///   cipher's id (decision 3's reason, from the other side), and the
+    ///   delete that ends a move back would destroy it. The share refuses
+    ///   attachments, but the web vault can add one to a record already
+    ///   shared.
+    /// * **A field that did not decrypt, or a leaf under neither key**
+    ///   ([`UNREADABLE_PART`], the share's own sentence): it would arrive
+    ///   unreadable.
     fn move_back(
         &self,
         ctx: &Ctx,
         record: &crate::rest::sync::DecryptedItem,
         failures: &[crate::rest::sync::DecryptFailure],
+        refused: &str,
     ) -> Result<StopOutcome, SharingError> {
-        let refuse = || SharingError::Refused(MOVE_BACK_FAILED.to_string());
-        let has_attachments =
-            record.item.other.get("attachments").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty());
-        if has_attachments || !failures.is_empty() {
-            return Err(refuse());
+        let say = |sentence: &str| SharingError::Refused(sentence.to_string());
+        let refuse = || say(MOVE_BACK_FAILED);
+        let unreadable = || say(UNREADABLE_PART);
+        if in_trash_or_archive(&record.item) {
+            return Err(say(STOP_IN_TRASH));
+        }
+        if has_attachments(&record.item) {
+            return Err(say(MOVE_BACK_ATTACHMENTS));
+        }
+        if !failures.is_empty() {
+            return Err(unreadable());
         }
         let old = record.item.id.clone();
         let placed = self
@@ -1389,8 +1466,8 @@ impl Sharing {
         home.id = String::new();
         let own_key = match home.other.get("key").and_then(serde_json::Value::as_str).map(str::to_string) {
             Some(wrapped) => {
-                let wrapped = wrapped.parse::<EncString>().map_err(|_| refuse())?;
-                let cipher_key = crate::rest::crypto::unwrap_key_under(&wrapped, &ctx.org_key).map_err(|_| refuse())?;
+                let wrapped = wrapped.parse::<EncString>().map_err(|_| unreadable())?;
+                let cipher_key = crate::rest::crypto::unwrap_key_under(&wrapped, &ctx.org_key).map_err(|_| unreadable())?;
                 let rewrapped = crate::rest::crypto::wrap_key_under(&cipher_key, ctx.keys.user()).map_err(crypto)?;
                 home.other.insert("key".into(), serde_json::Value::String(rewrapped.to_string()));
                 Some(cipher_key)
@@ -1409,27 +1486,110 @@ impl Sharing {
             Some(key) => cipher.rekey_carried(key, key),
             None => cipher.rekey_carried(&ctx.org_key, ctx.keys.user()),
         }
-        .map_err(|_| refuse())?;
+        .map_err(|_| unreadable())?;
         let answer = self
             .call(|client, auth| client.create_cipher(&mut auth.session, &cipher))
             .map_err(|e| e.or_say(MOVE_BACK_FAILED))?;
-        let (created, _) = crate::rest::sync::decrypt_cipher(&answer, &ctx.keys).ok_or_else(refuse)?;
+        let created = match crate::rest::sync::decrypt_cipher(&answer, &ctx.keys) {
+            Some((created, failures))
+                if failures.is_empty() && !created.item.id.is_empty() && created.item.id != old && organization_of(&created.item).is_none() =>
+            {
+                created
+            }
+            _ => {
+                // Never the org copy's id: a server echoing that one back is
+                // not naming a copy it made.
+                if let Some(made) = answer.get("id").and_then(serde_json::Value::as_str).filter(|id| !id.is_empty() && *id != old) {
+                    if let Err(e) = self.call(|client, auth| client.hard_delete_cipher(&mut auth.session, made)) {
+                        log::warn!("a personal copy whose answer could not be read was left behind: {e}");
+                    }
+                }
+                return Err(refuse());
+            }
+        };
         let new = created.item.id.clone();
 
-        // Filed in nothing first, so a failed delete leaves a copy nobody but
-        // the owner sees. Best effort: a server that refuses an empty list
-        // still gets the delete.
-        if let Err(e) = self.call(|client, auth| sharing_api::set_cipher_collections(client, &mut auth.session, &old, &[])) {
-            log::info!("a record coming home could not be unfiled before its delete: {e}");
+        let (unfiled, purged) = self.second_half(&old);
+        self.rekey_local(&ctx.account.id, &old, &new, purged.is_err());
+        let mut changed = SharingOutcome { upserted: vec![created.item], removed: Vec::new() };
+        match (unfiled, purged) {
+            (_, Ok(())) => changed.removed.push(old),
+            (Ok(answer), Err(_)) => changed.upserted.extend(self.readable(&answer, &ctx.keys)),
+            (Err(_), Err(_)) => return Err(SharingError::Refused(refused.to_string())),
         }
-        let purged = self.purge_org_copy(&old);
+        Ok(StopOutcome { moved_to: Some(new), changed })
+    }
+
+    /// **A stop on a record whose move back is pending**: its second half
+    /// again -- unfile, then delete -- and the personal copy it already has.
+    /// See [`Self::stop_with`] on why this is never a second move. The answer
+    /// follows [`Self::move_back`]'s rule: refused while the person can
+    /// still see the org copy, and otherwise the new id, with the personal
+    /// copy re-read so the daemon holds it even when the first try's refusal
+    /// never told it.
+    fn finish_pending(&self, ctx: &Ctx, old: &str, personal_id: &str, refused: &str) -> Result<StopOutcome, SharingError> {
+        let (unfiled, purged) = self.second_half(old);
+        let mut changed = SharingOutcome::default();
+        match (unfiled, purged) {
+            (_, Ok(())) => {
+                self.strike_unfinished(&ctx.account.id, &[old.to_string()]);
+                changed.removed.push(old.to_string());
+            }
+            (Ok(answer), Err(_)) => changed.upserted.extend(self.readable(&answer, &ctx.keys)),
+            (Err(_), Err(_)) => return Err(SharingError::Refused(refused.to_string())),
+        }
+        if let Ok((home, _)) = self.fetch_record(personal_id, &ctx.keys) {
+            changed.upserted.push(home.item);
+        }
+        Ok(StopOutcome { moved_to: Some(personal_id.to_string()), changed })
+    }
+
+    /// **A move back's second half**: the org copy filed in nothing, then
+    /// deleted, each tried whatever the other did. Filed in nothing first, so
+    /// a failed delete leaves a copy nobody but the owner sees; a server that
+    /// refuses the empty list still gets the delete. Both outcomes come back,
+    /// because what the stop may say depends on both.
+    fn second_half(&self, old: &str) -> (Result<serde_json::Value, SharingError>, Result<(), SharingError>) {
+        let unfiled = self.call(|client, auth| sharing_api::set_cipher_collections(client, &mut auth.session, old, &[]));
+        if let Err(e) = &unfiled {
+            log::info!("a record coming home could not be unfiled: {e}");
+        }
+        let purged = self.purge_org_copy(old);
         if let Err(e) = &purged {
             log::info!("a record came home and its org copy waits for the next pass: {e}");
         }
+        (unfiled, purged)
+    }
 
-        self.rekey_local(&ctx.account.id, &old, &new, purged.is_err());
-        let removed = if purged.is_ok() { vec![old] } else { Vec::new() };
-        Ok(StopOutcome { moved_to: Some(new), changed: SharingOutcome { upserted: vec![created.item], removed } })
+    /// A cipher answer as an item, when it reads cleanly; otherwise nothing,
+    /// and the next whole read shows it.
+    fn readable(&self, answer: &serde_json::Value, keys: &VaultKeys) -> Option<VaultItem> {
+        crate::rest::sync::decrypt_cipher(answer, keys).filter(|(_, failures)| failures.is_empty()).map(|(read, _)| read.item)
+    }
+
+    /// The personal id of a move back still pending for `org_cipher_id`.
+    fn pending_move(&self, account: &str, org_cipher_id: &str) -> Option<String> {
+        let path = self.setup().state_path?;
+        crate::sharing_state::SharingState::load(&path).account(account).unfinished.into_iter().find_map(|entry| {
+            let crate::sharing_state::Unfinished::PurgeOrgCopy { org_cipher_id: id, personal_id } = entry;
+            (id == org_cipher_id).then_some(personal_id)
+        })
+    }
+
+    /// Strikes finished moves back from `unfinished`.
+    fn strike_unfinished(&self, account: &str, org_cipher_ids: &[String]) {
+        let Some(path) = self.setup().state_path else {
+            return;
+        };
+        let written = crate::sharing_state::update(&path, |state| {
+            state.account_mut(account).unfinished.retain(|entry| {
+                let crate::sharing_state::Unfinished::PurgeOrgCopy { org_cipher_id, .. } = entry;
+                !org_cipher_ids.contains(org_cipher_id)
+            });
+        });
+        if let Err(e) = written {
+            log::warn!("a finished move back could not be struck from the sharing state: {e}");
+        }
     }
 
     /// `DELETE /api/ciphers/{id}/delete` -- NodeWarden's unconditional
@@ -1497,32 +1657,39 @@ impl Sharing {
     }
 
     /// **The second halves that failed**, retried on every pass (spec 5.4,
-    /// 13). An org copy already gone (404) counts as done -- see
-    /// [`Self::purge_org_copy`].
+    /// 13): unfile, then delete ([`Self::second_half`]) -- the unfile too,
+    /// since a first try that failed at both left the person able to see the
+    /// org copy. An org copy already gone (404) counts as done -- see
+    /// [`Self::purge_org_copy`]. A finished move announces the org copy gone
+    /// and its personal copy, re-read with the keys the backend holds: the
+    /// stop that made that copy may have been refused, and so never have
+    /// told the daemon about it.
     pub(crate) fn finish_unfinished(&self) -> SharingOutcome {
         let mut outcome = SharingOutcome::default();
         let (Some(path), Some(account)) = (self.setup().state_path, self.held().account.clone()) else {
             return outcome;
         };
         let pending = crate::sharing_state::SharingState::load(&path).account(&account.id).unfinished;
+        if pending.is_empty() {
+            return outcome;
+        }
+        let keys = self.keys.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let mut done = Vec::new();
         for entry in pending {
-            let crate::sharing_state::Unfinished::PurgeOrgCopy { org_cipher_id, .. } = &entry;
-            match self.purge_org_copy(org_cipher_id) {
-                Ok(()) => {
-                    outcome.removed.push(org_cipher_id.clone());
-                    done.push(entry.clone());
-                }
-                Err(e) => log::info!("an unfinished move back is still waiting: {e}"),
+            let crate::sharing_state::Unfinished::PurgeOrgCopy { org_cipher_id, personal_id } = entry;
+            if self.second_half(&org_cipher_id).1.is_err() {
+                continue;
             }
+            if let Some(keys) = &keys {
+                if let Ok((home, _)) = self.fetch_record(&personal_id, keys) {
+                    outcome.upserted.push(home.item);
+                }
+            }
+            outcome.removed.push(org_cipher_id.clone());
+            done.push(org_cipher_id);
         }
         if !done.is_empty() {
-            let written = crate::sharing_state::update(&path, |state| {
-                state.account_mut(&account.id).unfinished.retain(|u| !done.contains(u));
-            });
-            if let Err(e) = written {
-                log::warn!("a finished move back could not be struck from the sharing state: {e}");
-            }
+            self.strike_unfinished(&account.id, &done);
         }
         outcome
     }
@@ -2580,38 +2747,247 @@ mod tests {
         assert_eq!(sent["login"]["uris"][0]["uriChecksum"], serde_json::json!(checksum), "a carried leaf under the unchanged key is left alone");
     }
 
-    /// **What cannot come home whole stays shared, and nothing is written**:
-    /// a leaf that opens under neither key would be unreadable in the
-    /// personal copy, and an attachment belongs to the org cipher id, so the
-    /// delete that ends a move back would destroy it.
-    #[test]
-    fn what_cannot_come_home_whole_stays_shared_and_nothing_is_written() {
+    /// `record`, whose last person is anna, stopped: refused with `sentence`
+    /// and nothing written -- no create, no unfile, no delete.
+    fn stays_shared_with_nothing_written(record: &serde_json::Value, sentence: &str) {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
         with_roster(&mut server, &[]);
-        let stranger = crate::rest::crypto::generate_symmetric_key().expect("a key");
-        let mut foreign = shared_cipher("s1", "Acme VPN", &["c-anna"]);
-        foreign["login"]["uris"] = serde_json::json!([{
-            "uri": org_sealed("https://acme.example"),
-            "uriChecksum": crate::rest::crypto::tests::seal(&stranger, b"checksum-1"),
-            "match": null
-        }]);
-        let mut with_file = shared_cipher("s2", "Acme VPN", &["c-anna"]);
-        with_file["attachments"] = serde_json::json!([{ "id": "a1", "fileName": "2.x|y|z" }]);
-        server.mock("GET", "/api/ciphers/s1").with_body(foreign.to_string()).create();
-        server.mock("GET", "/api/ciphers/s2").with_body(with_file.to_string()).create();
+        let id = record["id"].as_str().expect("an id").to_string();
+        server.mock("GET", format!("/api/ciphers/{id}").as_str()).with_body(record.to_string()).create();
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
         let puts = server.mock("PUT", Matcher::Any).expect(0).create();
         let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
-        for id in ["s1", "s2"] {
-            match engine.stop(id, "anna@example.com") {
-                Err(SharingError::Refused(said)) => assert_eq!(said, MOVE_BACK_FAILED, "{id}"),
-                other => panic!("{id}: expected the move-back refusal, got {other:?}"),
-            }
+        match engine.stop(&id, "anna@example.com") {
+            Err(SharingError::Refused(said)) => assert_eq!(said, sentence),
+            other => panic!("expected {sentence:?}, got {other:?}"),
         }
         writes.assert();
         puts.assert();
         deletes.assert();
+    }
+
+    /// **A leaf that opens under neither key does not come home**: it would
+    /// be unreadable in the personal copy. The share's own sentence.
+    #[test]
+    fn a_leaf_under_neither_key_does_not_come_home() {
+        let stranger = crate::rest::crypto::generate_symmetric_key().expect("a key");
+        let mut record = shared_cipher("s1", "Acme VPN", &["c-anna"]);
+        record["login"]["uris"] = serde_json::json!([{
+            "uri": org_sealed("https://acme.example"),
+            "uriChecksum": crate::rest::crypto::tests::seal(&stranger, b"checksum-1"),
+            "match": null
+        }]);
+        stays_shared_with_nothing_written(&record, UNREADABLE_PART);
+    }
+
+    /// **A modelled field that did not decrypt does not come home either.**
+    #[test]
+    fn a_field_that_did_not_decrypt_does_not_come_home() {
+        let mut record = shared_cipher("s1", "Acme VPN", &["c-anna"]);
+        record["notes"] = serde_json::json!(user_sealed("under the wrong key for an org record"));
+        stays_shared_with_nothing_written(&record, UNREADABLE_PART);
+    }
+
+    /// **An attachment keeps the record shared, and says why**: it belongs to
+    /// the org cipher id, and the delete that ends a move back would destroy
+    /// it.
+    #[test]
+    fn a_record_with_an_attachment_does_not_come_home() {
+        let mut record = shared_cipher("s1", "Acme VPN", &["c-anna"]);
+        record["attachments"] = serde_json::json!([{ "id": "a1", "fileName": "2.x|y|z" }]);
+        stays_shared_with_nothing_written(&record, MOVE_BACK_ATTACHMENTS);
+    }
+
+    /// **A record in the trash or the archive does not come home live.**
+    #[test]
+    fn a_trashed_or_archived_record_does_not_come_home_live() {
+        for field in ["deletedDate", "archivedDate"] {
+            let mut record = shared_cipher("s1", "Acme VPN", &["c-anna"]);
+            record[field] = serde_json::json!("2026-09-01T00:00:00.000Z");
+            stays_shared_with_nothing_written(&record, STOP_IN_TRASH);
+        }
+    }
+
+    /// **Taking one of two people off a trashed record still works**: only
+    /// the move back is refused, so `forget` is never stuck on the trash.
+    #[test]
+    fn one_of_two_people_comes_off_a_trashed_record() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com"), person_collection("c-bob", "bob@example.com")]);
+        with_roster(&mut server, &[]);
+        let mut record = shared_cipher("s1", "Acme VPN", &["c-anna", "c-bob"]);
+        record["deletedDate"] = serde_json::json!("2026-09-01T00:00:00.000Z");
+        server.mock("GET", "/api/ciphers/s1").with_body(record.to_string()).create();
+        let mut unfiled = shared_cipher("s1", "Acme VPN", &["c-bob"]);
+        unfiled["deletedDate"] = serde_json::json!("2026-09-01T00:00:00.000Z");
+        let off = server.mock("PUT", "/api/ciphers/s1/collections").with_body(unfiled.to_string()).expect(1).create();
+        engine.stop("s1", "anna@example.com").expect("stopped");
+        off.assert();
+    }
+
+    /// A move back of `s1` (folder and star remembered) whose create is
+    /// answered by `reply`: refused with [`MOVE_BACK_FAILED`], the org copy
+    /// neither unfiled nor deleted, its folder and star still remembered, and
+    /// nothing pending. `orphan` names the copy the reply made, which must be
+    /// deleted -- and no other DELETE may be sent.
+    fn a_refused_create(reply: impl FnOnce(crate::test_http::Mock) -> crate::test_http::Mock, orphan: Option<&str>) {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let path = dir.join("sharing_state.json");
+        crate::sharing_state::update(&path, |state| {
+            state.account_mut(FIXTURE_USER_ID).moves.insert("s1".into(), crate::sharing_state::Move { folder_id: Some("f1".into()), favorite: true });
+        }).expect("seeded");
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[]);
+        server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
+        let create = reply(server.mock("POST", "/api/ciphers")).expect(1).create();
+        let puts = server.mock("PUT", Matcher::Any).expect(0).create();
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        let cleaned = orphan.map(|id| server.mock("DELETE", format!("/api/ciphers/{id}/delete").as_str()).with_status(204).expect(1).create());
+        match engine.stop("s1", "anna@example.com") {
+            Err(SharingError::Refused(said)) => assert_eq!(said, MOVE_BACK_FAILED),
+            other => panic!("expected the move-back refusal, got {other:?}"),
+        }
+        create.assert();
+        puts.assert();
+        deletes.assert();
+        if let Some(cleaned) = cleaned {
+            cleaned.assert();
+        }
+        let state = crate::sharing_state::SharingState::load(&path).account(FIXTURE_USER_ID);
+        assert!(state.moves.contains_key("s1"), "the folder and star were spent on a move that did not happen");
+        assert!(state.unfinished.is_empty());
+    }
+
+    /// **A failed create changes nothing**: no unfile, no delete.
+    #[test]
+    fn a_failed_create_leaves_the_org_copy_untouched() {
+        a_refused_create(|m| m.with_status(500), None);
+    }
+
+    /// **A create reply that cannot be read in full is refused, and the copy
+    /// it names is deleted** -- a field that does not decrypt, a copy filed
+    /// in an org, no id at all -- and a reply naming the ORG copy's id is
+    /// never taken for a copy to delete.
+    #[test]
+    fn an_unreadable_create_reply_leaves_the_org_copy_untouched_and_no_duplicate() {
+        let stranger = crate::rest::crypto::generate_symmetric_key().expect("a key");
+        let mut half = personal_cipher("p-new", "Acme VPN");
+        half["name"] = serde_json::json!(crate::rest::crypto::tests::seal(&stranger, b"Acme VPN"));
+        a_refused_create(move |m| m.with_body(half.to_string()), Some("p-new"));
+        a_refused_create(|m| m.with_body_from_request(echo("p-new", Some("org-elsewhere"), &[])), Some("p-new"));
+        a_refused_create(|m| m.with_body(r#"{"object":"cipher"}"#), None);
+        a_refused_create(|m| m.with_body_from_request(echo("s1", None, &[])), None);
+    }
+
+    /// **A stop after a half-finished move makes no second copy** (review
+    /// round 1). The unfile and the delete both fail: the person can still
+    /// see the org copy, so the stop says so -- twice, and the second one
+    /// creates nothing -- and the one pending move is finished by the next
+    /// pass that can: unfiled, deleted, and the personal copy announced.
+    #[test]
+    fn a_stop_after_a_half_finished_move_makes_no_second_copy() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let path = dir.join("sharing_state.json");
+        crate::sharing_state::update(&path, |state| {
+            state.account_mut(FIXTURE_USER_ID).moves.insert("s1".into(), crate::sharing_state::Move { folder_id: Some("f1".into()), favorite: true });
+        }).expect("seeded");
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[]);
+        server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
+        let create = server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).expect(1).create();
+        let unfile_fails = server.mock("PUT", "/api/ciphers/s1/collections").with_status(500).expect(2).create();
+        let delete_fails = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).expect(2).create();
+        let still_sees = format!("{STOP_FAILED_PREFIX} anna@example.com can still see it.");
+        for attempt in ["first", "second"] {
+            match engine.stop("s1", "anna@example.com") {
+                Err(SharingError::Refused(said)) => assert_eq!(said, still_sees, "{attempt}"),
+                other => panic!("{attempt}: expected the still-sees refusal, got {other:?}"),
+            }
+        }
+        create.assert();
+        unfile_fails.assert();
+        delete_fails.assert();
+        let pending = crate::sharing_state::SharingState::load(&path).account(FIXTURE_USER_ID).unfinished;
+        assert_eq!(pending, [crate::sharing_state::Unfinished::PurgeOrgCopy { org_cipher_id: "s1".into(), personal_id: "p-new".into() }]);
+
+        let unfiled = server
+            .mock("PUT", "/api/ciphers/s1/collections")
+            .match_body(Matcher::Json(serde_json::json!({ "collectionIds": [] })))
+            .with_body(shared_cipher("s1", "Acme VPN", &[]).to_string())
+            .expect(1)
+            .create();
+        let deleted = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        server.mock("GET", "/api/ciphers/p-new").with_body(personal_cipher("p-new", "Acme VPN").to_string()).create();
+        let pass = engine.refresh(Trigger::Batch).expect("a pass");
+        unfiled.assert();
+        deleted.assert();
+        create.assert();
+        assert_eq!(pass.outcome.removed, ["s1"]);
+        assert_eq!(pass.outcome.upserted.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["p-new"], "the personal copy is announced");
+        assert!(crate::sharing_state::SharingState::load(&path).account(FIXTURE_USER_ID).unfinished.is_empty());
+    }
+
+    /// **A retried stop finishes the pending move itself**, and answers the
+    /// copy it already made -- one create in all.
+    #[test]
+    fn a_retried_stop_finishes_the_pending_move_with_the_copy_it_already_made() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[]);
+        server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
+        let create = server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).expect(1).create();
+        server.mock("PUT", "/api/ciphers/s1/collections").with_status(500).expect(1).create();
+        server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).expect(1).create();
+        assert!(engine.stop("s1", "anna@example.com").is_err(), "the person can still see it");
+        server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).expect(1).create();
+        let deleted = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        server.mock("GET", "/api/ciphers/p-new").with_body(personal_cipher("p-new", "Acme VPN").to_string()).create();
+        let outcome = engine.stop("s1", "anna@example.com").expect("finished");
+        deleted.assert();
+        create.assert();
+        assert_eq!(outcome.moved_to.as_deref(), Some("p-new"));
+        assert_eq!(outcome.changed.removed, ["s1"]);
+        assert_eq!(outcome.changed.upserted.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["p-new"]);
+        let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert!(state.unfinished.is_empty());
+    }
+
+    /// **Unfiled but not deleted is a stop that worked**: the person has lost
+    /// it, and the org copy's new filing rides in the outcome, so the daemon
+    /// stops showing it in their collection.
+    #[test]
+    fn an_org_copy_unfiled_but_not_deleted_is_announced_filed_nowhere() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[]);
+        server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
+        server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).create();
+        server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).create();
+        server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).create();
+        let outcome = engine.stop("s1", "anna@example.com").expect("stopped");
+        assert_eq!(outcome.moved_to.as_deref(), Some("p-new"));
+        let org_copy = outcome.changed.upserted.iter().find(|i| i.id == "s1").expect("the unfiled org copy is announced");
+        assert!(collection_ids_of(org_copy).is_empty());
+    }
+
+    /// **A failed invitations read does not skip a half-finished move**: the
+    /// pass logs it and runs on.
+    #[test]
+    fn a_failed_invitations_read_does_not_skip_a_half_finished_move() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            state.account_mut(FIXTURE_USER_ID).unfinished.push(crate::sharing_state::Unfinished::PurgeOrgCopy {
+                org_cipher_id: "s1".into(),
+                personal_id: "p1".into(),
+            });
+        }).expect("seeded");
+        server.mock("GET", "/api/organizations/invitations/mine").with_status(500).create();
+        server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).create();
+        let deleted = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        let pass = engine.refresh(Trigger::WholeRead).expect("the pass runs on");
+        deleted.assert();
+        assert_eq!(pass.outcome.removed, ["s1"]);
     }
 
     /// **A move remembered for a record that is still personal is stale** --
