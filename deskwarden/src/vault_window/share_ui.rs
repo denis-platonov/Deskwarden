@@ -52,6 +52,10 @@ pub(crate) const PANICKED: &str = "Sharing stopped unexpectedly. Try again.";
 /// A write asked for while another is still out -- see [`request`], which
 /// says this rather than dropping the second one without a word.
 pub(crate) const BUSY: &str = "Another sharing change is still running. Try again when it finishes.";
+/// A Show fingerprint while another is out -- [`request`]'s answer to it,
+/// said rather than dropped. The card greys every Show while one is out, so
+/// this is the sentence a wiring mistake would show.
+pub(crate) const FINGERPRINT_BUSY: &str = "A fingerprint is still on its way. Try again when it arrives.";
 
 pub(crate) fn shared_toast(email: &str) -> String {
     format!("Shared with {email}. It is in their vault now.")
@@ -73,12 +77,11 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 // ---- one person on one record ---------------------------------------------------------
 
 /// A person as the SHARING card lists them. Built for every record the read
-/// pane draws (`detail::PeopleSharing::people`) and drawn by Task 17's card;
-/// until then only this file's tests read one.
+/// pane draws (`detail::PeopleSharing::people`) and drawn by
+/// [`draw_people_block`].
 ///
 /// `pub` and not `pub(crate)` because `detail::PeopleSharing`, a field of
 /// `detail::draw_detail_read`'s public signature, carries a slice of them.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonLine {
     pub(crate) email: String,
@@ -87,8 +90,6 @@ pub struct PersonLine {
     pub(crate) line: String,
 }
 
-// Read by Task 17's SHARING card.
-#[allow(dead_code)]
 impl PersonLine {
     pub(crate) fn pill(&self) -> theme::SharePillKind {
         match self.state {
@@ -264,6 +265,13 @@ pub(crate) struct SharingPane {
     /// the user compared (Task 12), and this is where the window keeps which
     /// key that was. Spent by the Confirm it binds -- see [`request`].
     pub(crate) fingerprint: Option<(String, Fingerprint)>,
+    /// **A fingerprint is being fetched** for this normalised email. The read
+    /// has a slot of its own, one at a time: [`Self::fingerprint`] holds one
+    /// answer, so two reads out at once would race for it, and the card
+    /// greys every Show while this is set. Taken by [`request`], freed by the
+    /// answer in [`apply`] -- a failure and a panicked worker included, since
+    /// both come back as the call's own `Fingerprint` report.
+    pub(crate) fingerprinting: Option<String>,
     /// A toast and when it goes, in egui seconds.
     pub(crate) toast: Option<(String, f64)>,
     /// A failed request's sentence, shown on the card until the next write.
@@ -343,12 +351,12 @@ impl SharingPane {
         self.view.as_ref().is_some_and(|v| !v.incoming.is_empty())
     }
 
-    /// Handed to the read pane by [`people_sharing`], for Task 17's card.
+    /// Handed to the read pane by [`people_sharing`], for the SHARING card.
     pub(crate) fn confirming_for(&self, item_id: &str) -> Option<&str> {
         self.stop_confirming.as_ref().filter(|(id, _)| id == item_id).map(|(_, e)| e.as_str())
     }
 
-    /// Handed to the read pane by [`people_sharing`], for Task 17's card.
+    /// Handed to the read pane by [`people_sharing`], for the SHARING card.
     pub(crate) fn stopping_for(&self, item_id: &str) -> Option<&str> {
         self.stopping.as_ref().filter(|(id, _)| id == item_id).map(|(_, e)| e.as_str())
     }
@@ -357,14 +365,14 @@ impl SharingPane {
     /// the key hash of the fingerprint this window was shown for them -- or
     /// `None` while no fingerprint for that person is held, or they are not
     /// a changed key in the view. The card's button sends this and nothing
-    /// else (Task 17), so a Confirm always follows a Show fingerprint.
+    /// else (`vault_window::mod`'s `DetailAction::ShareAnyway` arm), so a
+    /// Confirm always follows a Show fingerprint.
     ///
     /// The view's state is a display fact: its people come from collection
     /// names, and a name is not proof of who holds the key. The binding that
     /// matters is the hash, which the engine checks against the key it would
     /// confirm and refuses on a mismatch -- this is the window's half, the
     /// engine's is the one that cannot be bypassed.
-    #[allow(dead_code)]
     pub(crate) fn share_anyway(&self, email: &str) -> Option<SharingCall> {
         let email = normalise_email(email);
         let (shown_for, fingerprint) = self.fingerprint.as_ref()?;
@@ -637,7 +645,9 @@ pub(crate) fn spawn_sharing_call(
 ///
 /// **Show fingerprint does not take the write slot.** It is a read -- the
 /// daemon hashes a key it holds -- so it may run beside a write, and its
-/// report leaves `busy` and the view alone (see [`apply`]).
+/// report leaves `busy` and the view alone (see [`apply`]). It has a slot of
+/// its own instead, [`SharingPane::fingerprinting`]: a second while one is
+/// out is refused with [`FINGERPRINT_BUSY`].
 #[must_use]
 pub(crate) fn request(
     pane: &mut SharingPane,
@@ -658,7 +668,11 @@ pub(crate) fn request(
     };
     match &call {
         SharingCall::View => pane.begin_view(),
-        SharingCall::Fingerprint(_) => {}
+        SharingCall::Fingerprint(_) if pane.fingerprinting.is_some() => {
+            pane.notice = Some(FINGERPRINT_BUSY.to_string());
+            return false;
+        }
+        SharingCall::Fingerprint(email) => pane.fingerprinting = Some(normalise_email(email)),
         _ if pane.busy => {
             pane.notice = Some(BUSY.to_string());
             return false;
@@ -676,11 +690,14 @@ pub(crate) fn request(
         }
         _ => pane.busy = true,
     }
-    // A write clears the last write's sentence; the view read does NOT. A
+    // A write clears the last write's sentence; the two reads do NOT. A
     // failed write marks the view stale, and the very next frame asks for it
     // -- clearing the notice there would take the sentence down one frame
     // after it went up (`a_failed_writes_sentence_outlives_the_view_read_it_causes`).
-    if !matches!(call, SharingCall::View) {
+    // A fingerprint is the user's own read, often of the person whose stop
+    // just failed, and the sentence saying so stays beside the words it
+    // fetched (`a_fingerprint_request_keeps_the_notice_and_holds_its_own_slot`).
+    if !matches!(call, SharingCall::View | SharingCall::Fingerprint(_)) {
         pane.notice = None;
     }
     spawn_sharing_call(ctx.clone(), tx.clone(), client.clone(), call);
@@ -722,6 +739,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
         // [`request`]), so its answer must not free one a write still holds,
         // and it changed nothing the view shows.
         SharingReport::Fingerprint { email, result } => {
+            pane.fingerprinting = None;
             match result {
                 Ok(fingerprint) => pane.fingerprint = Some((normalise_email(&email), fingerprint)),
                 Err(sentence) => pane.notice = Some(sentence),
@@ -897,6 +915,8 @@ pub(crate) fn people_sharing<'a>(
         confirming: pane.confirming_for(&item.id),
         stopping: pane.stopping_for(&item.id),
         fingerprint: pane.fingerprint.as_ref().map(|(email, f)| (email.as_str(), f.phrase.as_str())),
+        fingerprinting: pane.fingerprinting.as_deref(),
+        notice: pane.notice.as_deref(),
         view_only_from: pane.view.as_ref().and_then(|v| v.received_from(&item.id)),
     }
 }
@@ -1380,6 +1400,612 @@ pub(crate) fn say_refusal_in_dialog(pane: &mut SharingPane) {
         dialog.minting = false;
         dialog.error = pane.notice.take();
     }
+}
+
+// ---- the SHARING card's blocks (mock 6b) ---------------------------------------------
+//
+// **One card, two blocks, one entry shape.** 6b lists People and then the
+// Active Send, each under a stacked label with its mark, and every entry is
+// the same thing: a 28-point tile, two lines of words, the controls at the
+// right. A person's tile is round with their initial and a Send's is square
+// with the paper plane (6e's TILES: "a share is a person", "a Send is a
+// link"). The parts are here and `detail::sharing_card` calls them for the
+// Send, so the two blocks of one card cannot come to disagree about where a
+// control sits or how tall an entry is.
+
+pub(crate) const STOP_LABEL: &str = "Stop sharing";
+pub(crate) const REINVITE_LABEL: &str = "Re-invite";
+pub(crate) const SHARE_ANYWAY_LABEL: &str = "Share anyway";
+pub(crate) const SHOW_FINGERPRINT: &str = "Show fingerprint";
+pub(crate) const HIDE_FINGERPRINT: &str = "Hide fingerprint";
+/// The fingerprint box's own Hide, at the right of its eyebrow (mock 6b).
+const HIDE_SHORT: &str = "Hide";
+/// Where Show fingerprint stood, while its answer is on the way.
+pub(crate) const FETCHING_FINGERPRINT: &str = "Fetching fingerprint\u{2026}";
+pub(crate) const REMOVE_LABEL: &str = "Remove from their vault";
+/// Mock 6e's "Stop sharing, running".
+pub(crate) const STOPPING_LABEL: &str = "Stopping\u{2026}";
+pub(crate) const STOP_HINT: &str =
+    "Anything they already copied stays with them. If that matters, change the password afterwards.";
+/// A greyed Share anyway's hover: what it is waiting for.
+const SHARE_ANYWAY_HOVER: &str = "Show their fingerprint and compare it first";
+const PEOPLE_BLOCK_LABEL: &str = "People";
+const FINGERPRINT_EYEBROW: &str = "FINGERPRINT";
+/// 6b's `.chead .side`, which the SHARING card wears once it lists people.
+pub(crate) const SHARING_SIDE: &str = "people: view-only, updates when you edit";
+/// 6b's `.cnote`, which speaks for both blocks -- and so replaces 5d's own
+/// note once the card lists people.
+pub(crate) const PEOPLE_NOTE: &str = "A person keeps a view-only copy in their own vault that follows your edits, \
+    until you stop sharing. A Send is a link: anyone who has it can open it until it expires or you \
+    revoke it.";
+
+/// `.cblock`: `padding: 12px 16px 6px`, and a `border-bottom` in the row
+/// rule's grey.
+const BLOCK_PAD_X: i8 = 16;
+const BLOCK_PAD_TOP: i8 = 12;
+const BLOCK_PAD_BOTTOM: i8 = 6;
+/// `.bl`: a 12-point mark, `gap: 8px`, 12px faint at the mock's 1.5 line
+/// height, and `margin-bottom: 2px`.
+const BLOCK_MARK: f32 = 12.0;
+const BLOCK_MARK_GAP: f32 = 8.0;
+const BLOCK_LABEL_SIZE: f32 = 12.0;
+const BLOCK_LABEL_HEIGHT: f32 = 18.0;
+const BLOCK_LABEL_GAP: f32 = 2.0;
+/// `.pe`: `padding: 9px 0; gap: 11px`, round the 28-point `.pav` / `.stile`.
+const ENTRY_PAD_Y: f32 = 9.0;
+const ENTRY_TILE: f32 = 28.0;
+const ENTRY_TILE_GAP: f32 = 11.0;
+/// `.pav`'s 11px 600 initial, and `.stile`'s 14-point plane.
+const AVATAR_INITIAL_SIZE: f32 = 11.0;
+const TILE_PLANE: f32 = 14.0;
+/// `.stile`'s `border-radius: 7px`.
+const TILE_RADIUS: u8 = 7;
+/// `.who`: two lines, `gap: 3px`. The first is as tall as the pill beside the
+/// name; the second is the 11px status line.
+const WHO_GAP: f32 = 3.0;
+const WHO_LINE_2: f32 = 15.0;
+const WHO_HEIGHT: f32 = theme::PILL_HEIGHT + WHO_GAP + WHO_LINE_2;
+/// `.who .l1`: 14px, `gap: 8px` to the pill. `.l2`: 11px, `gap: 4px`.
+const TITLE_SIZE: f32 = 14.0;
+const TITLE_PILL_GAP: f32 = 8.0;
+const LINE_SIZE: f32 = 11.0;
+const LINE_GAP: f32 = 4.0;
+/// `.cctl`: `gap: 8px`.
+const CONTROL_GAP: f32 = 8.0;
+/// **The narrowest the words may get beside the controls.** Under it, the
+/// controls take a line of their own beneath the words -- the read pane's
+/// narrowest width leaves an address a dozen points beside Re-invite and Stop
+/// sharing, which is no address at all. The same room decides both states
+/// of one entry (see [`sharing_entry`]), so a question going up never moves
+/// the controls between the two shapes.
+const WHO_MIN_WIDTH: f32 = 150.0;
+const CONTROL_LINE_GAP: f32 = 8.0;
+/// `.extra`: `padding: 0 0 12px 39px` -- under the words, clear of the tile.
+const EXTRA_INDENT: i8 = 39;
+const EXTRA_PAD_BOTTOM: i8 = 12;
+/// `.confirm .h { margin-top: 4px }` and `.confirm .btn { margin-top: 10px }`.
+const QUESTION_HINT_GAP: f32 = 4.0;
+const QUESTION_BUTTON_GAP: f32 = 10.0;
+/// `.fp`: `padding: 10px 12px; gap: 6px`, 8-point corners; the words at 13px
+/// in the bold monospace, the eyebrow at 11px with `.08em` of tracking.
+const FP_PAD_X: i8 = 12;
+const FP_PAD_Y: i8 = 10;
+const FP_GAP: f32 = 6.0;
+const FP_RADIUS: u8 = 8;
+const FP_WORDS_SIZE: f32 = 13.0;
+const FP_SMALL_SIZE: f32 = 11.0;
+const FP_EYEBROW_TRACKING: f32 = 0.88;
+/// `.cnote`: `padding: 12px 16px 13px`, 11px ghost at a 1.5 line height.
+const NOTE_PAD_TOP: i8 = 12;
+const NOTE_PAD_BOTTOM: i8 = 13;
+const NOTE_SIZE: f32 = 11.0;
+const NOTE_LINE_HEIGHT: f32 = 16.5;
+/// A notice: 12px in the error red, `6` above the note it sits over.
+const NOTICE_SIZE: f32 = 12.0;
+const NOTICE_GAP: f32 = 6.0;
+/// Mock 6a's `.toast`: `right: 20px; bottom: 20px; padding: 10px 14px`, 13px
+/// white on ink, 8-point corners -- the copy confirmation's own box.
+const TOAST_INSET: f32 = 20.0;
+const TOAST_PAD: egui::Vec2 = egui::vec2(14.0, 10.0);
+const TOAST_TEXT_SIZE: f32 = 13.0;
+const TOAST_RADIUS: u8 = 8;
+
+/// Mock 6b's red question, with the record and the person in it.
+pub(crate) fn stop_question(record: &str, email: &str) -> String {
+    format!("Stop sharing {record} with {email}? It leaves their vault at once.")
+}
+
+/// What a shown fingerprint is to be compared with (mock 6b).
+fn fingerprint_note(email: &str) -> String {
+    format!(
+        "This should match the phrase {email} sees under Account \u{203a} Fingerprint phrase. If it \
+         does not, stop sharing: the record went to a key that is not theirs."
+    )
+}
+
+/// **A changed key's fingerprint says what to do before Share anyway.** The
+/// mock draws no changed key; the engine does (`PersonState::KeyChanged`),
+/// and the one safe reading of it is that the words are compared out of band
+/// -- the new key came over the same server the old one did, so a phrase
+/// read off this screen and the other person's screen alike proves nothing
+/// unless the two people say it to each other.
+pub(crate) fn key_changed_note(email: &str) -> String {
+    format!(
+        "Their key changed. Before you share anyway, compare these words with {email} by phone or \
+         in person: they see theirs under Account \u{203a} Fingerprint phrase. If the words do not \
+         match, do not share."
+    )
+}
+
+/// Two addresses name one person: the view's, the pane's and a report's are
+/// each normalised on their own path, so the card asks the same way.
+fn same_person(a: &str, b: &str) -> bool {
+    normalise_email(a) == normalise_email(b)
+}
+
+/// **The width the card really shows** from this `Ui`'s left edge -- the
+/// clip rect, `detail::app_card_content_width`'s rule, for its reason: the
+/// read pane's body is a `ScrollArea`, which grows its content `Ui` to last
+/// frame's widest child, and `available_width` reports that growth back.
+fn content_width(ui: &egui::Ui) -> f32 {
+    (ui.clip_rect().right() - ui.max_rect().left()).min(ui.available_width()).max(0.0)
+}
+
+/// Which mark a block's stacked label carries (6b's `.bl`).
+#[derive(Clone, Copy)]
+pub(crate) enum BlockMark {
+    Person,
+    Plane,
+}
+
+/// **One block of the SHARING card**: 6b's `.cblock` -- the stacked label
+/// with its mark, then whatever `add` draws, then the rule under the block.
+pub(crate) fn sharing_block(ui: &mut egui::Ui, mark: BlockMark, label: &str, add: impl FnOnce(&mut egui::Ui)) {
+    let width = (content_width(ui) - f32::from(BLOCK_PAD_X) * 2.0).max(0.0);
+    egui::Frame::new()
+        .inner_margin(egui::Margin { left: BLOCK_PAD_X, right: BLOCK_PAD_X, top: BLOCK_PAD_TOP, bottom: BLOCK_PAD_BOTTOM })
+        .show(ui, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            let (band, _) = ui.allocate_exact_size(egui::vec2(width, BLOCK_LABEL_HEIGHT), egui::Sense::hover());
+            let at = egui::Rect::from_min_size(
+                egui::pos2(band.left(), band.center().y - BLOCK_MARK / 2.0),
+                egui::Vec2::splat(BLOCK_MARK),
+            );
+            match mark {
+                BlockMark::Person => theme::paint_person_mark(ui.painter(), at, theme::TEXT_FAINT),
+                BlockMark::Plane => theme::paint_send_plane(ui.painter(), at, theme::TEXT_FAINT),
+            }
+            let galley = ui.painter().layout_no_wrap(
+                label.to_string(),
+                egui::FontId::proportional(BLOCK_LABEL_SIZE),
+                theme::TEXT_FAINT,
+            );
+            let top = band.center().y - galley.size().y / 2.0;
+            ui.painter().galley(egui::pos2(at.right() + BLOCK_MARK_GAP, top), galley, theme::TEXT_FAINT);
+            ui.add_space(BLOCK_LABEL_GAP);
+            add(ui);
+        });
+    theme::row_rule(ui);
+}
+
+/// The room a row of [`theme::row_button`]s takes, `.cctl`'s gap between
+/// them -- measured off the galleys the buttons will lay, never estimated.
+pub(crate) fn controls_room(ui: &egui::Ui, labels: &[&str]) -> f32 {
+    let gaps = CONTROL_GAP * labels.len().saturating_sub(1) as f32;
+    labels.iter().map(|label| theme::row_button_width(ui, label)).sum::<f32>() + gaps
+}
+
+/// An entry's leading mark.
+#[derive(Clone, Copy)]
+pub(crate) enum EntryTile<'a> {
+    /// Round, with the first letter of this address.
+    Person(&'a str),
+    /// Square, with the paper plane.
+    Send,
+}
+
+/// The pill after an entry's first line: a share pill for a person (5-point
+/// corners, person mark), a Send's stadium state pill for a link.
+#[derive(Clone, Copy)]
+pub(crate) enum EntryPill<'a> {
+    Share(theme::SharePillKind),
+    Send(theme::PillTone, &'a str),
+}
+
+impl EntryPill<'_> {
+    fn width(self, painter: &egui::Painter) -> f32 {
+        match self {
+            Self::Share(kind) => theme::share_pill_width(painter, kind),
+            Self::Send(tone, label) => theme::state_pill_width(painter, tone, label),
+        }
+    }
+
+    fn paint(self, painter: &egui::Painter, left_center: egui::Pos2) {
+        match self {
+            Self::Share(kind) => {
+                theme::share_pill(painter, left_center, kind);
+            }
+            Self::Send(tone, label) => {
+                theme::state_pill(painter, left_center, tone, label);
+            }
+        }
+    }
+}
+
+fn paint_entry_tile(painter: &egui::Painter, rect: egui::Rect, tile: EntryTile<'_>) {
+    match tile {
+        EntryTile::Person(email) => {
+            // Inside the 28 points, as the mock's `border: 1px` is.
+            painter.circle(rect.center(), ENTRY_TILE / 2.0 - 0.5, theme::CARD, egui::Stroke::new(1.0, theme::HAIRLINE));
+            let initial: String = email.trim().chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+            let font = egui::FontId::new(AVATAR_INITIAL_SIZE, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+            let galley = painter.layout_no_wrap(initial, font, theme::TEXT_MUTED);
+            painter.galley(rect.center() - galley.size() / 2.0, galley, theme::TEXT_MUTED);
+        }
+        EntryTile::Send => {
+            let corners = egui::CornerRadius::same(TILE_RADIUS);
+            painter.rect_filled(rect, corners, theme::CARD);
+            painter.rect_stroke(rect, corners, egui::Stroke::new(1.0, theme::HAIRLINE), egui::StrokeKind::Inside);
+            let plane = egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(TILE_PLANE));
+            theme::paint_send_plane(painter, plane, theme::TEXT_MUTED);
+        }
+    }
+}
+
+/// **One entry of a block** (6b's `.pe`): the tile, the words `who` draws,
+/// and the controls `controls` draws, laid RIGHT TO LEFT -- so the first
+/// control drawn is the rightmost, and a two-step's Cancel drawn first takes
+/// the very slot the control it replaces had, with no room held for the
+/// others.
+///
+/// **Placed, not flowed.** The entry's rect is allocated whole and the three
+/// parts are put into rects inside it, because a horizontal layout centres
+/// each item against the row's height SO FAR, and a 28-point button after a
+/// 38-point column of words would sit high.
+///
+/// `controls_room` is the room the controls have AT REST, and it is what
+/// decides the words' width and whether the controls share their line --
+/// never the controls of the moment: a question going up swaps Stop sharing
+/// for a narrower Cancel, and an entry that re-measured would move its words,
+/// or jump from two lines to one, under the pointer that pressed it.
+pub(crate) fn sharing_entry(
+    ui: &mut egui::Ui,
+    tile: EntryTile<'_>,
+    controls_room: f32,
+    who: impl FnOnce(&mut egui::Ui),
+    controls: impl FnOnce(&mut egui::Ui),
+) {
+    let width = ui.available_width();
+    let text_left = ENTRY_TILE + ENTRY_TILE_GAP;
+    let one_line = width - text_left - controls_room - CONTROL_GAP >= WHO_MIN_WIDTH;
+    let controls_line = if one_line { 0.0 } else { CONTROL_LINE_GAP + theme::ROW_BUTTON_HEIGHT_2B };
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(width, ENTRY_PAD_Y * 2.0 + WHO_HEIGHT + controls_line),
+        egui::Sense::hover(),
+    );
+    let body = egui::Rect::from_min_size(rect.min + egui::vec2(0.0, ENTRY_PAD_Y), egui::vec2(width, WHO_HEIGHT));
+    let tile_rect = egui::Rect::from_min_size(
+        egui::pos2(body.left(), body.center().y - ENTRY_TILE / 2.0),
+        egui::Vec2::splat(ENTRY_TILE),
+    );
+    paint_entry_tile(ui.painter(), tile_rect, tile);
+    let words_left = body.left() + text_left;
+    let words_right = if one_line { body.right() - controls_room - CONTROL_GAP } else { body.right() };
+    let words = egui::Rect::from_min_max(egui::pos2(words_left, body.top()), egui::pos2(words_right.max(words_left), body.bottom()));
+    let mut words_ui = ui.new_child(egui::UiBuilder::new().max_rect(words).layout(egui::Layout::top_down(egui::Align::Min)));
+    words_ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+    who(&mut words_ui);
+    let slot = if one_line {
+        egui::Rect::from_min_max(egui::pos2(words_right + CONTROL_GAP, body.top()), body.max)
+    } else {
+        egui::Rect::from_min_size(
+            egui::pos2(words_left, body.bottom() + CONTROL_LINE_GAP),
+            egui::vec2((body.right() - words_left).max(0.0), theme::ROW_BUTTON_HEIGHT_2B),
+        )
+    };
+    let mut controls_ui = ui.new_child(egui::UiBuilder::new().max_rect(slot).layout(egui::Layout::right_to_left(egui::Align::Center)));
+    controls_ui.spacing_mut().item_spacing = egui::vec2(CONTROL_GAP, 0.0);
+    controls(&mut controls_ui);
+}
+
+/// An entry's first line: the name at 14px, cut short with an ellipsis
+/// before it can push the pill after it off the entry, then the pill.
+pub(crate) fn entry_title(ui: &mut egui::Ui, title: &str, pill: EntryPill<'_>) {
+    let width = ui.available_width();
+    let pill_width = pill.width(ui.painter());
+    let row = egui::Layout::left_to_right(egui::Align::Center);
+    ui.allocate_ui_with_layout(egui::vec2(width, theme::PILL_HEIGHT), row, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(TITLE_PILL_GAP, 0.0);
+        let room = (width - pill_width - TITLE_PILL_GAP).max(0.0);
+        ui.allocate_ui_with_layout(egui::vec2(room, theme::PILL_HEIGHT), row, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(title).size(TITLE_SIZE).color(theme::INK)).truncate());
+        });
+        let (slot, _) = ui.allocate_exact_size(egui::vec2(pill_width, theme::PILL_HEIGHT), egui::Sense::hover());
+        pill.paint(ui.painter(), egui::pos2(slot.left(), slot.center().y));
+    });
+}
+
+/// An entry's second line: the status words at 11px, and after them -- past
+/// a middle dot -- a link, `(label, pressable)`. Answers whether the link was
+/// pressed. The words give way to the link, not the other way round.
+pub(crate) fn entry_line(ui: &mut egui::Ui, line: &str, link: Option<(&str, bool)>) -> bool {
+    let width = ui.available_width();
+    let mut pressed = false;
+    let row = egui::Layout::left_to_right(egui::Align::Center);
+    ui.add_space(WHO_GAP);
+    ui.allocate_ui_with_layout(egui::vec2(width, WHO_LINE_2), row, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(LINE_GAP, 0.0);
+        let link_room = link.map_or(0.0, |(label, _)| {
+            let measure = |text: &str, family: egui::FontFamily| {
+                ui.painter().layout_no_wrap(text.to_string(), egui::FontId::new(LINE_SIZE, family), theme::TEXT_FAINT).size().x
+            };
+            measure("\u{b7}", egui::FontFamily::Proportional)
+                + measure(label, egui::FontFamily::Name(theme::SEMIBOLD.into()))
+                + LINE_GAP * 2.0
+        });
+        ui.allocate_ui_with_layout(egui::vec2((width - link_room).max(0.0), WHO_LINE_2), row, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(line).size(LINE_SIZE).color(theme::TEXT_FAINT)).truncate());
+        });
+        if let Some((label, pressable)) = link {
+            ui.label(egui::RichText::new("\u{b7}").size(LINE_SIZE).color(theme::TEXT_FAINT));
+            // `.link`: 600 weight in the deep blue; greyed when it cannot be
+            // pressed, and then it takes no click at all.
+            let ink = if pressable { theme::BLUE_DEEP } else { theme::TEXT_GHOST };
+            let sense = if pressable { egui::Sense::click() } else { egui::Sense::hover() };
+            let response = ui.add(egui::Label::new(theme::semibold(label, LINE_SIZE).color(ink)).sense(sense));
+            if pressable && response.hovered() {
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            pressed = pressable && response.clicked();
+        }
+    });
+    pressed
+}
+
+/// What goes under an entry (6b's `.extra`): the stop question, or the
+/// fingerprint -- indented to the words, clear of the tile.
+pub(crate) fn entry_extra(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let width = (ui.available_width() - f32::from(EXTRA_INDENT)).max(0.0);
+    egui::Frame::new()
+        .inner_margin(egui::Margin { left: EXTRA_INDENT, right: 0, top: 0, bottom: EXTRA_PAD_BOTTOM })
+        .show(ui, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            add(ui);
+        });
+}
+
+/// **The People block of the SHARING card** (mock 6b): one entry per person
+/// -- a round avatar with their initial, the address and share pill, the
+/// status line with its fingerprint link, and the controls. Stop sharing is
+/// the app's two-step: Cancel in Stop's own slot, and the question and the
+/// red button under the row, so nothing above moves under the pointer.
+pub(crate) fn draw_people_block(
+    ui: &mut egui::Ui,
+    record: &str,
+    people: &super::detail::PeopleSharing<'_>,
+    action: &mut super::detail::DetailAction,
+) {
+    sharing_block(ui, BlockMark::Person, PEOPLE_BLOCK_LABEL, |ui| {
+        for (index, person) in people.people.iter().enumerate() {
+            // `.pe + .pe`: a rule between two people, none over the first.
+            if index > 0 {
+                theme::row_rule(ui);
+            }
+            person_entry(ui, record, person, people, action);
+        }
+    });
+}
+
+/// One person, with everything the pane is in the middle of for them.
+///
+/// **Share anyway is drawn, greyed, until their fingerprint is on screen.**
+/// Drawn, so a changed key says where the way on is; greyed, because the
+/// window can only send [`SharingPane::share_anyway`]'s call, which binds the
+/// confirm to the key whose words were shown -- and a press that sent
+/// nothing would be a button that lies.
+fn person_entry(
+    ui: &mut egui::Ui,
+    record: &str,
+    person: &PersonLine,
+    people: &super::detail::PeopleSharing<'_>,
+    action: &mut super::detail::DetailAction,
+) {
+    use super::detail::DetailAction;
+    let email = person.email.as_str();
+    let names_them = |who: Option<&str>| who.is_some_and(|who| same_person(who, email));
+    let stopping = names_them(people.stopping);
+    let confirming = names_them(people.confirming) && !stopping;
+    let shown = people.fingerprint.filter(|(who, _)| same_person(who, email)).map(|(_, phrase)| phrase);
+    // Rightmost first, the order the controls are laid in: 6b reads
+    // `Re-invite, Stop sharing` left to right, and Share anyway -- a changed
+    // key's, which the mock does not draw -- goes before them both.
+    let mut resting = vec![STOP_LABEL];
+    if person.reinvite() {
+        resting.push(REINVITE_LABEL);
+    }
+    if person.share_anyway() {
+        resting.push(SHARE_ANYWAY_LABEL);
+    }
+    let room = controls_room(ui, &resting);
+    // One fetch at a time (`SharingPane::fingerprinting`): the person being
+    // fetched says so where their link was, and every other Show greys.
+    let link = person.fingerprint().then(|| match (shown, people.fingerprinting) {
+        (Some(_), _) => (HIDE_FINGERPRINT, true),
+        (None, Some(who)) if same_person(who, email) => (FETCHING_FINGERPRINT, false),
+        (None, Some(_)) => (SHOW_FINGERPRINT, false),
+        (None, None) => (SHOW_FINGERPRINT, true),
+    });
+    let mut link_pressed = false;
+    sharing_entry(
+        ui,
+        EntryTile::Person(email),
+        room,
+        |ui| {
+            entry_title(ui, email, EntryPill::Share(person.pill()));
+            link_pressed = entry_line(ui, &person.line, link);
+        },
+        |ui| {
+            if stopping {
+                // No widget of any kind while the stop runs: the Send's
+                // revoke rule, for the same reason.
+                ui.label(egui::RichText::new(STOPPING_LABEL).size(12.0).color(theme::TEXT_MUTED));
+                return;
+            }
+            if confirming {
+                if theme::row_button(ui, CANCEL_BUTTON).clicked() {
+                    *action = DetailAction::CancelStopSharing;
+                }
+                return;
+            }
+            if theme::row_button_danger(ui, STOP_LABEL)
+                .on_hover_text("Take this record out of their vault")
+                .clicked()
+            {
+                *action = DetailAction::StopSharing(email.to_string());
+            }
+            if person.reinvite()
+                && theme::row_button(ui, REINVITE_LABEL).on_hover_text("Send them a fresh invitation").clicked()
+            {
+                *action = DetailAction::Reinvite(email.to_string());
+            }
+            if person.share_anyway() {
+                let ready = shown.is_some();
+                let pressed = ui
+                    .add_enabled_ui(ready, |ui| theme::row_button(ui, SHARE_ANYWAY_LABEL))
+                    .inner
+                    .on_disabled_hover_text(SHARE_ANYWAY_HOVER)
+                    .clicked();
+                if ready && pressed {
+                    *action = DetailAction::ShareAnyway(email.to_string());
+                }
+            }
+        },
+    );
+    if link_pressed {
+        *action = if shown.is_some() { DetailAction::HideFingerprint } else { DetailAction::ShowFingerprint(email.to_string()) };
+    }
+    if confirming {
+        entry_extra(ui, |ui| {
+            ui.add(egui::Label::new(theme::semibold(stop_question(record, email), 14.0).color(theme::ERROR)).wrap());
+            ui.add_space(QUESTION_HINT_GAP);
+            ui.add(egui::Label::new(egui::RichText::new(STOP_HINT).size(11.0).color(theme::TEXT_FAINT)).wrap());
+            ui.add_space(QUESTION_BUTTON_GAP);
+            // Cancel wins an ambiguous frame, as on the Send's revoke: the
+            // safe answer to one on a destructive control is not to destroy.
+            if theme::destructive_button(ui, REMOVE_LABEL).clicked() && *action != DetailAction::CancelStopSharing {
+                *action = DetailAction::ConfirmStopSharing(email.to_string());
+            }
+        });
+    }
+    if let Some(phrase) = shown {
+        let note = if person.share_anyway() { key_changed_note(email) } else { fingerprint_note(email) };
+        let mut hide = false;
+        entry_extra(ui, |ui| hide = fingerprint_box(ui, phrase, &note));
+        if hide {
+            *action = DetailAction::HideFingerprint;
+        }
+    }
+}
+
+/// 6b's `.fp`: the eyebrow with its Hide, the five words, and what to compare
+/// them with. Answers whether Hide was pressed.
+fn fingerprint_box(ui: &mut egui::Ui, phrase: &str, note: &str) -> bool {
+    let mut hide = false;
+    egui::Frame::new()
+        .fill(theme::BLUE_WASH)
+        .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
+        .corner_radius(egui::CornerRadius::same(FP_RADIUS))
+        .inner_margin(egui::Margin::symmetric(FP_PAD_X, FP_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing = egui::vec2(0.0, FP_GAP);
+            ui.horizontal(|ui| {
+                ui.label(theme::letterspaced(FINGERPRINT_EYEBROW, FP_SMALL_SIZE, theme::BOLD, FP_EYEBROW_TRACKING, theme::BLUE_DEEP));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let link = egui::Label::new(theme::semibold(HIDE_SHORT, FP_SMALL_SIZE).color(theme::BLUE_DEEP)).sense(egui::Sense::click());
+                    let response = ui.add(link);
+                    if response.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    hide = response.clicked();
+                });
+            });
+            let words = egui::RichText::new(phrase)
+                .size(FP_WORDS_SIZE)
+                .family(egui::FontFamily::Name(theme::MONO_BOLD.into()))
+                .color(theme::BLUE_DEEP);
+            ui.add(egui::Label::new(words).wrap());
+            ui.add(egui::Label::new(egui::RichText::new(note).size(FP_SMALL_SIZE).color(theme::BLUE_DEEP)).wrap());
+        });
+    hide
+}
+
+/// **The foot of the SHARING card**: a sharing request's sentence, if one is
+/// standing, over the card's note (6b's `.cnote`, or 5d's with only a Send).
+///
+/// The notice is the engine's or the window's sentence -- a refusal, a stop
+/// or a share that failed -- and it can name a decrypted record, so it is
+/// drawn here and logged nowhere (module doc). It stands at the foot and not
+/// the head for `detail::sharing_card`'s reason: a sentence arriving while
+/// the pointer is on a row must not push that row away.
+pub(crate) fn draw_card_note(ui: &mut egui::Ui, notice: Option<&str>, note: Option<&str>) {
+    if notice.is_none() && note.is_none() {
+        return;
+    }
+    let width = (content_width(ui) - f32::from(BLOCK_PAD_X) * 2.0).max(0.0);
+    egui::Frame::new()
+        .inner_margin(egui::Margin { left: BLOCK_PAD_X, right: BLOCK_PAD_X, top: NOTE_PAD_TOP, bottom: NOTE_PAD_BOTTOM })
+        .show(ui, |ui| {
+            ui.set_width(width);
+            ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
+            if let Some(notice) = notice {
+                ui.add(egui::Label::new(egui::RichText::new(notice).size(NOTICE_SIZE).color(theme::ERROR)).wrap());
+                if note.is_some() {
+                    ui.add_space(NOTICE_GAP);
+                }
+            }
+            if let Some(note) = note {
+                let text = egui::RichText::new(note)
+                    .size(NOTE_SIZE)
+                    .line_height(Some(NOTE_LINE_HEIGHT))
+                    .color(theme::TEXT_GHOST);
+                ui.add(egui::Label::new(text).wrap());
+            }
+        });
+}
+
+/// **The share toast** (mock 6a): one dark box inside the pane's bottom
+/// right, the copy confirmation's shape and inset, saying how a share or a
+/// stop ended while no dialog is open to say it.
+///
+/// **A painter on a foreground layer, not an `Area`**, for
+/// `detail::draw_copy_toast`'s reason: an `Area` spends its first frame
+/// measuring itself and paints nothing, and a toast takes no input.
+///
+/// **No repaint is asked for.** The toast is taken down by [`drain`] once
+/// its [`TOAST_SECONDS`] are up, and the vault window's own frame schedule
+/// wakes it at least every half second -- a timer here would be a second
+/// repaint loop for something the existing one already covers.
+///
+/// Wrapped to the pane: the engine's sentences are longer than a copy
+/// confirmation's and a narrow pane is narrower than some of them.
+pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, pane: &SharingPane) {
+    let Some((text, _)) = &pane.toast else {
+        return;
+    };
+    let wrap = (pane_rect.width() - TOAST_INSET * 2.0 - TOAST_PAD.x * 2.0).max(1.0);
+    let galley = ui.painter().layout(text.clone(), egui::FontId::proportional(TOAST_TEXT_SIZE), theme::CARD, wrap);
+    let size = galley.size() + TOAST_PAD * 2.0;
+    let at = egui::pos2(
+        (pane_rect.right() - TOAST_INSET - size.x).max(pane_rect.left() + TOAST_INSET),
+        (pane_rect.bottom() - TOAST_INSET - size.y).max(pane_rect.top() + TOAST_INSET),
+    );
+    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("share-toast")));
+    let rect = egui::Rect::from_min_size(at, size);
+    painter.rect_filled(rect, egui::CornerRadius::same(TOAST_RADIUS), theme::INK);
+    painter.galley(rect.min + TOAST_PAD, galley, theme::CARD);
 }
 
 #[cfg(test)]
@@ -2147,5 +2773,276 @@ mod tests {
             other => panic!("expected the view, got {other:?}"),
         }
         drop(host);
+    }
+
+    // ---- the SHARING card's people (mock 6b) ----------------------------------------
+
+    /// A harness frame: the People block alone, drawn into a 700x800 window
+    /// after one warm frame (a press is hit-tested against the widgets of the
+    /// frame before it), and every string it painted.
+    fn block_frame(people: super::super::detail::PeopleSharing<'_>, events: Vec<egui::Event>) -> (super::super::detail::DetailAction, Vec<(String, egui::Rect)>) {
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(700.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(Vec::new()), |ui| {
+            let mut ignored = super::super::detail::DetailAction::None;
+            draw_people_block(ui, "Acme VPN", &people, &mut ignored);
+        });
+        let mut action = super::super::detail::DetailAction::None;
+        let output = ctx.run_ui(input(events), |ui| draw_people_block(ui, "Acme VPN", &people, &mut action));
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        (action, texts)
+    }
+
+    fn lines() -> Vec<PersonLine> {
+        vec![
+            PersonLine { email: "anna@x.io".into(), state: PersonState::Shared, line: "Shared \u{b7} since 14 Sep".into() },
+            PersonLine { email: "carol@x.io".into(), state: PersonState::WaitingAccount, line: "Waiting to create an account \u{b7} 6 days left".into() },
+        ]
+    }
+
+    fn centre_of(texts: &[(String, egui::Rect)], needle: &str) -> egui::Pos2 {
+        texts.iter().find(|(t, _)| t == needle).map(|(_, r)| r.center()).unwrap_or_else(|| panic!("no {needle:?} in {texts:?}"))
+    }
+
+    /// **Mock 6b at rest**: each person, their pill, their line; Stop
+    /// sharing on every row; Re-invite where it helps; the fingerprint link
+    /// only where a key is held.
+    #[test]
+    fn the_people_block_draws_each_person_with_their_controls() {
+        let people_lines = lines();
+        let people = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
+        let (_, texts) = block_frame(people, Vec::new());
+        let count = |needle: &str| texts.iter().filter(|(t, _)| t == needle).count();
+        assert_eq!(count("anna@x.io"), 1);
+        assert_eq!(count(STOP_LABEL), 2);
+        assert_eq!(count(REINVITE_LABEL), 1, "only carol's invite can be renewed");
+        assert_eq!(count(SHOW_FINGERPRINT), 1, "only anna's key is held");
+        assert_eq!(count("Shared"), 1);
+        assert_eq!(count("No account yet"), 1);
+        assert_eq!(count(PEOPLE_BLOCK_LABEL), 1, "the stacked label over the entries");
+        assert_eq!(count("A"), 1, "anna's avatar carries her initial: {texts:?}");
+        assert_eq!(count("C"), 1, "carol's avatar carries hers");
+    }
+
+    /// **Stop sharing is two steps** (mock 6b): the first reports
+    /// `StopSharing`; with the question up, Cancel sits in its slot and the red
+    /// button under the row reports `ConfirmStopSharing`.
+    #[test]
+    fn stopping_is_asked_before_it_happens() {
+        use super::super::detail::DetailAction;
+        let people_lines = lines();
+        let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
+        let (_, texts) = block_frame(at_rest, Vec::new());
+        let stop = texts.iter().find(|(t, _)| t == STOP_LABEL).map(|(_, r)| r.center()).expect("Stop sharing");
+        assert_eq!(block_frame(at_rest, click(stop)).0, DetailAction::StopSharing("anna@x.io".into()));
+
+        let asking = super::super::detail::PeopleSharing { people: &people_lines, confirming: Some("anna@x.io"), ..Default::default() };
+        let (_, texts) = block_frame(asking, Vec::new());
+        assert!(texts.iter().any(|(t, _)| t == &stop_question("Acme VPN", "anna@x.io")), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == STOP_HINT), "the note that a copy stays with them");
+        let remove = texts.iter().find(|(t, _)| t == REMOVE_LABEL).map(|(_, r)| r.center()).expect("the red button");
+        assert_eq!(block_frame(asking, click(remove)).0, DetailAction::ConfirmStopSharing("anna@x.io".into()));
+        let cancel = texts.iter().find(|(t, _)| t == CANCEL_BUTTON).map(|(_, r)| r.center()).expect("Cancel");
+        assert_eq!(block_frame(asking, click(cancel)).0, DetailAction::CancelStopSharing);
+        // **Cancel is where Stop sharing was**, so a second rapid click on
+        // Stop lands on the way out and never on the red button below.
+        assert_eq!(block_frame(asking, click(stop)).0, DetailAction::CancelStopSharing, "a second click where Stop was");
+        assert!(remove.y > stop.y, "the question went above the row, which moves it");
+        assert_eq!(texts.iter().filter(|(t, _)| t == STOP_LABEL).count(), 1, "only carol's Stop is offered while anna's is asked");
+    }
+
+    /// While a stop runs, the row says so and offers nothing -- mock 6e's
+    /// `Stopping…` -- and a click where Stop was reports nothing.
+    #[test]
+    fn a_running_stop_says_so_and_offers_nothing() {
+        use super::super::detail::DetailAction;
+        let people_lines = lines();
+        let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
+        let (_, texts) = block_frame(at_rest, Vec::new());
+        let stop = centre_of(&texts, STOP_LABEL);
+        let running = super::super::detail::PeopleSharing {
+            people: &people_lines,
+            confirming: Some("anna@x.io"),
+            stopping: Some("anna@x.io"),
+            ..Default::default()
+        };
+        let (action, texts) = block_frame(running, click(stop));
+        assert_eq!(action, DetailAction::None);
+        assert!(texts.iter().any(|(t, _)| t == STOPPING_LABEL), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == REMOVE_LABEL || t == CANCEL_BUTTON), "{texts:?}");
+    }
+
+    /// The fingerprint, once fetched, is shown under the person with the
+    /// sentence that says what to compare it with (mock 6b, fingerprint).
+    #[test]
+    fn a_shown_fingerprint_says_what_to_compare_it_with() {
+        use super::super::detail::DetailAction;
+        let people_lines = lines();
+        let people = super::super::detail::PeopleSharing {
+            people: &people_lines,
+            fingerprint: Some(("anna@x.io", "turban-deftly-anime-chatroom-unselfish")),
+            ..Default::default()
+        };
+        let (_, texts) = block_frame(people, Vec::new());
+        assert!(texts.iter().any(|(t, _)| t == "turban-deftly-anime-chatroom-unselfish"));
+        assert!(texts.iter().any(|(t, _)| t == HIDE_FINGERPRINT));
+        assert!(texts.iter().any(|(t, _)| t.contains("Account \u{203a} Fingerprint phrase")));
+        let hide = centre_of(&texts, HIDE_FINGERPRINT);
+        assert_eq!(block_frame(people, click(hide)).0, DetailAction::HideFingerprint);
+        let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
+        let (_, texts) = block_frame(at_rest, Vec::new());
+        let show = centre_of(&texts, SHOW_FINGERPRINT);
+        assert_eq!(block_frame(at_rest, click(show)).0, DetailAction::ShowFingerprint("anna@x.io".into()));
+    }
+
+    /// **Show fingerprint is not offered twice at once**: while one is
+    /// being fetched the person's link says so, and every other Show is
+    /// greyed and reports nothing.
+    #[test]
+    fn show_fingerprint_waits_while_one_is_being_fetched() {
+        use super::super::detail::DetailAction;
+        let people_lines = vec![
+            PersonLine { email: "anna@x.io".into(), state: PersonState::Shared, line: "Shared".into() },
+            PersonLine { email: "eve@x.io".into(), state: PersonState::Shared, line: "Shared".into() },
+        ];
+        let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
+        let (_, texts) = block_frame(at_rest, Vec::new());
+        let eves = texts.iter().filter(|(t, _)| t == SHOW_FINGERPRINT).map(|(_, r)| r.center()).last().expect("eve's Show");
+        let fetching = super::super::detail::PeopleSharing { people: &people_lines, fingerprinting: Some("anna@x.io"), ..Default::default() };
+        let (action, texts) = block_frame(fetching, click(eves));
+        assert_eq!(action, DetailAction::None, "a second Show while one is out");
+        assert_eq!(texts.iter().filter(|(t, _)| t == FETCHING_FINGERPRINT).count(), 1, "{texts:?}");
+        assert_eq!(texts.iter().filter(|(t, _)| t == SHOW_FINGERPRINT).count(), 1, "eve's, greyed");
+    }
+
+    /// **A changed key is shared anyway only after its fingerprint is on
+    /// screen**: the button is there but does nothing until Show fingerprint
+    /// has answered for that person, and then the five words come with the
+    /// warning that says to compare them by phone or in person.
+    #[test]
+    fn a_changed_key_is_shared_anyway_only_after_its_fingerprint_is_shown() {
+        use super::super::detail::DetailAction;
+        let people_lines = vec![PersonLine {
+            email: "eve@x.io".into(),
+            state: PersonState::KeyChanged,
+            line: "Their key changed. Check the fingerprint before sharing.".into(),
+        }];
+        let unchecked = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
+        let (_, texts) = block_frame(unchecked, Vec::new());
+        assert!(texts.iter().any(|(t, _)| t == "Key changed"), "the pill: {texts:?}");
+        let anyway = centre_of(&texts, SHARE_ANYWAY_LABEL);
+        assert_eq!(block_frame(unchecked, click(anyway)).0, DetailAction::None, "no fingerprint seen yet");
+        assert!(texts.iter().any(|(t, _)| t == SHOW_FINGERPRINT));
+
+        let someone_elses = super::super::detail::PeopleSharing {
+            people: &people_lines,
+            fingerprint: Some(("anna@x.io", "cobalt-hinge-lantern-mossy-quill")),
+            ..Default::default()
+        };
+        assert_eq!(block_frame(someone_elses, click(anyway)).0, DetailAction::None, "another person's fingerprint");
+
+        let checked = super::super::detail::PeopleSharing {
+            people: &people_lines,
+            fingerprint: Some(("eve@x.io", "cobalt-hinge-lantern-mossy-quill")),
+            ..Default::default()
+        };
+        let (_, texts) = block_frame(checked, Vec::new());
+        assert!(texts.iter().any(|(t, _)| t == "cobalt-hinge-lantern-mossy-quill"));
+        assert!(texts.iter().any(|(t, _)| t == &key_changed_note("eve@x.io")), "{texts:?}");
+        assert!(key_changed_note("eve@x.io").contains("by phone or in person"));
+        let anyway = centre_of(&texts, SHARE_ANYWAY_LABEL);
+        assert_eq!(block_frame(checked, click(anyway)).0, DetailAction::ShareAnyway("eve@x.io".into()));
+    }
+
+    /// **Mock 6b, invite expired**: Re-invite and Stop sharing stay, and
+    /// Re-invite reports the person.
+    #[test]
+    fn an_expired_invite_can_be_renewed() {
+        use super::super::detail::DetailAction;
+        let people_lines = vec![PersonLine {
+            email: "carol@x.io".into(),
+            state: PersonState::Expired,
+            line: "The invite ran out on 3 Oct \u{b7} they never created an account".into(),
+        }];
+        let people = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
+        let (_, texts) = block_frame(people, Vec::new());
+        assert!(texts.iter().any(|(t, _)| t == "Invite expired"));
+        assert!(!texts.iter().any(|(t, _)| t == SHOW_FINGERPRINT), "no key is held for an expired invite");
+        let reinvite = centre_of(&texts, REINVITE_LABEL);
+        assert_eq!(block_frame(people, click(reinvite)).0, DetailAction::Reinvite("carol@x.io".into()));
+    }
+
+    /// **A fingerprint is a read with its own one-at-a-time slot**: asking
+    /// for one leaves the last write's sentence on the card (it is not a
+    /// write), a second while it is out is refused out loud, and its answer
+    /// -- either way -- frees the slot.
+    #[test]
+    fn a_fingerprint_request_keeps_the_notice_and_holds_its_own_slot() {
+        let mut pane = SharingPane::default();
+        pane.notice = Some("Couldn't stop sharing.".into());
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let line = dead_line();
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Fingerprint("Anna@X.io".into())));
+        assert_eq!(pane.notice.as_deref(), Some("Couldn't stop sharing."), "a read clears no sentence");
+        assert_eq!(pane.fingerprinting.as_deref(), Some("anna@x.io"));
+        assert!(!request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Fingerprint("eve@x.io".into())), "one at a time");
+        assert_eq!(pane.notice.as_deref(), Some(FINGERPRINT_BUSY));
+        assert_eq!(pane.fingerprinting.as_deref(), Some("anna@x.io"), "the refused one took nothing over");
+        let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
+        apply(&mut pane, report, 0.0);
+        assert!(pane.fingerprinting.is_none(), "answered, even with a failure: the slot is free");
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(3)).is_err(), "the refused one started nothing");
+    }
+
+    /// The window hands the card what it is in the middle of: the notice and
+    /// the fingerprint being fetched, as well as Task 15's states.
+    #[test]
+    fn the_read_pane_is_handed_the_notice_and_the_fetch() {
+        let item: VaultItem = serde_json::from_value(serde_json::json!({ "id": "r1", "name": "Acme VPN" })).expect("item");
+        let mut pane = SharingPane::default();
+        pane.notice = Some("no".into());
+        pane.fingerprinting = Some("anna@x.io".into());
+        let people = people_sharing(&pane, true, &item, &[]);
+        assert_eq!(people.notice, Some("no"));
+        assert_eq!(people.fingerprinting, Some("anna@x.io"));
+    }
+
+    /// **The share toast** (mock 6a): the sentence, in the dark box, inside
+    /// the pane's bottom right -- and nothing without one.
+    #[test]
+    fn the_share_toast_is_drawn_in_the_panes_corner() {
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let pane_rect = egui::Rect::from_min_max(egui::pos2(400.0, 0.0), egui::pos2(900.0, 700.0));
+        let mut pane = SharingPane::default();
+        let frame = |pane: &SharingPane| {
+            let output = ctx.run_ui(input(), |ui| draw_share_toast(ui, pane_rect, pane));
+            let mut texts = Vec::new();
+            for clipped in &output.shapes {
+                collect_texts(&clipped.shape, &mut texts);
+            }
+            texts
+        };
+        assert!(frame(&pane).is_empty());
+        pane.toast = Some((shared_toast("anna@x.io"), 5.0));
+        let texts = frame(&pane);
+        let (_, at) = texts.iter().find(|(t, _)| *t == shared_toast("anna@x.io")).expect("the toast");
+        assert!(pane_rect.contains_rect(*at), "{at:?}");
+        assert!(at.center().x > pane_rect.center().x && at.center().y > pane_rect.center().y, "bottom right: {at:?}");
     }
 }

@@ -3941,6 +3941,13 @@ pub fn build_frame_with_search(
             // Recompute once per selection change, not every frame -- see
             // `fill_count`'s declaration above.
             fill_count = selected_id.as_deref().map(|id| fill_stats.count(id)).unwrap_or(0);
+            // **A sharing sentence belongs to the record it was said on.**
+            // The SHARING card shows `sharing.notice` until the next write,
+            // and with no write coming it would follow the user from record
+            // to record -- "Couldn't stop sharing" standing on a record that
+            // was never shared. The stop question and the running stop are
+            // keyed by record id already and need nothing here.
+            sharing.notice = None;
             // **Nothing to reset for the delete any more.** This block used
             // to clear a two-click arm here, because an arm set on the
             // previous item would otherwise have been confirmable against
@@ -5008,6 +5015,17 @@ pub fn build_frame_with_search(
                                 &mut breaches,
                                 people,
                             );
+                            // **The share toast, over the pane just drawn**
+                            // (mock 6a): how a share or a stop ended, said in
+                            // the corner the copy confirmation uses. The
+                            // pane's own rect is this `Ui`'s clip rect --
+                            // `draw_detail_read` places the copy toast by the
+                            // very same one. Not while a modal is up, for the
+                            // copy toast's rule: a confirmation belongs to
+                            // the topmost surface, and a modal is topmost.
+                            if !item_list::a_modal_is_up(ui.ctx()) {
+                                share_ui::draw_share_toast(ui, ui.clip_rect(), &sharing);
+                            }
                             // **The re-prompt, in the gating position.** A
                             // refused action becomes `DetailAction::None`
                             // before the match below runs, which is what
@@ -5101,6 +5119,58 @@ pub fn build_frame_with_search(
                                 DetailAction::CancelRevokeSend => {
                                     revoke_asked = Some(send_ui::ReadPaneRevoke::Cancel);
                                 }
+                                // **Design 6b: the SHARING card's people.**
+                                // Stop sharing's first press only puts the
+                                // question up, keyed by THIS record and the
+                                // person, so another record's card never
+                                // draws it.
+                                DetailAction::StopSharing(email) => {
+                                    sharing.stop_confirming = Some((item.id.clone(), email));
+                                }
+                                DetailAction::CancelStopSharing => sharing.stop_confirming = None,
+                                // **Every request's `false` has its sentence
+                                // on the card already, and raised no spinner
+                                // to take down**: `request` puts `stopping`
+                                // up itself, and only once the call has
+                                // started -- so a refusal leaves nothing
+                                // turning. Clearing `stopping` here on a
+                                // refusal would be WRONG, not merely idle:
+                                // a refusal for a write already out means
+                                // `stopping` may be that other stop's
+                                // spinner. The question stays up, so the
+                                // user can press again or Cancel.
+                                DetailAction::ConfirmStopSharing(email) => {
+                                    let call = share_ui::SharingCall::Stop { item_id: item.id.clone(), email };
+                                    let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                                }
+                                DetailAction::Reinvite(email) => {
+                                    let call = share_ui::SharingCall::Reinvite(email);
+                                    let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                                }
+                                // A read with its own slot: `request` marks
+                                // the fetch and refuses a second one aloud.
+                                DetailAction::ShowFingerprint(email) => {
+                                    let call = share_ui::SharingCall::Fingerprint(email);
+                                    let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                                }
+                                // Hiding spends it: Share anyway is for the
+                                // key whose words are ON SCREEN, and after
+                                // this there are none.
+                                DetailAction::HideFingerprint => sharing.fingerprint = None,
+                                // **Only `share_anyway`'s call is ever sent**
+                                // -- a Confirm bound to the key hash of the
+                                // fingerprint that was shown for this very
+                                // person, and `None` unless there is one and
+                                // they are a changed key. The card greys the
+                                // button until then, so `None` here is a
+                                // press the card should not have taken, said
+                                // rather than dropped.
+                                DetailAction::ShareAnyway(email) => match sharing.share_anyway(&email) {
+                                    Some(call) => {
+                                        let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                                    }
+                                    None => sharing.notice = Some(share_ui::CHECK_FINGERPRINT_FIRST.to_string()),
+                                },
                                 // **4a.** The draft is built HERE, from the
                                 // item, for the reason `Edit`'s is: the
                                 // action carries nothing and this scope is
@@ -8572,6 +8642,29 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         | DetailAction::RevokeSend
         | DetailAction::ConfirmRevokeSend
         | DetailAction::CancelRevokeSend
+        // **Design 6b's people controls take access AWAY or re-send an
+        // invitation**: none reads a field of the item, paints one or copies
+        // one. Stop sharing and its two answers take the record out of a
+        // person's vault; Re-invite re-reaches a person the record already
+        // went to, behind the `permit_share` that first sent it. The
+        // fingerprint is a digest of the OTHER person's public key -- public
+        // by construction, and read aloud between the two of them -- not a
+        // secret of this vault.
+        //
+        // **Share anyway is the one that sends something**: the record goes
+        // on to the person's NEW key. What stands in front of that is the
+        // fingerprint and not the master password, and on purpose: the
+        // re-prompt proves who is at THIS keyboard, the danger here is who is
+        // at the other end, and only the comparison answers that. The window
+        // sends nothing but `SharingPane::share_anyway`'s call, bound to the
+        // key whose words were shown, and the engine refuses any other key.
+        | DetailAction::StopSharing(_)
+        | DetailAction::ConfirmStopSharing(_)
+        | DetailAction::CancelStopSharing
+        | DetailAction::Reinvite(_)
+        | DetailAction::ShowFingerprint(_)
+        | DetailAction::HideFingerprint
+        | DetailAction::ShareAnyway(_)
         // Closing the pane HIDES the item; there is nothing here to prove a
         // master password for.
         | DetailAction::ClosePane

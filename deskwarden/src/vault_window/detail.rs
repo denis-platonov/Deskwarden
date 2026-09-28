@@ -270,6 +270,10 @@ pub(crate) const ROW_PAD_Y: i8 = 13;
 /// moving this row out of `LOGIN CREDENTIALS` was for.
 pub(crate) const TOTP_CARD_HEADING: &str = "ONE-TIME CODE";
 const CARD_HEADING_SIZE: f32 = 12.0;
+/// 6b's `.chead .side`: 11px, and `gap: 10px` from the caption -- see
+/// [`card_with_side`].
+const CARD_SIDE_SIZE: f32 = 11.0;
+const CARD_SIDE_GAP: f32 = 10.0;
 const CARD_HEADING_TRACKING: f32 = 0.72;
 /// `gap: 16px` between a row's label column, its value and its controls.
 const ROW_GAP: f32 = 16.0;
@@ -650,6 +654,32 @@ pub enum DetailAction {
     /// The confirmation's way out. Drawn where Revoke was, so a second rapid
     /// click lands on it rather than on the destructive button.
     CancelRevokeSend,
+    /// **Design 6b** -- a person's Stop sharing was pressed: step one of two,
+    /// which arms the question and takes nothing away. Carries the person's
+    /// address; the window pairs it with the record on screen.
+    ///
+    /// This and the six after it are on the **non**-exposing side of
+    /// `detail_action_exposes_secrets`, where each is argued: none reads a
+    /// field of the item, paints one or copies one, and the one that sends
+    /// the record anywhere -- Share anyway -- is gated by the fingerprint
+    /// comparison instead.
+    StopSharing(String),
+    /// Step two: the question's `Remove from their vault`.
+    ConfirmStopSharing(String),
+    /// The question's way out, drawn where Stop sharing was -- the Revoke
+    /// pattern above, for a person.
+    CancelStopSharing,
+    /// A fresh invitation for a person whose invite ran out, or who has no
+    /// account yet (spec 6.1).
+    Reinvite(String),
+    /// Fetch and show a person's fingerprint phrase. A read of a public key's
+    /// digest, not a secret of this vault.
+    ShowFingerprint(String),
+    HideFingerprint,
+    /// Confirm a person whose key changed, after the fingerprint was shown.
+    /// The window sends only `SharingPane::share_anyway`'s call, which binds
+    /// the confirm to the key whose words were on screen.
+    ShareAnyway(String),
     /// **Design 4a** -- open the sequence builder on this item's fill rule.
     ///
     /// Its own act rather than a corner of [`Self::Edit`], because it opens a
@@ -4400,15 +4430,38 @@ pub fn draw_detail_read(
         ui.add_space(CARD_GAP);
     }
 
-    // **Design 5d's SHARING card**, under `MATCHED APP` and above `NOTES`.
+    // **The SHARING card** (designs 5d and 6b), under `MATCHED APP` and above
+    // `NOTES`.
     //
-    // Drawn only while there is a live Send, which is the whole of the pill's
-    // promise: "it always means someone can open this right now, never 'was
-    // shared once'". A card that stood empty saying "not shared" would be the
-    // opposite -- a permanent row about a thing that is not happening.
-    if let Some(shared) = shared {
-        card(ui, SHARING_CARD_HEADING, |ui| {
-            sharing_card(ui, shared, &crate::send::SystemClock, &mut action);
+    // Drawn only while it has something that is happening now: people this
+    // record is shared with, a live Send, or a sharing request's sentence.
+    // That is 5d's promise for the pill -- "it always means someone can open
+    // this right now, never 'was shared once'" -- and a card that stood empty
+    // saying "not shared" would be the opposite, a permanent row about a
+    // thing that is not happening.
+    //
+    // **Design 6b's order**: People first -- round avatar, share pill -- and
+    // the Active Send under them, each block under its own stacked label.
+    // The note closes the card: 6b's, which speaks for both, once there are
+    // people; 5d's while a Send is all there is. A notice goes UNDER the
+    // entries and never above them, so a sentence that arrives while the
+    // pointer is over a row cannot push the row out from under it.
+    let has_people = !people.people.is_empty();
+    if shared.is_some() || has_people || people.notice.is_some() {
+        let side = has_people.then_some(super::share_ui::SHARING_SIDE);
+        card_with_side(ui, SHARING_CARD_HEADING, side, |ui| {
+            if has_people {
+                super::share_ui::draw_people_block(ui, &item.name, &people, &mut action);
+            }
+            if let Some(shared) = shared {
+                sharing_card(ui, shared, &crate::send::SystemClock, &mut action);
+            }
+            let note = if has_people {
+                Some(super::share_ui::PEOPLE_NOTE)
+            } else {
+                shared.map(|_| SHARING_NOTE)
+            };
+            super::share_ui::draw_card_note(ui, people.notice, note);
         });
         ui.add_space(CARD_GAP);
     }
@@ -5948,11 +6001,11 @@ pub struct SharedSend<'a> {
 /// sharing": no Share control, no people, an editable record -- the pane
 /// every caller that is not about sharing draws.
 ///
-/// **Only `share_control` is drawn by this pane yet.** The people, the stop
-/// and fingerprint states and `view_only_from` are carried now so the window
-/// resolves the whole of it in one place (`people_sharing`) and the tasks
-/// that draw the SHARING card and the recipient's view-only header change
-/// what is drawn, not what is passed.
+/// The header's Share control reads `share_control`; the SHARING card reads
+/// the people, the stop and fingerprint states and the notice
+/// (`share_ui::draw_people_block`). `view_only_from` is carried for the
+/// recipient's view-only header, which draws it when it is built, so that
+/// task changes what is drawn and not what is passed.
 #[derive(Clone, Copy, Default)]
 pub struct PeopleSharing<'a> {
     /// The Share control: `Some(true)` shares, `Some(false)` offers a Send
@@ -5965,6 +6018,12 @@ pub struct PeopleSharing<'a> {
     pub stopping: Option<&'a str>,
     /// `(email, phrase)` of the fingerprint on show.
     pub fingerprint: Option<(&'a str, &'a str)>,
+    /// A fingerprint is being fetched for this email: every Show waits.
+    pub fingerprinting: Option<&'a str>,
+    /// A sharing request's sentence -- a refusal, or the engine's answer --
+    /// shown on the SHARING card until the next write. It can name a
+    /// decrypted record, so it is drawn and never logged.
+    pub notice: Option<&'a str>,
     /// A received record: who shares it. The pane is view-only.
     pub view_only_from: Option<&'a str>,
 }
@@ -5988,90 +6047,95 @@ pub struct PeopleSharing<'a> {
 ///
 /// The Sent screen's two steps, in the Sent screen's words: Revoke arms the
 /// question, `Delete permanently` answers it, and Cancel is drawn **exactly
-/// where Revoke was**, with `Send again` stepping back but keeping its room,
-/// so a second rapid click on Revoke lands on the way out. The question and
+/// where Revoke was**, with `Send again` stepping back, so a second rapid
+/// click on Revoke lands on the way out. The question and
 /// the destructive button go UNDER the controls rather than above them, for
 /// the same reason: anything inserted above would push the row down and put
 /// something else under the pointer.
+///
+/// # 6b's shape
+///
+/// A block under its own stacked `Active Send` label, and one entry in it: a
+/// square tile with the paper plane (a Send is a link), `Anyone with the
+/// link` beside the Send's stadium pill, the subtitle under them, and the
+/// controls at the right -- the same entry the People block above draws for
+/// a person, through the same `share_ui` parts, so the two blocks of one card
+/// cannot come to disagree about where a control sits. The controls are laid
+/// right to left, so Cancel takes Revoke's own slot without holding room for
+/// Send again. The card's note is the caller's, drawn after every block.
 fn sharing_card(
     ui: &mut egui::Ui,
     shared: SharedSend<'_>,
     now: &dyn crate::send::SendClock,
     action: &mut DetailAction,
 ) {
+    use super::share_ui::{EntryPill, EntryTile};
     let send = shared.send;
-    row(
-        ui,
-        ACTIVE_SEND_LABEL,
-        |ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 2.0;
-                ui.label(RichText::new(SEND_REACH).size(ROW_VALUE_SIZE).color(theme::INK));
-                ui.label(
-                    RichText::new(crate::vault_window::send_ui::row_subtitle(send, now))
-                        .size(ROW_HINT_SIZE)
-                        .color(theme::TEXT_FAINT),
+    let state = crate::send::send_state(send, now);
+    super::share_ui::sharing_block(ui, super::share_ui::BlockMark::Plane, ACTIVE_SEND_LABEL, |ui| {
+        // The room the controls keep in every state is the resting pair's, so
+        // the question, the running delete and the resting row lay the text
+        // out alike and nothing moves between them.
+        let room = super::share_ui::controls_room(ui, &[REVOKE_LABEL, SEND_AGAIN_LABEL]);
+        super::share_ui::sharing_entry(
+            ui,
+            EntryTile::Send,
+            room,
+            |ui| {
+                super::share_ui::entry_title(
+                    ui,
+                    SEND_REACH,
+                    EntryPill::Send(send_ui::state_tone(state), send_ui::state_label(state)),
                 );
-            });
-        },
-        |_ui| {},
-    );
-    let line = (app_card_content_width(ui) - f32::from(CARD_PAD_X) * 2.0).max(0.0);
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(CARD_PAD_X, ROW_PAD_Y))
-        .show(ui, |ui| {
-            ui.set_width(line);
-            if shared.revoking {
-                // **No widget of any kind** while the delete runs, which is
-                // the Sent screen's rule for the same state: a disabled
-                // button is still a button the layout has to hold, and one
-                // more click here would be a second child for one Send.
-                ui.label(
-                    RichText::new(send_ui::DELETING_LABEL)
-                        .size(ROW_HINT_SIZE)
-                        .color(theme::TEXT_MUTED),
-                );
-                return;
-            }
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = CONTROL_GAP;
+                let _ = super::share_ui::entry_line(ui, &send_ui::row_subtitle(send, now), None);
+            },
+            |ui| {
+                if shared.revoking {
+                    // **No widget of any kind** while the delete runs, which
+                    // is the Sent screen's rule for the same state: a
+                    // disabled button is still a button the layout has to
+                    // hold, and one more click here would be a second child
+                    // for one Send.
+                    ui.label(
+                        RichText::new(send_ui::DELETING_LABEL)
+                            .size(ROW_LABEL_SIZE)
+                            .color(theme::TEXT_MUTED),
+                    );
+                    return;
+                }
                 if shared.confirming {
-                    // `Send again` steps back and its room is kept, so Cancel
-                    // starts at the very pixel Revoke did. `add_space` adds
-                    // no item spacing of its own, so the gap is added here.
-                    let room = theme::row_button_width(ui, SEND_AGAIN_LABEL) + CONTROL_GAP;
-                    ui.add_space(room);
+                    // In Revoke's slot: the first control laid right to left.
                     if theme::row_button(ui, send_ui::CANCEL_LABEL).clicked() {
                         *action = DetailAction::CancelRevokeSend;
                     }
                     return;
                 }
-                // **Send again first, Revoke second**, which is the order the
-                // app card's footer uses for the same reason: the ordinary
-                // action reads first and the one that takes something away
-                // reads last.
-                if theme::row_button(ui, SEND_AGAIN_LABEL)
-                    .on_hover_text("Publish a new link for this record")
-                    .clicked()
-                {
-                    *action = DetailAction::SendRecord;
-                }
-                // In the danger ink now that it deletes, as the Sent screen's
-                // Revoke is red; step one still destroys nothing.
+                // **Revoke first, which puts it RIGHTMOST**, so the row reads
+                // Send again then Revoke -- the app card's footer order, for
+                // its reason: the ordinary action reads first and the one
+                // that takes something away reads last. In the danger ink now
+                // that it deletes, as the Sent screen's Revoke is red; step
+                // one still destroys nothing.
                 if theme::row_button_danger(ui, REVOKE_LABEL)
                     .on_hover_text("Delete this Send, so its link stops working for good")
                     .clicked()
                 {
                     *action = DetailAction::RevokeSend;
                 }
-            });
-            if shared.confirming {
-                ui.add_space(10.0);
-                ui.label(
+                if theme::row_button(ui, SEND_AGAIN_LABEL)
+                    .on_hover_text("Publish a new link for this record")
+                    .clicked()
+                {
+                    *action = DetailAction::SendRecord;
+                }
+            },
+        );
+        if shared.confirming && !shared.revoking {
+            super::share_ui::entry_extra(ui, |ui| {
+                ui.add(egui::Label::new(
                     theme::semibold(send_ui::CONFIRM_PROMPT, ROW_VALUE_SIZE).color(theme::ERROR),
-                );
-                ui.add_space(8.0);
+                ).wrap());
+                ui.add_space(10.0);
                 // Cancel wins an ambiguous frame: the safe answer to one on a
                 // destructive control is not to destroy.
                 if theme::destructive_button(ui, send_ui::CONFIRM_LABEL).clicked()
@@ -6079,17 +6143,9 @@ fn sharing_card(
                 {
                     *action = DetailAction::ConfirmRevokeSend;
                 }
-            }
-        });
-    row(
-        ui,
-        "",
-        |ui| {
-            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-            ui.label(RichText::new(SHARING_NOTE).size(ROW_HINT_SIZE).color(theme::TEXT_GHOST));
-        },
-        |_ui| {},
-    );
+            });
+        }
+    });
 }
 
 // **There is no `Edit the sequence` entry**, and the long argument for where
@@ -6197,6 +6253,25 @@ fn unsupported_card(ui: &mut egui::Ui, pane: &UnsupportedPane) {
 /// row's own and not the card's. `contents` therefore draws [`row`]s (or
 /// [`card_text`]), never bare labels.
 fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    card_with_side(ui, title, None, contents);
+}
+
+/// [`card`], with an optional **side note at the heading band's right** --
+/// design 6b's `.chead .side` (`margin-left: auto; 11px; weight 400; no
+/// tracking; ghost`), which the SHARING card wears once it lists people.
+///
+/// **Painted, not laid out**: the note goes onto the band after the band is
+/// drawn, so the band keeps 2b's height and the caption its optical drop
+/// whether or not a card has one -- a `horizontal` holding both would floor
+/// the band at `interact_size.y` and move every row under it. A note that
+/// would run into the caption on a narrow pane is left out: it restates
+/// what the card's own note says in full, so it is the part that can go.
+fn card_with_side(
+    ui: &mut egui::Ui,
+    title: &str,
+    side: Option<&str>,
+    contents: impl FnOnce(&mut egui::Ui),
+) {
     egui::Frame::new()
         .fill(theme::CARD)
         .corner_radius(CornerRadius::same(10))
@@ -6217,7 +6292,7 @@ fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
                 None,
             )
             .round() as i8;
-            egui::Frame::new()
+            let band = egui::Frame::new()
                 .inner_margin(Margin {
                     left: CARD_PAD_X,
                     right: CARD_PAD_X,
@@ -6232,8 +6307,27 @@ fn card(ui: &mut egui::Ui, title: &str, contents: impl FnOnce(&mut egui::Ui)) {
                         theme::BOLD,
                         CARD_HEADING_TRACKING,
                         theme::TEXT_MUTED,
-                    ));
+                    ))
+                    .rect
                 });
+            if let Some(side) = side {
+                let caption = band.inner;
+                let band = band.response.rect;
+                let galley = ui.painter().layout_no_wrap(
+                    side.to_string(),
+                    egui::FontId::proportional(CARD_SIDE_SIZE),
+                    theme::TEXT_GHOST,
+                );
+                // Box-centred in the band: the note is mixed case, so the
+                // capitals' optical drop is not its to take.
+                let at = egui::pos2(
+                    band.right() - f32::from(CARD_PAD_X) - galley.size().x,
+                    band.center().y - galley.size().y / 2.0,
+                );
+                if at.x >= caption.right() + CARD_SIDE_GAP {
+                    ui.painter().galley(at, galley, theme::TEXT_GHOST);
+                }
+            }
             // The heading's `border-bottom`, which is the card's own `#eae7e7`
             // and NOT the lighter rule that goes between rows.
             theme::hairline(ui);
@@ -9998,6 +10092,11 @@ mod tests {
         /// The header's Share control, as `share_ui::share_control` would
         /// resolve it. None unless a test sets it.
         share_control: Option<bool>,
+        /// Design 6b's people on the SHARING card, and a standing sharing
+        /// sentence -- empty and `None` unless a test sets them (see
+        /// [`Pane::with_people`] and [`Pane::with_sharing_notice`]).
+        people: Vec<crate::vault_window::share_ui::PersonLine>,
+        sharing_notice: Option<String>,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -10437,6 +10536,8 @@ mod tests {
                 reveal_totp_seed: false,
                 shared: None,
                 share_control: None,
+                people: Vec::new(),
+                sharing_notice: None,
             }
         }
 
@@ -10444,6 +10545,18 @@ mod tests {
         /// shares, `false` offers a Send instead (`share_ui::share_control`).
         fn with_share_control(mut self, offered: bool) -> Self {
             self.share_control = Some(offered);
+            self
+        }
+
+        /// The same pane, on a record shared with these people (design 6b).
+        fn with_people(mut self, people: Vec<crate::vault_window::share_ui::PersonLine>) -> Self {
+            self.people = people;
+            self
+        }
+
+        /// The same pane, with a sharing request's sentence standing.
+        fn with_sharing_notice(mut self, notice: &str) -> Self {
+            self.sharing_notice = Some(notice.to_string());
             self
         }
 
@@ -10529,7 +10642,12 @@ mod tests {
                         false,
                         self.reveal_totp_seed,
                         &mut inert_breach_cache(),
-                        PeopleSharing { share_control: self.share_control, ..PeopleSharing::default() });
+                        PeopleSharing {
+                            share_control: self.share_control,
+                            people: &self.people,
+                            notice: self.sharing_notice.as_deref(),
+                            ..PeopleSharing::default()
+                        });
                 },
             );
             let mut frame = Frame {
@@ -12867,10 +12985,20 @@ mod tests {
         // heading is `UNSUPPORTED ITEM` and is in the list under that name.
         // Real call sites only: a doc comment naming `card(ui, ...)` is a
         // mention, not a card, and three of them are in this file.
+        //
+        // A card with a heading side note (6b's SHARING card) is called as
+        // `card_with_side(ui, ...)`, and counts; `card`'s own body, which
+        // forwards its caller's `title` with no side note, is the one such
+        // line that is not a card of its own.
         let calls = source
             .lines()
             .map(str::trim_end)
-            .filter(|line| line.trim_start().starts_with("card(ui, "))
+            .filter(|line| {
+                let line = line.trim_start();
+                line.starts_with("card(ui, ")
+                    || (line.starts_with("card_with_side(ui, ")
+                        && !line.starts_with("card_with_side(ui, title, None, contents)"))
+            })
             .count();
         assert_eq!(
             calls,
@@ -18960,6 +19088,121 @@ mod tests {
             busy_pane.click(&item, &totp, revoke_at).action,
             DetailAction::None,
             "a click where Revoke was reported something while the delete runs"
+        );
+    }
+
+    // ------------------------------------------------ 6b's SHARING card
+
+    fn anna_shared() -> Vec<crate::vault_window::share_ui::PersonLine> {
+        vec![crate::vault_window::share_ui::PersonLine {
+            email: "anna@x.io".to_string(),
+            state: crate::rest::sharing::PersonState::Shared,
+            line: "Shared \u{b7} since 14 Sep".to_string(),
+        }]
+    }
+
+    /// **Design 6b's order and words.** People alone draw the card -- a
+    /// record shared with a person and never sent is still shared. With a
+    /// Send out too, People come first and the Active Send under them, each
+    /// under its stacked label; the heading gains 6b's side note, and 6b's
+    /// note, which speaks for both blocks, replaces 5d's. A Send alone is
+    /// 5d's card as it was, and a record with neither draws no card.
+    #[test]
+    fn the_sharing_card_lists_people_above_the_active_send() {
+        let item = a_login();
+        let totp = TotpState::NoSecret;
+
+        let people_only = Pane::new().with_people(anna_shared()).idle(&item, &totp);
+        assert!(people_only.painted(SHARING_CARD_HEADING), "{:?}", people_only.strings());
+        assert!(people_only.painted("anna@x.io") && people_only.painted(crate::vault_window::share_ui::STOP_LABEL));
+        assert!(people_only.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
+        assert!(!people_only.painted(ACTIVE_SEND_LABEL), "an Active Send with no Send out");
+
+        let both = Pane::new().with_people(anna_shared()).sharing(a_live_send(), false, false).idle(&item, &totp);
+        let people_label = both.rect_of("People");
+        let send_label = both.rect_of(ACTIVE_SEND_LABEL);
+        assert!(people_label.bottom() < send_label.top(), "People are not above the Active Send");
+        assert!(both.rect_of("anna@x.io").bottom() < send_label.top());
+        assert!(send_label.bottom() < both.rect_of(SEND_REACH).top(), "the label is stacked over its entry");
+        assert!(both.painted(crate::vault_window::share_ui::SHARING_SIDE), "{:?}", both.strings());
+        assert!(both.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
+        assert!(!both.painted(SHARING_NOTE), "two notes on one card");
+        assert_eq!(
+            both.card_headings().iter().filter(|(h, _)| *h == SHARING_CARD_HEADING).count(),
+            1,
+            "one SHARING card for both blocks"
+        );
+
+        let send_only = Pane::new().sharing(a_live_send(), false, false).idle(&item, &totp);
+        assert!(send_only.painted(SHARING_NOTE));
+        assert!(!send_only.painted(crate::vault_window::share_ui::PEOPLE_NOTE));
+        assert!(!send_only.painted(crate::vault_window::share_ui::SHARING_SIDE), "the side note is about people");
+
+        let neither = Pane::new().idle(&item, &totp);
+        assert!(!neither.painted(SHARING_CARD_HEADING));
+    }
+
+    /// **A sharing sentence is drawn on the card, at its foot** -- the
+    /// engine's words can name a decrypted record, so the screen is their
+    /// one place -- and it draws the card by itself when there is nothing
+    /// else to show: a share that failed with its dialog closed leaves a
+    /// record with no people and no Send, and the sentence must still be
+    /// seen. It sits under the entries, so it moves none of them.
+    #[test]
+    fn a_sharing_notice_is_drawn_at_the_foot_of_the_card() {
+        let item = a_login();
+        let totp = TotpState::NoSecret;
+        let notice = "Couldn't stop sharing Acme VPN.";
+
+        let alone = Pane::new().with_sharing_notice(notice).idle(&item, &totp);
+        assert!(alone.painted(SHARING_CARD_HEADING), "{:?}", alone.strings());
+        assert!(alone.painted(notice));
+
+        let quiet = Pane::new().with_people(anna_shared()).idle(&item, &totp);
+        let saying = Pane::new().with_people(anna_shared()).with_sharing_notice(notice).idle(&item, &totp);
+        assert!(saying.rect_of(notice).top() > saying.rect_of("anna@x.io").bottom());
+        assert!(saying.rect_of(notice).bottom() <= saying.rect_of(crate::vault_window::share_ui::PEOPLE_NOTE).top());
+        assert_eq!(
+            quiet.rect_of(crate::vault_window::share_ui::STOP_LABEL),
+            saying.rect_of(crate::vault_window::share_ui::STOP_LABEL),
+            "the sentence moved a control"
+        );
+    }
+
+    /// **At the narrowest pane the people's controls go under their
+    /// words** rather than squeezing the address to nothing -- and every
+    /// control is still inside the card, where it can be pressed.
+    #[test]
+    fn at_the_narrowest_pane_a_persons_controls_stay_on_the_card() {
+        let item = a_login();
+        let totp = TotpState::NoSecret;
+        let mut people = anna_shared();
+        people.push(crate::vault_window::share_ui::PersonLine {
+            email: "carol@x.io".to_string(),
+            state: crate::rest::sharing::PersonState::WaitingAccount,
+            line: "Waiting to create an account \u{b7} 6 days left".to_string(),
+        });
+        let mut pane = Pane::wide(MIN_PANE).with_people(people);
+        let frame = pane.idle(&item, &totp);
+        let card_right = MIN_PANE - f32::from(BODY_PAD_X);
+        let reinvite = frame.rect_of(crate::vault_window::share_ui::REINVITE_LABEL);
+        assert!(reinvite.right() <= card_right && reinvite.left() >= 0.0, "{reinvite:?} is off the card");
+        let carol = frame.rect_of("carol@x.io");
+        assert!(reinvite.top() > carol.bottom(), "the controls did not go under the words");
+        assert!(
+            frame.rendered_glyphs("carol@x.io").contains("carol"),
+            "the address was squeezed to nothing"
+        );
+        let stop = frame
+            .texts
+            .iter()
+            .filter(|(t, _)| t == crate::vault_window::share_ui::STOP_LABEL)
+            .map(|(_, r)| *r)
+            .next()
+            .expect("anna's Stop sharing");
+        assert_eq!(
+            pane.click(&item, &totp, stop.center()).action,
+            DetailAction::StopSharing("anna@x.io".to_string())
         );
     }
 
