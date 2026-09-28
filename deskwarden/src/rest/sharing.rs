@@ -245,6 +245,25 @@ pub struct StopOutcome {
     pub changed: SharingOutcome,
 }
 
+/// What forgetting a person did -- see [`Sharing::forget`].
+///
+/// **No `Clone`**, unlike its siblings: `failed` holds a [`SharingError`],
+/// which has none (its [`VaultError`] has none).
+#[derive(Debug, Default)]
+pub struct ForgetOutcome {
+    /// The records (old ids) that stopped being shared with them.
+    pub stopped: Vec<String>,
+    /// What those stops changed on the server, for the daemon's copy --
+    /// **also when `failed` is set**: a stop that landed before a later step
+    /// failed is still a change the daemon must file and announce.
+    pub changed: SharingOutcome,
+    /// Why the forget did not finish, when it did not: the sentence to show
+    /// (or the session's own error). The person is NOT forgotten then --
+    /// their membership, collection and pin are whatever the steps before
+    /// the failure left -- and a Retry is the same call.
+    pub failed: Option<SharingError>,
+}
+
 // ---- the engine's own types -----------------------------------------------------
 
 /// What set off a pass (spec 11.5's triggers).
@@ -1724,6 +1743,178 @@ impl Sharing {
     }
 }
 
+// ---- people -----------------------------------------------------------------------
+
+/// A forget some of whose stops failed: how many records it could not stop.
+/// Counted, not said to be still visible to them -- a failed stop on a record whose
+/// move back is pending may not be one the person can still see (see
+/// [`Sharing::finish_pending`]), and this sentence is true either way.
+fn forget_unstopped(email: &str, count: usize) -> String {
+    let records = if count == 1 { "one record".to_string() } else { format!("{count} records") };
+    format!("Couldn't forget {email}. Sharing couldn't be stopped on {records}.")
+}
+
+impl Sharing {
+    /// **Forget a person** (spec 6.8, the ✕ on a suggestion): every record
+    /// shared with them stopped, their membership or invitation removed,
+    /// their collection deleted, their pin forgotten. `items` is the daemon's
+    /// vault, which says which records are filed in their collection.
+    ///
+    /// The address book (`sent_history`) is the window's to prune, after it
+    /// has deleted the person's Sends -- the existing forget question does
+    /// both halves in one answer (spec 11.7).
+    ///
+    /// # A stop that fails part-way
+    ///
+    /// Every record is still tried: one that cannot stop (an attachment, the
+    /// trash, a server that refused) must not keep the others shared. But
+    /// **nothing after the stops runs while one failed**: [`Self::stop_with`]
+    /// refuses only while the record is (or may be) still theirs, so removing
+    /// the membership or deleting the collection then would report the person
+    /// forgotten while they can still see something -- and would take away
+    /// the collection the Retry finds that record by. Their pin stays too, so
+    /// the key they joined with is still the one checked. Removing the
+    /// membership FIRST, to cut them off whatever the stops did, was the
+    /// alternative; it was not taken because the record it strands is still
+    /// filed in their collection in an org they have left, shared with nobody
+    /// and never coming home.
+    ///
+    /// A session that ended (or sharing gone) ends the loop at once: every
+    /// later stop would fail the same way.
+    ///
+    /// # Why a failure rides in the outcome
+    ///
+    /// Once one stop has landed, the call's answer is `Ok` with
+    /// [`ForgetOutcome::failed`] set, not `Err`: an `Err` would drop the
+    /// stops already made -- a record moved home, another unfiled -- and the
+    /// daemon would keep showing the person on them until its next whole
+    /// read. `vault_api`'s route files and announces `changed`, then answers
+    /// the refusal. Pinned by
+    /// `a_refused_forget_through_the_daemon_still_announces_what_it_stopped`.
+    ///
+    /// # Errors
+    ///
+    /// Before anything was written: the sentence to show, or the backend's
+    /// failure. The account's own address is refused ([`YOURSELF`]) -- its
+    /// membership is the org's owner.
+    pub fn forget(&self, email: &str, items: &[VaultItem]) -> Result<ForgetOutcome, SharingError> {
+        let _one = self.one_at_a_time();
+        let ctx = self.context()?;
+        let email = normalise_email(email);
+        if email == normalise_email(&ctx.account.email) {
+            return Err(SharingError::Refused(YOURSELF.to_string()));
+        }
+        let mut outcome = ForgetOutcome::default();
+        let collection = ctx.collection_for(&email).map(str::to_string);
+        outcome.failed = 'forget: {
+            if let Some(collection) = &collection {
+                let records: Vec<String> = items
+                    .iter()
+                    .filter(|item| organization_of(item) == Some(ctx.org_id.as_str()))
+                    .filter(|item| collection_ids_of(item).contains(&collection.as_str()))
+                    .map(|item| item.id.clone())
+                    .collect();
+                let mut unstopped = 0;
+                for id in records {
+                    match self.stop_with(&ctx, &id, &email) {
+                        Ok(stopped) => {
+                            outcome.stopped.push(id);
+                            outcome.changed.upserted.extend(stopped.changed.upserted);
+                            outcome.changed.removed.extend(stopped.changed.removed);
+                        }
+                        Err(ended @ (SharingError::Vault(VaultError::Unauthorized) | SharingError::Unavailable(_))) => {
+                            break 'forget Some(ended);
+                        }
+                        Err(e) => {
+                            log::info!("a record could not be stopped while forgetting a person: {e}");
+                            unstopped += 1;
+                        }
+                    }
+                }
+                if unstopped > 0 {
+                    break 'forget Some(SharingError::Refused(forget_unstopped(&email, unstopped)));
+                }
+            }
+            // Past the stops, the person can see nothing of ours: the
+            // sentence for a later step says so, and the server's own words
+            // follow it (`or_say`).
+            let unfinished = format!("Sharing with {email} has stopped, but Deskwarden couldn't finish forgetting them. Try again.");
+            let roster = match self.fetch_roster(&ctx.org_id) {
+                Ok(roster) => roster,
+                Err(e) => break 'forget Some(e),
+            };
+            if let Some(member) = roster.into_iter().find(|m| normalise_email(&m.email) == email) {
+                if let Err(e) = self.call(|client, auth| sharing_api::remove_user(client, &mut auth.session, &ctx.org_id, &member.id)) {
+                    break 'forget Some(e.or_say(&unfinished));
+                }
+            }
+            if let Some(collection) = &collection {
+                if let Err(e) = self.call(|client, auth| sharing_api::delete_collection(client, &mut auth.session, &ctx.org_id, collection)) {
+                    break 'forget Some(e.or_say(&unfinished));
+                }
+            }
+            None
+        };
+        if outcome.failed.is_none() {
+            if let Some(path) = self.setup().state_path {
+                if let Err(e) = crate::sharing_state::update(&path, |state| state.account_mut(&ctx.account.id).forget_person(&email)) {
+                    log::warn!("a forgotten person's pin could not be dropped: {e}");
+                }
+            }
+            let mut held = self.held();
+            held.key_changed.remove(&email);
+            held.no_key.remove(&email);
+        }
+        if let Err(e) = self.reload_org(&ctx) {
+            log::info!("the sharing view could not be re-read after a forget: {e}");
+        }
+        Ok(outcome)
+    }
+
+    /// **Re-invite** (spec 6.1's Re-invite action): a pending invitation is
+    /// renewed -- a new token and a new 7 days, expired or not; anyone else
+    /// without access to their collection is invited again the way a share
+    /// would ([`Self::ensure_member`]: the direct add when they have an
+    /// account, an invitation when not). Someone who still has access is left
+    /// as they are, and the answer says which of the three they are.
+    ///
+    /// The address is checked as a share checks it: the route takes any
+    /// body, and the second branch can create a collection.
+    ///
+    /// # Errors
+    ///
+    /// The sentence to show, or the backend's failure.
+    pub fn reinvite(&self, email: &str) -> Result<ShareResult, SharingError> {
+        let _one = self.one_at_a_time();
+        let mut ctx = self.context()?;
+        let email = normalise_email(email);
+        if !plausible_email(&email) {
+            return Err(SharingError::Refused(NOT_AN_EMAIL.to_string()));
+        }
+        if email == normalise_email(&ctx.account.email) {
+            return Err(SharingError::Refused(YOURSELF.to_string()));
+        }
+        let refused = format!("Couldn't re-invite {email}.");
+        let roster = self.fetch_roster(&ctx.org_id)?;
+        let result = match roster.iter().find(|m| normalise_email(&m.email) == email) {
+            Some(member) if member.status == MemberStatus::Invited => {
+                let ou = member.id.clone();
+                self.call(|client, auth| sharing_api::reinvite(client, &mut auth.session, &ctx.org_id, &ou))
+                    .map_err(|e| e.or_say(&refused))?;
+                ShareResult::WaitingAccount
+            }
+            _ => {
+                let collection = self.ensure_collection(&mut ctx, &email)?;
+                self.ensure_member(&ctx, &email, &collection)?
+            }
+        };
+        if let Err(e) = self.reload_org(&ctx) {
+            log::info!("the sharing view could not be re-read after a re-invite: {e}");
+        }
+        Ok(result)
+    }
+}
+
 /// Spec 6.1's table, as a function of the roster row, the collection and
 /// what the confirm pass learned.
 fn person_state(member: Option<&Member>, collection_id: &str, held: &Held, now: i64) -> PersonState {
@@ -3197,5 +3388,212 @@ mod tests {
             "{changes:?}"
         );
         assert!(cache.get_by_id("p-new").is_some(), "the personal copy is in the daemon's vault");
+    }
+
+    // ---- forgetting a person, and re-inviting one (Task 11) ----------------------
+
+    /// **Forget X** (spec 6.8): every share with X stopped -- a record shared
+    /// with others loses X, a record shared only with X comes home -- then
+    /// X's membership removed, X's collection deleted, and X's pin forgotten.
+    #[test]
+    fn forgetting_a_person_stops_every_share_removes_them_and_deletes_their_collection() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            state.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", crate::sharing_state::Pin { sha256: "ab".into(), user_id: "anna-id".into(), at: 1 });
+        }).expect("seeded");
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com"), person_collection("c-bob", "bob@example.com")]);
+        with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]);
+        server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Both", &["c-anna", "c-bob"]).to_string()).create();
+        server.mock("GET", "/api/ciphers/s2").with_body(shared_cipher("s2", "Only anna", &["c-anna"]).to_string()).create();
+        let off = server.mock("PUT", "/api/ciphers/s1/collections").match_body(Matcher::Json(serde_json::json!({ "collectionIds": ["c-bob"] })))
+            .with_body(shared_cipher("s1", "Both", &["c-bob"]).to_string()).expect(1).create();
+        server.mock("POST", "/api/ciphers").with_body_from_request(echo("p2", None, &[])).expect(1).create();
+        server.mock("PUT", "/api/ciphers/s2/collections").with_body(shared_cipher("s2", "Only anna", &[]).to_string()).create();
+        server.mock("DELETE", "/api/ciphers/s2/delete").with_status(204).create();
+        let member = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id").as_str()).with_status(204).expect(1).create();
+        let collection = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/collections/c-anna").as_str()).with_status(204).expect(1).create();
+        let items: Vec<VaultItem> = [shared_cipher("s1", "Both", &["c-anna", "c-bob"]), shared_cipher("s2", "Only anna", &["c-anna"])]
+            .iter()
+            .map(|raw| serde_json::from_value(serde_json::json!({ "id": raw["id"], "name": "x", "organizationId": raw["organizationId"], "collectionIds": raw["collectionIds"] })).expect("an item"))
+            .collect();
+        let outcome = engine.forget("anna@example.com", &items).expect("forgotten");
+        off.assert();
+        member.assert();
+        collection.assert();
+        assert_eq!(outcome.stopped, ["s1", "s2"]);
+        assert!(outcome.changed.removed.contains(&"s2".to_string()));
+        let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert!(state.pin_for("anna@example.com").is_none());
+    }
+
+    /// **Re-invite** (spec 6.5): a pending invitation gets a new token and 7
+    /// days; a person who is gone is invited again.
+    #[test]
+    fn reinviting_renews_an_invitation_and_invites_a_gone_person_again() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[person_collection("c-carol", "carol@example.com"), person_collection("c-gus", "gus@example.com")]);
+        with_roster(&mut server, &[roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"])]);
+        let renewed = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/inv-carol/reinvite").as_str()).with_body("").expect(1).create();
+        assert_eq!(engine.reinvite("carol@example.com").expect("renewed"), ShareResult::WaitingAccount);
+        renewed.assert();
+
+        server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=gus%40example.com").as_str()).with_status(404).create();
+        let invited = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
+            .with_body(r#"{"id":"inv-gus","status":0,"object":"organizationInvitation"}"#).expect(1).create();
+        assert_eq!(engine.reinvite("gus@example.com").expect("invited"), ShareResult::WaitingAccount);
+        invited.assert();
+    }
+
+    /// The daemon's items for these server records: what `forget` reads to
+    /// find the records filed in a person's collection.
+    fn items_of(records: &[serde_json::Value]) -> Vec<VaultItem> {
+        records
+            .iter()
+            .map(|raw| {
+                serde_json::from_value(serde_json::json!({
+                    "id": raw["id"], "name": raw["id"], "organizationId": raw["organizationId"], "collectionIds": raw["collectionIds"]
+                }))
+                .expect("an item")
+            })
+            .collect()
+    }
+
+    /// Anna, pinned and confirmed, with her own collection and bob's beside
+    /// it; `s1` (an attachment, filed for anna alone -- it cannot come home)
+    /// and `s2` (anna and bob) on the server; `s2`'s unfile for anna answers.
+    /// Returns `s1` and `s2` as the server has them, and the unfile.
+    fn anna_on_a_stuck_record_and_a_shared_one(server: &mut MockServer, dir: &crate::test_scratch::ScratchDir) -> ([serde_json::Value; 2], crate::test_http::Mock) {
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            state.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", crate::sharing_state::Pin { sha256: "ab".into(), user_id: "anna-id".into(), at: 1 });
+        }).expect("seeded");
+        with_collections(server, &[person_collection("c-anna", "anna@example.com"), person_collection("c-bob", "bob@example.com")]);
+        with_roster(server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]);
+        let mut stuck = shared_cipher("s1", "Has a file", &["c-anna"]);
+        stuck["attachments"] = serde_json::json!([{ "id": "a1", "fileName": "2.x|y|z" }]);
+        let both = shared_cipher("s2", "Both", &["c-anna", "c-bob"]);
+        server.mock("GET", "/api/ciphers/s1").with_body(stuck.to_string()).create();
+        server.mock("GET", "/api/ciphers/s2").with_body(both.to_string()).create();
+        let off = server
+            .mock("PUT", "/api/ciphers/s2/collections")
+            .match_body(Matcher::Json(serde_json::json!({ "collectionIds": ["c-bob"] })))
+            .with_body(shared_cipher("s2", "Both", &["c-bob"]).to_string())
+            .expect(1)
+            .create();
+        ([stuck, both], off)
+    }
+
+    /// **A forget that cannot stop every record keeps the person** -- this
+    /// build's answer to a stop failing part-way (spec 6.8 leaves it open).
+    /// Every record is tried: the one that will not stop (an attachment
+    /// cannot come home) does not keep the others shared. But while anna can
+    /// still see it, nothing makes the forget look done: no membership
+    /// removed, no collection deleted, the pin kept, and a refusal that says
+    /// how many records did not stop. What DID stop is in the outcome.
+    #[test]
+    fn a_forget_that_cannot_stop_one_record_keeps_the_person_and_says_so() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let (records, off) = anna_on_a_stuck_record_and_a_shared_one(&mut server, &dir);
+        let creates = server.mock("POST", Matcher::Any).expect(0).create();
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        let outcome = engine.forget("anna@example.com", &items_of(&records)).expect("the stops were tried");
+        off.assert();
+        creates.assert();
+        deletes.assert();
+        assert_eq!(outcome.stopped, ["s2"], "the stuck record is not reported stopped");
+        assert_eq!(outcome.changed.upserted.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["s2"]);
+        match &outcome.failed {
+            Some(SharingError::Refused(said)) => {
+                assert_eq!(said, "Couldn't forget anna@example.com. Sharing couldn't be stopped on one record.");
+            }
+            other => panic!("expected the forget's refusal, got {other:?}"),
+        }
+        let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert!(state.pin_for("anna@example.com").is_some(), "a person who can still see a record keeps their pin");
+    }
+
+    /// **A membership the server will not remove leaves the forget
+    /// unfinished, in words that are true**: every record has stopped, so
+    /// the sentence says sharing has. The collection and the pin wait for the
+    /// Retry, which is the same call and finishes it.
+    #[test]
+    fn a_membership_that_will_not_go_says_sharing_stopped_and_a_retry_finishes() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let state_path = dir.join("sharing_state.json");
+        crate::sharing_state::update(&state_path, |state| {
+            state.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", crate::sharing_state::Pin { sha256: "ab".into(), user_id: "anna-id".into(), at: 1 });
+        }).expect("seeded");
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]);
+        let member_path = format!("/api/organizations/{FIXTURE_ORG}/users/anna-id");
+        let collection_path = format!("/api/organizations/{FIXTURE_ORG}/collections/c-anna");
+        let refused = server.mock("DELETE", member_path.as_str()).with_status(500).expect(1).create();
+        let kept = server.mock("DELETE", collection_path.as_str()).with_status(204).expect(0).create();
+        let outcome = engine.forget("anna@example.com", &[]).expect("tried");
+        refused.assert();
+        kept.assert();
+        match &outcome.failed {
+            Some(SharingError::Refused(said)) => assert_eq!(
+                said,
+                "Sharing with anna@example.com has stopped, but Deskwarden couldn't finish forgetting them. Try again."
+            ),
+            other => panic!("expected the unfinished sentence, got {other:?}"),
+        }
+        assert!(crate::sharing_state::SharingState::load(&state_path).account(FIXTURE_USER_ID).pin_for("anna@example.com").is_some());
+
+        let removed = server.mock("DELETE", member_path.as_str()).with_status(204).expect(1).create();
+        let deleted = server.mock("DELETE", collection_path.as_str()).with_status(204).expect(1).create();
+        let outcome = engine.forget("anna@example.com", &[]).expect("finished");
+        removed.assert();
+        deleted.assert();
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+        assert!(crate::sharing_state::SharingState::load(&state_path).account(FIXTURE_USER_ID).pin_for("anna@example.com").is_none());
+    }
+
+    /// **The account's own address is never forgotten**: its membership is
+    /// the org's owner. Refused before anything is written.
+    #[test]
+    fn forgetting_yourself_is_refused_and_nothing_is_written() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[]);
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        assert!(matches!(engine.forget(&FIXTURE_EMAIL.to_uppercase(), &[]), Err(SharingError::Refused(s)) if s == YOURSELF));
+        deletes.assert();
+    }
+
+    /// **Through the daemon, what a refused forget DID stop is still filed
+    /// and announced** -- why `ForgetOutcome` carries its refusal instead of
+    /// the call returning it: an early `Err` would drop the stops that had
+    /// landed, and the daemon would go on showing anna on a record she has
+    /// lost. The route still answers the refusal.
+    #[test]
+    fn a_refused_forget_through_the_daemon_still_announces_what_it_stopped() {
+        let (mut server, cache, api, token) = crate::vault_api::tests::a_daemon();
+        let engine = cache.bridge().sharing().expect("an engine");
+        let dir = crate::test_scratch::ScratchDir::new("sharing-forget-daemon");
+        engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
+        server
+            .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        let (records, off) = anna_on_a_stuck_record_and_a_shared_one(&mut server, &dir);
+        assert!(cache.apply_written_elsewhere(&items_of(&records), &[], cache.epoch().era()), "seeded");
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        let answer = crate::vault_api::tests::ask(&api, "POST", "/sharing/person/forget", Some(&token), r#"{"email":"anna@example.com"}"#);
+        off.assert();
+        deletes.assert();
+        assert_eq!(answer.status, 400, "{}", answer.body);
+        assert!(answer.body.contains("Sharing couldn't be stopped on one record."), "{}", answer.body);
+        let changes = api.feed().wait_after(Some(0), false, std::time::Duration::ZERO).changes;
+        use crate::change_feed::Change;
+        use crate::rest::notifications::Announcement;
+        assert!(
+            matches!(changes.as_slice(), [Change::Vault(Announcement::Item { id, .. }), Change::Sharing] if id == "s2"),
+            "{changes:?}"
+        );
+        let s2 = cache.get_by_id("s2").expect("s2 is held");
+        assert_eq!(collection_ids_of(&s2), ["c-bob"], "the daemon no longer shows anna on s2");
     }
 }

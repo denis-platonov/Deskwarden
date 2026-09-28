@@ -324,6 +324,28 @@ impl SharingClient {
         let data = self.post(&format!("/sharing/item/{item_id}/stop"), serde_json::json!({ "email": email }))?;
         Ok(data.get("movedTo").and_then(serde_json::Value::as_str).map(str::to_string))
     }
+
+    /// `POST /sharing/person/forget`. The records (old ids) stopped.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's. A forget that did not finish
+    /// is one: what it did stop the daemon has already announced.
+    pub fn forget(&self, email: &str) -> Result<Vec<String>, String> {
+        let data = self.post("/sharing/person/forget", serde_json::json!({ "email": email }))?;
+        Ok(serde_json::from_value(data.get("stopped").cloned().unwrap_or_default()).unwrap_or_default())
+    }
+
+    /// `POST /sharing/person/reinvite`.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's.
+    pub fn reinvite(&self, email: &str) -> Result<crate::rest::sharing::ShareResult, String> {
+        let data = self.post("/sharing/person/reinvite", serde_json::json!({ "email": email }))?;
+        serde_json::from_value(data.get("result").cloned().unwrap_or_default())
+            .map_err(|_| "The vault service answered something unreadable.".to_string())
+    }
 }
 
 /// A sharing route's answer: `data` on success, the daemon's `message` -- the
@@ -538,6 +560,39 @@ mod tests {
         home.assert();
         server.mock("POST", "/sharing/item/s-2/stop").with_body(r#"{"success":true,"data":{"movedTo":null}}"#).create();
         assert_eq!(client.stop("s-2", "bob@example.com"), Ok(None));
+    }
+
+    /// **`forget` and `reinvite` name the person in the body**, never the
+    /// path; `forget` reads back the records it stopped, and a forget that
+    /// did not finish is the daemon's sentence.
+    #[test]
+    fn forget_and_reinvite_send_the_person_in_the_body_and_read_the_answer_back() {
+        let mut server = crate::test_http::server();
+        let client = SharingClient::new(&server.url(), &Zeroizing::new(GRANT.to_string()));
+        let body = crate::test_http::Matcher::Json(serde_json::json!({ "email": "anna@example.com" }));
+        let forgot = server
+            .mock("POST", "/sharing/person/forget")
+            .match_body(body.clone())
+            .with_body(r#"{"success":true,"data":{"stopped":["s-1","s-2"]}}"#)
+            .expect(1)
+            .create();
+        assert_eq!(client.forget("anna@example.com"), Ok(vec!["s-1".to_string(), "s-2".to_string()]));
+        forgot.assert();
+        let unfinished = "Couldn't forget anna@example.com. Sharing couldn't be stopped on one record.";
+        server
+            .mock("POST", "/sharing/person/forget")
+            .with_status(400)
+            .with_body(serde_json::json!({ "success": false, "message": unfinished }).to_string())
+            .create();
+        assert_eq!(client.forget("anna@example.com"), Err(unfinished.to_string()));
+        let renewed = server
+            .mock("POST", "/sharing/person/reinvite")
+            .match_body(body)
+            .with_body(r#"{"success":true,"data":{"result":"waitingAccount"}}"#)
+            .expect(1)
+            .create();
+        assert_eq!(client.reinvite("anna@example.com"), Ok(crate::rest::sharing::ShareResult::WaitingAccount));
+        renewed.assert();
     }
 
     /// **What the daemon writes is what a window reads**, and nothing else is.

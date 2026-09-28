@@ -327,6 +327,8 @@ impl VaultApi {
             ("GET", ["sharing"]) => self.sharing_view(),
             ("POST", ["sharing", "item", id]) => self.share_item(id, request.body),
             ("POST", ["sharing", "item", id, "stop"]) => self.stop_sharing(id, request.body),
+            ("POST", ["sharing", "person", "forget"]) => self.forget_person(request.body),
+            ("POST", ["sharing", "person", "reinvite"]) => self.reinvite_person(request.body),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
@@ -525,6 +527,51 @@ impl VaultApi {
             Ok(outcome) => {
                 self.publish_outcome(&outcome.changed, era);
                 ApiResponse::ok(serde_json::json!({ "movedTo": outcome.moved_to }))
+            }
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/person/forget {email}` (spec 11.3). **What the forget
+    /// stopped is filed and announced even when it did not finish**, and then
+    /// the refusal is the answer -- see `Sharing::forget` on why its failure
+    /// rides in the outcome. The era is read before the engine's first round
+    /// trip, as [`Self::share_item`] reads it.
+    fn forget_person(&self, body: &[u8]) -> ApiResponse {
+        let era = self.cache.epoch().era();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let Some(email) = email_in(body) else {
+            return ApiResponse::refused(400, "Say who to forget.");
+        };
+        match engine.forget(&email, &self.cache.items()) {
+            Ok(outcome) => {
+                self.publish_outcome(&outcome.changed, era);
+                match &outcome.failed {
+                    Some(e) => sharing_failed(e),
+                    None => ApiResponse::ok(serde_json::json!({ "stopped": outcome.stopped })),
+                }
+            }
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/person/reinvite {email}` (spec 11.3). Nothing in the
+    /// vault moves, so only `sharing` is announced.
+    fn reinvite_person(&self, body: &[u8]) -> ApiResponse {
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let Some(email) = email_in(body) else {
+            return ApiResponse::refused(400, "Say who to invite.");
+        };
+        match engine.reinvite(&email) {
+            Ok(result) => {
+                self.feed.publish([Change::Sharing]);
+                ApiResponse::ok(serde_json::json!({ "result": result }))
             }
             Err(e) => sharing_failed(&e),
         }
