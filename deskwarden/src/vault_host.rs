@@ -260,6 +260,11 @@ impl HubWorker {
 /// * **A vault that is not loaded takes nothing.** A lock empties the cache,
 ///   and a push arriving after it must not be the thing that fills it again:
 ///   the batch is dropped, and the next unlock loads a vault that has it.
+/// * **The sharing pass runs LAST**, after the batch is published. It makes
+///   round trips of its own (a session's first probes the server), and run
+///   before the publish it held the batch back from every window for their
+///   length. Its own `Sharing` change follows the batch on the feed. Pinned by
+///   `the_vault_batch_is_published_before_the_sharing_pass_runs`.
 fn hub_tick(listener: &HubListener, api: &VaultApi, now: Instant) {
     let cache = api.cache();
     let feed = api.feed();
@@ -291,27 +296,32 @@ fn hub_tick(listener: &HubListener, api: &VaultApi, now: Instant) {
                         changes.len()
                     );
                     api.note_applied(era, before);
-                    api.sharing_pass(Trigger::Batch);
-                    true
+                    Some(Trigger::Batch)
                 }
                 Err(why) => {
                     log::info!("announced changes need the whole vault after all: {why}");
-                    false
+                    None
                 }
             }
         }
-        None => false,
+        None => None,
     };
-    if !applied {
-        match cache.populate() {
-            Ok(_) => {
-                api.forget_applied();
-                api.sharing_pass(Trigger::WholeRead);
-            }
-            Err(e) => log::warn!("the daemon could not re-read the vault after an announcement: {e:?}"),
+    // Which pass the batch calls for, run once it is published: a one-record
+    // apply is a `Batch`, a reload a `WholeRead`, a failed reload none.
+    let pass = applied.or_else(|| match cache.populate() {
+        Ok(_) => {
+            api.forget_applied();
+            Some(Trigger::WholeRead)
         }
-    }
+        Err(e) => {
+            log::warn!("the daemon could not re-read the vault after an announcement: {e:?}");
+            None
+        }
+    });
     feed.publish(announced.into_iter().map(Change::Vault));
+    if let Some(trigger) = pass {
+        api.sharing_pass(trigger);
+    }
 }
 
 /// **The sharing timer** (spec 11.5, trigger 4): how often the daemon asks
@@ -688,6 +698,38 @@ mod tests {
 
         sync.assert();
         record.assert();
+    }
+
+    /// **A window hears the vault batch before the sharing pass runs.** The
+    /// pass makes round trips of its own -- this one, the session's first,
+    /// probes the server -- and a batch published after them reached the
+    /// window only once they were done. Published first, the batch is not
+    /// held up, and the pass's own `Sharing` change follows it.
+    #[test]
+    fn the_vault_batch_is_published_before_the_sharing_pass_runs() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        server.mock("GET", "/api/accounts/revision-date").with_body("1700000000000").expect_at_least(0).create();
+        server.mock("GET", "/api/sync?excludeDomains=true").with_body(sync_payload()).expect(1).create();
+        declare_the_per_id_cipher_route(&mut server);
+        server
+            .mock("GET", "/api/accounts/profile")
+            .with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string())
+            .create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
+        server
+            .mock("GET", "/api/users/user-1/public-key")
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        let api = an_api_over(VaultCache::new(backend));
+        assert_eq!(api.cache().populate().expect("the vault read"), PopulateOutcome::Populated);
+        let (hub, pushes) = a_listener_the_test_can_push_to();
+        pushes.go_live(true);
+        let pushed = Announcement::Item { id: "live-1".to_string(), revision: None };
+        pushes.hear_vault(pushed.clone());
+        hub_tick(&hub, &api, Instant::now());
+        let changes = api.feed().wait_after(Some(0), false, Duration::ZERO).changes;
+        assert_eq!(changes.first(), Some(&Change::Vault(pushed)), "{changes:?}");
+        assert_eq!(changes.last(), Some(&Change::Sharing), "the pass's change comes after the batch: {changes:?}");
     }
 
     fn an_api_over(cache: VaultCache) -> VaultApi {

@@ -825,7 +825,9 @@ fn collection_name(raw: &str, key: Option<&SymmetricKey>) -> Option<String> {
 /// `None` -- rather than an empty list -- for anything else, including a
 /// `{"message":"Not found"}` error body that arrived with a 200. See
 /// [`Roster`] on why that distinction is load-bearing.
-fn map_members(answer: &Value) -> Option<Vec<Member>> {
+///
+/// `pub(crate)` for the sharing engine, which reads a fresh roster through the same reader.
+pub(crate) fn map_members(answer: &Value) -> Option<Vec<Member>> {
     let rows = match answer.get("data") {
         Some(Value::Array(rows)) => rows,
         _ => answer.as_array()?,

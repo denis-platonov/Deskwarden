@@ -52,6 +52,18 @@ pub fn default_path() -> Option<PathBuf> {
     crate::settings::config_dir().map(|dir| dir.join(SENT_HISTORY_FILE_NAME))
 }
 
+/// What an entry records: a Send (a link) or a share (a person). Spec 11.7:
+/// both feed the one address book the Send composer and the Share dialog
+/// suggest from. `Send` by default, so a file from before shares reads
+/// unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SentKind {
+    #[default]
+    Send,
+    Share,
+}
+
 /// One Send this app made from a record.
 ///
 /// `#[serde(default)]` on the struct, so a file from a version without one of
@@ -59,6 +71,9 @@ pub fn default_path() -> Option<PathBuf> {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SentRecord {
+    /// A Send or a share. For a share, `send_id` is empty and `fields` is
+    /// empty: a person gets the whole record, and there is no link.
+    pub kind: SentKind,
     /// When the Send was made, in milliseconds since the Unix epoch, **UTC**.
     pub sent_at_unix_millis: i64,
     /// The Send's server id -- what names it to the server. **Not its link**;
@@ -83,6 +98,10 @@ pub struct Person {
     pub last_sent_unix_millis: i64,
     /// The Send ids this file holds for them, newest first.
     pub send_ids: Vec<String>,
+    /// How many of this person's entries are Sends, and how many shares --
+    /// what the suggestion's count says ("3 sent", "2 shared").
+    pub sent: usize,
+    pub shared: usize,
 }
 
 /// The whole file.
@@ -131,16 +150,23 @@ impl SentHistory {
             if entry.recipient.trim().is_empty() {
                 continue;
             }
+            let is_send = entry.kind == SentKind::Send;
             match people.iter_mut().find(|p| same_person(&p.email, &entry.recipient)) {
                 Some(person) => {
-                    person.send_ids.push(entry.send_id.clone());
+                    if is_send && !entry.send_id.is_empty() {
+                        person.send_ids.push(entry.send_id.clone());
+                    }
+                    person.sent += usize::from(is_send);
+                    person.shared += usize::from(!is_send);
                     person.last_sent_unix_millis =
                         person.last_sent_unix_millis.max(entry.sent_at_unix_millis);
                 }
                 None => people.push(Person {
                     email: entry.recipient.trim().to_string(),
                     last_sent_unix_millis: entry.sent_at_unix_millis,
-                    send_ids: vec![entry.send_id.clone()],
+                    send_ids: if is_send && !entry.send_id.is_empty() { vec![entry.send_id.clone()] } else { Vec::new() },
+                    sent: usize::from(is_send),
+                    shared: usize::from(!is_send),
                 }),
             }
         }
@@ -211,6 +237,7 @@ mod tests {
 
     fn sent(at: i64, id: &str, to: &str) -> SentRecord {
         SentRecord {
+            kind: SentKind::Send,
             sent_at_unix_millis: at,
             send_id: id.to_string(),
             recipient: to.to_string(),
@@ -309,5 +336,22 @@ mod tests {
             let field = format!("pub {banned}");
             assert!(!body.contains(&field), "SentRecord grew a `{banned}` field");
         }
+    }
+
+    /// **A share is a person in the address book too** (spec 11.7), counted
+    /// separately so the suggestion can say "2 shared" or "3 sent", and a file
+    /// from before shares reads as all Sends.
+    #[test]
+    fn shares_and_sends_feed_one_address_book_with_their_own_counts() {
+        let mut history = SentHistory::default();
+        history.record(sent(1, "a", "anna@example.com"));
+        history.record(SentRecord { kind: SentKind::Share, item_id: "r1".into(), recipient: "Anna@example.com".into(), sent_at_unix_millis: 2, ..SentRecord::default() });
+        history.record(SentRecord { kind: SentKind::Share, item_id: "r2".into(), recipient: "anna@example.com".into(), sent_at_unix_millis: 3, ..SentRecord::default() });
+        let people = history.people();
+        assert_eq!(people.len(), 1);
+        assert_eq!((people[0].sent, people[0].shared), (1, 2));
+        assert_eq!(people[0].send_ids, ["a"], "a share has no Send id");
+        let old: SentHistory = serde_json::from_str(r#"{"entries":[{"send_id":"x","recipient":"b@c.d"}]}"#).expect("an old file");
+        assert_eq!(old.entries[0].kind, SentKind::Send);
     }
 }

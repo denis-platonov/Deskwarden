@@ -6770,6 +6770,7 @@ pub fn build_frame_with_search(
                             let totp = state.draft.totp_to_send(seed);
                             let seed_sealed = matches!(totp, crate::record::TotpToSend::Sealed { .. });
                             pending = Some(crate::sent_history::SentRecord {
+                                kind: crate::sent_history::SentKind::Send,
                                 sent_at_unix_millis: crate::send::SendClock::now_unix_millis(
                                     &crate::send::SystemClock,
                                 ),

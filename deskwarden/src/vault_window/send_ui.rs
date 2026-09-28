@@ -7603,6 +7603,7 @@ mod paint_tests {
         };
         let mut history = crate::sent_history::SentHistory::default();
         history.record(crate::sent_history::SentRecord {
+            kind: crate::sent_history::SentKind::Send,
             sent_at_unix_millis: NOW,
             send_id: send.id.clone(),
             recipient: "dancefront".to_string(),

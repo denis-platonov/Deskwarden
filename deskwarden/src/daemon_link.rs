@@ -289,10 +289,19 @@ impl SharingClient {
     }
 
     /// One `POST` to a sharing route, its `data` back.
-    // Its callers are the window's share flows, which arrive with them (Tasks 9-13).
-    #[allow(dead_code)]
     pub(crate) fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
         sharing_answer(self.agent.post(&format!("{}{}", self.base_url, path)).send_json(body))
+    }
+
+    /// `POST /sharing/item/{id}` -- share a record with a person.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's.
+    pub fn share(&self, item_id: &str, email: &str) -> Result<crate::rest::sharing::ShareResult, String> {
+        let data = self.post(&format!("/sharing/item/{item_id}"), serde_json::json!({ "email": email }))?;
+        serde_json::from_value(data.get("result").cloned().unwrap_or_default())
+            .map_err(|_| "The vault service answered something unreadable.".to_string())
     }
 }
 

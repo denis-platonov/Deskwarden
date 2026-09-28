@@ -696,13 +696,7 @@ impl VaultKeys {
 
     /// These keys with one organisation's added (or replaced). For the sharing
     /// engine's first share: the org it just created is in no profile yet.
-    ///
-    /// `#[allow(dead_code)]` until the sharing engine task wires in its first
-    /// production caller -- shipped complete and tested now rather than
-    /// alongside that caller, for the same reason `switch_to_account` and
-    /// `add_account` were in `main.rs`.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn with_organization(&self, id: &str, key: SymmetricKey) -> VaultKeys {
         let mut orgs: Vec<(String, SymmetricKey)> =
             self.orgs.iter().filter(|(known, _)| known != id).cloned().collect();

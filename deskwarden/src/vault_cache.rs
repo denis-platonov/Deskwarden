@@ -1708,24 +1708,33 @@ impl VaultCache {
     /// back gives it a new id and deletes the old one (spec 9.4), which is one
     /// `removed` and one `upserted`. No read happens here: the engine already
     /// holds the server's answer, decrypted.
-    pub fn apply_written_elsewhere(&self, upserted: &[VaultItem], removed: &[String]) {
-        let _ = self.persisting(|| {
+    ///
+    /// **Era-guarded, as [`Self::apply_announced`] is.** `era` is the one the
+    /// engine's work STARTED in; a lock, an account switch or a re-populate
+    /// among its round trips began another, and an outcome from the old one
+    /// filed into the new snapshot would put one account's records in
+    /// another's vault. Returns whether it was applied: `false` for an ended
+    /// era or an unpopulated cache, and then nothing changed.
+    pub fn apply_written_elsewhere(&self, upserted: &[VaultItem], removed: &[String], era: VaultEra) -> bool {
+        self.persisting(|| {
             let mut snapshot = self.lock();
-            if snapshot.populated {
-                for id in removed {
-                    snapshot.items.retain(|i| &i.id != id);
-                    snapshot.note_item_write(id, true);
-                }
-                for item in upserted {
-                    if let Some(at) = snapshot.items.iter().position(|i| i.id == item.id) {
-                        snapshot.items.remove(at);
-                    }
-                    snapshot.items.insert(0, item.clone());
-                    snapshot.note_item_write(&item.id, false);
-                }
+            if !(snapshot.populated && snapshot.epoch().era() == era) {
+                return Ok(false);
             }
-            Ok(())
-        });
+            for id in removed {
+                snapshot.items.retain(|i| &i.id != id);
+                snapshot.note_item_write(id, true);
+            }
+            for item in upserted {
+                if let Some(at) = snapshot.items.iter().position(|i| i.id == item.id) {
+                    snapshot.items.remove(at);
+                }
+                snapshot.items.insert(0, item.clone());
+                snapshot.note_item_write(&item.id, false);
+            }
+            Ok(true)
+        })
+        .unwrap_or(false)
     }
 
     /// The vault's trash in one call, **without the era guard** -- reachable
@@ -6529,9 +6538,38 @@ mod tests {
         let cache = crate::test_vault::cache_with_items(vec![item("a"), item("b")]);
         let mut moved = item("b");
         moved.name = "moved".into();
-        cache.apply_written_elsewhere(&[moved, item("c")], &["a".to_string()]);
+        assert!(cache.apply_written_elsewhere(&[moved, item("c")], &["a".to_string()], cache.epoch().era()));
         let ids: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
         assert_eq!(ids, ["c", "b"]);
         assert_eq!(cache.get_by_id("b").map(|i| i.name), Some("moved".to_string()));
+    }
+
+    /// **An outcome computed in an era that has ended changes nothing** --
+    /// `apply_announced`'s guard, on the sharing engine's hook. A share or a
+    /// pass takes network round trips; a lock, an account switch or a
+    /// re-populate landing among them starts a new era, and what the engine
+    /// then hands back belongs to the vault it started in, not this one.
+    #[test]
+    fn items_written_elsewhere_in_an_era_that_ended_change_nothing() {
+        let item = |id: &str| -> VaultItem { serde_json::from_value(serde_json::json!({ "id": id, "name": id })).expect("item") };
+        let cache = crate::test_vault::cache_with_items(vec![item("a")]);
+        let stale = cache.epoch().era();
+        cache.clear();
+        let epoch = cache.epoch();
+        assert_eq!(
+            cache.populate_with_vault(VaultSnapshot { items: vec![item("x")], folders: Vec::new() }, epoch),
+            PopulateOutcome::Populated,
+            "control: another vault is loaded"
+        );
+        let mut moved = item("x");
+        moved.name = "moved".into();
+        assert!(!cache.apply_written_elsewhere(&[moved, item("c")], &["x".to_string()], stale));
+        let ids: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["x"], "an outcome from the ended era was filed into this one");
+        assert_eq!(cache.get_by_id("x").map(|i| i.name), Some("x".to_string()));
+        assert!(
+            cache.apply_written_elsewhere(&[item("c")], &[], cache.epoch().era()),
+            "control: the current era's outcome applies"
+        );
     }
 }

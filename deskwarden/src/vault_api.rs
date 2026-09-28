@@ -120,8 +120,6 @@ fn failed(error: &VaultError) -> ApiResponse {
 
 /// A sharing refusal as an answer. Spec 11.3: `Unsupported` -> 501 with why, a
 /// refused step -> 400 with the sentence to show, the rest as `failed`.
-// Its callers are the write routes, which arrive with the flows (Tasks 9-13).
-#[allow(dead_code)]
 fn sharing_failed(error: &SharingError) -> ApiResponse {
     match error {
         SharingError::Unavailable(reason) => ApiResponse::refused(501, reason),
@@ -327,6 +325,7 @@ impl VaultApi {
                 ApiResponse { status: 200, body: crate::change_feed::page_body(&page) }
             }
             ("GET", ["sharing"]) => self.sharing_view(),
+            ("POST", ["sharing", "item", id]) => self.share_item(id, request.body),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
@@ -405,8 +404,6 @@ impl VaultApi {
 
     /// The engine, or the response that says why there is none: a vault not
     /// loaded yet is 503, a backend without one (`bw serve`) is 501.
-    // Its callers are the write routes, which arrive with the flows (Tasks 9-13).
-    #[allow(dead_code)]
     fn engine(&self) -> Result<Arc<Sharing>, ApiResponse> {
         if !self.cache.is_populated() {
             return Err(not_ready());
@@ -438,8 +435,18 @@ impl VaultApi {
     /// feed** -- removals first, then the new copies, in one batch, then
     /// `sharing`. A window reads each announced item back from this daemon,
     /// which already holds it; nothing reaches the server.
-    fn publish_outcome(&self, outcome: &SharingOutcome) {
-        self.cache.apply_written_elsewhere(&outcome.upserted, &outcome.removed);
+    ///
+    /// **`era` is the vault era the write or pass STARTED in**, read before
+    /// its first round trip. A lock, an account switch or a re-populate that
+    /// landed while it ran started a new one, and then the outcome belongs to
+    /// a vault this daemon no longer holds: the cache drops it (its guard is
+    /// `apply_announced`'s), and nothing is announced about items the current
+    /// vault never had. The next whole read shows the server's truth anyway.
+    fn publish_outcome(&self, outcome: &SharingOutcome, era: VaultEra) {
+        if !self.cache.apply_written_elsewhere(&outcome.upserted, &outcome.removed, era) {
+            log::info!("a sharing outcome from an ended vault session was dropped");
+            return;
+        }
         let mut changes: Vec<Change> = outcome
             .removed
             .iter()
@@ -466,15 +473,38 @@ impl VaultApi {
         let Some(engine) = self.cache.bridge().sharing() else {
             return;
         };
+        let era = self.cache.epoch().era();
         match engine.refresh(trigger) {
             Ok(pass) => {
                 if !pass.outcome.is_empty() {
-                    self.publish_outcome(&pass.outcome);
+                    self.publish_outcome(&pass.outcome, era);
                 } else if pass.changed {
                     self.feed.publish([Change::Sharing]);
                 }
             }
             Err(e) => log::info!("the sharing pass ({trigger:?}) did not complete: {e}"),
+        }
+    }
+
+    /// `POST /sharing/item/{id} {email}` (spec 11.3). What moved is applied
+    /// to the daemon's copy and announced; the answer says which of the
+    /// dialog's three results it was. The era is read before the engine's
+    /// first round trip -- see [`Self::publish_outcome`].
+    fn share_item(&self, id: &str, body: &[u8]) -> ApiResponse {
+        let era = self.cache.epoch().era();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let Some(email) = email_in(body) else {
+            return ApiResponse::refused(400, "Say who to share with.");
+        };
+        match engine.share(id, &email) {
+            Ok(outcome) => {
+                self.publish_outcome(&outcome.changed, era);
+                ApiResponse::ok(serde_json::json!({ "result": outcome.result }))
+            }
+            Err(e) => sharing_failed(&e),
         }
     }
 
@@ -591,6 +621,16 @@ fn folder_name(body: &[u8]) -> Option<String> {
     body.get("name")?.as_str().map(str::to_string)
 }
 
+/// The `email` a sharing body names, or `None`.
+fn email_in(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("email")?
+        .as_str()
+        .map(str::to_string)
+        .filter(|email| !email.trim().is_empty())
+}
+
 /// A query string, read as `key=value` pairs. The keys this API reads are
 /// ASCII words and the values ASCII numbers and booleans, so nothing is
 /// percent-decoded: a value that needed it is not one of ours.
@@ -643,7 +683,8 @@ pub(crate) mod tests {
         (server, cache, api, token)
     }
 
-    fn ask(api: &VaultApi, method: &str, target: &str, token: Option<&str>, body: &str) -> ApiResponse {
+    /// `pub(crate)` for `rest::sharing`'s daemon-level tests.
+    pub(crate) fn ask(api: &VaultApi, method: &str, target: &str, token: Option<&str>, body: &str) -> ApiResponse {
         let header = token.map(|token| format!("Bearer {token}"));
         api.answer(&ApiRequest {
             method,
@@ -853,6 +894,28 @@ pub(crate) mod tests {
         assert_eq!(answer["data"]["reason"], crate::rest::sharing::REASON_BW_SERVE);
         api.sharing_pass(crate::rest::sharing::Trigger::WholeRead);
         nothing.assert();
+    }
+
+    /// **A sharing outcome from an ended era is neither filed nor announced.**
+    /// The era threaded through `publish_outcome` is the one the work started
+    /// in; a re-populate in between (here: a lock and the next unlock) ends
+    /// it, and the outcome must not land in the vault loaded since.
+    #[test]
+    fn a_sharing_outcome_from_an_ended_era_is_dropped() {
+        let (_server, cache, api, _token) = a_daemon();
+        let stale = cache.epoch().era();
+        cache.clear();
+        assert_eq!(cache.populate().expect("the next load"), PopulateOutcome::Populated);
+        let before: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
+        let moved: VaultItem = serde_json::from_value(serde_json::json!({ "id": "moved-1", "name": "Moved" })).expect("an item");
+        let outcome = SharingOutcome { upserted: vec![moved], removed: vec!["live-1".to_string()] };
+        api.publish_outcome(&outcome, stale);
+        assert_eq!(cache.items().into_iter().map(|i| i.id).collect::<Vec<_>>(), before, "a stale outcome was filed");
+        assert!(api.feed().wait_after(Some(0), false, Duration::ZERO).changes.is_empty(), "a stale outcome was announced");
+        // Control: the same outcome in the current era lands and is announced.
+        api.publish_outcome(&outcome, cache.epoch().era());
+        assert_eq!(cache.items().first().map(|i| i.id.clone()), Some("moved-1".to_string()));
+        assert!(api.feed().wait_after(Some(0), false, Duration::ZERO).changes.contains(&Change::Sharing));
     }
 
     /// A wrong method on a sharing route is 405, not 404.
