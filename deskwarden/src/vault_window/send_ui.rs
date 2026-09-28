@@ -1455,6 +1455,13 @@ pub const RECEIVED_SCOPE_SUBTEXT: &str =
     "Read a Send from its link with Import a record. What you import is listed here; the record \
      itself lives in your vault.";
 
+/// [`RECEIVED_SCOPE_SUBTEXT`] once records from people are in the list:
+/// design 6d's `.lnote`, word for word -- [`SHARES_SUBTEXT`]'s rule on the
+/// other screen.
+pub const RECEIVED_PEOPLE_SUBTEXT: &str =
+    "Records people share with you arrive here and in your vault, view-only, and change when they \
+     edit them. A Send you read with Import a record is your own copy; it is listed here too.";
+
 /// One line of the `Shared with me` list: an import that happened, as this
 /// app is allowed to remember it.
 ///
@@ -1892,7 +1899,17 @@ fn draw_send_list(
     //
     // Once a person share is listed, 6c's own note replaces 5b's: it names
     // both things the list holds and where each is made.
-    let gloss = if shares.is_empty() { view.gloss() } else { SHARES_SUBTEXT };
+    //
+    // And on `Shared with me`, once a record from a person is listed, 6d's
+    // own note replaces 5b's for the same reason: the list holds two kinds
+    // now, and the note says what each is.
+    let gloss = if !shares.is_empty() {
+        SHARES_SUBTEXT
+    } else if matches!(view, SendView::Received(_)) && !people.received.is_empty() {
+        RECEIVED_PEOPLE_SUBTEXT
+    } else {
+        view.gloss()
+    };
     let mut notes: Vec<std::sync::Arc<egui::Galley>> = vec![ui.painter().layout(
         gloss.to_string(),
         note_font.clone(),
@@ -9186,6 +9203,11 @@ mod paint_tests {
         assert!(top(FROM_SENDS_EYEBROW) < top("SAP Production"));
         assert!(painted.has("from denis@x.io \u{b7} view-only"), "{:?}", painted.text);
         assert!(painted.has(&format!("2 {RECORDS_NOUN}")), "the strip counts both groups: {:?}", painted.text);
+        // 6d's `.lnote` in place of 5b's line, as 6c's replaces it on Sent;
+        // and 5b's line where nobody shares anything.
+        assert!(painted.has(RECEIVED_PEOPLE_SUBTEXT) && !painted.has(RECEIVED_SCOPE_SUBTEXT), "{:?}", painted.text);
+        let imports_only = paint_received_with(&rows, &[], None);
+        assert!(imports_only.has(RECEIVED_SCOPE_SUBTEXT) && !imports_only.has(RECEIVED_PEOPLE_SUBTEXT));
         // The same height as the import row under it: one row shape.
         let band = |label: &str| painted.fills.iter().filter(|(r, c)| *c == theme::CARD && r.contains(painted.rect_of(label).expect("text").center())).map(|(r, _)| r.height()).fold(f32::INFINITY, f32::min);
         assert_eq!(band("Acme VPN"), band("SAP Production"));

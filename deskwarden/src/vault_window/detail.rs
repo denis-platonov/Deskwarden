@@ -155,18 +155,36 @@ fn header_controls(item: &VaultItem) -> usize {
 /// marks against, in all four cases (a login and a card, with and without
 /// the control).
 ///
-/// **A received record's strip is the ⋮ and the ✕ alone** (mock 6d, and the
+/// **A view-only record's strip is the ⋮ and the ✕ alone** (mock 6d, and the
 /// owner's call on the star): the star, the envelope, the clock and Share each
 /// write the record or share it on, and `draw_controls` draws none of them
-/// for it -- so this counts [`HEADER_CONTROLS_VIEW_ONLY`], the branch and the
-/// drawing having arrived together. A reservation for fewer controls than
-/// are painted is the x = -34.5 defect; `the_strip_reserves_room_for_every
-/// _control_it_draws` counts both received kinds against the painted marks.
+/// for it -- so this counts [`HEADER_CONTROLS_VIEW_ONLY`] wherever
+/// [`pane_writable`] says no, the branch and the drawing reading one
+/// predicate. A reservation for fewer controls than are painted is the
+/// x = -34.5 defect; `the_strip_reserves_room_for_every_control_it_draws`
+/// counts both received kinds, and an unnamed `edit: false` item, against the
+/// painted marks.
 fn header_controls_for(item: &VaultItem, people: &PeopleSharing<'_>) -> usize {
-    if people.view_only_from.is_some() {
+    if !pane_writable(item, people) {
         return HEADER_CONTROLS_VIEW_ONLY;
     }
     header_controls(item) + usize::from(people.share_control.is_some())
+}
+
+/// **Whether the read pane offers anything that writes** -- the ONE predicate
+/// the strip's count, its drawing, the ⋮'s contents and the matched app's
+/// Remove all read.
+///
+/// Two ways to be view-only, and both count. The view names a received
+/// record's sharer (`view_only_from`), and the server marks any item this
+/// account may not write `edit: false` (`vault_bridge::may_edit`) -- which
+/// covers what the view does not name: a read-only collection in an
+/// organisation, or a received record while the window has no sharing view
+/// yet. `vault_window::mod` gates the actions on `may_edit`; drawing on the
+/// view alone left exactly those items a full strip of controls that the gate
+/// then swallowed without a word.
+fn pane_writable(item: &VaultItem, people: &PeopleSharing<'_>) -> bool {
+    people.view_only_from.is_none() && crate::vault_bridge::may_edit(item)
 }
 
 /// A view-only record's strip: the kebab, whose menu says why it is short,
@@ -986,11 +1004,23 @@ pub fn view_only_footer(from: &str) -> String {
     format!("Shared by {from}, view-only. Only they can edit or delete it.")
 }
 
+/// [`view_only_footer`] where no sharer is known: an `edit: false` item the
+/// sharing view does not name (a read-only organisation collection, or a
+/// received record before the view has arrived). Says the same fact without
+/// inventing a name.
+pub const VIEW_ONLY_FOOTER: &str = "View-only. Only its owner can edit or delete it.";
+
 /// **What a view-only record allows** (spec 6.9): everything that reads,
 /// nothing that writes. The server refuses a write anyway (spec 10.3); this
 /// is so the user is not offered one. Moving it to a folder and starring it
 /// are writes on NodeWarden too (the sharing plan's decision 5), and so is
 /// the ✉ and Share: 6d's "cannot share it on".
+///
+/// **Revoke is let through**, both steps of it. A live Send of this record is
+/// the user's OWN Send -- deleting it writes nothing to the record and takes
+/// a link to it out of the world -- so refusing it would keep exposure up for
+/// the sake of a rule about writes. Only the two doors that hand the record on
+/// (`SendRecord`, `ShareRecord`) are closed.
 ///
 /// **The writers are listed, not the readers**, for
 /// `item_list::RowCommand::writes_the_record`'s reason: a writer forgotten
@@ -1019,8 +1049,6 @@ pub fn view_only(action: DetailAction) -> DetailAction {
         | DetailAction::AddTotp
         | DetailAction::SendRecord
         | DetailAction::ShareRecord
-        | DetailAction::RevokeSend
-        | DetailAction::ConfirmRevokeSend
         | DetailAction::Restore
         | DetailAction::Unarchive
         | DetailAction::PurgeForever => DetailAction::None,
@@ -1932,7 +1960,17 @@ pub fn draw_out_of_vault_read(
                             // written rather than `unreachable!()`d, because
                             // a pane that panicked would be a worse answer to
                             // a future entry than a pane that skipped one.
-                            for entry in super::item_list::out_of_vault_entries(out) {
+                            // `_for` the item: an `edit: false` record's
+                            // Restore and Delete forever are writes too, and
+                            // its menu says why instead (`VIEW_ONLY_FOOTER`).
+                            let entries = super::item_list::out_of_vault_entries_for(item, out);
+                            if entries.is_empty() {
+                                ui.set_width(VIEW_ONLY_MENU_WIDTH);
+                                ui.add(
+                                    egui::Label::new(RichText::new(VIEW_ONLY_FOOTER).size(11.0).color(theme::TEXT_GHOST)).wrap(),
+                                );
+                            }
+                            for entry in entries {
                                 let super::item_list::MenuEntry::Command(entry) = entry else {
                                     continue;
                                 };
@@ -3561,6 +3599,9 @@ pub fn draw_detail_read(
             // **`header_controls_for`, with the Share control** (design 6a):
             // one more square wherever the window resolved one.
             let controls = header_controls_for(item, &people);
+            // What the strip, the ⋮ and the cards below draw writes by --
+            // [`pane_writable`], the predicate the count above just read.
+            let writable = pane_writable(item, &people);
             let controls_width = theme::HEADER_BUTTON_HEIGHT * controls as f32
                 + HEADER_GAP * (controls - 1) as f32;
             let layout = header_layout(content_width, controls_width);
@@ -3646,10 +3687,24 @@ pub fn draw_detail_read(
                         // strip is short. The same two-runs-and-a-mark shape
                         // as the folder, so it is the folder's line and not a
                         // third arrangement of it.
+                        //
+                        // The mock's spacing, run for run: `.dsub { gap: 8px }`
+                        // between the kind and the by-line, and inside the
+                        // by-line (`.by { gap: 5px }`) the "·", the mark and
+                        // the words 5 apart -- the dot is the by-line's own,
+                        // so it is in the by-line's muted ink.
+                        //
+                        // Only where a sharer is NAMED. An `edit: false` item
+                        // the view does not name keeps its ordinary subtitle:
+                        // the ⋮ says it is view-only, and a "Shared by" with
+                        // no one after it would be a claim with a hole in it.
                         if let Some(from) = people.view_only_from {
                             ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
-                                subtitle_text(ui, subtitle_kind_id(&item.id), &format!("{} \u{b7} ", kind.label()));
+                                subtitle_text(ui, subtitle_kind_id(&item.id), &kind.label());
+                                ui.add_space(VIEW_ONLY_KIND_GAP);
+                                ui.label(RichText::new("\u{b7}").size(SUBTITLE_SIZE).color(theme::TEXT_MUTED));
+                                ui.add_space(VIEW_ONLY_MARK_GAP);
                                 let (mark, _) = ui.allocate_exact_size(
                                     egui::vec2(VIEW_ONLY_MARK + VIEW_ONLY_MARK_GAP, SUBTITLE_SIZE),
                                     egui::Sense::hover(),
@@ -3795,13 +3850,16 @@ pub fn draw_detail_read(
                     // The kebab stays rather than going with its entries: a
                     // strip that lost its ⋮ on some records would say nothing
                     // about why, and this line is where the why lives.
-                    if let Some(from) = people.view_only_from {
+                    //
+                    // On `!writable` and not on a sharer being named: an
+                    // `edit: false` item the view does not name is just as
+                    // view-only, and says so without a name
+                    // ([`VIEW_ONLY_FOOTER`]).
+                    if !writable {
+                        let footer = people.view_only_from.map_or_else(|| VIEW_ONLY_FOOTER.to_string(), view_only_footer);
                         ui.set_width(VIEW_ONLY_MENU_WIDTH);
                         ui.add(
-                            egui::Label::new(
-                                RichText::new(view_only_footer(from)).size(11.0).color(theme::TEXT_GHOST),
-                            )
-                            .wrap(),
+                            egui::Label::new(RichText::new(footer).size(11.0).color(theme::TEXT_GHOST)).wrap(),
                         );
                         return;
                     }
@@ -4030,7 +4088,6 @@ pub fn draw_detail_read(
                 // than drawn greyed, for the ⏱'s own reason -- a control that
                 // can only ever say "not you" -- and `header_controls_for`
                 // reserves room for exactly the ⋮ and ✕ that are left.
-                let writable = people.view_only_from.is_none();
                 if writable && item_takes_a_one_time_code(item) {
                     // Bound before it is asked, rather than chained into the
                     // `if` above: collapsing the two conditions would make
@@ -4568,6 +4625,9 @@ pub fn draw_detail_read(
                 app_field_present,
                 website,
                 ResolvedApp { name: &app_name, icon: app_icon.as_ref() },
+                // Remove unbinds the app by writing the record's custom
+                // field, so a view-only record is not offered it.
+                pane_writable(item, &people),
                 &mut action,
             );
         });
@@ -5635,6 +5695,9 @@ fn app_match_card(
     // [`app_name_lookup_path`] chose, on a worker thread, once per path. See
     // [`ResolvedApp`].
     app: ResolvedApp<'_>,
+    // Whether Remove is offered: it writes the record (see
+    // [`pane_writable`]), and a view-only record's card keeps only what reads.
+    removable: bool,
     action: &mut DetailAction,
 ) {
     let m = match app_card_body(app_match, field_present) {
@@ -5653,7 +5716,7 @@ fn app_match_card(
         // value. The notice says what is wrong, and Remove -- the same
         // control, in the same column, as the bound card's -- clears it.
         AppCardBody::Unreadable => {
-            app_notice_with_remove(ui, APP_MATCH_UNREADABLE_NOTICE, action);
+            app_notice_with_remove(ui, APP_MATCH_UNREADABLE_NOTICE, removable, action);
             return;
         }
     };
@@ -5689,7 +5752,7 @@ fn app_match_card(
     // WHICH window this rule is for, and this one says what would be typed
     // into it.
     theme::row_rule(ui);
-    app_card_footer(ui, &app_card_notes(m), &app_open_choices(m, website), action);
+    app_card_footer(ui, &app_card_notes(m), &app_open_choices(m, website), removable, action);
 }
 
 /// The word on the card's one destructive control, in one place, so the
@@ -6013,6 +6076,9 @@ fn app_card_footer(
     // all, which is every case in which there is nothing this pane may
     // honestly start.
     choices: &[OpenChoice],
+    // Whether Remove is drawn -- `false` on a view-only record, whose card
+    // keeps Open and loses the one control that writes.
+    removable: bool,
     action: &mut DetailAction,
 ) {
     // The same column the rows above wrap into -- a note left to
@@ -6095,7 +6161,9 @@ fn app_card_footer(
                 // Open first, so it reads first: it is the ordinary action
                 // and Remove is the destructive one.
                 app_card_open_control(ui, choices, action);
-                app_card_remove_control(ui, action);
+                if removable {
+                    app_card_remove_control(ui, action);
+                }
             });
         });
 }
@@ -6366,11 +6434,11 @@ fn app_card_open_control(ui: &mut egui::Ui, choices: &[OpenChoice], action: &mut
 /// that the control reports the same [`DetailAction::RemoveAppMatch`] the
 /// bound card's does -- and so the write arm in `vault_window::mod`, which
 /// clears the field by NAME through `without_app_match`, is reached by both.
-fn app_notice_with_remove(ui: &mut egui::Ui, notice: &'static str, action: &mut DetailAction) {
+fn app_notice_with_remove(ui: &mut egui::Ui, notice: &'static str, removable: bool, action: &mut DetailAction) {
     // No Open, and not because none was computed: there is no parsed match to
     // compute one from. Remove is the only honest offer on an unreadable
     // field, and that is the whole of this body.
-    app_card_footer(ui, &[notice], &[], action);
+    app_card_footer(ui, &[notice], &[], removable, action);
 }
 
 /// A pane for an item this build cannot show the contents of: it states the
@@ -7324,9 +7392,11 @@ fn subtitle_font() -> egui::FontId {
 }
 
 /// Mock 6d's `ic('person', 11, ..)` before a received record's "Shared by",
-/// and the `.by { gap: 5px }` after it.
+/// and the `.by { gap: 5px }` either side of it.
 const VIEW_ONLY_MARK: f32 = 11.0;
 const VIEW_ONLY_MARK_GAP: f32 = 5.0;
+/// Mock 6d's `.dsub { gap: 8px }`: the kind, then the by-line.
+const VIEW_ONLY_KIND_GAP: f32 = 8.0;
 /// Mock 6d's `.menu { width: 250px }`, which the view-only kebab's one line
 /// wraps inside rather than stretching the menu across the pane.
 const VIEW_ONLY_MENU_WIDTH: f32 = 250.0;
@@ -17292,6 +17362,11 @@ mod tests {
     /// defect, which is why the count and the drawing changed together.
     #[test]
     fn the_strip_reserves_room_for_every_control_it_draws() {
+        // An `edit: false` item the view names no sharer for: a read-only
+        // organisation collection's, or a received record before the view
+        // has arrived. View-only all the same (`pane_writable`).
+        let mut unnamed = a_login();
+        unnamed.other.insert("edit".into(), serde_json::Value::Bool(false));
         for (what, item, share, from) in [
             ("a login", a_login(), None, None),
             ("a card", a_full_card(), None, None),
@@ -17299,6 +17374,7 @@ mod tests {
             ("a card offered a Send", a_full_card(), Some(false), None),
             ("a received login", a_login(), None, Some("denis@x.io")),
             ("a received card", a_full_card(), None, Some("denis@x.io")),
+            ("an unnamed edit:false login offered Share", unnamed, Some(true), None),
         ] {
             let mut pane = Pane::wide(MIN_PANE);
             if let Some(offered) = share {
@@ -17309,6 +17385,7 @@ mod tests {
             }
             let people = PeopleSharing { share_control: share, view_only_from: from, ..PeopleSharing::default() };
             let frame = pane.idle(&item, &TotpState::NoSecret);
+            let view_only = from.is_some() || !crate::vault_bridge::may_edit(&item);
 
             let mut painted = vec![
                 // Three dots, one control -- `Frame::kebab` is what asserts
@@ -17316,7 +17393,7 @@ mod tests {
                 ("the kebab", usize::from(!frame.kebab_dots.is_empty())),
                 ("the close ✕", frame.pane_closes.len()),
             ];
-            if from.is_some() {
+            if view_only {
                 for (name, count) in [
                     ("star", frame.stars.len()),
                     ("envelope", frame.envelopes.len()),
@@ -17333,7 +17410,7 @@ mod tests {
             // -- and its ABSENCE asserted on the other item, so a ⏱ that
             // started appearing on cards fails here rather than merely making
             // two counts agree with each other.
-            if from.is_some() {
+            if view_only {
                 // Asserted absent above.
             } else if item_takes_a_one_time_code(&item) {
                 painted.push(("the one-time code clock", frame.clocks.len()));
@@ -17344,7 +17421,10 @@ mod tests {
                      for a code to go into"
                 );
             }
-            if share.is_some() {
+            if view_only {
+                // Asserted absent above -- even where the window resolved
+                // one, which is the unnamed `edit: false` case's point.
+            } else if share.is_some() {
                 painted.push(("the Share control", frame.shares.len()));
             } else {
                 assert!(frame.shares.is_empty(), "{what} was drawn a Share control nobody resolved");
@@ -17409,7 +17489,8 @@ mod tests {
 
     /// **The rest of what a view-only record allows**: every write maps to
     /// nothing -- the kebab's, the header's, the cards' (the matched app's
-    /// Remove) and the out-of-vault three -- and every read passes through.
+    /// Remove) and the out-of-vault three -- and every read passes through,
+    /// with Revoke among them.
     #[test]
     fn view_only_passes_every_read_and_no_write() {
         for write in [
@@ -17424,8 +17505,6 @@ mod tests {
             DetailAction::AddTotp,
             DetailAction::SendRecord,
             DetailAction::ShareRecord,
-            DetailAction::RevokeSend,
-            DetailAction::ConfirmRevokeSend,
             DetailAction::Restore,
             DetailAction::Unarchive,
             DetailAction::PurgeForever,
@@ -17439,6 +17518,10 @@ mod tests {
             DetailAction::OpenWebsite("https://x.io".into()),
             DetailAction::CopyPasswordHistory(0),
             DetailAction::ClosePane,
+            // Revoking the user's OWN Send of the record writes nothing to
+            // it and takes a link out of the world: let through, both steps.
+            DetailAction::RevokeSend,
+            DetailAction::ConfirmRevokeSend,
             DetailAction::CancelRevokeSend,
         ] {
             assert_eq!(view_only(read.clone()), read, "a read was taken away");
@@ -17458,6 +17541,57 @@ mod tests {
         let frame = pane.idle(&a_login(), &TotpState::NoSecret);
         let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
         assert!(bounds.contains_rect(frame.kebab()) && bounds.contains_rect(frame.pane_close().0));
+    }
+
+    /// **An `edit: false` item the view names no sharer for is view-only
+    /// too** -- a read-only organisation collection's, or a received record
+    /// before the view arrives. Its strip is the ⋮ and the ✕, its ⋮ says so
+    /// without inventing a name, and its subtitle makes no "Shared by" claim.
+    #[test]
+    fn an_unnamed_view_only_item_says_so_without_a_name() {
+        let mut item = a_login();
+        item.other.insert("edit".into(), serde_json::Value::Bool(false));
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(frame.stars.is_empty() && frame.envelopes.is_empty() && frame.clocks.is_empty());
+        assert!(!frame.texts.iter().any(|(t, _)| t.contains("Shared by")), "{:?}", frame.texts);
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let painted = open.strings();
+        assert!(painted.iter().any(|s| *s == VIEW_ONLY_FOOTER), "{painted:?}");
+        for writer in ["Edit", "Clone", crate::vault_window::item_list::DELETE_LABEL, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
+            assert!(!painted.iter().any(|s| *s == writer), "an edit:false item's kebab offers {writer:?}: {painted:?}");
+        }
+    }
+
+    /// **The matched app's Remove is a write** -- it clears the record's
+    /// custom field -- so a view-only record's card keeps Open and loses it.
+    /// The same item, writable, is the control: Remove is painted there.
+    #[test]
+    fn a_view_only_records_matched_app_card_offers_no_remove() {
+        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
+        let mut pane = Pane::new().knows_app(CHROME_PATH, CHROME_NAME);
+        assert!(pane.idle(&item, &TotpState::NoSecret).painted(APP_REMOVE_LABEL), "control: Remove on a writable record");
+        let mut received = Pane::new().knows_app(CHROME_PATH, CHROME_NAME).view_only("denis@x.io");
+        let frame = received.idle(&item, &TotpState::NoSecret);
+        assert!(frame.painted(OPEN_MENU_LABEL), "the card is still drawn, with Open");
+        assert!(!frame.painted(APP_REMOVE_LABEL), "a view-only record's card offers Remove");
+    }
+
+    /// **The Trash's ⋮ for an `edit: false` record offers neither Restore
+    /// nor Delete forever** -- both writes NodeWarden refuses -- and says why
+    /// instead. (The window's gate, `vault_window::mod::view_only_gate`, is
+    /// what keeps a Delete forever from opening the confirmation.)
+    #[test]
+    fn a_view_only_records_trash_menu_offers_no_write() {
+        let mut item = out_of_vault_item("Ledgerline");
+        item.other.insert("edit".into(), serde_json::Value::Bool(false));
+        for out in [OutOfVault::Trash, OutOfVault::Archive] {
+            let opened = open_out_of_vault_kebab(&item, out);
+            for writer in ["Restore", "Delete forever", "Unarchive"] {
+                assert!(!opened.iter().any(|t| t == writer), "{out:?}: offers {writer:?}: {opened:?}");
+            }
+            assert!(opened.iter().any(|t| t == VIEW_ONLY_FOOTER), "{out:?}: says nothing: {opened:?}");
+        }
     }
 
     /// **The ✕ reports `ClosePane`, and the ✉ reports `SendRecord`.**

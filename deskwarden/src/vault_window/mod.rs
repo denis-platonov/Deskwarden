@@ -3350,8 +3350,11 @@ pub fn build_frame_with_search(
         );
         // **Design 6d's FROM PEOPLE**, built beside them for the same reason:
         // one list per frame, owning its strings. Named by the live vault's
-        // items -- a received record is never archived or trashed by its
-        // recipient, who can do neither to it.
+        // items alone, and that is all the view can name: the daemon builds
+        // its `received` out of its LIVE cache (`vault_api`'s `sharing_view`
+        // hands `engine.view` `cache.items()`), so a received record the
+        // sharer has trashed is in neither list and is not a row here. Unlike
+        // `share_rows` there is no archive or trash to search.
         let received_share_rows = share_ui::received_share_rows(sharing.view.as_ref(), &items);
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
@@ -4086,11 +4089,14 @@ pub fn build_frame_with_search(
                 // menu_entries`) and the read pane maps its own away
                 // (`detail::view_only`), so what this meets is a stray -- a
                 // menu drawn the frame before a sync turned the record
-                // view-only. After the re-prompt rather than before it, so
-                // the gate above stays the one line in front of the match
-                // (`both_gating_calls_are_written_into_the_paths_they_gate`);
-                // the cost is that such a stray on a protected record asks
-                // for the password before it is dropped.
+                // view-only. After the re-prompt rather than before it, and
+                // that is a choice, not something a pin forces: it keeps the
+                // re-prompt the plain statement it has always been, directly
+                // over the match, rather than a call wrapped in an `Option`
+                // combinator for a case the menu no longer produces. The cost
+                // is that such a stray on a protected record asks for the
+                // password before it is dropped. Pinned in place by
+                // `the_view_only_gates_stand_in_front_of_what_they_gate`.
                 let permitted = permitted.filter(|command| crate::vault_bridge::may_edit(&item) || !command.writes_the_record());
                 if let Some(command) = permitted {
                 let login = item.login.as_ref();
@@ -4960,6 +4966,15 @@ pub fn build_frame_with_search(
                             sidebar::folder_name(&folders, item.folder_id.as_deref()),
                             icons.textures.get(item.id.as_str()),
                         );
+                        // **The view-only gate, here too** (spec 6.9): an
+                        // `edit: false` record's Restore, Unarchive and
+                        // Delete forever are writes NodeWarden refuses, so
+                        // they become nothing BEFORE the match -- Delete
+                        // forever never reaches `delete_confirm`. The pane's
+                        // ⋮ offers none of them for such a record
+                        // (`item_list::out_of_vault_entries_for`); this is
+                        // the gate behind it, as in the read arm.
+                        let action = view_only_gate(item, action);
                         // **No `permit_detail_action` here, and that is
                         // stated rather than omitted.** That gate asks
                         // whether an action would put a secret on screen;
@@ -5143,7 +5158,7 @@ pub fn build_frame_with_search(
                             // BEFORE the re-prompt rather than after, so a
                             // write that will not happen never asks for the
                             // master password first.
-                            let action = if crate::vault_bridge::may_edit(item) { action } else { detail::view_only(action) };
+                            let action = view_only_gate(item, action);
                             let action = permit_detail_action(
                                 ui.ctx(),
                                 action,
@@ -8969,6 +8984,25 @@ fn reveal_gained(before: &detail::RevealState, after: &detail::RevealState) -> b
         // either side.
         || (0..detail::MAX_HISTORY_ROWS)
             .any(|i| password_history[i] && !before.password_history[i])
+}
+
+/// **The view-only gate** (spec 6.9): an item the server marks `edit: false`
+/// -- a record someone shares with this account, or a read-only collection's
+/// -- has every write the panes report turned into `DetailAction::None`
+/// (`detail::view_only`), and every read passed through.
+///
+/// One function for the two arms that act on a pane's report -- the read
+/// pane's and the out-of-vault pane's -- so a gate on one and not the other
+/// cannot happen quietly; `the_view_only_gates_stand_in_front_of_what_they
+/// _gate` pins both calls. A courtesy, like `may_edit` itself: the server
+/// refuses the write whatever this says, and this stops the user being
+/// offered one.
+fn view_only_gate(item: &VaultItem, action: detail::DetailAction) -> detail::DetailAction {
+    if crate::vault_bridge::may_edit(item) {
+        action
+    } else {
+        detail::view_only(action)
+    }
 }
 
 /// **The one place a `DetailAction` that would expose a secret is allowed
@@ -40829,6 +40863,75 @@ mod reprompt_gating_tests {
         // CONTROL: this reader really read the production region, and would
         // have noticed had it been handed the empty string.
         assert!(source.len() > 100_000, "control: the production region is {} bytes", source.len());
+    }
+
+    /// **The view-only gates stand in front of what they gate** (spec 6.9):
+    /// the two panes' reports go through `view_only_gate` before the match
+    /// that acts on them, the row-command filter sits between the re-prompt
+    /// and its match, and both chords that never pass through a pane --
+    /// CTRL+SHIFT+S and CTRL+SHIFT+2 -- are filtered on `may_edit` inside the
+    /// block that opens their form. Each is asserted by POSITION, not by
+    /// presence: a gate moved below the match it guards is a gate the action
+    /// has already walked past.
+    #[test]
+    fn the_view_only_gates_stand_in_front_of_what_they_gate() {
+        let whole = include_str!("mod.rs");
+        let cut = whole.find(concat!("#[cfg", "(test)]")).expect("no test module in this file");
+        let source = &whole[..cut];
+        let at = |needle: &str| source.find(needle).unwrap_or_else(|| panic!("{needle:?} is not in the production region"));
+        let gate = concat!("let action = view_only_", "gate(item, action);");
+        assert_eq!(source.matches(gate).count(), 2, "one gate per pane that reports actions");
+
+        // The read pane: the gate, then the re-prompt, with nothing but
+        // comments between them.
+        let reprompt = at(concat!("let action = permit_detail_", "action("));
+        let read_gate = source[..reprompt].rfind(gate).expect("no gate above the read pane's re-prompt");
+        assert!(reprompt - read_gate < 1_000, "the read pane's gate is not directly above its re-prompt");
+
+        // The out-of-vault pane: after it draws, before Delete forever can
+        // open the confirmation.
+        let drawn = at(concat!("detail::draw_out_of_vault_", "read("));
+        let oov_gate = drawn + source[drawn..].find(gate).expect("no gate after the out-of-vault pane");
+        let purge = drawn + source[drawn..].find(concat!("detail::DetailAction::Purge", "Forever =>")).expect("no Purge arm");
+        assert!(oov_gate < purge, "the out-of-vault gate is below the arm that opens the confirmation");
+
+        // The row commands: between the re-prompt and the match.
+        let filter = concat!(
+            "let permitted = permitted.filter(|command| crate::vault_bridge::may_edit(&item) || !command.writes_",
+            "the_record());"
+        );
+        assert_eq!(source.matches(filter).count(), 1);
+        let row_reprompt = at(concat!("let permitted = permit_row_", "command("));
+        let row_filter = at(filter);
+        let row_match = row_reprompt + source[row_reprompt..].find("if let Some(command) = permitted {").expect("no row match");
+        assert!(row_reprompt < row_filter && row_filter < row_match, "the row filter is not between the re-prompt and the match");
+
+        // The two chords: inside the block that opens each form.
+        let may_edit = concat!(".filter(|item| crate::vault_bridge::may_", "edit(item))");
+        for (opens, form) in [
+            ("if send_record_asked {", concat!("record_send = permit_record_", "send(")),
+            ("if add_totp_asked && totp_add_state.is_none() {", concat!("totp_add::TotpAdd::", "opening(")),
+        ] {
+            let start = at(opens);
+            let end = start + source[start..].find(form).unwrap_or_else(|| panic!("{form:?} is not after {opens:?}"));
+            assert!(source[start..end].contains(may_edit), "{opens:?} opens its form for a view-only record");
+        }
+    }
+
+    /// **`view_only_gate` turns a view-only record's writes into nothing,
+    /// the out-of-vault three included** -- so a Trash `edit: false` record's
+    /// Delete forever never reaches the confirmation -- and leaves a
+    /// writable record's actions alone.
+    #[test]
+    fn the_view_only_gate_drops_a_view_only_records_writes_and_nothing_else() {
+        let mut theirs: VaultItem = serde_json::from_value(serde_json::json!({ "id": "t1", "name": "Theirs" })).expect("item");
+        theirs.other.insert("edit".into(), serde_json::Value::Bool(false));
+        let mine: VaultItem = serde_json::from_value(serde_json::json!({ "id": "m1", "name": "Mine" })).expect("item");
+        for write in [detail::DetailAction::PurgeForever, detail::DetailAction::Restore, detail::DetailAction::Unarchive, detail::DetailAction::Edit] {
+            assert_eq!(view_only_gate(&theirs, write.clone()), detail::DetailAction::None, "{write:?} passed on a view-only record");
+            assert_eq!(view_only_gate(&mine, write.clone()), write, "{write:?} was taken off a writable record");
+        }
+        assert_eq!(view_only_gate(&theirs, detail::DetailAction::CopyPassword), detail::DetailAction::CopyPassword);
     }
 
     // ==================================================================

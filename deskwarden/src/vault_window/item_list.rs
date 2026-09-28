@@ -446,7 +446,7 @@ pub fn menu_entries(
     may_unfile: bool,
 ) -> Vec<MenuEntry> {
     if let Some(out) = source.out_of_vault() {
-        return out_of_vault_entries(out);
+        return out_of_vault_entries_for(item, out);
     }
     let kind = ItemKind::of(item);
     let login = item.login.as_ref();
@@ -564,6 +564,22 @@ pub fn menu_entries(
 /// what a trashed item can do, and the one that is not the one being read is
 /// the one that goes stale. See `detail::draw_out_of_vault_read`, which maps
 /// each [`RowCommand`] here to the `DetailAction` it reports.
+pub(super) fn out_of_vault_entries_for(item: &VaultItem, out: OutOfVault) -> Vec<MenuEntry> {
+    let mut entries = out_of_vault_entries(out);
+    // **An `edit: false` record's Trash and Archive menus are empty**: every
+    // entry here -- Restore, Delete forever, Unarchive -- writes the record
+    // ([`RowCommand::writes_the_record`]), and NodeWarden refuses each on a
+    // view-only collection. The row menu then opens on nothing; the read
+    // pane's ⋮ says why (`detail::VIEW_ONLY_FOOTER`).
+    if !crate::vault_bridge::may_edit(item) {
+        entries.retain(|entry| !matches!(entry, MenuEntry::Command(command) if command.command.writes_the_record()));
+    }
+    entries
+}
+
+/// [`out_of_vault_entries_for`] without the item: the menu for an item this
+/// account may write, which is what the tests that compare the two menus
+/// compare.
 pub(super) fn out_of_vault_entries(out: OutOfVault) -> Vec<MenuEntry> {
     match out {
         OutOfVault::Trash => vec![
@@ -3320,6 +3336,19 @@ mod menu_entry_tests {
             labels(&menu_entries(&item, &[folder("f1", "Work")], FilterSource::LiveVault, true)),
             vec!["Copy username", "Copy password", "Copy TOTP", "Open website"]
         );
+    }
+
+    /// **And its Trash and Archive menus are empty**: Restore, Delete forever
+    /// and Unarchive each write the record. The same item, writable, is the
+    /// control.
+    #[test]
+    fn a_view_only_records_trash_and_archive_menus_offer_no_write() {
+        let mut item = full_login();
+        item.other.insert("edit".into(), serde_json::Value::Bool(false));
+        for source in [FilterSource::Trash, FilterSource::Archive] {
+            assert!(!labels(&menu_entries(&full_login(), &[], source, false)).is_empty(), "control: {source:?}");
+            assert_eq!(labels(&menu_entries(&item, &[], source, false)), Vec::<String>::new(), "{source:?}");
+        }
     }
 
     /// **"No folder" is offered exactly where the backend can perform it.**
