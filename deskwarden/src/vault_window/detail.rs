@@ -155,14 +155,23 @@ fn header_controls(item: &VaultItem) -> usize {
 /// marks against, in all four cases (a login and a card, with and without
 /// the control).
 ///
-/// The received record's shorter strip (mock 6d: no star, no envelope, no
-/// clock, no Share) is NOT counted here yet, deliberately: this pane still
-/// draws those controls for a received record, and a reservation for fewer
-/// controls than are painted is the x = -34.5 defect again. The branch comes
-/// with the drawing it counts.
+/// **A received record's strip is the ⋮ and the ✕ alone** (mock 6d, and the
+/// owner's call on the star): the star, the envelope, the clock and Share each
+/// write the record or share it on, and `draw_controls` draws none of them
+/// for it -- so this counts [`HEADER_CONTROLS_VIEW_ONLY`], the branch and the
+/// drawing having arrived together. A reservation for fewer controls than
+/// are painted is the x = -34.5 defect; `the_strip_reserves_room_for_every
+/// _control_it_draws` counts both received kinds against the painted marks.
 fn header_controls_for(item: &VaultItem, people: &PeopleSharing<'_>) -> usize {
+    if people.view_only_from.is_some() {
+        return HEADER_CONTROLS_VIEW_ONLY;
+    }
     header_controls(item) + usize::from(people.share_control.is_some())
 }
+
+/// A view-only record's strip: the kebab, whose menu says why it is short,
+/// and the close. See [`header_controls_for`].
+const HEADER_CONTROLS_VIEW_ONLY: usize = 2;
 
 /// The mock's own `.hctls { gap: 2px }`: the closest two of the strip's
 /// controls are ever drawn. See [`controls_gap`].
@@ -966,6 +975,57 @@ pub enum DetailAction {
     /// [`Self::OpenWebsite`], which already exists and already goes through
     /// `is_safe_web_url` and `ShellExecuteW`.
     OpenApp(LaunchPlan),
+}
+
+/// **The kebab's one line on a received record** (mock 6d, ⋮ menu open), in
+/// place of the entries a view-only record does not have. It names the
+/// sharer as the view names them, which is display and nothing more (see
+/// `share_ui::ReceivedShareRow::from`).
+#[must_use]
+pub fn view_only_footer(from: &str) -> String {
+    format!("Shared by {from}, view-only. Only they can edit or delete it.")
+}
+
+/// **What a view-only record allows** (spec 6.9): everything that reads,
+/// nothing that writes. The server refuses a write anyway (spec 10.3); this
+/// is so the user is not offered one. Moving it to a folder and starring it
+/// are writes on NodeWarden too (the sharing plan's decision 5), and so is
+/// the ✉ and Share: 6d's "cannot share it on".
+///
+/// **The writers are listed, not the readers**, for
+/// `item_list::RowCommand::writes_the_record`'s reason: a writer forgotten
+/// here is a press the server refuses, while a reader forgotten in a reader
+/// list would silently take a Copy off every received record. The
+/// out-of-vault three are here with that function's `Restore`, `Unarchive`
+/// and `PurgeForever`, so the pane and the row menu refuse one set.
+///
+/// Applied by `vault_window::mod` right before the re-prompt gate -- a write
+/// that will not happen never asks for the master password -- to every
+/// action the read pane reports for an item `vault_bridge::may_edit` says
+/// no to. The pane also draws none of these controls for a received record
+/// (`draw_controls`); this is the gate behind the drawing, and it is what
+/// a card's own write -- the matched app's Remove -- meets.
+#[must_use]
+pub fn view_only(action: DetailAction) -> DetailAction {
+    match action {
+        DetailAction::Edit
+        | DetailAction::Clone
+        | DetailAction::Delete
+        | DetailAction::MoveToFolder(_)
+        | DetailAction::Unfile
+        | DetailAction::ToggleFavorite(_)
+        | DetailAction::EditSequence
+        | DetailAction::RemoveAppMatch
+        | DetailAction::AddTotp
+        | DetailAction::SendRecord
+        | DetailAction::ShareRecord
+        | DetailAction::RevokeSend
+        | DetailAction::ConfirmRevokeSend
+        | DetailAction::Restore
+        | DetailAction::Unarchive
+        | DetailAction::PurgeForever => DetailAction::None,
+        other => other,
+    }
 }
 
 /// Whether this kind can be filled into an application.
@@ -3576,6 +3636,41 @@ pub fn draw_detail_read(
                         // see [`subtitle_text`], which is where the faint
                         // 12pt styling these used to carry as a `RichText`
                         // now lives, unchanged.
+                        //
+                        // **A received record says who shared it, and that
+                        // it is view-only** (mock 6d's `.dsub .by`), in place
+                        // of the folder: `Login · ` in the subtitle's faint
+                        // ink, then a person mark and the claim in the
+                        // muted one, a step louder -- the mock's own two
+                        // inks, since this is the line that explains why the
+                        // strip is short. The same two-runs-and-a-mark shape
+                        // as the folder, so it is the folder's line and not a
+                        // third arrangement of it.
+                        if let Some(from) = people.view_only_from {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                subtitle_text(ui, subtitle_kind_id(&item.id), &format!("{} \u{b7} ", kind.label()));
+                                let (mark, _) = ui.allocate_exact_size(
+                                    egui::vec2(VIEW_ONLY_MARK + VIEW_ONLY_MARK_GAP, SUBTITLE_SIZE),
+                                    egui::Sense::hover(),
+                                );
+                                theme::paint_person_mark(
+                                    ui.painter(),
+                                    egui::Rect::from_center_size(
+                                        egui::pos2(mark.left() + VIEW_ONLY_MARK / 2.0, mark.center().y),
+                                        egui::Vec2::splat(VIEW_ONLY_MARK),
+                                    ),
+                                    theme::TEXT_MUTED,
+                                );
+                                subtitle_text_in(
+                                    ui,
+                                    subtitle_folder_id(&item.id),
+                                    &format!("Shared by {from} \u{b7} view-only"),
+                                    theme::TEXT_MUTED,
+                                );
+                            });
+                            return;
+                        }
                         let (lead, name) = header_subtitle_parts(kind, folder);
                         match name {
                             None => {
@@ -3688,6 +3783,28 @@ pub fn draw_detail_read(
                 let menu = egui::Popup::menu(&kebab)
                     .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
                 menu.show(|ui| {
+                    // **Mock 6d's ⋮ on a received record: nothing that
+                    // writes -- only why.** No Edit, Clone or Delete, and no
+                    // Move to folder either, although the mock keeps it
+                    // ("folders are yours"): NodeWarden refuses every write
+                    // on a view-only collection's cipher, the move included,
+                    // so the owner took it out with the rest (the plan's
+                    // decision 5). The line is the mock's `.foot`: 11pt,
+                    // ghost ink, wrapped in the menu's 250pt.
+                    //
+                    // The kebab stays rather than going with its entries: a
+                    // strip that lost its ⋮ on some records would say nothing
+                    // about why, and this line is where the why lives.
+                    if let Some(from) = people.view_only_from {
+                        ui.set_width(VIEW_ONLY_MENU_WIDTH);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(view_only_footer(from)).size(11.0).color(theme::TEXT_GHOST),
+                            )
+                            .wrap(),
+                        );
+                        return;
+                    }
                     // **The Icon submenu is gone from here**, and from the
                     // item row's menu with it. It lives on the edit pane's
                     // pencil badge now -- the little disc on the avatar,
@@ -3907,7 +4024,14 @@ pub fn draw_detail_read(
                 // a literal typed here would be a second home for a fact the
                 // key handler owns, and a rebinding would leave this tooltip
                 // lying.
-                if item_takes_a_one_time_code(item) {
+                // **None of the four below on a received record** (mock 6d):
+                // the ⏱ and the ★ write the record, the ✉ and Share hand it
+                // on, and a view-only record takes neither. Not drawn rather
+                // than drawn greyed, for the ⏱'s own reason -- a control that
+                // can only ever say "not you" -- and `header_controls_for`
+                // reserves room for exactly the ⋮ and ✕ that are left.
+                let writable = people.view_only_from.is_none();
+                if writable && item_takes_a_one_time_code(item) {
                     // Bound before it is asked, rather than chained into the
                     // `if` above: collapsing the two conditions would make
                     // PAINTING this control a side effect of evaluating a
@@ -3935,7 +4059,7 @@ pub fn draw_detail_read(
                 // is offered instead", said on the hover so the press is no
                 // surprise. `None` draws no control, and `header_controls_for`
                 // reserves room for exactly that.
-                if let Some(offered) = people.share_control {
+                if let Some(offered) = people.share_control.filter(|_| writable) {
                     let hover = if offered {
                         super::share_ui::SHARE_TOOLTIP
                     } else {
@@ -3982,13 +4106,14 @@ pub fn draw_detail_read(
                 // second home for the same fact, and a rebinding would leave
                 // this tooltip lying. Same rule, and the same separator, as
                 // the rows' `"Click to copy · {chord}"`.
-                if theme::send_record_button(ui)
-                    .on_hover_text(format!(
-                        "{} · {}",
-                        record_ui::SEND_RECORD_LABEL,
-                        record_ui::SEND_RECORD_SHORTCUT
-                    ))
-                    .clicked()
+                if writable
+                    && theme::send_record_button(ui)
+                        .on_hover_text(format!(
+                            "{} · {}",
+                            record_ui::SEND_RECORD_LABEL,
+                            record_ui::SEND_RECORD_SHORTCUT
+                        ))
+                        .clicked()
                 {
                     action = DetailAction::SendRecord;
                 }
@@ -4053,9 +4178,10 @@ pub fn draw_detail_read(
                 } else {
                     "Add this item to Favorites"
                 };
-                if theme::star_toggle(ui, item.favorite)
-                    .on_hover_text(favourite_hover)
-                    .clicked()
+                if writable
+                    && theme::star_toggle(ui, item.favorite)
+                        .on_hover_text(favourite_hover)
+                        .clicked()
                 {
                     // The TARGET state, computed here from the item this
                     // pane actually drew -- see `DetailAction::ToggleFavorite`.
@@ -6021,9 +6147,10 @@ pub struct SharedSend<'a> {
 ///
 /// The header's Share control reads `share_control`; the SHARING card reads
 /// the people, the stop and fingerprint states and the notice
-/// (`share_ui::draw_people_block`). `view_only_from` is carried for the
-/// recipient's view-only header, which draws it when it is built, so that
-/// task changes what is drawn and not what is passed.
+/// (`share_ui::draw_people_block`). `view_only_from` makes the pane mock 6d's
+/// view-only one: the "Shared by … · view-only" subtitle, the strip cut to
+/// the ⋮ and the ✕ (`header_controls_for`), and the ⋮ saying why
+/// ([`view_only_footer`]).
 #[derive(Clone, Copy, Default)]
 pub struct PeopleSharing<'a> {
     /// The Share control: `Some(true)` shares, `Some(false)` offers a Send
@@ -6042,7 +6169,9 @@ pub struct PeopleSharing<'a> {
     /// shown on the SHARING card until the next write. It can name a
     /// decrypted record, so it is drawn and never logged.
     pub notice: Option<&'a str>,
-    /// A received record: who shares it. The pane is view-only.
+    /// A received record: who shares it, as the view names them (display
+    /// only -- see `share_ui::ReceivedShareRow::from`). The pane is
+    /// view-only.
     pub view_only_from: Option<&'a str>,
 }
 
@@ -7165,9 +7294,13 @@ fn title_text_id(item_id: &str) -> egui::Id {
 /// run's width before it can ask a `TextEdit` to be exactly that wide, and a
 /// width measured from anything but the painted galley is a width that clips
 /// or pads the run.
-fn subtitle_galley(ui: &egui::Ui, text: &str) -> std::sync::Arc<egui::Galley> {
+///
+/// `color` is the run's ink: [`theme::TEXT_FAINT`] for the kind and the
+/// folder, and the received record's "Shared by" run a step louder in
+/// [`theme::TEXT_MUTED`] (mock 6d's `.by`) -- see [`subtitle_text_in`].
+fn subtitle_galley(ui: &egui::Ui, text: &str, color: egui::Color32) -> std::sync::Arc<egui::Galley> {
     let styled: egui::WidgetText =
-        RichText::new(text).size(SUBTITLE_SIZE).color(theme::TEXT_FAINT).into();
+        RichText::new(text).size(SUBTITLE_SIZE).color(color).into();
     styled.into_galley(
         ui,
         Some(egui::TextWrapMode::Extend),
@@ -7189,6 +7322,14 @@ fn subtitle_galley(ui: &egui::Ui, text: &str) -> std::sync::Arc<egui::Galley> {
 fn subtitle_font() -> egui::FontId {
     egui::FontId::new(SUBTITLE_SIZE, egui::FontFamily::Proportional)
 }
+
+/// Mock 6d's `ic('person', 11, ..)` before a received record's "Shared by",
+/// and the `.by { gap: 5px }` after it.
+const VIEW_ONLY_MARK: f32 = 11.0;
+const VIEW_ONLY_MARK_GAP: f32 = 5.0;
+/// Mock 6d's `.menu { width: 250px }`, which the view-only kebab's one line
+/// wraps inside rather than stretching the menu across the pane.
+const VIEW_ONLY_MENU_WIDTH: f32 = 250.0;
 
 /// One run of the header's subtitle: **the same faint words in the same
 /// place, and now selectable with the mouse.** The user, of the detail
@@ -7222,9 +7363,17 @@ fn subtitle_font() -> egui::FontId {
 /// item_name` would not catch that: it asks about the GALLEY's rect, which
 /// stays at the left edge, not about the box the widget allocated.
 fn subtitle_text(ui: &mut egui::Ui, id: egui::Id, text: &str) {
-    let width = subtitle_galley(ui, text).size().x;
+    subtitle_text_in(ui, id, text, theme::TEXT_FAINT);
+}
+
+/// [`subtitle_text`] in another ink -- the received record's "Shared by ...
+/// · view-only" run, which mock 6d sets in the muted grey beside the faint
+/// kind. Everything else about the run is [`subtitle_text`]'s, so the two
+/// runs of one line are one widget in two colours.
+fn subtitle_text_in(ui: &mut egui::Ui, id: egui::Id, text: &str, color: egui::Color32) {
+    let width = subtitle_galley(ui, text, color).size().x;
     let mut layouter =
-        |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| subtitle_galley(ui, buf.as_str());
+        |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| subtitle_galley(ui, buf.as_str(), color);
     // `&str`, so the buffer is immutable: the selection works, typing does
     // nothing.
     let mut source = text;
@@ -10115,6 +10264,10 @@ mod tests {
         /// [`Pane::with_people`] and [`Pane::with_sharing_notice`]).
         people: Vec<crate::vault_window::share_ui::PersonLine>,
         sharing_notice: Option<String>,
+        /// Who shares this record with the account, when it is a received
+        /// one (mock 6d) -- `None` unless a test sets it (see
+        /// [`Pane::view_only`]), which is every record the user owns.
+        view_only_from: Option<String>,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -10556,6 +10709,7 @@ mod tests {
                 share_control: None,
                 people: Vec::new(),
                 sharing_notice: None,
+                view_only_from: None,
             }
         }
 
@@ -10569,6 +10723,13 @@ mod tests {
         /// The same pane, on a record shared with these people (design 6b).
         fn with_people(mut self, people: Vec<crate::vault_window::share_ui::PersonLine>) -> Self {
             self.people = people;
+            self
+        }
+
+        /// The same pane, on a record `from` shares with this account: the
+        /// view-only pane of mock 6d.
+        fn view_only(mut self, from: &str) -> Self {
+            self.view_only_from = Some(from.to_string());
             self
         }
 
@@ -10664,6 +10825,7 @@ mod tests {
                             share_control: self.share_control,
                             people: &self.people,
                             notice: self.sharing_notice.as_deref(),
+                            view_only_from: self.view_only_from.as_deref(),
                             ..PeopleSharing::default()
                         });
                 },
@@ -10756,8 +10918,10 @@ mod tests {
         /// that click -- the first one on which the menu paints.
         fn open_kebab(&mut self, item: &VaultItem, totp: &TotpState) -> Frame {
             let closed = self.idle(item, totp);
+            // The ✕ and not the star: a received record's strip draws no
+            // star (mock 6d), and its kebab is the one this opens most.
             assert!(
-                closed.stars.len() == 1,
+                closed.pane_closes.len() == 1,
                 "the pane did not lay out at all, so opening its menu proves nothing"
             );
             let kebab = closed.kebab().center();
@@ -17120,34 +17284,58 @@ mod tests {
     /// **And for both answers of the Share control** (design 6a): drawn, it
     /// is one more control and [`header_controls_for`] must count it; not
     /// drawn, it must not be painted. Four cases, not two.
+    ///
+    /// **And for a received record** (mock 6d), whose strip is the ⋮ and the
+    /// ✕ alone: the four marks that write -- or share it on -- are asserted
+    /// ABSENT, and the reservation must shrink with them. A reservation for
+    /// more than is painted only wastes room; for fewer, it is the x = -34.5
+    /// defect, which is why the count and the drawing changed together.
     #[test]
     fn the_strip_reserves_room_for_every_control_it_draws() {
-        for (what, item, share) in [
-            ("a login", a_login(), None),
-            ("a card", a_full_card(), None),
-            ("a login with Share", a_login(), Some(true)),
-            ("a card offered a Send", a_full_card(), Some(false)),
+        for (what, item, share, from) in [
+            ("a login", a_login(), None, None),
+            ("a card", a_full_card(), None, None),
+            ("a login with Share", a_login(), Some(true), None),
+            ("a card offered a Send", a_full_card(), Some(false), None),
+            ("a received login", a_login(), None, Some("denis@x.io")),
+            ("a received card", a_full_card(), None, Some("denis@x.io")),
         ] {
             let mut pane = Pane::wide(MIN_PANE);
             if let Some(offered) = share {
                 pane = pane.with_share_control(offered);
             }
-            let people = PeopleSharing { share_control: share, ..PeopleSharing::default() };
+            if let Some(from) = from {
+                pane = pane.view_only(from);
+            }
+            let people = PeopleSharing { share_control: share, view_only_from: from, ..PeopleSharing::default() };
             let frame = pane.idle(&item, &TotpState::NoSecret);
 
             let mut painted = vec![
-                ("the favourite star", frame.stars.len()),
-                ("the Send envelope", frame.envelopes.len()),
                 // Three dots, one control -- `Frame::kebab` is what asserts
                 // the count of dots, and it is called here for that assertion.
                 ("the kebab", usize::from(!frame.kebab_dots.is_empty())),
                 ("the close ✕", frame.pane_closes.len()),
             ];
+            if from.is_some() {
+                for (name, count) in [
+                    ("star", frame.stars.len()),
+                    ("envelope", frame.envelopes.len()),
+                    ("clock", frame.clocks.len()),
+                    ("Share control", frame.shares.len()),
+                ] {
+                    assert_eq!(count, 0, "{what} was drawn a {name}, and a view-only record takes no write");
+                }
+            } else {
+                painted.push(("the favourite star", frame.stars.len()));
+                painted.push(("the Send envelope", frame.envelopes.len()));
+            }
             // The conditional one, listed only where it is meant to be drawn
             // -- and its ABSENCE asserted on the other item, so a ⏱ that
             // started appearing on cards fails here rather than merely making
             // two counts agree with each other.
-            if item_takes_a_one_time_code(&item) {
+            if from.is_some() {
+                // Asserted absent above.
+            } else if item_takes_a_one_time_code(&item) {
                 painted.push(("the one-time code clock", frame.clocks.len()));
             } else {
                 assert!(
@@ -17179,6 +17367,97 @@ mod tests {
                 header_controls_for(&item, &people)
             );
         }
+    }
+
+    /// **A received record is view-only** (mock 6d): the subtitle says who
+    /// shared it; no star, no envelope, no clock, no Share; the kebab says
+    /// why and offers no Edit, Clone or Delete.
+    #[test]
+    fn a_received_record_reads_view_only_and_offers_nothing_that_writes() {
+        let item = a_login();
+        let mut pane = Pane::new().view_only("denis@x.io");
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(frame.texts.iter().any(|(t, _)| t.contains("Shared by denis@x.io \u{b7} view-only")), "{:?}", frame.texts);
+        assert!(frame.stars.is_empty(), "a received record draws no star");
+        assert!(frame.envelopes.is_empty(), "a received record draws no envelope");
+        assert!(frame.clocks.is_empty(), "a received record draws no clock");
+        assert_eq!(view_only(DetailAction::Edit), DetailAction::None);
+        assert_eq!(view_only(DetailAction::Delete), DetailAction::None);
+        assert_eq!(view_only(DetailAction::ToggleFavorite(true)), DetailAction::None);
+        assert_eq!(view_only(DetailAction::CopyPassword), DetailAction::CopyPassword, "copy still works");
+    }
+
+    /// **Mock 6d's ⋮, open**: the one line saying why, and not one entry
+    /// that writes -- no Edit, no Clone, no Delete, and (the owner's call,
+    /// since NodeWarden refuses every write on a view-only collection) no
+    /// Move to folder either. The kebab and the ✕ are still there.
+    #[test]
+    fn a_received_records_kebab_says_why_and_offers_no_write() {
+        let item = a_login();
+        let mut pane = Pane::new().view_only("denis@x.io");
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let painted = open.strings();
+        assert!(
+            painted.iter().any(|s| *s == view_only_footer("denis@x.io")),
+            "the view-only kebab does not say why it is empty: {painted:?}"
+        );
+        assert_eq!(view_only_footer("denis@x.io"), "Shared by denis@x.io, view-only. Only they can edit or delete it.");
+        for writer in ["Edit", "Clone", crate::vault_window::item_list::DELETE_LABEL, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
+            assert!(!painted.iter().any(|s| *s == writer), "a received record's kebab offers {writer:?}: {painted:?}");
+        }
+    }
+
+    /// **The rest of what a view-only record allows**: every write maps to
+    /// nothing -- the kebab's, the header's, the cards' (the matched app's
+    /// Remove) and the out-of-vault three -- and every read passes through.
+    #[test]
+    fn view_only_passes_every_read_and_no_write() {
+        for write in [
+            DetailAction::Edit,
+            DetailAction::Clone,
+            DetailAction::Delete,
+            DetailAction::MoveToFolder("f1".into()),
+            DetailAction::Unfile,
+            DetailAction::ToggleFavorite(false),
+            DetailAction::EditSequence,
+            DetailAction::RemoveAppMatch,
+            DetailAction::AddTotp,
+            DetailAction::SendRecord,
+            DetailAction::ShareRecord,
+            DetailAction::RevokeSend,
+            DetailAction::ConfirmRevokeSend,
+            DetailAction::Restore,
+            DetailAction::Unarchive,
+            DetailAction::PurgeForever,
+        ] {
+            assert_eq!(view_only(write.clone()), DetailAction::None, "{write:?} writes, and passed");
+        }
+        for read in [
+            DetailAction::CopyUsername,
+            DetailAction::CopyTotp,
+            DetailAction::CopyValue("x".into()),
+            DetailAction::OpenWebsite("https://x.io".into()),
+            DetailAction::CopyPasswordHistory(0),
+            DetailAction::ClosePane,
+            DetailAction::CancelRevokeSend,
+        ] {
+            assert_eq!(view_only(read.clone()), read, "a read was taken away");
+        }
+    }
+
+    /// **Two controls fit anywhere, at the strip's own gap**: the six-control
+    /// strip closes its gaps at the minimum pane (`controls_gap`); the
+    /// received record's ⋮ and ✕ never need to.
+    #[test]
+    fn a_received_records_strip_keeps_its_gap_at_the_minimum_pane() {
+        let people = PeopleSharing { view_only_from: Some("denis@x.io"), ..PeopleSharing::default() };
+        let n = header_controls_for(&a_login(), &people);
+        assert_eq!(n, 2, "the kebab and the close");
+        assert_eq!(controls_gap(MIN_PANE - f32::from(HEADER_PAD_X) * 2.0, n), HEADER_GAP);
+        let mut pane = Pane::wide(MIN_PANE).view_only("denis@x.io");
+        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
+        let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
+        assert!(bounds.contains_rect(frame.kebab()) && bounds.contains_rect(frame.pane_close().0));
     }
 
     /// **The ✕ reports `ClosePane`, and the ✉ reports `SendRecord`.**

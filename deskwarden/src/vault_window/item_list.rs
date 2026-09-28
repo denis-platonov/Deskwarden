@@ -207,9 +207,11 @@ impl RowCommand {
     /// courtesy `vault_bridge::may_edit` describes, lost for one command. A
     /// reader list forgotten the same way would silently take a harmless Copy
     /// off every received record's menu, which nobody would report as a bug.
-    // Called from `vault_window::mod`'s row-command gate in Task 19 (a
-    // received record is view-only); until then only this module's tests ask.
-    #[allow(dead_code)]
+    ///
+    /// Read twice: [`menu_entries`] leaves these out of a view-only record's
+    /// menu, and `vault_window::mod`'s row-command gate drops one that
+    /// arrives anyway -- from the pane's own ⋮, or a menu drawn a frame
+    /// before a sync turned the record view-only.
     #[must_use]
     pub(crate) fn writes_the_record(&self) -> bool {
         matches!(
@@ -518,6 +520,20 @@ pub fn menu_entries(
     // the two rows in that order too.
     entries.push(enabled_command("Archive", RowCommand::Archive));
     entries.push(enabled_command(DELETE_LABEL, RowCommand::Delete));
+    // **A received record's menu is the read half of this one** (mock 6d:
+    // "only what a view-only record allows"). Everything that writes goes --
+    // [`RowCommand::writes_the_record`]'s decision, not a second list here --
+    // and Move to folder with it, which that function counts as a write on
+    // NodeWarden. Left out rather than greyed, like the detail pane's kebab:
+    // greyed entries on every received record would be a menu that mostly
+    // says no. `vault_window::mod` refuses a write for such an item anyway;
+    // this is so the menu does not offer one.
+    if !crate::vault_bridge::may_edit(item) {
+        entries.retain(|entry| match entry {
+            MenuEntry::Command(command) => !command.command.writes_the_record(),
+            MenuEntry::MoveToFolder(_) | MenuEntry::Icon(_) => false,
+        });
+    }
     entries
 }
 
@@ -2607,12 +2623,21 @@ fn item_row(
     }
     // Only acts on the frame the drag actually starts (see
     // `Response::dnd_set_drag_payload`), so this is not a per-frame write.
-    response.dnd_set_drag_payload(DraggedItem {
-        id: item.id.clone(),
-        folder_id: item.folder_id.clone(),
-    });
-    if response.dragged() {
-        drag_ghost(ui, &item.name);
+    //
+    // **Not for a received record** (mock 6d): a drop on a folder is a move,
+    // which NodeWarden refuses on a view-only collection (see
+    // `RowCommand::writes_the_record`), and the sidebar's drop goes straight
+    // to the move rather than through the row-command gate. So the drag
+    // never starts -- no payload, no ghost -- which is the menu's rule for
+    // Move to folder, applied to the gesture that does the same thing.
+    if crate::vault_bridge::may_edit(item) {
+        response.dnd_set_drag_payload(DraggedItem {
+            id: item.id.clone(),
+            folder_id: item.folder_id.clone(),
+        });
+        if response.dragged() {
+            drag_ghost(ui, &item.name);
+        }
     }
     // The menu is rendered into egui's own popup layer (a separate `Area`),
     // so nothing here allocates in the row's ui and the fixed row pitch
@@ -3280,6 +3305,21 @@ mod menu_entry_tests {
         assert!(!trashed.contains(&"Delete".to_string()));
         assert!(!live.contains(&"Restore".to_string()));
         assert!(trashed.contains(&"Restore".to_string()));
+    }
+
+    /// **A received record's row menu is the read half of the live one**
+    /// (mock 6d): the copies and Open website stay; Edit, Move to folder,
+    /// Archive and Delete -- each a write NodeWarden refuses on a view-only
+    /// collection -- are not offered at all, rather than offered and then
+    /// dropped by the window's gate.
+    #[test]
+    fn a_view_only_records_row_menu_offers_only_what_reads() {
+        let mut item = full_login();
+        item.other.insert("edit".into(), serde_json::Value::Bool(false));
+        assert_eq!(
+            labels(&menu_entries(&item, &[folder("f1", "Work")], FilterSource::LiveVault, true)),
+            vec!["Copy username", "Copy password", "Copy TOTP", "Open website"]
+        );
     }
 
     /// **"No folder" is offered exactly where the backend can perform it.**

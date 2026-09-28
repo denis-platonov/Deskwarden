@@ -369,10 +369,6 @@ impl SharingPane {
         self.stale = false;
     }
 
-    pub(crate) fn received_count(&self) -> usize {
-        self.view.as_ref().map_or(0, |v| v.received.len())
-    }
-
     pub(crate) fn has_incoming(&self) -> bool {
         self.view.as_ref().is_some_and(|v| !v.incoming.is_empty())
     }
@@ -2380,13 +2376,18 @@ pub struct PeopleRows<'a> {
     pub(crate) notice: Option<String>,
     /// Out: what was pressed this frame.
     pub(crate) asked: Option<PeopleAsk>,
+    /// **Shared with me's FROM PEOPLE** (mock 6d): the records other people
+    /// share with this account, which [`draw_received_group`] lists above
+    /// the imported Sends. Only rows: a received record has no two-step here
+    /// -- a click opens it in the vault, and its pane is view-only there.
+    pub(crate) received: &'a [ReceivedShareRow],
 }
 
 impl PeopleRows<'static> {
     /// Nothing about sharing: what every caller that is not about it passes.
     #[must_use]
     pub fn none() -> Self {
-        Self { shares: &[], confirming: None, stopping: None, notice: None, asked: None }
+        Self { shares: &[], confirming: None, stopping: None, notice: None, asked: None, received: &[] }
     }
 }
 
@@ -2398,6 +2399,137 @@ pub(crate) enum PeopleAsk {
     /// "Remove from their vault": step two.
     ConfirmStop(String),
     CancelStop,
+}
+
+// ---- Shared with me: records from people (mock 6d) -----------------------------------
+//
+// **The data and the grouping are here; the row is `send_ui`'s**, for the Sent
+// list's reason above: a received record stands in Shared with me's column
+// beside the imported Sends, and that column is one row shape. So the row is
+// `send_ui::draw_person_row` -- the band, the record's tile and the person
+// mark the Sent list's share row wears -- with no pill: a received record's
+// only state is "yours to read", which the subtitle says.
+
+/// A received row's selection key starts with this, so it can never be taken
+/// for an imported Send's key or a share's -- the Received detail finds no
+/// row for it and shows its "nothing picked" pane, which is right: the row's
+/// click has already opened the record in the vault.
+pub(crate) const RECEIVED_KEY_PREFIX: &str = "recv:";
+/// Mock 6d's two `.lgroup` eyebrows over Shared with me's list.
+pub(crate) const FROM_PEOPLE_EYEBROW: &str = "FROM PEOPLE";
+pub(crate) const FROM_SENDS_EYEBROW: &str = "IMPORTED FROM SENDS";
+/// `.lgroup { font-size: 10px; letter-spacing: 0.1em; padding: 6px 4px 0 }`.
+const GROUP_EYEBROW_PX: f32 = 10.0;
+const GROUP_EYEBROW_TRACKING: f32 = 1.0;
+const GROUP_EYEBROW_TOP: f32 = 6.0;
+const GROUP_EYEBROW_INSET: f32 = 4.0;
+
+/// A record someone shares with this account, in Shared with me.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReceivedShareRow {
+    /// `recv:{item id}` -- see [`RECEIVED_KEY_PREFIX`].
+    pub(crate) key: String,
+    pub(crate) item_id: String,
+    /// The VAULT ITEM's name, for [`ShareRow::name`]'s reason: the vault
+    /// decrypted and authenticated the record, and the view only says which
+    /// item it is.
+    pub(crate) name: String,
+    /// Who shares it, as the view names them. **For display only**: the
+    /// view's sharer is read off the sharing org's name, which its owner
+    /// wrote in plaintext and could have spelled as anybody. The view offers
+    /// no authenticated alternative for a record received (the collection
+    /// under it is the SHARER's, keyed by an org key only they vouch for), so
+    /// this is shown as the claim it is and decides nothing.
+    pub(crate) from: String,
+}
+
+/// **The received records the window holds, in the view's order.** An entry
+/// whose item the vault does not hold -- a view a frame older than a sync --
+/// is left out, for [`share_rows`]' reason: the vault is where a name comes
+/// from, and a nameless row is not one to show.
+pub(crate) fn received_share_rows(view: Option<&SharingView>, items: &[VaultItem]) -> Vec<ReceivedShareRow> {
+    let Some(view) = view else {
+        return Vec::new();
+    };
+    view.received
+        .iter()
+        .filter_map(|r| {
+            let item = items.iter().find(|i| i.id == r.item_id)?;
+            Some(ReceivedShareRow {
+                key: format!("{RECEIVED_KEY_PREFIX}{}", item.id),
+                item_id: item.id.clone(),
+                name: item.name.clone(),
+                from: r.from.clone(),
+            })
+        })
+        .collect()
+}
+
+/// The height [`group_eyebrow`] takes, measured -- what `send_ui` adds to its
+/// row count's height so its scroll bar decides on the list really drawn.
+pub(crate) fn group_eyebrow_height(ui: &egui::Ui) -> f32 {
+    let bold = egui::FontId::new(GROUP_EYEBROW_PX, egui::FontFamily::Name(theme::BOLD.into()));
+    GROUP_EYEBROW_TOP + ui.ctx().fonts_mut(|f| f.row_height(&bold))
+}
+
+/// **One of mock 6d's list eyebrows** (`.lgroup`): 10pt bold, tracked 0.1em,
+/// in the ghost ink, 6pt under whatever is above it and 4pt in from the row
+/// edge. Not `theme::eyebrow`, which is the rail's 11pt header: the mock sets
+/// these a size down, as headers INSIDE a list rather than over one.
+pub(crate) fn group_eyebrow(ui: &mut egui::Ui, width: f32, text: &str) {
+    let job = theme::letterspaced(text, GROUP_EYEBROW_PX, theme::BOLD, GROUP_EYEBROW_TRACKING, theme::TEXT_GHOST);
+    let galley = ui.painter().layout_job(job);
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, group_eyebrow_height(ui)), egui::Sense::hover());
+    ui.painter().galley(egui::pos2(rect.left() + GROUP_EYEBROW_INSET, rect.top() + GROUP_EYEBROW_TOP), galley, theme::TEXT_GHOST);
+}
+
+/// **Shared with me's people half** (mock 6d): the FROM PEOPLE eyebrow and a
+/// row per received record -- "from denis@example.com · view-only" under its
+/// name. A row opens the record in the vault, where its pane is view-only.
+/// Draws nothing, not even the eyebrow, when nobody shares anything, so the
+/// screen of an account that only ever imported Sends is unchanged.
+///
+/// **IMPORTED FROM SENDS is not drawn here** although the mock puts it under
+/// this group: this function cannot see whether there are imports, and an
+/// eyebrow over no rows says a group exists that does not. `send_ui` draws it,
+/// where both lists are known (`shared_with_me_puts_records_from_people_above
+/// _the_imports`).
+///
+/// `records` are the vault's tiles, so a received record wears in this list
+/// the favicon it wears in All items -- the Sent list's share row's rule.
+pub(crate) fn draw_received_group(
+    ui: &mut egui::Ui,
+    people: &mut PeopleRows<'_>,
+    width: f32,
+    height: f32,
+    selected: &mut Option<String>,
+    records: crate::vault_window::send_ui::RecordTiles<'_>,
+) -> Option<crate::vault_window::send_ui::SendUiAction> {
+    if people.received.is_empty() {
+        return None;
+    }
+    let mut action = None;
+    group_eyebrow(ui, width, FROM_PEOPLE_EYEBROW);
+    for row in people.received {
+        let clicked = crate::vault_window::send_ui::draw_person_row(
+            ui,
+            crate::vault_window::send_ui::PersonRow {
+                key: &row.key,
+                item_id: &row.item_id,
+                name: &row.name,
+                subtitle: &format!("from {} \u{b7} view-only", row.from),
+                pill: None,
+            },
+            width,
+            height,
+            selected,
+            records,
+        );
+        if clicked {
+            action = Some(crate::vault_window::send_ui::SendUiAction::OpenRecord(row.item_id.clone()));
+        }
+    }
+    action
 }
 
 #[cfg(test)]
@@ -2656,11 +2788,15 @@ mod tests {
     /// The rail's numbers: one per record in Shared with me, and the dot
     /// while an invitation waits. (Sent's share count is `share_rows`'s
     /// length -- the list's own rows -- and is held by
-    /// `sent_lists_one_row_for_each_record_and_person`.)
+    /// `sent_lists_one_row_for_each_record_and_person`; Shared with me's is
+    /// `received_share_rows`' length on the same terms, held by
+    /// `received_rows_are_named_by_the_vault_and_need_their_record`.)
     #[test]
     fn the_rail_counts_come_from_the_view() {
         let mut pane = SharingPane::default();
-        assert_eq!((pane.received_count(), pane.has_incoming()), (0, false));
+        let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "t1", "name": "Theirs" })).expect("item")];
+        let received = |pane: &SharingPane| received_share_rows(pane.view.as_ref(), &items).len();
+        assert_eq!((received(&pane), pane.has_incoming()), (0, false));
         let mut v = view(
             vec![("anna@x.io", PersonState::Shared, None), ("bob@x.io", PersonState::WaitingAccept, None)],
             vec![("r1", vec!["anna@x.io", "bob@x.io"]), ("r2", vec!["anna@x.io"])],
@@ -2668,7 +2804,7 @@ mod tests {
         v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "t1".into(), from: "d@x.io".into() });
         v.incoming.push(crate::rest::sharing::IncomingEntry { id: "i1".into(), from: "e@x.io".into(), expires_at: None });
         pane.view = Some(v);
-        assert_eq!((pane.received_count(), pane.has_incoming()), (1, true));
+        assert_eq!((received(&pane), pane.has_incoming()), (1, true));
         pane.stop_confirming = Some(("r1".into(), "bob@x.io".into()));
         assert_eq!(pane.confirming_for("r1"), Some("bob@x.io"));
         assert_eq!(pane.confirming_for("r2"), None);
@@ -3642,5 +3778,81 @@ mod tests {
         let rows = share_rows(Some(&v), &[&items, &archived], &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows.iter().any(|r| r.item_id == "gone" && r.name == "Old VPN"));
+    }
+
+    // ---- Shared with me: records from people (mock 6d) ------------------------------
+
+    /// A harness frame: `draw` in a `width`-wide window after one warm frame
+    /// (a press is hit-tested against the widgets of the frame before it),
+    /// and every string the measured frame painted.
+    fn ui_frame(width: f32, events: Vec<egui::Event>, mut draw: impl FnMut(&mut egui::Ui)) -> Vec<(String, egui::Rect)> {
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, 800.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(Vec::new()), |ui| draw(ui));
+        let output = ctx.run_ui(input(events), |ui| draw(ui));
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    /// **Mock 6d**: FROM PEOPLE above IMPORTED FROM SENDS, each received row
+    /// "from denis@example.com · view-only", and a click opens the record.
+    #[test]
+    fn shared_with_me_lists_received_records_from_people_and_opens_them() {
+        use crate::vault_window::send_ui::{RecordTiles, SendUiAction};
+        let received = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }];
+        let mut people = PeopleRows { received: &received, ..PeopleRows::none() };
+        let mut selected = None;
+        let texts = ui_frame(400.0, Vec::new(), |ui| {
+            let _ = draw_received_group(ui, &mut people, 376.0, 62.0, &mut selected, RecordTiles::default());
+        });
+        assert!(texts.iter().any(|(t, _)| t == FROM_PEOPLE_EYEBROW));
+        assert!(texts.iter().any(|(t, _)| t == "from denis@x.io \u{b7} view-only"), "{texts:?}");
+        let row = texts.iter().find(|(t, _)| t == "Acme VPN").map(|(_, r)| r.center()).expect("the row");
+        let mut opened = None;
+        let _ = ui_frame(400.0, click(row), |ui| {
+            if let Some(action) = draw_received_group(ui, &mut people, 376.0, 62.0, &mut selected, RecordTiles::default()) {
+                opened = Some(action);
+            }
+        });
+        assert!(matches!(opened, Some(SendUiAction::OpenRecord(ref id)) if id == "r9"));
+        assert_eq!(selected.as_deref(), Some("recv:r9"), "the row is picked as it opens");
+    }
+
+    /// **Nobody shares anything: nothing is drawn**, not even the eyebrow --
+    /// a Shared with me that only ever imported Sends looks as it always did.
+    #[test]
+    fn no_received_records_draw_no_group() {
+        use crate::vault_window::send_ui::RecordTiles;
+        let mut people = PeopleRows::none();
+        let texts = ui_frame(400.0, Vec::new(), |ui| {
+            let _ = draw_received_group(ui, &mut people, 376.0, 62.0, &mut None, RecordTiles::default());
+        });
+        assert!(texts.is_empty(), "{texts:?}");
+    }
+
+    /// **The row's name is the VAULT item's**, never the view's: the view
+    /// says only which item and who from. An entry the vault does not hold
+    /// (a view a frame older than a sync) is left out rather than drawn
+    /// nameless, and no view is no rows.
+    #[test]
+    fn received_rows_are_named_by_the_vault_and_need_their_record() {
+        let mut v = SharingView { available: true, ..SharingView::default() };
+        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "r9".into(), from: "denis@x.io".into() });
+        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "gone".into(), from: "denis@x.io".into() });
+        let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "r9", "name": "Acme VPN" })).expect("item")];
+        assert_eq!(
+            received_share_rows(Some(&v), &items),
+            vec![ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }]
+        );
+        assert!(received_share_rows(None, &items).is_empty());
     }
 }

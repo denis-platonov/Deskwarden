@@ -1700,7 +1700,7 @@ pub fn draw_send_pane(
         // different padding beneath, and one panel margin cannot be both.
         .frame(egui::Frame::new().fill(theme::CANVAS))
         .show(ui, |ui| {
-            if let Some(reported) = draw_send_list(ui, state, &view, delete, selected, records, people.shares) {
+            if let Some(reported) = draw_send_list(ui, state, &view, delete, selected, records, people) {
                 action = reported;
             }
         });
@@ -1732,8 +1732,10 @@ fn draw_send_list(
     delete: SendDeleteView<'_>,
     selected: &mut Option<String>,
     records: RecordTiles<'_>,
-    // Design 6c's person shares, one row per record and person.
-    shares: &[super::share_ui::ShareRow],
+    // Design 6c's person shares, one row per record and person, and 6d's
+    // records from people on `Shared with me`. Only rows are read here; the
+    // Stop sharing two-step is the detail's.
+    people: &mut super::share_ui::PeopleRows<'_>,
 ) -> Option<SendUiAction> {
     let mut action: Option<SendUiAction> = None;
     let width = ui.available_width();
@@ -1743,7 +1745,7 @@ fn draw_send_list(
     // is in none of them, so "All" is the one row a share belongs to (plan
     // decision 12), and `Shared with me` is another screen.
     let shares: &[super::share_ui::ShareRow] = match view {
-        SendView::Mine(crate::vault_window::sidebar::SendScope::All) => shares,
+        SendView::Mine(crate::vault_window::sidebar::SendScope::All) => people.shares,
         _ => &[],
     };
 
@@ -1757,7 +1759,7 @@ fn draw_send_list(
     // no shares stay unknown, unknown Sends with shares count the shares),
     // so the strip and the badge beside it say one number.
     let counted: Option<usize> = match (view, state) {
-        (SendView::Received(rows), _) => Some(rows.len()),
+        (SendView::Received(rows), _) => Some(rows.len() + people.received.len()),
         (SendView::Mine(scope), SendPaneState::Rows(rows)) => {
             Some(rows_in_scope(rows, *scope).len() + shares.len())
         }
@@ -1945,12 +1947,17 @@ fn draw_send_list(
     // puts that padding on the left, and -- exactly as `draw_item_list` does
     // -- the right padding IS the scroll bar's lane (`scrollbar_in_gutter`),
     // painted only when the rows overflow, so the rows keep one width.
-    let rows_area = |ui: &mut egui::Ui, rows: usize, body: &mut dyn FnMut(&mut egui::Ui)| {
+    //
+    // `eyebrows` is how many of Shared with me's group eyebrows (mock 6d)
+    // stand among the rows: each is one more item in the list and its height,
+    // counted so the scroll bar is decided on what is really drawn.
+    let rows_area = |ui: &mut egui::Ui, rows: usize, eyebrows: usize, body: &mut dyn FnMut(&mut egui::Ui)| {
         egui::Frame::new()
             .inner_margin(Margin { left: LIST_PAD as i8, right: 0, top: 0, bottom: LIST_PAD as i8 })
             .show(ui, |ui| {
                 let content = rows as f32 * ROW_HEIGHT
-                    + rows.saturating_sub(1) as f32 * LIST_ROW_GAP;
+                    + eyebrows as f32 * super::share_ui::group_eyebrow_height(ui)
+                    + (rows + eyebrows).saturating_sub(1) as f32 * LIST_ROW_GAP;
                 theme::scrollbar_in_gutter(ui, LIST_PAD);
                 if content < ui.available_height() {
                     theme::hide_scrollbar(ui);
@@ -2014,11 +2021,26 @@ fn draw_send_list(
     };
 
     match view {
+        // **Mock 6d: FROM PEOPLE, then IMPORTED FROM SENDS.** The records
+        // people share with this account first -- live, and theirs -- then
+        // the imports, which are the user's own copies. The eyebrows are
+        // drawn only where there are two groups to tell apart: an account
+        // nobody shares with keeps the list it always had, and one with no
+        // imports gets no eyebrow over nothing.
         SendView::Received(rows) => {
-            if rows.is_empty() {
+            if rows.is_empty() && people.received.is_empty() {
                 headline(ui, RECEIVED_EMPTY_HEADLINE, RECEIVED_EMPTY_DETAIL, theme::INK);
             } else {
-                rows_area(ui, rows.len(), &mut |ui| {
+                let received = people.received.len();
+                let two_groups = received > 0 && !rows.is_empty();
+                let eyebrows = usize::from(received > 0) + usize::from(two_groups);
+                rows_area(ui, rows.len() + received, eyebrows, &mut |ui| {
+                    if let Some(open) = super::share_ui::draw_received_group(ui, people, row_width, ROW_HEIGHT, selected, records) {
+                        action = Some(open);
+                    }
+                    if two_groups {
+                        super::share_ui::group_eyebrow(ui, row_width, super::share_ui::FROM_SENDS_EYEBROW);
+                    }
                     for row in rows.iter() {
                         draw_received_row(ui, row, row_width, selected);
                     }
@@ -2049,7 +2071,7 @@ fn draw_send_list(
             // have no Sends" over a share row would be true and read as
             // "nothing here".
             SendPaneState::Empty if !shares.is_empty() => {
-                rows_area(ui, shares.len(), &mut |ui| {
+                rows_area(ui, shares.len(), 0, &mut |ui| {
                     for share in shares {
                         draw_share_row(ui, share, row_width, selected, records);
                     }
@@ -2108,7 +2130,7 @@ fn draw_send_list(
                     let head = scope_empty_headline(*scope);
                     headline(ui, &head, SCOPE_EMPTY_DETAIL, theme::INK);
                 } else {
-                    rows_area(ui, in_scope.len() + shares.len(), &mut |ui| {
+                    rows_area(ui, in_scope.len() + shares.len(), 0, &mut |ui| {
                         // **Shares first** (plan decision 12). 6c interleaves
                         // the two by date, and a share has no server date to
                         // interleave by -- only this PC's record of it, which
@@ -2470,14 +2492,60 @@ fn draw_share_row(
     selected: &mut Option<String>,
     records: RecordTiles<'_>,
 ) {
+    let _ = draw_person_row(
+        ui,
+        PersonRow {
+            key: &share.key,
+            item_id: &share.item_id,
+            name: &share.name,
+            subtitle: &share.subtitle,
+            pill: Some(share.pill()),
+        },
+        width,
+        ROW_HEIGHT,
+        selected,
+        records,
+    );
+}
+
+/// **What a row about a record and a person says**: the Sent list's share
+/// row (6c) and Shared with me's received record (6d) are this one shape.
+pub(crate) struct PersonRow<'a> {
+    /// The selection key the row writes to `selected` when clicked.
+    pub(crate) key: &'a str,
+    /// The record, for its tile.
+    pub(crate) item_id: &'a str,
+    pub(crate) name: &'a str,
+    /// The words after the person mark: "to anna@example.com · Shared",
+    /// "from denis@example.com · view-only".
+    pub(crate) subtitle: &'a str,
+    /// The share pill at the right edge -- a share's state. `None` for a
+    /// received record, whose one state the subtitle already says.
+    pub(crate) pill: Option<theme::SharePillKind>,
+}
+
+/// **One row about a record and a person** -- [`draw_share_row`]'s whole
+/// drawing, shared with `share_ui::draw_received_group` so mock 6d's FROM
+/// PEOPLE rows and 6c's share rows are one row shape, which is the mock's
+/// own markup (both are its `.row` with a person-marked `.rs`). Answers
+/// whether it was clicked; the pick is written to `selected` here, as every
+/// row in this column writes it.
+pub(crate) fn draw_person_row(
+    ui: &mut egui::Ui,
+    row: PersonRow<'_>,
+    width: f32,
+    height: f32,
+    selected: &mut Option<String>,
+    records: RecordTiles<'_>,
+) -> bool {
     let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
+        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
-    let picked = selected.as_deref() == Some(share.key.as_str());
+    let picked = selected.as_deref() == Some(row.key);
     if response.clicked() {
-        *selected = Some(share.key.clone());
+        *selected = Some(row.key.to_string());
     }
     let painter = ui.painter().clone();
     let painter = &painter;
@@ -2495,20 +2563,25 @@ fn draw_share_row(
     );
 
     // The pill first, right-aligned, for `draw_row`'s reason: its measured
-    // width is what bounds the name and the subtitle.
-    let kind = share.pill();
-    let pill_width = theme::share_pill_width(painter, kind);
-    theme::share_pill(
-        painter,
-        egui::pos2(rect.right() - ROW_INSET - pill_width, rect.center().y),
-        kind,
-    );
-    let text_right = rect.right() - ROW_INSET - pill_width - ROW_TEXT_GAP;
+    // width is what bounds the name and the subtitle. With no pill (a
+    // received record) the text runs to the row's own inset.
+    let text_right = match row.pill {
+        Some(kind) => {
+            let pill_width = theme::share_pill_width(painter, kind);
+            theme::share_pill(
+                painter,
+                egui::pos2(rect.right() - ROW_INSET - pill_width, rect.center().y),
+                kind,
+            );
+            rect.right() - ROW_INSET - pill_width - ROW_TEXT_GAP
+        }
+        None => rect.right() - ROW_INSET,
+    };
 
     // A share IS a record, so it wears the record's tile -- its favicon when
     // the cache has one, as the Send made from it does in the row below.
     let tile = row_tile_rect(rect);
-    paint_send_tile(ui, tile, records, Some(&share.item_id), &share.name, picked, 1.0);
+    paint_send_tile(ui, tile, records, Some(row.item_id), row.name, picked, 1.0);
 
     let text_left = tile.right() + ROW_TEXT_GAP;
     let text_area = egui::Rect::from_min_max(
@@ -2527,7 +2600,7 @@ fn draw_share_row(
     clip.text(
         egui::pos2(text_area.left(), column_top),
         egui::Align2::LEFT_TOP,
-        &share.name,
+        row.name,
         title_font,
         if picked { theme::BLUE_DEEP } else { theme::INK },
     );
@@ -2545,10 +2618,11 @@ fn draw_share_row(
     clip.text(
         egui::pos2(mark.right() + SHARE_MARK_GAP, subtitle_top),
         egui::Align2::LEFT_TOP,
-        &share.subtitle,
+        row.subtitle,
         subtitle_font,
         theme::TEXT_FAINT,
     );
+    response.clicked()
 }
 
 /// 6c's `ic('person', 10, ..)` before a share row's subtitle, and its
@@ -8973,6 +9047,16 @@ mod paint_tests {
 
     /// The `Shared with me` screen, drawn.
     fn paint_received(rows: &[ReceivedRow], picked: Option<String>) -> Painted {
+        paint_received_with(rows, &[], picked)
+    }
+
+    /// [`paint_received`] with records people share with this account
+    /// (mock 6d's FROM PEOPLE).
+    fn paint_received_with(
+        rows: &[ReceivedRow],
+        from_people: &[crate::vault_window::share_ui::ReceivedShareRow],
+        picked: Option<String>,
+    ) -> Painted {
         let size = min_pane_size();
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
@@ -8998,7 +9082,10 @@ mod paint_tests {
                 SendView::Received(rows),
                 &mut selected,
                 RecordTiles::default(),
-                &mut crate::vault_window::share_ui::PeopleRows::none(),
+                &mut crate::vault_window::share_ui::PeopleRows {
+                    received: from_people,
+                    ..crate::vault_window::share_ui::PeopleRows::none()
+                },
             )
             .into_action();
         });
@@ -9079,6 +9166,36 @@ mod paint_tests {
              claim about a different thing: {:?}",
             painted.text
         );
+    }
+
+    /// **Mock 6d's list: FROM PEOPLE, then IMPORTED FROM SENDS**, top to
+    /// bottom, the strip counting both -- and the person row wears the
+    /// Sent list's own row band, so the column is one row shape.
+    #[test]
+    fn shared_with_me_puts_records_from_people_above_the_imports() {
+        use crate::vault_window::share_ui::{ReceivedShareRow, FROM_PEOPLE_EYEBROW, FROM_SENDS_EYEBROW};
+        let history = crate::receive_history::ReceiveHistory {
+            entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
+        };
+        let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
+        let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }];
+        let painted = paint_received_with(&rows, &people, None);
+        let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
+        assert!(top(FROM_PEOPLE_EYEBROW) < top("Acme VPN"));
+        assert!(top("Acme VPN") < top(FROM_SENDS_EYEBROW));
+        assert!(top(FROM_SENDS_EYEBROW) < top("SAP Production"));
+        assert!(painted.has("from denis@x.io \u{b7} view-only"), "{:?}", painted.text);
+        assert!(painted.has(&format!("2 {RECORDS_NOUN}")), "the strip counts both groups: {:?}", painted.text);
+        // The same height as the import row under it: one row shape.
+        let band = |label: &str| painted.fills.iter().filter(|(r, c)| *c == theme::CARD && r.contains(painted.rect_of(label).expect("text").center())).map(|(r, _)| r.height()).fold(f32::INFINITY, f32::min);
+        assert_eq!(band("Acme VPN"), band("SAP Production"));
+
+        // Records from people and no imports: the group alone -- no empty
+        // sentence, and no IMPORTED FROM SENDS eyebrow over nothing.
+        let alone = paint_received_with(&[], &people, None);
+        assert!(alone.has("Acme VPN"));
+        assert!(!alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
+        assert!(!alone.has(FROM_SENDS_EYEBROW), "an eyebrow over no rows: {:?}", alone.text);
     }
 
     /// **The activity sentence says what happened and what is left, and never

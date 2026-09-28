@@ -3348,6 +3348,11 @@ pub fn build_frame_with_search(
             crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
             &crate::local_time::SystemZone,
         );
+        // **Design 6d's FROM PEOPLE**, built beside them for the same reason:
+        // one list per frame, owning its strings. Named by the live vault's
+        // items -- a received record is never archived or trashed by its
+        // recipient, who can do neither to it.
+        let received_share_rows = share_ui::received_share_rows(sharing.view.as_ref(), &items);
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -3404,7 +3409,11 @@ pub fn build_frame_with_search(
                     // daemon's view the window holds: 0, 0 and no dot until
                     // it has one, and in a window with no line to the daemon.
                     shared_records: share_rows.len(),
-                    received_records: sharing.received_count(),
+                    // The FROM PEOPLE rows Shared with me lists, and not
+                    // the view's raw entries: `shared_records`' rule, so
+                    // the badge and the column say one number even while
+                    // the view names an item this vault does not hold yet.
+                    received_records: received_share_rows.len(),
                     invitation_waiting: sharing.has_incoming(),
                 };
                 match draw_sidebar(
@@ -4072,6 +4081,17 @@ pub fn build_frame_with_search(
                     &reprompt_gate,
                     &mut reprompt_proof,
                 );
+                // **A received record's writes are refused here too** (spec
+                // 6.9). The menu offers none of them (`item_list::
+                // menu_entries`) and the read pane maps its own away
+                // (`detail::view_only`), so what this meets is a stray -- a
+                // menu drawn the frame before a sync turned the record
+                // view-only. After the re-prompt rather than before it, so
+                // the gate above stays the one line in front of the match
+                // (`both_gating_calls_are_written_into_the_paths_they_gate`);
+                // the cost is that such a stray on a protected record asks
+                // for the password before it is dropped.
+                let permitted = permitted.filter(|command| crate::vault_bridge::may_edit(&item) || !command.writes_the_record());
                 if let Some(command) = permitted {
                 let login = item.login.as_ref();
                 match command {
@@ -4448,6 +4468,7 @@ pub fn build_frame_with_search(
             stopping: sharing.stopping.as_ref().map(|(id, email)| share_ui::share_key(id, email)),
             notice: sent_share_record.as_deref().and_then(|id| sharing.notice_for(id)).map(str::to_string),
             asked: None,
+            received: &received_share_rows,
         };
         let open_record = apply_send_action(
             egui::CentralPanel::default()
@@ -5112,6 +5133,17 @@ pub fn build_frame_with_search(
                             // copy -- the row's button and the CTRL chord --
                             // arrive as the same `DetailAction`, so both are
                             // gated by this one call.
+                            //
+                            // **A received record is view-only** (spec 6.9):
+                            // a write it cannot make is not offered either.
+                            // The pane draws none of the header's writers for
+                            // it; this is the gate behind the drawing, for a
+                            // card's own (the matched app's Remove) and for
+                            // an `edit: false` item the view has not named.
+                            // BEFORE the re-prompt rather than after, so a
+                            // write that will not happen never asks for the
+                            // master password first.
+                            let action = if crate::vault_bridge::may_edit(item) { action } else { detail::view_only(action) };
                             let action = permit_detail_action(
                                 ui.ctx(),
                                 action,
@@ -6921,10 +6953,16 @@ pub fn build_frame_with_search(
         // link, and "send the thing I threw away" is not a request this app
         // serves. That pane draws no ✉ either (see `draw_out_of_vault_read`),
         // so the two agree.
+        //
+        // **Not for a received record** (mock 6d: no ✉ -- "cannot share it
+        // on"). The pane draws no ✉ for one, and `detail::view_only` drops
+        // the button's request; this filter is what the CTRL+SHIFT+S chord,
+        // which never passes through the pane, meets.
         if send_record_asked {
             if let Some(item) = selected_id
                 .as_ref()
                 .and_then(|id| items.iter().find(|i| &i.id == id))
+                .filter(|item| crate::vault_bridge::may_edit(item))
             {
                 record_send = permit_record_send(
                     ui.ctx(),
@@ -7496,11 +7534,16 @@ pub fn build_frame_with_search(
         // A second press while a form is already open is ignored rather than
         // replacing it: the open form holds a typed seed and two parameter
         // choices, and re-opening would silently discard all three.
+        //
+        // `may_edit` for a received record (spec 6.9): a code is a write to
+        // the record, and CTRL+SHIFT+2 reaches here without the pane that
+        // draws no ⏱ for one.
         if add_totp_asked && totp_add_state.is_none() {
             if let Some(item) = selected_id
                 .as_ref()
                 .and_then(|id| items.iter().find(|i| &i.id == id))
                 .filter(|item| item.login.is_some())
+                .filter(|item| crate::vault_bridge::may_edit(item))
             {
                 totp_add_state = Some(totp_add::TotpAdd::opening(
                     &item.id,
