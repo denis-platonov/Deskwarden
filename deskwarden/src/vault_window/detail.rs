@@ -707,6 +707,13 @@ pub enum DetailAction {
     /// The window sends only `SharingPane::share_anyway`'s call, which binds
     /// the confirm to the key whose words were on screen.
     ShareAnyway(String),
+    /// A received record's kebab: stop receiving from its sharer (the
+    /// organisation id). **Not a write to the record** -- it leaves the
+    /// sharer's org, which takes every record from them out of this vault --
+    /// so [`view_only`], which lists writers, lets it through, and the one
+    /// kebab that offers it is the view-only one. Records the request only:
+    /// the window asks "Stop receiving from X?" before anything is sent.
+    StopReceiving(String),
     /// **Design 4a** -- open the sequence builder on this item's fill rule.
     ///
     /// Its own act rather than a corner of [`Self::Edit`], because it opens a
@@ -1004,6 +1011,12 @@ pub fn view_only_footer(from: &str) -> String {
     format!("Shared by {from}, view-only. Only they can edit or delete it.")
 }
 
+/// The received record's kebab entry that leaves its sharer's org.
+#[must_use]
+pub fn stop_receiving_label(from: &str) -> String {
+    format!("Stop receiving from {from}")
+}
+
 /// [`view_only_footer`] where no sharer is known: an `edit: false` item the
 /// sharing view does not name (a read-only organisation collection, or a
 /// received record before the view has arrived). Says the same fact without
@@ -1020,7 +1033,9 @@ pub const VIEW_ONLY_FOOTER: &str = "View-only. Only its owner can edit or delete
 /// the user's OWN Send -- deleting it writes nothing to the record and takes
 /// a link to it out of the world -- so refusing it would keep exposure up for
 /// the sake of a rule about writes. Only the two doors that hand the record on
-/// (`SendRecord`, `ShareRecord`) are closed.
+/// (`SendRecord`, `ShareRecord`) are closed. **Stop receiving is let through
+/// too** (`StopReceiving`): it writes nothing to the record -- it leaves the
+/// sharer's org -- and a received record is the only one that offers it.
 ///
 /// **The writers are listed, not the readers**, for
 /// `item_list::RowCommand::writes_the_record`'s reason: a writer forgotten
@@ -3858,6 +3873,21 @@ pub fn draw_detail_read(
                     if !writable {
                         let footer = people.view_only_from.map_or_else(|| VIEW_ONLY_FOOTER.to_string(), view_only_footer);
                         ui.set_width(VIEW_ONLY_MENU_WIDTH);
+                        // **Stop receiving (spec 6.9), the one entry**, and
+                        // only on a record the view names a sharer for and
+                        // that is filed in an organisation: leaving is what
+                        // it asks, of THAT org. An unnamed `edit: false`
+                        // item -- a read-only collection's -- has nobody to
+                        // stop receiving from, and says only why.
+                        if let (Some(from), Some(org)) =
+                            (people.view_only_from, crate::rest::organizations::organization_of(item))
+                        {
+                            if ui.button(stop_receiving_label(from)).clicked() {
+                                action = DetailAction::StopReceiving(org.to_string());
+                                ui.close();
+                            }
+                            ui.separator();
+                        }
                         ui.add(
                             egui::Label::new(RichText::new(footer).size(11.0).color(theme::TEXT_GHOST)).wrap(),
                         );
@@ -17487,6 +17517,30 @@ mod tests {
         }
     }
 
+    /// **Stop receiving (spec 6.9) is the received record's one entry**, on
+    /// a record filed in its sharer's org: it names the sharer, reports the
+    /// org, and -- not being a write to the record -- passes `view_only`. An
+    /// unnamed `edit: false` item's kebab has nobody to stop receiving from.
+    #[test]
+    fn a_received_records_kebab_offers_stop_receiving_from_its_sharer() {
+        let mut item = a_login();
+        item.other.insert("organizationId".into(), serde_json::json!("org-denis"));
+        let mut pane = Pane::new().view_only("denis@x.io");
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let entry = open.rect_of(&stop_receiving_label("denis@x.io"));
+        assert_eq!(stop_receiving_label("denis@x.io"), "Stop receiving from denis@x.io");
+        let pressed = pane.click(&item, &TotpState::NoSecret, entry.center());
+        assert_eq!(pressed.action, DetailAction::StopReceiving("org-denis".into()));
+        assert_eq!(view_only(DetailAction::StopReceiving("org-denis".into())), DetailAction::StopReceiving("org-denis".into()));
+
+        item.other.insert("edit".into(), serde_json::Value::Bool(false));
+        let mut unnamed = Pane::new();
+        let open = unnamed.open_kebab(&item, &TotpState::NoSecret);
+        let painted = open.strings();
+        assert!(painted.iter().any(|s| *s == VIEW_ONLY_FOOTER), "control: the unnamed kebab opened: {painted:?}");
+        assert!(!painted.iter().any(|s| s.starts_with("Stop receiving")), "{painted:?}");
+    }
+
     /// **The rest of what a view-only record allows**: every write maps to
     /// nothing -- the kebab's, the header's, the cards' (the matched app's
     /// Remove) and the out-of-vault three -- and every read passes through,
@@ -17523,6 +17577,8 @@ mod tests {
             DetailAction::RevokeSend,
             DetailAction::ConfirmRevokeSend,
             DetailAction::CancelRevokeSend,
+            // Leaving the sharer's org writes nothing to the record.
+            DetailAction::StopReceiving("org-denis".into()),
         ] {
             assert_eq!(view_only(read.clone()), read, "a read was taken away");
         }

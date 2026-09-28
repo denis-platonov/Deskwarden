@@ -332,6 +332,9 @@ impl VaultApi {
             ("POST", ["sharing", "person", "confirm"]) => self.confirm_person(request.body),
             ("POST", ["sharing", "person", "fingerprint"]) => self.person_fingerprint(request.body),
             ("POST", ["sharing", "invite-code"]) => self.invite_code(request.body),
+            ("POST", ["sharing", "incoming", id, "accept"]) => self.incoming(id, true),
+            ("POST", ["sharing", "incoming", id, "decline"]) => self.incoming(id, false),
+            ("POST", ["sharing", "from", org, "leave"]) => self.leave_sharer(org),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
@@ -633,6 +636,46 @@ impl VaultApi {
         };
         match engine.fingerprint(&email) {
             Ok(fingerprint) => ApiResponse::ok(to_value(&fingerprint)),
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/incoming/{id}/accept|decline` (spec 11.3) -- the
+    /// recipient's answer to an invitation, by the id `GET /sharing` listed it
+    /// under. **The token that answers it is the engine's** (`Sharing::
+    /// accept`): the window never held it, so no body carries one. Nothing in
+    /// the vault moves yet -- an accept's records arrive once the sharer's
+    /// daemon confirms -- so only `sharing` is announced.
+    fn incoming(&self, id: &str, accept: bool) -> ApiResponse {
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let done = if accept { engine.accept(id) } else { engine.decline(id) };
+        match done {
+            Ok(()) => {
+                self.feed.publish([Change::Sharing]);
+                ApiResponse::done()
+            }
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/from/{orgId}/leave` (spec 11.3) -- Stop receiving. Every
+    /// record from that sharer leaves the daemon's copy and is announced gone
+    /// with `sharing`, in one batch. The era is read before the engine's first
+    /// round trip, as [`Self::share_item`] reads it.
+    fn leave_sharer(&self, org: &str) -> ApiResponse {
+        let era = self.cache.epoch().era();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        match engine.leave(org, &self.cache.items()) {
+            Ok(outcome) => {
+                self.publish_outcome(&outcome, era);
+                ApiResponse::done()
+            }
             Err(e) => sharing_failed(&e),
         }
     }
@@ -1197,5 +1240,52 @@ pub(crate) mod tests {
         let hash = sent["masterPasswordHash"].as_str().expect("a hash was sent");
         assert!(!hash.is_empty() && hash != "master", "{sent}");
         assert_eq!(sent.as_object().map(serde_json::Map::len), Some(1), "only the hash is sent: {sent}");
+    }
+
+    /// **The recipient's three routes** (spec 11.3): an answer to an
+    /// invitation this daemon does not hold is the engine's sentence, never a
+    /// request; and Stop receiving leaves the sharer's org, takes every
+    /// record from them out of the daemon's copy, and announces each gone
+    /// with `sharing` -- the window re-reads nothing from the server.
+    #[test]
+    fn stopping_receiving_takes_the_sharers_records_out_and_announces_them() {
+        let (mut server, cache, api, token) = a_daemon();
+        let engine = cache.bridge().sharing().expect("a REST daemon has an engine");
+        engine.set_up(crate::rest::sharing::SharingSetup::none());
+        server.mock("GET", "/api/accounts/profile").with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
+        server
+            .mock("GET", "/api/users/user-1/public-key")
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .expect_at_least(0)
+            .create();
+        api.sharing_pass(crate::rest::sharing::Trigger::WholeRead);
+
+        let answers = server.mock("POST", "/api/organizations/invitations/accept").expect(0).create();
+        for route in ["/sharing/incoming/inv-9/accept", "/sharing/incoming/inv-9/decline"] {
+            let answer = ask(&api, "POST", route, Some(&token), "{}");
+            assert_eq!(answer.status, 400, "{route}");
+            let said: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
+            assert_eq!(said["message"], crate::rest::sharing::INVITATION_GONE, "{route}");
+        }
+        answers.assert();
+
+        engine.held().others = vec![("org-denis".into(), "denis@example.com".into())];
+        let theirs: VaultItem =
+            serde_json::from_value(serde_json::json!({ "id": "theirs-1", "name": "Acme VPN", "organizationId": "org-denis" })).expect("item");
+        assert!(cache.apply_written_elsewhere(&[theirs], &[], cache.epoch().era()), "control: the received record is filed");
+        let left = server.mock("POST", "/api/organizations/org-denis/leave").with_body("").expect(1).create();
+        let answer = ask(&api, "POST", "/sharing/from/org-denis/leave", Some(&token), "{}");
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        left.assert();
+        assert!(!cache.items().iter().any(|i| i.id == "theirs-1"), "the sharer's record is still in the daemon's copy");
+        let changes = api.feed().wait_after(Some(0), false, Duration::ZERO).changes;
+        assert!(
+            changes.contains(&Change::Vault(crate::rest::notifications::Announcement::ItemGone { id: "theirs-1".into(), revision: None })),
+            "{changes:?}"
+        );
+        assert!(changes.contains(&Change::Sharing), "{changes:?}");
+        let again = ask(&api, "POST", "/sharing/from/org-denis/leave", Some(&token), "{}");
+        assert_eq!(again.status, 400, "a sharer already left is not one to leave: {}", again.body);
     }
 }

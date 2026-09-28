@@ -1392,6 +1392,7 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "prefs-modal-scrim",
     "record-forget-scrim",
     "record-import-scrim",
+    "record-leave-scrim",
     "record-send-scrim",
     "record-share-scrim",
     "totp-add-scrim",

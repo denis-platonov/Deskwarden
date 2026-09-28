@@ -2400,6 +2400,128 @@ impl Sharing {
     }
 }
 
+// ---- the recipient -----------------------------------------------------------------
+
+/// An invitation id this account no longer holds: answered already (here or
+/// on another PC), expired and dropped by the last read, or never one.
+pub const INVITATION_GONE: &str = "This invitation is no longer waiting.";
+/// A leave asked of an organisation that is not someone else's sharing org --
+/// this account's own (whose owner NodeWarden will not let leave anyway), a
+/// real organisation, or one this account has already left.
+pub const NOT_A_SHARER: &str = "That is not someone sharing with you.";
+
+impl Sharing {
+    /// **The token of an invitation this account still holds**, by the id the
+    /// view listed it under.
+    ///
+    /// The token is what accepts the invitation, so it never leaves the
+    /// daemon: `invitations/mine` put it in [`Held::incoming`] as a
+    /// `Zeroizing`, the view carries only the id ([`IncomingEntry`]), and the
+    /// window's accept names that id. This clone is wiped when the write that
+    /// asked for it returns.
+    fn token_of(&self, id: &str) -> Result<zeroize::Zeroizing<String>, SharingError> {
+        self.held()
+            .incoming
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| i.token.clone())
+            .ok_or_else(|| SharingError::Refused(INVITATION_GONE.to_string()))
+    }
+
+    /// **Accept an invitation** (spec 6.9): NodeWarden's
+    /// `POST /invitations/accept {token}`. The sharer's daemon confirms, and
+    /// the records arrive on the push that confirm produces.
+    ///
+    /// **The org is filed as waiting at once**, from the invitation's own
+    /// org id and name, so Shared with me says "Waiting for X to finish
+    /// sharing" the moment the row goes rather than after the next whole
+    /// read -- which is what fills [`Held::waiting`] otherwise, and which
+    /// replaces this entry with the server's own answer when it comes. The
+    /// sharer is read off the org's name as the view's `incoming` reads it
+    /// (`sharer_of`), display only.
+    ///
+    /// Accepting records no SSO consent and asks nothing more of the server:
+    /// the token is the whole of it (NodeWarden's own decision).
+    ///
+    /// # Errors
+    ///
+    /// The invitation is gone ([`INVITATION_GONE`]), or the server refused --
+    /// its sentence after "Couldn't accept the invitation."
+    pub fn accept(&self, id: &str) -> Result<(), SharingError> {
+        let _one = self.one_at_a_time();
+        self.require_available()?;
+        let token = self.token_of(id)?;
+        self.call(|client, auth| sharing_api::accept_invitation(client, &mut auth.session, &token))
+            .map_err(|e| e.or_say("Couldn't accept the invitation."))?;
+        let mut held = self.held();
+        let accepted = held.incoming.iter().position(|i| i.id == id).map(|at| held.incoming.remove(at));
+        if let Some(invitation) = accepted {
+            let from = invitation.organization_name.as_deref().and_then(sharer_of).map(str::to_string);
+            if let Some(from) = from {
+                if !held.waiting.iter().any(|(org, _)| *org == invitation.organization_id) {
+                    held.waiting.push((invitation.organization_id.clone(), from));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// **Decline an invitation**: `POST /invitations/decline {token}`.
+    /// Nothing is added to this vault; the sharer can invite again later.
+    ///
+    /// # Errors
+    ///
+    /// The invitation is gone ([`INVITATION_GONE`]), or the server refused.
+    pub fn decline(&self, id: &str) -> Result<(), SharingError> {
+        let _one = self.one_at_a_time();
+        self.require_available()?;
+        let token = self.token_of(id)?;
+        self.call(|client, auth| sharing_api::decline_invitation(client, &mut auth.session, &token))
+            .map_err(|e| e.or_say("Couldn't decline the invitation."))?;
+        self.held().incoming.retain(|i| i.id != id);
+        Ok(())
+    }
+
+    /// **Stop receiving from a sharer** (spec 6.9): leave their sharing org,
+    /// `POST /api/organizations/{id}/leave`. Every record from them is gone
+    /// from this vault at once, so the outcome names each item of `items`
+    /// filed in that org, and the daemon takes them out of its copy and
+    /// announces them gone -- no whole read.
+    ///
+    /// **Only someone ELSE's sharing org**, as the last whole read listed them
+    /// ([`Held::others`]): the kebab that asks is a received record's, and a
+    /// leave of anything else -- this account's own sharing org, a real
+    /// organisation -- is not what "Stop receiving" means. NodeWarden refuses
+    /// its owner a leave in any case.
+    ///
+    /// # Errors
+    ///
+    /// Not someone else's sharing org ([`NOT_A_SHARER`]), or the server
+    /// refused.
+    pub fn leave(&self, organization_id: &str, items: &[VaultItem]) -> Result<SharingOutcome, SharingError> {
+        let _one = self.one_at_a_time();
+        self.require_available()?;
+        if !self.held().others.iter().any(|(id, _)| id == organization_id) {
+            return Err(SharingError::Refused(NOT_A_SHARER.to_string()));
+        }
+        self.call(|client, auth| sharing_api::leave_organization(client, &mut auth.session, organization_id))
+            .map_err(|e| e.or_say("Couldn't stop receiving."))?;
+        {
+            let mut held = self.held();
+            held.others.retain(|(id, _)| id != organization_id);
+            held.waiting.retain(|(id, _)| id != organization_id);
+        }
+        Ok(SharingOutcome {
+            upserted: Vec::new(),
+            removed: items
+                .iter()
+                .filter(|item| organization_of(item) == Some(organization_id))
+                .map(|item| item.id.clone())
+                .collect(),
+        })
+    }
+}
+
 // ---- invite codes -----------------------------------------------------------------
 
 impl Sharing {
@@ -4882,5 +5004,87 @@ mod tests {
         assert_eq!(refused(&engine, "carol@example.com"), "The invitation to carol@example.com has expired. Re-invite them, then make the code.");
         assert_eq!(refused(&engine, "carol@example.com"), NOT_ADMIN);
         assert_eq!(refused(&engine, "carol@example.com"), format!("{INVITE_CODE_FAILED} The server said: Something else"));
+    }
+
+    fn invited(server: &mut MockServer) {
+        server
+            .mock("GET", "/api/organizations/invitations/mine")
+            .with_body(serde_json::json!({ "data": [{
+                "id": "inv-1", "organizationId": "org-denis", "organizationName": "Shared by denis@example.com",
+                "token": "tok-1", "expirationDate": "2999-01-01T00:00:00.000Z"
+            }]}).to_string())
+            .expect_at_least(0)
+            .create();
+    }
+
+    /// **"denis@… wants to share with you"** (spec 6.9): the invitation is in
+    /// the view, Accept posts its token, and it leaves the view.
+    #[test]
+    fn a_recipient_accepts_an_invitation_by_its_token() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
+        invited(&mut server);
+        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        engine.refresh(Trigger::WholeRead).expect("probed");
+        let view = engine.view(&[]);
+        assert_eq!(view.incoming, vec![IncomingEntry { id: "inv-1".into(), from: "denis@example.com".into(), expires_at: Some("2999-01-01T00:00:00.000Z".into()) }]);
+        // The token is the daemon's alone: what the window is sent has none.
+        let sent = serde_json::to_string(&view).expect("json");
+        assert!(!sent.contains("tok-1"), "{sent}");
+        let accepted = server
+            .mock("POST", "/api/organizations/invitations/accept")
+            .match_body(Matcher::Json(serde_json::json!({ "token": "tok-1" })))
+            .with_body("")
+            .expect(1)
+            .create();
+        engine.accept("inv-1").expect("accepted");
+        accepted.assert();
+        assert!(engine.view(&[]).incoming.is_empty());
+        // Waiting at once, not after the next whole read: the row that went
+        // is replaced by "Waiting for denis@… to finish sharing".
+        assert_eq!(
+            engine.view(&[]).waiting,
+            vec![WaitingEntry { organization_id: "org-denis".into(), from: "denis@example.com".into() }]
+        );
+        assert!(matches!(engine.accept("inv-1"), Err(SharingError::Refused(_))), "an invitation already answered is gone");
+    }
+
+    #[test]
+    fn a_recipient_declines_an_invitation_by_its_token() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
+        invited(&mut server);
+        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        engine.refresh(Trigger::WholeRead).expect("probed");
+        let declined = server.mock("POST", "/api/organizations/invitations/decline")
+            .match_body(Matcher::Json(serde_json::json!({ "token": "tok-1" }))).with_body("").expect(1).create();
+        engine.decline("inv-1").expect("declined");
+        declined.assert();
+        let view = engine.view(&[]);
+        assert!(view.incoming.is_empty() && view.waiting.is_empty(), "a decline leaves nothing waiting: {view:?}");
+    }
+
+    /// **Stop receiving from X** (spec 6.9): leave the sharer's org, and every
+    /// record from them leaves the vault.
+    #[test]
+    fn stopping_receiving_leaves_the_org_and_removes_its_records() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        engine.held().others = vec![("org-denis".into(), "denis@example.com".into())];
+        let left = server.mock("POST", "/api/organizations/org-denis/leave").with_body("").expect(1).create();
+        let items: Vec<VaultItem> = ["a", "b"].iter().map(|id| serde_json::from_value(serde_json::json!({
+            "id": id, "name": id, "organizationId": if *id == "a" { "org-denis" } else { "org-other" }
+        })).expect("item")).collect();
+        let outcome = engine.leave("org-denis", &items).expect("left");
+        left.assert();
+        assert_eq!(outcome.removed, ["a"]);
+        assert!(matches!(engine.leave("org-mine", &items), Err(SharingError::Refused(_))), "only someone else's sharing org can be left");
     }
 }

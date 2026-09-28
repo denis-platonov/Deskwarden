@@ -369,9 +369,9 @@ impl SharingPane {
         self.stale = false;
     }
 
-    pub(crate) fn has_incoming(&self) -> bool {
-        self.view.as_ref().is_some_and(|v| !v.incoming.is_empty())
-    }
+    // **`has_incoming` was here**, and the rail's dot read it. The dot reads
+    // the frame's own `incoming_rows` now -- the rows the list draws -- so
+    // the badge = list rule holds for it as for the counts.
 
     /// Handed to the read pane by [`people_sharing`], for the SHARING card.
     pub(crate) fn confirming_for(&self, item_id: &str) -> Option<&str> {
@@ -584,10 +584,11 @@ impl ShareDialog {
 /// borrowed `&str`, and is wiped when the call is dropped at the end of
 /// [`run`] -- never copied into a plain `String` on the way.
 ///
-/// `View`, and the Share dialog's three (Share, Forget, InviteCode), have
-/// callers; the rest are sent by the cards Tasks 17-20 draw (Stop, Reinvite,
-/// Fingerprint, Confirm: 17; Accept, Decline, Leave: 20).
-#[allow(dead_code)]
+/// `View`, and the Share dialog's three (Share, Forget, InviteCode), are the
+/// window's and the dialog's; the rest are sent by the cards: Stop, Reinvite,
+/// Fingerprint and Confirm by the SHARING card and Sent's share detail;
+/// Accept and Decline by Shared with me's invitations; Leave by a received
+/// record's Stop receiving.
 pub(crate) enum SharingCall {
     View,
     Share { item_id: String, item_name: String, email: String },
@@ -2381,17 +2382,38 @@ pub struct PeopleRows<'a> {
     /// the imported Sends. Only rows: a received record has no two-step here
     /// -- a click opens it in the vault, and its pane is view-only there.
     pub(crate) received: &'a [ReceivedShareRow],
+    /// **Shared with me's invitations** (mock 6d, invite pending): the rows
+    /// [`draw_incoming_rows`] puts first in the list, each with Accept and
+    /// Decline, and the pane [`draw_invitation_detail`] draws for one.
+    pub(crate) incoming: &'a [IncomingRow],
+    /// **The sharers this account accepted and who have not finished yet**
+    /// -- the view's `waiting`, by the sharer's address. Each is one quiet
+    /// [`waiting_line`] under the invitations: an accepted sharing org shows
+    /// its member nothing until the sharer's daemon confirms them, and
+    /// without the line an Accept would look like it did nothing.
+    pub(crate) waiting: &'a [String],
 }
 
 impl PeopleRows<'static> {
     /// Nothing about sharing: what every caller that is not about it passes.
     #[must_use]
     pub fn none() -> Self {
-        Self { shares: &[], confirming: None, stopping: None, notice: None, asked: None, received: &[] }
+        Self {
+            shares: &[],
+            confirming: None,
+            stopping: None,
+            notice: None,
+            asked: None,
+            received: &[],
+            incoming: &[],
+            waiting: &[],
+        }
     }
 }
 
-/// A press in the Sent list's sharing half. Keys are [`share_key`]s.
+/// A press in the Sends pane's sharing half. `Stop`'s keys are
+/// [`share_key`]s; `Accept`'s and `Decline`'s are INVITATION IDS -- the
+/// view's, which the daemon answers by the token it holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PeopleAsk {
     /// Stop sharing's step one: put the question up.
@@ -2399,6 +2421,11 @@ pub(crate) enum PeopleAsk {
     /// "Remove from their vault": step two.
     ConfirmStop(String),
     CancelStop,
+    /// An invitation's Accept (mock 6d), in its row or its pane.
+    Accept(String),
+    /// Its Decline. One press, like Accept: a decline adds nothing and takes
+    /// nothing away, and the sharer can invite again.
+    Decline(String),
 }
 
 // ---- Shared with me: records from people (mock 6d) -----------------------------------
@@ -2530,6 +2557,317 @@ pub(crate) fn draw_received_group(
         }
     }
     action
+}
+
+// ---- the recipient's invitations (mock 6d, invite pending) --------------------------------
+//
+// **The row is drawn here and the pane in `send_ui`**, each by what it is
+// made of. The invitation row is the list's one row that asks for something
+// (6d's `.invite`): a blue-wash card with its own buttons, no record tile and
+// no pill, so it shares nothing with `send_ui::draw_person_row` and is placed
+// here whole. Its pane is 6c's pane shape -- the white strip, the 21pt title,
+// the header actions measured onto the title's line, the fact card -- whose
+// parts are `send_ui`'s, so [`draw_invitation_detail`] finds the row and
+// hands it to `send_ui::draw_invitation_pane`.
+
+/// An invitation row's selection key starts with this, so it can never be
+/// taken for a Send's key, a share's or a received record's -- `send_ui`'s
+/// Received detail opens the invitation's pane on it.
+pub(crate) const INVITE_KEY_PREFIX: &str = "invite:";
+pub(crate) const ACCEPT_LABEL: &str = "Accept";
+pub(crate) const DECLINE_LABEL: &str = "Decline";
+/// 6d's `.invite .t2`.
+pub(crate) const INVITE_NOTHING_YET: &str = "Nothing reaches your vault until you accept.";
+/// 6d's `.dsub` under the sharer's address in the invitation's pane.
+pub(crate) const INVITE_PANE_SUBTITLE: &str = "wants to share records with you";
+/// 6d's card, and its rows. 6d gives Access a second line ("You can see,
+/// copy and autofill them. You cannot edit or delete them."); the fact card
+/// has one line per row, so the hint is split at its own sentence boundary
+/// into a row each -- 6c's WHAT THEY SEE made the same split.
+pub(crate) const IF_YOU_ACCEPT_TITLE: &str = "IF YOU ACCEPT";
+pub(crate) const YOU_GET_ROW: &str = "You get";
+pub(crate) const YOU_CAN_ROW: &str = "You can";
+pub(crate) const YOU_CAN_VALUE: &str = "See, copy and autofill them";
+pub(crate) const YOU_CANNOT_ROW: &str = "You cannot";
+pub(crate) const YOU_CANNOT_VALUE: &str = "Edit or delete them";
+pub(crate) const THEY_CHANGE_ROW: &str = "They change";
+pub(crate) const INVITE_EXPIRES_ROW: &str = "Invite expires";
+
+/// 6d's `.invite` geometry: `padding: 11px 12px`, a 40pt avatar (`.pav.lg`)
+/// 11pt from its words, `gap: 10px` down to the actions, which are
+/// `padding-left: 51px` in -- under the words, not the avatar -- and are
+/// `.btn.sm`: 28pt tall, 11pt of side padding, 8pt apart.
+const INVITE_PAD_X: f32 = 12.0;
+const INVITE_PAD_Y: f32 = 11.0;
+pub(crate) const INVITER_AVATAR: f32 = 40.0;
+const INVITER_INITIAL_SIZE: f32 = 15.0;
+const INVITE_AVATAR_GAP: f32 = 11.0;
+const INVITE_ACTS_GAP: f32 = 10.0;
+const INVITE_BUTTON_HEIGHT: f32 = 28.0;
+const INVITE_BUTTON_PAD_X: f32 = 11.0;
+const INVITE_BUTTON_GAP: f32 = 8.0;
+const INVITE_RADIUS: u8 = 10;
+const INVITE_TITLE_SIZE: f32 = 13.0;
+const INVITE_LINE_SIZE: f32 = 11.0;
+const INVITE_LINE_GAP: f32 = 2.0;
+/// One invitation row, whole: what `send_ui` adds to its list's measured
+/// height so the scroll bar is decided on the list really drawn.
+pub(crate) const INVITE_ROW_HEIGHT: f32 =
+    INVITE_PAD_Y + INVITER_AVATAR + INVITE_ACTS_GAP + INVITE_BUTTON_HEIGHT + INVITE_PAD_Y;
+/// One [`waiting_line`]: 12pt words in a band as tall as a group eyebrow's
+/// row pair, inset as the eyebrows are.
+pub(crate) const WAITING_LINE_HEIGHT: f32 = 24.0;
+const WAITING_LINE_SIZE: f32 = 12.0;
+
+/// "Waiting for denis@… to finish sharing" (spec 6.9): accepted, not yet
+/// confirmed. The sharer's daemon confirms on its next pass; until then the
+/// org shows this account nothing, and this line is why.
+pub(crate) fn waiting_line(from: &str) -> String {
+    format!("Waiting for {from} to finish sharing")
+}
+
+/// 6d's `.t1`, the invitation row's first line.
+pub(crate) fn wants_to_share(from: &str) -> String {
+    format!("{from} wants to share with you")
+}
+
+/// 6d's IF YOU ACCEPT, `You get`.
+pub(crate) fn you_get(from: &str) -> String {
+    format!("The records {from} shares with you, now and later")
+}
+
+/// 6d's IF YOU ACCEPT, `They change`.
+pub(crate) fn they_change(from: &str) -> String {
+    format!("When {from} edits them")
+}
+
+/// 6d's `.meta` under the card.
+pub(crate) fn decline_note(from: &str) -> String {
+    format!("If you decline, nothing is added to your vault. {from} can invite you again later.")
+}
+
+/// An invitation to answer, as Shared with me lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IncomingRow {
+    /// `invite:{id}` -- see [`INVITE_KEY_PREFIX`].
+    pub(crate) key: String,
+    /// The view's invitation id: what Accept and Decline name. Never the
+    /// token, which the window does not have.
+    pub(crate) id: String,
+    /// The sharer, read off the sharing org's plaintext name -- display only,
+    /// for [`ReceivedShareRow::from`]'s reason: whoever made the org wrote it.
+    pub(crate) from: String,
+    /// "in 6 days", or `None` without an expiry.
+    pub(crate) expires: Option<String>,
+}
+
+/// "in 6 days" from an expiry, rounded up as the SHARING card's
+/// "6 days left" is ([`days_left`]). An invitation `invitations/mine` still
+/// lists has not run out, so a zero is the last hours of its last day.
+fn expires_words(days: i64) -> String {
+    match days {
+        ..=0 => "today".to_string(),
+        1 => "in 1 day".to_string(),
+        days => format!("in {days} days"),
+    }
+}
+
+/// **The invitations the view lists, in its order.** No view, no rows.
+pub(crate) fn incoming_rows(view: Option<&SharingView>, now_ms: i64) -> Vec<IncomingRow> {
+    let Some(view) = view else {
+        return Vec::new();
+    };
+    view.incoming
+        .iter()
+        .map(|i| IncomingRow {
+            key: format!("{INVITE_KEY_PREFIX}{}", i.id),
+            id: i.id.clone(),
+            from: i.from.clone(),
+            expires: days_left(i.expires_at.as_deref(), now_ms).map(expires_words),
+        })
+        .collect()
+}
+
+/// **The sharer's avatar at 6d's large size** (`.pav.lg.emph`): a white disc
+/// in the blue edge, the address's first letter in blue. The invitation row
+/// and its pane's header both wear it.
+pub(crate) fn paint_inviter(painter: &egui::Painter, rect: egui::Rect, from: &str) {
+    painter.circle(rect.center(), rect.width().min(rect.height()) / 2.0 - 0.5, theme::CARD, egui::Stroke::new(1.0, theme::BLUE_EDGE));
+    let initial: String = from.trim().chars().next().map(|c| c.to_uppercase().collect()).unwrap_or_default();
+    let font = egui::FontId::new(INVITER_INITIAL_SIZE, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+    let galley = painter.layout_no_wrap(initial, font, theme::BLUE);
+    painter.galley(rect.center() - galley.size() / 2.0, galley, theme::BLUE);
+}
+
+/// One line of `text`, ended with an ellipsis where it would pass `width` --
+/// an address too long for the row is cut, never wrapped under the buttons.
+fn one_line(painter: &egui::Painter, text: &str, font: egui::FontId, color: egui::Color32, width: f32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple_singleline(text.to_string(), font, color);
+    job.wrap.max_width = width.max(0.0);
+    job.wrap.max_rows = 1;
+    job.wrap.break_anywhere = true;
+    job.wrap.overflow_character = Some('\u{2026}');
+    painter.layout_job(job)
+}
+
+/// **The invitation rows** at the top of Shared with me (mock 6d, invite
+/// pending): a wash card with the sharer's avatar, "X wants to share with
+/// you", "Nothing reaches your vault until you accept.", and Accept /
+/// Decline under the words. Then a quiet [`waiting_line`] for every sharer
+/// this account accepted and is waiting on. Draws nothing when there is
+/// neither.
+///
+/// **Placed, not flowed**, for [`sharing_entry`]'s reason, and one thing
+/// more: the card's own click -- which picks the invitation, so its pane
+/// opens beside it -- is registered BEFORE the buttons. egui gives a press to
+/// the widget registered last, so a card sensed after its buttons (a
+/// `Frame` whose response is made clickable once its content is drawn) takes
+/// every Accept for a pick.
+pub(crate) fn draw_incoming_rows(ui: &mut egui::Ui, people: &mut PeopleRows<'_>, width: f32, selected: &mut Option<String>) {
+    for row in people.incoming {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, INVITE_ROW_HEIGHT), egui::Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        if response.clicked() {
+            *selected = Some(row.key.clone());
+        }
+        let picked = selected.as_deref() == Some(row.key.as_str());
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        painter.rect(
+            rect,
+            egui::CornerRadius::same(INVITE_RADIUS),
+            theme::BLUE_WASH,
+            egui::Stroke::new(1.0, if picked { theme::BLUE } else { theme::BLUE_EDGE }),
+            egui::StrokeKind::Inside,
+        );
+        let avatar = egui::Rect::from_min_size(
+            egui::pos2(rect.left() + INVITE_PAD_X, rect.top() + INVITE_PAD_Y),
+            egui::Vec2::splat(INVITER_AVATAR),
+        );
+        paint_inviter(&painter, avatar, &row.from);
+        let text_left = avatar.right() + INVITE_AVATAR_GAP;
+        let text_width = rect.right() - INVITE_PAD_X - text_left;
+        let title = one_line(
+            &painter,
+            &wants_to_share(&row.from),
+            egui::FontId::new(INVITE_TITLE_SIZE, egui::FontFamily::Name(theme::BOLD.into())),
+            theme::BLUE_DEEP,
+            text_width,
+        );
+        let line = one_line(
+            &painter,
+            INVITE_NOTHING_YET,
+            egui::FontId::new(INVITE_LINE_SIZE, egui::FontFamily::Proportional),
+            theme::TEXT_MUTED,
+            text_width,
+        );
+        // 6d's `.top { align-items: center }`: the two lines, as a block,
+        // centred on the avatar.
+        let block = title.size().y + INVITE_LINE_GAP + line.size().y;
+        let top = avatar.center().y - block / 2.0;
+        let line_top = top + title.size().y + INVITE_LINE_GAP;
+        painter.galley(egui::pos2(text_left, top), title, theme::BLUE_DEEP);
+        painter.galley(egui::pos2(text_left, line_top), line, theme::TEXT_MUTED);
+        let acts_top = avatar.bottom() + INVITE_ACTS_GAP;
+        let slot = |x: f32, label: &str| {
+            egui::Rect::from_min_size(
+                egui::pos2(x, acts_top),
+                egui::vec2(theme::action_button_width(ui.painter(), label, INVITE_BUTTON_PAD_X), INVITE_BUTTON_HEIGHT),
+            )
+        };
+        let accept = slot(text_left, ACCEPT_LABEL);
+        let decline = slot(accept.right() + INVITE_BUTTON_GAP, DECLINE_LABEL);
+        if theme::action_button(ui, accept, ACCEPT_LABEL, theme::ActionTone::Primary).clicked() {
+            people.asked = Some(PeopleAsk::Accept(row.id.clone()));
+        }
+        if theme::action_button(ui, decline, DECLINE_LABEL, theme::ActionTone::Secondary).clicked() {
+            people.asked = Some(PeopleAsk::Decline(row.id.clone()));
+        }
+    }
+    for from in people.waiting {
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, WAITING_LINE_HEIGHT), egui::Sense::hover());
+        let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+        let galley = one_line(
+            &painter,
+            &waiting_line(from),
+            egui::FontId::new(WAITING_LINE_SIZE, egui::FontFamily::Proportional),
+            theme::TEXT_FAINT,
+            width - GROUP_EYEBROW_INSET * 2.0,
+        );
+        let y = rect.center().y - galley.size().y / 2.0;
+        painter.galley(egui::pos2(rect.left() + GROUP_EYEBROW_INSET, y), galley, theme::TEXT_FAINT);
+    }
+}
+
+/// The height [`draw_incoming_rows`] takes, with the list's `gap` after each
+/// of its rows -- what `send_ui` adds to its row count's height.
+pub(crate) fn incoming_rows_height(people: &PeopleRows<'_>, row_gap: f32) -> f32 {
+    people.incoming.len() as f32 * (INVITE_ROW_HEIGHT + row_gap) + people.waiting.len() as f32 * (WAITING_LINE_HEIGHT + row_gap)
+}
+
+/// **The invitation's pane** (mock 6d): the sharer, Accept and Decline, what
+/// accepting means (IF YOU ACCEPT) and what declining does. Draws nothing for
+/// a key that names no invitation listed now -- one answered a moment ago.
+pub(crate) fn draw_invitation_detail(ui: &mut egui::Ui, people: &mut PeopleRows<'_>, key: &str) {
+    let Some(row) = people.incoming.iter().find(|r| r.key == key).cloned() else {
+        return;
+    };
+    crate::vault_window::send_ui::draw_invitation_pane(ui, &row, people);
+}
+
+/// The leave question's two answers.
+pub(crate) const STOP_RECEIVING_LABEL: &str = "Stop receiving";
+pub(crate) const KEEP_RECEIVING_LABEL: &str = "Keep";
+
+pub(crate) fn stop_receiving_title(from: &str) -> String {
+    format!("Stop receiving from {from}?")
+}
+
+pub(crate) fn stop_receiving_body(from: &str) -> String {
+    format!("Every record {from} shares with you leaves your vault now. They can invite you again later.")
+}
+
+/// **"Stop receiving from X?"** -- every record from them leaves this vault,
+/// so it is asked first, over a scrim, as the forget question is
+/// (`record_ui::draw_forget_confirm`, whose shape this is). `Some(true)` to
+/// leave, `Some(false)` to keep -- Escape included -- and `None` while
+/// undecided.
+///
+/// The scrim is its own and spelled in the declaration, so
+/// `item_list::MODAL_SCRIM_AREAS` names it (its census reads the literal)
+/// and the item list's arrow keys stand down behind the question.
+pub(crate) fn draw_leave_confirm(ctx: &egui::Context, from: &str) -> Option<bool> {
+    let mut answer = None;
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-leave-scrim")));
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-leave-modal"))).show(ctx, |ui| {
+        theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
+        egui::Frame::new()
+            .fill(theme::CARD)
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .inner_margin(egui::Margin::same(20))
+            .show(ui, |ui| {
+                ui.set_width(380.0);
+                ui.label(theme::bold(stop_receiving_title(from), 15.0).color(theme::INK));
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(stop_receiving_body(from)).size(12.0).color(theme::TEXT_SECONDARY));
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    if theme::destructive_button(ui, STOP_RECEIVING_LABEL).clicked() {
+                        answer = Some(true);
+                    }
+                    ui.add_space(theme::FORM_FOOTER_GAP);
+                    if theme::secondary_button(ui, KEEP_RECEIVING_LABEL).clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+    });
+    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = Some(false);
+    }
+    answer
 }
 
 #[cfg(test)]
@@ -2796,7 +3134,8 @@ mod tests {
         let mut pane = SharingPane::default();
         let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "t1", "name": "Theirs" })).expect("item")];
         let received = |pane: &SharingPane| received_share_rows(pane.view.as_ref(), &items).len();
-        assert_eq!((received(&pane), pane.has_incoming()), (0, false));
+        let invited = |pane: &SharingPane| !incoming_rows(pane.view.as_ref(), NOW).is_empty();
+        assert_eq!((received(&pane), invited(&pane)), (0, false));
         let mut v = view(
             vec![("anna@x.io", PersonState::Shared, None), ("bob@x.io", PersonState::WaitingAccept, None)],
             vec![("r1", vec!["anna@x.io", "bob@x.io"]), ("r2", vec!["anna@x.io"])],
@@ -2804,7 +3143,7 @@ mod tests {
         v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "t1".into(), from: "d@x.io".into() });
         v.incoming.push(crate::rest::sharing::IncomingEntry { id: "i1".into(), from: "e@x.io".into(), expires_at: None });
         pane.view = Some(v);
-        assert_eq!((received(&pane), pane.has_incoming()), (1, true));
+        assert_eq!((received(&pane), invited(&pane)), (1, true));
         pane.stop_confirming = Some(("r1".into(), "bob@x.io".into()));
         assert_eq!(pane.confirming_for("r1"), Some("bob@x.io"));
         assert_eq!(pane.confirming_for("r2"), None);
@@ -3854,5 +4193,123 @@ mod tests {
             vec![ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }]
         );
         assert!(received_share_rows(None, &items).is_empty());
+    }
+
+    /// **The invitation row and its pane** (mock 6d, invite pending): who
+    /// wants to share, "Nothing reaches your vault until you accept.", and
+    /// Accept / Decline in both places.
+    #[test]
+    fn an_invitation_is_the_first_row_and_accepting_it_is_one_press() {
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: Some("in 6 days".into()) }];
+        let mut people = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
+        let mut selected = None;
+        let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+        assert!(texts.iter().any(|(t, _)| t == "denis@x.io wants to share with you"), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == INVITE_NOTHING_YET));
+        let accept = texts.iter().find(|(t, _)| t == ACCEPT_LABEL).map(|(_, r)| r.center()).expect("Accept");
+        let _ = ui_frame(400.0, click(accept), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+        assert_eq!(people.asked, Some(PeopleAsk::Accept("inv-1".into())));
+
+        let mut people = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
+        let texts = ui_frame(700.0, Vec::new(), |ui| draw_invitation_detail(ui, &mut people, "invite:inv-1"));
+        assert!(texts.iter().any(|(t, _)| t == "IF YOU ACCEPT"));
+        assert!(texts.iter().any(|(t, _)| t == "in 6 days"));
+        assert!(texts.iter().any(|(t, _)| t == DECLINE_LABEL));
+        assert!(texts.iter().any(|(t, _)| *t == decline_note("denis@x.io")), "{texts:?}");
+        let decline = texts.iter().find(|(t, _)| t == DECLINE_LABEL).map(|(_, r)| r.center()).expect("Decline");
+        let _ = ui_frame(700.0, click(decline), |ui| draw_invitation_detail(ui, &mut people, "invite:inv-1"));
+        assert_eq!(people.asked, Some(PeopleAsk::Decline("inv-1".into())), "the pane's Decline answers the invitation");
+    }
+
+    /// **Decline is one press too, the card's own click picks it, and the
+    /// buttons are not the card's**: a press on Accept or Decline answers the
+    /// invitation and leaves the selection where it was -- the card's click
+    /// is registered first, so the buttons over it win the press.
+    #[test]
+    fn declining_is_one_press_and_the_cards_click_picks_it_without_taking_the_buttons() {
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: None }];
+        let mut people = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
+        let mut selected = None;
+        let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+        let decline = texts.iter().find(|(t, _)| t == DECLINE_LABEL).map(|(_, r)| r.center()).expect("Decline");
+        let _ = ui_frame(400.0, click(decline), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+        assert_eq!(people.asked, Some(PeopleAsk::Decline("inv-1".into())));
+        assert_eq!(selected, None, "a press on Decline also picked the card");
+
+        let mut people = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
+        let words = texts.iter().find(|(t, _)| t == INVITE_NOTHING_YET).map(|(_, r)| r.center()).expect("the second line");
+        let _ = ui_frame(400.0, click(words), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+        assert_eq!(selected.as_deref(), Some("invite:inv-1"), "the card's click picks it");
+        assert_eq!(people.asked, None, "picking the card answers nothing");
+    }
+
+    /// **An accepted sharer who has not finished is one quiet line**, under
+    /// the invitations -- and nothing at all is drawn with neither.
+    #[test]
+    fn a_sharer_being_waited_on_is_one_line_and_nothing_is_drawn_without_one() {
+        let waiting = ["denis@x.io".to_string()];
+        let mut people = PeopleRows { waiting: &waiting, ..PeopleRows::none() };
+        let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut None));
+        assert_eq!(texts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["Waiting for denis@x.io to finish sharing"]);
+        let mut people = PeopleRows::none();
+        let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut None));
+        assert!(texts.is_empty(), "{texts:?}");
+        assert!(incoming_rows_height(&PeopleRows::none(), 6.0).abs() < f32::EPSILON);
+    }
+
+    /// **The view's invitations, as rows**: keyed `invite:{id}`, the expiry
+    /// in words rounded up as the SHARING card's are, none without one --
+    /// and no view, no rows.
+    #[test]
+    fn incoming_rows_carry_the_views_id_and_the_expiry_in_words() {
+        let mut v = SharingView { available: true, ..SharingView::default() };
+        let iso = |at: i64| {
+            let parts = crate::local_time::civil_parts(at);
+            format!("{:04}-{:02}-{:02}T{:02}:{:02}:00Z", parts.year, parts.month, parts.day, parts.hour, parts.minute)
+        };
+        for (id, expires) in [("i6", Some(iso(NOW + 6 * DAY - 60_000))), ("i1", Some(iso(NOW + DAY - 60_000))), ("i0", None)] {
+            v.incoming.push(crate::rest::sharing::IncomingEntry { id: id.into(), from: "denis@x.io".into(), expires_at: expires });
+        }
+        let rows = incoming_rows(Some(&v), NOW);
+        assert_eq!(rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["invite:i6", "invite:i1", "invite:i0"]);
+        assert_eq!(rows.iter().map(|r| r.expires.as_deref()).collect::<Vec<_>>(), [Some("in 6 days"), Some("in 1 day"), None]);
+        assert_eq!(rows[0].id, "i6");
+        assert!(incoming_rows(None, NOW).is_empty());
+    }
+
+    /// **"Stop receiving from X?"** names the sharer and what goes, and
+    /// Escape keeps.
+    #[test]
+    fn the_leave_question_names_the_sharer_and_escape_keeps() {
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let mut answer = None;
+        // An area is sized, unseen, on the frame it first appears: the
+        // second frame is the one that paints it.
+        let _ = ctx.run_ui(input(Vec::new()), |ui| answer = draw_leave_confirm(ui.ctx(), "denis@x.io"));
+        let output = ctx.run_ui(input(Vec::new()), |ui| answer = draw_leave_confirm(ui.ctx(), "denis@x.io"));
+        assert_eq!(answer, None, "undecided until a press");
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        for said in [stop_receiving_title("denis@x.io"), stop_receiving_body("denis@x.io"), STOP_RECEIVING_LABEL.to_string(), KEEP_RECEIVING_LABEL.to_string()] {
+            assert!(texts.iter().any(|(t, _)| *t == said), "{said:?} is not on the question: {texts:?}");
+        }
+        let escape = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }];
+        let _ = ctx.run_ui(input(escape), |ui| answer = draw_leave_confirm(ui.ctx(), "denis@x.io"));
+        assert_eq!(answer, Some(false));
     }
 }

@@ -410,8 +410,8 @@ impl SharingClient {
         serde_json::from_value(data).map_err(|_| "The vault service answered something unreadable.".to_string())
     }
 
-    /// `POST /sharing/incoming/{id}/accept`. The route arrives in Task 20;
-    /// until then the daemon refuses it and this answers its sentence.
+    /// `POST /sharing/incoming/{id}/accept`. The id is the one `GET /sharing`
+    /// listed; the invitation's token stays in the daemon, which sends it.
     ///
     /// # Errors
     ///
@@ -425,7 +425,7 @@ impl SharingClient {
         self.post(&format!("/sharing/incoming/{id}/accept"), serde_json::json!({})).map(|_| ())
     }
 
-    /// `POST /sharing/incoming/{id}/decline`. The route arrives in Task 20.
+    /// `POST /sharing/incoming/{id}/decline`, [`Self::accept`]'s twin.
     ///
     /// # Errors
     ///
@@ -439,7 +439,6 @@ impl SharingClient {
     }
 
     /// `POST /sharing/from/{orgId}/leave` -- stop receiving from a sharer.
-    /// The route arrives in Task 20.
     ///
     /// # Errors
     ///

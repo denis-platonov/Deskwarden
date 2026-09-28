@@ -1902,10 +1902,14 @@ fn draw_send_list(
     //
     // And on `Shared with me`, once a record from a person is listed, 6d's
     // own note replaces 5b's for the same reason: the list holds two kinds
-    // now, and the note says what each is.
+    // now, and the note says what each is. An invitation, or a sharer being
+    // waited on, counts: 6d's invite-pending list wears that note too, and
+    // it is what says where an accepted invitation's records will arrive.
     let gloss = if !shares.is_empty() {
         SHARES_SUBTEXT
-    } else if matches!(view, SendView::Received(_)) && !people.received.is_empty() {
+    } else if matches!(view, SendView::Received(_))
+        && !(people.received.is_empty() && people.incoming.is_empty() && people.waiting.is_empty())
+    {
         RECEIVED_PEOPLE_SUBTEXT
     } else {
         view.gloss()
@@ -1968,13 +1972,18 @@ fn draw_send_list(
     // `eyebrows` is how many of Shared with me's group eyebrows (mock 6d)
     // stand among the rows: each is one more item in the list and its height,
     // counted so the scroll bar is decided on what is really drawn.
-    let rows_area = |ui: &mut egui::Ui, rows: usize, eyebrows: usize, body: &mut dyn FnMut(&mut egui::Ui)| {
+    //
+    // `extra` is the height of rows of another shape among them -- 6d's
+    // invitation cards and waiting lines, each with its gap after it
+    // (`share_ui::incoming_rows_height`) -- for the same reason.
+    let rows_area = |ui: &mut egui::Ui, rows: usize, eyebrows: usize, extra: f32, body: &mut dyn FnMut(&mut egui::Ui)| {
         egui::Frame::new()
             .inner_margin(Margin { left: LIST_PAD as i8, right: 0, top: 0, bottom: LIST_PAD as i8 })
             .show(ui, |ui| {
                 let content = rows as f32 * ROW_HEIGHT
                     + eyebrows as f32 * super::share_ui::group_eyebrow_height(ui)
-                    + (rows + eyebrows).saturating_sub(1) as f32 * LIST_ROW_GAP;
+                    + (rows + eyebrows).saturating_sub(1) as f32 * LIST_ROW_GAP
+                    + extra;
                 theme::scrollbar_in_gutter(ui, LIST_PAD);
                 if content < ui.available_height() {
                     theme::hide_scrollbar(ui);
@@ -2044,14 +2053,33 @@ fn draw_send_list(
         // drawn only where there are two groups to tell apart: an account
         // nobody shares with keeps the list it always had, and one with no
         // imports gets no eyebrow over nothing.
+        //
+        // **An invitation is the first row** (6d, invite pending), and the
+        // accepted-but-unfinished sharers' waiting lines follow it: both are
+        // about what is ON ITS WAY, above what is here. The invitation is
+        // picked when nothing on this screen is, as 6d draws it (`.invite.sel`
+        // beside its pane) -- picked here, before the detail column resolves
+        // the selection in the same frame, so the two columns never disagree.
         SendView::Received(rows) => {
-            if rows.is_empty() && people.received.is_empty() {
+            let names_a_row = selected.as_deref().is_some_and(|key| {
+                rows.iter().any(|r| r.key == key)
+                    || people.received.iter().any(|r| r.key == key)
+                    || people.incoming.iter().any(|r| r.key == key)
+            });
+            if !names_a_row {
+                if let Some(first) = people.incoming.first() {
+                    *selected = Some(first.key.clone());
+                }
+            }
+            if rows.is_empty() && people.received.is_empty() && people.incoming.is_empty() && people.waiting.is_empty() {
                 headline(ui, RECEIVED_EMPTY_HEADLINE, RECEIVED_EMPTY_DETAIL, theme::INK);
             } else {
                 let received = people.received.len();
                 let two_groups = received > 0 && !rows.is_empty();
                 let eyebrows = usize::from(received > 0) + usize::from(two_groups);
-                rows_area(ui, rows.len() + received, eyebrows, &mut |ui| {
+                let invitations = super::share_ui::incoming_rows_height(people, LIST_ROW_GAP);
+                rows_area(ui, rows.len() + received, eyebrows, invitations, &mut |ui| {
+                    super::share_ui::draw_incoming_rows(ui, people, row_width, selected);
                     if let Some(open) = super::share_ui::draw_received_group(ui, people, row_width, ROW_HEIGHT, selected, records) {
                         action = Some(open);
                     }
@@ -2088,7 +2116,7 @@ fn draw_send_list(
             // have no Sends" over a share row would be true and read as
             // "nothing here".
             SendPaneState::Empty if !shares.is_empty() => {
-                rows_area(ui, shares.len(), 0, &mut |ui| {
+                rows_area(ui, shares.len(), 0, 0.0, &mut |ui| {
                     for share in shares {
                         draw_share_row(ui, share, row_width, selected, records);
                     }
@@ -2147,7 +2175,7 @@ fn draw_send_list(
                     let head = scope_empty_headline(*scope);
                     headline(ui, &head, SCOPE_EMPTY_DETAIL, theme::INK);
                 } else {
-                    rows_area(ui, in_scope.len() + shares.len(), 0, &mut |ui| {
+                    rows_area(ui, in_scope.len() + shares.len(), 0, 0.0, &mut |ui| {
                         // **Shares first** (plan decision 12). 6c interleaves
                         // the two by date, and a share has no server date to
                         // interleave by -- only this PC's record of it, which
@@ -2856,6 +2884,18 @@ fn draw_send_detail(
             }
         }
         SendView::Received(rows) => {
+            // **An invitation key opens the invitation's own pane** (6d) --
+            // while that invitation is still listed. One answered a moment
+            // ago names nothing now and falls through to "nothing picked".
+            if let Some(key) = selected
+                .as_deref()
+                .filter(|key| key.starts_with(super::share_ui::INVITE_KEY_PREFIX))
+                .filter(|key| people.incoming.iter().any(|row| row.key == *key))
+            {
+                let key = key.to_string();
+                super::share_ui::draw_invitation_detail(ui, people, &key);
+                return action;
+            }
             let picked =
                 selected.as_deref().and_then(|key| rows.iter().find(|row| row.key == key));
             match picked {
@@ -3535,6 +3575,137 @@ fn draw_share_detail(
                 });
         });
     action
+}
+
+/// **An invitation's own pane** (mock 6d, invite pending), drawn for
+/// `share_ui::draw_invitation_detail`: [`draw_share_detail`]'s shape with the
+/// sharer where the record was -- the white strip, 6d's large person avatar
+/// in the tile's place, the address as the 21pt title over "wants to share
+/// records with you", and Accept then Decline measured onto the title's line
+/// when they fit and under it when they do not. Under it, IF YOU ACCEPT in
+/// the fact card every other pane on this screen uses, and 6d's `.meta`.
+///
+/// Nothing here accepts anything: a press goes out through `people.asked`,
+/// and the window sends the daemon the invitation's id.
+pub(crate) fn draw_invitation_pane(
+    ui: &mut egui::Ui,
+    row: &super::share_ui::IncomingRow,
+    people: &mut super::share_ui::PeopleRows<'_>,
+) {
+    use super::share_ui::{self as sharing, PeopleAsk};
+    let width = ui.available_width();
+    let labels = [sharing::ACCEPT_LABEL, sharing::DECLINE_LABEL];
+    let content = (width - DETAIL_PAD_X_F * 2.0).max(0.0);
+    let action_pad = action_pad_for(ui, &labels, content);
+    let actions_width = actions_total(ui, &labels, action_pad);
+    let inline = HEADER_TILE + ROW_TEXT_GAP + TITLE_MIN_ROOM + HEADER_ACTION_GAP + actions_width <= content;
+    let strip_height = if inline {
+        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK
+    } else {
+        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK + ACTION_ROW_GAP + theme::ACTION_BUTTON_HEIGHT
+    };
+    let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
+    {
+        let p = ui.painter().clone();
+        let p = &p;
+        p.rect_filled(strip, CornerRadius::ZERO, theme::CARD);
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(strip.left(), strip.bottom() - 1.0),
+                egui::pos2(strip.right(), strip.bottom()),
+            ),
+            CornerRadius::ZERO,
+            theme::HAIRLINE,
+        );
+        let block_top = strip.top() + DETAIL_PAD_Y_F;
+        let tile = egui::Rect::from_min_size(
+            egui::pos2(strip.left() + DETAIL_PAD_X_F, block_top + (HEADER_BLOCK - HEADER_TILE) / 2.0),
+            egui::Vec2::splat(HEADER_TILE),
+        );
+        // 6d's `.pav.lg` is 40 against the record tile's 42: centred in the
+        // tile's slot, so the title starts where a record's would.
+        sharing::paint_inviter(p, egui::Rect::from_center_size(tile.center(), egui::Vec2::splat(sharing::INVITER_AVATAR)), &row.from);
+        let text_left = tile.right() + ROW_TEXT_GAP;
+        let text_right = strip.right() - DETAIL_PAD_X_F - if inline { actions_width + HEADER_ACTION_GAP } else { 0.0 };
+        let clip = p.with_clip_rect(
+            egui::Rect::from_min_max(egui::pos2(text_left, strip.top()), egui::pos2(text_right.max(text_left), strip.bottom()))
+                .intersect(ui.clip_rect()),
+        );
+        let title = elided(
+            &clip,
+            &row.from,
+            egui::FontId::new(TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
+            theme::INK,
+            (text_right - text_left).max(0.0),
+        );
+        clip.galley(egui::pos2(text_left, block_top), title, theme::INK);
+        clip.text(
+            egui::pos2(text_left, block_top + TITLE_LINE + SUBTITLE_GAP + theme::PILL_HEIGHT / 2.0),
+            egui::Align2::LEFT_CENTER,
+            sharing::INVITE_PANE_SUBTITLE,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+            theme::TEXT_FAINT,
+        );
+    }
+
+    // --- the actions: 6d's `.dacts`, Accept then Decline ---
+    let action_y = if inline {
+        strip.top() + DETAIL_PAD_Y_F + (HEADER_BLOCK - theme::ACTION_BUTTON_HEIGHT) / 2.0
+    } else {
+        strip.top() + DETAIL_PAD_Y_F + HEADER_BLOCK + ACTION_ROW_GAP
+    };
+    let x0 = if inline { strip.right() - DETAIL_PAD_X_F - actions_width } else { strip.left() + DETAIL_PAD_X_F };
+    let slot = |x: f32, label: &str| {
+        egui::Rect::from_min_size(
+            egui::pos2(x, action_y),
+            egui::vec2(theme::action_button_width(ui.painter(), label, action_pad), theme::ACTION_BUTTON_HEIGHT),
+        )
+    };
+    let accept_rect = slot(x0, sharing::ACCEPT_LABEL);
+    let decline_rect = slot(accept_rect.right() + BUTTON_GAP, sharing::DECLINE_LABEL);
+    if theme::action_button(ui, accept_rect, sharing::ACCEPT_LABEL, theme::ActionTone::Primary).clicked() {
+        people.asked = Some(PeopleAsk::Accept(row.id.clone()));
+    }
+    if theme::action_button(ui, decline_rect, sharing::DECLINE_LABEL, theme::ActionTone::Secondary).clicked() {
+        people.asked = Some(PeopleAsk::Decline(row.id.clone()));
+    }
+
+    // --- the body: IF YOU ACCEPT, what a decline does, and a sentence ---
+    ui.advance_cursor_after_rect(strip);
+    let you_get = sharing::you_get(&row.from);
+    let they_change = sharing::they_change(&row.from);
+    let mut facts = vec![
+        (sharing::YOU_GET_ROW, CardValue::Plain(&you_get)),
+        (sharing::ACCESS_ROW, CardValue::Plain(sharing::VIEW_ONLY)),
+        (sharing::YOU_CAN_ROW, CardValue::Plain(sharing::YOU_CAN_VALUE)),
+        (sharing::YOU_CANNOT_ROW, CardValue::Plain(sharing::YOU_CANNOT_VALUE)),
+        (sharing::THEY_CHANGE_ROW, CardValue::Plain(&they_change)),
+    ];
+    if let Some(expires) = row.expires.as_deref() {
+        facts.push((sharing::INVITE_EXPIRES_ROW, CardValue::Plain(expires)));
+    }
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("invitation-detail")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    draw_fact_card(ui, sharing::IF_YOU_ACCEPT_TITLE, None, &facts, false);
+                    ui.add_space(CARD_STACK_GAP);
+                    ui.add(
+                        egui::Label::new(egui::RichText::new(sharing::decline_note(&row.from)).size(12.0).color(theme::TEXT_FAINT))
+                            .wrap(),
+                    );
+                    // An Accept or a Decline that failed, said on the pane
+                    // it was asked from -- the share detail's rule: at the
+                    // foot, shown and never logged.
+                    if let Some(notice) = people.notice.as_deref() {
+                        ui.add_space(CARD_STACK_GAP);
+                        ui.add(egui::Label::new(egui::RichText::new(notice).size(12.0).color(theme::ERROR)).wrap());
+                    }
+                });
+        });
 }
 
 /// What one row of a fact card shows in its value column.
@@ -9074,6 +9245,18 @@ mod paint_tests {
         from_people: &[crate::vault_window::share_ui::ReceivedShareRow],
         picked: Option<String>,
     ) -> Painted {
+        let mut people =
+            crate::vault_window::share_ui::PeopleRows { received: from_people, ..crate::vault_window::share_ui::PeopleRows::none() };
+        paint_received_people(rows, &mut people, picked).0
+    }
+
+    /// [`paint_received`] with every sharing input the screen takes -- 6d's
+    /// invitations and waiting sharers too -- and the selection it ended on.
+    fn paint_received_people(
+        rows: &[ReceivedRow],
+        people: &mut crate::vault_window::share_ui::PeopleRows<'_>,
+        picked: Option<String>,
+    ) -> (Painted, Option<String>) {
         let size = min_pane_size();
         let ctx = egui::Context::default();
         let input = || egui::RawInput {
@@ -9099,10 +9282,7 @@ mod paint_tests {
                 SendView::Received(rows),
                 &mut selected,
                 RecordTiles::default(),
-                &mut crate::vault_window::share_ui::PeopleRows {
-                    received: from_people,
-                    ..crate::vault_window::share_ui::PeopleRows::none()
-                },
+                people,
             )
             .into_action();
         });
@@ -9110,7 +9290,7 @@ mod paint_tests {
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
         }
-        painted
+        (painted, selected)
     }
 
     /// **`Shared with me` lists what was imported, and its detail says where
@@ -9218,6 +9398,49 @@ mod paint_tests {
         assert!(alone.has("Acme VPN"));
         assert!(!alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
         assert!(!alone.has(FROM_SENDS_EYEBROW), "an eyebrow over no rows: {:?}", alone.text);
+    }
+
+    /// **Mock 6d, invite pending**: the invitation is the list's first row,
+    /// above FROM PEOPLE; nothing picked, it is picked, and its pane -- the
+    /// sharer, Accept and Decline, IF YOU ACCEPT, what a decline does --
+    /// stands beside it; the strip counts records and not the invitation
+    /// (6d's "2 records"); and a sharer being waited on alone is a list with
+    /// its line in it, never the empty screen.
+    #[test]
+    fn an_invitation_leads_shared_with_me_and_its_pane_opens_beside_it() {
+        use crate::vault_window::share_ui::{self as sharing, IncomingRow, PeopleRows, ReceivedShareRow};
+        let history = crate::receive_history::ReceiveHistory {
+            entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
+        };
+        let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
+        let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }];
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: Some("in 6 days".into()) }];
+        let mut people = PeopleRows { received: &from_people, incoming: &incoming, ..PeopleRows::none() };
+        let (painted, selected) = paint_received_people(&rows, &mut people, None);
+        assert_eq!(selected.as_deref(), Some("invite:inv-1"), "nothing picked: the invitation is");
+        let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
+        assert!(top("denis@x.io wants to share with you") < top(sharing::FROM_PEOPLE_EYEBROW));
+        assert_eq!(painted.in_list(sharing::ACCEPT_LABEL), 1);
+        assert_eq!(painted.in_detail(sharing::ACCEPT_LABEL), 1);
+        assert_eq!(painted.in_detail(sharing::DECLINE_LABEL), 1);
+        assert_eq!(painted.in_detail(sharing::IF_YOU_ACCEPT_TITLE), 1);
+        assert_eq!(painted.in_detail(sharing::INVITE_PANE_SUBTITLE), 1);
+        assert_eq!(painted.in_detail("in 6 days"), 1);
+        assert!(painted.has(&format!("2 {RECORDS_NOUN}")), "the invitation is not a record: {:?}", painted.text);
+        assert!(painted.has(RECEIVED_PEOPLE_SUBTEXT), "{:?}", painted.text);
+        // Picked elsewhere on this screen, the pick stands.
+        let (_, kept) = paint_received_people(&rows, &mut people, Some("item-here".into()));
+        assert_eq!(kept.as_deref(), Some("item-here"));
+        // An invitation answered a moment ago names nothing: no pane for it.
+        let mut answered = PeopleRows { received: &from_people, ..PeopleRows::none() };
+        let (gone, _) = paint_received_people(&rows, &mut answered, Some("invite:inv-1".into()));
+        assert_eq!(gone.in_detail(sharing::IF_YOU_ACCEPT_TITLE), 0);
+
+        let waiting = ["denis@x.io".to_string()];
+        let mut only_waiting = PeopleRows { waiting: &waiting, ..PeopleRows::none() };
+        let (painted, _) = paint_received_people(&[], &mut only_waiting, None);
+        assert!(painted.has(&sharing::waiting_line("denis@x.io")), "{:?}", painted.text);
+        assert!(!painted.has(RECEIVED_EMPTY_HEADLINE), "{:?}", painted.text);
     }
 
     /// **The activity sentence says what happened and what is left, and never

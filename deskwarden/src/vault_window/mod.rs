@@ -1196,6 +1196,11 @@ pub fn build_frame_with_search(
     let sharing_client = crate::daemon_link::sharing_client();
     let mut sharing = share_ui::SharingPane::default();
     let (sharing_tx, sharing_rx) = mpsc::channel::<share_ui::SharingReport>();
+    // **"Stop receiving from X?" is up** (spec 6.9): the sharer's org id,
+    // the sharer as the view names them, and the received record the kebab
+    // was opened on -- the record a failure is said on. Set by a received
+    // record's kebab; the leave goes out only on the question's yes.
+    let mut leave_ask: Option<(String, String, String)> = None;
     // The `u64` is the `SendFetch` generation the fetch was started under, so
     // an answer to a question the user has since navigated away from can be
     // told apart from an answer to the current one. See
@@ -3356,6 +3361,16 @@ pub fn build_frame_with_search(
         // sharer has trashed is in neither list and is not a row here. Unlike
         // `share_rows` there is no archive or trash to search.
         let received_share_rows = share_ui::received_share_rows(sharing.view.as_ref(), &items);
+        // **Design 6d's invitations, and the sharers being waited on**, built
+        // beside them for the same reason. The rail's dot on Shared with me
+        // is read off `incoming_rows` too -- the badge = list rule: a dot
+        // with no invitation row under it cannot happen.
+        let incoming_rows = share_ui::incoming_rows(
+            sharing.view.as_ref(),
+            crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
+        );
+        let waiting_from: Vec<String> =
+            sharing.view.as_ref().map(|v| v.waiting.iter().map(|w| w.from.clone()).collect()).unwrap_or_default();
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -3417,7 +3432,7 @@ pub fn build_frame_with_search(
                     // the badge and the column say one number even while
                     // the view names an item this vault does not hold yet.
                     received_records: received_share_rows.len(),
-                    invitation_waiting: sharing.has_incoming(),
+                    invitation_waiting: !incoming_rows.is_empty(),
                 };
                 match draw_sidebar(
                     ui,
@@ -4464,17 +4479,28 @@ pub fn build_frame_with_search(
         // the SHARING card before the user came here, or on another share --
         // is said as a toast, as the read pane does; one about this record is
         // said at the foot of its detail.
+        //
+        // **On Shared with me the same rule holds for an invitation**, by its
+        // key: an Accept or a Decline is asked as a write about the
+        // invitation on screen (`request_on` below), so its failure stands at
+        // the foot of that invitation's pane, and one about anything else --
+        // a record, another invitation -- goes to a toast.
         let sent_share_record = selected_send.as_deref().and_then(share_ui::parse_share_key).map(|(item_id, _)| item_id);
-        if show_sends && !on_received {
-            share_ui::route_stray_notice(&mut sharing, sent_share_record.as_deref().unwrap_or_default(), ui.input(|i| i.time));
+        let shown_invitation =
+            selected_send.as_deref().filter(|key| key.starts_with(share_ui::INVITE_KEY_PREFIX)).map(str::to_string);
+        let notice_about = if on_received { shown_invitation } else { sent_share_record };
+        if show_sends {
+            share_ui::route_stray_notice(&mut sharing, notice_about.as_deref().unwrap_or_default(), ui.input(|i| i.time));
         }
         let mut people_rows = share_ui::PeopleRows {
             shares: &share_rows,
             confirming: sharing.stop_confirming.as_ref().map(|(id, email)| share_ui::share_key(id, email)),
             stopping: sharing.stopping.as_ref().map(|(id, email)| share_ui::share_key(id, email)),
-            notice: sent_share_record.as_deref().and_then(|id| sharing.notice_for(id)).map(str::to_string),
+            notice: notice_about.as_deref().and_then(|id| sharing.notice_for(id)).map(str::to_string),
             asked: None,
             received: &received_share_rows,
+            incoming: &incoming_rows,
+            waiting: &waiting_from,
         };
         let open_record = apply_send_action(
             egui::CentralPanel::default()
@@ -5291,6 +5317,13 @@ pub fn build_frame_with_search(
                                 // is made in this file.
                                 DetailAction::ShareAnyway(email) => {
                                     share_anyway_asked = Some((item.id.clone(), email));
+                                }
+                                // **Recorded, not sent**: every record from
+                                // the sharer leaves the vault, so the
+                                // question after the panels asks first.
+                                DetailAction::StopReceiving(org) => {
+                                    let from = sharing.view.as_ref().and_then(|v| v.received_from(&item.id)).unwrap_or_default().to_string();
+                                    leave_ask = Some((org, from, item.id.clone()));
                                 }
                                 // **4a.** The draft is built HERE, from the
                                 // item, for the reason `Edit`'s is: the
@@ -6622,6 +6655,20 @@ pub fn build_frame_with_search(
                     );
                 }
             }
+            // **An invitation's answer** (6d), from its row or its pane: one
+            // press, by the view's id -- the token is the daemon's. Asked
+            // about the invitation's own key, so a refusal stands on its pane
+            // (`notice_about` above) and not on whatever record is shown next.
+            Some(share_ui::PeopleAsk::Accept(id)) => {
+                let key = format!("{}{id}", share_ui::INVITE_KEY_PREFIX);
+                let call = share_ui::SharingCall::Accept(id);
+                let _ = share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+            }
+            Some(share_ui::PeopleAsk::Decline(id)) => {
+                let key = format!("{}{id}", share_ui::INVITE_KEY_PREFIX);
+                let call = share_ui::SharingCall::Decline(id);
+                let _ = share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+            }
             None => {}
         }
         // **`Open record`**: leave the Sent screen and show the item the Send
@@ -7279,6 +7326,23 @@ pub fn build_frame_with_search(
                     forget_ask = None;
                     forget_records.clear();
                 }
+                None => {}
+            }
+        }
+        // **"Stop receiving from X?"** (spec 6.9), over its own scrim. Yes
+        // asks the daemon to leave the sharer's org -- which takes every
+        // record from them out of the vault through the feed -- as a write
+        // about the record the kebab was on, so a refusal is said on that
+        // record's card (`request_on`). The question goes either way: a
+        // refused request has said why, and there is no spinner to take down.
+        if let Some((org, from, record)) = leave_ask.clone() {
+            match share_ui::draw_leave_confirm(ui.ctx(), &from) {
+                Some(true) => {
+                    let call = share_ui::SharingCall::Leave(org);
+                    let _ = share_ui::request_on(&mut sharing, &record, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                    leave_ask = None;
+                }
+                Some(false) => leave_ask = None,
                 None => {}
             }
         }
@@ -8849,6 +8913,10 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         | DetailAction::ShowFingerprint(_)
         | DetailAction::HideFingerprint
         | DetailAction::ShareAnyway(_)
+        // **Stop receiving takes records AWAY from this vault**: it reads no
+        // field of the item, paints none and copies none, and the question it
+        // puts up names only the sharer.
+        | DetailAction::StopReceiving(_)
         // Closing the pane HIDES the item; there is nothing here to prove a
         // master password for.
         | DetailAction::ClosePane
