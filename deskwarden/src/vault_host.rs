@@ -153,8 +153,13 @@ fn serve(server: &tiny_http::Server, api: &VaultApi, stop: &AtomicBool) {
             .iter()
             .find(|header| header.field.equiv("Authorization"))
             .map(|header| Zeroizing::new(header.value.as_str().to_string()));
-        let mut body = Zeroizing::new(Vec::new());
         let oversized = request.body_length().is_some_and(|length| length as u64 > MAX_BODY);
+        // Sized to the declared length before the read: a `Vec` that grew
+        // while reading would free each shorter copy of the body unwiped, and
+        // `POST /sharing/invite-code`'s body is the master password. A body
+        // with no length (chunked) still grows; no client of ours sends one.
+        let declared = if oversized { 0 } else { request.body_length().unwrap_or(0) };
+        let mut body = Zeroizing::new(Vec::with_capacity(declared));
         if !oversized {
             use std::io::Read as _;
             let _ = request.as_reader().take(MAX_BODY + 1).read_to_end(&mut body);

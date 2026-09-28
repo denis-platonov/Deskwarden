@@ -1,7 +1,7 @@
 //! **NodeWarden's sharing routes**, one typed function each -- the NodeWarden
 //! column of spec §7.3, with the request and answer shapes of §10 and of the
 //! routes NodeWarden already has (`/members/*`, `/invitations/*`,
-//! `/admin/invites`).
+//! `/users/{ouId}/registration-invite`).
 //!
 //! No policy lives here. Which route to call, in what order, and what a
 //! refusal means for the user is `rest::sharing`'s. What lives here is the
@@ -148,13 +148,31 @@ pub struct RawCollection {
     pub name: String,
 }
 
-/// A NodeWarden registration code, as `/api/admin/invites` answers it.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// A NodeWarden registration code, as the registration-invite route answers
+/// it (NodeWarden's `toInviteResponse`, the shape `/api/admin/invites` uses
+/// too).
+///
+/// **A hand-written `Debug` that prints neither the code nor the link**: the
+/// code registers an account on the server, and the link carries it in its
+/// fragment -- the `access_url` leak `crate::debug_leak_guard` opens with,
+/// in a plain `String` its seed step cannot see. `Serialize` stays: the
+/// daemon's answer to the window is the one place the code is meant to go.
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InviteCode {
     pub code: String,
     pub link: Option<String>,
     pub expires_at: Option<String>,
+}
+
+impl std::fmt::Debug for InviteCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteCode")
+            .field("code", &"<redacted>")
+            .field("link", &self.link.as_ref().map(|_| "<redacted>"))
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
 }
 
 /// The official create body, spec §9.5.
@@ -492,17 +510,30 @@ pub fn leave_organization(client: &RestClient, session: &mut Session, org: &str)
     send(client, session, &SharingRequest::new(SharingMethod::Post, path, None)).map(|_| ())
 }
 
-/// `POST /api/admin/invites {masterPasswordHash, expiresInHours}` -- a
-/// registration code, for a NodeWarden administrator sharing with somebody
-/// who has no account (owner decision Q3 (b)). Seven days, matching the org
-/// invitation's own expiry.
-pub fn mint_invite_code(
+/// `POST /api/organizations/{id}/users/{ouId}/registration-invite
+/// {masterPasswordHash}` -- a registration code for ONE pending invitation,
+/// for a NodeWarden administrator sharing with somebody who has no account
+/// (owner decision Q3 (b)). Answered 201 with NodeWarden's invite shape.
+///
+/// **This route and not `/api/admin/invites`**, which mints a code for
+/// anyone, for as long as it is asked to last. NodeWarden's per-invitation
+/// route (`handleCreateRegistrationInviteForOrgUser`) ties the code to the
+/// invitation instead: it expires with it, and the server refuses it for an
+/// invitation whose address already has an account ("This person already has
+/// an account"), for an expired one, for anyone but a confirmed manager of
+/// the org who is also an active server admin (403), and without the right
+/// master-password hash ("Invalid password"). The hash is in the body, never
+/// a query.
+pub fn registration_invite(
     client: &RestClient,
     session: &mut Session,
+    org: &str,
+    ou_id: &str,
     master_password_hash: &str,
 ) -> Result<InviteCode, RestError> {
-    let json = json!({ "masterPasswordHash": master_password_hash, "expiresInHours": 168 });
-    let answer = send(client, session, &SharingRequest::new(SharingMethod::Post, "/api/admin/invites".into(), Some(json)))?;
+    let path = format!("/api/organizations/{}/users/{}/registration-invite", safe(org)?, safe(ou_id)?);
+    let json = json!({ "masterPasswordHash": master_password_hash });
+    let answer = send(client, session, &SharingRequest::new(SharingMethod::Post, path, Some(json)))?;
     Ok(InviteCode {
         code: text_at(&answer, "code").ok_or(RestError::Parse("the invite code"))?,
         link: text_at(&answer, "inviteLink"),
@@ -806,22 +837,45 @@ mod tests {
         any.assert();
     }
 
-    /// **The registration code a NodeWarden admin can mint** (owner decision
-    /// Q3 (b)): the master-password hash goes in the body, never a query.
+    /// **The registration code a NodeWarden admin can mint, for ONE pending
+    /// invitation** (owner decision Q3 (b)): the invitation's own route, the
+    /// master-password hash in the body and never a query, and the answer
+    /// read as NodeWarden's `toInviteResponse` writes it. An id that is not
+    /// path-safe never reaches the wire.
     #[test]
-    fn an_invite_code_is_minted_with_the_password_hash_in_the_body() {
+    fn a_registration_invite_is_minted_for_one_invitation_with_the_hash_in_the_body() {
         let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
         let minted = server
-            .mock("POST", "/api/admin/invites")
-            .match_body(Matcher::PartialJson(serde_json::json!({ "masterPasswordHash": "HASH==", "expiresInHours": 168 })))
+            .mock("POST", format!("/api/organizations/{ORG}/users/inv-1/registration-invite").as_str())
+            .match_body(Matcher::Json(serde_json::json!({ "masterPasswordHash": "HASH==" })))
             .with_status(201)
-            .with_body(r#"{"code":"abc123","inviteLink":"https://vault.example/#/register?invite=abc123","expiresAt":"2026-10-04T00:00:00Z","object":"invite"}"#)
+            .with_body(r#"{"code":"abc123","status":"active","createdBy":"user-1","usedBy":null,"createdAt":"2026-09-28T00:00:00.000Z","updatedAt":"2026-09-28T00:00:00.000Z","expiresAt":"2026-10-04T00:00:00.000Z","inviteLink":"https://vault.example/#/register?invite=abc123","object":"invite"}"#)
             .expect(1)
             .create();
-        let code = mint_invite_code(&client, &mut session, "HASH==").expect("minted");
+        let code = registration_invite(&client, &mut session, ORG, "inv-1", "HASH==").expect("minted");
         minted.assert();
         assert_eq!(code.code, "abc123");
         assert_eq!(code.link.as_deref(), Some("https://vault.example/#/register?invite=abc123"));
+        assert_eq!(code.expires_at.as_deref(), Some("2026-10-04T00:00:00.000Z"));
+
+        let any = server.mock("POST", Matcher::Any).expect(0).create();
+        assert!(matches!(registration_invite(&client, &mut session, "../x", "inv-1", "HASH=="), Err(RestError::UnsafeId)));
+        assert!(matches!(registration_invite(&client, &mut session, ORG, "a/b", "HASH=="), Err(RestError::UnsafeId)));
+        any.assert();
+    }
+
+    /// **An invite code never prints through `Debug`**: it is a credential
+    /// for registering an account on the server, and the link carries it too.
+    #[test]
+    fn an_invite_codes_debug_never_prints_the_code_or_the_link() {
+        let code = InviteCode {
+            code: "c0de-secret".into(),
+            link: Some("https://vault.example/#/register?invite=c0de-secret".into()),
+            expires_at: Some("2026-10-04T00:00:00.000Z".into()),
+        };
+        let printed = format!("{code:?}");
+        assert!(!printed.contains("c0de-secret"), "{printed}");
+        assert!(printed.contains("2026-10-04"), "{printed}");
     }
 }

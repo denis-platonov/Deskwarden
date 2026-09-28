@@ -217,6 +217,16 @@ pub const STOP_IN_TRASH: &str = "This record is in the trash or the archive. Res
 /// age or the organisation. Bitwarden's web vault makes the pair at sign-in.
 pub const NO_KEY_PAIR: &str =
     "This account has no encryption keys for sharing yet. Sign in to the web vault once to create them, then try again.";
+/// An invite code asked for by an account that is not NodeWarden's
+/// administrator -- refused here before any write, and the sentence the
+/// route's own 403 is read as too.
+pub const NOT_ADMIN: &str = "Only this server's administrator can make an invite code.";
+/// An invite code the server would not make, for a reason with no sentence
+/// of its own; the server's words follow it (`SharingError::or_say`).
+pub const INVITE_CODE_FAILED: &str = "Couldn't make an invite code.";
+/// The master password typed for an invite code was not this account's --
+/// the route's "Invalid password".
+pub const WRONG_PASSWORD: &str = "That master password isn't right.";
 
 /// What a share ended as: the words the dialog chooses between (mock 6a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2387,6 +2397,120 @@ impl Sharing {
             .map_err(|e| SharingError::Refused(e.to_string()))?;
         let phrase = crate::rest::crypto::fingerprint_phrase(&user_id, &spki, &words).map_err(crypto)?;
         Ok(Fingerprint { phrase, key_sha256: crate::rest::crypto::public_key_sha256_hex(&spki) })
+    }
+}
+
+// ---- invite codes -----------------------------------------------------------------
+
+impl Sharing {
+    /// **A NodeWarden registration code for one pending invitation** (owner
+    /// decision Q3 (b)). Registration on NodeWarden takes an admin's invite
+    /// code, so a person invited before they have an account can do nothing
+    /// until someone gives them one; when the sharer IS the admin, this is
+    /// that code.
+    ///
+    /// # Which invitation
+    ///
+    /// `email`'s row in a FRESH roster of this account's sharing org (spec
+    /// 13: every write reads current state first) -- its id is the ouId the
+    /// route is keyed by. Only a pending invitation qualifies, and anything
+    /// else is refused here, before the password is even hashed: an account
+    /// already there needs no code, an expired invitation has to be renewed
+    /// first (the server would refuse it, and the code would expire with
+    /// it), and an address nobody invited has nothing to attach a code to.
+    ///
+    /// # The password
+    ///
+    /// The route asks for the master password again, as `/api/admin/invites`
+    /// does. The typed password is hashed here with the session's own master
+    /// key -- exactly the hash a login sends -- into a `Zeroizing`, and only
+    /// that hash is sent. The master key's lock is held for the hash alone
+    /// and let go before the request, which [`Self::call`] locks again.
+    ///
+    /// **Why this route and not `/api/admin/invites`** (the brief's): see
+    /// [`sharing_api::registration_invite`] -- a code tied to one invitation
+    /// and expiring with it, refused by the server for anyone who already has
+    /// an account, rather than a free-standing code that outlives the reason
+    /// it was made.
+    ///
+    /// # Errors
+    ///
+    /// Not the administrator ([`NOT_ADMIN`]), no pending invitation for the
+    /// address, a wrong password ([`WRONG_PASSWORD`]), another server refusal
+    /// after [`INVITE_CODE_FAILED`], or the backend's own failure.
+    pub fn mint_invite_code(&self, email: &str, password: &[u8]) -> Result<sharing_api::InviteCode, SharingError> {
+        let _one = self.one_at_a_time();
+        self.require_available()?;
+        let profile = self.profile()?;
+        if !profile.is_server_admin() {
+            return Err(SharingError::Refused(NOT_ADMIN.to_string()));
+        }
+        let email = normalise_email(email);
+        let no_invitation = || SharingError::Refused(format!("There is no invitation waiting for {email}."));
+        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(INVITE_CODE_FAILED.to_string()))?;
+        let Some(org) = self.my_org_id(&profile, &account) else {
+            return Err(no_invitation());
+        };
+        let member = self.fetch_roster(&org)?.into_iter().find(|m| normalise_email(&m.email) == email).ok_or_else(no_invitation)?;
+        if member.status != MemberStatus::Invited {
+            return Err(SharingError::Refused(has_an_account(&email)));
+        }
+        let expired = member
+            .invitation_expires
+            .as_deref()
+            .and_then(crate::send::parse_iso_utc_millis)
+            .is_some_and(|at| at < now_millis());
+        if expired {
+            return Err(SharingError::Refused(invitation_expired(&email)));
+        }
+        let hash = {
+            let state = self.state.upgrade().ok_or(SharingError::Vault(VaultError::Unauthorized))?;
+            let guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+            guard.master_key.password_hash(password)
+        };
+        self.call(|client, auth| {
+            sharing_api::registration_invite(client, &mut auth.session, &org, &member.id, &hash).map_err(|e| match e {
+                // NodeWarden's 403 here is the admin check alone (a
+                // non-manager is a 404): the role was taken away since the
+                // profile read above.
+                RestError::Status(403) => RestError::Rejected { error: String::new(), description: NOT_ADMIN.to_string() },
+                other => other,
+            })
+        })
+        .map_err(|e| invite_code_refused(e, &email))
+    }
+}
+
+/// An address whose row is a member, not an invitation.
+fn has_an_account(email: &str) -> String {
+    format!("{email} already has an account, so they don't need an invite code.")
+}
+
+fn invitation_expired(email: &str) -> String {
+    format!("The invitation to {email} has expired. Re-invite them, then make the code.")
+}
+
+/// **The registration-invite route's refusals, as plain sentences.** The
+/// server's own words are matched lower-cased on a phrase, as
+/// `sharing_api`'s races are, since they are the only thing that tells a
+/// wrong password from a person who registered meanwhile; anything else
+/// keeps them after [`INVITE_CODE_FAILED`] (`or_say`), and a session that
+/// ended keeps its own error.
+fn invite_code_refused(error: SharingError, email: &str) -> SharingError {
+    let SharingError::Refused(said) = &error else {
+        return error.or_say(INVITE_CODE_FAILED);
+    };
+    let lowered = said.to_lowercase();
+    if said == NOT_ADMIN {
+        error
+    } else if lowered.contains("invalid password") {
+        SharingError::Refused(WRONG_PASSWORD.to_string())
+    } else if lowered.contains("already has an account") {
+        SharingError::Refused(has_an_account(email))
+    } else if lowered.contains("expired") {
+        SharingError::Refused(invitation_expired(email))
+    } else {
+        error.or_say(INVITE_CODE_FAILED)
     }
 }
 
@@ -4613,5 +4737,150 @@ mod tests {
         posts.assert();
         puts.assert();
         assert_eq!(set_aside_in(&dir).len(), 1);
+    }
+
+    /// **A pending invitation's expiry reaches the view** through a real
+    /// roster read, and the day it passes the person reads as expired.
+    #[test]
+    fn a_pending_invitation_says_when_it_expires_and_then_that_it_has() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![authentic("c-carol", "carol@example.com"), authentic("c-dan", "dan@example.com")],
+            roster: Vec::new(),
+        });
+        let mut carol = roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"]);
+        carol["invitationExpirationDate"] = serde_json::json!("2999-01-01T00:00:00.000Z");
+        let mut dan = roster_row("inv-dan", None, "dan@example.com", 0, &["c-dan"]);
+        dan["invitationExpirationDate"] = serde_json::json!("2001-01-01T00:00:00.000Z");
+        with_roster(&mut server, &[carol, dan]);
+        engine.refresh(Trigger::Timer).expect("a pass");
+        let view = engine.view(&[]);
+        let carol = view.person("carol@example.com").expect("carol");
+        assert_eq!(carol.state, PersonState::WaitingAccount);
+        assert_eq!(carol.expires_at.as_deref(), Some("2999-01-01T00:00:00.000Z"));
+        assert_eq!(view.person("dan@example.com").map(|p| p.state), Some(PersonState::Expired));
+    }
+
+    /// The fixture account on NodeWarden, owning the sharing org, as the
+    /// server's administrator or not. No files (`SharingSetup::none`), and
+    /// not probed yet: the mint probes, as every write does.
+    fn on_nodewarden_as(admin: bool) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>) {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        let mut profile = sharing_profile(serde_json::json!([sharing_org_row()]));
+        if admin {
+            profile["role"] = serde_json::json!("admin");
+        }
+        server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
+        server
+            .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .expect_at_least(0)
+            .create();
+        (server, backend, engine)
+    }
+
+    /// Carol's pending invitation, expiring far in the future.
+    fn carol_invited() -> serde_json::Value {
+        let mut carol = roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"]);
+        carol["invitationExpirationDate"] = serde_json::json!("2999-01-01T00:00:00.000Z");
+        carol
+    }
+
+    /// NodeWarden's `toInviteResponse`, as the registration-invite route
+    /// answers with it.
+    const MINTED: &str = r#"{"code":"abc","status":"active","createdBy":"user-1","usedBy":null,"createdAt":"2026-09-28T00:00:00.000Z","updatedAt":"2026-09-28T00:00:00.000Z","expiresAt":"2999-01-01T00:00:00.000Z","inviteLink":"https://nw.example/#/register?invite=abc","object":"invite"}"#;
+
+    /// **An administrator mints a registration code for one pending
+    /// invitation** (owner decision Q3 (b)): the invitation is found by email
+    /// in a fresh roster read, the typed password is turned into the server
+    /// hash with the session's own master key, and only the hash leaves the
+    /// process -- to that invitation's own route. Anyone else is refused
+    /// before any write.
+    #[test]
+    fn an_admin_mints_an_invite_code_with_the_password_hash_and_nobody_else_can() {
+        let (mut server, _backend, engine) = on_nodewarden_as(true);
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), carol_invited()]);
+        // The fixture account's master key is PBKDF2 of "master" with one
+        // iteration; its server hash is one more PBKDF2 round keyed by it.
+        let expected = crate::rest::crypto::master_key(b"master", FIXTURE_EMAIL, crate::rest::crypto::Kdf::Pbkdf2 { iterations: 1 })
+            .expect("the fixture master key")
+            .password_hash(b"master");
+        let minted = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/inv-carol/registration-invite").as_str())
+            .match_body(Matcher::Json(serde_json::json!({ "masterPasswordHash": expected.as_str() })))
+            .with_status(201)
+            .with_body(MINTED)
+            .expect(1)
+            .create();
+        let code = engine.mint_invite_code("Carol@Example.com", b"master").expect("minted");
+        minted.assert();
+        assert_eq!(code.code, "abc");
+        assert_eq!(code.link.as_deref(), Some("https://nw.example/#/register?invite=abc"));
+        assert_eq!(code.expires_at.as_deref(), Some("2999-01-01T00:00:00.000Z"));
+        assert!(engine.view(&[]).can_mint_invites);
+
+        let (mut other, _backend, engine) = on_nodewarden_as(false);
+        with_roster(&mut other, &[carol_invited()]);
+        let never = other.mock("POST", Matcher::Any).expect(0).create();
+        assert!(matches!(engine.mint_invite_code("carol@example.com", b"master"), Err(SharingError::Refused(s)) if s == NOT_ADMIN));
+        never.assert();
+        assert!(!engine.view(&[]).can_mint_invites);
+    }
+
+    /// **Only a pending invitation gets a code, and the server's refusals
+    /// read as plain sentences.** Someone with an account, an invitation
+    /// that has expired, and an address nobody invited are refused before
+    /// any write; a wrong password, "already has an account", a lost admin
+    /// role and anything else the route answers each say what happened.
+    #[test]
+    fn only_a_pending_invitation_gets_a_code_and_the_servers_refusals_are_plain() {
+        let (mut server, _backend, engine) = on_nodewarden_as(true);
+        let mut dan = roster_row("inv-dan", None, "dan@example.com", 0, &["c-dan"]);
+        dan["invitationExpirationDate"] = serde_json::json!("2001-01-01T00:00:00.000Z");
+        with_roster(
+            &mut server,
+            &[
+                roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]),
+                roster_row("ou-anna", Some("anna-id"), "anna@example.com", 2, &["c-anna"]),
+                dan,
+                carol_invited(),
+            ],
+        );
+        let route = |ou: &str| format!("/api/organizations/{FIXTURE_ORG}/users/{ou}/registration-invite");
+        let not_anna = server.mock("POST", route("ou-anna").as_str()).expect(0).create();
+        let not_dan = server.mock("POST", route("inv-dan").as_str()).expect(0).create();
+        let refused = |engine: &Sharing, email: &str| match engine.mint_invite_code(email, b"master") {
+            Err(SharingError::Refused(said)) => said,
+            other => panic!("expected a refusal for {email}, got {:?}", other.map(|_| "a code")),
+        };
+        assert_eq!(refused(&engine, "anna@example.com"), "anna@example.com already has an account, so they don't need an invite code.");
+        assert_eq!(refused(&engine, "dan@example.com"), "The invitation to dan@example.com has expired. Re-invite them, then make the code.");
+        assert_eq!(refused(&engine, "zed@example.com"), "There is no invitation waiting for zed@example.com.");
+        not_anna.assert();
+        not_dan.assert();
+
+        let said = |sentence: &str| {
+            serde_json::json!({ "error": sentence, "error_description": sentence, "ErrorModel": { "Message": sentence, "Object": "error" } }).to_string()
+        };
+        let carol = route("inv-carol");
+        server.mock("POST", carol.as_str()).with_status(400).with_body(said("Invalid password")).expect(1).create();
+        server.mock("POST", carol.as_str()).with_status(400).with_body(said("This person already has an account")).expect(1).create();
+        server.mock("POST", carol.as_str()).with_status(400).with_body(said("Invitation has expired")).expect(1).create();
+        server
+            .mock("POST", carol.as_str())
+            .with_status(403)
+            .with_body(said("Only a server administrator can create registration invites"))
+            .expect(1)
+            .create();
+        server.mock("POST", carol.as_str()).with_status(400).with_body(said("Something else")).expect(1).create();
+        assert_eq!(refused(&engine, "carol@example.com"), WRONG_PASSWORD);
+        assert_eq!(refused(&engine, "carol@example.com"), "carol@example.com already has an account, so they don't need an invite code.");
+        assert_eq!(refused(&engine, "carol@example.com"), "The invitation to carol@example.com has expired. Re-invite them, then make the code.");
+        assert_eq!(refused(&engine, "carol@example.com"), NOT_ADMIN);
+        assert_eq!(refused(&engine, "carol@example.com"), format!("{INVITE_CODE_FAILED} The server said: Something else"));
     }
 }

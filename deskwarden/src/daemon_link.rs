@@ -369,6 +369,46 @@ impl SharingClient {
         let data = self.post("/sharing/person/fingerprint", serde_json::json!({ "email": email }))?;
         serde_json::from_value(data).map_err(|_| "The vault service answered something unreadable.".to_string())
     }
+
+    /// `POST /sharing/invite-code` -- a registration code for `email`'s
+    /// pending invitation, minted by NodeWarden's administrator. The daemon
+    /// hashes `password` with the session's master key and sends only the
+    /// hash.
+    ///
+    /// **Not through [`Self::post`]**, whose `serde_json::Value` would hold
+    /// its own copy of the password and drop it unwiped, and whose
+    /// `send_json` serialises into a buffer nobody wipes either. The body is
+    /// written from borrowed fields straight into a `Zeroizing` buffer sized
+    /// up front -- a `Vec` that grew would leave its earlier allocations
+    /// behind unwiped -- and sent as bytes. What `ureq` copies it into on the
+    /// way to the socket this crate does not own and cannot wipe, the limit
+    /// `http_agent::bounded_total_with_bearer` states for the grant. The
+    /// caller's own `password` is the caller's to wipe. The code that comes
+    /// back is a credential for registering; see
+    /// [`crate::rest::sharing_api::InviteCode`]'s `Debug`.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's.
+    pub fn invite_code(&self, email: &str, password: &str) -> Result<crate::rest::sharing_api::InviteCode, String> {
+        #[derive(serde::Serialize)]
+        struct Body<'a> {
+            email: &'a str,
+            password: &'a str,
+        }
+        // JSON escapes a byte into at most six (`\u00XX`); the rest is the
+        // braces, the keys and the quotes.
+        let mut body = Zeroizing::new(Vec::with_capacity(6 * (email.len() + password.len()) + 64));
+        serde_json::to_writer(&mut *body, &Body { email, password })
+            .map_err(|_| "The invite code request could not be written.".to_string())?;
+        let data = sharing_answer(
+            self.agent
+                .post(&format!("{}/sharing/invite-code", self.base_url))
+                .set("Content-Type", "application/json")
+                .send_bytes(&body),
+        )?;
+        serde_json::from_value(data).map_err(|_| "The vault service answered something unreadable.".to_string())
+    }
 }
 
 /// A sharing route's answer: `data` on success, the daemon's `message` -- the
@@ -616,6 +656,34 @@ mod tests {
             .create();
         assert_eq!(client.reinvite("anna@example.com"), Ok(crate::rest::sharing::ShareResult::WaitingAccount));
         renewed.assert();
+    }
+
+    /// **`invite_code` names the person and carries the password in the
+    /// body** -- the one route whose body holds the master password, to the
+    /// loopback daemon that hashes it -- and reads the code back; a refusal
+    /// is the daemon's sentence.
+    #[test]
+    fn invite_code_sends_the_person_and_the_password_in_the_body_and_reads_the_code_back() {
+        let mut server = crate::test_http::server();
+        let client = SharingClient::new(&server.url(), &Zeroizing::new(GRANT.to_string()));
+        let minted = server
+            .mock("POST", "/sharing/invite-code")
+            .match_header("Content-Type", "application/json")
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({ "email": "carol@example.com", "password": "pa\"ss\\word" })))
+            .with_body(r#"{"success":true,"data":{"code":"abc","link":"https://nw.example/#/register?invite=abc","expiresAt":"2026-10-04T00:00:00.000Z"}}"#)
+            .expect(1)
+            .create();
+        let code = client.invite_code("carol@example.com", "pa\"ss\\word").expect("a code");
+        minted.assert();
+        assert_eq!(code.code, "abc");
+        assert_eq!(code.link.as_deref(), Some("https://nw.example/#/register?invite=abc"));
+        assert_eq!(code.expires_at.as_deref(), Some("2026-10-04T00:00:00.000Z"));
+        server
+            .mock("POST", "/sharing/invite-code")
+            .with_status(400)
+            .with_body(serde_json::json!({ "success": false, "message": crate::rest::sharing::NOT_ADMIN }).to_string())
+            .create();
+        assert_eq!(client.invite_code("carol@example.com", "master").err().as_deref(), Some(crate::rest::sharing::NOT_ADMIN));
     }
 
     /// **What the daemon writes is what a window reads**, and nothing else is.

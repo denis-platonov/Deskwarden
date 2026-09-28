@@ -331,6 +331,7 @@ impl VaultApi {
             ("POST", ["sharing", "person", "reinvite"]) => self.reinvite_person(request.body),
             ("POST", ["sharing", "person", "confirm"]) => self.confirm_person(request.body),
             ("POST", ["sharing", "person", "fingerprint"]) => self.person_fingerprint(request.body),
+            ("POST", ["sharing", "invite-code"]) => self.invite_code(request.body),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
@@ -636,6 +637,36 @@ impl VaultApi {
         }
     }
 
+    /// `POST /sharing/invite-code {email, password}` -> `{code, link,
+    /// expiresAt}`: NodeWarden's administrator mints a registration code for
+    /// one pending invitation (owner decision Q3 (b)). Neither the vault nor
+    /// the sharing view changes, so nothing is announced.
+    ///
+    /// **The one daemon body that carries the master password.** It is read
+    /// straight into [`InviteCodeBody`]'s `Zeroizing` -- not through a
+    /// `serde_json::Value`, whose own `String` copy would be dropped unwiped
+    /// -- and wiped when this returns; the host's buffer it came from is a
+    /// `Zeroizing` too (`vault_host::serve`). The engine sends only its hash
+    /// (decision 2 of the sharing plan), and nothing here logs either. Like
+    /// every route it is answered only to a live grant, on loopback.
+    fn invite_code(&self, body: &[u8]) -> ApiResponse {
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let asked: Option<InviteCodeBody> = serde_json::from_slice(body).ok();
+        let Some(asked) = asked.filter(|asked| !asked.email.trim().is_empty()) else {
+            return ApiResponse::refused(400, "Say who the code is for.");
+        };
+        if asked.password.is_empty() {
+            return ApiResponse::refused(400, "Type your master password.");
+        }
+        match engine.mint_invite_code(&asked.email, asked.password.as_bytes()) {
+            Ok(code) => ApiResponse::ok(to_value(&code)),
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
     /// Whether the ten-minute timer has anything to do.
     #[must_use]
     pub fn sharing_wants_timer(&self) -> bool {
@@ -757,6 +788,16 @@ fn email_in(body: &[u8]) -> Option<String> {
         .as_str()
         .map(str::to_string)
         .filter(|email| !email.trim().is_empty())
+}
+
+/// `POST /sharing/invite-code`'s body. **No `Debug`**: it holds the master
+/// password. A missing `password` reads as empty, so the route can say which
+/// half is missing; a missing `email` fails the read.
+#[derive(serde::Deserialize)]
+struct InviteCodeBody {
+    email: String,
+    #[serde(default)]
+    password: zeroize::Zeroizing<String>,
 }
 
 /// A body's `keySha256`: exactly 64 hex digits, the form
@@ -1092,5 +1133,69 @@ pub(crate) mod tests {
     fn a_wrong_method_on_a_sharing_route_is_refused_as_a_method() {
         let (_server, _cache, api, token) = a_daemon();
         assert_eq!(ask(&api, "DELETE", "/sharing", Some(&token), "").status, 405);
+        assert_eq!(ask(&api, "GET", "/sharing/invite-code", Some(&token), "").status, 405);
+    }
+
+    /// **`POST /sharing/invite-code {email, password}`**: a body without
+    /// either is refused before the engine is asked; a whole one is hashed
+    /// by the engine, and only the hash reaches the server -- the password
+    /// itself is nowhere in what the server was sent.
+    #[test]
+    fn an_invite_code_route_sends_only_the_hash_and_answers_the_code() {
+        let (mut server, cache, api, token) = a_daemon();
+        cache.bridge().sharing().expect("a REST daemon has an engine").set_up(crate::rest::sharing::SharingSetup::none());
+        let nothing = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
+        for (body, sentence) in [
+            (r#"{"email":"carol@example.com"}"#, "Type your master password."),
+            (r#"{"email":"carol@example.com","password":""}"#, "Type your master password."),
+            (r#"{"password":"master"}"#, "Say who the code is for."),
+            ("not json", "Say who the code is for."),
+        ] {
+            let answer = ask(&api, "POST", "/sharing/invite-code", Some(&token), body);
+            assert_eq!(answer.status, 400, "{body}");
+            let said: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
+            assert_eq!(said["message"], sentence, "{body}");
+        }
+        nothing.assert();
+
+        let mut profile = crate::rest::backend::tests::sharing_profile(serde_json::json!([crate::rest::backend::tests::sharing_org_row()]));
+        profile["role"] = serde_json::json!("admin");
+        server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
+        server
+            .mock("GET", "/api/users/user-1/public-key")
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .expect_at_least(0)
+            .create();
+        let mut carol = crate::rest::backend::tests::roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"]);
+        carol["invitationExpirationDate"] = serde_json::json!("2999-01-01T00:00:00.000Z");
+        server
+            .mock("GET", "/api/organizations/org1/users?includeCollections=true")
+            .with_body(serde_json::json!({ "data": [carol] }).to_string())
+            .expect_at_least(0)
+            .create();
+        let sent = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = Arc::clone(&sent);
+        let minted = server
+            .mock("POST", "/api/organizations/org1/users/inv-carol/registration-invite")
+            .match_request(move |request| {
+                *seen.lock().expect("the capture") = request.body().to_vec();
+                true
+            })
+            .with_status(201)
+            .with_body(r#"{"code":"abc","expiresAt":"2999-01-01T00:00:00.000Z","inviteLink":"https://nw.example/#/register?invite=abc","object":"invite"}"#)
+            .expect(1)
+            .create();
+        let answer = ask(&api, "POST", "/sharing/invite-code", Some(&token), r#"{"email":"carol@example.com","password":"master"}"#);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        minted.assert();
+        let body: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
+        assert_eq!(body["data"]["code"], "abc");
+        assert_eq!(body["data"]["link"], "https://nw.example/#/register?invite=abc");
+        assert_eq!(body["data"]["expiresAt"], "2999-01-01T00:00:00.000Z");
+        let sent: serde_json::Value = serde_json::from_slice(&sent.lock().expect("the capture")).expect("json");
+        let hash = sent["masterPasswordHash"].as_str().expect("a hash was sent");
+        assert!(!hash.is_empty() && hash != "master", "{sent}");
+        assert_eq!(sent.as_object().map(serde_json::Map::len), Some(1), "only the hash is sent: {sent}");
     }
 }
