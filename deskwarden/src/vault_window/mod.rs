@@ -3327,6 +3327,27 @@ pub fn build_frame_with_search(
         // the detail pane below reads too, and a shadowing local here would
         // hand it the wrong type.
         let directory = crate::rest::organizations::current();
+        // **Design 6c's person shares, built once per frame, here** -- so the
+        // rail's Sent badge and the Sent list count ONE list: the badge is
+        // `share_rows.len()`, the list draws these rows. It owns its strings,
+        // so it borrows nothing the frame writes to later.
+        //
+        // A shared record is looked for in the live vault, then the archive
+        // and the trash: a share of an archived record is still live. Those
+        // two lists are fetched only once the user opens them, so until then
+        // such a share is neither listed nor counted -- one answer on both,
+        // rather than a badge counting a row the column cannot draw.
+        let share_rows = share_ui::share_rows(
+            sharing.view.as_ref(),
+            &[
+                items.as_slice(),
+                archive_list.items.as_deref().unwrap_or_default(),
+                trash_list.items.as_deref().unwrap_or_default(),
+            ],
+            &sent_history,
+            crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
+            &crate::local_time::SystemZone,
+        );
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -3382,7 +3403,7 @@ pub fn build_frame_with_search(
                     // Personal sharing's half of the SHARING rows, off the
                     // daemon's view the window holds: 0, 0 and no dot until
                     // it has one, and in a window with no line to the daemon.
-                    shared_records: sharing.sent_pairs(),
+                    shared_records: share_rows.len(),
                     received_records: sharing.received_count(),
                     invitation_waiting: sharing.has_incoming(),
                 };
@@ -4404,19 +4425,14 @@ pub fn build_frame_with_search(
              Refresh, Delete, Cancel and the confirmation -- is inert. See \
              `send_ui::SendUiVerdict`"
         );
-        // **Design 6c**: the Sent list's person shares, one row per record and
-        // person, and the Stop sharing two-step on a share's own detail. Built
-        // here, above the applier, and read back after it -- it borrows only
-        // this frame's `share_rows`, so `sharing` is free to change once the
-        // pane has drawn. It is not the Sends model (that is written inline in
-        // the panel, and pinned there): what it gates is sharing's own half.
-        let share_rows = share_ui::share_rows(
-            sharing.view.as_ref(),
-            &items,
-            &sent_history,
-            crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
-            &crate::local_time::SystemZone,
-        );
+        // **Design 6c**: the Sent list's person shares (`share_rows`, built
+        // above the rail), and the Stop sharing two-step on a share's own
+        // detail. Built here, above the applier, and read back after it -- it
+        // borrows only this frame's `share_rows`, so `sharing` is free to
+        // change once the pane has drawn. It is not the Sends model (that is
+        // written inline in the panel, and pinned there): what it gates is
+        // sharing's own half.
+        //
         // The record whose share is on the Sent detail, if one is. On the Sent
         // screen a write's failure about ANY other record -- a stop asked on
         // the SHARING card before the user came here, or on another share --
@@ -6564,12 +6580,27 @@ pub fn build_frame_with_search(
         // **`Open record`**: leave the Sent screen and show the item the Send
         // was made from, as a click on its row in the list would -- when it is
         // still in the vault. One that has gone since leaves the screen as it is.
+        //
+        // A person share can be of an ARCHIVED or trashed record (`share_rows`
+        // looks there too), so the record is opened under the list that holds
+        // it -- the item pane resolves a selection against the filter's own
+        // list, and under All an archived id would be "Select an item.".
         if let Some(item_id) = open_record {
-            if items.iter().any(|item| item.id == item_id) {
+            let holds = |list: Option<&[VaultItem]>| list.is_some_and(|l| l.iter().any(|item| item.id == item_id));
+            let home = if holds(Some(items.as_slice())) {
+                Some(SidebarFilter::All)
+            } else if holds(archive_list.items.as_deref()) {
+                Some(SidebarFilter::Archive)
+            } else if holds(trash_list.items.as_deref()) {
+                Some(SidebarFilter::Trash)
+            } else {
+                None
+            };
+            if let Some(home) = home {
                 sends_selected = false;
                 received_selected = false;
                 health_selected = false;
-                filter = SidebarFilter::All;
+                filter = home;
                 selected_id = Some(item_id);
                 detail_dismissed = false;
                 mode = DetailMode::Read;
@@ -37750,6 +37781,103 @@ mod send_delete_wiring {
                  `let` of it substitutes an inert action"
             );
         }
+    }
+
+    /// **What the Sent detail asked of sharing is applied after the pane that
+    /// asked it, unconditionally, and a confirmed stop goes out through
+    /// `share_ui::request`** (design 6c).
+    ///
+    /// `people_rows.asked` is the Sends pane's second output: the verdict
+    /// carries the Sends' one action to `apply_send_action`, and this carries
+    /// the share's Stop sharing two-step. The same defects that pinned the
+    /// verdict apply to it -- read BEFORE the pane has drawn, it is always
+    /// `None` and Stop sharing is a button that does nothing; read inside an
+    /// `if`, it does something only in the states that `if` admits; and a
+    /// stop sent any way but `request` skips its one-write-at-a-time slot,
+    /// its refusal sentences and the `stopping` spinner the detail shows. So:
+    ///
+    /// * the `match people_rows.asked.take()` is written once, AFTER the
+    ///   applier's pinned tail, at the frame closure's own top level (the
+    ///   depth `the_frame_applies_the_sends_action_unconditionally` measures
+    ///   the applier at);
+    /// * nothing else reads `people_rows.asked`;
+    /// * its `ConfirmStop` arm hands `share_ui::request` a
+    ///   `SharingCall::Stop`, the call the SHARING card sends.
+    #[test]
+    fn the_sent_details_stop_is_applied_after_the_pane_and_sent_through_request() {
+        let code = code_braces_only(production());
+        let squashed = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+        let flat = squashed(&code);
+
+        let tail = squashed(concat!(
+            "}) .inner .into_", "action(), &mut send_delete, &mut send_fetch, \
+             ui.ctx(), &send_delete_tx, &session_token, spawn_send_delete, \
+             copy_send_url, );"
+        ));
+        let asked = concat!("match people_rows.asked.", "take() {");
+        assert_eq!(flat.matches(&tail).count(), 1, "control: the applier's pinned tail is not in the frame once");
+        assert_eq!(
+            flat.matches(asked).count(),
+            1,
+            "{asked:?} is written {} times in the frame, not once",
+            flat.matches(asked).count()
+        );
+        assert_eq!(
+            flat.matches(concat!("people_rows.", "asked")).count(),
+            1,
+            "`people_rows.asked` is read somewhere besides the one `take()` after the applier -- \
+             a second reader can consume the Sent detail's press before the stop is sent"
+        );
+        let tail_at = flat.find(&tail).expect("counted above");
+        let asked_at = flat.find(asked).expect("counted above");
+        assert!(
+            asked_at > tail_at,
+            "the Sent detail's press is read BEFORE `apply_send_action` -- that is, before the \
+             pane that sets it has drawn, so it is always `None` and Stop sharing on a share's \
+             detail does nothing"
+        );
+
+        let sibling = concat!("send_fetch.note_", "screen(on_sends);");
+        assert_eq!(code.matches(sibling).count(), 1, "control: the depth anchor is not in the frame once");
+        assert_eq!(
+            depth_of(&code, "match people_rows.asked"),
+            depth_of(&code, sibling),
+            "the Sent detail's press is read inside an `if`, `match` or block -- it reaches the \
+             window only in the states that gate admits"
+        );
+
+        // The match's own body, brace-matched from its opening brace.
+        let open = asked_at + asked.len() - 1;
+        let mut depth = 0i32;
+        let mut end = open;
+        for (at, ch) in flat[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                end = open + at;
+                break;
+            }
+        }
+        let body = &flat[open..=end];
+        let confirm = concat!("share_ui::PeopleAsk::Confirm", "Stop(key)");
+        let confirm_at = body.find(confirm).unwrap_or_else(|| panic!("no {confirm:?} arm in {body:?}"));
+        let arm = &body[confirm_at..];
+        let arm = &arm[..arm.find(concat!("share_ui::PeopleAsk::Cancel", "Stop")).unwrap_or(arm.len())];
+        let arm = &arm[..arm.find("None =>").unwrap_or(arm.len())];
+        let request = arm.find(concat!("share_ui::", "request(")).unwrap_or_else(|| {
+            panic!("the ConfirmStop arm does not go through `share_ui::request`: {arm:?}")
+        });
+        assert!(
+            arm[request..].contains(concat!("share_ui::SharingCall::", "Stop { item_id, email }")),
+            "the ConfirmStop arm's request is not the card's `SharingCall::Stop`: {arm:?}"
+        );
+        assert!(
+            !arm.contains(concat!("spawn_sharing_", "call(")),
+            "the ConfirmStop arm starts the stop itself, around `request`'s slot: {arm:?}"
+        );
     }
 
     // ==================================================================

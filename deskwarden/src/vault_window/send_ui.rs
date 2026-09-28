@@ -94,6 +94,11 @@ pub const SCOPE_SUBTEXT: &str =
     "A Send is made from a record: open it and choose Send. Sends made in other Bitwarden apps \
      are listed here too.";
 
+/// [`SCOPE_SUBTEXT`] once person shares are in the list: design 6c's `.lnote`,
+/// word for word.
+const SHARES_SUBTEXT: &str = "Sends and shares are both made from a record: open it and choose Send \
+     (a link) or Share (a person). Sends made in other Bitwarden apps are listed here too.";
+
 /// The list's sort, drawn where design 5b draws it: the server lists Sends
 /// newest first, and so does this column.
 pub const NEWEST_LABEL: &str = "Newest";
@@ -1399,6 +1404,10 @@ pub const RECEIVED_EMPTY_DETAIL: &str =
 /// not know" and "there is nothing" look alike.
 pub const NOTHING_PICKED: &str = "Pick a Send to see its link, its views and its dates.";
 pub const NOTHING_PICKED_RECEIVED: &str = "Pick a row to see when it arrived and where it went.";
+/// [`NOTHING_PICKED`] once person shares are in the list, which it would
+/// otherwise leave out. 6c draws no empty pane, so these words are this
+/// app's, in [`NOTHING_PICKED`]'s shape.
+const NOTHING_PICKED_WITH_SHARES: &str = "Pick a Send to see its link, or a share to see who has the record.";
 
 /// Which of the two SHARING screens this pane is drawing, and -- for the
 /// account's own Sends -- which of design 5b's sub-filters is in force.
@@ -1742,12 +1751,18 @@ fn draw_send_list(
     // the strip can say it. `None` where the count is not a fact this app has
     // -- an unanswered or failed fetch -- which is the same rule the rail's
     // badge follows, on the same list.
+    //
+    // **With the Sends unknown and shares listed, the shares are counted** --
+    // the rail's own partial count (`sidebar`'s Sent row: unknown Sends with
+    // no shares stay unknown, unknown Sends with shares count the shares),
+    // so the strip and the badge beside it say one number.
     let counted: Option<usize> = match (view, state) {
         (SendView::Received(rows), _) => Some(rows.len()),
         (SendView::Mine(scope), SendPaneState::Rows(rows)) => {
             Some(rows_in_scope(rows, *scope).len() + shares.len())
         }
         (SendView::Mine(_), SendPaneState::Empty) => Some(shares.len()),
+        (SendView::Mine(_), _) if !shares.is_empty() => Some(shares.len()),
         (SendView::Mine(_), _) => None,
     };
 
@@ -1872,8 +1887,12 @@ fn draw_send_list(
     // harness that draws one frame. Measuring first is this file's standing
     // discipline for exactly this class of bug.
     let note_font = egui::FontId::new(NOTE_PX, egui::FontFamily::Proportional);
+    //
+    // Once a person share is listed, 6c's own note replaces 5b's: it names
+    // both things the list holds and where each is made.
+    let gloss = if shares.is_empty() { view.gloss() } else { SHARES_SUBTEXT };
     let mut notes: Vec<std::sync::Arc<egui::Galley>> = vec![ui.painter().layout(
-        view.gloss().to_string(),
+        gloss.to_string(),
         note_font.clone(),
         theme::TEXT_GHOST,
         text_width,
@@ -1946,6 +1965,38 @@ fn draw_send_list(
                     });
             });
     };
+    // **The shares, above a Sends fetch that has not answered or has
+    // failed.** They come from the daemon's `/sharing` view by a route of
+    // their own, so a Sends list still loading -- which it is on EVERY visit,
+    // since leaving the screen drops the answer -- or one that failed says
+    // nothing about them, and hiding them would contradict both the rail
+    // (which counts them while the Sends are unknown) and the detail pane
+    // (which keeps showing a picked one). The rows are `rows_area`'s, in the
+    // same frame at the same place; what differs is that the scroll area
+    // shrinks to them and stops [`LIST_STATUS_ROOM`] short of the column's
+    // foot, so the spinner or the failure under them is never pushed off it.
+    let shares_above = |ui: &mut egui::Ui, body: &mut dyn FnMut(&mut egui::Ui)| {
+        egui::Frame::new()
+            .inner_margin(Margin { left: LIST_PAD as i8, right: 0, top: 0, bottom: 0 })
+            .show(ui, |ui| {
+                let content = shares.len() as f32 * ROW_HEIGHT
+                    + shares.len().saturating_sub(1) as f32 * LIST_ROW_GAP;
+                let room = (ui.available_height() - LIST_STATUS_ROOM).max(ROW_HEIGHT);
+                theme::scrollbar_in_gutter(ui, LIST_PAD);
+                if content <= room {
+                    theme::hide_scrollbar(ui);
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("send-list-shares")
+                    .auto_shrink([false, true])
+                    .max_height(room)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = LIST_ROW_GAP;
+                        ui.add_space(0.0);
+                        body(ui);
+                    });
+            });
+    };
     let headline = |ui: &mut egui::Ui, head: &str, detail: &str, colour: egui::Color32| {
         ui.add_space(LIST_PAD);
         ui.indent("send-empty", |ui| {
@@ -1976,6 +2027,13 @@ fn draw_send_list(
         }
         SendView::Mine(scope) => match state {
             SendPaneState::Loading => {
+                if !shares.is_empty() {
+                    shares_above(ui, &mut |ui| {
+                        for share in shares {
+                            draw_share_row(ui, share, row_width, selected, records);
+                        }
+                    });
+                }
                 ui.add_space(LIST_PAD);
                 ui.indent("send-loading", |ui| {
                     ui.horizontal(|ui| {
@@ -1999,8 +2057,17 @@ fn draw_send_list(
             }
             SendPaneState::Empty => headline(ui, EMPTY_HEADLINE, EMPTY_DETAIL, theme::INK),
             SendPaneState::Failed { message, ambiguous } => {
-                // A failure draws NO row area at all, and never reuses the
-                // empty state's words. Both are asserted over painted glyphs.
+                // A failure draws NO Sends row area at all, and never reuses
+                // the empty state's words. Both are asserted over painted
+                // glyphs. The shares above it are not the failed fetch's --
+                // see `shares_above`.
+                if !shares.is_empty() {
+                    shares_above(ui, &mut |ui| {
+                        for share in shares {
+                            draw_share_row(ui, share, row_width, selected, records);
+                        }
+                    });
+                }
                 ui.add_space(LIST_PAD);
                 ui.indent("send-failed", |ui| {
                     ui.set_width(text_width);
@@ -2072,6 +2139,12 @@ const STRIP_GAP: f32 = 10.0;
 const LIST_PAD: f32 = super::item_list::LIST_PADDING;
 /// The `gap: 6px` between two rows -- the records list's.
 const LIST_ROW_GAP: f32 = super::item_list::ROW_GAP;
+/// What the shares listed above a loading or failed Sends fetch leave free
+/// at the column's foot: the failure block at its tallest -- the headline, a
+/// two-line message, the ambiguous line and Try again, with their gaps --
+/// plus the pad above it. More shares than leave that room free are
+/// scrolled, rather than pushing the spinner or Try again off the column.
+const LIST_STATUS_ROOM: f32 = 160.0;
 /// The list column's footnote: the rail's own footer size, because it is the
 /// same kind of line in the same kind of place. See the footnote's own
 /// argument in [`draw_send_list`].
@@ -2686,7 +2759,8 @@ fn draw_send_detail(
                 // that a blank column beside a FULL list reads as a load that
                 // failed, and that case is unchanged.
                 None if in_scope.is_empty() && shares.is_empty() => {}
-                None => detail_prompt(ui, NOTHING_PICKED),
+                None if shares.is_empty() => detail_prompt(ui, NOTHING_PICKED),
+                None => detail_prompt(ui, NOTHING_PICKED_WITH_SHARES),
                 Some(row) => action = draw_send_card(ui, row, delete, records),
             }
         }
@@ -9730,7 +9804,12 @@ mod paint_tests {
         assert_eq!(list_rows(&painted).len(), 1, "an account with no Sends still lists its share");
         assert!(!painted.has(EMPTY_HEADLINE), "{:?}", painted.text);
         assert!(painted.has("1 item"), "{:?}", painted.text);
-        assert_eq!(painted.in_detail(NOTHING_PICKED), 1, "a list to pick from, and nothing picked");
+        assert_eq!(
+            painted.in_detail(NOTHING_PICKED_WITH_SHARES),
+            1,
+            "a list to pick from, and nothing picked -- in words that name the shares"
+        );
+        assert!(painted.has(SHARES_SUBTEXT), "6c's note under a list with a share: {:?}", painted.text);
 
         // A sub-row is a Send state, and a share has none.
         let ctx = egui::Context::default();
@@ -9759,6 +9838,39 @@ mod paint_tests {
             collect(&clipped.shape, &mut painted);
         }
         assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 0, "a share on a Send-state sub-row");
+    }
+
+    /// **The shares do not wait for the Sends.** They come from the daemon's
+    /// view, not from `bw send list`, so a Sends fetch still out -- which it
+    /// is on every visit -- or one that failed lists them all the same,
+    /// above its spinner or its failure, and the strip counts them as the
+    /// rail does. With no share, both states are what they always were.
+    #[test]
+    fn shares_are_listed_while_the_sends_load_and_after_they_fail() {
+        let record = a_record("rec-1", "Acme VPN");
+        let records = std::slice::from_ref(&record);
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
+        let failed = SendPaneState::Failed { message: "bw is not signed in.".to_string(), ambiguous: true };
+        for size in [egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0), min_pane_size()] {
+            for (state, status) in [(&SendPaneState::Loading, LOADING_LABEL), (&failed, TRY_AGAIN_LABEL)] {
+                let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
+                let (painted, _) = paint_sharing(state, &mut people, &mut None, records, size, Vec::new());
+                let rows = list_rows(&painted);
+                assert_eq!(rows.len(), 1, "{status:?}: the share is not listed: {:?}", painted.text);
+                let words = painted.rect_of(status).unwrap_or_else(|| panic!("no {status:?}: {:?}", painted.text));
+                assert!(words.top() > rows[0].bottom(), "{status:?} is not under the share");
+                assert!(words.bottom() <= size.y, "{status:?} is pushed off a {}pt column", size.y);
+                assert!(painted.has("1 item"), "{status:?}: the strip does not count the share: {:?}", painted.text);
+
+                // The control: the same state with no share lists no row and
+                // counts nothing it does not know.
+                let mut none = PeopleRows::none();
+                let (bare, _) = paint_sharing(state, &mut none, &mut None, records, size, Vec::new());
+                assert!(list_rows(&bare).is_empty());
+                assert!(bare.has(status));
+                assert!(!bare.has("1 item"));
+            }
+        }
     }
 }
 

@@ -369,12 +369,6 @@ impl SharingPane {
         self.stale = false;
     }
 
-    /// Sent's count of person shares: one per (record, person), as the list
-    /// draws them (mock 6c).
-    pub(crate) fn sent_pairs(&self) -> usize {
-        self.view.as_ref().map_or(0, |v| v.records.iter().map(|r| r.people.len()).sum())
-    }
-
     pub(crate) fn received_count(&self) -> usize {
         self.view.as_ref().map_or(0, |v| v.received.len())
     }
@@ -2302,13 +2296,22 @@ pub(crate) fn parse_share_key(key: &str) -> Option<(String, String)> {
 /// local record of it, since a share has no server timestamp (plan decision
 /// 12). A share this PC has no record of sorts last, by record name.
 ///
-/// A record the vault does not hold (the view is a frame older than a sync,
-/// or the record is in the trash) is left out: its name would be the only
-/// thing to show, and the vault is where a name comes from. A person the
-/// view lists on a record twice is one row -- the key is the row's identity.
+/// **`sources` are the lists the record is looked for in, in order**: the
+/// live vault, then the archive and the trash where the window has them. A
+/// share of an ARCHIVED record is still live -- the person still has it --
+/// so it must not drop out of Sent because the record left the live list.
+///
+/// A record none of them holds is left out: its name would be the only
+/// thing to show, and the vault is where a name comes from. That covers a
+/// view a frame older than a sync, and an archived or trashed record while
+/// the window has not fetched that list yet (the archive and the trash are
+/// fetched when first opened). The rail's Sent badge counts THIS list
+/// (`vault_window::mod` hands it `share_rows.len()`), so the badge and the
+/// column say one number whichever it is. A person the view lists on a
+/// record twice is one row -- the key is the row's identity.
 pub(crate) fn share_rows(
     view: Option<&SharingView>,
-    items: &[VaultItem],
+    sources: &[&[VaultItem]],
     history: &SentHistory,
     now_ms: i64,
     zone: &dyn LocalOffset,
@@ -2318,7 +2321,7 @@ pub(crate) fn share_rows(
     };
     let mut rows: Vec<(Option<i64>, ShareRow)> = Vec::new();
     for record in &view.records {
-        let Some(item) = items.iter().find(|i| i.id == record.item_id) else {
+        let Some(item) = sources.iter().find_map(|list| list.iter().find(|i| i.id == record.item_id)) else {
             continue;
         };
         for email in &record.people {
@@ -2494,7 +2497,7 @@ mod tests {
         pane.begin_view();
         assert!(!pane.wants_view(0.0), "one question at a time");
         apply(&mut pane, SharingReport::View(Ok(view(vec![("anna@x.io", PersonState::Shared, None)], vec![("r1", vec!["anna@x.io"])]))), 0.0);
-        assert_eq!(pane.sent_pairs(), 1);
+        assert!(pane.view.as_ref().is_some_and(|v| v.records.len() == 1));
         // A dialog whose share is out -- the only kind an answer lands in
         // (`an_answer_does_not_land_in_a_dialog_that_did_not_ask`).
         let asked = || ShareDialog { in_flight: true, ..ShareDialog::opening("r1", "Acme VPN") };
@@ -2650,12 +2653,14 @@ mod tests {
         assert_eq!(pane.notice.as_deref(), Some(PANICKED));
     }
 
-    /// The rail's numbers: one per (record, person) in Sent, one per record
-    /// in Shared with me, and the dot while an invitation waits.
+    /// The rail's numbers: one per record in Shared with me, and the dot
+    /// while an invitation waits. (Sent's share count is `share_rows`'s
+    /// length -- the list's own rows -- and is held by
+    /// `sent_lists_one_row_for_each_record_and_person`.)
     #[test]
     fn the_rail_counts_come_from_the_view() {
         let mut pane = SharingPane::default();
-        assert_eq!((pane.sent_pairs(), pane.received_count(), pane.has_incoming()), (0, 0, false));
+        assert_eq!((pane.received_count(), pane.has_incoming()), (0, false));
         let mut v = view(
             vec![("anna@x.io", PersonState::Shared, None), ("bob@x.io", PersonState::WaitingAccept, None)],
             vec![("r1", vec!["anna@x.io", "bob@x.io"]), ("r2", vec!["anna@x.io"])],
@@ -2663,7 +2668,7 @@ mod tests {
         v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "t1".into(), from: "d@x.io".into() });
         v.incoming.push(crate::rest::sharing::IncomingEntry { id: "i1".into(), from: "e@x.io".into(), expires_at: None });
         pane.view = Some(v);
-        assert_eq!((pane.sent_pairs(), pane.received_count(), pane.has_incoming()), (3, 1, true));
+        assert_eq!((pane.received_count(), pane.has_incoming()), (1, true));
         pane.stop_confirming = Some(("r1".into(), "bob@x.io".into()));
         assert_eq!(pane.confirming_for("r1"), Some("bob@x.io"));
         assert_eq!(pane.confirming_for("r2"), None);
@@ -3604,7 +3609,7 @@ mod tests {
             sent_at_unix_millis: NOW,
             ..Default::default()
         });
-        let rows = share_rows(Some(&v), &items, &history, NOW, &crate::local_time::FixedOffset(0));
+        let rows = share_rows(Some(&v), &[&items], &history, NOW, &crate::local_time::FixedOffset(0));
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].item_id, "r2", "the newest share first");
         assert_eq!(rows[0].subtitle, "to anna@x.io \u{b7} Shared");
@@ -3614,7 +3619,7 @@ mod tests {
         assert_eq!(rows[2].since, None, "no local record, so no date and the end of the list");
         assert_eq!(parse_share_key(&rows[0].key), Some(("r2".to_string(), "anna@x.io".to_string())));
         assert_eq!(parse_share_key("send-id"), None, "a Send's id is not a share key");
-        assert_eq!(share_rows(None, &items, &history, NOW, &crate::local_time::FixedOffset(0)), Vec::new());
+        assert_eq!(share_rows(None, &[&items], &history, NOW, &crate::local_time::FixedOffset(0)), Vec::new());
     }
 
     /// **A record the vault does not hold is not listed**, and a person the
@@ -3626,9 +3631,16 @@ mod tests {
             vec![("r1", vec!["anna@x.io", "Anna@X.io"]), ("gone", vec!["anna@x.io"])],
         );
         let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "r1", "name": "Acme VPN" })).expect("item")];
-        let rows = share_rows(Some(&v), &items, &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
+        let rows = share_rows(Some(&v), &[&items], &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].name, "Acme VPN", "the vault's name");
         assert_eq!(rows[0].pill(), theme::SharePillKind::Shared);
+
+        // An ARCHIVED record's share is still live: found in the archive, it
+        // is listed -- the live list is looked in first.
+        let archived: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "gone", "name": "Old VPN" })).expect("item")];
+        let rows = share_rows(Some(&v), &[&items, &archived], &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.iter().any(|r| r.item_id == "gone" && r.name == "Old VPN"));
     }
 }
