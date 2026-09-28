@@ -474,6 +474,8 @@ struct Inbox {
     /// ONE refetch, and the time is all [`HubListener::sends_changed`] needs
     /// to wait the burst out.
     sends: Option<Instant>,
+    /// When the daemon last said the sharing view changed, if not taken yet -- a time, for `sends`'s reason.
+    sharing: Option<Instant>,
 }
 
 impl Shared {
@@ -485,6 +487,10 @@ impl Shared {
 
     fn notice_sends(&self) {
         self.inbox.lock().unwrap_or_else(PoisonError::into_inner).sends = Some(Instant::now());
+    }
+
+    fn notice_sharing(&self) {
+        self.inbox.lock().unwrap_or_else(PoisonError::into_inner).sharing = Some(Instant::now());
     }
 }
 
@@ -605,6 +611,21 @@ impl HubListener {
         match inbox.sends {
             Some(at) if now.saturating_duration_since(at) >= self.settle => {
                 inbox.sends = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// **The sharing view is stale**: the daemon said `sharing`, or the feed
+    /// was reset. True once per settled notice, as [`Self::sends_changed`].
+    /// The window's answer is to re-read `GET /sharing` -- one loopback
+    /// request out of the daemon's memory, never the server.
+    pub fn sharing_changed(&self, now: Instant) -> bool {
+        let mut inbox = self.shared.inbox.lock().unwrap_or_else(PoisonError::into_inner);
+        match inbox.sharing {
+            Some(at) if now.saturating_duration_since(at) >= self.settle => {
+                inbox.sharing = None;
                 true
             }
             _ => false,
@@ -735,11 +756,13 @@ fn follow(mut poll: FollowPoll, timing: Timing, shared: &Shared) {
                 if page.reset || restarted {
                     shared.notice(Announcement::Whole);
                     shared.notice_sends();
+                    shared.notice_sharing();
                 } else {
                     for change in page.changes {
                         match change {
                             Change::Vault(announced) => shared.notice(announced),
                             Change::Sends => shared.notice_sends(),
+                            Change::Sharing => shared.notice_sharing(),
                         }
                     }
                 }

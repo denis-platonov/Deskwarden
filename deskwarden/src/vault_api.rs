@@ -49,7 +49,9 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
+use crate::change_feed::Change;
 use crate::change_feed::{ChangeFeed, LONG_POLL};
+use crate::rest::sharing::{Sharing, SharingError, SharingOutcome, Trigger};
 use crate::service_token::{self, Token};
 use crate::vault_bridge::{NewItem, RelayedItem, VaultError, VaultItem};
 use crate::vault_cache::{PopulateOutcome, VaultCache, VaultEra, VaultUnavailable};
@@ -113,6 +115,18 @@ fn failed(error: &VaultError) -> ApiResponse {
         VaultError::Unsupported { why, .. } => ApiResponse::refused(501, why),
         VaultError::Http(_) => ApiResponse::refused(400, "the vault server refused the request"),
         VaultError::Parse(_) => ApiResponse::refused(502, "the vault server's answer was unreadable"),
+    }
+}
+
+/// A sharing refusal as an answer. Spec 11.3: `Unsupported` -> 501 with why, a
+/// refused step -> 400 with the sentence to show, the rest as `failed`.
+// Its callers are the write routes, which arrive with the flows (Tasks 9-13).
+#[allow(dead_code)]
+fn sharing_failed(error: &SharingError) -> ApiResponse {
+    match error {
+        SharingError::Unavailable(reason) => ApiResponse::refused(501, reason),
+        SharingError::Refused(sentence) => ApiResponse::refused(400, sentence),
+        SharingError::Vault(e) => failed(e),
     }
 }
 
@@ -312,11 +326,13 @@ impl VaultApi {
                 let page = self.feed.wait_after(after, query.is("live", "true"), self.long_poll);
                 ApiResponse { status: 200, body: crate::change_feed::page_body(&page) }
             }
+            ("GET", ["sharing"]) => self.sharing_view(),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
             | (_, ["restore" | "archive", "item", _])
-            | (_, ["object", "totp", _]) => ApiResponse::refused(405, "that method is not answered here"),
+            | (_, ["object", "totp", _])
+            | (_, ["sharing", ..]) => ApiResponse::refused(405, "that method is not answered here"),
             _ => ApiResponse::refused(404, "no such route"),
         }
     }
@@ -356,6 +372,7 @@ impl VaultApi {
         match self.cache.populate() {
             Ok(PopulateOutcome::Populated) => {
                 self.forget_applied();
+                self.sharing_pass(Trigger::WholeRead);
                 synced
             }
             Ok(PopulateOutcome::DiscardedStale) => not_ready(),
@@ -382,6 +399,89 @@ impl VaultApi {
     /// copy's now.
     pub fn forget_applied(&self) {
         *self.applied() = None;
+    }
+
+    // ---- personal sharing ---------------------------------------------------
+
+    /// The engine, or the response that says why there is none: a vault not
+    /// loaded yet is 503, a backend without one (`bw serve`) is 501.
+    // Its callers are the write routes, which arrive with the flows (Tasks 9-13).
+    #[allow(dead_code)]
+    fn engine(&self) -> Result<Arc<Sharing>, ApiResponse> {
+        if !self.cache.is_populated() {
+            return Err(not_ready());
+        }
+        self.cache
+            .bridge()
+            .sharing()
+            .ok_or_else(|| ApiResponse::refused(501, "Sharing needs direct sync with a self-hosted server."))
+    }
+
+    /// `GET /sharing` -- answered from the engine's held view and the daemon's
+    /// items, with no server round trip (spec 11.3). Never an error: "not
+    /// loaded" and "not here" are views too.
+    fn sharing_view(&self) -> ApiResponse {
+        if !self.cache.is_populated() {
+            return ApiResponse::ok(to_value(&crate::rest::sharing::SharingView::unavailable(
+                crate::rest::sharing::REASON_NOT_LOADED,
+            )));
+        }
+        match self.cache.bridge().sharing() {
+            Some(engine) => ApiResponse::ok(to_value(&engine.view(&self.cache.items()))),
+            None => ApiResponse::ok(to_value(&crate::rest::sharing::SharingView::unavailable(
+                crate::rest::sharing::REASON_BW_SERVE,
+            ))),
+        }
+    }
+
+    /// **What a sharing write changed, into the daemon's copy and onto the
+    /// feed** -- removals first, then the new copies, in one batch, then
+    /// `sharing`. A window reads each announced item back from this daemon,
+    /// which already holds it; nothing reaches the server.
+    fn publish_outcome(&self, outcome: &SharingOutcome) {
+        self.cache.apply_written_elsewhere(&outcome.upserted, &outcome.removed);
+        let mut changes: Vec<Change> = outcome
+            .removed
+            .iter()
+            .map(|id| Change::Vault(crate::rest::notifications::Announcement::ItemGone { id: id.clone(), revision: None }))
+            .collect();
+        changes.extend(outcome.upserted.iter().map(|item| {
+            Change::Vault(crate::rest::notifications::Announcement::Item {
+                id: item.id.clone(),
+                revision: item.other.get("revisionDate").and_then(serde_json::Value::as_str).map(str::to_string),
+            })
+        }));
+        changes.push(Change::Sharing);
+        self.feed.publish(changes);
+    }
+
+    /// **One sharing pass** -- the triggers of spec 11.5 call this: a whole
+    /// read, an applied hub batch, the timer. It is the daemon's own work; no
+    /// window needs to be open. A failure is logged and the next trigger tries
+    /// again.
+    pub fn sharing_pass(&self, trigger: Trigger) {
+        if !self.cache.is_populated() {
+            return;
+        }
+        let Some(engine) = self.cache.bridge().sharing() else {
+            return;
+        };
+        match engine.refresh(trigger) {
+            Ok(pass) => {
+                if !pass.outcome.is_empty() {
+                    self.publish_outcome(&pass.outcome);
+                } else if pass.changed {
+                    self.feed.publish([Change::Sharing]);
+                }
+            }
+            Err(e) => log::info!("the sharing pass ({trigger:?}) did not complete: {e}"),
+        }
+    }
+
+    /// Whether the ten-minute timer has anything to do.
+    #[must_use]
+    pub fn sharing_wants_timer(&self) -> bool {
+        self.cache.is_populated() && self.cache.bridge().sharing().is_some_and(|engine| engine.wants_timer())
     }
 
     fn list_items(&self, query: &Query<'_>) -> ApiResponse {
@@ -711,5 +811,54 @@ pub(crate) mod tests {
         let printed = format!("{:?}", NewItem::Relayed(relayed));
         assert!(!printed.contains("hunter2-secret"), "{printed}");
         assert!(printed.contains("NewItem::Relayed"), "{printed}");
+    }
+
+    /// **`GET /sharing` answers from the daemon's held view**, in the
+    /// envelope, and a first pass is what turns it on.
+    #[test]
+    fn the_sharing_view_is_answered_from_the_daemon_and_a_pass_publishes_it() {
+        let (mut server, cache, api, token) = a_daemon();
+        cache.bridge().sharing().expect("a REST daemon has an engine").set_up(crate::rest::sharing::SharingSetup::none());
+        let before = ask(&api, "GET", "/sharing", Some(&token), "");
+        assert_eq!(before.status, 200);
+        let body: serde_json::Value = serde_json::from_str(&before.body).expect("json");
+        assert_eq!(body["data"]["available"], false);
+        assert_eq!(body["data"]["reason"], crate::rest::sharing::REASON_NOT_LOADED);
+
+        server.mock("GET", "/api/accounts/profile").with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string()).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
+        server.mock("GET", "/api/users/user-1/public-key")
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        api.sharing_pass(crate::rest::sharing::Trigger::WholeRead);
+        let page = api.feed().wait_after(Some(0), false, Duration::ZERO);
+        assert!(page.changes.contains(&crate::change_feed::Change::Sharing), "{:?}", page.changes);
+        let after: serde_json::Value = serde_json::from_str(&ask(&api, "GET", "/sharing", Some(&token), "").body).expect("json");
+        assert_eq!(after["data"]["available"], true);
+        assert_eq!(after["data"]["dialect"], "nodewarden");
+    }
+
+    /// **`bw serve` answers "unavailable" and makes no request** (spec 7.4).
+    #[test]
+    fn bw_serve_answers_sharing_unavailable_and_makes_no_request() {
+        let mut server = crate::test_http::server();
+        let nothing = server.mock("GET", crate::test_http::Matcher::Any).expect(0).create();
+        // Seeded with no request: the `bw serve` bridge's first request must
+        // be one the sharing code made, and there must be none.
+        let cache = Arc::new(crate::test_vault::cache_at(server.url(), Vec::new(), Vec::new()));
+        let api = VaultApi::new(Arc::clone(&cache), Arc::new(ChangeFeed::with_instance(1)));
+        let token = api.grant_with("window", fixed).expose().to_string();
+        let answer: serde_json::Value = serde_json::from_str(&ask(&api, "GET", "/sharing", Some(&token), "").body).expect("json");
+        assert_eq!(answer["data"]["available"], false);
+        assert_eq!(answer["data"]["reason"], crate::rest::sharing::REASON_BW_SERVE);
+        api.sharing_pass(crate::rest::sharing::Trigger::WholeRead);
+        nothing.assert();
+    }
+
+    /// A wrong method on a sharing route is 405, not 404.
+    #[test]
+    fn a_wrong_method_on_a_sharing_route_is_refused_as_a_method() {
+        let (_server, _cache, api, token) = a_daemon();
+        assert_eq!(ask(&api, "DELETE", "/sharing", Some(&token), "").status, 405);
     }
 }

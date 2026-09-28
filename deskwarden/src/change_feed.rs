@@ -26,9 +26,16 @@
 //! from the daemon is already the new one. A second vocabulary would be a
 //! second place for "which pushes are targetable" to be decided.
 //!
-//! [`Change::Sends`] is the other kind: a Send was created, changed, opened or
+//! [`Change::Sends`] is another: a Send was created, changed, opened or
 //! revoked. It is a list refetch and never a vault read -- see
-//! `HubListener::sends_changed`.
+//! `HubListener::sends_changed`. [`Change::Sharing`] is the third, and the
+//! same shape: the sharing view moved, and a client re-reads `GET /sharing`
+//! out of the daemon's memory -- see `HubListener::sharing_changed`.
+//!
+//! **A kind a client does not know is skipped, not a failed page**: a browser
+//! extension will not always be the daemon's own build, and three failed
+//! pages in a row close a window. `a_page_with_an_unknown_kind_still_parses`
+//! pins it.
 //!
 //! # A client that fell behind is told so
 //!
@@ -66,6 +73,10 @@ pub enum Change {
     Vault(Announcement),
     /// A Send changed. A client drops its Sends list and asks again.
     Sends,
+    /// **The sharing view changed**: re-read `GET /sharing`. Published after
+    /// every sharing engine write and after every pass that changed
+    /// anything. Item movements ride the vault kinds beside it.
+    Sharing,
 }
 
 /// One answer to [`ChangeFeed::wait_after`].
@@ -268,6 +279,11 @@ enum WireChange {
     },
     Whole,
     Sends,
+    Sharing,
+    /// A kind this build does not know -- a newer daemon's, read by an older
+    /// client. Skipped rather than failing the page (spec 11.4).
+    #[serde(other)]
+    Unknown,
 }
 
 impl From<&Change> for WireChange {
@@ -282,22 +298,23 @@ impl From<&Change> for WireChange {
             Change::Vault(Announcement::VaultAt { date }) => WireChange::VaultAt { date: date.clone() },
             Change::Vault(Announcement::Whole) => WireChange::Whole,
             Change::Sends => WireChange::Sends,
+            Change::Sharing => WireChange::Sharing,
         }
     }
 }
 
-impl From<WireChange> for Change {
-    fn from(change: WireChange) -> Self {
-        match change {
-            WireChange::Item { id, revision } => Change::Vault(Announcement::Item { id, revision }),
-            WireChange::ItemGone { id, revision } => {
-                Change::Vault(Announcement::ItemGone { id, revision })
-            }
-            WireChange::VaultAt { date } => Change::Vault(Announcement::VaultAt { date }),
-            WireChange::Whole => Change::Vault(Announcement::Whole),
-            WireChange::Sends => Change::Sends,
-        }
-    }
+/// A wire change as this build understands it, or `None` for a kind it does
+/// not know.
+fn change_from(change: WireChange) -> Option<Change> {
+    Some(match change {
+        WireChange::Item { id, revision } => Change::Vault(Announcement::Item { id, revision }),
+        WireChange::ItemGone { id, revision } => Change::Vault(Announcement::ItemGone { id, revision }),
+        WireChange::VaultAt { date } => Change::Vault(Announcement::VaultAt { date }),
+        WireChange::Whole => Change::Vault(Announcement::Whole),
+        WireChange::Sends => Change::Sends,
+        WireChange::Sharing => Change::Sharing,
+        WireChange::Unknown => return None,
+    })
 }
 
 /// A page as the JSON body the daemon answers `GET /changes` with.
@@ -326,7 +343,7 @@ pub fn page_from_body(body: &str) -> Result<FeedPage, String> {
         seq: wire.seq,
         live: wire.live,
         reset: wire.reset,
-        changes: wire.changes.into_iter().map(Change::from).collect(),
+        changes: wire.changes.into_iter().filter_map(change_from).collect(),
     })
 }
 
@@ -419,9 +436,35 @@ mod tests {
                 Change::Vault(Announcement::VaultAt { date: "2026-09-26T00:00:00Z".to_string() }),
                 Change::Vault(Announcement::Whole),
                 Change::Sends,
+                Change::Sharing,
             ],
         };
         assert_eq!(page_from_body(&page_body(&page)).expect("reads back"), page);
         assert!(page_from_body("{\"nope\":1}").is_err());
+    }
+
+    /// **A kind this build does not know is skipped, not fatal** (spec 11.4).
+    /// A window and its daemon are one build today; a browser extension will
+    /// not be, and one unknown kind must not fail a whole page -- three failed
+    /// pages in a row close a window.
+    #[test]
+    fn a_page_with_an_unknown_kind_still_parses() {
+        let page = page_from_body(
+            r#"{"instance":1,"seq":3,"live":true,"reset":false,"changes":[{"kind":"somethingNew","x":1},{"kind":"sharing"},{"kind":"item","id":"a"}]}"#,
+        )
+        .expect("an unknown kind is skipped");
+        assert_eq!(
+            page.changes,
+            vec![Change::Sharing, Change::Vault(Announcement::Item { id: "a".into(), revision: None })]
+        );
+    }
+
+    #[test]
+    fn a_sharing_change_is_not_a_vault_batch() {
+        let feed = ChangeFeed::with_instance(1);
+        feed.publish([Change::Sharing]);
+        assert_eq!(feed.vault_batches(), 0, "the match engine is not rebuilt for a sharing change");
+        let page = feed.wait_after(Some(0), false, Duration::ZERO);
+        assert_eq!(page.changes, vec![Change::Sharing]);
     }
 }

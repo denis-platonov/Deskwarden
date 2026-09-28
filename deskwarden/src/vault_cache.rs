@@ -1699,6 +1699,35 @@ impl VaultCache {
         Ok(fetched)
     }
 
+    /// **Items the sharing engine changed on the server**, applied the way a
+    /// write's own answer is: the new copy at the top of the list, the old one
+    /// gone, each noted as a write so a populate racing it cannot resurrect
+    /// what it replaced.
+    ///
+    /// A share keeps a record's id and changes what it is filed under; a move
+    /// back gives it a new id and deletes the old one (spec 9.4), which is one
+    /// `removed` and one `upserted`. No read happens here: the engine already
+    /// holds the server's answer, decrypted.
+    pub fn apply_written_elsewhere(&self, upserted: &[VaultItem], removed: &[String]) {
+        let _ = self.persisting(|| {
+            let mut snapshot = self.lock();
+            if snapshot.populated {
+                for id in removed {
+                    snapshot.items.retain(|i| &i.id != id);
+                    snapshot.note_item_write(id, true);
+                }
+                for item in upserted {
+                    if let Some(at) = snapshot.items.iter().position(|i| i.id == item.id) {
+                        snapshot.items.remove(at);
+                    }
+                    snapshot.items.insert(0, item.clone());
+                    snapshot.note_item_write(&item.id, false);
+                }
+            }
+            Ok(())
+        });
+    }
+
     /// The vault's trash in one call, **without the era guard** -- reachable
     /// from tests only.
     ///
@@ -6490,5 +6519,19 @@ mod tests {
             "a write that was REFUSED was replayed over the backend's answer when the \
              backend finally came up, resurrecting an edit the server never accepted"
         );
+    }
+
+    /// **What the sharing engine changed on the server lands in the snapshot**
+    /// the way a write's own answer does: at the top, the old copy gone.
+    #[test]
+    fn items_written_elsewhere_replace_and_remove_in_the_snapshot() {
+        let item = |id: &str| -> VaultItem { serde_json::from_value(serde_json::json!({ "id": id, "name": id })).expect("item") };
+        let cache = crate::test_vault::cache_with_items(vec![item("a"), item("b")]);
+        let mut moved = item("b");
+        moved.name = "moved".into();
+        cache.apply_written_elsewhere(&[moved, item("c")], &["a".to_string()]);
+        let ids: Vec<String> = cache.items().into_iter().map(|i| i.id).collect();
+        assert_eq!(ids, ["c", "b"]);
+        assert_eq!(cache.get_by_id("b").map(|i| i.name), Some("moved".to_string()));
     }
 }

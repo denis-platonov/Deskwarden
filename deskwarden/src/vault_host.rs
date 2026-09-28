@@ -31,6 +31,13 @@
 //! and only THEN published to the feed, so a client that reads a record back
 //! reads the new one. Send pushes are published as `Change::Sends` and touch
 //! no vault at all.
+//!
+//! **The sharing pass rides the same thread** (spec 11.5): after an applied
+//! batch, after the hub's own populate, for a new vault era, and on
+//! [`SHARING_TIMER`] while someone is waiting -- `VaultApi::sharing_pass`
+//! publishes `Change::Sharing` when the view moved. A thread of its own
+//! would be one more for `job_object`'s census to count and one more lock
+//! order to get right, for work that is at most a few requests a tick.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -40,6 +47,7 @@ use zeroize::Zeroizing;
 
 use crate::change_feed::{Change, ChangeFeed};
 use crate::rest::notifications::HubListener;
+use crate::rest::sharing::Trigger;
 use crate::vault_api::{ApiRequest, VaultApi};
 
 /// How many requests the daemon answers at once. One long-poll per open
@@ -225,8 +233,10 @@ impl HubWorker {
         std::thread::Builder::new()
             .name("vault-hub".to_string())
             .spawn(move || {
+                let mut sharing = SharingTick { era: None, next: Instant::now() + SHARING_TIMER };
                 while !thread_stop.load(Ordering::SeqCst) {
                     hub_tick(&listener, &api, Instant::now());
+                    sharing_tick(&api, &mut sharing, Instant::now());
                     std::thread::sleep(HUB_TICK);
                 }
             })
@@ -281,6 +291,7 @@ fn hub_tick(listener: &HubListener, api: &VaultApi, now: Instant) {
                         changes.len()
                     );
                     api.note_applied(era, before);
+                    api.sharing_pass(Trigger::Batch);
                     true
                 }
                 Err(why) => {
@@ -293,11 +304,51 @@ fn hub_tick(listener: &HubListener, api: &VaultApi, now: Instant) {
     };
     if !applied {
         match cache.populate() {
-            Ok(_) => api.forget_applied(),
+            Ok(_) => {
+                api.forget_applied();
+                api.sharing_pass(Trigger::WholeRead);
+            }
             Err(e) => log::warn!("the daemon could not re-read the vault after an announcement: {e:?}"),
         }
     }
     feed.publish(announced.into_iter().map(Change::Vault));
+}
+
+/// **The sharing timer** (spec 11.5, trigger 4): how often the daemon asks
+/// the server about people still waiting, while the vault is unlocked and
+/// only while somebody is. NodeWarden pushes an accept to the sharer from
+/// slice 1, so this is the backstop, not the path.
+pub const SHARING_TIMER: Duration = Duration::from_secs(600);
+
+/// The hub worker's memory for the sharing pass: which vault era it last
+/// ran for (a new era is an unlock or a switch: a whole read), and when the
+/// timer is next due.
+struct SharingTick {
+    era: Option<crate::vault_cache::VaultEra>,
+    next: Instant,
+}
+
+/// Runs the pass for a new era and for the timer; called on the hub worker's
+/// own thread, once per tick.
+fn sharing_tick(api: &VaultApi, tick: &mut SharingTick, now: Instant) {
+    let cache = api.cache();
+    if !cache.is_populated() {
+        tick.era = None;
+        return;
+    }
+    let era = cache.epoch().era();
+    if tick.era != Some(era) {
+        tick.era = Some(era);
+        tick.next = now + SHARING_TIMER;
+        api.sharing_pass(Trigger::WholeRead);
+        return;
+    }
+    if now >= tick.next {
+        tick.next = now + SHARING_TIMER;
+        if api.sharing_wants_timer() {
+            api.sharing_pass(Trigger::Timer);
+        }
+    }
 }
 
 /// **Whether the daemon's vault changed under its match engine** since the
@@ -659,5 +710,38 @@ mod tests {
             }
             other => panic!("an ungranted request was answered (ok = {})", other.is_ok()),
         }
+    }
+
+    /// **A window reads the sharing view from the daemon, over the real
+    /// loopback listener**, and hears `Change::Sharing` on its feed.
+    #[test]
+    fn a_window_reads_the_sharing_view_and_hears_its_change_through_the_daemon() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        server.mock("GET", "/api/accounts/revision-date").with_body("1700000000000").expect_at_least(0).create();
+        server.mock("GET", "/api/sync?excludeDomains=true").with_body(sync_payload()).expect_at_least(0).create();
+        server.mock("GET", "/api/accounts/profile").with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string()).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
+        server.mock("GET", "/api/users/user-1/public-key")
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        backend.sharing_engine().set_up(crate::rest::sharing::SharingSetup::none());
+        let daemon = Arc::new(VaultCache::new(backend));
+        assert_eq!(daemon.populate().expect("the load"), PopulateOutcome::Populated);
+        let api = Arc::new(VaultApi::new(Arc::clone(&daemon), Arc::new(ChangeFeed::with_instance(5))).with_long_poll(Duration::from_millis(200)));
+        let host = VaultHost::start(Arc::clone(&api)).expect("a loopback port");
+        let link = DaemonLink::from_line(&host.link_line_for("window")).expect("the line");
+        let listener = crate::rest::notifications::HubListener::following(link.feed_poll(), FAST);
+        // The listener's first poll is "where are you?", answered with the
+        // feed's current number: a change published before it lands would be
+        // history to it and never heard. The hub going live is news it hears
+        // only once it follows, so waiting for that orders the two.
+        api.feed().set_live(true);
+        eventually("the window follows the feed", || listener.is_live());
+
+        api.sharing_pass(crate::rest::sharing::Trigger::WholeRead);
+        eventually("the window heard the sharing change", || listener.sharing_changed(Instant::now()));
+        let view = link.sharing().view().expect("the view");
+        assert!(view.available);
+        drop(host);
     }
 }

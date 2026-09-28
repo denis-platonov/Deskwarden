@@ -116,6 +116,12 @@ impl DaemonLink {
         self
     }
 
+    /// This link's sharing client.
+    #[must_use]
+    pub fn sharing(&self) -> SharingClient {
+        SharingClient::new(&self.base_url, &self.grant)
+    }
+
     /// The link this process's parent wrote down its stdin, if it wrote one.
     ///
     /// One line and then end-of-file: the daemon closes the pipe as soon as it
@@ -241,6 +247,73 @@ pub fn sync_through_the_daemon() -> Option<Result<(), String>> {
 #[must_use]
 pub fn feed_poll() -> Option<crate::rest::notifications::FollowPoll> {
     installed().map(DaemonLink::feed_poll)
+}
+
+/// The window's sharing client, or `None` in a process with no link -- where
+/// sharing is not offered (spec 7.4) and the Share control offers a Send.
+#[must_use]
+pub fn sharing_client() -> Option<SharingClient> {
+    installed().map(DaemonLink::sharing)
+}
+
+/// How long a sharing call may take: a share is about eight server requests
+/// behind the daemon.
+const SHARING_DEADLINE: Duration = Duration::from_secs(60);
+
+/// **The window's line to the daemon's sharing engine.** Typed calls to the
+/// `/sharing` routes; nothing personal in a query string (spec 11.3).
+#[derive(Clone)]
+pub struct SharingClient {
+    base_url: String,
+    agent: crate::http_agent::TotalBounded,
+}
+
+impl SharingClient {
+    /// A client for one daemon, with one grant.
+    #[must_use]
+    pub fn new(base_url: &str, grant: &Zeroizing<String>) -> Self {
+        Self {
+            base_url: base_url.to_string(),
+            agent: crate::http_agent::bounded_total_with_bearer(CONNECT, SHARING_DEADLINE, grant.clone()),
+        }
+    }
+
+    /// `GET /sharing`.
+    ///
+    /// # Errors
+    ///
+    /// The daemon refused or did not answer, as a sentence.
+    pub fn view(&self) -> Result<crate::rest::sharing::SharingView, String> {
+        let data = sharing_answer(self.agent.get(&format!("{}/sharing", self.base_url)).call())?;
+        serde_json::from_value(data).map_err(|e| format!("The vault service answered something unreadable: {e}"))
+    }
+
+    /// One `POST` to a sharing route, its `data` back.
+    // Its callers are the window's share flows, which arrive with them (Tasks 9-13).
+    #[allow(dead_code)]
+    pub(crate) fn post(&self, path: &str, body: serde_json::Value) -> Result<serde_json::Value, String> {
+        sharing_answer(self.agent.post(&format!("{}{}", self.base_url, path)).send_json(body))
+    }
+}
+
+/// A sharing route's answer: `data` on success, the daemon's `message` -- the
+/// sentence the engine chose -- on a refusal.
+fn sharing_answer(result: Result<ureq::Response, ureq::Error>) -> Result<serde_json::Value, String> {
+    match result {
+        Ok(response) => {
+            let body: serde_json::Value = response.into_json().map_err(|e| e.to_string())?;
+            Ok(body.get("data").cloned().unwrap_or(serde_json::Value::Null))
+        }
+        Err(ureq::Error::Status(_, response)) => {
+            let body: serde_json::Value = response.into_json().unwrap_or(serde_json::Value::Null);
+            Err(body
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("The vault service refused the request.")
+                .to_string())
+        }
+        Err(e) => Err(format!("The vault service did not answer: {e}")),
+    }
 }
 
 /// **The window's vault backend when the daemon owns the vault.**
