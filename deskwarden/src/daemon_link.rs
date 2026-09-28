@@ -347,26 +347,27 @@ impl SharingClient {
             .map_err(|_| "The vault service answered something unreadable.".to_string())
     }
 
-    /// `POST /sharing/person/confirm` -- "Share anyway".
+    /// `POST /sharing/person/confirm` -- "Share anyway", to the key whose
+    /// fingerprint the user compared: `key_sha256` is the
+    /// [`crate::rest::sharing::Fingerprint::key_sha256`] [`Self::fingerprint`]
+    /// answered with.
     ///
     /// # Errors
     ///
     /// The engine's sentence, or the daemon's.
-    pub fn confirm(&self, email: &str) -> Result<(), String> {
-        self.post("/sharing/person/confirm", serde_json::json!({ "email": email })).map(|_| ())
+    pub fn confirm(&self, email: &str, key_sha256: &str) -> Result<(), String> {
+        self.post("/sharing/person/confirm", serde_json::json!({ "email": email, "keySha256": key_sha256 })).map(|_| ())
     }
 
-    /// `POST /sharing/person/fingerprint` -- the five words.
+    /// `POST /sharing/person/fingerprint` -- the five words, and the hash of
+    /// the key they were made from.
     ///
     /// # Errors
     ///
     /// The engine's sentence, or the daemon's.
-    pub fn fingerprint(&self, email: &str) -> Result<String, String> {
+    pub fn fingerprint(&self, email: &str) -> Result<crate::rest::sharing::Fingerprint, String> {
         let data = self.post("/sharing/person/fingerprint", serde_json::json!({ "email": email }))?;
-        data.get("phrase")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| "The vault service answered something unreadable.".to_string())
+        serde_json::from_value(data).map_err(|_| "The vault service answered something unreadable.".to_string())
     }
 }
 

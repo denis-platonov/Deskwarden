@@ -230,6 +230,16 @@ pub struct Collection {
     /// open -- an organisation whose key failed to unwrap, most likely. See
     /// [`UNREADABLE_NAME`], which is what gets drawn.
     pub name: Option<String>,
+    /// **The name decrypted under the org key**, so only a holder of that
+    /// key can have written it. `false` for a plaintext name -- which
+    /// NodeWarden's web vault may leave, and which the SERVER can write too.
+    /// A plaintext name is drawn like any other, but nothing that grants or
+    /// confirms trusts it: the sharing engine's rule 2 (spec 11.5) reads a
+    /// person collection's email off an authenticated name only, or a hostile
+    /// server could list `mallory@...` in plaintext beside an accepted row
+    /// and have the org key wrapped to its own key
+    /// (`a_plaintext_collection_name_never_confirms_anyone`).
+    pub authenticated: bool,
 }
 
 impl Collection {
@@ -782,11 +792,15 @@ fn map_collection(raw: &Value, keys: &VaultKeys) -> Option<Collection> {
         .and_then(Value::as_str)
         .filter(|id| !id.is_empty())?
         .to_string();
-    let name = object
+    let read = object
         .get("name")
         .and_then(Value::as_str)
         .and_then(|raw| collection_name(raw, keys.organization(&organization_id)));
-    Some(Collection { id, organization_id, name })
+    let (name, authenticated) = match read {
+        Some((name, authenticated)) => (Some(name), authenticated),
+        None => (None, false),
+    };
+    Some(Collection { id, organization_id, name, authenticated })
 }
 
 /// A collection's `name`, which is **ciphertext on Bitwarden and plaintext on
@@ -805,13 +819,16 @@ fn map_collection(raw: &Value, keys: &VaultKeys) -> Option<Collection> {
 /// The third case is the one that matters and it is why this is not
 /// `unwrap_or(raw)`: falling back to the raw text there would paint
 /// `2.aB9d...|...|...` into the rail as though it were a collection's name.
-fn collection_name(raw: &str, key: Option<&SymmetricKey>) -> Option<String> {
+///
+/// The `bool` is [`Collection::authenticated`]: `true` in the decrypt branch
+/// alone.
+fn collection_name(raw: &str, key: Option<&SymmetricKey>) -> Option<(String, bool)> {
     let Ok(enc) = raw.parse::<EncString>() else {
-        return Some(raw.to_string());
+        return Some((raw.to_string(), false));
     };
     let key = key?;
     let bytes = decrypt(key, &enc).ok()?;
-    std::str::from_utf8(&bytes).ok().map(str::to_string)
+    std::str::from_utf8(&bytes).ok().map(|name| (name.to_string(), true))
 }
 
 /// A members answer, read out of whichever envelope arrived.
@@ -957,6 +974,10 @@ struct WireCollection {
     id: String,
     organization_id: String,
     name: Option<String>,
+    /// [`Collection::authenticated`]. Absent in a body from before it
+    /// existed, and read as `false`: unauthenticated is the safe default.
+    #[serde(default)]
+    authenticated: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1029,6 +1050,7 @@ impl Directory {
                     id: c.id.clone(),
                     organization_id: c.organization_id.clone(),
                     name: c.name.clone(),
+                    authenticated: c.authenticated,
                 })
                 .collect(),
             rosters: self
@@ -1075,7 +1097,7 @@ impl Directory {
             collections: wire
                 .collections
                 .into_iter()
-                .map(|c| Collection { id: c.id, organization_id: c.organization_id, name: c.name })
+                .map(|c| Collection { id: c.id, organization_id: c.organization_id, name: c.name, authenticated: c.authenticated })
                 .collect(),
             rosters: wire
                 .rosters

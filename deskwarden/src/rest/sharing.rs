@@ -230,6 +230,17 @@ pub enum ShareResult {
     WaitingAccount,
 }
 
+/// **Show fingerprint's answer**: the five words, and the SHA-256 of the key
+/// they were made from. Neither is secret -- both are of a PUBLIC key -- and
+/// the hash is what binds "Share anyway" to the key the user compared.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Fingerprint {
+    pub phrase: String,
+    /// Lowercase hex, `crypto::public_key_sha256_hex`'s -- the pin's own form.
+    pub key_sha256: String,
+}
+
 /// A share's result and what it changed.
 #[derive(Debug, Clone)]
 pub struct ShareOutcome {
@@ -419,23 +430,51 @@ pub(crate) struct Account {
     pub(crate) keyed: bool,
 }
 
+/// One person collection C(E): its id, the email its name holds, and
+/// whether that name decrypted under the org key.
+///
+/// **`authenticated` is spec 11.5's rule 2.** Only a holder of the org key
+/// can write a name that decrypts, so only such a name may put a person in
+/// the confirm queue or let "Share anyway" hand them the org key. A plaintext
+/// name -- NodeWarden's web vault may leave one, and the server can write one
+/// -- is drawn on the card like any other and used to find a collection to
+/// file into, stop or delete, but never to confirm. See
+/// [`crate::rest::organizations::Collection::authenticated`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PersonCollection {
+    pub(crate) id: String,
+    /// Normalised.
+    pub(crate) email: String,
+    pub(crate) authenticated: bool,
+}
+
+/// The first collection for `email` in `collections`, authenticated or not
+/// as `authenticated_only` asks -- [`MyOrg`]'s and [`Ctx`]'s one lookup.
+fn person_collection_for<'a>(collections: &'a [PersonCollection], email: &str, authenticated_only: bool) -> Option<&'a str> {
+    let email = normalise_email(email);
+    collections
+        .iter()
+        .find(|c| c.email == email && (c.authenticated || !authenticated_only))
+        .map(|c| c.id.as_str())
+}
+
 /// This account's own sharing org, as the last read left it.
 #[derive(Debug, Clone)]
 pub(crate) struct MyOrg {
     pub(crate) id: String,
-    /// `(collection id, normalised email)`, in server order.
-    pub(crate) collections: Vec<(String, String)>,
+    /// In server order.
+    pub(crate) collections: Vec<PersonCollection>,
     pub(crate) roster: Vec<Member>,
 }
 
 impl MyOrg {
-    fn collection_for(&self, email: &str) -> Option<&str> {
-        let email = normalise_email(email);
-        self.collections.iter().find(|(_, e)| *e == email).map(|(id, _)| id.as_str())
+    /// Rule 2's lookup: a collection whose name decrypted under the org key.
+    fn authenticated_collection_for(&self, email: &str) -> Option<&str> {
+        person_collection_for(&self.collections, email, true)
     }
 
     fn email_of(&self, collection_id: &str) -> Option<&str> {
-        self.collections.iter().find(|(id, _)| id == collection_id).map(|(_, e)| e.as_str())
+        self.collections.iter().find(|c| c.id == collection_id).map(|c| c.email.as_str())
     }
 
     fn member(&self, email: &str) -> Option<&Member> {
@@ -612,7 +651,13 @@ impl Sharing {
             collections: directory
                 .collections_of(&org.id)
                 .into_iter()
-                .filter_map(|c| c.name.as_deref().map(|name| (c.id.clone(), normalise_email(name))))
+                .filter_map(|c| {
+                    c.name.as_deref().map(|name| PersonCollection {
+                        id: c.id.clone(),
+                        email: normalise_email(name),
+                        authenticated: c.authenticated,
+                    })
+                })
                 .collect(),
             roster: match directory.roster_of(&org.id) {
                 Roster::Known(members) => members.clone(),
@@ -664,7 +709,7 @@ impl Sharing {
             ..SharingView::default()
         };
         if let Some(org) = &held.my_org {
-            for (collection_id, email) in &org.collections {
+            for PersonCollection { id: collection_id, email, .. } in &org.collections {
                 if view.people.iter().any(|p| &p.email == email) {
                     continue;
                 }
@@ -836,7 +881,7 @@ impl Sharing {
     pub fn wants_timer(&self) -> bool {
         let held = self.held();
         held.my_org.as_ref().is_some_and(|org| {
-            org.roster.iter().any(|m| m.status != MemberStatus::Confirmed && org.collection_for(&m.email).is_some())
+            org.roster.iter().any(|m| m.status != MemberStatus::Confirmed && org.authenticated_collection_for(&m.email).is_some())
         })
     }
 }
@@ -851,14 +896,17 @@ pub(crate) struct Ctx {
     pub(crate) keys: Arc<VaultKeys>,
     pub(crate) org_id: String,
     pub(crate) org_key: SymmetricKey,
-    /// `(collection id, normalised email)`.
-    pub(crate) collections: Vec<(String, String)>,
+    pub(crate) collections: Vec<PersonCollection>,
 }
 
 impl Ctx {
     pub(crate) fn collection_for(&self, email: &str) -> Option<&str> {
-        let email = normalise_email(email);
-        self.collections.iter().find(|(_, e)| *e == email).map(|(id, _)| id.as_str())
+        person_collection_for(&self.collections, email, false)
+    }
+
+    /// Rule 2's lookup -- see [`PersonCollection`].
+    pub(crate) fn authenticated_collection_for(&self, email: &str) -> Option<&str> {
+        person_collection_for(&self.collections, email, true)
     }
 }
 
@@ -882,14 +930,16 @@ fn plausible_email(email: &str) -> bool {
 }
 
 /// A collection name read with the org key; a NodeWarden web-vault name
-/// that is plaintext is read as it is.
-fn collection_email(raw: &str, key: &SymmetricKey) -> Option<String> {
+/// that is plaintext is read as it is. The `bool` is whether the name was
+/// authenticated -- decrypted under the org key -- and is `true` in that
+/// branch alone ([`PersonCollection::authenticated`]).
+fn collection_email(raw: &str, key: &SymmetricKey) -> Option<(String, bool)> {
     match raw.parse::<EncString>() {
         Ok(enc) => {
             let bytes = crate::rest::crypto::decrypt(key, &enc).ok()?;
-            std::str::from_utf8(&bytes).ok().map(normalise_email)
+            std::str::from_utf8(&bytes).ok().map(|name| (normalise_email(name), true))
         }
-        Err(_) => Some(normalise_email(raw)),
+        Err(_) => Some((normalise_email(raw), false)),
     }
 }
 
@@ -964,10 +1014,13 @@ impl Sharing {
             .map(|o| o.id.clone())
     }
 
-    /// The org's person collections, decrypted: `(id, email)`.
-    pub(crate) fn collections_of(&self, org: &str, key: &SymmetricKey) -> Result<Vec<(String, String)>, SharingError> {
+    /// The org's person collections, decrypted where they are ciphertext.
+    pub(crate) fn collections_of(&self, org: &str, key: &SymmetricKey) -> Result<Vec<PersonCollection>, SharingError> {
         let listed = self.call(|client, auth| sharing_api::organization_collections(client, &mut auth.session, org))?;
-        Ok(listed.into_iter().filter_map(|c| collection_email(&c.name, key).map(|email| (c.id, email))).collect())
+        Ok(listed
+            .into_iter()
+            .filter_map(|c| collection_email(&c.name, key).map(|(email, authenticated)| PersonCollection { id: c.id, email, authenticated }))
+            .collect())
     }
 
     /// The org's roster, fresh: `/users`, or `/members` on an older server.
@@ -1065,7 +1118,8 @@ impl Sharing {
         let id = self
             .call(|client, auth| sharing_api::create_collection(client, &mut auth.session, &ctx.org_id, &name, &ctx.account.id))
             .map_err(|e| e.or_say(&format!("Couldn't prepare sharing with {email}. Try again.")))?;
-        ctx.collections.push((id.clone(), email.to_string()));
+        // Authenticated: this engine wrote the name, under the org key.
+        ctx.collections.push(PersonCollection { id: id.clone(), email: email.to_string(), authenticated: true });
         Ok(id)
     }
 
@@ -2027,8 +2081,10 @@ impl Sharing {
 
 impl Sharing {
     /// **The confirm pass** (spec 11.5). For each accepted member of this
-    /// account's sharing org whose email has a person collection (rule 2:
-    /// only a holder of the org key could have named it), fetch the key,
+    /// account's sharing org whose email has an AUTHENTICATED person
+    /// collection (rule 2: only a holder of the org key could have named it;
+    /// a plaintext name the server could have written does not count -- see
+    /// [`PersonCollection`]), fetch the key,
     /// compare it with the pin, and confirm -- wrapping the org key to it --
     /// unless the key changed. The roster is the one the last whole read
     /// fetched, so the whole-read and batch triggers cost no roster request;
@@ -2050,8 +2106,26 @@ impl Sharing {
     /// the error with `?` was the alternative, and it dropped the `changed`
     /// of every confirm that had already landed, so no `Sharing` change told
     /// a window about them (`one_refused_confirm_does_not_stop_the_next_person`).
-    /// A session that ended stops the loop at once: every later call would
-    /// fail the same way.
+    /// A session that ended, or a server that could not be reached, stops
+    /// the loop at once: every later call would fail the same way.
+    ///
+    /// # Who is not asked again
+    ///
+    /// A person already `keyChanged` is re-checked by the timer alone. Their
+    /// key does not come back to the pin often enough to spend a request on
+    /// every hub batch; the timer (which runs while they wait) still sees a
+    /// key that returned, and "Share anyway" is the user's way through before
+    /// then.
+    ///
+    /// # Pins that cannot be read
+    ///
+    /// **Nobody is confirmed while `sharing_state.json` is there and does not
+    /// parse.** Every confirm here is a pin decision -- compare, or trust on
+    /// first use -- and a file that cannot be read would read as no pins at
+    /// all, so a key already pinned and since swapped would be trusted as
+    /// new. The pass logs it and waits; `state_path == None` (a test's setup)
+    /// has no pins by design and is not this case
+    /// (`unreadable_pins_confirm_nobody`).
     ///
     /// # The org key
     ///
@@ -2081,11 +2155,16 @@ impl Sharing {
             mine.roster
                 .iter()
                 .filter(|m| m.status == MemberStatus::Accepted && m.user_id.as_deref().is_some_and(|id| !id.is_empty()))
-                .filter(|m| mine.collection_for(&m.email).is_some())
+                .filter(|m| mine.authenticated_collection_for(&m.email).is_some())
+                .filter(|m| trigger == Trigger::Timer || !held.key_changed.contains(&normalise_email(&m.email)))
                 .cloned()
                 .collect()
         };
         if candidates.is_empty() {
+            return Ok(false);
+        }
+        if !self.pins_readable() {
+            log::warn!("the sharing pins could not be read, so nobody is confirmed until they can be");
             return Ok(false);
         }
         let cached = self.keys.lock().unwrap_or_else(PoisonError::into_inner).as_ref().and_then(|keys| keys.organization(&org).cloned());
@@ -2104,7 +2183,7 @@ impl Sharing {
             let email = normalise_email(&member.email);
             match self.confirm_one(&org, &org_key, &account.id, &member, &email) {
                 Ok(moved) => changed |= moved,
-                Err(ended @ (SharingError::Vault(VaultError::Unauthorized) | SharingError::Unavailable(_))) => {
+                Err(ended @ SharingError::Vault(VaultError::Unauthorized | VaultError::Unreachable(_))) => {
                     log::info!("the confirm pass stopped: {ended}");
                     break;
                 }
@@ -2134,6 +2213,12 @@ impl Sharing {
         }
         self.confirm_to(org, org_key, account, member, email, sharing_api::AccountKey { user_id, public_key: spki })?;
         Ok(true)
+    }
+
+    /// Whether the pins can be read: no file configured (a test's setup),
+    /// no file yet, or one that parses. See [`Self::confirm_pass`].
+    fn pins_readable(&self) -> bool {
+        self.setup().state_path.is_none_or(|path| crate::sharing_state::SharingState::read(&path).is_some())
     }
 
     /// Confirms one member to one key, pins it, and marks them confirmed in
@@ -2172,10 +2257,22 @@ impl Sharing {
     /// fingerprint and trusts the new key. Confirmed to it, and it becomes the
     /// pin.
     ///
+    /// # Bound to the key the user checked
+    ///
+    /// `expected_sha256` is [`Fingerprint::key_sha256`] from the Show
+    /// fingerprint the user compared. The key is fetched again here, and one
+    /// that is not that key -- the server swapped it between the check and
+    /// the click -- is refused, the person is marked `keyChanged` again, and
+    /// neither the pin nor the membership changes
+    /// (`share_anyway_refuses_a_key_other_than_the_one_fingerprinted`).
+    /// Without it the click trusted whatever key the server served at that
+    /// moment, which is the attack the fingerprint exists to catch.
+    ///
     /// Held to the pass's rule 2 as well: only an accepted member whose email
-    /// has a person collection -- someone this account shares with -- is
-    /// confirmed here. The window offers the action only on such a card, but
-    /// the route takes any address, and a confirm hands over the org key.
+    /// has an authenticated person collection -- someone this account shares
+    /// with -- is confirmed here. The window offers the action only on such a
+    /// card, but the route takes any address, and a confirm hands over the
+    /// org key.
     ///
     /// The old pin is NOT dropped first. [`Self::confirm_to`] overwrites it
     /// once the confirm has landed; dropped first, a confirm that then
@@ -2185,12 +2282,12 @@ impl Sharing {
     /// # Errors
     ///
     /// The sentence to show, or the backend's failure.
-    pub fn confirm_anyway(&self, email: &str) -> Result<(), SharingError> {
+    pub fn confirm_anyway(&self, email: &str, expected_sha256: &str) -> Result<(), SharingError> {
         let _one = self.one_at_a_time();
         let ctx = self.context()?;
         let email = normalise_email(email);
         let not_waiting = || SharingError::Refused(format!("{email} is not waiting to be confirmed."));
-        if ctx.collection_for(&email).is_none() {
+        if ctx.authenticated_collection_for(&email).is_none() {
             return Err(not_waiting());
         }
         let member = self
@@ -2206,6 +2303,10 @@ impl Sharing {
         let spki = self
             .call(|client, auth| sharing_api::user_public_key(client, &mut auth.session, &user_id))?
             .ok_or_else(|| SharingError::Refused(format!("{email} has not signed in to a Bitwarden app yet.")))?;
+        if !crate::rest::crypto::public_key_sha256_hex(&spki).eq_ignore_ascii_case(expected_sha256.trim()) {
+            self.held().key_changed.insert(email.clone());
+            return Err(SharingError::Refused(format!("{email}'s key changed again. Check the fingerprint before sharing.")));
+        }
         self.confirm_to(&ctx.org_id, &ctx.org_key, &ctx.account.id, &member, &email, sharing_api::AccountKey { user_id, public_key: spki })?;
         if let Err(e) = self.reload_org(&ctx) {
             log::info!("the sharing view could not be re-read after a confirm: {e}");
@@ -2221,11 +2322,14 @@ impl Sharing {
     ///
     /// Any member of this account's org with an account: a confirmed one
     /// too, since the phrase is how the user checks a key they already trust.
+    /// The answer carries the key's SHA-256 beside the phrase, which "Share
+    /// anyway" sends back so it confirms the very key the user compared (see
+    /// [`Self::confirm_anyway`]).
     ///
     /// # Errors
     ///
     /// No key yet, the word list missing, or the backend's failure.
-    pub fn fingerprint(&self, email: &str) -> Result<String, SharingError> {
+    pub fn fingerprint(&self, email: &str) -> Result<Fingerprint, SharingError> {
         let ctx = self.context()?;
         let email = normalise_email(email);
         let member = self
@@ -2239,7 +2343,8 @@ impl Sharing {
             .ok_or_else(|| SharingError::Refused(format!("{email} has not signed in to a Bitwarden app yet.")))?;
         let words = crate::rest::eff_wordlist::load_from(&self.setup().eff_wordlist)
             .map_err(|e| SharingError::Refused(e.to_string()))?;
-        crate::rest::crypto::fingerprint_phrase(&user_id, &spki, &words).map_err(crypto)
+        let phrase = crate::rest::crypto::fingerprint_phrase(&user_id, &spki, &words).map_err(crypto)?;
+        Ok(Fingerprint { phrase, key_sha256: crate::rest::crypto::public_key_sha256_hex(&spki) })
     }
 }
 
@@ -2286,6 +2391,12 @@ mod tests {
         Sharing::new(crate::rest::api::RestClient::new("http://127.0.0.1:1"), Weak::new(), Arc::new(Mutex::new(None)))
     }
 
+    /// A person collection whose name decrypted under the org key -- what
+    /// a whole read holds for one this engine made.
+    fn authentic(id: &str, email: &str) -> PersonCollection {
+        PersonCollection { id: id.to_string(), email: email.to_string(), authenticated: true }
+    }
+
     fn member(email: &str, status: MemberStatus, collections: &[&str], expires: Option<&str>) -> Member {
         Member {
             id: format!("ou-{email}"),
@@ -2320,7 +2431,7 @@ mod tests {
                 id: "org1".into(),
                 collections: ["anna", "bob", "carol", "dan", "eve", "fay", "gus", "hal"]
                     .iter()
-                    .map(|n| (format!("c-{n}"), format!("{n}@x.io")))
+                    .map(|n| authentic(&format!("c-{n}"), &format!("{n}@x.io")))
                     .collect(),
                 roster: vec![
                     member("anna@x.io", MemberStatus::Confirmed, &["c-anna"], None),
@@ -4086,7 +4197,7 @@ mod tests {
         let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
         with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
-        engine.held().my_org = Some(MyOrg { id: FIXTURE_ORG.into(), collections: vec![("c-anna".into(), "anna@example.com".into())], roster: Vec::new() });
+        engine.held().my_org = Some(MyOrg { id: FIXTURE_ORG.into(), collections: vec![authentic("c-anna", "anna@example.com")], roster: Vec::new() });
         let roster_read = server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]))
@@ -4118,7 +4229,7 @@ mod tests {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         engine.held().my_org = Some(MyOrg {
             id: FIXTURE_ORG.into(),
-            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            collections: vec![authentic("c-anna", "anna@example.com")],
             roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
         });
         let roster_read = server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).expect(0).create();
@@ -4139,7 +4250,7 @@ mod tests {
         }).expect("seeded");
         engine.held().my_org = Some(MyOrg {
             id: FIXTURE_ORG.into(),
-            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            collections: vec![authentic("c-anna", "anna@example.com")],
             roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
         });
         server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
@@ -4158,7 +4269,7 @@ mod tests {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         engine.held().my_org = Some(MyOrg {
             id: FIXTURE_ORG.into(),
-            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            collections: vec![authentic("c-anna", "anna@example.com")],
             roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("mal-id", Some("mal-id"), "mallory@example.com", 1, &["c-anna"])] })).expect("a roster"),
         });
         let key = server.mock("GET", "/api/users/mal-id/public-key").expect(0).create();
@@ -4174,7 +4285,7 @@ mod tests {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         engine.held().my_org = Some(MyOrg {
             id: FIXTURE_ORG.into(),
-            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            collections: vec![authentic("c-anna", "anna@example.com")],
             roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
         });
         server.mock("GET", "/api/users/anna-id/public-key").with_status(404).create();
@@ -4194,7 +4305,8 @@ mod tests {
         with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
         server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
         let confirm = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str()).with_body("").expect(1).create();
-        engine.confirm_anyway("anna@example.com").expect("confirmed");
+        let fingerprinted = crate::rest::crypto::public_key_sha256_hex(&crate::rest::crypto::tests::fixture_public_spki());
+        engine.confirm_anyway("anna@example.com", &fingerprinted).expect("confirmed");
         confirm.assert();
         let pin = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
         assert_eq!(
@@ -4216,7 +4328,9 @@ mod tests {
             .mock("GET", format!("/api/users/{SDK_FINGERPRINT_USER}/public-key").as_str())
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(SDK_FINGERPRINT_KEY) }).to_string())
             .create();
-        assert_eq!(engine.fingerprint("anna@example.com").expect("a phrase"), SDK_FINGERPRINT_PHRASE);
+        let fingerprint = engine.fingerprint("anna@example.com").expect("a phrase");
+        assert_eq!(fingerprint.phrase, SDK_FINGERPRINT_PHRASE);
+        assert_eq!(fingerprint.key_sha256, crate::rest::crypto::public_key_sha256_hex(SDK_FINGERPRINT_KEY));
     }
 
     /// **One person's refused confirm does not hold up the next**: the pass
@@ -4228,7 +4342,7 @@ mod tests {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         engine.held().my_org = Some(MyOrg {
             id: FIXTURE_ORG.into(),
-            collections: vec![("c-anna".into(), "anna@example.com".into()), ("c-bob".into(), "bob@example.com".into())],
+            collections: vec![authentic("c-anna", "anna@example.com"), authentic("c-bob", "bob@example.com")],
             roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [
                 roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"]),
                 roster_row("bob-id", Some("bob-id"), "bob@example.com", 1, &["c-bob"]),
@@ -4262,8 +4376,143 @@ mod tests {
         with_roster(&mut server, &[roster_row("mal-id", Some("mal-id"), "mallory@example.com", 1, &["c-anna"])]);
         let key = server.mock("GET", "/api/users/mal-id/public-key").expect(0).create();
         let confirm = server.mock("POST", Matcher::Any).expect(0).create();
-        assert!(matches!(engine.confirm_anyway("mallory@example.com"), Err(SharingError::Refused(_))));
+        assert!(matches!(engine.confirm_anyway("mallory@example.com", &"11".repeat(32)), Err(SharingError::Refused(_))));
         key.assert();
         confirm.assert();
+    }
+
+    // ---- fix round 1: authenticated names, the checked key, unreadable pins ----
+
+    /// **A plaintext collection name is not rule 2** (review of Task 12): the
+    /// server can write `mallory@example.com` in plaintext itself, beside an
+    /// accepted row carrying its own key. Only a name that decrypted under
+    /// the org key lets "Share anyway" hand the org key over. The pass's half
+    /// is `vault_host`'s `a_plaintext_collection_name_never_confirms_anyone`,
+    /// which reads the name through a real whole read.
+    #[test]
+    fn share_anyway_refuses_a_plaintext_collection_name() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[serde_json::json!({ "id": "c-mal", "organizationId": FIXTURE_ORG, "name": "mallory@example.com" })]);
+        with_roster(&mut server, &[roster_row("mal-id", Some("mal-id"), "mallory@example.com", 1, &["c-mal"])]);
+        let key = server.mock("GET", "/api/users/mal-id/public-key").expect(0).create();
+        let confirm = server.mock("POST", Matcher::Any).expect(0).create();
+        let fingerprinted = crate::rest::crypto::public_key_sha256_hex(&crate::rest::crypto::tests::fixture_public_spki());
+        assert!(matches!(engine.confirm_anyway("mallory@example.com", &fingerprinted), Err(SharingError::Refused(_))));
+        key.assert();
+        confirm.assert();
+        // And the pass, over the same names read into `held` by a reload.
+        let ctx = engine.context().expect("a context");
+        assert!(ctx.collection_for("mallory@example.com").is_some() && ctx.authenticated_collection_for("mallory@example.com").is_none());
+        engine.reload_org(&ctx).expect("reloaded");
+        let pass = engine.refresh(Trigger::Timer).expect("a pass");
+        key.assert();
+        confirm.assert();
+        assert!(!pass.changed);
+    }
+
+    /// **"Share anyway" confirms the key the user fingerprinted, or nothing**:
+    /// a key swapped between Show fingerprint and the click is refused, the
+    /// person is `keyChanged` again, and neither the pin nor the membership
+    /// moves.
+    #[test]
+    fn share_anyway_refuses_a_key_other_than_the_one_fingerprinted() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let old = crate::sharing_state::Pin { sha256: "00".repeat(32), user_id: "anna-id".into(), at: 1 };
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            state.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", old.clone());
+        }).expect("seeded");
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
+        let confirm = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str()).expect(0).create();
+        match engine.confirm_anyway("anna@example.com", &"11".repeat(32)) {
+            Err(SharingError::Refused(said)) => {
+                assert_eq!(said, "anna@example.com's key changed again. Check the fingerprint before sharing.");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        confirm.assert();
+        let pinned = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert_eq!(pinned.pin_for("anna@example.com"), Some(&old), "the pin moved to a key nobody checked");
+        assert!(engine.held().key_changed.contains("anna@example.com"));
+    }
+
+    /// **Pins that cannot be read confirm nobody**: read as empty, a corrupt
+    /// `sharing_state.json` would be "no pins", and a swapped key would be
+    /// trusted on first use. The pass waits instead -- no key read, no
+    /// confirm.
+    #[test]
+    fn unreadable_pins_confirm_nobody() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        std::fs::write(dir.join("sharing_state.json"), b"{ not the state").expect("a corrupt file");
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![authentic("c-anna", "anna@example.com")],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
+        });
+        let key = server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).expect(0).create();
+        let confirm = server.mock("POST", Matcher::Any).expect(0).create();
+        let pass = engine.refresh(Trigger::WholeRead).expect("a pass");
+        key.assert();
+        confirm.assert();
+        assert!(!pass.changed);
+        // Control: it is the corrupt file that is refused, not a missing one.
+        std::fs::remove_file(dir.join("sharing_state.json")).expect("removed");
+        assert!(crate::sharing_state::SharingState::read(&dir.join("sharing_state.json")).is_some());
+    }
+
+    /// **A `keyChanged` person is not asked about on every batch**: a hub
+    /// batch skips them, and the timer still looks.
+    #[test]
+    fn a_changed_key_is_rechecked_by_the_timer_alone() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![authentic("c-anna", "anna@example.com")],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
+        });
+        engine.held().key_changed.insert("anna@example.com".into());
+        with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
+        let key = server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).expect(1).create();
+        server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str()).with_body("").create();
+        engine.refresh(Trigger::Batch).expect("a batch pass");
+        engine.refresh(Trigger::WholeRead).expect("a whole-read pass");
+        engine.refresh(Trigger::Timer).expect("the timer");
+        key.assert();
+    }
+
+    /// **The confirm wraps THE org key to THEIR key**: the posted `key`
+    /// opens under the fixture private key -- the half of the key the
+    /// server served for anna -- to exactly the org key, not merely to
+    /// something shaped like a type-4 string.
+    #[test]
+    fn the_posted_confirm_key_opens_to_the_org_key_under_their_private_key() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![authentic("c-anna", "anna@example.com")],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
+        });
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
+        let posted = Arc::new(Mutex::new(None::<String>));
+        let keep = Arc::clone(&posted);
+        let confirm = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str())
+            .with_body_from_request(move |request| {
+                let body: serde_json::Value = serde_json::from_slice(request.body()).expect("json");
+                *keep.lock().expect("unpoisoned") = body["key"].as_str().map(str::to_string);
+                Vec::new()
+            })
+            .expect(1)
+            .create();
+        engine.refresh(Trigger::WholeRead).expect("a pass");
+        confirm.assert();
+        let wrapped: EncString = posted.lock().expect("unpoisoned").clone().expect("a key was posted").parse().expect("an EncString");
+        let opened = crate::rest::crypto::unwrap_org_key(
+            &crate::rest::crypto::tests::hex(crate::rest::crypto::tests::ORG_KEY_PRIVATE_PKCS8_DER),
+            &wrapped,
+        )
+        .expect("opens under anna's private key");
+        assert!(opened == crate::rest::backend::tests::fixture_org_key(), "the confirm wrapped some other key");
     }
 }

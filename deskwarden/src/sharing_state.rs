@@ -105,13 +105,25 @@ impl SharingState {
     /// `sent_history` reads its own.
     #[must_use]
     pub fn load(path: &Path) -> Self {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return Self::default();
+        Self::read(path).unwrap_or_default()
+    }
+
+    /// [`Self::load`], telling "nothing there" from "something there that
+    /// cannot be read": absent or empty is `Some(empty)`, a file that will not
+    /// read or parse is `None`. What the confirm pass asks before it makes a
+    /// pin decision -- an unreadable file read as empty would be "no pins",
+    /// and every swapped key would be trusted on first use again.
+    #[must_use]
+    pub fn read(path: &Path) -> Option<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Self::default()),
+            Err(_) => return None,
         };
         if text.trim().is_empty() {
-            return Self::default();
+            return Some(Self::default());
         }
-        serde_json::from_str(&text).unwrap_or_default()
+        serde_json::from_str(&text).ok()
     }
 
     /// Writes the whole file atomically: a `.tmp` sibling, then a rename.

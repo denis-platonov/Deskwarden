@@ -834,4 +834,47 @@ mod tests {
         let page = api.feed().wait_after(Some(0), false, Duration::ZERO);
         assert!(page.changes.contains(&Change::Sharing), "{:?}", page.changes);
     }
+
+    /// **A plaintext collection name never confirms anyone** (review of Task
+    /// 12, spec 11.5 rule 2): a hostile server lists a collection named
+    /// `mallory@example.com` in plaintext -- a name it can write without the
+    /// org key -- beside an accepted row whose key is its own. The whole read
+    /// files the name, the card may show it, and the daemon's pass neither
+    /// reads mallory's key nor confirms her.
+    #[test]
+    fn a_plaintext_collection_name_never_confirms_anyone() {
+        use crate::rest::backend::tests::{FIXTURE_ORG, roster_row, sharing_org_row, sharing_profile};
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        backend.sharing_engine().set_up(crate::rest::sharing::SharingSetup::none());
+        server.mock("GET", "/api/accounts/revision-date").with_body("1700000000000").expect_at_least(0).create();
+        let profile = sharing_profile(serde_json::json!([sharing_org_row()]));
+        server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(serde_json::json!({
+                "object": "sync", "profile": profile.clone(), "folders": [], "ciphers": [],
+                "collections": [{ "id": "c-mal", "organizationId": FIXTURE_ORG, "name": "mallory@example.com", "object": "collection" }]
+            }).to_string())
+            .expect(1)
+            .create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(serde_json::json!({ "data": [roster_row("mal-id", Some("mal-id"), "mallory@example.com", 1, &["c-mal"])] }).to_string())
+            .expect_at_least(0)
+            .create();
+        server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
+        let key = serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string();
+        server.mock("GET", "/api/users/user-1/public-key").with_body(key.clone()).expect_at_least(0).create();
+        let mallorys_key = server.mock("GET", "/api/users/mal-id/public-key").with_body(key).expect(0).create();
+        let confirm = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
+
+        let cache = VaultCache::new(backend);
+        assert_eq!(cache.populate().expect("the daemon's load"), PopulateOutcome::Populated);
+        let api = an_api_over(cache);
+        api.sharing_pass(Trigger::WholeRead);
+        api.sharing_pass(Trigger::Timer);
+        mallorys_key.assert();
+        confirm.assert();
+        assert!(!api.sharing_wants_timer(), "nobody the pass may confirm is waiting");
+    }
 }

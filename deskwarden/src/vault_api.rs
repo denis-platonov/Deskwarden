@@ -586,8 +586,16 @@ impl VaultApi {
         }
     }
 
-    /// `POST /sharing/person/confirm {email}` -- "Share anyway" (spec 11.3).
-    /// Nothing in the vault moves, so only `sharing` is announced.
+    /// `POST /sharing/person/confirm {email, keySha256}` -- "Share anyway"
+    /// (spec 11.3). Nothing in the vault moves, so only `sharing` is
+    /// announced -- on a refusal too, since a key that changed again marks
+    /// the person `keyChanged` and the card must say so.
+    ///
+    /// **`keySha256` is required**: the hash Show fingerprint answered with,
+    /// binding the confirm to the key the user compared (see
+    /// `Sharing::confirm_anyway`). A body without one -- or with anything
+    /// but 64 hex digits -- is refused before the engine is asked, so no
+    /// client can confirm a key nobody checked.
     fn confirm_person(&self, body: &[u8]) -> ApiResponse {
         let engine = match self.engine() {
             Ok(engine) => engine,
@@ -596,18 +604,24 @@ impl VaultApi {
         let Some(email) = email_in(body) else {
             return ApiResponse::refused(400, "Say who to confirm.");
         };
-        match engine.confirm_anyway(&email) {
+        let Some(key_sha256) = key_sha256_in(body) else {
+            return ApiResponse::refused(400, "Check the fingerprint before sharing.");
+        };
+        match engine.confirm_anyway(&email, &key_sha256) {
             Ok(()) => {
                 self.feed.publish([Change::Sharing]);
                 ApiResponse::done()
             }
-            Err(e) => sharing_failed(&e),
+            Err(e) => {
+                self.feed.publish([Change::Sharing]);
+                sharing_failed(&e)
+            }
         }
     }
 
-    /// `POST /sharing/person/fingerprint {email}` -> `{phrase}` (spec 11.3).
-    /// A read: nothing is announced. A POST rather than a GET so the address
-    /// rides in the body, never in a query string.
+    /// `POST /sharing/person/fingerprint {email}` -> `{phrase, keySha256}`
+    /// (spec 11.3). A read: nothing is announced. A POST rather than a GET
+    /// so the address rides in the body, never in a query string.
     fn person_fingerprint(&self, body: &[u8]) -> ApiResponse {
         let engine = match self.engine() {
             Ok(engine) => engine,
@@ -617,7 +631,7 @@ impl VaultApi {
             return ApiResponse::refused(400, "Say whose fingerprint to show.");
         };
         match engine.fingerprint(&email) {
-            Ok(phrase) => ApiResponse::ok(serde_json::json!({ "phrase": phrase })),
+            Ok(fingerprint) => ApiResponse::ok(to_value(&fingerprint)),
             Err(e) => sharing_failed(&e),
         }
     }
@@ -743,6 +757,17 @@ fn email_in(body: &[u8]) -> Option<String> {
         .as_str()
         .map(str::to_string)
         .filter(|email| !email.trim().is_empty())
+}
+
+/// A body's `keySha256`: exactly 64 hex digits, the form
+/// `crypto::public_key_sha256_hex` writes, or nothing.
+fn key_sha256_in(body: &[u8]) -> Option<String> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("keySha256")?
+        .as_str()
+        .filter(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+        .map(str::to_ascii_lowercase)
 }
 
 /// A query string, read as `key=value` pairs. The keys this API reads are
@@ -1035,6 +1060,31 @@ pub(crate) mod tests {
         api.publish_outcome(&outcome, cache.epoch().era());
         assert_eq!(cache.items().first().map(|i| i.id.clone()), Some("moved-1".to_string()));
         assert!(api.feed().wait_after(Some(0), false, Duration::ZERO).changes.contains(&Change::Sharing));
+    }
+
+    /// **"Share anyway" without the fingerprinted key's hash is refused
+    /// before the engine is asked** (review of Task 12): no probe, no
+    /// profile, no key read, no confirm.
+    #[test]
+    fn a_confirm_without_the_checked_key_is_refused_and_asks_nothing() {
+        let (mut server, cache, api, token) = a_daemon();
+        cache.bridge().sharing().expect("a REST daemon has an engine").set_up(crate::rest::sharing::SharingSetup::none());
+        let probe = server.mock("GET", "/api/organizations/invitations/mine").expect(0).create();
+        let profile = server.mock("GET", "/api/accounts/profile").expect(0).create();
+        let writes = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
+        for body in [
+            r#"{"email":"anna@example.com"}"#,
+            r#"{"email":"anna@example.com","keySha256":"not-a-hash"}"#,
+            r#"{"email":"anna@example.com","keySha256":"0000"}"#,
+        ] {
+            let answer = ask(&api, "POST", "/sharing/person/confirm", Some(&token), body);
+            assert_eq!(answer.status, 400, "{body}");
+            let said: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
+            assert_eq!(said["message"], "Check the fingerprint before sharing.", "{body}");
+        }
+        probe.assert();
+        profile.assert();
+        writes.assert();
     }
 
     /// A wrong method on a sharing route is 405, not 404.
