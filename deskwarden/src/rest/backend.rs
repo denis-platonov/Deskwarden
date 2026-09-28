@@ -270,7 +270,9 @@ pub struct RestBackend {
     /// was rejected: `write_through`'s closure takes `&mut Authenticated`, so
     /// the state guard is already borrowed mutably across the send, and a
     /// reader wanting only the keys would have queued behind every write.
-    keys: Mutex<Option<Arc<VaultKeys>>>,
+    ///
+    /// **An `Arc`**, since personal sharing: the engine shares this cache rather than keeping a second one (see `rest::sharing`).
+    keys: Arc<Mutex<Option<Arc<VaultKeys>>>>,
     /// The last `GET /api/sync` this backend made, with the revision the
     /// server reported just before it.
     ///
@@ -343,6 +345,10 @@ pub struct RestBackend {
     /// The writers, `one_record` and `keys_only` never touch it: they are
     /// not whole-vault reads, and a write must not queue behind one.
     fetching: Mutex<()>,
+    /// **The personal-sharing engine** (`rest::sharing`), built with this
+    /// backend and dropped with it -- so an account switch, which is a new
+    /// `RestBackend`, is a new engine with nothing held.
+    sharing: Arc<crate::rest::sharing::Sharing>,
 }
 
 /// One sync, and the revision the server reported immediately before it.
@@ -396,12 +402,20 @@ impl RestBackend {
         // `None`, and it must be: a constructor that pre-warmed the key cache
         // would be a constructor that fetches, which is exactly what
         // `signed_in_with_no_sync_route`'s doc relies on not happening.
+        let keys = Arc::new(Mutex::new(None));
+        // The engine makes no request here either; see `Sharing::new`.
+        let sharing = Arc::new(crate::rest::sharing::Sharing::new(
+            client.clone(),
+            Arc::downgrade(&state),
+            Arc::clone(&keys),
+        ));
         Self {
             client,
             state,
-            keys: Mutex::new(None),
+            keys,
             synced: Mutex::new(None),
             fetching: Mutex::new(()),
+            sharing,
         }
     }
 
@@ -450,6 +464,12 @@ impl RestBackend {
     /// with, mapped as every other call in this file maps it.
     pub fn verify_stored_login(&self) -> Result<(), VaultError> {
         self.keys_only().map(|_| ())
+    }
+
+    /// The sharing engine, for tests and for `VaultBackend::sharing`.
+    #[must_use]
+    pub fn sharing_engine(&self) -> Arc<crate::rest::sharing::Sharing> {
+        Arc::clone(&self.sharing)
     }
 
     // ---- the two things every method starts with ---------------------------
@@ -632,12 +652,18 @@ impl RestBackend {
         // that trait would oblige four impls with nothing to say about
         // organisations each to say something. See that module's docs, which
         // argue the trade against this file's own rule about second caches.
-        crate::rest::organizations::remember(crate::rest::organizations::Directory::load(
+        let directory = crate::rest::organizations::Directory::load(
             &self.client,
             &mut state.session,
             &response,
             &keys,
-        ));
+        );
+        // The sharing engine takes what this read already paid for -- its
+        // org's roster and person collections -- so its confirm pass asks the
+        // server for no roster of its own (spec 11.5). It locks nothing of the
+        // session's; see `Sharing::note_directory`.
+        self.sharing.note_directory(&directory, response.profile.as_ref());
+        crate::rest::organizations::remember(directory);
         drop(state);
         let vault = Arc::new(vault);
         let keys = self.remember_keys(keys);
@@ -1457,6 +1483,11 @@ impl VaultBackend for RestBackend {
     fn revision_of_last_read(&self) -> Option<i64> {
         self.synced.lock().ok()?.as_ref().map(|cached| cached.revision)
     }
+
+    /// This backend's engine: sharing is a direct-REST feature (spec 7.4).
+    fn sharing(&self) -> Option<Arc<crate::rest::sharing::Sharing>> {
+        Some(Arc::clone(&self.sharing))
+    }
 }
 
 /// [`RestBackend::generate`]'s body, as a function: a generated secret and the
@@ -1633,7 +1664,9 @@ fn is_archived(item: &VaultItem) -> bool {
 ///
 /// **No arm carries a secret.** [`RestError`]'s own doc asserts that of every
 /// one of its variants, and this only formats them.
-fn rest_error(e: RestError) -> VaultError {
+///
+/// `pub(crate)` for `rest::sharing`, which maps the same errors the same way.
+pub(crate) fn rest_error(e: RestError) -> VaultError {
     match e {
         RestError::Unauthorized => VaultError::Unauthorized,
         RestError::Parse(what) => VaultError::Parse(format!("the server's answer was missing {what}")),
@@ -1694,7 +1727,9 @@ fn log_record_failures(id: &str, failures: &[crate::rest::sync::DecryptFailure])
 /// ciphertext or a key -- only a name for what was wrong -- so formatting it
 /// into a message that may be logged is safe by that type's construction, not
 /// by inspection here.
-fn crypto_error(e: CryptoError) -> VaultError {
+///
+/// `pub(crate)` for `rest::sharing`, which maps the same errors the same way.
+pub(crate) fn crypto_error(e: CryptoError) -> VaultError {
     VaultError::Http(format!("this vault's cryptography failed: {e}"))
 }
 
@@ -4020,5 +4055,116 @@ pub mod tests {
             assert!(!text.contains("master"), "{text}");
             assert!(!text.contains("AT-1") && !text.contains("RT-1"), "{text}");
         }
+    }
+
+    // ---- personal-sharing fixtures, shared with `rest::sharing`'s tests ----
+
+    pub const FIXTURE_EMAIL: &str = EMAIL;
+    pub const FIXTURE_USER_ID: &str = "user-1";
+    pub const FIXTURE_ORG: &str = "org1";
+
+    /// The fixture account's profile as `GET /api/accounts/profile` answers it
+    /// for sharing: its id and email, its user key, and its private key --
+    /// the OpenSSL fixture key, whose org-key ciphertext `sharing_org_row`
+    /// carries.
+    pub fn sharing_profile(organizations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "object": "profile",
+            "id": FIXTURE_USER_ID,
+            "email": EMAIL,
+            "role": "user",
+            "key": protected_user_key(),
+            "privateKey": seal(
+                &user_key(),
+                &crate::rest::crypto::tests::hex(crate::rest::crypto::tests::ORG_KEY_PRIVATE_PKCS8_DER)
+            ),
+            "organizations": organizations.clone(),
+            "organizationsNew": organizations,
+        })
+    }
+
+    /// The fixture account's own sharing org: owned, named for the fixture
+    /// email, its key the bytes 0..63 that OpenSSL wrapped to the fixture key.
+    pub fn sharing_org_row() -> serde_json::Value {
+        serde_json::json!({
+            "id": FIXTURE_ORG,
+            "name": format!("Shared by {EMAIL}"),
+            "role": "owner",
+            "type": 0,
+            "status": 2,
+            "enabled": true,
+            "key": format!(
+                "4.{}",
+                crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::hex(
+                    crate::rest::crypto::tests::ORG_KEY_WRAPPED_OAEP_SHA1
+                ))
+            )
+        })
+    }
+
+    /// A personal cipher in the fixture vault's shape.
+    pub fn personal_cipher(id: &str, name: &str) -> serde_json::Value {
+        cipher(id, name, &serde_json::json!({}))
+    }
+
+    /// A cipher in the fixture sharing org, filed in `collections`.
+    pub fn shared_cipher(id: &str, name: &str, collections: &[&str]) -> serde_json::Value {
+        let key = org_key();
+        serde_json::json!({
+            "object": "cipherDetails",
+            "id": id,
+            "type": 1,
+            "organizationId": FIXTURE_ORG,
+            "collectionIds": collections,
+            "key": null,
+            "creationDate": "2024-01-01T00:00:00.000000Z",
+            "revisionDate": "2024-02-02T00:00:00.000000Z",
+            "deletedDate": null,
+            "archivedDate": null,
+            "favorite": false,
+            "folderId": null,
+            "reprompt": 0,
+            "name": seal(&key, name.as_bytes()),
+            "fields": [],
+            "login": {
+                "username": seal(&key, b"u@example.com"),
+                "password": seal(&key, b"shared"),
+                "uris": []
+            }
+        })
+    }
+
+    pub fn fixture_org_key() -> SymmetricKey {
+        org_key()
+    }
+
+    /// An org key pair without generating one: the OpenSSL fixture key,
+    /// its private half under `org`. RSA-2048 generation is seconds in a
+    /// debug build and is tested once, in `crypto`.
+    pub fn fixture_key_pair(
+        org: &SymmetricKey,
+    ) -> Result<(String, crate::rest::crypto::EncString), CryptoError> {
+        let private = crate::rest::crypto::tests::hex(crate::rest::crypto::tests::ORG_KEY_PRIVATE_PKCS8_DER);
+        let public = crate::rest::crypto::public_key_of(&private)?;
+        Ok((crate::rest::crypto::tests::base64(&public), crate::rest::crypto::encrypt(org, &private)?))
+    }
+
+    /// A person collection of the fixture org: the email under the org key.
+    pub fn person_collection(id: &str, email: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "organizationId": FIXTURE_ORG, "name": seal(&org_key(), email.as_bytes()), "object": "collection" })
+    }
+
+    /// One `/users?includeCollections=true` row; read-only on every collection.
+    pub fn roster_row(ou: &str, user_id: Option<&str>, email: &str, status: i64, collections: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "object": "organizationUserUserDetails",
+            "id": ou,
+            "userId": user_id,
+            "email": email,
+            "type": if user_id == Some(FIXTURE_USER_ID) { 0 } else { 2 },
+            "status": status,
+            "collections": collections.iter().map(|c| serde_json::json!({ "id": c, "readOnly": true, "hidePasswords": false, "manage": false })).collect::<Vec<_>>(),
+            "invitationExpirationDate": null
+        })
     }
 }

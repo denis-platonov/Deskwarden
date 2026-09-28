@@ -159,5 +159,7 @@ pub mod send_link;
 /// Every request goes out through `api::RestClient::send_sharing`, the one
 /// door, and is built only here. No policy: `sharing` decides what to call.
 pub mod sharing_api;
+/// **The personal-sharing engine**, run by the daemon inside `RestBackend`.
+pub mod sharing;
 pub mod sync;
 pub mod write;

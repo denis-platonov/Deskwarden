@@ -167,6 +167,13 @@ pub trait VaultBackend: Send + Sync {
     /// **The revision the backend's last whole read was taken at**, without
     /// asking anything. `None` when it has made none, or has no such notion.
     fn revision_of_last_read(&self) -> Option<i64>;
+    /// **The personal-sharing engine**, where this backend has one.
+    ///
+    /// Only `rest::backend::RestBackend` does: sharing is a direct-REST
+    /// feature and is not offered on `bw serve` (spec 7.4). Every forwarding
+    /// impl forwards and every other says `None`, written out rather than
+    /// defaulted, by this trait's rule.
+    fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>>;
 }
 
 /// `bw serve`, as a backend.
@@ -272,6 +279,10 @@ impl VaultBackend for VaultBridge {
         None
     }
     fn revision_of_last_read(&self) -> Option<i64> {
+        None
+    }
+    // `bw serve` cannot invite, accept or make an org (spec 7.4).
+    fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
         None
     }
 }
@@ -443,6 +454,9 @@ impl VaultBackend for CachingBackend {
     fn revision_of_last_read(&self) -> Option<i64> {
         self.inner.revision_of_last_read()
     }
+    fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
+        self.inner.sharing()
+    }
 }
 
 impl VaultBackend for Box<dyn VaultBackend> {
@@ -520,6 +534,9 @@ impl VaultBackend for Box<dyn VaultBackend> {
     }
     fn revision_of_last_read(&self) -> Option<i64> {
         (**self).revision_of_last_read()
+    }
+    fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
+        (**self).sharing()
     }
 }
 
@@ -721,6 +738,9 @@ impl VaultBackend for LateBoundBackend {
     fn revision_of_last_read(&self) -> Option<i64> {
         self.read(|slot| slot.as_ref().and_then(|b| b.revision_of_last_read()))
     }
+    fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
+        self.read(|slot| slot.as_ref().and_then(|b| b.sharing()))
+    }
 }
 
 /// A shared handle to one [`LateBoundBackend`].
@@ -809,6 +829,9 @@ impl VaultBackend for SharedLateBoundBackend {
     }
     fn revision_of_last_read(&self) -> Option<i64> {
         (**self).revision_of_last_read()
+    }
+    fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
+        (**self).sharing()
     }
 }
 
@@ -925,6 +948,9 @@ mod late_bound_tests {
             None
         }
         fn revision_of_last_read(&self) -> Option<i64> {
+            None
+        }
+        fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
             None
         }
     }
@@ -1138,6 +1164,9 @@ mod caching_backend_tests {
             None
         }
         fn revision_of_last_read(&self) -> Option<i64> {
+            None
+        }
+        fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
             None
         }
     }

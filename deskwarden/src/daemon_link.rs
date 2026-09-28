@@ -381,6 +381,10 @@ impl VaultBackend for DaemonBackend {
     fn revision_of_last_read(&self) -> Option<i64> {
         None
     }
+    // A window's sharing goes through `SharingClient` to the daemon's engine; it has none of its own.
+    fn sharing(&self) -> Option<std::sync::Arc<crate::rest::sharing::Sharing>> {
+        None
+    }
 }
 
 #[cfg(test)]
