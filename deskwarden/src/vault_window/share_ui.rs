@@ -38,8 +38,7 @@ use crate::vault_bridge::VaultItem;
 
 // ---- the words (mock 6e's STATUS LINES) -----------------------------------------
 
-// The header's Share tooltip: drawn by Task 16's Share control.
-#[allow(dead_code)]
+/// The header's Share tooltip (mock 6b's hover).
 pub(crate) const SHARE_TOOLTIP: &str = "Share with a person \u{b7} view-only";
 pub(crate) const SHARE_UNAVAILABLE_TOOLTIP: &str =
     "Sharing with a person needs a NodeWarden server. This sends a link instead.";
@@ -73,11 +72,15 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 
 // ---- one person on one record ---------------------------------------------------------
 
-/// A person as the SHARING card lists them. Drawn by Task 17's card; until
-/// then only this file's tests build one.
+/// A person as the SHARING card lists them. Built for every record the read
+/// pane draws (`detail::PeopleSharing::people`) and drawn by Task 17's card;
+/// until then only this file's tests read one.
+///
+/// `pub` and not `pub(crate)` because `detail::PeopleSharing`, a field of
+/// `detail::draw_detail_read`'s public signature, carries a slice of them.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PersonLine {
+pub struct PersonLine {
     pub(crate) email: String,
     pub(crate) state: PersonState,
     /// The status line under the address (mock 6b).
@@ -145,9 +148,8 @@ fn since(history: &SentHistory, item_id: &str, email: &str) -> Option<i64> {
         .max()
 }
 
-/// **The people one record is shared with**, each with its status line.
-/// Called by Task 17's SHARING card.
-#[allow(dead_code)]
+/// **The people one record is shared with**, each with its status line --
+/// what the window hands the read pane in `detail::PeopleSharing::people`.
 pub(crate) fn person_lines(
     view: Option<&SharingView>,
     item_id: &str,
@@ -205,8 +207,8 @@ pub(crate) fn short_state(state: PersonState, expires_at: Option<&str>, now_ms: 
 /// **The header's Share control** for one record: `Some(true)` shares,
 /// `Some(false)` offers a Send instead (sharing is NodeWarden-only; owner's
 /// decision), `None` draws nothing -- a received record (view-only), or a
-/// window that has not heard from the daemon yet. Called by Task 16's header.
-#[allow(dead_code)]
+/// window that has not heard from the daemon yet. Read by the header through
+/// [`people_sharing`].
 pub(crate) fn share_control(view: Option<&SharingView>, linked: bool, item: &VaultItem) -> Option<bool> {
     if !linked {
         return Some(false);
@@ -219,9 +221,8 @@ pub(crate) fn share_control(view: Option<&SharingView>, linked: bool, item: &Vau
 }
 
 /// The names of the records shared with `email`, for the forget question
-/// (spec 11.7: records and Sends in one list). Called by Task 16's forget
-/// question.
-#[allow(dead_code)]
+/// (spec 11.7: records and Sends in one list) -- `vault_window::mod`'s
+/// `forget_request_for`.
 pub(crate) fn records_shared_with(view: Option<&SharingView>, email: &str, items: &[VaultItem]) -> Vec<String> {
     let Some(view) = view else {
         return Vec::new();
@@ -323,14 +324,12 @@ impl SharingPane {
         self.view.as_ref().is_some_and(|v| !v.incoming.is_empty())
     }
 
-    /// Read by Task 17's card.
-    #[allow(dead_code)]
+    /// Handed to the read pane by [`people_sharing`], for Task 17's card.
     pub(crate) fn confirming_for(&self, item_id: &str) -> Option<&str> {
         self.stop_confirming.as_ref().filter(|(id, _)| id == item_id).map(|(_, e)| e.as_str())
     }
 
-    /// Read by Task 17's card.
-    #[allow(dead_code)]
+    /// Handed to the read pane by [`people_sharing`], for Task 17's card.
     pub(crate) fn stopping_for(&self, item_id: &str) -> Option<&str> {
         self.stopping.as_ref().filter(|(id, _)| id == item_id).map(|(_, e)| e.as_str())
     }
@@ -367,35 +366,47 @@ impl SharingPane {
     }
 }
 
-/// **The Share dialog's state** (mock 6a). Drawn by Task 16's
-/// `draw_share_modal`; [`apply`] and this file's tests are its only users
-/// until then.
+/// **The Share dialog's state** (mock 6a), drawn by [`draw_share_modal`] and
+/// answered by [`answer_dialog`]. It lives in [`SharingPane::dialog`], so a
+/// report can reach it whether or not the frame is drawing it.
 ///
 /// No `Debug`: it holds the typed master password (the crate's rule for a
 /// body that mentions `Zeroizing`), and an [`InviteCode`], which is a
 /// credential for registering.
-#[allow(dead_code)]
 pub(crate) struct ShareDialog {
     pub(crate) item_id: String,
     pub(crate) item_name: String,
     pub(crate) email: String,
+    /// A share is out and its answer has not come: the dialog's spinner.
+    /// Set only by [`answer_dialog`] when `request` started the call, and
+    /// taken down by the answer or, on a refusal, at once.
     pub(crate) in_flight: bool,
     /// The last attempt's sentence.
     pub(crate) error: Option<String>,
     /// A share that left an invitation for an address with no account.
     pub(crate) waiting_account: Option<String>,
     /// The master password, typed to mint an invite code. Wiped on drop, and
-    /// replaced by an empty one whatever the mint answers.
+    /// taken out -- leaving an empty one -- the moment Create is pressed,
+    /// whatever the mint answers. Never logged, never in a `Debug`.
     pub(crate) password: Zeroizing<String>,
+    /// A mint is out: [`Self::in_flight`]'s twin for the invite code.
     pub(crate) minting: bool,
     pub(crate) invite_code: Option<InviteCode>,
-    /// The ✕ on a suggestion: forget this person, asked first.
-    pub(crate) forget: Option<String>,
+    // A suggestion's ✕ is not state: the dialog REPORTS it, as
+    // [`ShareDialogAction::Forget`], in the frame it was pressed, and the
+    // window asks the forget question. The `forget` field that stood here for
+    // it had no reader.
+    /// The address box has been given the keyboard once. 6a draws the box
+    /// focused on open -- one field, so the dialog is for typing into it --
+    /// and asking once rather than every frame is what lets a click on a
+    /// suggestion or a button take the focus away.
+    pub(crate) focused: bool,
 }
 
 impl ShareDialog {
-    /// Opened by Task 16's Share control.
-    #[allow(dead_code)]
+    /// A fresh dialog for one record. Called by `vault_window::mod`'s
+    /// `permit_share` alone, behind the re-prompt
+    /// (`exactly_one_line_opens_the_share_dialog`).
     pub(crate) fn opening(item_id: &str, item_name: &str) -> Self {
         Self {
             item_id: item_id.to_string(),
@@ -407,7 +418,7 @@ impl ShareDialog {
             password: Zeroizing::new(String::new()),
             minting: false,
             invite_code: None,
-            forget: None,
+            focused: false,
         }
     }
 }
@@ -421,8 +432,8 @@ impl ShareDialog {
 /// borrowed `&str`, and is wiped when the call is dropped at the end of
 /// [`run`] -- never copied into a plain `String` on the way.
 ///
-/// Only `View` has a caller in this task; the rest are sent by the cards
-/// Tasks 16-20 draw (Share, Forget, InviteCode: 16; Stop, Reinvite,
+/// `View`, and the Share dialog's three (Share, Forget, InviteCode), have
+/// callers; the rest are sent by the cards Tasks 17-20 draw (Stop, Reinvite,
 /// Fingerprint, Confirm: 17; Accept, Decline, Leave: 20).
 #[allow(dead_code)]
 pub(crate) enum SharingCall {
@@ -659,33 +670,49 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
             }
             return;
         }
-        SharingReport::Shared { email, item_name, result } => match result {
-            Ok(ShareResult::Shared) => {
-                pane.dialog = None;
-                toast(pane, shared_toast(&email));
-            }
-            Ok(ShareResult::WaitingAccept) => {
-                pane.dialog = None;
-                toast(pane, waiting_toast(&email, &item_name));
-            }
-            // The open dialog says it in its own words (mock 6a); with the
-            // dialog closed before the answer came, a toast does.
-            Ok(ShareResult::WaitingAccount) => match pane.dialog.as_mut() {
-                Some(dialog) => {
-                    dialog.in_flight = false;
-                    dialog.waiting_account = Some(email);
+        // **An answer lands only in the dialog that asked** -- the one with a
+        // share out (`in_flight`). A dialog closed before its answer came and
+        // a fresh one opened since, on this record or another, did not ask:
+        // painting the old share's "no account yet" or failure into it would
+        // put one record's outcome on another's dialog. Those answers are
+        // said the way a closed dialog's are, as a toast or a notice
+        // (`an_answer_does_not_land_in_a_dialog_that_did_not_ask`).
+        SharingReport::Shared { email, item_name, result } => {
+            let asked = pane.dialog.as_ref().is_some_and(|d| d.in_flight);
+            match result {
+                Ok(ShareResult::Shared) => {
+                    if asked {
+                        pane.dialog = None;
+                    }
+                    toast(pane, shared_toast(&email));
                 }
-                None => toast(pane, waiting_account_toast(&email)),
-            },
-            Err(sentence) => {
-                if let Some(dialog) = pane.dialog.as_mut() {
-                    dialog.in_flight = false;
-                    dialog.error = Some(sentence);
-                } else {
-                    pane.notice = Some(sentence);
+                Ok(ShareResult::WaitingAccept) => {
+                    if asked {
+                        pane.dialog = None;
+                    }
+                    toast(pane, waiting_toast(&email, &item_name));
                 }
+                // The open dialog says it in its own words (mock 6a); with
+                // the dialog closed before the answer came, a toast does.
+                Ok(ShareResult::WaitingAccount) => match pane.dialog.as_mut().filter(|_| asked) {
+                    Some(dialog) => {
+                        dialog.in_flight = false;
+                        dialog.waiting_account = Some(email);
+                    }
+                    None => toast(pane, waiting_account_toast(&email)),
+                },
+                // The engine's refusals -- a record with attachments, in the
+                // trash, in another organisation, waiting to come home -- are
+                // its own sentences, and the dialog is where they are read.
+                Err(sentence) => match pane.dialog.as_mut().filter(|_| asked) {
+                    Some(dialog) => {
+                        dialog.in_flight = false;
+                        dialog.error = Some(sentence);
+                    }
+                    None => pane.notice = Some(sentence),
+                },
             }
-        },
+        }
         SharingReport::Stopped { email, result } => {
             pane.stopping = None;
             pane.stop_confirming = None;
@@ -699,23 +726,35 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                 pane.notice = Some(sentence);
             }
         }
+        // A forget's failure can name a decrypted record ("Couldn't stop
+        // sharing Wi-Fi ..."), so it is SHOWN -- in the Share dialog when the
+        // forget came from its suggestions and it is still open, on the card
+        // otherwise -- and never logged (module doc).
         SharingReport::Forgot(result) => {
             if let Err(sentence) = result {
-                pane.notice = Some(sentence);
+                match pane.dialog.as_mut() {
+                    Some(dialog) => dialog.error = Some(sentence),
+                    None => pane.notice = Some(sentence),
+                }
             }
         }
-        SharingReport::InviteCode(result) => {
-            if let Some(dialog) = pane.dialog.as_mut() {
+        // Only the dialog that is minting takes a code -- the share answer's
+        // rule above, for the same reason.
+        SharingReport::InviteCode(result) => match pane.dialog.as_mut().filter(|d| d.minting) {
+            Some(dialog) => {
                 dialog.minting = false;
                 dialog.password = Zeroizing::new(String::new());
                 match result {
                     Ok(code) => dialog.invite_code = Some(code),
                     Err(sentence) => dialog.error = Some(sentence),
                 }
-            } else if let Err(sentence) = result {
-                pane.notice = Some(sentence);
             }
-        }
+            None => {
+                if let Err(sentence) = result {
+                    pane.notice = Some(sentence);
+                }
+            }
+        },
     }
     pane.busy = false;
     pane.stale = true;
@@ -766,6 +805,510 @@ pub(crate) fn reload_sent_history(path: &std::path::Path, unsaved: &mut Vec<Unsa
     let mut history = SentHistory::load(path);
     unsaved.iter().for_each(|change| change.apply_to(&mut history));
     history
+}
+
+// ---- the read pane's half (design 6a, 6b, 6d) -------------------------------------
+
+/// **Everything the read pane is told about sharing, for one record**, in
+/// one place: the Share control's answer, the people and their lines, the
+/// stop and fingerprint states, and who shares a received record. Both of
+/// the window's read-pane callers build it here, so the pane behind the
+/// sequence builder and the live one cannot resolve the header two ways.
+pub(crate) fn people_sharing<'a>(
+    pane: &'a SharingPane,
+    linked: bool,
+    item: &VaultItem,
+    people: &'a [PersonLine],
+) -> super::detail::PeopleSharing<'a> {
+    super::detail::PeopleSharing {
+        share_control: share_control(pane.view.as_ref(), linked, item),
+        people,
+        confirming: pane.confirming_for(&item.id),
+        stopping: pane.stopping_for(&item.id),
+        fingerprint: pane.fingerprint.as_ref().map(|(email, f)| (email.as_str(), f.phrase.as_str())),
+        view_only_from: pane.view.as_ref().and_then(|v| v.received_from(&item.id)),
+    }
+}
+
+// ---- the Share dialog (mock 6a) ------------------------------------------------------
+//
+// **Built from the Send composer's parts, on purpose.** 6a's own note is that
+// the dialog is "styled like Send a record, narrower because it has one
+// field", so it is `theme::form_card` and its three bands, `record_ui`'s
+// RECORD chip, `send_ui`'s suggestion list and the composer's footer --
+// called, not copied -- and only what 6a draws that 5a does not (the share
+// mark on the title, the access sentence, the no-account band) is new here.
+
+pub(crate) const SHARE_BUTTON: &str = "Share";
+pub(crate) const CANCEL_BUTTON: &str = "Cancel";
+pub(crate) const DONE_BUTTON: &str = "Done";
+/// The administrator's button on the no-account band. An invite code is
+/// NodeWarden's way in for a new account (plan decision 4: no email is sent),
+/// minted for the one pending invitation the share just left.
+pub(crate) const MAKE_CODE_BUTTON: &str = "Create an invite code";
+pub(crate) const COPY_CODE_BUTTON: &str = "Copy";
+/// What the copy confirmation calls the code: "Invite code copied".
+pub(crate) const INVITE_CODE_LABEL: &str = "Invite code";
+const RECORD_EYEBROW: &str = "RECORD";
+const WITH_EYEBROW: &str = "WITH";
+const WITH_HINT: &str = "Their email address";
+/// 6a's eyebrow over the suggestions: the Send composer's `SENT TO BEFORE`,
+/// renamed because this list is fed by shares as well as Sends.
+const SUGGESTIONS_EYEBROW: &str = "SHARED WITH BEFORE";
+/// 6a's footer note. `Sent` is the rail's own word for the list a share is
+/// filed in (`sidebar::SENDS_ROW_LABEL`).
+const APPEARS_IN_SENT: &str = "Appears in Sent";
+/// The footer note while a share is out -- mock 6e's `Stopping…` idiom.
+const SHARING_NOW: &str = "Sharing\u{2026}";
+/// The footer note while a code is being made.
+const MAKING_CODE: &str = "Making a code\u{2026}";
+const PASSWORD_HINT: &str = "Your master password";
+/// 6a's `.modal { width: 560px }`: 5a's card, narrower by the Access block it
+/// does not have. Wide enough that `theme::form_card_pad_x` gives every band
+/// the design's 18 (its threshold is 470).
+const MODAL_WIDTH: f32 = 560.0;
+/// 6a's `ic('eye', 16, ...)` before the access sentence, its `margin-top:
+/// 1px`, and the `gap: 10px` after it.
+const ACCESS_EYE: f32 = 16.0;
+const ACCESS_EYE_GAP: f32 = 10.0;
+/// 6a's `.mband`: `padding: 12px 18px`, a 15-point info mark with `gap: 9px`.
+const BAND_PAD_Y: i8 = 12;
+const BAND_MARK: f32 = 15.0;
+const BAND_MARK_GAP: f32 = 9.0;
+/// The password box beside Create an invite code.
+const PASSWORD_BOX_WIDTH: f32 = 220.0;
+/// The scrim of the forget question, which can stand over this dialog (a
+/// suggestion's ✕ asks it). While it is up, Escape is that question's.
+const FORGET_SCRIM: &str = "record-forget-scrim";
+
+/// 6a's access sentence, with `view-only` in the ink and weight the mock's
+/// `<b>` gives it, wrapped at `width`. 12px at a 1.5 line height, the
+/// mock's `.access .t`.
+fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
+    let plain = egui::TextFormat {
+        font_id: egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        color: theme::TEXT_SECONDARY,
+        line_height: Some(18.0),
+        ..Default::default()
+    };
+    let strong = egui::TextFormat {
+        font_id: egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+        color: theme::INK,
+        ..plain.clone()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.append("They get ", 0.0, plain.clone());
+    job.append("view-only", 0.0, strong);
+    job.append(
+        &format!(
+            " access: they can see, copy and autofill it, but not edit, delete or share it on. \
+             When you edit {record}, their copy changes too. You can stop sharing at any time \
+             from the record."
+        ),
+        0.0,
+        plain,
+    );
+    job.wrap.max_width = width;
+    job
+}
+
+/// **The no-account band's two sentences** -- the bold line and the one
+/// under it.
+///
+/// **NodeWarden sends no email** (plan decision 4), so this says what really
+/// happens next: the person needs an invite code to sign up, and the band
+/// never says an invitation was emailed, which is mock 6a's wording for the
+/// official server's flow. An administrator is told they can make that code
+/// here; anybody else, who makes it.
+fn no_account_band(email: &str, record: &str, admin: bool) -> (String, String) {
+    let head = format!("Waiting for {email} to create an account \u{b7} the invitation lasts 7 days.");
+    let who = if admin {
+        "They need an invite code to sign up. You are this server's administrator, so you can \
+         create one below and give it to them."
+    } else {
+        "They need an invite code from your server's administrator to sign up."
+    };
+    let body = format!(
+        "{who} {record} reaches their vault after they sign up and accept, and you can re-invite \
+         them from the record."
+    );
+    (head, body)
+}
+
+/// What an invite code is handed on as: the link where the server gave one,
+/// the bare code otherwise.
+pub(crate) fn invite_text(code: &InviteCode) -> &str {
+    code.link.as_deref().unwrap_or(&code.code)
+}
+
+/// A suggestion's count, by kind (mock 6a: "2 shared", "3 sent").
+fn person_count_words(person: &crate::sent_history::Person) -> String {
+    match (person.sent, person.shared) {
+        (0, shared) => format!("{shared} shared"),
+        (sent, 0) => super::send_ui::sent_count_words(sent),
+        (sent, shared) => format!("{shared} shared, {sent} sent"),
+    }
+}
+
+/// What the dialog asked for this frame.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ShareDialogAction {
+    None,
+    Submit,
+    Cancel,
+    MintCode,
+    /// A suggestion's ✕: the window asks the forget question.
+    Forget(String),
+    Done,
+    /// The made invite code's Copy: the window copies it the way it copies
+    /// every credential (`clipboard::copy_secret`), which this file does not
+    /// reach.
+    CopyCode,
+}
+
+/// **Draws the Share dialog** over the window: scrim, card, the record,
+/// the WITH field with suggestions from the one address book (Sends and
+/// shares), what view-only means, and Share/Cancel -- or, after a share to an
+/// address with no account, the band that says so and Done.
+///
+/// **It decides nothing it draws.** What a press does is [`answer_dialog`]'s;
+/// this only reports which press it was. Share, Cancel, Done, the corner ✕
+/// and Escape are all refused while a share or a mint is out -- the Send
+/// composer's rule, and the reason is the same: a dialog closed under its own
+/// spinner has an answer coming that nothing is waiting for.
+pub(crate) fn draw_share_modal(
+    ctx: &egui::Context,
+    dialog: &mut ShareDialog,
+    item: Option<&VaultItem>,
+    folder: Option<&str>,
+    history: &SentHistory,
+    view: Option<&SharingView>,
+) -> ShareDialogAction {
+    let mut action = ShareDialogAction::None;
+    let busy = dialog.in_flight || dialog.minting;
+    let admin = view.is_some_and(|v| v.can_mint_invites);
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-share-scrim")));
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-share-modal"))).show(ctx, |ui| {
+        // Before the card, not after: a drag strip laid over the card's
+        // controls would swallow their clicks (`theme::modal_drag_handle`).
+        theme::modal_drag_handle(ui, theme::FORM_CARD_HEADER_HEIGHT);
+        ui.set_max_width(MODAL_WIDTH);
+        let (card, title) = theme::form_card(ui, |ui| {
+            let title = theme::form_card_header_share(ui, &format!("Share {}", dialog.item_name));
+            theme::form_card_body(ui, |ui| {
+                ui.set_width(ui.available_width());
+                theme::eyebrow(ui, RECORD_EYEBROW);
+                ui.add_space(theme::EYEBROW_GAP);
+                super::record_ui::record_chip(ui, &dialog.item_name, &super::record_ui::chip_subtitle(item, folder));
+                ui.add_space(theme::BLOCK_GAP);
+
+                // **The WITH box** -- read-only once the share has left an
+                // invitation (6a's fourth state draws the address greyed):
+                // the answer on the band is about that address, and editing
+                // it under the band would make the two disagree.
+                theme::eyebrow(ui, WITH_EYEBROW);
+                ui.add_space(theme::EYEBROW_GAP);
+                let editable = !busy && dialog.waiting_account.is_none();
+                let width = ui.available_width();
+                let field = ui
+                    .add_enabled_ui(editable, |ui| theme::inline_field(ui, &mut dialog.email, WITH_HINT, width, false))
+                    .inner;
+                if editable && !dialog.focused {
+                    field.request_focus();
+                    dialog.focused = true;
+                }
+                if let Some(email) = super::send_ui::draw_people_suggestions(
+                    ui,
+                    egui::Id::new("record-share-suggestions"),
+                    &field,
+                    &mut dialog.email,
+                    history,
+                    editable,
+                    SUGGESTIONS_EYEBROW,
+                    &person_count_words,
+                ) {
+                    action = ShareDialogAction::Forget(email);
+                }
+                // The ↵ on the Share button is a promise: Enter in the box
+                // shares. A single-line box gives up the keyboard on Enter,
+                // which is how the press is seen here.
+                if editable
+                    && field.lost_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    && !dialog.email.trim().is_empty()
+                {
+                    action = ShareDialogAction::Submit;
+                }
+                ui.add_space(theme::BLOCK_GAP);
+                ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(ACCESS_EYE), egui::Sense::hover());
+                    theme::paint_view_eye(ui.painter(), mark.translate(egui::vec2(0.0, 1.0)), theme::TEXT_MUTED);
+                    ui.add_space(ACCESS_EYE_GAP);
+                    let width = ui.available_width();
+                    ui.add(egui::Label::new(access_job(&dialog.item_name, width)).wrap());
+                });
+                // The last attempt's sentence -- the engine's refusal (a
+                // record with attachments, in the trash, in another
+                // organisation, waiting to come home), a refused request, a
+                // forget that did not finish. Shown here and never logged.
+                if let Some(error) = &dialog.error {
+                    ui.add_space(10.0);
+                    ui.add(egui::Label::new(egui::RichText::new(error).size(12.0).color(theme::ERROR)).wrap());
+                }
+            });
+            if let Some(email) = dialog.waiting_account.clone() {
+                if let Some(asked) = no_account_block(ui, dialog, &email, admin) {
+                    action = asked;
+                }
+            }
+            // **5a's footer, answers left and a standing note right** --
+            // and the note says what is running while something is.
+            theme::form_card_footer(ui, |ui| {
+                let note = if dialog.in_flight {
+                    SHARING_NOW
+                } else if dialog.minting {
+                    MAKING_CODE
+                } else {
+                    APPEARS_IN_SENT
+                };
+                ui.horizontal(|ui| {
+                    if dialog.waiting_account.is_some() {
+                        if theme::primary_button_enabled(ui, DONE_BUTTON, None, !busy).clicked() {
+                            action = ShareDialogAction::Done;
+                        }
+                    } else {
+                        let ready = !busy && !dialog.email.trim().is_empty();
+                        if theme::primary_button_enabled(ui, SHARE_BUTTON, Some("\u{21b5}"), ready).clicked() {
+                            action = ShareDialogAction::Submit;
+                        }
+                        ui.add_space(theme::FORM_FOOTER_GAP);
+                        if ui.add_enabled_ui(!busy, |ui| theme::secondary_button(ui, CANCEL_BUTTON)).inner.clicked() {
+                            action = ShareDialogAction::Cancel;
+                        }
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        theme::form_footer_note(ui, note);
+                    });
+                });
+            });
+            title
+        });
+        // 6a's `.mhead .x`: the ✕ answers what Cancel answers, gated by
+        // what gates it -- `record_ui::draw_export_form`'s rule.
+        if theme::modal_corner_mark_gated(ui, card, title, !busy) {
+            action = ShareDialogAction::Cancel;
+        }
+        // **The app's own copy confirmation, over this card** -- the invite
+        // code's Copy says "Invite code copied" the way every copy in this
+        // window does. Drawn inside the modal's area, on its layer, for
+        // `totp_add`'s reason: the read pane's toast would be painted under
+        // this card (and stands down while a modal is up).
+        super::detail::draw_copy_toast(ui, card);
+    });
+    // Escape is Cancel -- unless the forget question is standing over this
+    // dialog, where Escape is that question's "No" and must not also close
+    // the dialog underneath it.
+    let forget_up = ctx.memory(|m| {
+        m.areas().is_visible(&egui::LayerId::new(theme::SCRIM_ORDER, egui::Id::new(FORGET_SCRIM)))
+    });
+    if action == ShareDialogAction::None && !busy && !forget_up && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        action = ShareDialogAction::Cancel;
+    }
+    action
+}
+
+/// **6a's no-account band**, between the body and the footer: the amber of
+/// `totp_add`'s 6c band rather than `theme::form_card_caution`'s red, and an
+/// info mark rather than a warning, because nothing went wrong -- the share
+/// went through and is waiting for somebody to sign up.
+///
+/// An administrator also gets the invite code here: a master-password box and
+/// Create an invite code, then the code with a Copy. Only an administrator
+/// (`SharingView::can_mint_invites`), and only here -- a code is minted for
+/// the one pending invitation this share left, so there is nothing to mint
+/// for before it exists.
+fn no_account_block(
+    ui: &mut egui::Ui,
+    dialog: &mut ShareDialog,
+    email: &str,
+    admin: bool,
+) -> Option<ShareDialogAction> {
+    let mut asked = None;
+    let (head, body) = no_account_band(email, &dialog.item_name, admin);
+    // 6a's `border-top: 1px solid var(--caution-edge)`.
+    let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rule, egui::CornerRadius::ZERO, theme::CAUTION_EDGE);
+    egui::Frame::new()
+        .fill(theme::CAUTION_WASH)
+        .inner_margin(egui::Margin::symmetric(theme::form_card_pad_x(ui.available_width()), BAND_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(BAND_MARK), egui::Sense::hover());
+                theme::paint_info_mark(ui.painter(), mark.translate(egui::vec2(0.0, 1.0)), theme::CAUTION_MARK);
+                ui.add_space(BAND_MARK_GAP);
+                ui.vertical(|ui| {
+                    let width = ui.available_width();
+                    ui.add(egui::Label::new(band_job(&head, &body, width)).wrap());
+                    if !admin {
+                        return;
+                    }
+                    ui.add_space(10.0);
+                    match &dialog.invite_code {
+                        Some(code) => {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = theme::FORM_FOOTER_GAP;
+                                ui.label(
+                                    egui::RichText::new(invite_text(code))
+                                        .size(13.0)
+                                        .monospace()
+                                        .color(theme::INK),
+                                );
+                                if theme::row_button(ui, COPY_CODE_BUTTON).clicked() {
+                                    asked = Some(ShareDialogAction::CopyCode);
+                                }
+                            });
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new(format!("Give it to {email}. They enter it when they sign up."))
+                                    .size(12.0)
+                                    .color(theme::CAUTION_INK),
+                            );
+                        }
+                        None => {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = theme::FORM_FOOTER_GAP;
+                                let field = ui
+                                    .add_enabled_ui(!dialog.minting, |ui| {
+                                        theme::inline_field(ui, &mut dialog.password, PASSWORD_HINT, PASSWORD_BOX_WIDTH, true)
+                                    })
+                                    .inner;
+                                let can = !dialog.minting && !dialog.password.is_empty();
+                                let pressed = ui
+                                    .add_enabled_ui(can, |ui| theme::secondary_button(ui, MAKE_CODE_BUTTON))
+                                    .inner
+                                    .clicked();
+                                let entered = can && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if pressed || entered {
+                                    asked = Some(ShareDialogAction::MintCode);
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+        });
+    asked
+}
+
+/// The band's paragraph: the bold line, a break, the plain one -- 6a's
+/// `<b>…</b><br>…` at 12px and a 1.5 line height, in the caution ink.
+fn band_job(head: &str, body: &str, width: f32) -> egui::text::LayoutJob {
+    let plain = egui::TextFormat {
+        font_id: egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        color: theme::CAUTION_INK,
+        line_height: Some(18.0),
+        ..Default::default()
+    };
+    let strong = egui::TextFormat {
+        font_id: egui::FontId::new(12.0, egui::FontFamily::Name(theme::BOLD.into())),
+        ..plain.clone()
+    };
+    let mut job = egui::text::LayoutJob::default();
+    job.append(head, 0.0, strong);
+    job.append("\n", 0.0, plain.clone());
+    job.append(body, 0.0, plain);
+    job.wrap.max_width = width;
+    job
+}
+
+/// **What a press in the dialog does**, and the one place it is decided:
+/// the dialog goes back into the pane or is dropped, and a share or a mint
+/// is asked for through [`request`].
+///
+/// **A refused request never leaves a spinner up.** `request` answers
+/// `false` with its sentence in [`SharingPane::notice`] and no report coming
+/// -- no line to the daemon, or a write already out -- so the spinner this
+/// raised is taken down here, at once, and the sentence moves into the
+/// dialog, which is what the user is looking at
+/// (`a_refused_request_never_leaves_the_dialogs_spinner_up`).
+///
+/// **The master password leaves the dialog on Create**, taken rather than
+/// copied: the call carries the one copy and wipes it when it is dropped,
+/// whether it ran or was refused. Cancel and Done drop the dialog, which
+/// wipes whatever was typed.
+///
+/// Answers what the window must do itself: [`ShareDialogAction::Forget`]
+/// (the forget question is the window's) and
+/// [`ShareDialogAction::CopyCode`] (so is the clipboard); `None` otherwise.
+pub(crate) fn answer_dialog(
+    pane: &mut SharingPane,
+    mut dialog: ShareDialog,
+    action: ShareDialogAction,
+    client: Option<&SharingClient>,
+    ctx: &egui::Context,
+    tx: &mpsc::Sender<SharingReport>,
+) -> ShareDialogAction {
+    let busy = dialog.in_flight || dialog.minting;
+    match action {
+        ShareDialogAction::Cancel | ShareDialogAction::Done => ShareDialogAction::None,
+        ShareDialogAction::Submit if !busy && !dialog.email.trim().is_empty() => {
+            dialog.in_flight = true;
+            dialog.error = None;
+            let call = SharingCall::Share {
+                item_id: dialog.item_id.clone(),
+                item_name: dialog.item_name.clone(),
+                email: dialog.email.trim().to_string(),
+            };
+            pane.dialog = Some(dialog);
+            if !request(pane, client, ctx, tx, call) {
+                say_refusal_in_dialog(pane);
+            }
+            ShareDialogAction::None
+        }
+        ShareDialogAction::MintCode if !busy => {
+            let password = std::mem::replace(&mut dialog.password, Zeroizing::new(String::new()));
+            match dialog.waiting_account.clone().filter(|_| !password.is_empty()) {
+                Some(email) => {
+                    dialog.minting = true;
+                    dialog.error = None;
+                    pane.dialog = Some(dialog);
+                    if !request(pane, client, ctx, tx, SharingCall::InviteCode { email, password }) {
+                        say_refusal_in_dialog(pane);
+                    }
+                }
+                None => pane.dialog = Some(dialog),
+            }
+            ShareDialogAction::None
+        }
+        ShareDialogAction::Forget(email) => {
+            pane.dialog = Some(dialog);
+            ShareDialogAction::Forget(email)
+        }
+        ShareDialogAction::CopyCode => {
+            pane.dialog = Some(dialog);
+            ShareDialogAction::CopyCode
+        }
+        ShareDialogAction::None | ShareDialogAction::Submit | ShareDialogAction::MintCode => {
+            pane.dialog = Some(dialog);
+            ShareDialogAction::None
+        }
+    }
+}
+
+/// **A request the pane refused, said in the open dialog**: its spinners
+/// down and [`request`]'s sentence moved out of the notice into the dialog's
+/// error, so it is said once and where the user is looking. For the window's
+/// own requests made from the dialog (a forget from a suggestion's ✕) as
+/// well as [`answer_dialog`]'s.
+pub(crate) fn say_refusal_in_dialog(pane: &mut SharingPane) {
+    if let Some(dialog) = pane.dialog.as_mut() {
+        dialog.in_flight = false;
+        dialog.minting = false;
+        dialog.error = pane.notice.take();
+    }
 }
 
 #[cfg(test)]
@@ -866,12 +1409,15 @@ mod tests {
         assert!(!pane.wants_view(0.0), "one question at a time");
         apply(&mut pane, SharingReport::View(Ok(view(vec![("anna@x.io", PersonState::Shared, None)], vec![("r1", vec!["anna@x.io"])]))), 0.0);
         assert_eq!(pane.sent_pairs(), 1);
-        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        // A dialog whose share is out -- the only kind an answer lands in
+        // (`an_answer_does_not_land_in_a_dialog_that_did_not_ask`).
+        let asked = || ShareDialog { in_flight: true, ..ShareDialog::opening("r1", "Acme VPN") };
+        pane.dialog = Some(asked());
         apply(&mut pane, SharingReport::Shared { email: "anna@x.io".into(), item_name: "Acme VPN".into(), result: Ok(ShareResult::Shared) }, 1.0);
         assert!(pane.dialog.is_none());
         assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Shared with anna@x.io. It is in their vault now."));
         assert!(pane.wants_view(0.0), "a write makes the view stale");
-        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        pane.dialog = Some(asked());
         apply(&mut pane, SharingReport::Shared { email: "b@x.io".into(), item_name: "Acme VPN".into(), result: Err("Couldn't share the record. It's still in your vault.".into()) }, 2.0);
         assert_eq!(pane.dialog.as_ref().and_then(|d| d.error.as_deref()), Some("Couldn't share the record. It's still in your vault."));
     }
@@ -1126,7 +1672,7 @@ mod tests {
         assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Waiting for carol@x.io to create an account."));
 
         pane.toast = None;
-        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        pane.dialog = Some(ShareDialog { in_flight: true, ..ShareDialog::opening("r1", "Acme VPN") });
         apply(&mut pane, shared("carol@x.io", ShareResult::WaitingAccount), 2.0);
         assert!(pane.toast.is_none(), "the open dialog says it instead");
         assert_eq!(pane.dialog.as_ref().and_then(|d| d.waiting_account.as_deref()), Some("carol@x.io"));
@@ -1169,6 +1715,302 @@ mod tests {
         let history = reload_sent_history(&stuck, &mut unsaved);
         assert_eq!(ids(&history), vec!["mine".to_string()]);
         assert_eq!(unsaved.len(), 1, "kept for the next attempt");
+    }
+
+    /// A harness frame: the dialog drawn over a 1100x800 window, and every
+    /// string it painted.
+    fn modal_frame(dialog: &mut ShareDialog, history: &SentHistory, view: Option<&SharingView>, events: Vec<egui::Event>) -> (ShareDialogAction, Vec<(String, egui::Rect)>) {
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 800.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        // TWO frames of the modal before the measured one. The first is the
+        // anchored area's sizing pass, which paints nothing and registers no
+        // widget; egui hit-tests a press against the widgets of the frame
+        // BEFORE it, so a click on the frame after the sizing pass lands on
+        // nothing. The second is the one a click is tested against.
+        for _ in 0..2 {
+            let _ = ctx.run_ui(input(Vec::new()), |ui| {
+                let _ = draw_share_modal(ui.ctx(), dialog, None, None, history, view);
+            });
+        }
+        let mut action = ShareDialogAction::None;
+        let output = ctx.run_ui(input(events), |ui| {
+            action = draw_share_modal(ui.ctx(), dialog, None, None, history, view);
+        });
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        (action, texts)
+    }
+
+    fn collect_texts(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((text.galley.text().to_owned(), text.visual_bounding_rect())),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| collect_texts(s, out)),
+            _ => {}
+        }
+    }
+
+    fn click(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]
+    }
+
+    /// **Mock 6a**: the record, the WITH field, what view-only means, Share
+    /// and Cancel -- and nothing about organisations anywhere.
+    #[test]
+    fn the_share_dialog_says_what_the_mock_says_and_never_names_an_organisation() {
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), None, Vec::new());
+        let has = |needle: &str| texts.iter().any(|(t, _)| t.contains(needle));
+        assert!(has("Share Acme VPN"), "{texts:?}");
+        assert!(has("RECORD") && has("WITH"));
+        assert!(has("They get view-only access"));
+        assert!(has(SHARE_BUTTON) && has(CANCEL_BUTTON));
+        assert!(has("Appears in Sent"), "6a's footer note: {texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.to_lowercase().contains("organi")), "the dialog names an organisation: {texts:?}");
+    }
+
+    /// Pressing Share with an address reports `Submit`; with none, nothing.
+    #[test]
+    fn share_submits_only_with_an_address() {
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), None, Vec::new());
+        let at = texts.iter().find(|(t, _)| t == SHARE_BUTTON).map(|(_, r)| r.center()).expect("the Share button");
+        let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, click(at));
+        assert_eq!(action, ShareDialogAction::None, "an empty address does not submit");
+        dialog.email = "anna@example.com".into();
+        let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, click(at));
+        assert_eq!(action, ShareDialogAction::Submit);
+    }
+
+    /// **Enter in the address box shares**, as the ↵ on the button says.
+    #[test]
+    fn enter_in_the_address_box_shares() {
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.email = "anna@example.com".into();
+        let enter = vec![egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }];
+        let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, enter);
+        assert_eq!(action, ShareDialogAction::Submit, "the box opens focused, and Enter in it shares");
+    }
+
+    /// **No account** (mock 6a, fourth state): the dialog stays open to say
+    /// so, and an administrator is offered an invite code.
+    #[test]
+    fn a_person_without_an_account_is_said_and_an_admin_can_make_an_invite_code() {
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.waiting_account = Some("carol@example.com".into());
+        let admin = SharingView { available: true, can_mint_invites: true, ..SharingView::default() };
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
+        let has = |needle: &str| texts.iter().any(|(t, _)| t.contains(needle));
+        assert!(has("Waiting for carol@example.com to create an account"), "{texts:?}");
+        assert!(has(MAKE_CODE_BUTTON));
+        assert!(has(DONE_BUTTON));
+        assert!(!has(SHARE_BUTTON) || !texts.iter().any(|(t, _)| t == SHARE_BUTTON), "Done replaces Share and Cancel");
+        let plain = SharingView { available: true, ..SharingView::default() };
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&plain), Vec::new());
+        assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON), "only an administrator can mint");
+    }
+
+    /// **An administrator is offered a code only for somebody with no
+    /// account**: the invite code is per pending invitation, and before a
+    /// share has left one there is no invitation to make it for.
+    #[test]
+    fn an_invite_code_is_offered_only_once_a_share_is_waiting_for_an_account() {
+        let admin = SharingView { available: true, can_mint_invites: true, ..SharingView::default() };
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
+        assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON), "{texts:?}");
+    }
+
+    /// **NodeWarden sends no email** (plan decision 4), so the band never
+    /// says one was sent -- to an administrator or to anyone else -- and says
+    /// what does happen: an invite code.
+    #[test]
+    fn the_no_account_band_says_an_invite_code_and_never_an_email() {
+        for admin in [false, true] {
+            let (head, body) = no_account_band("carol@example.com", "Acme VPN", admin);
+            let all = format!("{head} {body}").to_lowercase();
+            assert!(!all.contains("email") && !all.contains("e-mail"), "{all}");
+            assert!(all.contains("invite code"), "{all}");
+            assert!(body.contains("Acme VPN") && head.contains("carol@example.com"));
+        }
+        assert!(no_account_band("c@x.io", "R", false).1.contains("administrator"), "a non-admin is told who makes codes");
+    }
+
+    /// **An invite code, once made, is on the band with a Copy** -- and the
+    /// password box it was made with is gone.
+    #[test]
+    fn a_made_invite_code_is_shown_with_a_copy() {
+        let admin = SharingView { available: true, can_mint_invites: true, ..SharingView::default() };
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.waiting_account = Some("carol@example.com".into());
+        dialog.invite_code = Some(InviteCode { code: "K7Q2-99XA".into(), link: None, expires_at: None });
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
+        assert!(texts.iter().any(|(t, _)| t.contains("K7Q2-99XA")), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == COPY_CODE_BUTTON));
+        assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON));
+        let at = texts.iter().find(|(t, _)| t == COPY_CODE_BUTTON).map(|(_, r)| r.center()).expect("Copy");
+        let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), click(at));
+        assert_eq!(action, ShareDialogAction::CopyCode);
+        assert_eq!(dialog.invite_code.as_ref().map(invite_text), Some("K7Q2-99XA"));
+    }
+
+    /// The suggestion's count says which kinds a person has had: shares,
+    /// Sends, or both (mock 6a: "2 shared", "3 sent").
+    #[test]
+    fn a_suggestion_counts_shares_and_sends() {
+        let person = |sent, shared| crate::sent_history::Person { email: "a@x.io".into(), last_sent_unix_millis: 0, send_ids: Vec::new(), sent, shared };
+        assert_eq!(person_count_words(&person(0, 2)), "2 shared");
+        assert_eq!(person_count_words(&person(3, 0)), "3 sent");
+        assert_eq!(person_count_words(&person(3, 2)), "2 shared, 3 sent");
+    }
+
+    /// **A refused request takes the dialog's spinner down at once, and the
+    /// dialog says why.** `request` answers `false` with its sentence in the
+    /// pane's notice and no report coming -- so nothing else would ever end
+    /// the spinner. Here: no line to the daemon, then a write already out.
+    #[test]
+    fn a_refused_request_never_leaves_the_dialogs_spinner_up() {
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+
+        let mut pane = SharingPane::default();
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.email = " anna@x.io ".into();
+        let left = answer_dialog(&mut pane, dialog, ShareDialogAction::Submit, None, &ctx, &tx);
+        assert_eq!(left, ShareDialogAction::None);
+        let dialog = pane.dialog.as_ref().expect("the dialog stays open");
+        assert!(!dialog.in_flight, "no line to the daemon: the spinner is down");
+        assert_eq!(dialog.error.as_deref(), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert!(pane.notice.is_none(), "said once, in the dialog");
+
+        let line = dead_line();
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, SharingCall::Reinvite("bob@x.io".into())));
+        let dialog = pane.dialog.take().expect("the dialog");
+        let _ = answer_dialog(&mut pane, dialog, ShareDialogAction::Submit, Some(&line), &ctx, &tx);
+        let dialog = pane.dialog.as_ref().expect("the dialog stays open");
+        assert!(!dialog.in_flight, "a second write: the spinner is down");
+        assert_eq!(dialog.error.as_deref(), Some(BUSY));
+
+        let mut dialog = pane.dialog.take().expect("the dialog");
+        dialog.waiting_account = Some("carol@x.io".into());
+        dialog.password.push_str("hunter2");
+        let _ = answer_dialog(&mut pane, dialog, ShareDialogAction::MintCode, Some(&line), &ctx, &tx);
+        let dialog = pane.dialog.as_ref().expect("the dialog stays open");
+        assert!(!dialog.minting, "a refused mint: the spinner is down");
+        assert!(dialog.password.is_empty(), "the password is gone whatever the answer");
+        assert_eq!(dialog.error.as_deref(), Some(BUSY));
+        let _ = rx.recv_timeout(std::time::Duration::from_secs(30));
+    }
+
+    /// **A share that starts raises the spinner and sends the trimmed
+    /// address**; its failure comes back into the dialog and takes it down.
+    #[test]
+    fn a_share_that_starts_raises_the_spinner_and_its_answer_takes_it_down() {
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut pane = SharingPane::default();
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.email = " anna@x.io ".into();
+        dialog.error = Some("an old sentence".into());
+        let _ = answer_dialog(&mut pane, dialog, ShareDialogAction::Submit, Some(&dead_line()), &ctx, &tx);
+        let dialog = pane.dialog.as_ref().expect("the dialog stays open while the share runs");
+        assert!(dialog.in_flight);
+        assert!(dialog.error.is_none(), "a new attempt clears the last one's sentence");
+        let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
+        match &report {
+            SharingReport::Shared { email, item_name, result: Err(_) } => {
+                assert_eq!((email.as_str(), item_name.as_str()), ("anna@x.io", "Acme VPN"));
+            }
+            other => panic!("expected the share's failure, got {other:?}"),
+        }
+        apply(&mut pane, report, 1.0);
+        let dialog = pane.dialog.as_ref().expect("a failed share keeps the dialog");
+        assert!(!dialog.in_flight && dialog.error.is_some());
+    }
+
+    /// **Minting sends the pending invitation's address and the password,
+    /// and the dialog's box is emptied as it goes** -- the one copy of the
+    /// master password is in the call, and is wiped when the call is.
+    #[test]
+    fn minting_takes_the_password_out_of_the_dialog() {
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut pane = SharingPane::default();
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.waiting_account = Some("carol@x.io".into());
+        dialog.password.push_str("hunter2");
+        let _ = answer_dialog(&mut pane, dialog, ShareDialogAction::MintCode, Some(&dead_line()), &ctx, &tx);
+        let dialog = pane.dialog.as_ref().expect("the dialog");
+        assert!(dialog.minting);
+        assert!(dialog.password.is_empty());
+        let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
+        assert!(matches!(report, SharingReport::InviteCode(Err(_))), "{report:?}");
+        apply(&mut pane, report, 1.0);
+        assert!(!pane.dialog.as_ref().expect("the dialog").minting);
+    }
+
+    /// Cancel and Done close the dialog -- dropping it, which wipes a
+    /// half-typed password -- and a suggestion's ✕ is handed to the window,
+    /// which owns the forget question, with the dialog left open under it.
+    #[test]
+    fn cancel_and_done_close_and_a_forget_is_the_windows() {
+        let (tx, _rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let mut pane = SharingPane::default();
+        for close in [ShareDialogAction::Cancel, ShareDialogAction::Done] {
+            let _ = answer_dialog(&mut pane, ShareDialog::opening("r1", "Acme VPN"), close, None, &ctx, &tx);
+            assert!(pane.dialog.is_none());
+        }
+        let left = answer_dialog(&mut pane, ShareDialog::opening("r1", "Acme VPN"), ShareDialogAction::Forget("a@x.io".into()), None, &ctx, &tx);
+        assert_eq!(left, ShareDialogAction::Forget("a@x.io".into()));
+        assert!(pane.dialog.is_some());
+        let open = pane.dialog.take().expect("open");
+        let left = answer_dialog(&mut pane, open, ShareDialogAction::CopyCode, None, &ctx, &tx);
+        assert_eq!(left, ShareDialogAction::CopyCode);
+        assert!(pane.dialog.is_some());
+    }
+
+    /// **A forget that failed says so in the open dialog** -- its sentence
+    /// can name a decrypted record, so it goes to the screen and nowhere else.
+    #[test]
+    fn a_failed_forget_is_said_in_the_open_dialog() {
+        let mut pane = SharingPane::default();
+        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        apply(&mut pane, SharingReport::Forgot(Err("Couldn't stop sharing Wi-Fi.".into())), 0.0);
+        assert_eq!(pane.dialog.as_ref().and_then(|d| d.error.as_deref()), Some("Couldn't stop sharing Wi-Fi."));
+        assert!(pane.notice.is_none());
+        pane.dialog = None;
+        apply(&mut pane, SharingReport::Forgot(Err("Couldn't stop sharing Wi-Fi.".into())), 0.0);
+        assert_eq!(pane.notice.as_deref(), Some("Couldn't stop sharing Wi-Fi."));
+    }
+
+    /// **An answer lands only in the dialog that asked.** A share closed with
+    /// Cancel and then a fresh dialog opened -- on this record or another --
+    /// must not have the old share's "no account yet" or failure painted into
+    /// it; the answer is said as a toast or a notice instead.
+    #[test]
+    fn an_answer_does_not_land_in_a_dialog_that_did_not_ask() {
+        let mut pane = SharingPane::default();
+        pane.dialog = Some(ShareDialog::opening("r2", "Wi-Fi"));
+        apply(&mut pane, SharingReport::Shared { email: "carol@x.io".into(), item_name: "Acme VPN".into(), result: Ok(ShareResult::WaitingAccount) }, 0.0);
+        assert!(pane.dialog.as_ref().is_some_and(|d| d.waiting_account.is_none()));
+        assert!(pane.toast.is_some());
+        apply(&mut pane, SharingReport::Shared { email: "b@x.io".into(), item_name: "Acme VPN".into(), result: Err("no".into()) }, 1.0);
+        assert!(pane.dialog.as_ref().is_some_and(|d| d.error.is_none()));
+        assert_eq!(pane.notice.as_deref(), Some("no"));
+        apply(&mut pane, SharingReport::InviteCode(Ok(InviteCode { code: "C".into(), link: None, expires_at: None })), 2.0);
+        assert!(pane.dialog.as_ref().is_some_and(|d| d.invite_code.is_none()), "a code nobody in this dialog asked for");
     }
 
     /// **The worker reaches the daemon** through the real loopback listener:

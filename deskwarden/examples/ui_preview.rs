@@ -2788,6 +2788,9 @@ impl Preview {
                         // default; the preview draws the default window.
                         false,
                         &mut fixtures.breaches,
+                        // Design 6: nothing about sharing -- a preview has no
+                        // daemon to ask whether a Share control belongs here.
+                        detail::PeopleSharing::default(),
                     );
                 }
                 PaneKind::Discard => {

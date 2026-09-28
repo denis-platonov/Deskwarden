@@ -846,7 +846,11 @@ const RECORD_CHIP_TILE: f32 = 32.0;
 /// says `SP` because its record is called "SAP Production"; ours says
 /// whatever [`theme::initials`] makes of the record actually being sent,
 /// which is the same function the item list and the delete modal use.
-fn record_chip(ui: &mut egui::Ui, item_name: &str, kind_and_folder: &str) {
+///
+/// **`pub(crate)` for the Share dialog** (design 6a), whose `RECORD` block is
+/// this chip exactly -- 6a's `.rchip` is §5a's -- and which calls this rather
+/// than a copy of it, so the two modals name their record one way.
+pub(crate) fn record_chip(ui: &mut egui::Ui, item_name: &str, kind_and_folder: &str) {
     egui::Frame::new()
         .fill(theme::BLUE_WASH)
         .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
@@ -1138,7 +1142,9 @@ pub fn uri_count(uris: usize) -> String {
 ///
 /// Empty when there is no item, which is the one state that draws no second
 /// line at all rather than a lonely separator.
-fn chip_subtitle(item: Option<&crate::vault_bridge::VaultItem>, folder: Option<&str>) -> String {
+///
+/// `pub(crate)` beside [`record_chip`], for the Share dialog.
+pub(crate) fn chip_subtitle(item: Option<&crate::vault_bridge::VaultItem>, folder: Option<&str>) -> String {
     let Some(item) = item else {
         return String::new();
     };

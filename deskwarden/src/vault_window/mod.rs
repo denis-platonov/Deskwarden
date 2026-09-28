@@ -1180,6 +1180,10 @@ pub fn build_frame_with_search(
     // that fails stops it with the person kept, and its failure is reported
     // where every revoke's is.
     let mut forget_ask: Option<(String, Vec<(String, String)>)> = None;
+    // The names of the records shared with the person `forget_ask` is about
+    // (spec 11.7) -- the question's second list. Stopped by the daemon's
+    // forget on yes; cleared with the question either way.
+    let mut forget_records: Vec<String> = Vec::new();
     let mut forgetting: Option<(String, Vec<(String, String)>)> = None;
     // **Personal sharing** (design 6). The client is the window's line to
     // the daemon's /sharing routes, or `None` in a window with no line --
@@ -2632,6 +2636,11 @@ pub fn build_frame_with_search(
         // controls at all, so "send the thing I threw away" is still refused,
         // and now by the pane's own shape rather than by a greyed button.
         let mut send_record_asked = false;
+        // **Sharing a record with a person was ASKED FOR** (design 6a), by the
+        // read pane's Share control -- `send_record_asked`'s shape for the
+        // Share dialog: a frame-local request, turned into a dialog in one
+        // block after the panels, through `permit_share`.
+        let mut share_asked = false;
         // **"Add a one-time code" was ASKED FOR**, by the chord, and nothing
         // has been decided about it yet.
         //
@@ -4961,6 +4970,19 @@ pub fn build_frame_with_search(
                             // value and not a borrow, which is what lets the
                             // refusal below put it back.
                             let reveal_before = reveal;
+                            // **Design 6, for this record**: the Share
+                            // control's answer and the people on it, out of
+                            // the daemon's view -- resolved in one place,
+                            // `share_ui::people_sharing`, which the pane
+                            // behind the sequence builder reads too.
+                            let person_lines = share_ui::person_lines(
+                                sharing.view.as_ref(),
+                                &item.id,
+                                &sent_history,
+                                crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
+                                &crate::local_time::SystemZone,
+                            );
+                            let people = share_ui::people_sharing(&sharing, sharing_client.is_some(), item, &person_lines);
                             let action = draw_read_arm(
                                 ui,
                                 item,
@@ -4980,6 +5002,7 @@ pub fn build_frame_with_search(
                                 check_breaches,
                                 reveal_totp_seed,
                                 &mut breaches,
+                                people,
                             );
                             // **The re-prompt, in the gating position.** A
                             // refused action becomes `DetailAction::None`
@@ -5407,6 +5430,14 @@ pub fn build_frame_with_search(
                                 // is what refuses it.
                                 DetailAction::SendRecord => {
                                     send_record_asked = true;
+                                }
+                                // **The header's Share control** (design 6a),
+                                // for `SendRecord`'s reason exactly: it sets a
+                                // flag and opens nothing, and the one block
+                                // that turns the flag into a dialog asks the
+                                // re-prompt first (`permit_share`).
+                                DetailAction::ShareRecord => {
+                                    share_asked = true;
                                 }
                                 // **The detail header's ⏱**, and it sets the
                                 // SAME frame-local flag the chord sets, for
@@ -5990,6 +6021,16 @@ pub fn build_frame_with_search(
                                 );
                             }
                             (None, Some(item)) => {
+                                // The live pane's own sharing answer, so the
+                                // header behind the builder is the header the
+                                // user left.
+                                let person_lines = share_ui::person_lines(
+                                    sharing.view.as_ref(),
+                                    &item.id,
+                                    &sent_history,
+                                    crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
+                                    &crate::local_time::SystemZone,
+                                );
                                 let _ = draw_read_arm(
                                     ui,
                                     item,
@@ -6009,6 +6050,7 @@ pub fn build_frame_with_search(
                                     check_breaches,
                                     reveal_totp_seed,
                                     &mut breaches,
+                                    share_ui::people_sharing(&sharing, sharing_client.is_some(), item, &person_lines),
                                 );
                             }
                             (None, None) => {}
@@ -6708,6 +6750,70 @@ pub fn build_frame_with_search(
             }
         }
 
+        // **The Share dialog** (design 6a), opened through the re-prompt gate
+        // and drawn after the panels, over them, as the record composer is.
+        // The item is re-resolved out of `items` for `send_record_asked`'s
+        // reasons: nothing holds a borrow this far down, and a row selected
+        // under Trash or Archive -- which draws no Share control anyway --
+        // cannot be shared from here either.
+        if share_asked {
+            if let Some(item) = selected_id.as_ref().and_then(|id| items.iter().find(|i| &i.id == id)) {
+                sharing.dialog = permit_share(ui.ctx(), item, &reprompt_gate, &mut reprompt_proof);
+            }
+        }
+        if let Some(mut dialog) = sharing.dialog.take() {
+            let item = items.iter().find(|i| i.id == dialog.item_id);
+            let folder = item.and_then(|item| sidebar::folder_name(&folders, item.folder_id.as_deref()));
+            let answer = share_ui::draw_share_modal(ui.ctx(), &mut dialog, item, folder, &sent_history, sharing.view.as_ref());
+            // Every press is decided in `share_ui::answer_dialog`, which puts
+            // the dialog back or drops it and takes a refused request's
+            // spinner down at once. What comes back is the window's own.
+            match share_ui::answer_dialog(&mut sharing, dialog, answer, sharing_client.as_ref(), ui.ctx(), &sharing_tx) {
+                // A suggestion's ✕: the Send composer's forget, with the
+                // same question when the person still holds something.
+                share_ui::ShareDialogAction::Forget(email) => {
+                    let forgotten = forget_request_for(
+                        &email,
+                        &mut forget_ask,
+                        &mut forget_records,
+                        &send_fetch,
+                        &mut sent_history,
+                        sent_history_path.as_deref(),
+                        &mut sent_unsaved,
+                        sharing.view.as_ref(),
+                        &items,
+                    );
+                    // Nothing shared and nothing live: forgotten here at
+                    // once, and the daemon is told too, so anything it still
+                    // holds for them (a pending invitation) goes -- its forget
+                    // is a no-op success when there is nothing. Only where
+                    // sharing is on: elsewhere there is no daemon side.
+                    if forgotten && sharing.view.as_ref().is_some_and(|v| v.available) {
+                        let call = share_ui::SharingCall::Forget(email);
+                        if !share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call) {
+                            share_ui::say_refusal_in_dialog(&mut sharing);
+                        }
+                    }
+                }
+                // The made invite code, copied the way every credential this
+                // window copies is: onto the clipboard's secret path, out of
+                // history and under the clearing triggers.
+                share_ui::ShareDialogAction::CopyCode => {
+                    if let Some(code) = sharing.dialog.as_ref().and_then(|d| d.invite_code.as_ref()) {
+                        crate::clipboard::copy_secret(share_ui::invite_text(code));
+                        // "Invite code copied", drawn by the dialog over its
+                        // own card (`detail::draw_copy_toast`).
+                        detail::note_copied(ui.ctx(), share_ui::INVITE_CODE_LABEL);
+                    }
+                }
+                share_ui::ShareDialogAction::None
+                | share_ui::ShareDialogAction::Submit
+                | share_ui::ShareDialogAction::Cancel
+                | share_ui::ShareDialogAction::MintCode
+                | share_ui::ShareDialogAction::Done => {}
+            }
+        }
+
         // **The record composer**, drawn here for `folder_edit`'s reason
         // exactly: last, so the card and its scrim are over the three panels.
         //
@@ -6757,31 +6863,23 @@ pub fn build_frame_with_search(
             // on the server is forgotten at once; one with shares is asked
             // about first. "Still on the server" is the Sends list when this
             // window has one, and every Send filed for them when it has not.
+            //
+            // **The same question the Share dialog's ✕ asks**, from the one
+            // function both call -- which now also names the records shared
+            // with the person (spec 11.7), so forgetting someone from here
+            // cannot quietly leave records in their vault.
             if let Some(email) = state.draft.forget.take() {
-                let listed: Option<Vec<String>> = match &send_fetch.result {
-                    Some(Ok(rows)) => Some(rows.iter().map(|row| row.id.clone()).collect()),
-                    _ => None,
-                };
-                let shares: Vec<(String, String)> = sent_history
-                    .entries
-                    .iter()
-                    .filter(|entry| entry.recipient.trim().eq_ignore_ascii_case(email.trim()))
-                    .filter(|entry| listed.as_ref().is_none_or(|ids| ids.contains(&entry.send_id)))
-                    .map(|entry| (entry.send_id.clone(), entry.name.clone()))
-                    .collect();
-                if shares.is_empty() {
-                    sent_history.forget(&email);
-                    if let Some(path) = sent_history_path.as_deref() {
-                        if let Err(e) = crate::sent_history::update(path, |h| {
-                            h.forget(&email);
-                        }) {
-                            log::warn!("a person could not be forgotten in the sent history: {e:?}");
-                            sent_unsaved.push(share_ui::UnsavedSent::Forget(email.clone()));
-                        }
-                    }
-                } else {
-                    forget_ask = Some((email, shares));
-                }
+                let _ = forget_request_for(
+                    &email,
+                    &mut forget_ask,
+                    &mut forget_records,
+                    &send_fetch,
+                    &mut sent_history,
+                    sent_history_path.as_deref(),
+                    &mut sent_unsaved,
+                    sharing.view.as_ref(),
+                    &items,
+                );
             }
             match answer {
                 record_ui::RecordUiAction::SubmitExport => {
@@ -6894,14 +6992,35 @@ pub fn build_frame_with_search(
         // threading model for one of the two writes would be two ways to
         // create an item.
         // The confirmation, and then the deletions, one at a time.
+        //
+        // **Both lists are named** (spec 11.7): the live Sends and the
+        // records shared with the person. Yes asks the daemon to stop the
+        // shares -- its forget, one call for every record -- and starts the
+        // Send deletions; if the daemon cannot be asked (a sharing change
+        // already out), nothing starts and the person is kept, with the
+        // sentence where the user is looking.
         if let Some((email, shares)) = &forget_ask {
-            let names: Vec<String> = shares.iter().map(|(_, name)| name.clone()).collect();
+            let mut names: Vec<String> = shares.iter().map(|(_, name)| name.clone()).collect();
+            names.extend(forget_records.iter().cloned());
             match record_ui::draw_forget_confirm(ui.ctx(), email, &names) {
                 Some(record_ui::ForgetAnswer::DeleteShares) => {
-                    forgetting = forget_ask.take();
-                    send_delete.report = None;
+                    let stopped = forget_records.is_empty() || {
+                        let call = share_ui::SharingCall::Forget(email.clone());
+                        share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call)
+                    };
+                    forget_records.clear();
+                    if stopped {
+                        forgetting = forget_ask.take();
+                        send_delete.report = None;
+                    } else {
+                        forget_ask = None;
+                        share_ui::say_refusal_in_dialog(&mut sharing);
+                    }
                 }
-                Some(record_ui::ForgetAnswer::Keep) => forget_ask = None,
+                Some(record_ui::ForgetAnswer::Keep) => {
+                    forget_ask = None;
+                    forget_records.clear();
+                }
                 None => {}
             }
         }
@@ -8449,6 +8568,9 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // here would put TWO Hello prompts between the click and the
         // composer for one act.
         | DetailAction::SendRecord
+        // Share, for SendRecord's reason exactly: the exposure is gated where
+        // the dialog opens, by `permit_share`.
+        | DetailAction::ShareRecord
         // **And `AddTotp` is on this side for a DIFFERENT reason from
         // `SendRecord`'s, which is why it is argued and not merely appended.**
         // `SendRecord` is here because its exposure is gated further down;
@@ -8663,6 +8785,94 @@ fn permit_record_send(
             detail::note_refused(ctx, crate::reprompt::refusal_text(true));
             None
         }
+    }
+}
+
+/// [`permit_record_send`] for the Share dialog (design 6a): a share hands a
+/// record -- every field of it, now and after every edit -- to another
+/// person, so a re-prompt-protected item asks first, before the dialog
+/// exists. At the open, for `permit_record_send`'s reason: the dialog itself
+/// shows nothing out of the vault but the record's name.
+///
+/// The only place a [`share_ui::ShareDialog`] is built in this file, and
+/// `exactly_one_line_opens_the_share_dialog` holds it to that.
+fn permit_share(
+    ctx: &egui::Context,
+    item: &VaultItem,
+    gate: &crate::reprompt::RepromptGate,
+    proof: &mut crate::reprompt::Proof,
+) -> Option<share_ui::ShareDialog> {
+    let protected = crate::vault_bridge::reprompt_protected(item);
+    match crate::reprompt::permit(gate, protected, proof, Instant::now(), || {
+        share_ui::ShareDialog::opening(&item.id, &item.name)
+    }) {
+        crate::reprompt::Outcome::Done(dialog) => Some(dialog),
+        crate::reprompt::Outcome::Refused => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(false));
+            None
+        }
+        crate::reprompt::Outcome::Cannot => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(true));
+            None
+        }
+    }
+}
+
+/// **The forget question's two lists** (spec 11.7): the person's live Sends,
+/// asked about and deleted through the Sent screen's one door, and the
+/// records shared with them, stopped by the daemon's forget when the answer
+/// is yes. With nothing on either list the person is forgotten at once and
+/// this answers `true`; otherwise the question is put up (`forget_ask` and
+/// `forget_records`) and it answers `false`.
+///
+/// One function for the two places a person can be forgotten -- the Send
+/// composer's Recipient suggestions and the Share dialog's -- so the two ✕
+/// marks cannot ask different questions about the same person.
+///
+/// **Only Sends are queued for deletion.** A share's entry in the sent
+/// history has no Send id (`SentKind::Share`), and queueing one would hand
+/// the Sent screen's delete an empty id; shares are the daemon's to stop, and
+/// they are on the second list.
+#[allow(clippy::too_many_arguments)]
+fn forget_request_for(
+    email: &str,
+    forget_ask: &mut Option<(String, Vec<(String, String)>)>,
+    forget_records: &mut Vec<String>,
+    send_fetch: &send_ui::SendFetch,
+    sent_history: &mut crate::sent_history::SentHistory,
+    sent_history_path: Option<&std::path::Path>,
+    sent_unsaved: &mut Vec<share_ui::UnsavedSent>,
+    sharing: Option<&crate::rest::sharing::SharingView>,
+    items: &[VaultItem],
+) -> bool {
+    let listed: Option<Vec<String>> = match &send_fetch.result {
+        Some(Ok(rows)) => Some(rows.iter().map(|row| row.id.clone()).collect()),
+        _ => None,
+    };
+    let shares: Vec<(String, String)> = sent_history
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == crate::sent_history::SentKind::Send)
+        .filter(|entry| entry.recipient.trim().eq_ignore_ascii_case(email.trim()))
+        .filter(|entry| listed.as_ref().is_none_or(|ids| ids.contains(&entry.send_id)))
+        .map(|entry| (entry.send_id.clone(), entry.name.clone()))
+        .collect();
+    let records = share_ui::records_shared_with(sharing, email, items);
+    if shares.is_empty() && records.is_empty() {
+        sent_history.forget(email);
+        if let Some(path) = sent_history_path {
+            if let Err(e) = crate::sent_history::update(path, |h| {
+                h.forget(email);
+            }) {
+                log::warn!("a person could not be forgotten in the sent history: {e:?}");
+                sent_unsaved.push(share_ui::UnsavedSent::Forget(email.to_string()));
+            }
+        }
+        true
+    } else {
+        *forget_ask = Some((email.to_string(), shares));
+        *forget_records = records;
+        false
     }
 }
 
@@ -12613,6 +12823,10 @@ fn draw_read_arm(
     // draws no TOTP-secret row at all.
     reveal_totp_seed: bool,
     breaches: &mut crate::breach::BreachCache,
+    // Design 6, forwarded -- `share_ui` resolves it from the daemon's view
+    // (`share_ui::people_sharing`), and this arm only carries it so the pane
+    // can be driven headlessly with it under a test's control.
+    people: detail::PeopleSharing<'_>,
 ) -> DetailAction {
     let action = draw_detail_read(
         ui,
@@ -12629,6 +12843,7 @@ fn draw_read_arm(
         check_breaches,
         reveal_totp_seed,
         breaches,
+        people,
     );
     // **CTRL+SHIFT+F used to be read here, and is gone with the button it
     // was the keyboard equivalent of.** Its whole identity was "clicking
@@ -22598,6 +22813,9 @@ mod draw_read_arm_tests {
                 &mut crate::breach::BreachCache::new(std::sync::Arc::new(|_, _| {
                     crate::breach::BreachStatus::Unavailable
                 })),
+                // Nothing about sharing: the Share control has its own tests
+                // in `detail`, and this harness has no daemon behind it.
+                crate::vault_window::detail::PeopleSharing::default(),
             );
         });
 
@@ -39226,6 +39444,25 @@ mod send_create_wiring {
             clears >= 2,
             "the composer is cleared from {clears} places; Cancel and a started publish are \
              both meant to drop it, and dropping it is what wipes the seed passphrase"
+        );
+    }
+
+    /// **The Share dialog has one door too, and it is `permit_share`** --
+    /// the record composer's rule above, for design 6a's dialog: a share
+    /// hands every field of a record to another person, so a re-prompt-
+    /// protected item asks before the dialog exists. A second line that
+    /// OPENS the dialog -- builds one with `ShareDialog::opening` and puts it
+    /// in the pane -- is a door around that question.
+    #[test]
+    fn exactly_one_line_opens_the_share_dialog() {
+        let code = code_without_comments(include_str!("mod.rs"));
+        let opens = code.matches(concat!("sharing.dialog = permit_", "share(")).count();
+        assert_eq!(opens, 1, "the Share dialog is opened from {opens} places, not one");
+        let built = code.matches(concat!("ShareDialog::", "opening(")).count();
+        assert_eq!(
+            built, 1,
+            "`ShareDialog::opening` is called {built} times in this file; the one call is \
+             inside `permit_share`, behind the re-prompt"
         );
     }
 

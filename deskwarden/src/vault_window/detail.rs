@@ -146,6 +146,52 @@ fn header_controls(item: &VaultItem) -> usize {
     HEADER_CONTROLS_ALWAYS + usize::from(item_takes_a_one_time_code(item))
 }
 
+/// [`header_controls`] with sharing: the Share control (design 6a) is one
+/// more wherever the window resolved one -- sharing on NodeWarden, or a Send
+/// offered in its place -- and none where it did not.
+///
+/// **Read this, never [`header_controls`], when reserving room**: it is what
+/// `the_strip_reserves_room_for_every_control_it_draws` counts the painted
+/// marks against, in all four cases (a login and a card, with and without
+/// the control).
+///
+/// The received record's shorter strip (mock 6d: no star, no envelope, no
+/// clock, no Share) is NOT counted here yet, deliberately: this pane still
+/// draws those controls for a received record, and a reservation for fewer
+/// controls than are painted is the x = -34.5 defect again. The branch comes
+/// with the drawing it counts.
+fn header_controls_for(item: &VaultItem, people: &PeopleSharing<'_>) -> usize {
+    header_controls(item) + usize::from(people.share_control.is_some())
+}
+
+/// The mock's own `.hctls { gap: 2px }`: the closest two of the strip's
+/// controls are ever drawn. See [`controls_gap`].
+const HEADER_CONTROLS_MIN_GAP: f32 = 2.0;
+
+/// **The gap between the strip's controls in a row `row` points wide.**
+///
+/// [`HEADER_GAP`] wherever the controls fit at it, which is every row the
+/// one-line arrangement is ever given ([`header_layout`] only keeps them on
+/// the title's line where they do) and the stacked row at every width but
+/// the narrowest. Design 6a's Share control made six squares, and six at 14
+/// is 274 points against the 250 the stacked row has at the app's minimum
+/// pane -- the overflow `the_strips_controls_fit_the_apps_minimum_window`
+/// predicted for a sixth control. So there, and only there, the gaps close
+/// until the row fits: at 250 they are 9.2, still well clear of the mock's
+/// own 2, which is the floor.
+///
+/// Closing the gaps rather than dropping a control or shrinking the squares:
+/// every control is a 34-point target the user aims at, and a strip that
+/// hid one at small widths would be a control that exists or not by window
+/// size. The gaps are the only slack the row has.
+fn controls_gap(row: f32, controls: usize) -> f32 {
+    if controls < 2 {
+        return HEADER_GAP;
+    }
+    let spare = (row - theme::HEADER_BUTTON_HEIGHT * controls as f32) / (controls - 1) as f32;
+    spare.clamp(HEADER_CONTROLS_MIN_GAP, HEADER_GAP)
+}
+
 /// **Whether this item is one a one-time code could be added to** -- and the
 /// single expression both the strip and its guards read.
 ///
@@ -805,6 +851,15 @@ pub enum DetailAction {
     /// the composer re-resolves the id when it opens, and again when Create
     /// is pressed.
     SendRecord,
+    /// The header's Share control (design 6a). Sets the window's
+    /// `share_asked`, like `SendRecord` sets `send_record_asked`; the dialog is
+    /// opened through the re-prompt gate there (`permit_share`), and
+    /// `exactly_one_line_opens_the_share_dialog` holds it to that one door.
+    ///
+    /// Only where sharing is offered: where it is not, the same control
+    /// reports [`Self::SendRecord`] -- the owner's "a Send is offered
+    /// instead" -- so this variant always means a person can be shared with.
+    ShareRecord,
     /// The header's clock was clicked: the user wants the **"Add a one-time
     /// code"** form for this item.
     ///
@@ -3218,6 +3273,11 @@ pub fn draw_detail_read(
     // sometimes absent would put a second gate in the signature, and two
     // gates is how "couldn't check" becomes "safe".
     breaches: &mut BreachCache,
+    // **Design 6**: the Share control, the people on the SHARING card, and a
+    // received record's view-only line -- resolved by the window from the
+    // daemon's view (`share_ui::people_sharing`). `PeopleSharing::default()`
+    // from every caller that is not about sharing.
+    people: PeopleSharing<'_>,
 ) -> DetailAction {
     let mut action = DetailAction::None;
     // **First, before anything is drawn or any chord is resolved.** A copy
@@ -3389,7 +3449,10 @@ pub fn draw_detail_read(
             // control at x = -34.5 once already, and
             // `the_strip_reserves_room_for_every_control_it_draws` is what
             // now measures the two against each other.
-            let controls = header_controls(item);
+            //
+            // **`header_controls_for`, with the Share control** (design 6a):
+            // one more square wherever the window resolved one.
+            let controls = header_controls_for(item, &people);
             let controls_width = theme::HEADER_BUTTON_HEIGHT * controls as f32
                 + HEADER_GAP * (controls - 1) as f32;
             let layout = header_layout(content_width, controls_width);
@@ -3486,7 +3549,8 @@ pub fn draw_detail_read(
                     });
                 });
             };
-            // **Right-to-left, so what reads left-to-right is ★, ✉, ⏱, ⋮, ✕.**
+            // **Right-to-left, so what reads left-to-right is ★, ✉, Share, ⏱,
+            // ⋮, ✕** -- Share only where the window resolved one (design 6a).
             // The caller supplies a `Ui` already in that layout and already
             // carrying `HEADER_GAP` spacing; this only fills it.
             //
@@ -3810,6 +3874,29 @@ pub fn draw_detail_read(
                         action = DetailAction::AddTotp;
                     }
                 }
+                // **Share, right after the envelope** (mock 6a) -- drawn
+                // before it because this strip lays out right to left, so it
+                // reads ★ ✉ Share ⏱ ⋮ ✕. The mock's strip puts the ⏱ before
+                // the ✉; this one keeps the star and the envelope adjacent,
+                // which is the order the owner asked for ("email icon after
+                // Fav"), and keeps 6a's own point -- Share straight after the
+                // ✉ -- beside it.
+                //
+                // Where sharing is not offered (not NodeWarden, no line to
+                // the daemon) it opens the Send composer: the owner's "a Send
+                // is offered instead", said on the hover so the press is no
+                // surprise. `None` draws no control, and `header_controls_for`
+                // reserves room for exactly that.
+                if let Some(offered) = people.share_control {
+                    let hover = if offered {
+                        super::share_ui::SHARE_TOOLTIP
+                    } else {
+                        super::share_ui::SHARE_UNAVAILABLE_TOOLTIP
+                    };
+                    if theme::share_record_button(ui).on_hover_text(hover).clicked() {
+                        action = if offered { DetailAction::ShareRecord } else { DetailAction::SendRecord };
+                    }
+                }
                 // **"Send a record", MOVED HERE off the window titlebar** at
                 // the user's direction: "remove huge button Send a record on
                 // top -- those are global things to the details like email
@@ -3953,7 +4040,9 @@ pub fn draw_detail_read(
                     band,
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
-                        ui.spacing_mut().item_spacing.x = HEADER_GAP;
+                        // `HEADER_GAP`, closed only where six controls would
+                        // not otherwise fit this row -- see `controls_gap`.
+                        ui.spacing_mut().item_spacing.x = controls_gap(ui.available_width(), controls);
                         draw_controls(ui);
                     },
                 );
@@ -5851,6 +5940,33 @@ pub struct SharedSend<'a> {
     pub confirming: bool,
     /// A delete of this Send is running: the card has no controls at all.
     pub revoking: bool,
+}
+
+/// **Personal sharing, as the read pane draws it** (design 6a, 6b, 6d),
+/// resolved by the window from the daemon's view -- see
+/// `share_ui::people_sharing`, which builds it. `Default` is "nothing about
+/// sharing": no Share control, no people, an editable record -- the pane
+/// every caller that is not about sharing draws.
+///
+/// **Only `share_control` is drawn by this pane yet.** The people, the stop
+/// and fingerprint states and `view_only_from` are carried now so the window
+/// resolves the whole of it in one place (`people_sharing`) and the tasks
+/// that draw the SHARING card and the recipient's view-only header change
+/// what is drawn, not what is passed.
+#[derive(Clone, Copy, Default)]
+pub struct PeopleSharing<'a> {
+    /// The Share control: `Some(true)` shares, `Some(false)` offers a Send
+    /// instead, `None` draws none. See `share_ui::share_control`.
+    pub share_control: Option<bool>,
+    pub people: &'a [super::share_ui::PersonLine],
+    /// Stop sharing's step two is up for this email.
+    pub confirming: Option<&'a str>,
+    /// A stop is running for this email.
+    pub stopping: Option<&'a str>,
+    /// `(email, phrase)` of the fingerprint on show.
+    pub fingerprint: Option<(&'a str, &'a str)>,
+    /// A received record: who shares it. The pane is view-only.
+    pub view_only_from: Option<&'a str>,
 }
 
 /// **Design 5d's card body.**
@@ -9119,7 +9235,8 @@ mod tests {
                 None,
                 false,
                 false,
-                &mut inert_breach_cache());
+                &mut inert_breach_cache(),
+                PeopleSharing::default());
         });
 
         let mut texts = Vec::new();
@@ -9196,6 +9313,7 @@ mod tests {
             envelopes: Vec::new(),
             pane_closes: Vec::new(),
             clocks: Vec::new(),
+            shares: Vec::new(),
             segments: Vec::new(),
             images: Vec::new(),
             shapes: egui::Shape::Noop,
@@ -9216,6 +9334,7 @@ mod tests {
         frame.envelopes = theme::icon_probe::envelopes(&all);
         frame.pane_closes = theme::icon_probe::pane_close_marks(&all);
         frame.clocks = theme::icon_probe::clocks(&all);
+        frame.shares = theme::icon_probe::share_controls(&all);
         frame.segments = theme::icon_probe::line_segments(&all);
         collect_images(&all, &mut frame.images);
         frame.shapes = all;
@@ -9785,7 +9904,8 @@ mod tests {
                 None,
                 false,
                 false,
-                &mut inert_breach_cache());
+                &mut inert_breach_cache(),
+                PeopleSharing::default());
         })
         .shapes
     }
@@ -9875,6 +9995,9 @@ mod tests {
         /// hand the pane one. `None` unless a test sets it (see
         /// [`Pane::sharing`]), which is every pane with no Send out.
         shared: Option<(crate::send::SendSummary, bool, bool)>,
+        /// The header's Share control, as `share_ui::share_control` would
+        /// resolve it. None unless a test sets it.
+        share_control: Option<bool>,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -9919,6 +10042,10 @@ mod tests {
         /// and unlike the envelope it is drawn for SOME items only, which
         /// is what most of the guards over it are about.
         clocks: Vec<(egui::Rect, egui::Color32)>,
+        /// The header's Share controls (design 6a), by their head's ring --
+        /// drawn only where the window resolved one, which in this harness is
+        /// only where a test asked ([`Pane::with_share_control`]).
+        shares: Vec<(egui::Rect, egui::Color32)>,
         segments: Vec<egui::Rect>,
         /// Every textured rect -- the matched app's icon is the only one this
         /// pane can paint. See [`collect_images`].
@@ -10309,7 +10436,15 @@ mod tests {
                 apps: crate::app_identity::AppIdentityCache::default(),
                 reveal_totp_seed: false,
                 shared: None,
+                share_control: None,
             }
+        }
+
+        /// The same pane, with the header's Share control drawn: `true`
+        /// shares, `false` offers a Send instead (`share_ui::share_control`).
+        fn with_share_control(mut self, offered: bool) -> Self {
+            self.share_control = Some(offered);
+            self
         }
 
         /// The same pane, on a record with a live Send out, its revoke at the
@@ -10393,7 +10528,8 @@ mod tests {
                         }),
                         false,
                         self.reveal_totp_seed,
-                        &mut inert_breach_cache());
+                        &mut inert_breach_cache(),
+                        PeopleSharing { share_control: self.share_control, ..PeopleSharing::default() });
                 },
             );
             let mut frame = Frame {
@@ -10408,6 +10544,7 @@ mod tests {
                 envelopes: Vec::new(),
                 pane_closes: Vec::new(),
                 clocks: Vec::new(),
+                shares: Vec::new(),
                 segments: Vec::new(),
                 images: Vec::new(),
                 shapes: egui::Shape::Noop,
@@ -10432,6 +10569,7 @@ mod tests {
             frame.envelopes = theme::icon_probe::envelopes(&all);
             frame.pane_closes = theme::icon_probe::pane_close_marks(&all);
             frame.clocks = theme::icon_probe::clocks(&all);
+            frame.shares = theme::icon_probe::share_controls(&all);
             frame.segments = theme::icon_probe::line_segments(&all);
             collect_images(&all, &mut frame.images);
             frame.shapes = all;
@@ -16743,23 +16881,72 @@ mod tests {
     ///
     /// So the arithmetic is asserted rather than left implied -- at the
     /// widest count the strip can draw, which is the login's.
+    ///
+    /// **Six now, with design 6a's Share control**, and six at the full
+    /// [`HEADER_GAP`] do NOT fit: 6 x 34 + 5 x 14 is 274 against the stacked
+    /// row's 250. That is the overflow this test's doc predicted for a sixth
+    /// control, and the answer is [`controls_gap`]: the stacked row closes the
+    /// gaps between its controls -- never below the mock's own 2 -- until the
+    /// row fits, and stays at `HEADER_GAP` wherever it already did. So the
+    /// arithmetic is asserted at the gap the row is really drawn with.
     #[test]
     fn the_strips_controls_fit_the_apps_minimum_window() {
         let item = a_login();
-        let n = header_controls(&item);
-        let controls = theme::HEADER_BUTTON_HEIGHT * n as f32 + HEADER_GAP * (n - 1) as f32;
+        let people = PeopleSharing { share_control: Some(true), ..PeopleSharing::default() };
+        let n = header_controls_for(&item, &people);
+        assert_eq!(n, 6, "a login with the Share control is the widest strip there is");
         let content = MIN_PANE - f32::from(HEADER_PAD_X) * 2.0;
+        let at_full_gap = theme::HEADER_BUTTON_HEIGHT * n as f32 + HEADER_GAP * (n - 1) as f32;
         assert!(
-            header_layout(content, controls).stacked,
+            header_layout(content, at_full_gap).stacked,
             "the minimum pane is not stacking, so the controls are not getting the full \
              content width this assertion assumes"
         );
+        let gap = controls_gap(content, n);
+        let controls = theme::HEADER_BUTTON_HEIGHT * n as f32 + gap * (n - 1) as f32;
         assert!(
-            controls <= content,
+            controls <= content + 0.01,
             "at the app's minimum the strip's {n} controls want {controls}pt and the \
              stacked row has {content}pt -- a control is being painted off the pane, which \
              is the exact failure this file has already shipped once"
         );
+        assert!(gap >= HEADER_CONTROLS_MIN_GAP, "the controls are touching: a {gap}pt gap");
+        assert_eq!(
+            controls_gap(PANE - f32::from(HEADER_PAD_X) * 2.0, n),
+            HEADER_GAP,
+            "a row with room to spare keeps the strip's own gap"
+        );
+    }
+
+    /// **All six controls, painted at the app's minimum pane**: each inside
+    /// the column, none on another, none on the avatar -- the property
+    /// [`controls_gap`] exists for, read off the frame rather than the sum.
+    #[test]
+    fn six_controls_are_painted_inside_the_minimum_pane_and_apart() {
+        let item = a_login();
+        let mut pane = Pane::wide(MIN_PANE).with_share_control(true);
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
+        let (share, _) = frame.shares.first().copied().expect("the Share control");
+        let marks = [
+            ("the favourite star", frame.star().rect),
+            ("the Send envelope", frame.envelope().0),
+            ("the Share control", share),
+            ("the one-time code clock", frame.clock().0),
+            ("the kebab", frame.kebab()),
+            ("the close ✕", frame.pane_close().0),
+        ];
+        let avatar = frame.avatar_tile();
+        for (i, (name, rect)) in marks.iter().enumerate() {
+            assert!(bounds.contains_rect(*rect), "{name} is painted at {rect:?}, outside the column");
+            assert!(!rect.intersects(avatar), "{name} is painted on the avatar");
+            for (other, theirs) in &marks[i + 1..] {
+                assert!(!rect.intersects(*theirs), "{name} {rect:?} overlaps {other} {theirs:?}");
+            }
+        }
+        // Left to right: the envelope, then Share straight after it (6a).
+        assert!(frame.envelope().0.center().x < share.center().x);
+        assert!(share.center().x < frame.clock().0.center().x);
     }
 
     /// **The strip reserves room for exactly the controls it draws.**
@@ -16783,10 +16970,23 @@ mod tests {
     /// is a function of the item now: a login, which gets the ⏱, and a card,
     /// which does not. A reservation checked at one answer of a two-answer
     /// function is a reservation that has been checked once.
+    ///
+    /// **And for both answers of the Share control** (design 6a): drawn, it
+    /// is one more control and [`header_controls_for`] must count it; not
+    /// drawn, it must not be painted. Four cases, not two.
     #[test]
     fn the_strip_reserves_room_for_every_control_it_draws() {
-        for (what, item) in [("a login", a_login()), ("a card", a_full_card())] {
+        for (what, item, share) in [
+            ("a login", a_login(), None),
+            ("a card", a_full_card(), None),
+            ("a login with Share", a_login(), Some(true)),
+            ("a card offered a Send", a_full_card(), Some(false)),
+        ] {
             let mut pane = Pane::wide(MIN_PANE);
+            if let Some(offered) = share {
+                pane = pane.with_share_control(offered);
+            }
+            let people = PeopleSharing { share_control: share, ..PeopleSharing::default() };
             let frame = pane.idle(&item, &TotpState::NoSecret);
 
             let mut painted = vec![
@@ -16810,6 +17010,11 @@ mod tests {
                      for a code to go into"
                 );
             }
+            if share.is_some() {
+                painted.push(("the Share control", frame.shares.len()));
+            } else {
+                assert!(frame.shares.is_empty(), "{what} was drawn a Share control nobody resolved");
+            }
             let _ = frame.kebab();
             for (name, count) in &painted {
                 assert_eq!(
@@ -16820,12 +17025,12 @@ mod tests {
             }
             assert_eq!(
                 painted.len(),
-                header_controls(&item),
+                header_controls_for(&item, &people),
                 "with {what} selected the strip draws {} controls and reserves room for \
                  {} -- a control the reservation does not know about is a control that \
                  gets painted off the pane",
                 painted.len(),
-                header_controls(&item)
+                header_controls_for(&item, &people)
             );
         }
     }
@@ -16865,6 +17070,41 @@ mod tests {
             "clicking the header's ✉ did not report `SendRecord`, so the record composer \
              is unreachable from the only control that opens it"
         );
+    }
+
+    /// **The Share control sits right after the envelope** (mock 6a) and
+    /// reports `ShareRecord` -- or, where sharing is not offered, `SendRecord`:
+    /// the owner's "a Send is offered instead".
+    #[test]
+    fn the_share_control_shares_or_offers_a_send() {
+        let item = a_login();
+        for (offered, expected) in [(true, DetailAction::ShareRecord), (false, DetailAction::SendRecord)] {
+            let mut pane = Pane::new().with_share_control(offered);
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            let (envelope, _) = frame.envelopes.first().copied().expect("the envelope");
+            // Right of the envelope by one control's pitch.
+            let at = egui::pos2(envelope.center().x + theme::HEADER_BUTTON_HEIGHT, envelope.center().y);
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, at).action, expected);
+        }
+    }
+
+    /// **The Share control's hover says what it does**, in both answers: a
+    /// share is view-only, and where sharing is not offered the control says
+    /// that it sends a link instead -- so pressing it and getting the Send
+    /// composer is never a surprise.
+    #[test]
+    fn the_share_controls_hover_says_share_or_send() {
+        let item = a_login();
+        for (offered, words) in [
+            (true, super::super::share_ui::SHARE_TOOLTIP),
+            (false, super::super::share_ui::SHARE_UNAVAILABLE_TOOLTIP),
+        ] {
+            let mut pane = Pane::new().with_share_control(offered);
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            let (share, _) = frame.shares.first().copied().expect("the Share control");
+            let hovered = pane.hover_settled(&item, &TotpState::NoSecret, share.center());
+            assert!(hovered.painted(words), "hovering Share painted {:?}", hovered.strings());
+        }
     }
 
     /// **The ⏱ reports `AddTotp`, pressed where the header really painted
@@ -23863,7 +24103,8 @@ mod read_pane_scroll_tests {
                 None,
                         false,
                         false,
-                        &mut super::tests::inert_breach_cache());
+                        &mut super::tests::inert_breach_cache(),
+                        PeopleSharing::default());
                 },
             );
             let mut shot = Shot::default();
@@ -25913,7 +26154,8 @@ mod breach_badge_tests {
                 None,
                     enabled,
                     false,
-                    &mut cache);
+                    &mut cache,
+                    PeopleSharing::default());
             });
             painted.runs.clear();
             painted.fills.clear();

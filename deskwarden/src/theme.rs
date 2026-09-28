@@ -7831,15 +7831,32 @@ pub fn form_card_header(ui: &mut Ui, title: &str) -> Rect {
 /// band is otherwise identical -- same padding, same 14px, same rule closing
 /// it -- and two headers a point apart is this file's most-repeated defect.
 pub fn form_card_header_marked(ui: &mut Ui, title: &str, plane: bool) -> Rect {
+    if plane {
+        form_card_header_with(ui, title, Some((SEND_PLANE, &|p: &egui::Painter, r: Rect| paint_send_plane(p, r, BLUE))))
+    } else {
+        form_card_header_with(ui, title, None)
+    }
+}
+
+/// **The one header band**, with whichever mark the card wears before its
+/// title: `(size, painter)`, or none. [`form_card_header_marked`]'s plane
+/// and [`form_card_header_share`]'s person-with-a-plus both come through
+/// here, so the two title bands cannot come apart by a point --
+/// `all_four_bands_ask_the_rule_rather_than_the_narrow_constant` counts ONE
+/// header asking for its padding, and a second copy of this body was a fifth.
+fn form_card_header_with(
+    ui: &mut Ui,
+    title: &str,
+    mark: Option<(f32, &dyn Fn(&egui::Painter, Rect))>,
+) -> Rect {
     let line = egui::Frame::new()
         .inner_margin(Margin::symmetric(form_card_pad_x(ui.available_width()), FORM_CARD_PAD_Y))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
-                if plane {
-                    let (mark, _) =
-                        ui.allocate_exact_size(Vec2::splat(SEND_PLANE), Sense::hover());
-                    paint_send_plane(ui.painter(), mark, BLUE);
+                if let Some((size, paint)) = mark {
+                    let (at, _) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+                    paint(ui.painter(), at);
                     ui.add_space(SEND_PLANE_GAP);
                 }
                 ui.label(RichText::new(title).size(14.0).color(INK).strong()).rect
@@ -7946,13 +7963,28 @@ pub fn share_record_button(ui: &mut Ui) -> Response {
     }
     // The strip's resting grey and its hover ink, the envelope's own pair.
     let color = if response.hovered() { INK } else { TEXT_SECONDARY };
-    let stroke = Stroke::new(ICON_STROKE, color);
     // The mock's 21px glyph in a 24-unit box, centred in the 34pt control.
-    let size = SHARE_GLYPH;
-    let unit = size / 24.0;
-    let origin = rect.center() - Vec2::splat(size / 2.0);
+    paint_share_glyph(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(SHARE_GLYPH)),
+        Stroke::new(ICON_STROKE, color),
+    );
+    response
+}
+
+/// **The Share glyph -- a person with a plus** -- in a 24-unit box scaled to
+/// `rect`, stroked with `stroke` as given: the mock's `ic('share', ...)`.
+///
+/// One drawing for its two places. The header's control strokes it at 21
+/// points in [`ICON_STROKE`]; the Share dialog's title band wears it at 18 in
+/// [`BLUE`] and the mock's 2-unit weight (6a's `ic('share', 18, '#1b3fa0',
+/// 2)`), exactly as §5a's composer wears [`paint_send_plane`] in front of its
+/// title. Split out of [`share_record_button`] rather than drawn twice so the
+/// dialog's mark and the control that opens it cannot come apart.
+pub fn paint_share_glyph(painter: &egui::Painter, rect: Rect, stroke: Stroke) {
+    let unit = rect.width() / 24.0;
+    let origin = rect.min;
     let at = |ux: f32, uy: f32| origin + Vec2::new(ux * unit, uy * unit);
-    let painter = ui.painter();
     painter.circle_stroke(at(9.5, 8.2), 3.7 * unit, stroke);
     // `M3 20.2c.5-3.8 3.1-6 6.5-6 1.3 0 2.5.3 3.5.9`: a shoulder that stops
     // short on the right, where the plus stands. One open path for the
@@ -7969,11 +8001,87 @@ pub fn share_record_button(ui: &mut Ui) -> Response {
     // tracks are 16.7 and the ✕ arms are diagonal.
     painter.line_segment([at(18.0, 12.8), at(18.0, 19.8)], stroke);
     painter.line_segment([at(14.5, 16.3), at(21.5, 16.3)], stroke);
-    response
 }
 
 /// The mock's `ic('share', 21, ...)`: the Share control's glyph box.
 const SHARE_GLYPH: f32 = 21.0;
+
+/// The head of the header's Share glyph: `r="3.7"` in the 24-unit box, at
+/// [`SHARE_GLYPH`]. What `icon_probe::share_controls` finds the control by --
+/// a ring radius nothing else in this crate strokes (the clock is 8.5, the
+/// kebab's dots 1.7 and filled, the dialog's own 18-point glyph 2.8).
+pub const SHARE_HEAD_RADIUS: f32 = 3.7 * SHARE_GLYPH / 24.0;
+
+/// [`form_card_header`] **with the Share glyph in front of the title** --
+/// mock 6a's `.mhead`: `ic('share', 18, '#1b3fa0', 2)`, then `gap: 10px`, then
+/// the 14px title.
+///
+/// The same band as §5a's composer, with the same padding, the same 14px and
+/// the same rule closing it, because 6a's own note is that the Share dialog
+/// is "styled like Send a record": the only difference between the two title
+/// bands is the mark, and the mark is the one thing that says which door the
+/// user came through.
+pub fn form_card_header_share(ui: &mut Ui, title: &str) -> Rect {
+    form_card_header_with(
+        ui,
+        title,
+        Some((SHARE_DIALOG_GLYPH, &|p: &egui::Painter, r: Rect| {
+            paint_share_glyph(p, r, Stroke::new(2.0 * SHARE_DIALOG_GLYPH / 24.0, BLUE));
+        })),
+    )
+}
+
+/// 6a's `ic('share', 18, ...)` on the dialog's title band.
+const SHARE_DIALOG_GLYPH: f32 = 18.0;
+
+/// **The eye in front of 6a's access sentence** -- the mock's
+/// `ic('eye', 16, '#605d5d', 1.8)`: an almond and a pupil, in a 24-unit box
+/// scaled to `rect`.
+///
+/// The almond is the mock's four smooth cubics
+/// (`M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z`,
+/// each `S` reflecting the control point before it), flattened and drawn as
+/// ONE OPEN line that ends where it began. Open and not a closed `Path`, on
+/// purpose: `icon_probe::eyes` finds the read pane's reveal eyes as closed
+/// paths of [`EYE_VERTICES`] points, and this eye reveals nothing -- it says
+/// "view-only" -- so it must not be countable as one of those.
+pub fn paint_view_eye(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let unit = rect.width() / 24.0;
+    let at = |ux: f32, uy: f32| rect.min + Vec2::new(ux * unit, uy * unit);
+    let stroke = Stroke::new(1.8 * unit, color);
+    let mut almond = flattened_cubic([at(2.5, 12.0), at(2.5, 12.0), at(6.0, 5.5), at(12.0, 5.5)]);
+    for curve in [
+        [at(12.0, 5.5), at(18.0, 5.5), at(21.5, 12.0), at(21.5, 12.0)],
+        [at(21.5, 12.0), at(21.5, 12.0), at(18.0, 18.5), at(12.0, 18.5)],
+        [at(12.0, 18.5), at(6.0, 18.5), at(2.5, 12.0), at(2.5, 12.0)],
+    ] {
+        almond.extend(flattened_cubic(curve).into_iter().skip(1));
+    }
+    painter.add(egui::Shape::line(almond, stroke));
+    painter.circle_stroke(at(12.0, 12.0), 3.0 * unit, stroke);
+}
+
+/// **The info mark on 6a's no-account band** -- the mock's
+/// `ic('info', 15, '#8a5a06', 2.2)`: a ring, a dot and the stem of an `i`,
+/// in a 24-unit box scaled to `rect`.
+///
+/// An information mark and not [`paint_warning_glyph`]'s triangle, which is
+/// the design's own choice and the right one: nothing has gone wrong. The
+/// share went through; it is waiting for somebody to sign up.
+pub fn paint_info_mark(painter: &egui::Painter, rect: Rect, color: Color32) {
+    let unit = rect.width() / 24.0;
+    let at = |ux: f32, uy: f32| rect.min + Vec2::new(ux * unit, uy * unit);
+    let stroke = Stroke::new(2.2 * unit, color);
+    painter.circle_stroke(at(12.0, 12.0), 9.0 * unit, stroke);
+    // `M12 8h.01`: a round cap on a zero-length line is a dot of the
+    // stroke's width -- drawn filled, since egui caps nothing.
+    painter.circle_filled(at(12.0, 8.0), 1.1 * unit, color);
+    // `M11 12h1v5h1`: the stem with its two serifs, one open path.
+    painter.add(egui::Shape::line(
+        vec![at(11.0, 12.0), at(12.0, 12.0), at(12.0, 17.0), at(13.0, 17.0)],
+        stroke,
+    ));
+}
 
 /// Where one person stands, as a pill says it. Short words; the status line
 /// beside the pill carries the long form (mock 6e, SHARE PILLS).
@@ -13770,6 +13878,19 @@ pub mod icon_probe {
     pub fn clocks(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
         let mut out = Vec::new();
         walk_rings(shape, CLOCK_RADIUS, &mut out);
+        out
+    }
+
+    /// The header's Share controls (mock 6a), each as its head's ring and
+    /// the colour it was stroked in -- the only way `share_record_button` is
+    /// visible to a test, since it paints no fill and no string.
+    ///
+    /// **Found by the HEAD**, at [`SHARE_HEAD_RADIUS`], for [`clocks`]'s
+    /// reason: a ring radius is a thing one mark owns, where the plus's two
+    /// short axis-aligned segments are the shape the clock's hands also are.
+    pub fn share_controls(shape: &egui::Shape) -> Vec<(Rect, Color32)> {
+        let mut out = Vec::new();
+        walk_rings(shape, SHARE_HEAD_RADIUS, &mut out);
         out
     }
 

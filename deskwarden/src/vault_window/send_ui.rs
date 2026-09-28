@@ -4126,7 +4126,6 @@ pub fn draw_recipient_row(
     history: &crate::sent_history::SentHistory,
     enabled: bool,
 ) -> RecipientAnswer {
-    let mut answer = RecipientAnswer::Nothing;
     let label_width = access_label_width(ui);
     ui.add_space(ACCESS_ROW_SPACING);
     let field = access_row(ui, RECIPIENT_LABEL, label_width, enabled, |ui| {
@@ -4134,8 +4133,49 @@ pub fn draw_recipient_row(
         ui.add_enabled_ui(enabled, |ui| theme::inline_field(ui, recipient, RECIPIENT_HINT, width, false))
             .inner
     });
+    match draw_people_suggestions(
+        ui,
+        egui::Id::new("record-recipient-suggestions"),
+        &field,
+        recipient,
+        history,
+        enabled,
+        SUGGESTIONS_EYEBROW,
+        &|person| sent_count_words(person.send_ids.len()),
+    ) {
+        Some(email) => RecipientAnswer::Forget(email),
+        None => RecipientAnswer::Nothing,
+    }
+}
 
-    let popup_id = egui::Id::new("record-recipient-suggestions");
+/// **The people suggested under an address box** -- 5a's `SENT TO BEFORE`
+/// list, and 6a's `SHARED WITH BEFORE`, which is the same list fed by both
+/// kinds of entry. Answers the address whose [`FORGET_MARK`] was pressed.
+///
+/// One function for the two boxes that suggest people, because 6a's own note
+/// is that the Share dialog's list is the Send composer's list, renamed: the
+/// same rows, the same hover wash, the same ✕ at the same inset. The two
+/// differ in their eyebrow and in what the count beside each address says --
+/// a Send composer counts Sends, the Share dialog counts both kinds -- so
+/// those two are what a caller passes.
+///
+/// While `field` has focus -- or the pointer is over the list, so a click on
+/// a suggestion is not lost to the box giving up focus on the press -- the
+/// people in `crate::sent_history` whose address contains what is typed, most
+/// recently sent first. A click fills the box.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn draw_people_suggestions(
+    ui: &mut egui::Ui,
+    popup_id: egui::Id,
+    field: &egui::Response,
+    typed: &mut String,
+    history: &crate::sent_history::SentHistory,
+    enabled: bool,
+    eyebrow: &str,
+    count: &dyn Fn(&crate::sent_history::Person) -> String,
+) -> Option<String> {
+    let recipient = typed;
+    let mut answer = None;
     let last: Option<egui::Rect> = ui.data(|d| d.get_temp(popup_id));
     let pointer_in = last.is_some_and(|rect| {
         ui.input(|i| i.pointer.hover_pos().is_some_and(|at| rect.contains(at)))
@@ -4169,7 +4209,7 @@ pub fn draw_recipient_row(
                     ui.horizontal(|ui| {
                         ui.add_space(8.0);
                         ui.label(
-                            egui::RichText::new(SUGGESTIONS_EYEBROW)
+                            egui::RichText::new(eyebrow)
                                 .size(10.0)
                                 .strong()
                                 .color(theme::TEXT_GHOST),
@@ -4196,7 +4236,7 @@ pub fn draw_recipient_row(
                         let count = p.text(
                             egui::pos2(mark.left() - 6.0, row.center().y),
                             egui::Align2::RIGHT_CENTER,
-                            sent_count_words(person.send_ids.len()),
+                            count(person),
                             egui::FontId::new(11.0, egui::FontFamily::Proportional),
                             theme::TEXT_FAINT,
                         );
@@ -4219,7 +4259,7 @@ pub fn draw_recipient_row(
                             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                         }
                         if forget.clicked() {
-                            answer = RecipientAnswer::Forget(person.email.clone());
+                            answer = Some(person.email.clone());
                         } else if pressed.clicked() {
                             *recipient = person.email.clone();
                             ui.memory_mut(|m| m.surrender_focus(field.id));
