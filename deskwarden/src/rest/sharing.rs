@@ -196,6 +196,9 @@ pub const ROSTER_UNREADABLE: &str = "Deskwarden couldn't read who you share with
 /// A stop's refusal opens with this; the person who can still see the record
 /// follows it.
 pub const STOP_FAILED_PREFIX: &str = "Couldn't stop sharing.";
+/// A share of an org copy whose move back to the personal vault is pending:
+/// the personal copy is the record to share.
+pub const COMING_HOME: &str = "This record is being moved back to your vault. Share it from there.";
 /// The last person was stopped and the personal copy could not be made.
 /// Nothing was changed.
 pub const MOVE_BACK_FAILED: &str = "Couldn't move the record back to your vault. It is still shared.";
@@ -1245,6 +1248,14 @@ impl Sharing {
             return Err(SharingError::Refused(YOURSELF.to_string()));
         }
         let account = keyed_account(account)?;
+        // **An org copy whose move back is pending is not shared again.** Its
+        // personal copy exists, and the next pass unfiles everyone and
+        // deletes it -- so a person added here would be told "shared" and
+        // then silently lose it. Refused, not finished first: the record to
+        // share is the personal copy, which the user shares from their vault.
+        if self.pending_move(&account.id, item_id).is_some() {
+            return Err(SharingError::Refused(COMING_HOME.to_string()));
+        }
         let mut keys = self.keys_from(&profile)?;
         let (record, failures) = self.fetch_record(item_id, &keys)?;
         let existing = self.my_org_id(&profile, &account);
@@ -1352,7 +1363,7 @@ impl Sharing {
         let email = normalise_email(email);
         let refused = format!("{STOP_FAILED_PREFIX} {email} can still see it.");
         if let Some(personal_id) = self.pending_move(&ctx.account.id, item_id) {
-            return self.finish_pending(ctx, item_id, &personal_id, &refused);
+            return self.finish_pending(ctx, item_id, &personal_id, &email);
         }
         let nothing = || StopOutcome { moved_to: None, changed: SharingOutcome::default() };
         let Some(collection) = ctx.collection_for(&email).map(str::to_string) else {
@@ -1527,7 +1538,14 @@ impl Sharing {
     /// still see the org copy, and otherwise the new id, with the personal
     /// copy re-read so the daemon holds it even when the first try's refusal
     /// never told it.
-    fn finish_pending(&self, ctx: &Ctx, old: &str, personal_id: &str, refused: &str) -> Result<StopOutcome, SharingError> {
+    ///
+    /// **The refusal names `email` only when it is true of them.** Any stop
+    /// reaches this path, whoever it names, so "{email} can still see it" is
+    /// said only when the org copy -- re-read for the purpose, on this rare
+    /// branch alone -- is still filed in that person's collection. Otherwise
+    /// the neutral [`STOP_FAILED_PREFIX`]: the stop did fail, and whoever can
+    /// see the record, it is not someone this stop can name.
+    fn finish_pending(&self, ctx: &Ctx, old: &str, personal_id: &str, email: &str) -> Result<StopOutcome, SharingError> {
         let (unfiled, purged) = self.second_half(old);
         let mut changed = SharingOutcome::default();
         match (unfiled, purged) {
@@ -1536,7 +1554,18 @@ impl Sharing {
                 changed.removed.push(old.to_string());
             }
             (Ok(answer), Err(_)) => changed.upserted.extend(self.readable(&answer, &ctx.keys)),
-            (Err(_), Err(_)) => return Err(SharingError::Refused(refused.to_string())),
+            (Err(_), Err(_)) => {
+                let theirs = ctx.collection_for(email);
+                let still_theirs = theirs.is_some_and(|collection| {
+                    self.fetch_record(old, &ctx.keys)
+                        .is_ok_and(|(org_copy, _)| collection_ids_of(&org_copy.item).contains(&collection))
+                });
+                return Err(SharingError::Refused(if still_theirs {
+                    format!("{STOP_FAILED_PREFIX} {email} can still see it.")
+                } else {
+                    STOP_FAILED_PREFIX.to_string()
+                }));
+            }
         }
         if let Ok((home, _)) = self.fetch_record(personal_id, &ctx.keys) {
             changed.upserted.push(home.item);
@@ -2988,6 +3017,99 @@ mod tests {
         let pass = engine.refresh(Trigger::WholeRead).expect("the pass runs on");
         deleted.assert();
         assert_eq!(pass.outcome.removed, ["s1"]);
+    }
+
+    // ---- follow-up: a pending move back, from every side -------------------------
+
+    /// `s1`'s move back is pending: its personal copy is `p-new`.
+    fn pending_purge(dir: &crate::test_scratch::ScratchDir) -> std::path::PathBuf {
+        let path = dir.join("sharing_state.json");
+        crate::sharing_state::update(&path, |state| {
+            state.account_mut(FIXTURE_USER_ID).unfinished.push(crate::sharing_state::Unfinished::PurgeOrgCopy {
+                org_cipher_id: "s1".into(),
+                personal_id: "p-new".into(),
+            });
+        }).expect("seeded");
+        path
+    }
+
+    /// **An org copy on its way home is not shared again**: the next pass
+    /// unfiles everyone and deletes it, so a person added now would be told
+    /// "shared" and then lose it. Refused before the record is even read.
+    #[test]
+    fn an_org_copy_on_its_way_home_is_not_shared_again() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let path = pending_purge(&dir);
+        let read = server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).expect(0).create();
+        let writes = server.mock("POST", Matcher::Any).expect(0).create();
+        let puts = server.mock("PUT", Matcher::Any).expect(0).create();
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        match engine.share("s1", "bob@example.com") {
+            Err(SharingError::Refused(said)) => assert_eq!(said, COMING_HOME),
+            other => panic!("expected the coming-home refusal, got {other:?}"),
+        }
+        read.assert();
+        writes.assert();
+        puts.assert();
+        deletes.assert();
+        assert_eq!(crate::sharing_state::SharingState::load(&path).account(FIXTURE_USER_ID).unfinished.len(), 1);
+    }
+
+    /// **A refused stop on a pending move names only someone it is true of.**
+    /// Bob was never on the record: the neutral refusal. Anna's collection
+    /// still holds the org copy: her name, as before.
+    #[test]
+    fn a_refused_stop_on_a_pending_move_names_only_someone_who_can_still_see_it() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        pending_purge(&dir);
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com"), person_collection("c-bob", "bob@example.com")]);
+        with_roster(&mut server, &[]);
+        server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
+        server.mock("PUT", "/api/ciphers/s1/collections").with_status(500).create();
+        server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).create();
+        let creates = server.mock("POST", Matcher::Any).expect(0).create();
+        for (email, sentence) in [
+            ("bob@example.com", STOP_FAILED_PREFIX.to_string()),
+            ("carol@example.com", STOP_FAILED_PREFIX.to_string()),
+            ("anna@example.com", format!("{STOP_FAILED_PREFIX} anna@example.com can still see it.")),
+        ] {
+            match engine.stop("s1", email) {
+                Err(SharingError::Refused(said)) => assert_eq!(said, sentence, "{email}"),
+                other => panic!("{email}: expected a refusal, got {other:?}"),
+            }
+        }
+        creates.assert();
+    }
+
+    /// **A pending move unfiled but not deleted is a stop that worked**
+    /// ([`Sharing::finish_pending`]'s middle branch): the person has lost it,
+    /// the org copy is announced filed nowhere beside the personal copy, and
+    /// the delete stays pending. No second copy.
+    #[test]
+    fn a_pending_move_unfiled_but_not_deleted_is_a_stop_that_worked() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let path = pending_purge(&dir);
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[]);
+        let unfiled = server
+            .mock("PUT", "/api/ciphers/s1/collections")
+            .match_body(Matcher::Json(serde_json::json!({ "collectionIds": [] })))
+            .with_body(shared_cipher("s1", "Acme VPN", &[]).to_string())
+            .expect(1)
+            .create();
+        let delete_fails = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).expect(1).create();
+        server.mock("GET", "/api/ciphers/p-new").with_body(personal_cipher("p-new", "Acme VPN").to_string()).create();
+        let creates = server.mock("POST", Matcher::Any).expect(0).create();
+        let outcome = engine.stop("s1", "anna@example.com").expect("the person has lost it");
+        unfiled.assert();
+        delete_fails.assert();
+        creates.assert();
+        assert_eq!(outcome.moved_to.as_deref(), Some("p-new"));
+        assert!(outcome.changed.removed.is_empty(), "the org copy is still there");
+        let org_copy = outcome.changed.upserted.iter().find(|i| i.id == "s1").expect("the unfiled org copy is announced");
+        assert!(collection_ids_of(org_copy).is_empty());
+        assert!(outcome.changed.upserted.iter().any(|i| i.id == "p-new"), "the personal copy is announced");
+        assert_eq!(crate::sharing_state::SharingState::load(&path).account(FIXTURE_USER_ID).unfinished.len(), 1, "the delete stays pending");
     }
 
     /// **A move remembered for a record that is still personal is stale** --
