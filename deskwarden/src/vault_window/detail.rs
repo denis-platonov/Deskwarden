@@ -660,9 +660,9 @@ pub enum DetailAction {
     ///
     /// This and the six after it are on the **non**-exposing side of
     /// `detail_action_exposes_secrets`, where each is argued: none reads a
-    /// field of the item, paints one or copies one, and the one that sends
-    /// the record anywhere -- Share anyway -- is gated by the fingerprint
-    /// comparison instead.
+    /// field of the item, paints one or copies one. The two that grant access
+    /// -- Share anyway, and a Gone person's Re-invite -- are gated further
+    /// down, by `permit_share_anyway` and `permit_reinvite`.
     StopSharing(String),
     /// Step two: the question's `Remove from their vault`.
     ConfirmStopSharing(String),
@@ -2577,7 +2577,41 @@ pub(crate) fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
     // something else happens to cause a frame.
     ui.ctx()
         .request_repaint_after(std::time::Duration::from_secs_f64(left));
+    let (rect, galley) = copy_toast_geometry(ui, pane, text);
+    // **A painter on a foreground layer, not an `egui::Area`.** An `Area`
+    // that has never been laid out before runs its first pass invisibly to
+    // learn its own size, so an `Area`-based toast painted NOTHING on the
+    // frame the copy happened and only appeared on the next one -- measured,
+    // not assumed: `clicking_a_row_confirms_the_copy_by_name` failed against
+    // exactly that version while the placement test, which reads the frame
+    // after, passed. A painter has no layout and no state to warm up, and a
+    // confirmation is only ever painted: it takes no input, so it wants none
+    // of what an `Area` is for, and cannot swallow a click meant for the row
+    // beneath it.
+    let painter = ui
+        .ctx()
+        .layer_painter(egui::LayerId::new(egui::Order::Foreground, copy_toast_id()));
+    painter.rect_filled(rect, CornerRadius::same(8), theme::INK);
+    painter.galley(rect.min + COPY_TOAST_PAD, galley, theme::CARD);
+}
 
+/// The copy confirmation's padding round its text.
+const COPY_TOAST_PAD: egui::Vec2 = egui::vec2(14.0, 10.0);
+
+/// **Where the copy confirmation is on screen right now, if it is up** --
+/// the box [`draw_copy_toast`] paints this frame, from the same arithmetic.
+/// For the share toast, which shares the corner and stands above this one
+/// rather than over it (`share_ui::draw_share_toast`). Reads the record and
+/// changes nothing: an expired one is [`draw_copy_toast`]'s to clear.
+pub(crate) fn live_copy_toast_rect(ui: &egui::Ui, pane: egui::Rect) -> Option<egui::Rect> {
+    let now = ui.input(|i| i.time);
+    let toast = ui.ctx().data(|data| data.get_temp::<CopyToast>(copy_toast_id()));
+    let (text, _) = copy_toast_now(toast.as_ref(), now)?;
+    Some(copy_toast_geometry(ui, pane, text).0)
+}
+
+/// The copy confirmation's box inside `pane`, and its laid-out text.
+fn copy_toast_geometry(ui: &egui::Ui, pane: egui::Rect, text: String) -> (egui::Rect, std::sync::Arc<egui::Galley>) {
     // **Measured here and placed with `fixed_pos`, not handed to `anchor`.**
     // An `Area` whose size egui does not yet know runs an INVISIBLE sizing
     // pass on its first frame when it has to align itself -- so an anchored
@@ -2591,8 +2625,7 @@ pub(crate) fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
         egui::FontId::proportional(COPY_TOAST_TEXT_SIZE),
         theme::CARD,
     );
-    let pad = egui::vec2(14.0, 10.0);
-    let size = galley.size() + pad * 2.0;
+    let size = galley.size() + COPY_TOAST_PAD * 2.0;
     // `max` on the near edges so a pane narrower than the message keeps the
     // START of the sentence on screen rather than the end of it.
     //
@@ -2609,22 +2642,7 @@ pub(crate) fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
         (pane.right() - COPY_TOAST_INSET - size.x).max(pane.left() + COPY_TOAST_INSET),
         (pane.bottom() - COPY_TOAST_INSET - size.y).max(pane.top() + COPY_TOAST_INSET),
     );
-    // **A painter on a foreground layer, not an `egui::Area`.** An `Area`
-    // that has never been laid out before runs its first pass invisibly to
-    // learn its own size, so an `Area`-based toast painted NOTHING on the
-    // frame the copy happened and only appeared on the next one -- measured,
-    // not assumed: `clicking_a_row_confirms_the_copy_by_name` failed against
-    // exactly that version while the placement test, which reads the frame
-    // after, passed. A painter has no layout and no state to warm up, and a
-    // confirmation is only ever painted: it takes no input, so it wants none
-    // of what an `Area` is for, and cannot swallow a click meant for the row
-    // beneath it.
-    let painter = ui
-        .ctx()
-        .layer_painter(egui::LayerId::new(egui::Order::Foreground, copy_toast_id()));
-    let rect = egui::Rect::from_min_size(pos, size);
-    painter.rect_filled(rect, CornerRadius::same(8), theme::INK);
-    painter.galley(rect.min + pad, galley, theme::CARD);
+    (egui::Rect::from_min_size(pos, size), galley)
 }
 
 /// What a copy-on-click tile says when the pointer rests on it.

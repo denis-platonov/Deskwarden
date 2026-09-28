@@ -65,6 +65,17 @@ pub(crate) fn waiting_toast(email: &str, record: &str) -> String {
     format!("{email} was added. {record} appears in their vault once they accept.")
 }
 
+/// Share anyway went through: the record is on its way to the key whose
+/// fingerprint was compared.
+pub(crate) fn confirmed_toast(email: &str) -> String {
+    format!("Shared with {email} on their new key.")
+}
+
+/// A Re-invite went through.
+pub(crate) fn reinvited_toast(email: &str) -> String {
+    format!("Invitation sent to {email}.")
+}
+
 /// A share that left an invitation for an address with no account, said as a
 /// toast when no dialog is open to say it (mock 6e's dialog line, without
 /// the expiry the report does not carry).
@@ -265,6 +276,14 @@ pub(crate) struct SharingPane {
     /// the user compared (Task 12), and this is where the window keeps which
     /// key that was. Spent by the Confirm it binds -- see [`request`].
     pub(crate) fingerprint: Option<(String, Fingerprint)>,
+    /// **Where that person stood in the view when their fingerprint came
+    /// back** -- `None` when the view did not list them. A view that answers
+    /// with a DIFFERENT state for them drops the fingerprint ([`apply`]): a
+    /// changed key's box must never show the words of the key before, and a
+    /// state that moved is the one signal the window has that the key may
+    /// have. (A key that changes twice with no state between is the engine's
+    /// to catch: it confirms only the hash that was shown.)
+    fingerprint_state: Option<PersonState>,
     /// **A fingerprint is being fetched** for this normalised email. The read
     /// has a slot of its own, one at a time: [`Self::fingerprint`] holds one
     /// answer, so two reads out at once would race for it, and the card
@@ -275,8 +294,20 @@ pub(crate) struct SharingPane {
     /// A toast and when it goes, in egui seconds.
     pub(crate) toast: Option<(String, f64)>,
     /// A failed request's sentence, shown on the card until the next write.
-    /// Shown, never logged: see the module doc.
+    /// Shown, never logged: see the module doc. Set through [`Self::say`].
     pub(crate) notice: Option<String>,
+    /// **The record [`Self::notice`] is about**, when it is a write's answer:
+    /// the record on screen when that write was asked. `None` for a sentence
+    /// about no record in particular -- a refusal, a busy slot, a fingerprint.
+    /// The card shows a notice only on its own record, and one that arrives
+    /// while another record is on screen is routed to a toast instead
+    /// ([`route_stray_notice`]), so "Couldn't stop sharing" never stands on a
+    /// record it is not about.
+    notice_record: Option<String>,
+    /// The record on screen when the write in flight was asked -- carried
+    /// from [`request`] to its answer in [`apply`], which tags a failure with
+    /// it. See [`request_on`].
+    write_record: Option<String>,
     /// **The daemon's forget for the person the forget question is about**:
     /// their normalised email, and `None` until the answer comes, then
     /// whether it stopped every share. See [`Self::daemon_forget`].
@@ -425,6 +456,70 @@ impl SharingPane {
     pub(crate) fn end_forget(&mut self) {
         self.daemon_forget = None;
     }
+
+    /// **The one way a sentence goes on the card**: the notice, and the
+    /// record it is about -- `None` for one about no record in particular.
+    /// Setting the two together is what keeps a tag from an earlier notice
+    /// pinning a new one to the wrong record.
+    pub(crate) fn say(&mut self, sentence: String, record: Option<String>) {
+        self.notice = Some(sentence);
+        self.notice_record = record;
+    }
+
+    /// The notice the card on `item_id` shows: one about that record, or
+    /// about none.
+    pub(crate) fn notice_for(&self, item_id: &str) -> Option<&str> {
+        match &self.notice_record {
+            Some(record) if record != item_id => None,
+            _ => self.notice.as_deref(),
+        }
+    }
+
+    /// Hide fingerprint: the words and the state they were fetched in go
+    /// together, so Share anyway has nothing to confirm until Show runs again.
+    pub(crate) fn hide_fingerprint(&mut self) {
+        self.fingerprint = None;
+        self.fingerprint_state = None;
+    }
+
+    /// A toast, for [`TOAST_SECONDS`] from `now_seconds` (egui's input time).
+    fn toast(&mut self, text: String, now_seconds: f64) {
+        self.toast = Some((text, now_seconds + TOAST_SECONDS));
+    }
+}
+
+/// **A write's failure that belongs to another record goes to a toast.**
+/// Called by the read pane's frame with the record on screen: a notice tagged
+/// with a different record -- a stop asked on Acme VPN that failed after the
+/// user moved on to Wi-Fi -- is said once in the corner, where it names
+/// itself, rather than on a card it is not about or not at all.
+pub(crate) fn route_stray_notice(pane: &mut SharingPane, item_id: &str, now_seconds: f64) {
+    if pane.notice_record.as_deref().is_some_and(|record| record != item_id) {
+        if let Some(sentence) = pane.notice.take() {
+            pane.toast(sentence, now_seconds);
+        }
+        pane.notice_record = None;
+    }
+}
+
+/// **Whether sending anything more to `email` should ask for the master
+/// password first**: some record shared with them is re-prompt protected.
+///
+/// Share anyway and a Gone person's Re-invite do not send one record: they
+/// grant the person's membership, and a membership reaches EVERY record
+/// shared with them. So the question is asked of all of those records, not
+/// of the one on screen -- a plain record's card must not be a door around
+/// a protected one's prompt. No view, no records: nothing is sent anyway.
+pub(crate) fn shares_a_protected_record(view: Option<&SharingView>, email: &str, items: &[VaultItem]) -> bool {
+    let Some(view) = view else {
+        return false;
+    };
+    let email = normalise_email(email);
+    view.records
+        .iter()
+        .filter(|r| r.people.iter().any(|p| normalise_email(p) == email))
+        .filter_map(|r| items.iter().find(|i| i.id == r.item_id))
+        .any(crate::vault_bridge::reprompt_protected)
 }
 
 /// **The Share dialog's state** (mock 6a), drawn by [`draw_share_modal`] and
@@ -538,9 +633,19 @@ impl SharingCall {
             Self::Forget(_) => SharingReport::Forgot(Err(err)),
             Self::Fingerprint(email) => SharingReport::Fingerprint { email: email.clone(), result: Err(err) },
             Self::InviteCode { .. } => SharingReport::InviteCode(Err(err)),
-            Self::Reinvite(_) | Self::Confirm { .. } | Self::Accept(_) | Self::Decline(_) | Self::Leave(_) => {
-                SharingReport::Done(Err(err))
-            }
+            Self::Reinvite(email) => SharingReport::Reinvited { email: email.clone(), result: Err(err) },
+            Self::Confirm { email, .. } => SharingReport::Confirmed { email: email.clone(), result: Err(err) },
+            Self::Accept(_) | Self::Decline(_) | Self::Leave(_) => SharingReport::Done(Err(err)),
+        }
+    }
+
+    /// The record a write carries in itself -- a stop's, a share's. The
+    /// others are about a person, and [`request_on`] names the record they
+    /// were asked on.
+    fn record(&self) -> Option<&str> {
+        match self {
+            Self::Stop { item_id, .. } | Self::Share { item_id, .. } => Some(item_id),
+            _ => None,
         }
     }
 }
@@ -553,6 +658,10 @@ pub(crate) enum SharingReport {
     /// whether or not the dialog is still open when the answer comes.
     Shared { email: String, item_name: String, result: Result<ShareResult, String> },
     Stopped { email: String, result: Result<Option<String>, String> },
+    /// A Re-invite's answer, with the person it names in its toast.
+    Reinvited { email: String, result: Result<(), String> },
+    /// Share anyway's answer, likewise.
+    Confirmed { email: String, result: Result<(), String> },
     Done(Result<(), String>),
     /// The names of the records a forget stopped -- decrypted names.
     Forgot(Result<Vec<String>, String>),
@@ -574,6 +683,8 @@ impl std::fmt::Debug for SharingReport {
             Self::View(r) => ("View", outcome(r)),
             Self::Shared { result, .. } => ("Shared", outcome(result)),
             Self::Stopped { result, .. } => ("Stopped", outcome(result)),
+            Self::Reinvited { result, .. } => ("Reinvited", outcome(result)),
+            Self::Confirmed { result, .. } => ("Confirmed", outcome(result)),
             Self::Done(r) => ("Done", outcome(r)),
             Self::Forgot(r) => ("Forgot", outcome(r)),
             Self::Fingerprint { result, .. } => ("Fingerprint", outcome(result)),
@@ -596,9 +707,15 @@ pub(crate) fn run(client: &SharingClient, call: SharingCall) -> SharingReport {
             let result = client.stop(&item_id, &email);
             SharingReport::Stopped { email, result }
         }
-        SharingCall::Reinvite(email) => SharingReport::Done(client.reinvite(&email).map(|_| ())),
+        SharingCall::Reinvite(email) => {
+            let result = client.reinvite(&email).map(|_| ());
+            SharingReport::Reinvited { email, result }
+        }
         SharingCall::Forget(email) => SharingReport::Forgot(client.forget(&email)),
-        SharingCall::Confirm { email, key_sha256 } => SharingReport::Done(client.confirm(&email, &key_sha256)),
+        SharingCall::Confirm { email, key_sha256 } => {
+            let result = client.confirm(&email, &key_sha256);
+            SharingReport::Confirmed { email, result }
+        }
         SharingCall::Fingerprint(email) => {
             let result = client.fingerprint(&email);
             SharingReport::Fingerprint { email, result }
@@ -658,23 +775,23 @@ pub(crate) fn request(
 ) -> bool {
     if let SharingCall::Confirm { email, key_sha256 } = &call {
         if !pane.was_shown(email, key_sha256) {
-            pane.notice = Some(CHECK_FINGERPRINT_FIRST.to_string());
+            pane.say(CHECK_FINGERPRINT_FIRST.to_string(), None);
             return false;
         }
     }
     let Some(client) = client else {
-        pane.notice = Some(SHARE_UNAVAILABLE_TOOLTIP.to_string());
+        pane.say(SHARE_UNAVAILABLE_TOOLTIP.to_string(), None);
         return false;
     };
     match &call {
         SharingCall::View => pane.begin_view(),
         SharingCall::Fingerprint(_) if pane.fingerprinting.is_some() => {
-            pane.notice = Some(FINGERPRINT_BUSY.to_string());
+            pane.say(FINGERPRINT_BUSY.to_string(), None);
             return false;
         }
         SharingCall::Fingerprint(email) => pane.fingerprinting = Some(normalise_email(email)),
         _ if pane.busy => {
-            pane.notice = Some(BUSY.to_string());
+            pane.say(BUSY.to_string(), None);
             return false;
         }
         SharingCall::Stop { item_id, email } => {
@@ -686,9 +803,15 @@ pub(crate) fn request(
         // on in between, and the next confirm should be to what is shown then.
         SharingCall::Confirm { .. } => {
             pane.busy = true;
-            pane.fingerprint = None;
+            pane.hide_fingerprint();
         }
         _ => pane.busy = true,
+    }
+    // The record this write is about, for its answer to be said on
+    // (`SharingPane::notice_record`): a stop's or a share's own, or none --
+    // which [`request_on`] fills in for a write about a person.
+    if pane.busy && !matches!(call, SharingCall::View | SharingCall::Fingerprint(_)) {
+        pane.write_record = call.record().map(str::to_string);
     }
     // A write clears the last write's sentence; the two reads do NOT. A
     // failed write marks the view stale, and the very next frame asks for it
@@ -699,9 +822,31 @@ pub(crate) fn request(
     // fetched (`a_fingerprint_request_keeps_the_notice_and_holds_its_own_slot`).
     if !matches!(call, SharingCall::View | SharingCall::Fingerprint(_)) {
         pane.notice = None;
+        pane.notice_record = None;
     }
     spawn_sharing_call(ctx.clone(), tx.clone(), client.clone(), call);
     true
+}
+
+/// [`request`], for a write about a PERSON asked from a record's card -- a
+/// Re-invite, a Share anyway: the call itself names no record, so the one
+/// on screen is recorded as the one its answer belongs to. A failure then
+/// stands on that card, and is routed to a toast if the user has moved on
+/// (`route_stray_notice`).
+#[must_use]
+pub(crate) fn request_on(
+    pane: &mut SharingPane,
+    record: &str,
+    client: Option<&SharingClient>,
+    ctx: &egui::Context,
+    tx: &mpsc::Sender<SharingReport>,
+    call: SharingCall,
+) -> bool {
+    let started = request(pane, client, ctx, tx, call);
+    if started && pane.busy {
+        pane.write_record = Some(record.to_string());
+    }
+    started
 }
 
 /// Takes every report that has arrived. Called once per frame.
@@ -716,12 +861,22 @@ pub(crate) fn drain(rx: &mpsc::Receiver<SharingReport>, pane: &mut SharingPane, 
 
 /// One report into the pane.
 pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: f64) {
-    let toast = |pane: &mut SharingPane, text: String| pane.toast = Some((text, now_seconds + TOAST_SECONDS));
+    let toast = |pane: &mut SharingPane, text: String| pane.toast(text, now_seconds);
     match report {
         SharingReport::View(result) => {
             pane.fetching = false;
             match result {
                 Ok(view) => {
+                    // **A fingerprint shown for a state that has moved is
+                    // dropped**, so the changed-key box never shows the words
+                    // of the key before (`SharingPane::fingerprint_state`).
+                    let moved = pane
+                        .fingerprint
+                        .as_ref()
+                        .is_some_and(|(who, _)| view.person(who).map(|p| p.state) != pane.fingerprint_state);
+                    if moved {
+                        pane.hide_fingerprint();
+                    }
                     pane.view = Some(view);
                     pane.retry_at = None;
                 }
@@ -740,12 +895,28 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
         // and it changed nothing the view shows.
         SharingReport::Fingerprint { email, result } => {
             pane.fingerprinting = None;
+            // The slot the refusal was about is free: its sentence is spent.
+            if pane.notice.as_deref() == Some(FINGERPRINT_BUSY) {
+                pane.notice = None;
+            }
+            let email = normalise_email(&email);
             match result {
-                Ok(fingerprint) => pane.fingerprint = Some((normalise_email(&email), fingerprint)),
-                Err(sentence) => pane.notice = Some(sentence),
+                Ok(fingerprint) => {
+                    pane.fingerprint_state = pane.view.as_ref().and_then(|v| v.person(&email)).map(|p| p.state);
+                    pane.fingerprint = Some((email, fingerprint));
+                }
+                Err(sentence) => pane.say(sentence, None),
             }
             return;
         }
+        _ => {}
+    }
+    // **Every report from here on answers the one write in flight**, so the
+    // record it was asked on is taken here, and a failure is said on it.
+    let asked_on = pane.write_record.take();
+    let fail = |pane: &mut SharingPane, sentence: String| pane.say(sentence, asked_on.clone());
+    match report {
+        SharingReport::View(_) | SharingReport::Fingerprint { .. } => {}
         // **An answer lands only in the dialog that asked** -- the one with a
         // share out (`in_flight`). A dialog closed before its answer came and
         // a fresh one opened since, on this record or another, did not ask:
@@ -785,7 +956,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                         dialog.in_flight = false;
                         dialog.error = Some(sentence);
                     }
-                    None => pane.notice = Some(sentence),
+                    None => fail(pane, sentence),
                 },
             }
         }
@@ -794,12 +965,20 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
             pane.stop_confirming = None;
             match result {
                 Ok(_) => toast(pane, format!("Stopped sharing with {email}.")),
-                Err(sentence) => pane.notice = Some(sentence),
+                Err(sentence) => fail(pane, sentence),
             }
         }
+        SharingReport::Reinvited { email, result } => match result {
+            Ok(()) => toast(pane, reinvited_toast(&email)),
+            Err(sentence) => fail(pane, sentence),
+        },
+        SharingReport::Confirmed { email, result } => match result {
+            Ok(()) => toast(pane, confirmed_toast(&email)),
+            Err(sentence) => fail(pane, sentence),
+        },
         SharingReport::Done(result) => {
             if let Err(sentence) = result {
-                pane.notice = Some(sentence);
+                fail(pane, sentence);
             }
         }
         // **The daemon's forget came back.** Its outcome is recorded for the
@@ -823,7 +1002,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                         dialog.error = Some(sentence);
                     }
                 }
-                (None, Err(sentence)) => pane.notice = Some(sentence),
+                (None, Err(sentence)) => fail(pane, sentence),
                 (None, Ok(_)) => {}
             }
         }
@@ -840,13 +1019,23 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
             }
             None => {
                 if let Err(sentence) = result {
-                    pane.notice = Some(sentence);
+                    fail(pane, sentence);
                 }
             }
         },
     }
     pane.busy = false;
     pane.stale = true;
+    // **The write slot is free, so a "still running" refusal is spent** --
+    // on the card, and in an open dialog that was told it -- rather than
+    // standing beside a slot that is no longer busy. A sentence this report
+    // put up is a different one and stays.
+    if pane.notice.as_deref() == Some(BUSY) {
+        pane.notice = None;
+    }
+    if let Some(dialog) = pane.dialog.as_mut().filter(|d| d.error.as_deref() == Some(BUSY)) {
+        dialog.error = None;
+    }
 }
 
 // ---- the address book, re-read when sharing moves ------------------------------------
@@ -916,7 +1105,7 @@ pub(crate) fn people_sharing<'a>(
         stopping: pane.stopping_for(&item.id),
         fingerprint: pane.fingerprint.as_ref().map(|(email, f)| (email.as_str(), f.phrase.as_str())),
         fingerprinting: pane.fingerprinting.as_deref(),
-        notice: pane.notice.as_deref(),
+        notice: pane.notice_for(&item.id),
         view_only_from: pane.view.as_ref().and_then(|v| v.received_from(&item.id)),
     }
 }
@@ -1509,6 +1698,8 @@ const TOAST_INSET: f32 = 20.0;
 const TOAST_PAD: egui::Vec2 = egui::vec2(14.0, 10.0);
 const TOAST_TEXT_SIZE: f32 = 13.0;
 const TOAST_RADIUS: u8 = 8;
+/// The gap between the share toast and a copy confirmation under it.
+const TOAST_STACK_GAP: f32 = 8.0;
 
 /// Mock 6b's red question, with the record and the person in it.
 pub(crate) fn stop_question(record: &str, email: &str) -> String {
@@ -1991,16 +2182,21 @@ pub(crate) fn draw_card_note(ui: &mut egui::Ui, notice: Option<&str>, note: Opti
 ///
 /// Wrapped to the pane: the engine's sentences are longer than a copy
 /// confirmation's and a narrow pane is narrower than some of them.
-pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, pane: &SharingPane) {
+///
+/// **`clear_of` is a live copy confirmation's box**, if one is up: the two
+/// share the corner, so this one stands [`TOAST_STACK_GAP`] above it rather
+/// than on top of it (`detail::live_copy_toast_rect`).
+pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, clear_of: Option<egui::Rect>, pane: &SharingPane) {
     let Some((text, _)) = &pane.toast else {
         return;
     };
     let wrap = (pane_rect.width() - TOAST_INSET * 2.0 - TOAST_PAD.x * 2.0).max(1.0);
     let galley = ui.painter().layout(text.clone(), egui::FontId::proportional(TOAST_TEXT_SIZE), theme::CARD, wrap);
     let size = galley.size() + TOAST_PAD * 2.0;
+    let bottom = clear_of.map_or(pane_rect.bottom() - TOAST_INSET, |copy| copy.top() - TOAST_STACK_GAP);
     let at = egui::pos2(
         (pane_rect.right() - TOAST_INSET - size.x).max(pane_rect.left() + TOAST_INSET),
-        (pane_rect.bottom() - TOAST_INSET - size.y).max(pane_rect.top() + TOAST_INSET),
+        (bottom - size.y).max(pane_rect.top() + TOAST_INSET),
     );
     let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("share-toast")));
     let rect = egui::Rect::from_min_size(at, size);
@@ -2163,7 +2359,7 @@ mod tests {
         assert!(pane.fingerprint.is_none(), "a Confirm spends the fingerprint it was built from");
         assert!(pane.share_anyway("eve@x.io").is_none());
         match rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report") {
-            SharingReport::Done(Err(_)) => {}
+            SharingReport::Confirmed { email, result: Err(_) } => assert_eq!(email, "eve@x.io"),
             other => panic!("expected the confirm's failure, got {other:?}"),
         }
     }
@@ -2213,6 +2409,8 @@ mod tests {
             SharingReport::Shared { email: "anna@x.io".into(), item_name: "Acme VPN".into(), result: Err(secret.into()) },
             SharingReport::Stopped { email: "anna@x.io".into(), result: Err(secret.into()) },
             SharingReport::Done(Err(secret.into())),
+            SharingReport::Reinvited { email: "anna@x.io".into(), result: Err(secret.into()) },
+            SharingReport::Confirmed { email: "anna@x.io".into(), result: Err(secret.into()) },
             SharingReport::Forgot(Err(secret.into())),
             SharingReport::Forgot(Ok(vec!["Acme VPN".into()])),
             SharingReport::Fingerprint { email: "anna@x.io".into(), result: Err(secret.into()) },
@@ -2315,7 +2513,7 @@ mod tests {
         let [a, b] = reports;
         let (fingerprint, write) = if matches!(a, SharingReport::Fingerprint { .. }) { (a, b) } else { (b, a) };
         assert!(matches!(fingerprint, SharingReport::Fingerprint { .. }), "{fingerprint:?}");
-        assert!(matches!(write, SharingReport::Done(_)), "{write:?}");
+        assert!(matches!(write, SharingReport::Reinvited { .. }), "{write:?}");
 
         apply(&mut pane, fingerprint, 0.0);
         assert!(!pane.wants_view(0.0), "a fingerprint changes nothing the view shows");
@@ -2999,9 +3197,143 @@ mod tests {
         assert_eq!(pane.notice.as_deref(), Some(FINGERPRINT_BUSY));
         assert_eq!(pane.fingerprinting.as_deref(), Some("anna@x.io"), "the refused one took nothing over");
         let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
+        match &report {
+            SharingReport::Fingerprint { email, .. } => assert_eq!(email, "Anna@X.io", "the answer is the first read's"),
+            other => panic!("expected the fingerprint's answer, got {other:?}"),
+        }
         apply(&mut pane, report, 0.0);
         assert!(pane.fingerprinting.is_none(), "answered, even with a failure: the slot is free");
-        assert!(rx.recv_timeout(std::time::Duration::from_secs(3)).is_err(), "the refused one started nothing");
+        assert_ne!(pane.notice.as_deref(), Some(FINGERPRINT_BUSY), "the busy sentence went with the slot");
+        // The refused read started no thread: had it, the slot would have
+        // named eve, and its report could be waiting already. No wait here --
+        // the slot is the evidence.
+        assert!(rx.try_recv().is_err(), "the refused one started nothing");
+    }
+
+    /// **A busy sentence goes when the slot it was about frees** -- on the
+    /// card and in an open dialog that was told it -- and a sentence the
+    /// answer itself brings stays.
+    #[test]
+    fn a_busy_sentence_goes_when_the_slot_it_was_about_frees() {
+        let mut pane = SharingPane::default();
+        pane.say(BUSY.to_string(), None);
+        pane.dialog = Some(ShareDialog { error: Some(BUSY.to_string()), ..ShareDialog::opening("r1", "Acme VPN") });
+        apply(&mut pane, SharingReport::Reinvited { email: "bob@x.io".into(), result: Ok(()) }, 0.0);
+        assert!(pane.notice.is_none(), "the write finished; 'still running' is no longer true");
+        assert!(pane.dialog.as_ref().is_some_and(|d| d.error.is_none()));
+
+        pane.say(BUSY.to_string(), None);
+        apply(&mut pane, SharingReport::Reinvited { email: "bob@x.io".into(), result: Err("no".into()) }, 1.0);
+        assert_eq!(pane.notice.as_deref(), Some("no"), "the answer's own sentence stays");
+
+        pane.say(FINGERPRINT_BUSY.to_string(), None);
+        apply(&mut pane, SharingReport::Fingerprint { email: "anna@x.io".into(), result: Ok(fingerprint("ab12")) }, 2.0);
+        assert!(pane.notice.is_none());
+        pane.say(BUSY.to_string(), None);
+        apply(&mut pane, SharingReport::Fingerprint { email: "anna@x.io".into(), result: Ok(fingerprint("ab12")) }, 3.0);
+        assert_eq!(pane.notice.as_deref(), Some(BUSY), "a read frees no write slot, so the write's busy stands");
+    }
+
+    /// **Share anyway and Re-invite say how they went**: a toast naming the
+    /// person on success, the engine's sentence on failure.
+    #[test]
+    fn share_anyway_and_reinvite_say_how_they_went() {
+        let mut pane = SharingPane::default();
+        apply(&mut pane, SharingReport::Confirmed { email: "eve@x.io".into(), result: Ok(()) }, 0.0);
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Shared with eve@x.io on their new key."));
+        apply(&mut pane, SharingReport::Reinvited { email: "carol@x.io".into(), result: Ok(()) }, 1.0);
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Invitation sent to carol@x.io."));
+        pane.toast = None;
+        apply(&mut pane, SharingReport::Reinvited { email: "carol@x.io".into(), result: Err("Couldn't re-invite.".into()) }, 2.0);
+        assert!(pane.toast.is_none());
+        assert_eq!(pane.notice.as_deref(), Some("Couldn't re-invite."));
+        // A panicked worker reports as the call's own kind, so the toast's
+        // person is still known and the slot is still freed.
+        let panicked = SharingCall::Reinvite("carol@x.io".into()).failed(PANICKED);
+        assert!(matches!(&panicked, SharingReport::Reinvited { email, .. } if email == "carol@x.io"));
+        let panicked = SharingCall::Confirm { email: "eve@x.io".into(), key_sha256: "ab".into() }.failed(PANICKED);
+        assert!(matches!(&panicked, SharingReport::Confirmed { email, .. } if email == "eve@x.io"));
+    }
+
+    /// **A fingerprint shown for a state that has moved is dropped** when
+    /// the view says so -- the changed-key box must never show the words of
+    /// the key before -- and one whose person still stands where they stood
+    /// is kept.
+    #[test]
+    fn a_moved_state_drops_the_fingerprint_shown_for_the_state_before() {
+        let mut pane = SharingPane::default();
+        pane.view = Some(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![("r1", vec!["eve@x.io"])]));
+        apply(&mut pane, SharingReport::Fingerprint { email: "Eve@X.io".into(), result: Ok(fingerprint("ab12")) }, 0.0);
+        apply(&mut pane, SharingReport::View(Ok(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![("r1", vec!["eve@x.io"])]))), 1.0);
+        assert!(pane.fingerprint.is_some(), "nothing moved: the words stay");
+        assert!(pane.share_anyway("eve@x.io").is_some());
+        apply(&mut pane, SharingReport::View(Ok(view(vec![("eve@x.io", PersonState::Shared, None)], vec![("r1", vec!["eve@x.io"])]))), 2.0);
+        assert!(pane.fingerprint.is_none(), "the state moved: the words were for the state before");
+
+        // Shown for a person the view did not list yet: the view that first
+        // lists them has moved them too.
+        let mut pane = SharingPane::default();
+        pane.view = Some(view(vec![], vec![]));
+        apply(&mut pane, SharingReport::Fingerprint { email: "eve@x.io".into(), result: Ok(fingerprint("ab12")) }, 0.0);
+        apply(&mut pane, SharingReport::View(Ok(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![]))), 1.0);
+        assert!(pane.fingerprint.is_none());
+    }
+
+    /// **A write's failure is said on the record it was asked on.** The
+    /// card on that record shows it and another record's card does not; if
+    /// the user has moved on, the read pane routes it to a toast. A sentence
+    /// about no record -- a refusal -- shows wherever the user is.
+    #[test]
+    fn a_writes_failure_is_said_on_the_record_it_was_asked_on() {
+        let (tx, rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        let line = dead_line();
+        let mut pane = SharingPane::default();
+        assert!(request_on(&mut pane, "r1", Some(&line), &ctx, &tx, SharingCall::Reinvite("carol@x.io".into())));
+        let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
+        apply(&mut pane, report, 0.0);
+        let said = pane.notice.clone().expect("the failure is said");
+        assert_eq!(pane.notice_for("r1"), Some(said.as_str()));
+        assert_eq!(pane.notice_for("r2"), None, "another record's card");
+        route_stray_notice(&mut pane, "r1", 1.0);
+        assert!(pane.notice.is_some() && pane.toast.is_none(), "on its own record it stays on the card");
+        route_stray_notice(&mut pane, "r2", 1.0);
+        assert!(pane.notice.is_none());
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some(said.as_str()), "moved on: said as a toast");
+
+        // A stop carries its record in itself.
+        pane.toast = None;
+        let stop = SharingCall::Stop { item_id: "r7".into(), email: "anna@x.io".into() };
+        assert!(request(&mut pane, Some(&line), &ctx, &tx, stop));
+        let report = rx.recv_timeout(std::time::Duration::from_secs(30)).expect("a report");
+        apply(&mut pane, report, 2.0);
+        assert!(pane.notice_for("r7").is_some() && pane.notice_for("r1").is_none());
+
+        // A refusal is about no record: it shows on any card, and is never
+        // routed away -- a later refusal does not inherit the stop's record.
+        assert!(!request(&mut pane, None, &ctx, &tx, SharingCall::Reinvite("x@x.io".into())));
+        assert_eq!(pane.notice_for("r1"), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        route_stray_notice(&mut pane, "r1", 3.0);
+        assert_eq!(pane.notice.as_deref(), Some(SHARE_UNAVAILABLE_TOOLTIP));
+    }
+
+    /// **The re-prompt question is asked of every record a membership
+    /// reaches**: one protected record shared with the person is enough,
+    /// whatever record is on screen; a protected record NOT shared with them
+    /// is not their question.
+    #[test]
+    fn a_protected_record_shared_with_a_person_is_found() {
+        let item = |id: &str, reprompt: u8| -> VaultItem {
+            serde_json::from_value(serde_json::json!({ "id": id, "name": id, "reprompt": reprompt })).expect("item")
+        };
+        let items = vec![item("plain", 0), item("locked", 1), item("elsewhere", 1)];
+        let v = view(
+            vec![("eve@x.io", PersonState::KeyChanged, None), ("bob@x.io", PersonState::Shared, None)],
+            vec![("plain", vec!["eve@x.io", "bob@x.io"]), ("locked", vec!["eve@x.io"]), ("elsewhere", vec![])],
+        );
+        assert!(shares_a_protected_record(Some(&v), "Eve@X.io", &items));
+        assert!(!shares_a_protected_record(Some(&v), "bob@x.io", &items), "bob has only the plain one");
+        assert!(!shares_a_protected_record(None, "eve@x.io", &items));
     }
 
     /// The window hands the card what it is in the middle of: the notice and
@@ -3015,6 +3347,8 @@ mod tests {
         let people = people_sharing(&pane, true, &item, &[]);
         assert_eq!(people.notice, Some("no"));
         assert_eq!(people.fingerprinting, Some("anna@x.io"));
+        pane.say("Couldn't stop sharing Wi-Fi.".into(), Some("r2".into()));
+        assert_eq!(people_sharing(&pane, true, &item, &[]).notice, None, "another record's sentence");
     }
 
     /// **The share toast** (mock 6a): the sentence, in the dark box, inside
@@ -3030,19 +3364,27 @@ mod tests {
         theme::apply(&ctx);
         let pane_rect = egui::Rect::from_min_max(egui::pos2(400.0, 0.0), egui::pos2(900.0, 700.0));
         let mut pane = SharingPane::default();
-        let frame = |pane: &SharingPane| {
-            let output = ctx.run_ui(input(), |ui| draw_share_toast(ui, pane_rect, pane));
+        let frame = |pane: &SharingPane, copy: Option<egui::Rect>| {
+            let output = ctx.run_ui(input(), |ui| draw_share_toast(ui, pane_rect, copy, pane));
             let mut texts = Vec::new();
             for clipped in &output.shapes {
                 collect_texts(&clipped.shape, &mut texts);
             }
             texts
         };
-        assert!(frame(&pane).is_empty());
+        assert!(frame(&pane, None).is_empty());
         pane.toast = Some((shared_toast("anna@x.io"), 5.0));
-        let texts = frame(&pane);
+        let texts = frame(&pane, None);
         let (_, at) = texts.iter().find(|(t, _)| *t == shared_toast("anna@x.io")).expect("the toast");
         assert!(pane_rect.contains_rect(*at), "{at:?}");
         assert!(at.center().x > pane_rect.center().x && at.center().y > pane_rect.center().y, "bottom right: {at:?}");
+
+        // **Above a live copy confirmation, never over it**: the two share
+        // the corner.
+        let copy = egui::Rect::from_min_max(egui::pos2(740.0, 640.0), egui::pos2(880.0, 680.0));
+        let texts = frame(&pane, Some(copy));
+        let (_, stacked) = texts.iter().find(|(t, _)| *t == shared_toast("anna@x.io")).expect("the toast");
+        assert!(stacked.bottom() < copy.top(), "{stacked:?} runs into the copy box {copy:?}");
+        assert!(pane_rect.contains_rect(*stacked));
     }
 }

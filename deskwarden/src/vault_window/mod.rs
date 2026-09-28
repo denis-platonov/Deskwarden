@@ -2645,6 +2645,14 @@ pub fn build_frame_with_search(
         // Share dialog: a frame-local request, turned into a dialog in one
         // block after the panels, through `permit_share`.
         let mut share_asked = false;
+        // **Share anyway, and a Gone person's Re-invite, were ASKED FOR** on
+        // the SHARING card (design 6b), as `(record on screen, email)` --
+        // `share_asked`'s shape, for `share_asked`'s reason: each grants a
+        // person's membership, which reaches every record shared with them,
+        // so the one block after the panels puts them through the re-prompt
+        // (`permit_share_anyway`, `permit_reinvite`) before anything is sent.
+        let mut share_anyway_asked: Option<(String, String)> = None;
+        let mut reinvite_asked: Option<(String, String)> = None;
         // **"Add a one-time code" was ASKED FOR**, by the chord, and nothing
         // has been decided about it yet.
         //
@@ -4993,6 +5001,10 @@ pub fn build_frame_with_search(
                                 crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
                                 &crate::local_time::SystemZone,
                             );
+                            // A write's failure about ANOTHER record -- the
+                            // user moved on before it came back -- is said
+                            // as a toast, not on this record's card.
+                            share_ui::route_stray_notice(&mut sharing, &item.id, ui.input(|i| i.time));
                             let people = share_ui::people_sharing(&sharing, sharing_client.is_some(), item, &person_lines);
                             let action = draw_read_arm(
                                 ui,
@@ -5023,8 +5035,12 @@ pub fn build_frame_with_search(
                             // very same one. Not while a modal is up, for the
                             // copy toast's rule: a confirmation belongs to
                             // the topmost surface, and a modal is topmost.
+                            //
+                            // Above a live copy confirmation, never over it:
+                            // the two share the corner.
                             if !item_list::a_modal_is_up(ui.ctx()) {
-                                share_ui::draw_share_toast(ui, ui.clip_rect(), &sharing);
+                                let copy = detail::live_copy_toast_rect(ui, ui.clip_rect());
+                                share_ui::draw_share_toast(ui, ui.clip_rect(), copy, &sharing);
                             }
                             // **The re-prompt, in the gating position.** A
                             // refused action becomes `DetailAction::None`
@@ -5143,9 +5159,11 @@ pub fn build_frame_with_search(
                                     let call = share_ui::SharingCall::Stop { item_id: item.id.clone(), email };
                                     let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
                                 }
+                                // Recorded, not sent: a Gone person's
+                                // Re-invite re-grants access, and the block
+                                // after the panels asks the re-prompt first.
                                 DetailAction::Reinvite(email) => {
-                                    let call = share_ui::SharingCall::Reinvite(email);
-                                    let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                                    reinvite_asked = Some((item.id.clone(), email));
                                 }
                                 // A read with its own slot: `request` marks
                                 // the fetch and refuses a second one aloud.
@@ -5156,21 +5174,15 @@ pub fn build_frame_with_search(
                                 // Hiding spends it: Share anyway is for the
                                 // key whose words are ON SCREEN, and after
                                 // this there are none.
-                                DetailAction::HideFingerprint => sharing.fingerprint = None,
-                                // **Only `share_anyway`'s call is ever sent**
-                                // -- a Confirm bound to the key hash of the
-                                // fingerprint that was shown for this very
-                                // person, and `None` unless there is one and
-                                // they are a changed key. The card greys the
-                                // button until then, so `None` here is a
-                                // press the card should not have taken, said
-                                // rather than dropped.
-                                DetailAction::ShareAnyway(email) => match sharing.share_anyway(&email) {
-                                    Some(call) => {
-                                        let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
-                                    }
-                                    None => sharing.notice = Some(share_ui::CHECK_FINGERPRINT_FIRST.to_string()),
-                                },
+                                DetailAction::HideFingerprint => sharing.hide_fingerprint(),
+                                // **Recorded, not sent** -- `ShareRecord`'s
+                                // shape: the one block after the panels puts
+                                // it through `permit_share_anyway`, which is
+                                // the re-prompt and the only place a Confirm
+                                // is made in this file.
+                                DetailAction::ShareAnyway(email) => {
+                                    share_anyway_asked = Some((item.id.clone(), email));
+                                }
                                 // **4a.** The draft is built HERE, from the
                                 // item, for the reason `Edit`'s is: the
                                 // action carries nothing and this scope is
@@ -6833,6 +6845,21 @@ pub fn build_frame_with_search(
         if share_asked {
             if let Some(item) = selected_id.as_ref().and_then(|id| items.iter().find(|i| &i.id == id)) {
                 sharing.dialog = permit_share(ui.ctx(), item, &reprompt_gate, &mut reprompt_proof);
+            }
+        }
+        // **Share anyway and Re-invite (design 6b), through the re-prompt.**
+        // Each grants a person's membership, and a membership reaches every
+        // record shared with them -- so the gate asks about all of those, not
+        // the one on screen. A refusal says so and sends nothing; a call that
+        // is started has its answer said on the record it was asked on.
+        if let Some((record, email)) = share_anyway_asked.take() {
+            if let Some(call) = permit_share_anyway(ui.ctx(), &email, &items, &mut sharing, &reprompt_gate, &mut reprompt_proof) {
+                let _ = share_ui::request_on(&mut sharing, &record, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+            }
+        }
+        if let Some((record, email)) = reinvite_asked.take() {
+            if let Some(call) = permit_reinvite(ui.ctx(), &email, &items, &sharing, &reprompt_gate, &mut reprompt_proof) {
+                let _ = share_ui::request_on(&mut sharing, &record, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
             }
         }
         if let Some(mut dialog) = sharing.dialog.take() {
@@ -8645,19 +8672,19 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         // **Design 6b's people controls take access AWAY or re-send an
         // invitation**: none reads a field of the item, paints one or copies
         // one. Stop sharing and its two answers take the record out of a
-        // person's vault; Re-invite re-reaches a person the record already
-        // went to, behind the `permit_share` that first sent it. The
-        // fingerprint is a digest of the OTHER person's public key -- public
-        // by construction, and read aloud between the two of them -- not a
-        // secret of this vault.
+        // person's vault. The fingerprint is a digest of the OTHER person's
+        // public key -- public by construction, and read aloud between the
+        // two of them -- not a secret of this vault.
         //
-        // **Share anyway is the one that sends something**: the record goes
-        // on to the person's NEW key. What stands in front of that is the
-        // fingerprint and not the master password, and on purpose: the
-        // re-prompt proves who is at THIS keyboard, the danger here is who is
-        // at the other end, and only the comparison answers that. The window
-        // sends nothing but `SharingPane::share_anyway`'s call, bound to the
-        // key whose words were shown, and the engine refuses any other key.
+        // **And `ShareAnyway` and `Reinvite` are on this side for
+        // `SendRecord`'s and `ShareRecord`'s reason**: they DO grant access --
+        // a confirm hands the person's membership, and every record shared
+        // with them, to their new key; a Gone person's Re-invite re-grants
+        // one -- but the variant only records the request, and the gate is
+        // further down, by `permit_share_anyway` and `permit_reinvite`, which
+        // ask the re-prompt over EVERY record the membership reaches.
+        // Answering `true` here would ask about the record on screen alone,
+        // and ask twice.
         | DetailAction::StopSharing(_)
         | DetailAction::ConfirmStopSharing(_)
         | DetailAction::CancelStopSharing
@@ -8926,6 +8953,81 @@ fn permit_share(
         share_ui::ShareDialog::opening(&item.id, &item.name)
     }) {
         crate::reprompt::Outcome::Done(dialog) => Some(dialog),
+        crate::reprompt::Outcome::Refused => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(false));
+            None
+        }
+        crate::reprompt::Outcome::Cannot => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(true));
+            None
+        }
+    }
+}
+
+/// **Share anyway (design 6b), behind the re-prompt** -- [`permit_share`]'s
+/// door for a changed key, and the reason it needs one is wider than a
+/// share's: a confirm grants the person's MEMBERSHIP to their new key, and a
+/// membership reaches every record shared with them. So the question is
+/// asked when ANY of those records is re-prompt protected
+/// (`share_ui::shares_a_protected_record`), not only the one on screen.
+///
+/// Answers the call to send, or `None` -- with the reason said: a refusal
+/// the way [`permit_share`] says one, and no fingerprint on screen as
+/// `share_ui::CHECK_FINGERPRINT_FIRST`. The call is only ever
+/// `SharingPane::share_anyway`'s, bound to the key whose words were shown;
+/// this is the one place this file asks for it
+/// (`the_only_confirm_this_window_sends_comes_through_permit_share_anyway`).
+fn permit_share_anyway(
+    ctx: &egui::Context,
+    email: &str,
+    items: &[VaultItem],
+    sharing: &mut share_ui::SharingPane,
+    gate: &crate::reprompt::RepromptGate,
+    proof: &mut crate::reprompt::Proof,
+) -> Option<share_ui::SharingCall> {
+    let protected = share_ui::shares_a_protected_record(sharing.view.as_ref(), email, items);
+    match crate::reprompt::permit(gate, protected, proof, Instant::now(), || sharing.share_anyway(email)) {
+        crate::reprompt::Outcome::Done(Some(call)) => Some(call),
+        crate::reprompt::Outcome::Done(None) => {
+            sharing.say(share_ui::CHECK_FINGERPRINT_FIRST.to_string(), None);
+            None
+        }
+        crate::reprompt::Outcome::Refused => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(false));
+            None
+        }
+        crate::reprompt::Outcome::Cannot => {
+            detail::note_refused(ctx, crate::reprompt::refusal_text(true));
+            None
+        }
+    }
+}
+
+/// **Re-invite (design 6b), behind the re-prompt where it grants access.**
+///
+/// For a person who never got in -- no account yet, an invite that ran out
+/// -- a fresh invitation hands nothing new over: they were already meant to
+/// have it, behind the share that asked. For a person who is GONE it
+/// re-grants a membership that had ended, and that reaches every record
+/// shared with them -- [`permit_share_anyway`]'s reason, so the same
+/// question over the same records.
+fn permit_reinvite(
+    ctx: &egui::Context,
+    email: &str,
+    items: &[VaultItem],
+    sharing: &share_ui::SharingPane,
+    gate: &crate::reprompt::RepromptGate,
+    proof: &mut crate::reprompt::Proof,
+) -> Option<share_ui::SharingCall> {
+    let view = sharing.view.as_ref();
+    let gone = view
+        .and_then(|v| v.person(&crate::rest::organizations::normalise_email(email)))
+        .is_some_and(|p| p.state == crate::rest::sharing::PersonState::Gone);
+    let protected = gone && share_ui::shares_a_protected_record(view, email, items);
+    match crate::reprompt::permit(gate, protected, proof, Instant::now(), || {
+        share_ui::SharingCall::Reinvite(email.to_string())
+    }) {
+        crate::reprompt::Outcome::Done(call) => Some(call),
         crate::reprompt::Outcome::Refused => {
             detail::note_refused(ctx, crate::reprompt::refusal_text(false));
             None
@@ -39634,6 +39736,38 @@ mod send_create_wiring {
         );
     }
 
+    /// **The only Confirm this window sends comes through
+    /// `permit_share_anyway`** -- the share dialog's rule above, for design
+    /// 6b's Share anyway. A confirm grants a person's membership, and every
+    /// record shared with them, to their new key; the re-prompt over those
+    /// records stands in `permit_share_anyway`, and a Confirm built or asked
+    /// for anywhere else in this file is a door around it.
+    ///
+    /// Three halves. No `SharingCall::Confirm` is spelled here at all (the
+    /// call is `SharingPane::share_anyway`'s to build, bound to the key whose
+    /// words were shown); `share_anyway(` is asked exactly once, INSIDE
+    /// `permit_share_anyway`'s body; and that function is called from one
+    /// line. Comments are stripped first, so prose naming them is no door.
+    #[test]
+    fn the_only_confirm_this_window_sends_comes_through_permit_share_anyway() {
+        let code = code_without_comments(include_str!("mod.rs"));
+        let spelled = code.matches(concat!("SharingCall::", "Confirm")).count();
+        assert_eq!(spelled, 0, "a Confirm is built in this file {spelled} times, around the re-prompt");
+        let asked: Vec<usize> = code.match_indices(concat!(".share_", "anyway(")).map(|(at, _)| at).collect();
+        assert_eq!(asked.len(), 1, "`share_anyway(` is asked {} times in this file, not once", asked.len());
+        let body = code.find(concat!("fn permit_share_", "anyway(")).expect("`permit_share_anyway` is gone");
+        let body_end = body + code[body..].find("\n}").expect("its body closes");
+        assert!(
+            (body..body_end).contains(&asked[0]),
+            "the one `share_anyway(` is outside `permit_share_anyway`, so it is not behind the re-prompt"
+        );
+        let callers = code.matches(concat!("= permit_share_", "anyway(")).count();
+        assert_eq!(callers, 1, "`permit_share_anyway` is called from {callers} lines, not one");
+        // CONTROL: the stripped text still holds the production code these
+        // needles are looked for in.
+        assert!(code.contains(concat!("fn permit_", "reinvite(")), "control: the production code was not read");
+    }
+
     /// **The chord the pill advertises is the chord the code binds**, and it
     /// is bound EXACTLY.
     ///
@@ -40548,6 +40682,106 @@ mod reprompt_gating_tests {
             opens(&RepromptGate::unprovable(), &plain()),
             "control: an unprovable gate blocked an unprotected item too"
         );
+    }
+
+    // ==================================================================
+    // Share anyway and Re-invite (design 6b): a membership, behind the gate
+    // ==================================================================
+
+    /// The pane as the card sees it: eve, in `state`, on the one record
+    /// `item_id`, with her fingerprint on screen.
+    fn eve_on(state: crate::rest::sharing::PersonState, item_id: &str) -> share_ui::SharingPane {
+        use crate::rest::sharing::{Fingerprint, PersonEntry, RecordEntry, SharingView};
+        let mut pane = share_ui::SharingPane::default();
+        pane.view = Some(SharingView {
+            available: true,
+            people: vec![PersonEntry { email: "eve@x.io".into(), state, expires_at: None }],
+            records: vec![RecordEntry { item_id: item_id.into(), people: vec!["eve@x.io".into()] }],
+            ..SharingView::default()
+        });
+        pane.fingerprint = Some(("eve@x.io".into(), Fingerprint { phrase: "a-b-c-d-e".into(), key_sha256: "ab12".into() }));
+        pane
+    }
+
+    /// **A re-prompt-protected record shared with the person makes Share
+    /// anyway ask first.** A confirm grants her membership to her new key,
+    /// and the membership carries that protected record -- so a cancelled
+    /// prompt sends nothing and spends nothing, a proof sends the Confirm
+    /// bound to the key whose words were shown, and with only plain records
+    /// shared with her nobody is asked at all.
+    #[test]
+    fn a_protected_record_shared_with_the_person_makes_share_anyway_ask_first() {
+        use crate::rest::sharing::PersonState;
+        let ctx = egui::Context::default();
+        let protected_items = vec![protected()];
+        let mut pane = eve_on(PersonState::KeyChanged, "1");
+        let mut proof = Proof::default();
+        let refusing = RepromptGate::with_prover(Some(scope()), refuses);
+        assert!(
+            permit_share_anyway(&ctx, "eve@x.io", &protected_items, &mut pane, &refusing, &mut proof).is_none(),
+            "a cancelled prompt still confirmed a new key onto a protected record"
+        );
+        assert!(pane.fingerprint.is_some(), "a refusal spent the fingerprint");
+        assert!(
+            permit_share_anyway(&ctx, "eve@x.io", &protected_items, &mut pane, &RepromptGate::unprovable(), &mut Proof::default())
+                .is_none(),
+            "an account that cannot prove confirmed a new key onto a protected record"
+        );
+
+        let allowing = RepromptGate::with_prover(Some(scope()), allows);
+        match permit_share_anyway(&ctx, "Eve@X.io", &protected_items, &mut pane, &allowing, &mut Proof::default()) {
+            Some(share_ui::SharingCall::Confirm { email, key_sha256 }) => {
+                assert_eq!((email.as_str(), key_sha256.as_str()), ("eve@x.io", "ab12"));
+            }
+            _ => panic!("a proved Share anyway sent no Confirm, or not the one shown"),
+        }
+
+        // Only plain records reach her: the prover would panic if asked.
+        let plain_items = vec![plain()];
+        assert!(matches!(
+            permit_share_anyway(&ctx, "eve@x.io", &plain_items, &mut pane, &never_asks(), &mut Proof::default()),
+            Some(share_ui::SharingCall::Confirm { .. })
+        ));
+
+        // No words on screen: nothing to confirm, and the card says why.
+        pane.hide_fingerprint();
+        assert!(permit_share_anyway(&ctx, "eve@x.io", &plain_items, &mut pane, &never_asks(), &mut Proof::default()).is_none());
+        assert_eq!(pane.notice.as_deref(), Some(share_ui::CHECK_FINGERPRINT_FIRST));
+    }
+
+    /// **A Gone person's Re-invite asks first** where a protected record is
+    /// shared with them -- it re-grants a membership that had ended. Anyone
+    /// else's is a fresh invitation to what they were already meant to have,
+    /// and is not asked about.
+    #[test]
+    fn re_inviting_a_gone_person_asks_first_on_a_protected_record() {
+        use crate::rest::sharing::PersonState;
+        let ctx = egui::Context::default();
+        let refusing = RepromptGate::with_prover(Some(scope()), refuses);
+        let protected_items = vec![protected()];
+        let gone = eve_on(PersonState::Gone, "1");
+        assert!(
+            permit_reinvite(&ctx, "eve@x.io", &protected_items, &gone, &refusing, &mut Proof::default()).is_none(),
+            "a cancelled prompt still re-granted a protected record"
+        );
+        assert!(matches!(
+            permit_reinvite(&ctx, "eve@x.io", &protected_items, &gone, &RepromptGate::with_prover(Some(scope()), allows), &mut Proof::default()),
+            Some(share_ui::SharingCall::Reinvite(email)) if email == "eve@x.io"
+        ));
+        assert!(matches!(
+            permit_reinvite(&ctx, "eve@x.io", &[plain()], &gone, &never_asks(), &mut Proof::default()),
+            Some(share_ui::SharingCall::Reinvite(_))
+        ));
+        for waiting in [PersonState::WaitingAccount, PersonState::Expired] {
+            let pane = eve_on(waiting, "1");
+            assert!(
+                matches!(
+                    permit_reinvite(&ctx, "eve@x.io", &protected_items, &pane, &never_asks(), &mut Proof::default()),
+                    Some(share_ui::SharingCall::Reinvite(_))
+                ),
+                "{waiting:?}: a fresh invitation was asked about"
+            );
+        }
     }
 }
 
