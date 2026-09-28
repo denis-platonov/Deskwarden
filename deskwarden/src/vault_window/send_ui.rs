@@ -1619,13 +1619,17 @@ pub const SCOPE_EMPTY_DETAIL: &str = "Your other Sends are still on the Sends ro
 /// does not decide which of the window's messages wins, it only paints the
 /// one it is handed.
 ///
-/// # Seven parameters, and no clock among them
+/// # Eight parameters, and no clock among them
 ///
 /// `view` and `selected` joined when the screen grew a detail pane: which of
 /// the two SHARING screens is up and which of its rows the detail is
 /// describing. Both are the window's state and not this pane's -- a selection
 /// that reset every time the user glanced at Password health would be a
-/// detail pane that could not be left and returned to.
+/// detail pane that could not be left and returned to. `people` joined with
+/// design 6c, for the same reason: the shares and the stop the user is in
+/// the middle of are the window's `share_ui::SharingPane`, and what a press
+/// here asks of it goes back out through `people.asked` -- the verdict stays
+/// the Sends' own, one action, for `apply_send_action`.
 ///
 /// **It used to take a clock and a zone as well**, and a composer with its
 /// draft. The clock and the zone were the composer's: every date the list and
@@ -1648,6 +1652,12 @@ pub fn draw_send_pane(
     // The vault's records and their icons, for the tiles: a Send made from a
     // record wears that record's tile. See [`RecordTiles`].
     records: RecordTiles<'_>,
+    // **Design 6c's person shares**, listed before the Sends on the
+    // unfiltered row, and the Stop sharing two-step on a share's own detail:
+    // the rows in, what was pressed out (`asked`). The window's, like
+    // `selected` -- see `share_ui::PeopleRows`. `PeopleRows::none()` for a
+    // caller that is not about sharing.
+    people: &mut super::share_ui::PeopleRows<'_>,
 ) -> SendUiVerdict {
     let mut action = SendUiAction::None;
 
@@ -1681,13 +1691,13 @@ pub fn draw_send_pane(
         // different padding beneath, and one panel margin cannot be both.
         .frame(egui::Frame::new().fill(theme::CANVAS))
         .show(ui, |ui| {
-            if let Some(reported) = draw_send_list(ui, state, &view, delete, selected, records) {
+            if let Some(reported) = draw_send_list(ui, state, &view, delete, selected, records, people.shares) {
                 action = reported;
             }
         });
 
     if let Some(reported) =
-        draw_send_detail(ui, state, &view, delete, selected, records)
+        draw_send_detail(ui, state, &view, delete, selected, records, people)
     {
         // **The detail column wins an ambiguous frame.** Every destructive
         // control on this screen is in it, and the list column's own
@@ -1713,9 +1723,20 @@ fn draw_send_list(
     delete: SendDeleteView<'_>,
     selected: &mut Option<String>,
     records: RecordTiles<'_>,
+    // Design 6c's person shares, one row per record and person.
+    shares: &[super::share_ui::ShareRow],
 ) -> Option<SendUiAction> {
     let mut action: Option<SendUiAction> = None;
     let width = ui.available_width();
+
+    // **The shares this column lists: on the unfiltered row only.** The
+    // sub-rows are Send states -- Waiting, Opened, Used, Ended -- and a share
+    // is in none of them, so "All" is the one row a share belongs to (plan
+    // decision 12), and `Shared with me` is another screen.
+    let shares: &[super::share_ui::ShareRow] = match view {
+        SendView::Mine(crate::vault_window::sidebar::SendScope::All) => shares,
+        _ => &[],
+    };
 
     // How many rows this column is about to draw, decided BEFORE the strip so
     // the strip can say it. `None` where the count is not a fact this app has
@@ -1724,9 +1745,9 @@ fn draw_send_list(
     let counted: Option<usize> = match (view, state) {
         (SendView::Received(rows), _) => Some(rows.len()),
         (SendView::Mine(scope), SendPaneState::Rows(rows)) => {
-            Some(rows_in_scope(rows, *scope).len())
+            Some(rows_in_scope(rows, *scope).len() + shares.len())
         }
-        (SendView::Mine(_), SendPaneState::Empty) => Some(0),
+        (SendView::Mine(_), SendPaneState::Empty) => Some(shares.len()),
         (SendView::Mine(_), _) => None,
     };
 
@@ -1781,8 +1802,13 @@ fn draw_send_list(
     // WITH ME says the user published three, which is the opposite of what
     // that screen is about. It is the kind of slip a picture catches and a
     // rect assertion never can.
+    //
+    // **And a list with shares in it counts ITEMS** (6c's strip: "9 items"):
+    // "3 sends" over two Sends and a person share would call the share a
+    // link, which is the one thing 6e's tiles say it is not.
     let (one, many) = match view {
         SendView::Received(_) => (RECORD_NOUN, RECORDS_NOUN),
+        SendView::Mine(_) if !shares.is_empty() => (ITEM_NOUN, ITEMS_NOUN),
         SendView::Mine(_) => (SEND_NOUN, SENDS_NOUN),
     };
     let noun = match counted {
@@ -1961,6 +1987,16 @@ fn draw_send_list(
                     });
                 });
             }
+            // An account with no Sends and a share still has a list: "You
+            // have no Sends" over a share row would be true and read as
+            // "nothing here".
+            SendPaneState::Empty if !shares.is_empty() => {
+                rows_area(ui, shares.len(), &mut |ui| {
+                    for share in shares {
+                        draw_share_row(ui, share, row_width, selected, records);
+                    }
+                });
+            }
             SendPaneState::Empty => headline(ui, EMPTY_HEADLINE, EMPTY_DETAIL, theme::INK),
             SendPaneState::Failed { message, ambiguous } => {
                 // A failure draws NO row area at all, and never reuses the
@@ -1999,13 +2035,22 @@ fn draw_send_list(
             }
             SendPaneState::Rows(rows) => {
                 let in_scope = rows_in_scope(rows, *scope);
-                if in_scope.is_empty() {
+                if in_scope.is_empty() && shares.is_empty() {
                     // The account has Sends; this sub-row has none. A third
                     // sentence, deliberately -- see `scope_empty_headline`.
                     let head = scope_empty_headline(*scope);
                     headline(ui, &head, SCOPE_EMPTY_DETAIL, theme::INK);
                 } else {
-                    rows_area(ui, in_scope.len(), &mut |ui| {
+                    rows_area(ui, in_scope.len() + shares.len(), &mut |ui| {
+                        // **Shares first** (plan decision 12). 6c interleaves
+                        // the two by date, and a share has no server date to
+                        // interleave by -- only this PC's record of it, which
+                        // a share made elsewhere does not have -- so the
+                        // shares lead, newest first among themselves, and the
+                        // Sends keep their own order under them.
+                        for share in shares {
+                            draw_share_row(ui, share, row_width, selected, records);
+                        }
                         for row in &in_scope {
                             draw_row(ui, row, row_width, delete, selected, records);
                         }
@@ -2044,6 +2089,9 @@ pub const SEND_NOUN: &str = "send";
 pub const SENDS_NOUN: &str = "sends";
 pub const RECORD_NOUN: &str = "record";
 pub const RECORDS_NOUN: &str = "records";
+/// The Sent list's count once person shares are in it (6c's "9 items").
+const ITEM_NOUN: &str = "item";
+const ITEMS_NOUN: &str = "items";
 /// The failure's own retry, and the one way to ask for the list again without
 /// leaving the screen. **Not "Refresh"**, which is what the strip's own button
 /// said before it went: this one sits under a sentence explaining what went
@@ -2167,7 +2215,7 @@ fn draw_row(
     // row's own function -- the record's favicon when this Send was made from
     // a record that has one. See [`paint_send_tile`].
     let tile = row_tile_rect(rect);
-    paint_send_tile(ui, tile, records, row.sent.as_ref(), &row.name, picked, fade);
+    paint_send_tile(ui, tile, records, row.sent.as_ref().map(|s| s.item_id.as_str()), &row.name, picked, fade);
 
     let text_left = tile.right() + ROW_TEXT_GAP;
     let text_area = egui::Rect::from_min_max(
@@ -2325,6 +2373,116 @@ fn draw_received_row(
     );
 }
 
+/// **One person share** (design 6c): the record's tile, its name, a person
+/// mark before "to anna@example.com · Shared", and the share pill at the
+/// right edge.
+///
+/// **[`draw_row`]'s band, every number of it** -- the height, the inset, the
+/// radius, the picked edge and shadow, the tile drawn by the records list's
+/// own function in the records list's own place, and the two-line text
+/// column measured by `item_list::text_column_height`. The owner compares
+/// this column with the records list rect for rect, and a share row built to
+/// its own numbers would be the third row shape in one column. What is the
+/// share's own is what 6c says tells the two kinds apart: the person mark on
+/// the second line, and the share pill -- 5-point corners and a person where
+/// a Send pill is a stadium with a dot (`theme::share_pill`).
+///
+/// No fade: a share has no ended state that stays in the list -- a stopped
+/// share is gone from the view -- so 5b's receded row has nothing to say here.
+/// A person who is no longer receiving says so in their pill.
+fn draw_share_row(
+    ui: &mut egui::Ui,
+    share: &super::share_ui::ShareRow,
+    width: f32,
+    selected: &mut Option<String>,
+    records: RecordTiles<'_>,
+) {
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let picked = selected.as_deref() == Some(share.key.as_str());
+    if response.clicked() {
+        *selected = Some(share.key.clone());
+    }
+    let painter = ui.painter().clone();
+    let painter = &painter;
+    if picked {
+        painter.add(
+            theme::SELECTED_ROW_SHADOW.as_shape(rect, CornerRadius::same(ROW_RADIUS)),
+        );
+    }
+    painter.rect_filled(rect, CornerRadius::same(ROW_RADIUS), theme::CARD);
+    painter.rect_stroke(
+        rect,
+        CornerRadius::same(ROW_RADIUS),
+        egui::Stroke::new(1.0, if picked { theme::BLUE } else { theme::HAIRLINE }),
+        egui::StrokeKind::Inside,
+    );
+
+    // The pill first, right-aligned, for `draw_row`'s reason: its measured
+    // width is what bounds the name and the subtitle.
+    let kind = share.pill();
+    let pill_width = theme::share_pill_width(painter, kind);
+    theme::share_pill(
+        painter,
+        egui::pos2(rect.right() - ROW_INSET - pill_width, rect.center().y),
+        kind,
+    );
+    let text_right = rect.right() - ROW_INSET - pill_width - ROW_TEXT_GAP;
+
+    // A share IS a record, so it wears the record's tile -- its favicon when
+    // the cache has one, as the Send made from it does in the row below.
+    let tile = row_tile_rect(rect);
+    paint_send_tile(ui, tile, records, Some(&share.item_id), &share.name, picked, 1.0);
+
+    let text_left = tile.right() + ROW_TEXT_GAP;
+    let text_area = egui::Rect::from_min_max(
+        egui::pos2(text_left, rect.top()),
+        egui::pos2(text_right.max(text_left), rect.bottom()),
+    );
+    let clip = painter.with_clip_rect(text_area.intersect(ui.clip_rect()));
+    let title_font = egui::FontId::new(
+        super::item_list::TITLE_SIZE,
+        egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
+    );
+    let column_top = rect.center().y
+        - super::item_list::text_column_height(ui, "subtitle", picked) / 2.0;
+    let name_height = ui.ctx().fonts_mut(|f| f.row_height(&title_font));
+    let subtitle_top = column_top + name_height + super::item_list::TITLE_GAP_Y;
+    clip.text(
+        egui::pos2(text_area.left(), column_top),
+        egui::Align2::LEFT_TOP,
+        &share.name,
+        title_font,
+        if picked { theme::BLUE_DEEP } else { theme::INK },
+    );
+    // 6c's `.rs svg`: a 10-point person, `margin-right: 4px`, on the
+    // subtitle's own line -- centred on the line the subtitle font lays, so
+    // the mark and the words share a middle rather than a top.
+    let subtitle_font =
+        egui::FontId::new(super::item_list::SUBTITLE_SIZE, egui::FontFamily::Proportional);
+    let subtitle_height = ui.ctx().fonts_mut(|f| f.row_height(&subtitle_font));
+    let mark = egui::Rect::from_min_size(
+        egui::pos2(text_area.left(), subtitle_top + (subtitle_height - SHARE_MARK) / 2.0),
+        egui::Vec2::splat(SHARE_MARK),
+    );
+    theme::paint_person_mark(&clip, mark, theme::TEXT_FAINT);
+    clip.text(
+        egui::pos2(mark.right() + SHARE_MARK_GAP, subtitle_top),
+        egui::Align2::LEFT_TOP,
+        &share.subtitle,
+        subtitle_font,
+        theme::TEXT_FAINT,
+    );
+}
+
+/// 6c's `ic('person', 10, ..)` before a share row's subtitle, and its
+/// `margin-right: 4px`.
+const SHARE_MARK: f32 = 10.0;
+const SHARE_MARK_GAP: f32 = 4.0;
+
 /// **The records this screen's tiles are drawn from**: the vault's items and
 /// the icon cache's textures, both the window's, both borrowed.
 ///
@@ -2346,10 +2504,11 @@ pub struct RecordTiles<'a> {
 }
 
 impl<'a> RecordTiles<'a> {
-    /// The record a Send was made from, when this PC filed one and it is
-    /// still in the vault.
-    fn record(&self, sent: Option<&SentFacts>) -> Option<&'a crate::vault_bridge::VaultItem> {
-        let id = sent?.item_id.as_str();
+    /// The record with this id, while it is still in the vault: the one a
+    /// Send was made from (`SentFacts::item_id`, when this PC filed one), or
+    /// the one a person share is of.
+    fn record(&self, item_id: Option<&str>) -> Option<&'a crate::vault_bridge::VaultItem> {
+        let id = item_id?;
         self.items.iter().find(|item| item.id == id)
     }
 }
@@ -2378,7 +2537,9 @@ fn paint_send_tile(
     ui: &mut egui::Ui,
     tile: egui::Rect,
     records: RecordTiles<'_>,
-    sent: Option<&SentFacts>,
+    // The record the row is of or was made from, by id -- see
+    // [`RecordTiles::record`].
+    record: Option<&str>,
     name: &str,
     emphasised: bool,
     opacity: f32,
@@ -2389,7 +2550,7 @@ fn paint_send_tile(
             .layout(egui::Layout::left_to_right(egui::Align::Min)),
     );
     child.multiply_opacity(opacity);
-    match records.record(sent) {
+    match records.record(record) {
         Some(item) => super::item_list::row_tile(
             &mut child,
             records.icons.and_then(|icons| icons.get(&item.id)),
@@ -2479,11 +2640,27 @@ fn draw_send_detail(
     delete: SendDeleteView<'_>,
     selected: &mut Option<String>,
     records: RecordTiles<'_>,
+    people: &mut super::share_ui::PeopleRows<'_>,
 ) -> Option<SendUiAction> {
     let mut action: Option<SendUiAction> = None;
 
     match view {
         SendView::Mine(scope) => {
+            // **A share key opens the share's own detail** (design 6c) --
+            // when that share is still listed. A key naming a share that has
+            // gone (a stop that brought the record home gave it a new id, so
+            // the key the window holds names nothing now) falls through to
+            // the Sends' resolution below, which finds no Send by it and
+            // draws the prompt: "nothing picked" is what is true.
+            //
+            // The slice is copied out of `people` first, so the row borrowed
+            // from it outlives the `&mut people` the detail writes its
+            // question into. Scoped to "All" as the list is.
+            let shares: &[super::share_ui::ShareRow] =
+                if *scope == crate::vault_window::sidebar::SendScope::All { people.shares } else { &[] };
+            if let Some(share) = selected.as_deref().and_then(|key| shares.iter().find(|s| s.key == key)) {
+                return draw_share_detail(ui, share, people, records);
+            }
             let rows: &[SendRow] = match state {
                 SendPaneState::Rows(rows) => rows,
                 _ => &[],
@@ -2508,7 +2685,7 @@ fn draw_send_detail(
                 // pane's sake -- the reason `detail_prompt` exists at all is
                 // that a blank column beside a FULL list reads as a load that
                 // failed, and that case is unchanged.
-                None if in_scope.is_empty() => {}
+                None if in_scope.is_empty() && shares.is_empty() => {}
                 None => detail_prompt(ui, NOTHING_PICKED),
                 Some(row) => action = draw_send_card(ui, row, delete, records),
             }
@@ -2617,7 +2794,7 @@ fn draw_send_card(
         );
         // The record's own tile, as its read pane draws it, when the Send
         // was made from one that has an icon; its monogram otherwise.
-        paint_send_tile(ui, tile, records, row.sent.as_ref(), &row.name, true, 1.0);
+        paint_send_tile(ui, tile, records, row.sent.as_ref().map(|s| s.item_id.as_str()), &row.name, true, 1.0);
 
         let text_left = tile.right() + ROW_TEXT_GAP;
         // The text column stops where the actions begin when they are on this
@@ -2962,6 +3139,237 @@ fn draw_received_detail(ui: &mut egui::Ui, row: &ReceivedRow) {
                     );
                 });
         });
+}
+
+/// **A person share's own detail** (design 6c): 5b's pane with LINK and
+/// ACTIVITY replaced by PERSON and WHAT THEY SEE, and "its header keeps 5b's
+/// layout: Open record, then the red Stop sharing."
+///
+/// **Built from [`draw_send_card`]'s parts, not beside them**: the same strip,
+/// tile, 21px title and subtitle line with its pill; the same measured
+/// header that puts the controls on the title's line when they fit and under
+/// it when they do not; the same fact card. The two panes take turns in one
+/// column, and the owner compares them the way he compares the rows.
+///
+/// # Stop sharing is the app's two-step, and asks the window
+///
+/// Step one arms the question (`PeopleAsk::Stop`); the question stands over
+/// the cards with "Remove from their vault" under it, as a Send's revoke
+/// does; Cancel takes Stop sharing's own rectangle -- both labels are
+/// measured in every state, `action_labels`'s contract -- so a second rapid
+/// click where Stop sharing was lands on Cancel. Open record steps back while
+/// the question is up (6c's confirm caption). Nothing here stops anything:
+/// every press goes out through `people.asked`, and the window sends the one
+/// `SharingCall::Stop` the SHARING card sends too.
+///
+/// While the stop runs, the controls' row says so and holds no widget, the
+/// revoke's rule.
+///
+/// Open record is the Sent screen's own [`SendUiAction::OpenRecord`], with
+/// the id the view lists NOW -- so a record that came home under a new id is
+/// opened by that id, and one that has gone is left alone by the window.
+fn draw_share_detail(
+    ui: &mut egui::Ui,
+    share: &super::share_ui::ShareRow,
+    people: &mut super::share_ui::PeopleRows<'_>,
+    records: RecordTiles<'_>,
+) -> Option<SendUiAction> {
+    use super::share_ui::{self as sharing, PeopleAsk};
+    let mut action: Option<SendUiAction> = None;
+    let width = ui.available_width();
+    let key = share.key.as_str();
+    let stopping = people.stopping.as_deref() == Some(key);
+    let confirming = !stopping && people.confirming.as_deref() == Some(key);
+
+    // --- how the header is laid out, measured first (see `draw_send_card`) ---
+    let labels = [OPEN_RECORD_LABEL, sharing::STOP_LABEL];
+    let content = (width - DETAIL_PAD_X_F * 2.0).max(0.0);
+    let action_pad = action_pad_for(ui, &labels, content);
+    let actions_width = actions_total(ui, &labels, action_pad);
+    let inline = !stopping
+        && HEADER_TILE + ROW_TEXT_GAP + TITLE_MIN_ROOM + HEADER_ACTION_GAP + actions_width
+            <= content;
+    let strip_height = if inline {
+        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK
+    } else {
+        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK + ACTION_ROW_GAP + theme::ACTION_BUTTON_HEIGHT
+    };
+    let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
+    {
+        let p = ui.painter().clone();
+        let p = &p;
+        p.rect_filled(strip, CornerRadius::ZERO, theme::CARD);
+        p.rect_filled(
+            egui::Rect::from_min_max(
+                egui::pos2(strip.left(), strip.bottom() - 1.0),
+                egui::pos2(strip.right(), strip.bottom()),
+            ),
+            CornerRadius::ZERO,
+            theme::HAIRLINE,
+        );
+        let block_top = strip.top() + DETAIL_PAD_Y_F;
+        let tile = egui::Rect::from_min_size(
+            egui::pos2(
+                strip.left() + DETAIL_PAD_X_F,
+                block_top + (HEADER_BLOCK - HEADER_TILE) / 2.0,
+            ),
+            egui::Vec2::splat(HEADER_TILE),
+        );
+        paint_send_tile(ui, tile, records, Some(&share.item_id), &share.name, true, 1.0);
+        let text_left = tile.right() + ROW_TEXT_GAP;
+        let text_right = strip.right()
+            - DETAIL_PAD_X_F
+            - if inline { actions_width + HEADER_ACTION_GAP } else { 0.0 };
+        let clip = p.with_clip_rect(
+            egui::Rect::from_min_max(
+                egui::pos2(text_left, strip.top()),
+                egui::pos2(text_right.max(text_left), strip.bottom()),
+            )
+            .intersect(ui.clip_rect()),
+        );
+        let title = elided(
+            &clip,
+            &share.name,
+            egui::FontId::new(TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
+            theme::INK,
+            (text_right - text_left).max(0.0),
+        );
+        clip.galley(egui::pos2(text_left, block_top), title, theme::INK);
+        // 6c's `.dsub`: "Shared with a person", then the share pill -- where
+        // a Send's pane says what kind of Send it is and wears its state.
+        let sub_y = block_top + TITLE_LINE + SUBTITLE_GAP + theme::PILL_HEIGHT / 2.0;
+        let kind_rect = clip.text(
+            egui::pos2(text_left, sub_y),
+            egui::Align2::LEFT_CENTER,
+            sharing::SHARED_WITH_A_PERSON,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+            theme::TEXT_FAINT,
+        );
+        theme::share_pill(&clip, egui::pos2(kind_rect.right() + STRIP_GAP, sub_y), share.pill());
+    }
+
+    // --- the actions ---
+    let action_y = if inline {
+        strip.top() + DETAIL_PAD_Y_F + (HEADER_BLOCK - theme::ACTION_BUTTON_HEIGHT) / 2.0
+    } else {
+        strip.top() + DETAIL_PAD_Y_F + HEADER_BLOCK + ACTION_ROW_GAP
+    };
+    let x0 = if inline { strip.right() - DETAIL_PAD_X_F - actions_width } else { strip.left() + DETAIL_PAD_X_F };
+    if stopping {
+        ui.painter().text(
+            egui::pos2(strip.left() + DETAIL_PAD_X_F, action_y + theme::ACTION_BUTTON_HEIGHT / 2.0),
+            egui::Align2::LEFT_CENTER,
+            sharing::STOPPING_LABEL,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+            theme::TEXT_MUTED,
+        );
+    } else {
+        let slot = |x: f32, label: &str| {
+            egui::Rect::from_min_size(
+                egui::pos2(x, action_y),
+                egui::vec2(theme::action_button_width(ui.painter(), label, action_pad), theme::ACTION_BUTTON_HEIGHT),
+            )
+        };
+        let open_rect = slot(x0, OPEN_RECORD_LABEL);
+        let stop_rect = slot(open_rect.right() + BUTTON_GAP, sharing::STOP_LABEL);
+        if !confirming
+            && theme::action_button(ui, open_rect, OPEN_RECORD_LABEL, theme::ActionTone::Secondary).clicked()
+        {
+            action = Some(SendUiAction::OpenRecord(share.item_id.clone()));
+        }
+        if confirming {
+            if theme::action_button(ui, stop_rect, sharing::CANCEL_BUTTON, theme::ActionTone::Secondary).clicked() {
+                people.asked = Some(PeopleAsk::CancelStop);
+            }
+        } else if theme::action_button(ui, stop_rect, sharing::STOP_LABEL, theme::ActionTone::Destructive)
+            .on_hover_text(sharing::STOP_HOVER)
+            .clicked()
+        {
+            people.asked = Some(PeopleAsk::Stop(key.to_string()));
+        }
+    }
+
+    // --- the body: the question, PERSON, WHAT THEY SEE, and a sentence ---
+    //
+    // The cursor goes back to the strip's foot first, for `draw_send_card`'s
+    // reason: every control above was put inside a band already allocated.
+    ui.advance_cursor_after_rect(strip);
+    egui::Frame::new()
+        .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .id_salt("share-detail")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if confirming {
+                        ui.add(
+                            egui::Label::new(
+                                theme::semibold(sharing::stop_question(&share.name, &share.email), ANSWER_LINE_PX)
+                                    .color(theme::ERROR),
+                            )
+                            .wrap(),
+                        );
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(sharing::STOP_HINT).size(11.0).color(theme::TEXT_FAINT))
+                                .wrap(),
+                        );
+                        ui.add_space(10.0);
+                        // Cancel wins an ambiguous frame, as on the revoke:
+                        // the safe answer on a destructive control is not to
+                        // destroy.
+                        if theme::destructive_button(ui, sharing::REMOVE_LABEL).clicked()
+                            && people.asked != Some(PeopleAsk::CancelStop)
+                        {
+                            people.asked = Some(PeopleAsk::ConfirmStop(key.to_string()));
+                        }
+                        ui.add_space(14.0);
+                    }
+                    let since = share.since.as_deref().unwrap_or(sharing::SINCE_UNKNOWN);
+                    // A person who holds the record has a copy that follows
+                    // the edits; one who does not yet (or any more) has no
+                    // copy, and the row says where they stand instead.
+                    let copy = if share.state == crate::rest::sharing::PersonState::Shared {
+                        (sharing::THEIR_COPY_ROW, CardValue::Plain(sharing::FOLLOWS_EDITS))
+                    } else {
+                        (sharing::STATUS_ROW, CardValue::Plain(share.state_words()))
+                    };
+                    draw_fact_card(
+                        ui,
+                        sharing::PERSON_CARD_TITLE,
+                        None,
+                        &[
+                            (sharing::SHARED_WITH_ROW, CardValue::Plain(&share.email)),
+                            (sharing::SINCE_ROW, CardValue::Plain(since)),
+                            (sharing::ACCESS_ROW, CardValue::Plain(sharing::VIEW_ONLY)),
+                            copy,
+                        ],
+                        false,
+                    );
+                    ui.add_space(CARD_STACK_GAP);
+                    draw_fact_card(
+                        ui,
+                        sharing::WHAT_THEY_SEE_TITLE,
+                        Some(sharing::WHOLE_RECORD),
+                        &[
+                            (sharing::CAN_ROW, CardValue::Plain(sharing::CAN_VALUE)),
+                            (sharing::CANNOT_ROW, CardValue::Plain(sharing::CANNOT_VALUE)),
+                        ],
+                        false,
+                    );
+                    // **At the foot**, for the SHARING card's reason: a
+                    // sentence arriving while the pointer is on "Remove from
+                    // their vault" must not push the button away. The
+                    // engine's sentence -- shown here, logged nowhere.
+                    if let Some(notice) = people.notice.as_deref() {
+                        ui.add_space(CARD_STACK_GAP);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(notice).size(12.0).color(theme::ERROR)).wrap(),
+                        );
+                    }
+                });
+        });
+    action
 }
 
 /// What one row of a fact card shows in its value column.
@@ -5548,7 +5956,7 @@ mod verdict_linearity {
                 let _ = ctx.run_ui(Default::default(), |ui| {
                     // Deliberately dropped rather than applied: this is the
                     // shape every measured shadow reduces to.
-                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), SendView::Mine(crate::vault_window::sidebar::SendScope::All), &mut None, RecordTiles::default());
+                    let _ = draw_send_pane(ui, &state, None, SendDeleteView::default(), SendView::Mine(crate::vault_window::sidebar::SendScope::All), &mut None, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none());
                 });
             }),
             1,
@@ -5802,7 +6210,7 @@ mod paint_tests {
         let mut selected = picked;
         let mut action = SendUiAction::None;
         let output = ctx.run_ui(input(), |ui| {
-            action = draw_send_pane(ui, state, notice, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
+            action = draw_send_pane(ui, state, notice, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
 
         let mut painted = Painted::default();
@@ -6966,7 +7374,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
 
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -7000,7 +7408,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7012,7 +7420,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
+            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         action
     }
@@ -7150,7 +7558,7 @@ mod paint_tests {
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
         let output = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default()).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
@@ -7170,7 +7578,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default()).into_action();
+            let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7183,7 +7591,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default()).into_action();
+            action = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         assert_eq!(action, SendUiAction::DismissNotice);
     }
@@ -7213,7 +7621,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
         let _ = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let press = egui::RawInput {
             events: vec![
@@ -7228,7 +7636,7 @@ mod paint_tests {
             ..base()
         };
         let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
+            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let release = egui::RawInput {
             events: vec![egui::Event::PointerButton {
@@ -7241,7 +7649,7 @@ mod paint_tests {
         };
         let mut action = SendUiAction::None;
         let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default()).into_action();
+            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         action
     }
@@ -7694,6 +8102,7 @@ mod paint_tests {
                 SendView::Mine(ALL_SENDS),
                 &mut selected,
                 RecordTiles { items: &items, icons: Some(&icons) },
+                &mut crate::vault_window::share_ui::PeopleRows::none(),
             )
             .into_action();
         });
@@ -8318,6 +8727,7 @@ mod paint_tests {
                 SendView::Mine(scope),
                 &mut selected,
                 RecordTiles::default(),
+                &mut crate::vault_window::share_ui::PeopleRows::none(),
             )
             .into_action();
         });
@@ -8514,6 +8924,7 @@ mod paint_tests {
                 SendView::Received(rows),
                 &mut selected,
                 RecordTiles::default(),
+                &mut crate::vault_window::share_ui::PeopleRows::none(),
             )
             .into_action();
         });
@@ -9026,6 +9437,328 @@ mod paint_tests {
                 );
             }
         }
+    }
+
+    // ---- person shares in the Sent list (design 6c) -------------------------------
+
+    use crate::rest::sharing::PersonState;
+    use crate::vault_window::share_ui::{self, PeopleAsk, PeopleRows, ShareRow};
+
+    /// `record`'s share with `email`, as `share_ui::share_rows` would list it.
+    fn a_share_of(record: &crate::vault_bridge::VaultItem, email: &str, state: PersonState) -> ShareRow {
+        ShareRow {
+            key: share_ui::share_key(&record.id, email),
+            item_id: record.id.clone(),
+            name: record.name.clone(),
+            email: email.to_string(),
+            state,
+            subtitle: format!("to {email} \u{b7} Shared"),
+            since: Some("14 Sep".to_string()),
+        }
+    }
+
+    /// The Sent screen with `people` handed to it and `selected` picked, drawn
+    /// with `records` for its tiles, over a warm frame and a plain one before
+    /// the frame that carries `events` -- a press is hit-tested against the
+    /// widgets of the frame before it. `people.asked` is what that last frame
+    /// asked.
+    fn paint_sharing(
+        state: &SendPaneState,
+        people: &mut PeopleRows<'_>,
+        selected: &mut Option<String>,
+        records: &[crate::vault_bridge::VaultItem],
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> (Painted, SendUiAction) {
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let tiles = RecordTiles { items: records, icons: None };
+        let _ = ctx.run_ui(input(Vec::new()), |ui| {
+            let _ = draw_send_pane(ui, state, None, SendDeleteView::default(), SendView::Mine(ALL_SENDS), selected, tiles, people)
+                .into_action();
+        });
+        people.asked = None;
+        let mut action = SendUiAction::None;
+        let output = ctx.run_ui(input(events), |ui| {
+            action = draw_send_pane(ui, state, None, SendDeleteView::default(), SendView::Mine(ALL_SENDS), selected, tiles, people)
+                .into_action();
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        (painted, action)
+    }
+
+    fn press_at(pos: egui::Pos2) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+            egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() },
+        ]
+    }
+
+    /// Every row band the list column painted, top-down: a white fill exactly
+    /// one records row tall.
+    fn list_rows(painted: &Painted) -> Vec<egui::Rect> {
+        let mut rows: Vec<egui::Rect> = painted
+            .fills
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::CARD
+                    && r.center().x < crate::vault_window::LIST_WIDTH
+                    && (r.height() - ROW_HEIGHT).abs() < 0.5
+            })
+            .map(|(r, _)| *r)
+            .collect();
+        rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        rows.dedup_by(|a, b| (a.min - b.min).length() < 0.5);
+        rows
+    }
+
+    /// **A share row is a Send row's shape** (design 6c in 5b's column): the
+    /// same band, the same tile in the same place, the name on the same line
+    /// -- measured off what each PAINTS, the records-list parity rule this
+    /// column already holds -- and it is listed first. What sets it apart is
+    /// what 6c says does: the person mark's subtitle and a share pill, the
+    /// filled blue of Shared rather than a Send's stadium state pill.
+    #[test]
+    fn a_share_row_is_drawn_to_a_send_rows_shape_and_listed_first() {
+        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+        let record = a_record("rec-1", "SAP Production");
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
+        let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
+        let (painted, _) = paint_sharing(
+            &a_send_made_from(&record),
+            &mut people,
+            &mut None,
+            std::slice::from_ref(&record),
+            size,
+            Vec::new(),
+        );
+        let rows = list_rows(&painted);
+        assert_eq!(rows.len(), 2, "one share and one Send: {rows:?}");
+        let (share, send) = (rows[0], rows[1]);
+        assert_eq!(share.width(), send.width(), "the share row is not a Send row's width");
+        assert_eq!(share.left(), send.left());
+        assert!(
+            (send.top() - share.bottom() - LIST_ROW_GAP).abs() < 0.51,
+            "the two rows are not one list's gap apart: {share:?} {send:?}"
+        );
+
+        // The tile, and the name beside it, at one offset in both bands.
+        let tile_in = |row: egui::Rect| {
+            painted
+                .strokes
+                .iter()
+                .map(|(r, _)| *r)
+                .find(|r| row.contains_rect(*r) && (r.width() - r.height()).abs() < 0.5 && r.width() > 20.0)
+                .unwrap_or_else(|| panic!("no tile in {row:?}"))
+        };
+        let (share_tile, send_tile) = (tile_in(share), tile_in(send));
+        assert!(((share_tile.min - share.min) - (send_tile.min - send.min)).length() < 0.51, "{share_tile:?} vs {send_tile:?}");
+        assert_eq!(share_tile.size(), send_tile.size());
+        let names: Vec<egui::Rect> = painted
+            .text_rects
+            .iter()
+            .filter(|(t, r)| t == &record.name && r.center().x < crate::vault_window::LIST_WIDTH)
+            .map(|(_, r)| *r)
+            .collect();
+        assert_eq!(names.len(), 2, "{:?}", painted.text);
+        let (share_name, send_name) = if names[0].top() < names[1].top() { (names[0], names[1]) } else { (names[1], names[0]) };
+        assert!((share_name.left() - send_name.left()).abs() < 0.51);
+        assert!(((share_name.top() - share.top()) - (send_name.top() - send.top())).abs() < 1.01);
+
+        // 6c's own marks: the subtitle, and a share pill in Shared's blue.
+        assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 1, "{:?}", painted.text);
+        assert_eq!(painted.in_list(theme::SharePillKind::Shared.label()), 1);
+        let pill = theme::SharePillKind::Shared.tone();
+        assert!(
+            painted
+                .fills
+                .iter()
+                .any(|(r, f)| *f == pill.fill && share.contains_rect(*r) && (r.height() - theme::PILL_HEIGHT).abs() < 0.5),
+            "the share row wears no share pill"
+        );
+        assert!(
+            !painted.fills.iter().any(|(r, f)| *f == pill.fill && send.contains_rect(*r)),
+            "control: the Send row wears Shared's blue as well, so the fill says nothing"
+        );
+        assert!(painted.has("2 items"), "a share is not a Send, so the count is of items: {:?}", painted.text);
+    }
+
+    /// **A share's own detail** (mock 6c): PERSON and WHAT THEY SEE, Open
+    /// record, and a red Stop sharing that only ASKS -- picked from its row.
+    #[test]
+    fn a_shares_detail_shows_the_person_and_stops_in_two_steps() {
+        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+        let record = a_record("rec-1", "Acme VPN");
+        let state = a_send_made_from(&record);
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
+        let key = shares[0].key.clone();
+        let records = std::slice::from_ref(&record);
+        let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
+
+        // Picked from its row, which is the first.
+        let mut selected = None;
+        let (painted, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
+        let row = list_rows(&painted)[0];
+        let _ = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(row.center()));
+        assert_eq!(selected.as_deref(), Some(key.as_str()), "the share row did not pick itself");
+
+        let (painted, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
+        for words in [
+            share_ui::PERSON_CARD_TITLE,
+            share_ui::WHAT_THEY_SEE_TITLE,
+            share_ui::SHARED_WITH_A_PERSON,
+            share_ui::VIEW_ONLY,
+            share_ui::FOLLOWS_EDITS,
+            share_ui::WHOLE_RECORD,
+            "anna@x.io",
+            "14 Sep",
+            OPEN_RECORD_LABEL,
+            share_ui::STOP_LABEL,
+        ] {
+            assert_eq!(painted.in_detail(words), 1, "{words:?} in the detail: {:?}", painted.text);
+        }
+        assert_eq!(painted.in_detail(REVOKE_LABEL), 0, "a share has no link to revoke");
+
+        let open = painted.rects_of_exact(OPEN_RECORD_LABEL)[0].center();
+        let (_, action) = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(open));
+        assert_eq!(action, SendUiAction::OpenRecord(record.id.clone()));
+        assert_eq!(people.asked, None);
+
+        let stop = painted.rects_of_exact(share_ui::STOP_LABEL)[0].center();
+        let (_, action) = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(stop));
+        assert_eq!(people.asked, Some(PeopleAsk::Stop(key.clone())), "step one asks, and nothing else");
+        assert_eq!(action, SendUiAction::None);
+    }
+
+    /// **Step two** (mock 6c, confirm): the red question over the cards,
+    /// Cancel in Stop sharing's own slot, Open record gone, and "Remove from
+    /// their vault" as the one way through. And while the stop runs, the
+    /// header says so and offers nothing.
+    #[test]
+    fn stopping_a_share_asks_first_and_cancel_takes_the_stops_place() {
+        let record = a_record("rec-1", "Acme VPN");
+        let state = a_send_made_from(&record);
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
+        let key = shares[0].key.clone();
+        let records = std::slice::from_ref(&record);
+        for size in [egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0), min_pane_size()] {
+            let mut selected = Some(key.clone());
+            let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
+            let (at_rest, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
+            let stop_rect = at_rest.rects_of_exact(share_ui::STOP_LABEL)[0];
+            assert!(stop_rect.right() <= size.x + 0.5, "Stop sharing runs off a {}pt pane", size.x);
+
+            people.confirming = Some(key.clone());
+            let (asking, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
+            assert!(asking.has(&share_ui::stop_question("Acme VPN", "anna@x.io")), "{:?}", asking.text);
+            assert_eq!(asking.in_detail(share_ui::REMOVE_LABEL), 1);
+            assert_eq!(asking.in_detail(OPEN_RECORD_LABEL), 0, "Open record steps back while the question is up");
+            assert_eq!(asking.in_detail(share_ui::STOP_LABEL), 0);
+            let (cancel_button, _) = asking.control_under(share_ui::CANCEL_BUTTON);
+            let (stop_button, _) = at_rest.control_under(share_ui::STOP_LABEL);
+            assert!(
+                (cancel_button.min - stop_button.min).length() < 0.51 && (cancel_button.max - stop_button.max).length() < 0.51,
+                "Cancel is not in Stop sharing's slot at {}pt: {cancel_button:?} vs {stop_button:?}",
+                size.x
+            );
+
+            let remove = asking.rects_of_exact(share_ui::REMOVE_LABEL)[0].center();
+            let _ = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(remove));
+            assert_eq!(people.asked, Some(PeopleAsk::ConfirmStop(key.clone())));
+            let cancel = asking.rects_of_exact(share_ui::CANCEL_BUTTON)[0].center();
+            let _ = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(cancel));
+            assert_eq!(people.asked, Some(PeopleAsk::CancelStop));
+
+            people.confirming = None;
+            people.stopping = Some(key.clone());
+            let (running, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
+            assert_eq!(running.in_detail(share_ui::STOPPING_LABEL), 1, "{:?}", running.text);
+            for control in [share_ui::STOP_LABEL, share_ui::CANCEL_BUTTON, OPEN_RECORD_LABEL, share_ui::REMOVE_LABEL] {
+                assert_eq!(running.in_detail(control), 0, "{control:?} is offered while the stop runs");
+            }
+        }
+    }
+
+    /// **A sentence about the share on screen is said on it**, at the foot of
+    /// its detail -- a stop that failed, or one refused while another write
+    /// ran.
+    #[test]
+    fn a_shares_detail_says_what_went_wrong_at_its_foot() {
+        let record = a_record("rec-1", "Acme VPN");
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::WaitingAccept)];
+        let mut people = PeopleRows { shares: &shares, notice: Some(share_ui::BUSY.to_string()), ..PeopleRows::none() };
+        let mut selected = Some(shares[0].key.clone());
+        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+        let (painted, _) =
+            paint_sharing(&a_send_made_from(&record), &mut people, &mut selected, std::slice::from_ref(&record), size, Vec::new());
+        let notice = painted.rect_of(share_ui::BUSY).unwrap_or_else(|| panic!("no notice: {:?}", painted.text));
+        let card = painted.rect_of(share_ui::WHAT_THEY_SEE_TITLE).expect("the last card");
+        assert!(notice.top() > card.top(), "the sentence is not at the foot");
+        // A person still waiting has no copy to follow edits: the row says
+        // where they stand instead.
+        assert_eq!(painted.in_detail(share_ui::FOLLOWS_EDITS), 0);
+        assert_eq!(painted.in_detail(share_ui::STATUS_ROW), 1, "{:?}", painted.text);
+    }
+
+    /// **A share that has gone leaves the prompt, not a blank pane** -- a
+    /// stop that brought the record home gave it a new id, and the key the
+    /// window still holds names nothing. And the shares are listed only on
+    /// the unfiltered row, and with no Send at all.
+    #[test]
+    fn a_gone_share_leaves_the_prompt_and_shares_list_only_on_all() {
+        let record = a_record("rec-1", "Acme VPN");
+        let records = std::slice::from_ref(&record);
+        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+        let mut people = PeopleRows::none();
+        let mut selected = Some(share_ui::share_key("the-old-id", "anna@x.io"));
+        let (painted, _) = paint_sharing(&a_send_made_from(&record), &mut people, &mut selected, records, size, Vec::new());
+        assert_eq!(painted.in_detail(NOTHING_PICKED), 1, "{:?}", painted.text);
+
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
+        let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
+        let (painted, _) = paint_sharing(&SendPaneState::Empty, &mut people, &mut None, records, size, Vec::new());
+        assert_eq!(list_rows(&painted).len(), 1, "an account with no Sends still lists its share");
+        assert!(!painted.has(EMPTY_HEADLINE), "{:?}", painted.text);
+        assert!(painted.has("1 item"), "{:?}", painted.text);
+        assert_eq!(painted.in_detail(NOTHING_PICKED), 1, "a list to pick from, and nothing picked");
+
+        // A sub-row is a Send state, and a share has none.
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let state = a_send_made_from(&record);
+        let output = ctx.run_ui(input(), |ui| {
+            let _ = draw_send_pane(
+                ui,
+                &state,
+                None,
+                SendDeleteView::default(),
+                SendView::Mine(crate::vault_window::sidebar::SendScope::Waiting),
+                &mut None,
+                RecordTiles { items: records, icons: None },
+                &mut people,
+            )
+            .into_action();
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 0, "a share on a Send-state sub-row");
     }
 }
 
@@ -13043,11 +13776,19 @@ mod source_pins {
         // panel would be a name upstream of the pane -- the exact shape
         // `the_applier_takes_the_panel_with_no_binding_between` exists to
         // refuse. A comment cannot keep it inline; this can.
+        //
+        // **Design 6c's `&mut people_rows` is the last argument**: the frame's
+        // share rows and the stop two-step, built above the applier and read
+        // back after it. It is not a gate on what the pane is asked for -- the
+        // Sends model is still the inline `state` -- and pinning it here keeps
+        // the pane handed the window's one `PeopleRows` rather than a
+        // `none()` that would quietly list no share.
         let pane = squashed(concat!(
             "send_ui::draw_send_", "pane( ui, state, notice_message.as_deref(), \
              send_delete.view(), if on_received { send_ui::SendView::Received(&received) } \
              else { send_ui::SendView::Mine(send_scope) }, &mut selected_send, \
-             send_ui::RecordTiles { items: &items, icons: Some(&icons.textures) }, )"
+             send_ui::RecordTiles { items: &items, icons: Some(&icons.textures) }, \
+             &mut people_rows, )"
         ));
         assert_eq!(
             squashed(&production).matches(pane.as_str()).count(),

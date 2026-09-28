@@ -2711,6 +2711,8 @@ impl Preview {
                     selected,
                     // No vault behind the preview: every tile a monogram.
                     send_ui::RecordTiles::default(),
+                    // No daemon behind it either: no person share to list.
+                    &mut deskwarden::vault_window::share_ui::PeopleRows::none(),
                 );
                 // Taken and thrown away: a preview has no window to act on.
                 // See the doc above for why it must not simply be dropped.

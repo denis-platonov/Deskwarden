@@ -9,8 +9,10 @@
 //! line to the daemon has no view, and its Share control offers a Send.
 //!
 //! What is drawn here -- person lines, the Share dialog, the people block of
-//! the SHARING card, share rows in Sent, received rows in Shared with me --
-//! is called from `detail`, `send_ui` and `mod`, which own their panes.
+//! the SHARING card, received rows in Shared with me -- is called from
+//! `detail`, `send_ui` and `mod`, which own their panes. Sent's share rows and
+//! a share's detail are the one exception: their data is here ([`ShareRow`],
+//! [`PeopleRows`]) and `send_ui` draws them, in its own row and pane shapes.
 //!
 //! # The engine's sentences are shown, never logged
 //!
@@ -201,9 +203,8 @@ pub(crate) fn person_lines(
         .collect()
 }
 
-/// The Sent row's short state (mock 6c: "to anna@example.com · Shared").
-/// Called by Task 18's Sent rows.
-#[allow(dead_code)]
+/// The Sent row's short state (mock 6c: "to anna@example.com · Shared"),
+/// for [`share_rows`].
 pub(crate) fn short_state(state: PersonState, expires_at: Option<&str>, now_ms: i64) -> String {
     match state {
         PersonState::Shared => "Shared".to_string(),
@@ -1603,6 +1604,8 @@ pub(crate) fn say_refusal_in_dialog(pane: &mut SharingPane) {
 // control sits or how tall an entry is.
 
 pub(crate) const STOP_LABEL: &str = "Stop sharing";
+/// Stop sharing's hover, on the SHARING card and on a share's Sent detail.
+pub(crate) const STOP_HOVER: &str = "Take this record out of their vault";
 pub(crate) const REINVITE_LABEL: &str = "Re-invite";
 pub(crate) const SHARE_ANYWAY_LABEL: &str = "Share anyway";
 pub(crate) const SHOW_FINGERPRINT: &str = "Show fingerprint";
@@ -2051,7 +2054,7 @@ fn person_entry(
                 return;
             }
             if theme::row_button_danger(ui, STOP_LABEL)
-                .on_hover_text("Take this record out of their vault")
+                .on_hover_text(STOP_HOVER)
                 .clicked()
             {
                 *action = DetailAction::StopSharing(email.to_string());
@@ -2202,6 +2205,196 @@ pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, clear_of: O
     let rect = egui::Rect::from_min_size(at, size);
     painter.rect_filled(rect, egui::CornerRadius::same(TOAST_RADIUS), theme::INK);
     painter.galley(rect.min + TOAST_PAD, galley, theme::CARD);
+}
+
+// ---- Sent: one row per record and person (mock 6c) -------------------------------------
+//
+// **The data is here; the drawing is `send_ui`'s.** A share row stands in the
+// Sent list's column beside Send rows, and the owner's rule for that column
+// is one row shape, read off `item_list`'s constants and drawn through the
+// records list's own tile -- which `send_ui::draw_row` already does, with
+// private helpers a second copy here would drift from. So `send_ui` draws the
+// row and the detail (`draw_share_row`, `draw_share_detail`, both private to
+// it), and this file says what a share IS: its key, its words, and what a
+// press on it asks of the window.
+
+/// A share row's selection key starts with this, so it can never be taken
+/// for a Send's id -- `send_ui`'s detail tells the two apart by it.
+pub(crate) const SHARE_KEY_PREFIX: &str = "share:";
+/// 6c's header, beside the share pill.
+pub(crate) const SHARED_WITH_A_PERSON: &str = "Shared with a person";
+/// 6c's two cards.
+pub(crate) const PERSON_CARD_TITLE: &str = "PERSON";
+pub(crate) const WHAT_THEY_SEE_TITLE: &str = "WHAT THEY SEE";
+/// 6c's PERSON rows. `Since` falls back to [`SINCE_UNKNOWN`] for a share this
+/// PC holds no record of -- made on another PC, or before the sent history
+/// kept shares. "On another PC" would be a guess; this is what is known.
+pub(crate) const SHARED_WITH_ROW: &str = "Shared with";
+pub(crate) const SINCE_ROW: &str = "Since";
+pub(crate) const SINCE_UNKNOWN: &str = "Not recorded on this PC";
+pub(crate) const ACCESS_ROW: &str = "Access";
+pub(crate) const VIEW_ONLY: &str = "View-only";
+pub(crate) const THEIR_COPY_ROW: &str = "Their copy";
+pub(crate) const FOLLOWS_EDITS: &str = "Follows your edits";
+/// A person who does not hold the record yet (or any more) has no copy to
+/// follow anything, so their row says where they stand instead.
+pub(crate) const STATUS_ROW: &str = "Status";
+/// 6c's WHAT THEY SEE: the whole record, and 6c's Access hint split at its
+/// own sentence boundary into what they can and cannot do -- one fact per
+/// row, on the card's one label column, in the mock's words.
+pub(crate) const WHOLE_RECORD: &str = "The whole record, now and after every edit.";
+pub(crate) const CAN_ROW: &str = "They can";
+pub(crate) const CAN_VALUE: &str = "See, copy and autofill it";
+pub(crate) const CANNOT_ROW: &str = "They cannot";
+pub(crate) const CANNOT_VALUE: &str = "Edit, delete or share it on";
+
+/// **A share in the Sent list**: one record, one person (mock 6c).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ShareRow {
+    /// `share:{item id}:{email}` -- the Sent pane's selection key. See
+    /// [`share_key`].
+    pub(crate) key: String,
+    pub(crate) item_id: String,
+    /// The VAULT ITEM's name -- the decrypted record, whose cipher the vault
+    /// authenticated -- and never anything the view carries: the view's
+    /// people come from collection names, and a name is not proof.
+    pub(crate) name: String,
+    /// The person, normalised as the view holds them.
+    pub(crate) email: String,
+    pub(crate) state: PersonState,
+    /// "to anna@example.com · Shared".
+    pub(crate) subtitle: String,
+    /// "14 Sep", from the local record of the share.
+    pub(crate) since: Option<String>,
+}
+
+impl ShareRow {
+    /// The pill the row and its detail wear -- the SHARING card's own
+    /// ([`PersonLine::pill`]), so one person is one pill wherever they are.
+    pub(crate) fn pill(&self) -> theme::SharePillKind {
+        PersonLine { email: self.email.clone(), state: self.state, line: String::new() }.pill()
+    }
+
+    /// The subtitle's state words, after its middle dot. An address has no
+    /// spaces, so the first " · " is the one [`share_rows`] wrote. (Not
+    /// named `status`: `job_object`'s scan reads a method call of that name
+    /// as a `Command` starting a child.)
+    pub(crate) fn state_words(&self) -> &str {
+        self.subtitle.split_once(" \u{b7} ").map_or(self.subtitle.as_str(), |(_, state)| state)
+    }
+}
+
+/// A share's selection key. An item id is a GUID and has no `:`, so
+/// [`parse_share_key`] splits at the first one after the prefix and the
+/// address -- which may not -- comes back whole.
+pub(crate) fn share_key(item_id: &str, email: &str) -> String {
+    format!("{SHARE_KEY_PREFIX}{item_id}:{email}")
+}
+
+/// `(item id, email)` back out of a [`share_key`]; `None` for a Send's id.
+pub(crate) fn parse_share_key(key: &str) -> Option<(String, String)> {
+    let rest = key.strip_prefix(SHARE_KEY_PREFIX)?;
+    let (item_id, email) = rest.split_once(':')?;
+    Some((item_id.to_string(), email.to_string()))
+}
+
+/// **Every share, one row per record and person** -- newest first by the
+/// local record of it, since a share has no server timestamp (plan decision
+/// 12). A share this PC has no record of sorts last, by record name.
+///
+/// A record the vault does not hold (the view is a frame older than a sync,
+/// or the record is in the trash) is left out: its name would be the only
+/// thing to show, and the vault is where a name comes from. A person the
+/// view lists on a record twice is one row -- the key is the row's identity.
+pub(crate) fn share_rows(
+    view: Option<&SharingView>,
+    items: &[VaultItem],
+    history: &SentHistory,
+    now_ms: i64,
+    zone: &dyn LocalOffset,
+) -> Vec<ShareRow> {
+    let Some(view) = view else {
+        return Vec::new();
+    };
+    let mut rows: Vec<(Option<i64>, ShareRow)> = Vec::new();
+    for record in &view.records {
+        let Some(item) = items.iter().find(|i| i.id == record.item_id) else {
+            continue;
+        };
+        for email in &record.people {
+            let Some(person) = view.person(email) else {
+                continue;
+            };
+            let key = share_key(&item.id, &person.email);
+            if rows.iter().any(|(_, row)| row.key == key) {
+                continue;
+            }
+            let at = since(history, &item.id, &person.email);
+            rows.push((
+                at,
+                ShareRow {
+                    key,
+                    item_id: item.id.clone(),
+                    name: item.name.clone(),
+                    email: person.email.clone(),
+                    state: person.state,
+                    subtitle: format!(
+                        "to {} \u{b7} {}",
+                        person.email,
+                        short_state(person.state, person.expires_at.as_deref(), now_ms)
+                    ),
+                    since: at.map(|at| day(at, zone)),
+                },
+            ));
+        }
+    }
+    rows.sort_by(|(a, ra), (b, rb)| b.cmp(a).then_with(|| ra.name.cmp(&rb.name)).then_with(|| ra.email.cmp(&rb.email)));
+    rows.into_iter().map(|(_, row)| row).collect()
+}
+
+/// **What the Sent list is told about sharing, per frame, and what the user
+/// asked of it** -- the window's half of the Stop sharing two-step on a
+/// share's own detail, keyed by [`share_key`].
+///
+/// Built by the window from [`SharingPane`] before the Sends pane is drawn,
+/// and read back after it (`asked`). It borrows only the frame's own rows, so
+/// the pane is free to change while it is alive.
+///
+/// `pub` and not `pub(crate)`, for [`PersonLine`]'s reason: it is a parameter
+/// of `send_ui::draw_send_pane`'s public signature, which the UI preview
+/// example calls with [`PeopleRows::none`]. Its fields stay the crate's.
+pub struct PeopleRows<'a> {
+    pub(crate) shares: &'a [ShareRow],
+    /// The share key whose stop is armed.
+    pub(crate) confirming: Option<String>,
+    /// The share key whose stop is running.
+    pub(crate) stopping: Option<String>,
+    /// **A sharing sentence for the share on screen** -- a stop that failed,
+    /// a refusal -- which the detail shows at its foot. The engine's
+    /// sentence, so shown and never logged (module doc). The window hands it
+    /// over only for the record on screen ([`SharingPane::notice_for`]); one
+    /// about another record went to a toast ([`route_stray_notice`]).
+    pub(crate) notice: Option<String>,
+    /// Out: what was pressed this frame.
+    pub(crate) asked: Option<PeopleAsk>,
+}
+
+impl PeopleRows<'static> {
+    /// Nothing about sharing: what every caller that is not about it passes.
+    #[must_use]
+    pub fn none() -> Self {
+        Self { shares: &[], confirming: None, stopping: None, notice: None, asked: None }
+    }
+}
+
+/// A press in the Sent list's sharing half. Keys are [`share_key`]s.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PeopleAsk {
+    /// Stop sharing's step one: put the question up.
+    Stop(String),
+    /// "Remove from their vault": step two.
+    ConfirmStop(String),
+    CancelStop,
 }
 
 #[cfg(test)]
@@ -3386,5 +3579,56 @@ mod tests {
         let (_, stacked) = texts.iter().find(|(t, _)| *t == shared_toast("anna@x.io")).expect("the toast");
         assert!(stacked.bottom() < copy.top(), "{stacked:?} runs into the copy box {copy:?}");
         assert!(pane_rect.contains_rect(*stacked));
+    }
+
+    // ---- Sent's person shares (mock 6c) ------------------------------------------------
+
+    /// **One row per (record, person)** (mock 6c), newest share first, with
+    /// the person mark's subtitle "to anna@example.com · Shared" -- and a
+    /// share this PC holds no record of last, with no date to show.
+    #[test]
+    fn sent_lists_one_row_for_each_record_and_person() {
+        let v = view(
+            vec![("anna@x.io", PersonState::Shared, None), ("bob@x.io", PersonState::WaitingAccept, None)],
+            vec![("r1", vec!["anna@x.io", "bob@x.io"]), ("r2", vec!["anna@x.io"])],
+        );
+        let items: Vec<VaultItem> = ["r1", "r2"]
+            .iter()
+            .map(|id| serde_json::from_value(serde_json::json!({ "id": id, "name": format!("Record {id}") })).expect("item"))
+            .collect();
+        let mut history = SentHistory::default();
+        history.record(crate::sent_history::SentRecord {
+            kind: SentKind::Share,
+            item_id: "r2".into(),
+            recipient: "anna@x.io".into(),
+            sent_at_unix_millis: NOW,
+            ..Default::default()
+        });
+        let rows = share_rows(Some(&v), &items, &history, NOW, &crate::local_time::FixedOffset(0));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].item_id, "r2", "the newest share first");
+        assert_eq!(rows[0].subtitle, "to anna@x.io \u{b7} Shared");
+        assert_eq!(rows[0].state_words(), "Shared");
+        assert_eq!(rows[0].since.as_deref(), Some(day(NOW, &crate::local_time::FixedOffset(0)).as_str()));
+        assert!(rows.iter().any(|r| r.subtitle == "to bob@x.io \u{b7} Waiting to accept"));
+        assert_eq!(rows[2].since, None, "no local record, so no date and the end of the list");
+        assert_eq!(parse_share_key(&rows[0].key), Some(("r2".to_string(), "anna@x.io".to_string())));
+        assert_eq!(parse_share_key("send-id"), None, "a Send's id is not a share key");
+        assert_eq!(share_rows(None, &items, &history, NOW, &crate::local_time::FixedOffset(0)), Vec::new());
+    }
+
+    /// **A record the vault does not hold is not listed**, and a person the
+    /// view names twice on one record is one row: the key is the row.
+    #[test]
+    fn a_share_row_needs_its_record_and_is_listed_once() {
+        let v = view(
+            vec![("anna@x.io", PersonState::Shared, None)],
+            vec![("r1", vec!["anna@x.io", "Anna@X.io"]), ("gone", vec!["anna@x.io"])],
+        );
+        let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "r1", "name": "Acme VPN" })).expect("item")];
+        let rows = share_rows(Some(&v), &items, &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].name, "Acme VPN", "the vault's name");
+        assert_eq!(rows[0].pill(), theme::SharePillKind::Shared);
     }
 }

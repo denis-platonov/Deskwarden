@@ -4404,6 +4404,35 @@ pub fn build_frame_with_search(
              Refresh, Delete, Cancel and the confirmation -- is inert. See \
              `send_ui::SendUiVerdict`"
         );
+        // **Design 6c**: the Sent list's person shares, one row per record and
+        // person, and the Stop sharing two-step on a share's own detail. Built
+        // here, above the applier, and read back after it -- it borrows only
+        // this frame's `share_rows`, so `sharing` is free to change once the
+        // pane has drawn. It is not the Sends model (that is written inline in
+        // the panel, and pinned there): what it gates is sharing's own half.
+        let share_rows = share_ui::share_rows(
+            sharing.view.as_ref(),
+            &items,
+            &sent_history,
+            crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
+            &crate::local_time::SystemZone,
+        );
+        // The record whose share is on the Sent detail, if one is. On the Sent
+        // screen a write's failure about ANY other record -- a stop asked on
+        // the SHARING card before the user came here, or on another share --
+        // is said as a toast, as the read pane does; one about this record is
+        // said at the foot of its detail.
+        let sent_share_record = selected_send.as_deref().and_then(share_ui::parse_share_key).map(|(item_id, _)| item_id);
+        if show_sends && !on_received {
+            share_ui::route_stray_notice(&mut sharing, sent_share_record.as_deref().unwrap_or_default(), ui.input(|i| i.time));
+        }
+        let mut people_rows = share_ui::PeopleRows {
+            shares: &share_rows,
+            confirming: sharing.stop_confirming.as_ref().map(|(id, email)| share_ui::share_key(id, email)),
+            stopping: sharing.stopping.as_ref().map(|(id, email)| share_ui::share_key(id, email)),
+            notice: sent_share_record.as_deref().and_then(|id| sharing.notice_for(id)).map(str::to_string),
+            asked: None,
+        };
         let open_record = apply_send_action(
             egui::CentralPanel::default()
             // NO INNER MARGIN, and that is the fix for the band the owner
@@ -4465,6 +4494,22 @@ pub fn build_frame_with_search(
                     // `send_ui::source_pins::the_item_list_is_drawn_only_inside_the_not_sends_gate`,
                     // which is why this note is above the call rather than
                     // inside it: that pin reads the argument list as text.
+                    //
+                    // **The share toast, on this screen too** (mock 6a): a
+                    // share or a stop that finishes while Sent is up says how
+                    // it ended here, in the detail column's corner -- the
+                    // read pane's toast, which this screen replaces. A
+                    // painter on the foreground layer, so drawing it before
+                    // the pane paints it over the pane all the same; not
+                    // under a modal, the read pane's rule.
+                    if !item_list::a_modal_is_up(ui.ctx()) {
+                        let pane = ui.clip_rect();
+                        let detail = egui::Rect::from_min_max(
+                            egui::pos2((pane.left() + LIST_WIDTH).min(pane.right()), pane.top()),
+                            pane.max,
+                        );
+                        share_ui::draw_share_toast(ui, detail, None, &sharing);
+                    }
                     return send_ui::draw_send_pane(
                         ui,
                         state,
@@ -4477,6 +4522,7 @@ pub fn build_frame_with_search(
                         },
                         &mut selected_send,
                         send_ui::RecordTiles { items: &items, icons: Some(&icons.textures) },
+                        &mut people_rows,
                     );
                 }
                 // Resolved from the list the selection was made in, for the
@@ -6493,6 +6539,28 @@ pub fn build_frame_with_search(
             spawn_send_delete,
             copy_send_url,
         );
+        // **What the Sent detail asked of sharing** (design 6c): the same
+        // `stop_confirming` the SHARING card arms, and the same
+        // `SharingCall::Stop` it sends -- one stop, whichever screen asked.
+        // A refused request has already said why (`request`'s contract) and
+        // raised no spinner, so there is nothing to take down; the question
+        // stays up beside the sentence, to be answered again.
+        match people_rows.asked.take() {
+            Some(share_ui::PeopleAsk::Stop(key)) => sharing.stop_confirming = share_ui::parse_share_key(&key),
+            Some(share_ui::PeopleAsk::CancelStop) => sharing.stop_confirming = None,
+            Some(share_ui::PeopleAsk::ConfirmStop(key)) => {
+                if let Some((item_id, email)) = share_ui::parse_share_key(&key) {
+                    let _ = share_ui::request(
+                        &mut sharing,
+                        sharing_client.as_ref(),
+                        ui.ctx(),
+                        &sharing_tx,
+                        share_ui::SharingCall::Stop { item_id, email },
+                    );
+                }
+            }
+            None => {}
+        }
         // **`Open record`**: leave the Sent screen and show the item the Send
         // was made from, as a click on its row in the list would -- when it is
         // still in the vault. One that has gone since leaves the screen as it is.
