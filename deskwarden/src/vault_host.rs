@@ -786,4 +786,52 @@ mod tests {
         assert!(view.available);
         drop(host);
     }
+
+    /// **An accepted person is confirmed by the daemon with no window**
+    /// (spec 11.5 triggers 1-2): a push reaches the hub worker, the worker's
+    /// populate is a whole read, and the pass after it confirms -- all on the
+    /// daemon's own thread, with no client connected.
+    #[test]
+    fn an_accepted_person_is_confirmed_by_the_daemon_with_no_window() {
+        use crate::rest::backend::tests::{FIXTURE_ORG, person_collection, roster_row, sharing_org_row, sharing_profile};
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        backend.sharing_engine().set_up(crate::rest::sharing::SharingSetup::none());
+        server.mock("GET", "/api/accounts/revision-date").with_body("1700000000000").expect_at_least(0).create();
+        let profile = sharing_profile(serde_json::json!([sharing_org_row()]));
+        server
+            .mock("GET", "/api/sync?excludeDomains=true")
+            .with_body(serde_json::json!({
+                "object": "sync", "profile": profile.clone(), "folders": [], "ciphers": [],
+                "collections": [person_collection("c-anna", "anna@example.com")]
+            }).to_string())
+            .expect(1)
+            .create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] }).to_string())
+            .expect(1)
+            .create();
+        server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
+        let key = serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string();
+        server.mock("GET", "/api/users/user-1/public-key").with_body(key.clone()).expect_at_least(0).create();
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(key).expect(1).create();
+        let confirm = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str())
+            .with_body("")
+            .expect(1)
+            .create();
+
+        let cache = VaultCache::new(backend);
+        assert_eq!(cache.populate().expect("the daemon's load"), PopulateOutcome::Populated);
+        let api = an_api_over(cache);
+        let (hub, pushes) = a_listener_the_test_can_push_to();
+        pushes.go_live(true);
+        pushes.hear_vault(Announcement::Whole);
+        // `now` far enough ahead that the burst reads as settled.
+        hub_tick(&hub, &api, Instant::now() + Duration::from_secs(60));
+        confirm.assert();
+        let page = api.feed().wait_after(Some(0), false, Duration::ZERO);
+        assert!(page.changes.contains(&Change::Sharing), "{:?}", page.changes);
+    }
 }

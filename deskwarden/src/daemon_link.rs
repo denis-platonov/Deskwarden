@@ -346,6 +346,28 @@ impl SharingClient {
         serde_json::from_value(data.get("result").cloned().unwrap_or_default())
             .map_err(|_| "The vault service answered something unreadable.".to_string())
     }
+
+    /// `POST /sharing/person/confirm` -- "Share anyway".
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's.
+    pub fn confirm(&self, email: &str) -> Result<(), String> {
+        self.post("/sharing/person/confirm", serde_json::json!({ "email": email })).map(|_| ())
+    }
+
+    /// `POST /sharing/person/fingerprint` -- the five words.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's.
+    pub fn fingerprint(&self, email: &str) -> Result<String, String> {
+        let data = self.post("/sharing/person/fingerprint", serde_json::json!({ "email": email }))?;
+        data.get("phrase")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| "The vault service answered something unreadable.".to_string())
+    }
 }
 
 /// A sharing route's answer: `data` on success, the daemon's `message` -- the

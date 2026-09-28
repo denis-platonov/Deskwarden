@@ -354,6 +354,12 @@ pub struct SharingSetup {
     pub sent_path: Option<PathBuf>,
     pub fill_stats_path: Option<PathBuf>,
     pub make_key_pair: KeyPairMaker,
+    /// Where Show fingerprint looks for the EFF long list, in order --
+    /// read, never written. Production: beside the executable
+    /// (`eff_wordlist::eff_wordlist_paths`). A test names the repository's
+    /// own `assets/` copy rather than trusting `build.rs`'s best-effort copy
+    /// beside the test binary.
+    pub eff_wordlist: Vec<PathBuf>,
 }
 
 impl SharingSetup {
@@ -365,11 +371,13 @@ impl SharingSetup {
             sent_path: crate::sent_history::default_path(),
             fill_stats_path: crate::settings::config_dir().map(|dir| dir.join("fill-stats.json")),
             make_key_pair: crate::rest::crypto::generate_org_key_pair,
+            eff_wordlist: crate::rest::eff_wordlist::eff_wordlist_paths(),
         }
     }
 
-    /// No files at all: nothing is persisted. What a test starts from, and
-    /// it fills in scratch paths where the test is about a file.
+    /// No files at all: nothing is persisted, and no word list is looked
+    /// for. What a test starts from, and it fills in scratch paths where the
+    /// test is about a file.
     #[must_use]
     pub fn none() -> Self {
         Self {
@@ -377,6 +385,7 @@ impl SharingSetup {
             sent_path: None,
             fill_stats_path: None,
             make_key_pair: crate::rest::crypto::generate_org_key_pair,
+            eff_wordlist: Vec::new(),
         }
     }
 }
@@ -774,8 +783,9 @@ impl Sharing {
     /// **One pass** (spec 11.5): the probe, then the incoming invitations on a
     /// whole read or the timer, then every move back whose delete failed
     /// ([`Self::finish_unfinished`]) -- on every trigger, since each is one
-    /// file read when nothing is pending. The confirm pass joins it in its
-    /// own task.
+    /// file read when nothing is pending -- and last the confirm pass
+    /// ([`Self::confirm_pass`]), whose failure is logged like the
+    /// invitations' and for their reason.
     ///
     /// **A failed invitations read does not end the pass.** It used to, with
     /// `?`, and so a transient error there skipped the unfinished moves too:
@@ -810,6 +820,13 @@ impl Sharing {
         }
         pass.outcome = self.finish_unfinished();
         pass.changed |= !pass.outcome.is_empty();
+        match self.confirm_pass(trigger) {
+            Ok(confirmed) => pass.changed |= confirmed,
+            // A confirm that could not be made this time is tried again on the
+            // next trigger; the pass itself did what it could, and its
+            // finished moves above must still reach the daemon.
+            Err(e) => log::info!("the confirm pass stopped early: {e}"),
+        }
         Ok(pass)
     }
 
@@ -2006,6 +2023,226 @@ impl Sharing {
     }
 }
 
+// ---- confirming -------------------------------------------------------------------
+
+impl Sharing {
+    /// **The confirm pass** (spec 11.5). For each accepted member of this
+    /// account's sharing org whose email has a person collection (rule 2:
+    /// only a holder of the org key could have named it), fetch the key,
+    /// compare it with the pin, and confirm -- wrapping the org key to it --
+    /// unless the key changed. The roster is the one the last whole read
+    /// fetched, so the whole-read and batch triggers cost no roster request;
+    /// the timer reads it fresh, which is its one request of its own.
+    ///
+    /// # Which org, and which people
+    ///
+    /// `my_org` is only ever this account's OWN sharing org (`note_directory`
+    /// and `reload_org` fill it with nothing else), so a member of someone
+    /// else's org -- where this account is the recipient -- is never
+    /// confirmed from here. Within it, only status 1 with an account id:
+    /// an invitation has no key to wrap to, and a confirmed member has the
+    /// org key already.
+    ///
+    /// # One person's failure is not the pass's
+    ///
+    /// A key read or confirm that fails for one person is logged and the
+    /// next person is tried; the next trigger retries the first. Returning
+    /// the error with `?` was the alternative, and it dropped the `changed`
+    /// of every confirm that had already landed, so no `Sharing` change told
+    /// a window about them (`one_refused_confirm_does_not_stop_the_next_person`).
+    /// A session that ended stops the loop at once: every later call would
+    /// fail the same way.
+    ///
+    /// # The org key
+    ///
+    /// Read from the backend's key cache when it already holds it -- the
+    /// whole read that filled `my_org` filled that cache too -- and from a
+    /// fresh profile only when it does not. The cache is what every read
+    /// decrypts this org's records with, so it is the same key; asking the
+    /// profile every pass would add a third request to spec 11.5's two.
+    fn confirm_pass(&self, trigger: Trigger) -> Result<bool, SharingError> {
+        let (Some(org), Some(account)) = ({
+            let held = self.held();
+            (held.my_org.as_ref().map(|o| o.id.clone()), held.account.clone())
+        }) else {
+            return Ok(false);
+        };
+        if trigger == Trigger::Timer {
+            let roster = self.fetch_roster(&org)?;
+            if let Some(mine) = self.held().my_org.as_mut().filter(|mine| mine.id == org) {
+                mine.roster = roster;
+            }
+        }
+        let candidates: Vec<Member> = {
+            let held = self.held();
+            let Some(mine) = held.my_org.as_ref().filter(|mine| mine.id == org) else {
+                return Ok(false);
+            };
+            mine.roster
+                .iter()
+                .filter(|m| m.status == MemberStatus::Accepted && m.user_id.as_deref().is_some_and(|id| !id.is_empty()))
+                .filter(|m| mine.collection_for(&m.email).is_some())
+                .cloned()
+                .collect()
+        };
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let cached = self.keys.lock().unwrap_or_else(PoisonError::into_inner).as_ref().and_then(|keys| keys.organization(&org).cloned());
+        let org_key = match cached {
+            Some(key) => key,
+            None => {
+                let profile = self.profile()?;
+                match self.keys_from(&profile)?.organization(&org).cloned() {
+                    Some(key) => key,
+                    None => return Ok(false),
+                }
+            }
+        };
+        let mut changed = false;
+        for member in candidates {
+            let email = normalise_email(&member.email);
+            match self.confirm_one(&org, &org_key, &account.id, &member, &email) {
+                Ok(moved) => changed |= moved,
+                Err(ended @ (SharingError::Vault(VaultError::Unauthorized) | SharingError::Unavailable(_))) => {
+                    log::info!("the confirm pass stopped: {ended}");
+                    break;
+                }
+                Err(e) => log::info!("a person could not be confirmed this pass: {e}"),
+            }
+        }
+        Ok(changed)
+    }
+
+    /// One candidate of [`Self::confirm_pass`]: their key, the pin check, the
+    /// confirm. `Ok(true)` when the view reads differently afterwards.
+    fn confirm_one(
+        &self,
+        org: &str,
+        org_key: &SymmetricKey,
+        account: &str,
+        member: &Member,
+        email: &str,
+    ) -> Result<bool, SharingError> {
+        let user_id = member.user_id.clone().unwrap_or_default();
+        let Some(spki) = self.call(|client, auth| sharing_api::user_public_key(client, &mut auth.session, &user_id))? else {
+            return Ok(self.held().no_key.insert(email.to_string()));
+        };
+        let had_no_key = self.held().no_key.remove(email);
+        if !self.pin_allows(account, email, &spki) {
+            return Ok(self.held().key_changed.insert(email.to_string()) || had_no_key);
+        }
+        self.confirm_to(org, org_key, account, member, email, sharing_api::AccountKey { user_id, public_key: spki })?;
+        Ok(true)
+    }
+
+    /// Confirms one member to one key, pins it, and marks them confirmed in
+    /// the held roster -- no roster re-read (spec 11.5's cost: two requests per
+    /// person, the key and the confirm).
+    ///
+    /// **It does not check the pin**: its callers have, or -- "Share anyway"
+    /// -- have been told by the user to trust this key over it. The pin is
+    /// written only after the confirm landed, so a confirm that fails leaves
+    /// the old pin standing and the person `keyChanged`.
+    fn confirm_to(
+        &self,
+        org: &str,
+        org_key: &SymmetricKey,
+        account: &str,
+        member: &Member,
+        email: &str,
+        key: sharing_api::AccountKey,
+    ) -> Result<(), SharingError> {
+        let wrapped = crate::rest::crypto::wrap_key_to_public(org_key, &key.public_key).map_err(crypto)?;
+        let ou = member.id.clone();
+        self.call(|client, auth| sharing_api::confirm_member(client, &mut auth.session, org, &ou, &wrapped))?;
+        self.pin(account, email, &key);
+        let mut held = self.held();
+        held.key_changed.remove(email);
+        held.no_key.remove(email);
+        if let Some(mine) = held.my_org.as_mut().filter(|mine| mine.id == org) {
+            if let Some(row) = mine.roster.iter_mut().find(|m| m.id == member.id) {
+                row.status = MemberStatus::Confirmed;
+            }
+        }
+        Ok(())
+    }
+
+    /// **"Share anyway"** (spec 6.1, `keyChanged`): the user has looked at the
+    /// fingerprint and trusts the new key. Confirmed to it, and it becomes the
+    /// pin.
+    ///
+    /// Held to the pass's rule 2 as well: only an accepted member whose email
+    /// has a person collection -- someone this account shares with -- is
+    /// confirmed here. The window offers the action only on such a card, but
+    /// the route takes any address, and a confirm hands over the org key.
+    ///
+    /// The old pin is NOT dropped first. [`Self::confirm_to`] overwrites it
+    /// once the confirm has landed; dropped first, a confirm that then
+    /// failed would leave no pin at all, and the next pass would trust
+    /// whatever key the server answered with then, on first use, unasked.
+    ///
+    /// # Errors
+    ///
+    /// The sentence to show, or the backend's failure.
+    pub fn confirm_anyway(&self, email: &str) -> Result<(), SharingError> {
+        let _one = self.one_at_a_time();
+        let ctx = self.context()?;
+        let email = normalise_email(email);
+        let not_waiting = || SharingError::Refused(format!("{email} is not waiting to be confirmed."));
+        if ctx.collection_for(&email).is_none() {
+            return Err(not_waiting());
+        }
+        let member = self
+            .fetch_roster(&ctx.org_id)?
+            .into_iter()
+            .find(|m| {
+                normalise_email(&m.email) == email
+                    && m.status == MemberStatus::Accepted
+                    && m.user_id.as_deref().is_some_and(|id| !id.is_empty())
+            })
+            .ok_or_else(not_waiting)?;
+        let user_id = member.user_id.clone().unwrap_or_default();
+        let spki = self
+            .call(|client, auth| sharing_api::user_public_key(client, &mut auth.session, &user_id))?
+            .ok_or_else(|| SharingError::Refused(format!("{email} has not signed in to a Bitwarden app yet.")))?;
+        self.confirm_to(&ctx.org_id, &ctx.org_key, &ctx.account.id, &member, &email, sharing_api::AccountKey { user_id, public_key: spki })?;
+        if let Err(e) = self.reload_org(&ctx) {
+            log::info!("the sharing view could not be re-read after a confirm: {e}");
+        }
+        Ok(())
+    }
+
+    /// **The fingerprint phrase** for a person (spec 9.6): their user id and
+    /// the key the server holds for them, through Bitwarden's construction.
+    /// The EFF list is read now and dropped when this returns, from where
+    /// [`SharingSetup::eff_wordlist`] says -- beside the executable in
+    /// production, the repository's own copy in a test.
+    ///
+    /// Any member of this account's org with an account: a confirmed one
+    /// too, since the phrase is how the user checks a key they already trust.
+    ///
+    /// # Errors
+    ///
+    /// No key yet, the word list missing, or the backend's failure.
+    pub fn fingerprint(&self, email: &str) -> Result<String, SharingError> {
+        let ctx = self.context()?;
+        let email = normalise_email(email);
+        let member = self
+            .fetch_roster(&ctx.org_id)?
+            .into_iter()
+            .find(|m| normalise_email(&m.email) == email && m.user_id.as_deref().is_some_and(|id| !id.is_empty()))
+            .ok_or_else(|| SharingError::Refused(format!("{email} has not accepted yet, so there is no key to check.")))?;
+        let user_id = member.user_id.unwrap_or_default();
+        let spki = self
+            .call(|client, auth| sharing_api::user_public_key(client, &mut auth.session, &user_id))?
+            .ok_or_else(|| SharingError::Refused(format!("{email} has not signed in to a Bitwarden app yet.")))?;
+        let words = crate::rest::eff_wordlist::load_from(&self.setup().eff_wordlist)
+            .map_err(|e| SharingError::Refused(e.to_string()))?;
+        crate::rest::crypto::fingerprint_phrase(&user_id, &spki, &words).map_err(crypto)
+    }
+}
+
 /// Spec 6.1's table, as a function of the roster row, the collection and
 /// what the confirm pass learned.
 fn person_state(member: Option<&Member>, collection_id: &str, held: &Held, now: i64) -> PersonState {
@@ -2250,6 +2487,7 @@ mod tests {
             sent_path: Some(dir.join("sent_history.json")),
             fill_stats_path: Some(dir.join("fill-stats.json")),
             make_key_pair: fixture_key_pair,
+            eff_wordlist: vec![PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/eff_large_wordlist.txt"))],
         });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(organizations).to_string()).expect_at_least(0).create();
         server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
@@ -3832,5 +4070,200 @@ mod tests {
         let outcome = engine.forget("anna@example.com", &[]).expect("nothing to forget off NodeWarden");
         deletes.assert();
         assert!(outcome.stopped.is_empty() && outcome.failed.is_none());
+    }
+
+    // ---- confirming, Share anyway, Show fingerprint (Task 12) -------------------
+
+    fn anna_key() -> String {
+        serde_json::json!({ "userId": "anna-id", "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string()
+    }
+
+    /// **An accepted person is confirmed by the timer, with no sync** (spec
+    /// 11.5 trigger 4): the timer reads the roster itself -- its one request
+    /// of its own -- then two requests per person: the key, the confirm.
+    #[test]
+    fn an_accepted_person_is_confirmed_by_the_timer_without_a_sync() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        engine.held().my_org = Some(MyOrg { id: FIXTURE_ORG.into(), collections: vec![("c-anna".into(), "anna@example.com".into())], roster: Vec::new() });
+        let roster_read = server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]))
+            .expect(1)
+            .create();
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).expect(1).create();
+        let confirm = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str())
+            .match_request(|request| request.utf8_lossy_body().contains("\"key\":\"4."))
+            .with_body("")
+            .expect(1)
+            .create();
+        assert!(!engine.wants_timer(), "control: nobody is known to be waiting before the roster is read");
+        let pass = engine.refresh(Trigger::Timer).expect("a pass");
+        roster_read.assert();
+        confirm.assert();
+        sync.assert();
+        assert!(pass.changed);
+        let pin = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert!(pin.pin_for("anna@example.com").is_some(), "the first confirm pins the key");
+        assert_eq!(engine.view(&[]).person("anna@example.com").map(|p| p.state), Some(PersonState::Shared));
+        assert!(!engine.wants_timer(), "a confirmed person gives the timer nothing to do");
+    }
+
+    /// **The confirm pass reuses the roster the whole read fetched** (spec
+    /// 11.5): after `note_directory`, no roster request of its own.
+    #[test]
+    fn the_confirm_pass_reuses_the_roster_the_sync_fetched() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
+        });
+        let roster_read = server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).expect(0).create();
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).expect(1).create();
+        let confirm = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str()).with_body("").expect(1).create();
+        engine.refresh(Trigger::WholeRead).expect("a pass");
+        roster_read.assert();
+        confirm.assert();
+    }
+
+    /// **A changed public key is not confirmed** (spec 11.5 rule 4, 12.1):
+    /// the pin differs, so no key is wrapped to it and the card says so.
+    #[test]
+    fn a_changed_public_key_is_not_confirmed() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            state.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", crate::sharing_state::Pin { sha256: "00".repeat(32), user_id: "anna-id".into(), at: 1 });
+        }).expect("seeded");
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
+        });
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
+        let confirm = server.mock("POST", Matcher::Any).expect(0).create();
+        engine.refresh(Trigger::WholeRead).expect("a pass");
+        confirm.assert();
+        assert_eq!(engine.view(&[]).person("anna@example.com").map(|p| p.state), Some(PersonState::KeyChanged));
+    }
+
+    /// **A member whose email has no collection is never confirmed** (spec
+    /// 11.5 rule 2): a server-injected accept. Only a holder of the org key
+    /// can write a collection name that decrypts, so the server alone cannot
+    /// put a stranger in the confirm queue.
+    #[test]
+    fn a_member_whose_email_has_no_collection_is_never_confirmed() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("mal-id", Some("mal-id"), "mallory@example.com", 1, &["c-anna"])] })).expect("a roster"),
+        });
+        let key = server.mock("GET", "/api/users/mal-id/public-key").expect(0).create();
+        let confirm = server.mock("POST", Matcher::Any).expect(0).create();
+        engine.refresh(Trigger::WholeRead).expect("a pass");
+        key.assert();
+        confirm.assert();
+    }
+
+    /// An accepted account with no key yet waits for its first sign-in.
+    #[test]
+    fn an_account_without_a_key_waits_for_a_first_sign_in() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![("c-anna".into(), "anna@example.com".into())],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])] })).expect("a roster"),
+        });
+        server.mock("GET", "/api/users/anna-id/public-key").with_status(404).create();
+        engine.refresh(Trigger::WholeRead).expect("a pass");
+        assert_eq!(engine.view(&[]).person("anna@example.com").map(|p| p.state), Some(PersonState::WaitingSignIn));
+    }
+
+    /// **"Share anyway"** after a key change: confirmed to the new key, and
+    /// the pin follows it.
+    #[test]
+    fn share_anyway_confirms_the_new_key_and_repins_it() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            state.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", crate::sharing_state::Pin { sha256: "00".repeat(32), user_id: "anna-id".into(), at: 1 });
+        }).expect("seeded");
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
+        let confirm = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str()).with_body("").expect(1).create();
+        engine.confirm_anyway("anna@example.com").expect("confirmed");
+        confirm.assert();
+        let pin = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert_eq!(
+            pin.pin_for("anna@example.com").map(|p| p.sha256.clone()),
+            Some(crate::rest::crypto::public_key_sha256_hex(&crate::rest::crypto::tests::fixture_public_spki()))
+        );
+    }
+
+    /// **Show fingerprint** (spec 9.6): the phrase the person's own app shows,
+    /// from their user id and the key the server holds for them -- pinned to
+    /// Bitwarden's SDK vector by serving that user and key.
+    #[test]
+    fn a_persons_fingerprint_is_the_phrase_their_own_app_shows() {
+        use crate::rest::crypto::tests::{SDK_FINGERPRINT_KEY, SDK_FINGERPRINT_PHRASE, SDK_FINGERPRINT_USER};
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row("anna-ou", Some(SDK_FINGERPRINT_USER), "anna@example.com", 2, &["c-anna"])]);
+        server
+            .mock("GET", format!("/api/users/{SDK_FINGERPRINT_USER}/public-key").as_str())
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(SDK_FINGERPRINT_KEY) }).to_string())
+            .create();
+        assert_eq!(engine.fingerprint("anna@example.com").expect("a phrase"), SDK_FINGERPRINT_PHRASE);
+    }
+
+    /// **One person's refused confirm does not hold up the next**: the pass
+    /// logs it and goes on, and the one that landed is still announced --
+    /// with `?` in the loop it was dropped, and no `Sharing` change told the
+    /// window that bob is in.
+    #[test]
+    fn one_refused_confirm_does_not_stop_the_next_person() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg {
+            id: FIXTURE_ORG.into(),
+            collections: vec![("c-anna".into(), "anna@example.com".into()), ("c-bob".into(), "bob@example.com".into())],
+            roster: crate::rest::organizations::map_members(&serde_json::json!({ "data": [
+                roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"]),
+                roster_row("bob-id", Some("bob-id"), "bob@example.com", 1, &["c-bob"]),
+            ] }))
+            .expect("a roster"),
+        });
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
+        server.mock("GET", "/api/users/bob-id/public-key").with_body(anna_key()).create();
+        server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str())
+            .with_status(400)
+            .with_body(r#"{"message":"Something else went wrong"}"#)
+            .expect(1)
+            .create();
+        let bob = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/bob-id/confirm").as_str()).with_body("").expect(1).create();
+        let pass = engine.refresh(Trigger::WholeRead).expect("a pass");
+        bob.assert();
+        assert!(pass.changed, "bob's confirm landed and was not announced");
+        let view = engine.view(&[]);
+        assert_eq!(view.person("anna@example.com").map(|p| p.state), Some(PersonState::WaitingAccept));
+        assert_eq!(view.person("bob@example.com").map(|p| p.state), Some(PersonState::Shared));
+    }
+
+    /// **"Share anyway" confirms only someone this account shares with**: an
+    /// accepted member with no person collection is refused, as the pass
+    /// skips them (spec 11.5 rule 2), and nothing is wrapped to their key.
+    #[test]
+    fn share_anyway_refuses_a_member_with_no_collection() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row("mal-id", Some("mal-id"), "mallory@example.com", 1, &["c-anna"])]);
+        let key = server.mock("GET", "/api/users/mal-id/public-key").expect(0).create();
+        let confirm = server.mock("POST", Matcher::Any).expect(0).create();
+        assert!(matches!(engine.confirm_anyway("mallory@example.com"), Err(SharingError::Refused(_))));
+        key.assert();
+        confirm.assert();
     }
 }

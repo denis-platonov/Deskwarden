@@ -329,6 +329,8 @@ impl VaultApi {
             ("POST", ["sharing", "item", id, "stop"]) => self.stop_sharing(id, request.body),
             ("POST", ["sharing", "person", "forget"]) => self.forget_person(request.body),
             ("POST", ["sharing", "person", "reinvite"]) => self.reinvite_person(request.body),
+            ("POST", ["sharing", "person", "confirm"]) => self.confirm_person(request.body),
+            ("POST", ["sharing", "person", "fingerprint"]) => self.person_fingerprint(request.body),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
@@ -580,6 +582,42 @@ impl VaultApi {
                 self.feed.publish([Change::Sharing]);
                 ApiResponse::ok(serde_json::json!({ "result": result }))
             }
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/person/confirm {email}` -- "Share anyway" (spec 11.3).
+    /// Nothing in the vault moves, so only `sharing` is announced.
+    fn confirm_person(&self, body: &[u8]) -> ApiResponse {
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let Some(email) = email_in(body) else {
+            return ApiResponse::refused(400, "Say who to confirm.");
+        };
+        match engine.confirm_anyway(&email) {
+            Ok(()) => {
+                self.feed.publish([Change::Sharing]);
+                ApiResponse::done()
+            }
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/person/fingerprint {email}` -> `{phrase}` (spec 11.3).
+    /// A read: nothing is announced. A POST rather than a GET so the address
+    /// rides in the body, never in a query string.
+    fn person_fingerprint(&self, body: &[u8]) -> ApiResponse {
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let Some(email) = email_in(body) else {
+            return ApiResponse::refused(400, "Say whose fingerprint to show.");
+        };
+        match engine.fingerprint(&email) {
+            Ok(phrase) => ApiResponse::ok(serde_json::json!({ "phrase": phrase })),
             Err(e) => sharing_failed(&e),
         }
     }
