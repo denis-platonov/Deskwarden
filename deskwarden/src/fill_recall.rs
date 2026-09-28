@@ -448,6 +448,14 @@ impl FillRecall {
     pub fn is_empty(&self) -> bool {
         self.last.is_none()
     }
+
+    /// The remembered record took a new id (a shared record moved back to the
+    /// personal vault). Only the matching id moves.
+    pub fn rekey(&mut self, old: &str, new: &str) {
+        if let Some(last) = self.last.as_mut().filter(|last| last.item_id == old) {
+            last.item_id = new.to_string();
+        }
+    }
 }
 
 /// **The running app's one memory.**
@@ -456,7 +464,7 @@ impl FillRecall {
 ///
 /// Every decision in this module and in [`crate::app`] is a pure function over
 /// a [`FillRecall`] that a test hands in, and that is not weakened here: this
-/// is the *instance*, not a second implementation. The three wrappers below
+/// is the *instance*, not a second implementation. The four wrappers below
 /// are the whole of what touches it and none of them decides anything.
 ///
 /// It is a static because of where the memory must be written. The first fill
@@ -512,6 +520,17 @@ pub fn forget_production(why: Forgotten) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .forget(why);
+}
+
+/// [`FillRecall::rekey`] against the running app's memory.
+///
+/// **A third call shape**, beside record and drop, and argued rather than
+/// slipped in: the daemon's sharing engine is the one writer that changes a
+/// record's id under a live memory, and without this the next hotkey press
+/// would offer an id that no longer resolves -- harmless (the picker opens),
+/// and still one wrong card.
+pub fn rekey_production(old: &str, new: &str) {
+    PRODUCTION.lock().unwrap_or_else(std::sync::PoisonError::into_inner).rekey(old, new);
 }
 
 #[cfg(test)]
@@ -846,5 +865,17 @@ mod tests {
                  which window would be a tracking log of the user's day"
             );
         }
+    }
+
+    #[test]
+    fn a_remembered_record_follows_it_to_its_new_id() {
+        let mut recall = FillRecall::new();
+        let window = key(0x1234, 900, "app.exe");
+        let now = Instant::now();
+        recall.remember(window.clone(), "old", now);
+        recall.rekey("old", "new");
+        assert!(matches!(recall.recall(&window, now), Recall::Offer("new")));
+        recall.rekey("elsewhere", "x");
+        assert!(matches!(recall.recall(&window, now), Recall::Offer("new")), "only the matching id moves");
     }
 }

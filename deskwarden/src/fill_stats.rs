@@ -84,6 +84,17 @@ impl FillStats {
         self.load().get(item_id).copied().unwrap_or(0)
     }
 
+    /// Moves `old`'s count to `new` -- a shared record moved back to the
+    /// personal vault takes a new id, and "Filled 41 times" should come with
+    /// it. Best-effort, like every write here.
+    pub fn rekey(&self, old: &str, new: &str) {
+        let mut counts = self.load();
+        if let Some(count) = counts.remove(old) {
+            *counts.entry(new.to_string()).or_insert(0) += count;
+            let _ = self.save(&counts);
+        }
+    }
+
     fn load(&self) -> HashMap<String, u32> {
         std::fs::read_to_string(&self.path)
             .ok()
@@ -174,5 +185,17 @@ mod tests {
         assert_eq!(reopened.count("item-1"), 2);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn a_count_follows_a_record_to_its_new_id() {
+        let path = unique_path("rekey");
+        let stats = FillStats::new(path.clone());
+        stats.record_fill("old");
+        stats.record_fill("old");
+        stats.rekey("old", "new");
+        assert_eq!(stats.count("new"), 2);
+        assert_eq!(stats.count("old"), 0);
+        let _ = std::fs::remove_file(path);
     }
 }

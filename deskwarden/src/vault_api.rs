@@ -326,6 +326,7 @@ impl VaultApi {
             }
             ("GET", ["sharing"]) => self.sharing_view(),
             ("POST", ["sharing", "item", id]) => self.share_item(id, request.body),
+            ("POST", ["sharing", "item", id, "stop"]) => self.stop_sharing(id, request.body),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
             | (_, ["object", "item" | "folder", ..])
@@ -503,6 +504,27 @@ impl VaultApi {
             Ok(outcome) => {
                 self.publish_outcome(&outcome.changed, era);
                 ApiResponse::ok(serde_json::json!({ "result": outcome.result }))
+            }
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/item/{id}/stop {email}` (spec 11.3). A move back is
+    /// `itemGone(old)` then `item(new)` in one feed batch. The era is read
+    /// before the engine's first round trip, as [`Self::share_item`] reads it.
+    fn stop_sharing(&self, id: &str, body: &[u8]) -> ApiResponse {
+        let era = self.cache.epoch().era();
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let Some(email) = email_in(body) else {
+            return ApiResponse::refused(400, "Say who to stop sharing with.");
+        };
+        match engine.stop(id, &email) {
+            Ok(outcome) => {
+                self.publish_outcome(&outcome.changed, era);
+                ApiResponse::ok(serde_json::json!({ "movedTo": outcome.moved_to }))
             }
             Err(e) => sharing_failed(&e),
         }

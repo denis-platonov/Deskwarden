@@ -309,6 +309,21 @@ impl SharingClient {
         serde_json::from_value(data.get("result").cloned().unwrap_or_default())
             .map_err(|_| "The vault service answered something unreadable.".to_string())
     }
+
+    /// `POST /sharing/item/{id}/stop`. `Some(new id)` when the record came
+    /// back to the personal vault.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's. An unsafe id is refused before
+    /// any request, as [`Self::share`] refuses one.
+    pub fn stop(&self, item_id: &str, email: &str) -> Result<Option<String>, String> {
+        if !crate::rest::api::is_url_path_safe(item_id) {
+            return Err(crate::rest::sharing::STOP_FAILED_PREFIX.to_string());
+        }
+        let data = self.post(&format!("/sharing/item/{item_id}/stop"), serde_json::json!({ "email": email }))?;
+        Ok(data.get("movedTo").and_then(serde_json::Value::as_str).map(str::to_string))
+    }
 }
 
 /// A sharing route's answer: `data` on success, the daemon's `message` -- the
@@ -500,6 +515,29 @@ mod tests {
             .create();
         assert_eq!(client.share("p-1", "anna@example.com"), Ok(crate::rest::sharing::ShareResult::WaitingAccount));
         shared.assert();
+    }
+
+    /// **`stop` refuses an unsafe id before any request too**, and reads the
+    /// new id back when the record came home -- `None` when it did not.
+    #[test]
+    fn a_stop_refuses_an_id_that_is_not_path_safe_and_reads_back_where_the_record_went() {
+        let mut server = crate::test_http::server();
+        let any = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
+        let client = SharingClient::new(&server.url(), &Zeroizing::new(GRANT.to_string()));
+        for unsafe_id in ["../x", "a/b", "", "a?b=c", "a%2Fb"] {
+            assert!(client.stop(unsafe_id, "anna@example.com").is_err(), "{unsafe_id:?}");
+        }
+        any.assert();
+        let home = server
+            .mock("POST", "/sharing/item/s-1/stop")
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({ "email": "anna@example.com" })))
+            .with_body(r#"{"success":true,"data":{"movedTo":"p-new"}}"#)
+            .expect(1)
+            .create();
+        assert_eq!(client.stop("s-1", "anna@example.com"), Ok(Some("p-new".to_string())));
+        home.assert();
+        server.mock("POST", "/sharing/item/s-2/stop").with_body(r#"{"success":true,"data":{"movedTo":null}}"#).create();
+        assert_eq!(client.stop("s-2", "bob@example.com"), Ok(None));
     }
 
     /// **What the daemon writes is what a window reads**, and nothing else is.

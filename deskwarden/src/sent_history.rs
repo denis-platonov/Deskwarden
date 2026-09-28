@@ -203,6 +203,16 @@ impl SentHistory {
         self.entries.retain(|entry| entry.send_id != send_id);
     }
 
+    /// Every entry for `old` now names `new`: a shared record moved back to
+    /// the personal vault takes a new id (spec 9.4, Q9).
+    pub fn rekey_item(&mut self, old: &str, new: &str) {
+        for entry in &mut self.entries {
+            if entry.item_id == old {
+                entry.item_id = new.to_string();
+            }
+        }
+    }
+
     /// Writes the whole file, trimming first, creating the directory if this
     /// is the first thing this app ever wrote there.
     pub fn persist(&self, path: &Path) -> std::io::Result<()> {
@@ -353,5 +363,14 @@ mod tests {
         assert_eq!(people[0].send_ids, ["a"], "a share has no Send id");
         let old: SentHistory = serde_json::from_str(r#"{"entries":[{"send_id":"x","recipient":"b@c.d"}]}"#).expect("an old file");
         assert_eq!(old.entries[0].kind, SentKind::Send);
+    }
+
+    #[test]
+    fn a_record_moved_back_keeps_its_entries_under_its_new_id() {
+        let mut history = SentHistory::default();
+        history.record(sent(1, "a", "x@y.z"));
+        history.entries[0].item_id = "old".into();
+        history.rekey_item("old", "new");
+        assert_eq!(history.entries[0].item_id, "new");
     }
 }
