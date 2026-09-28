@@ -1184,6 +1184,10 @@ pub fn build_frame_with_search(
     // (spec 11.7) -- the question's second list. Stopped by the daemon's
     // forget on yes; cleared with the question either way.
     let mut forget_records: Vec<String> = Vec::new();
+    // The forget question was asked from the Share dialog's suggestions
+    // rather than the Send composer's -- so a refusal, and the daemon's
+    // answer, are said in that dialog (`SharingPane::begin_forget`).
+    let mut forget_from_dialog = false;
     let mut forgetting: Option<(String, Vec<(String, String)>)> = None;
     // **Personal sharing** (design 6). The client is the window's line to
     // the daemon's /sharing routes, or `None` in a window with no line --
@@ -6771,6 +6775,11 @@ pub fn build_frame_with_search(
             match share_ui::answer_dialog(&mut sharing, dialog, answer, sharing_client.as_ref(), ui.ctx(), &sharing_tx) {
                 // A suggestion's ✕: the Send composer's forget, with the
                 // same question when the person still holds something.
+                // Nothing shared and nothing live: forgotten there at once,
+                // and the daemon is NOT asked -- the view shows nothing of
+                // theirs for it to stop, and a no-op must not take the write
+                // slot. Otherwise the question goes up, remembered as this
+                // dialog's so the daemon's answer is said here.
                 share_ui::ShareDialogAction::Forget(email) => {
                     let forgotten = forget_request_for(
                         &email,
@@ -6783,17 +6792,7 @@ pub fn build_frame_with_search(
                         sharing.view.as_ref(),
                         &items,
                     );
-                    // Nothing shared and nothing live: forgotten here at
-                    // once, and the daemon is told too, so anything it still
-                    // holds for them (a pending invitation) goes -- its forget
-                    // is a no-op success when there is nothing. Only where
-                    // sharing is on: elsewhere there is no daemon side.
-                    if forgotten && sharing.view.as_ref().is_some_and(|v| v.available) {
-                        let call = share_ui::SharingCall::Forget(email);
-                        if !share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call) {
-                            share_ui::say_refusal_in_dialog(&mut sharing);
-                        }
-                    }
+                    forget_from_dialog = !forgotten;
                 }
                 // The made invite code, copied the way every credential this
                 // window copies is: onto the clipboard's secret path, out of
@@ -6869,6 +6868,7 @@ pub fn build_frame_with_search(
             // with the person (spec 11.7), so forgetting someone from here
             // cannot quietly leave records in their vault.
             if let Some(email) = state.draft.forget.take() {
+                forget_from_dialog = false;
                 let _ = forget_request_for(
                     &email,
                     &mut forget_ask,
@@ -7004,17 +7004,26 @@ pub fn build_frame_with_search(
             names.extend(forget_records.iter().cloned());
             match record_ui::draw_forget_confirm(ui.ctx(), email, &names) {
                 Some(record_ui::ForgetAnswer::DeleteShares) => {
-                    let stopped = forget_records.is_empty() || {
+                    // Only records the view shows as shared send the daemon's
+                    // forget; its answer is waited on below
+                    // (`SharingPane::begin_forget`).
+                    let started = forget_records.is_empty() || {
                         let call = share_ui::SharingCall::Forget(email.clone());
-                        share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call)
+                        let sent = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                        if sent {
+                            sharing.begin_forget(email, forget_from_dialog);
+                        }
+                        sent
                     };
                     forget_records.clear();
-                    if stopped {
+                    if started {
                         forgetting = forget_ask.take();
                         send_delete.report = None;
                     } else {
                         forget_ask = None;
-                        share_ui::say_refusal_in_dialog(&mut sharing);
+                        if forget_from_dialog {
+                            share_ui::say_refusal_in_dialog(&mut sharing);
+                        }
                     }
                 }
                 Some(record_ui::ForgetAnswer::Keep) => {
@@ -7029,12 +7038,28 @@ pub fn build_frame_with_search(
         // `delete_for_forgetting`). What is decided here is how it ends: a
         // failure stops it with the person kept, and an empty queue with
         // nothing out is every share gone, so the person is forgotten.
+        //
+        // **The daemon's half is waited on too** (`forget_step`): with
+        // records shared, the person is forgotten here only once its forget
+        // has come back `Ok`, and kept -- its sentence shown where it was
+        // asked -- when it has not.
         if let Some((email, queue)) = &mut forgetting {
-            if send_delete.in_flight.is_none() {
-                if matches!(send_delete.report, Some(SendDeleteReport::Failed { .. })) {
-                    log::warn!("a share could not be deleted, so its person is kept in the sent history");
+            let step = forget_step(
+                send_delete.in_flight.is_some(),
+                matches!(send_delete.report, Some(SendDeleteReport::Failed { .. })),
+                queue.is_empty(),
+                sharing.daemon_forget(email),
+            );
+            match step {
+                ForgetStep::Wait => {}
+                ForgetStep::Keep => {
+                    // No name and no sentence in the line: the sentence can
+                    // name a decrypted record, and it is on screen already.
+                    log::warn!("a share could not be stopped or deleted, so its person is kept in the sent history");
                     forgetting = None;
-                } else if queue.is_empty() {
+                    sharing.end_forget();
+                }
+                ForgetStep::Forget => {
                     let email = email.clone();
                     sent_history.forget(&email);
                     if let Some(path) = sent_history_path.as_deref() {
@@ -7046,6 +7071,7 @@ pub fn build_frame_with_search(
                         }
                     }
                     forgetting = None;
+                    sharing.end_forget();
                 }
             }
         }
@@ -8874,6 +8900,49 @@ fn forget_request_for(
         *forget_records = records;
         false
     }
+}
+
+/// What the forget being carried out does this frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForgetStep {
+    /// Something is still out: a Send deletion, or the daemon's forget.
+    Wait,
+    /// Something failed: the person is kept, and nothing more is deleted.
+    Keep,
+    /// Everything came back: forget the person locally.
+    Forget,
+}
+
+/// **When a forget that answered Yes is finished** -- a pure function of
+/// the Send deletions and the daemon's forget, so the rule is tested rather
+/// than argued in the frame (`forget_step_tests`).
+///
+/// **The person is forgotten locally only once everything came back**: every
+/// Send deletion (the existing rule), and -- where records were shared -- the
+/// daemon's forget, answered `Ok`. A deletion that failed, or a daemon forget
+/// that did not finish, keeps the person: dropping them from the sent history
+/// while records are still in their vault would take away the one list that
+/// says whom this user still shares with. `NotAsked` is a forget with no
+/// shared records, which has nothing on the daemon to wait for.
+fn forget_step(
+    send_in_flight: bool,
+    send_failed: bool,
+    queue_empty: bool,
+    daemon: share_ui::DaemonForget,
+) -> ForgetStep {
+    if daemon == share_ui::DaemonForget::Failed {
+        return ForgetStep::Keep;
+    }
+    if send_in_flight {
+        return ForgetStep::Wait;
+    }
+    if send_failed {
+        return ForgetStep::Keep;
+    }
+    if !queue_empty || daemon == share_ui::DaemonForget::Waiting {
+        return ForgetStep::Wait;
+    }
+    ForgetStep::Forget
 }
 
 /// [`permit_detail_action`] for the item list's right-click menu, in the same
@@ -28477,7 +28546,13 @@ mod preferences_modal_wiring_tests {
             // of the ITEM rather than the draft. Guarded rather than driven
             // because that arm lives inside `run`'s per-frame closure, which
             // nothing in this crate can call.
-            modules, 68,
+            // 69 as of the Share dialog's forget following the daemon, which
+            // added `mod forget_step_tests` -- that a person with shared
+            // records is forgotten locally only after the daemon's forget
+            // answers Ok, and kept when it fails, and the source guard that
+            // the daemon's forget is sent from one gated place. Recounted
+            // independently (top-level `mod` lines under `#[cfg(test)]`).
+            modules, 69,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -40909,5 +40984,90 @@ mod edit_history_copy_wiring {
             source().contains(concat!("fn permit_detail_", "action(")),
             "include_str! is not reading this module's own source"
         );
+    }
+}
+
+/// **Forgetting a person is finished only when everything came back** --
+/// `forget_step`, the rule the frame's forget block applies, and the one
+/// daemon forget the window sends, guarded at source level.
+#[cfg(test)]
+mod forget_step_tests {
+    use super::{forget_request_for, forget_step, share_ui, ForgetStep};
+    use share_ui::DaemonForget::{Failed, NotAsked, Stopped, Waiting};
+
+    /// **Both outcomes of the daemon's forget**: with records shared, the
+    /// person is forgotten locally only after `Forgot(Ok)`, and kept on
+    /// `Forgot(Err)` -- the Sends' own rule, "forget only once every deletion
+    /// has come back", applied to the daemon's half.
+    #[test]
+    fn the_person_is_forgotten_only_after_the_daemon_says_its_shares_stopped() {
+        // Sends all deleted, the daemon still out: wait.
+        assert_eq!(forget_step(false, false, true, Waiting), ForgetStep::Wait);
+        // ... then it answers Ok: forget.
+        assert_eq!(forget_step(false, false, true, Stopped), ForgetStep::Forget);
+        // ... or Err: keep, even with every Send gone, and even mid-deletion.
+        assert_eq!(forget_step(false, false, true, Failed), ForgetStep::Keep);
+        assert_eq!(forget_step(true, false, false, Failed), ForgetStep::Keep);
+        // The daemon done, Sends still going: wait for them.
+        assert_eq!(forget_step(true, false, false, Stopped), ForgetStep::Wait);
+        assert_eq!(forget_step(false, false, false, Stopped), ForgetStep::Wait);
+        // No records shared: nothing on the daemon to wait for -- the rule
+        // is the Sends' alone, as it was.
+        assert_eq!(forget_step(false, false, true, NotAsked), ForgetStep::Forget);
+        assert_eq!(forget_step(false, true, true, NotAsked), ForgetStep::Keep);
+        assert_eq!(forget_step(true, false, true, NotAsked), ForgetStep::Wait);
+    }
+
+    /// **Nothing shared, nothing asked of the daemon.** A person with no
+    /// live Sends and no records the view shows as shared with them is
+    /// forgotten at once, and no forget question -- and so no daemon forget,
+    /// no write slot -- is raised. With a record shared, the question goes up
+    /// naming it: that is the path that stops real shares, from either ✕.
+    #[test]
+    fn a_person_with_nothing_shared_is_forgotten_without_asking_the_daemon() {
+        use crate::rest::sharing::{RecordEntry, SharingView};
+        let items: Vec<crate::vault_bridge::VaultItem> =
+            vec![serde_json::from_value(serde_json::json!({ "id": "r1", "name": "Acme VPN" })).expect("item")];
+        let view = SharingView {
+            available: true,
+            records: vec![RecordEntry { item_id: "r1".into(), people: vec!["anna@x.io".into()] }],
+            ..SharingView::default()
+        };
+        let mut history = crate::sent_history::SentHistory::default();
+        history.record(crate::sent_history::SentRecord {
+            kind: crate::sent_history::SentKind::Share,
+            recipient: "bob@x.io".into(),
+            item_id: "r9".into(),
+            ..Default::default()
+        });
+        let fetch = super::send_ui::SendFetch::default();
+        let (mut ask, mut records, mut unsaved) = (None, Vec::new(), Vec::new());
+
+        let forgotten = forget_request_for("bob@x.io", &mut ask, &mut records, &fetch, &mut history, None, &mut unsaved, Some(&view), &items);
+        assert!(forgotten, "a share entry with no Send id is not a live Send, and the view shares nothing with bob");
+        assert!(ask.is_none() && records.is_empty());
+        assert!(history.entries.is_empty(), "forgotten at once");
+
+        let forgotten = forget_request_for("Anna@x.io", &mut ask, &mut records, &fetch, &mut history, None, &mut unsaved, Some(&view), &items);
+        assert!(!forgotten);
+        assert_eq!(records, vec!["Acme VPN".to_string()], "the question names the shared record");
+        assert!(ask.as_ref().is_some_and(|(_, sends)| sends.is_empty()));
+    }
+
+    /// **The window sends the daemon's forget from one place**: the forget
+    /// question's Yes, and only when the question named records -- so neither
+    /// ✕ sends a no-op forget that would take the write slot, and the send is
+    /// recorded (`begin_forget`) so the local forget waits for its answer.
+    #[test]
+    fn the_daemons_forget_is_sent_only_for_named_records_and_is_waited_on() {
+        let source = include_str!("mod.rs");
+        let production = &source[..source.find(concat!("#[cfg(", "test)]")).expect("a test marker")];
+        let call = concat!("share_ui::SharingCall::", "Forget(");
+        assert_eq!(production.matches(call).count(), 1, "the daemon's forget is sent from more than one place");
+        let at = production.find(call).expect("the call");
+        let before = &production[at.saturating_sub(200)..at];
+        assert!(before.contains(concat!("forget_records.is_", "empty() ||")), "the forget is not gated on named records");
+        let after = &production[at..at + 400];
+        assert!(after.contains(concat!("sharing.begin_", "forget(")), "a sent forget is not recorded, so nothing waits for it");
     }
 }

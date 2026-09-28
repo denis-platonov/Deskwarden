@@ -269,6 +269,25 @@ pub(crate) struct SharingPane {
     /// A failed request's sentence, shown on the card until the next write.
     /// Shown, never logged: see the module doc.
     pub(crate) notice: Option<String>,
+    /// **The daemon's forget for the person the forget question is about**:
+    /// their normalised email, and `None` until the answer comes, then
+    /// whether it stopped every share. See [`Self::daemon_forget`].
+    daemon_forget: Option<(String, Option<bool>)>,
+}
+
+/// Where the daemon's half of forgetting one person stands -- what the
+/// window's forget question waits on before it forgets the person locally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonForget {
+    /// No forget was sent for them: nothing was shared, so there is nothing
+    /// on the daemon's side to wait for.
+    NotAsked,
+    /// Sent; no answer yet.
+    Waiting,
+    /// Every share with them is stopped.
+    Stopped,
+    /// It did not finish. The person is kept, and the sentence is shown.
+    Failed,
 }
 
 /// How long a toast stays.
@@ -364,6 +383,40 @@ impl SharingPane {
             .as_ref()
             .is_some_and(|(shown_for, f)| *shown_for == normalise_email(email) && f.key_sha256 == key_sha256)
     }
+
+    /// **The daemon's forget for `email` has started** -- call it only when
+    /// [`request`] answered `true`. From here until the answer,
+    /// [`Self::daemon_forget`] says [`DaemonForget::Waiting`], and the window
+    /// does not forget the person locally.
+    ///
+    /// `from_dialog`: the forget question came from the Share dialog's
+    /// suggestions, so the answer is that dialog's to show (the flag goes on
+    /// the dialog itself, so a dialog opened later does not inherit it).
+    pub(crate) fn begin_forget(&mut self, email: &str, from_dialog: bool) {
+        self.daemon_forget = Some((normalise_email(email), None));
+        if from_dialog {
+            if let Some(dialog) = self.dialog.as_mut() {
+                dialog.forget_asked = true;
+            }
+        }
+    }
+
+    /// Where the daemon's half of forgetting `email` stands.
+    pub(crate) fn daemon_forget(&self, email: &str) -> DaemonForget {
+        match &self.daemon_forget {
+            Some((who, answer)) if *who == normalise_email(email) => match answer {
+                None => DaemonForget::Waiting,
+                Some(true) => DaemonForget::Stopped,
+                Some(false) => DaemonForget::Failed,
+            },
+            _ => DaemonForget::NotAsked,
+        }
+    }
+
+    /// The forget question is settled, either way: nothing is waited on.
+    pub(crate) fn end_forget(&mut self) {
+        self.daemon_forget = None;
+    }
 }
 
 /// **The Share dialog's state** (mock 6a), drawn by [`draw_share_modal`] and
@@ -401,6 +454,10 @@ pub(crate) struct ShareDialog {
     /// and asking once rather than every frame is what lets a click on a
     /// suggestion or a button take the focus away.
     pub(crate) focused: bool,
+    /// The daemon's forget running now was asked from THIS dialog's
+    /// suggestions -- so its answer lands here, and only here
+    /// ([`SharingPane::begin_forget`]).
+    pub(crate) forget_asked: bool,
 }
 
 impl ShareDialog {
@@ -419,6 +476,7 @@ impl ShareDialog {
             minting: false,
             invite_code: None,
             focused: false,
+            forget_asked: false,
         }
     }
 }
@@ -726,16 +784,29 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                 pane.notice = Some(sentence);
             }
         }
-        // A forget's failure can name a decrypted record ("Couldn't stop
-        // sharing Wi-Fi ..."), so it is SHOWN -- in the Share dialog when the
-        // forget came from its suggestions and it is still open, on the card
-        // otherwise -- and never logged (module doc).
+        // **The daemon's forget came back.** Its outcome is recorded for the
+        // forget question the window is carrying out (`daemon_forget`), which
+        // forgets the person locally only on `Ok` -- the Sends' rule, "only
+        // once every deletion came back".
+        //
+        // A failure can name a decrypted record ("Couldn't stop sharing
+        // Wi-Fi ..."), so it is SHOWN -- in the Share dialog that asked, the
+        // share answer's rule above, and on the card otherwise -- and never
+        // logged (module doc).
         SharingReport::Forgot(result) => {
-            if let Err(sentence) = result {
-                match pane.dialog.as_mut() {
-                    Some(dialog) => dialog.error = Some(sentence),
-                    None => pane.notice = Some(sentence),
+            if let Some((_, answer)) = pane.daemon_forget.as_mut() {
+                answer.get_or_insert(result.is_ok());
+            }
+            let asked = pane.dialog.as_mut().filter(|d| d.forget_asked);
+            match (asked, result) {
+                (Some(dialog), result) => {
+                    dialog.forget_asked = false;
+                    if let Err(sentence) = result {
+                        dialog.error = Some(sentence);
+                    }
                 }
+                (None, Err(sentence)) => pane.notice = Some(sentence),
+                (None, Ok(_)) => {}
             }
         }
         // Only the dialog that is minting takes a code -- the share answer's
@@ -1981,18 +2052,53 @@ mod tests {
         assert!(pane.dialog.is_some());
     }
 
-    /// **A forget that failed says so in the open dialog** -- its sentence
-    /// can name a decrypted record, so it goes to the screen and nowhere else.
+    /// **A forget that failed says so in the dialog that asked** -- its
+    /// sentence can name a decrypted record, so it goes to the screen and
+    /// nowhere else. A dialog that did not ask (the forget came from the Send
+    /// composer, or this dialog was opened afterwards) is left alone and the
+    /// card's notice says it: the share answer's rule.
     #[test]
-    fn a_failed_forget_is_said_in_the_open_dialog() {
+    fn a_failed_forget_is_said_in_the_dialog_that_asked_and_nowhere_else() {
+        let failed = || SharingReport::Forgot(Err("Couldn't stop sharing Wi-Fi.".into()));
         let mut pane = SharingPane::default();
         pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
-        apply(&mut pane, SharingReport::Forgot(Err("Couldn't stop sharing Wi-Fi.".into())), 0.0);
-        assert_eq!(pane.dialog.as_ref().and_then(|d| d.error.as_deref()), Some("Couldn't stop sharing Wi-Fi."));
+        pane.begin_forget("anna@x.io", true);
+        apply(&mut pane, failed(), 0.0);
+        let dialog = pane.dialog.as_ref().expect("open");
+        assert_eq!(dialog.error.as_deref(), Some("Couldn't stop sharing Wi-Fi."));
+        assert!(!dialog.forget_asked, "answered: the flag is spent");
         assert!(pane.notice.is_none());
-        pane.dialog = None;
-        apply(&mut pane, SharingReport::Forgot(Err("Couldn't stop sharing Wi-Fi.".into())), 0.0);
+
+        let mut pane = SharingPane::default();
+        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        pane.begin_forget("anna@x.io", false);
+        apply(&mut pane, failed(), 0.0);
+        assert!(pane.dialog.as_ref().is_some_and(|d| d.error.is_none()), "the composer's forget is not this dialog's");
         assert_eq!(pane.notice.as_deref(), Some("Couldn't stop sharing Wi-Fi."));
+
+        let mut pane = SharingPane::default();
+        apply(&mut pane, failed(), 0.0);
+        assert_eq!(pane.notice.as_deref(), Some("Couldn't stop sharing Wi-Fi."));
+    }
+
+    /// **The daemon's forget is waited on, and its outcome is kept** for the
+    /// window's forget question: `Waiting` until the answer, then `Stopped`
+    /// or `Failed` -- for that person only -- until the question ends.
+    #[test]
+    fn the_daemons_forget_is_waited_on_and_its_outcome_kept() {
+        let mut pane = SharingPane::default();
+        assert_eq!(pane.daemon_forget("anna@x.io"), DaemonForget::NotAsked);
+        pane.begin_forget("Anna@X.io", false);
+        assert_eq!(pane.daemon_forget("anna@x.io"), DaemonForget::Waiting);
+        assert_eq!(pane.daemon_forget("bob@x.io"), DaemonForget::NotAsked);
+        apply(&mut pane, SharingReport::Forgot(Ok(vec!["Acme VPN".into()])), 0.0);
+        assert_eq!(pane.daemon_forget("anna@x.io"), DaemonForget::Stopped);
+        pane.end_forget();
+        assert_eq!(pane.daemon_forget("anna@x.io"), DaemonForget::NotAsked);
+
+        pane.begin_forget("anna@x.io", false);
+        apply(&mut pane, SharingReport::Forgot(Err("no".into())), 1.0);
+        assert_eq!(pane.daemon_forget("anna@x.io"), DaemonForget::Failed);
     }
 
     /// **An answer lands only in the dialog that asked.** A share closed with
