@@ -1477,6 +1477,10 @@ mod tests {
         // paint the show it is waiting for, so the window would never come
         // back. See `ui_show`.
         ("vault_window/mod.rs", 9),
+        // The vault window's sharing worker: one call to the daemon's /sharing
+        // routes per request, reported back on a channel -- `spawn_reporting`'s
+        // shape in its own file, because the calls are `share_ui`'s.
+        ("vault_window/share_ui.rs", 1),
         // One: the capture loop behind design 6a's webcam route. It cannot
         // be a tick in a frame loop for a reason none of the entries above
         // has -- `IMFSourceReader::ReadSample` BLOCKS until the camera has

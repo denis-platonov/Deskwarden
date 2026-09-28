@@ -409,7 +409,53 @@ impl SharingClient {
         )?;
         serde_json::from_value(data).map_err(|_| "The vault service answered something unreadable.".to_string())
     }
+
+    /// `POST /sharing/incoming/{id}/accept`. The route arrives in Task 20;
+    /// until then the daemon refuses it and this answers its sentence.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's. An id that could not be a
+    /// path segment is refused here, before any request, as
+    /// [`Self::share`] refuses one.
+    pub fn accept(&self, id: &str) -> Result<(), String> {
+        if !crate::rest::api::is_url_path_safe(id) {
+            return Err(INVITATION_UNUSABLE.to_string());
+        }
+        self.post(&format!("/sharing/incoming/{id}/accept"), serde_json::json!({})).map(|_| ())
+    }
+
+    /// `POST /sharing/incoming/{id}/decline`. The route arrives in Task 20.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's. An unsafe id is refused before
+    /// any request.
+    pub fn decline(&self, id: &str) -> Result<(), String> {
+        if !crate::rest::api::is_url_path_safe(id) {
+            return Err(INVITATION_UNUSABLE.to_string());
+        }
+        self.post(&format!("/sharing/incoming/{id}/decline"), serde_json::json!({})).map(|_| ())
+    }
+
+    /// `POST /sharing/from/{orgId}/leave` -- stop receiving from a sharer.
+    /// The route arrives in Task 20.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence, or the daemon's. An unsafe id is refused before
+    /// any request.
+    pub fn leave(&self, organization_id: &str) -> Result<(), String> {
+        if !crate::rest::api::is_url_path_safe(organization_id) {
+            return Err("Couldn't stop receiving from this person.".to_string());
+        }
+        self.post(&format!("/sharing/from/{organization_id}/leave"), serde_json::json!({})).map(|_| ())
+    }
 }
+
+/// An invitation whose id could not be put in a route's path -- never one the
+/// server issued, so nothing to answer.
+const INVITATION_UNUSABLE: &str = "That invitation can't be answered.";
 
 /// A sharing route's answer: `data` on success, the daemon's `message` -- the
 /// sentence the engine chose -- on a refusal.
@@ -623,6 +669,32 @@ mod tests {
         home.assert();
         server.mock("POST", "/sharing/item/s-2/stop").with_body(r#"{"success":true,"data":{"movedTo":null}}"#).create();
         assert_eq!(client.stop("s-2", "bob@example.com"), Ok(None));
+    }
+
+    /// **An invitation or organisation id goes in the path too**, so
+    /// `accept`, `decline` and `leave` refuse an unsafe one before any
+    /// request, as `share` does; a real one reaches its route.
+    #[test]
+    fn the_recipients_answers_refuse_an_id_that_is_not_path_safe_before_any_request() {
+        let mut server = crate::test_http::server();
+        let any = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
+        let client = SharingClient::new(&server.url(), &Zeroizing::new(GRANT.to_string()));
+        for unsafe_id in ["../x", "a/b", "", "a?b=c", "a%2Fb"] {
+            assert!(client.accept(unsafe_id).is_err(), "{unsafe_id:?}");
+            assert!(client.decline(unsafe_id).is_err(), "{unsafe_id:?}");
+            assert!(client.leave(unsafe_id).is_err(), "{unsafe_id:?}");
+        }
+        any.assert();
+        let ok = r#"{"success":true,"data":{}}"#;
+        let accepted = server.mock("POST", "/sharing/incoming/i-1/accept").with_body(ok).expect(1).create();
+        let declined = server.mock("POST", "/sharing/incoming/i-2/decline").with_body(ok).expect(1).create();
+        let left = server.mock("POST", "/sharing/from/o-1/leave").with_body(ok).expect(1).create();
+        assert_eq!(client.accept("i-1"), Ok(()));
+        assert_eq!(client.decline("i-2"), Ok(()));
+        assert_eq!(client.leave("o-1"), Ok(()));
+        accepted.assert();
+        declined.assert();
+        left.assert();
     }
 
     /// **`forget` and `reinvite` name the person in the body**, never the

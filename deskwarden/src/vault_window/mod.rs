@@ -18,6 +18,8 @@ pub mod record_ui;
 pub mod rehearsal;
 pub mod relative_time;
 pub mod send_ui;
+/// Personal sharing: the Share dialog, the people on a record, share rows in Sent and received records in Shared with me.
+pub mod share_ui;
 pub mod sequence_builder;
 pub mod sidebar;
 pub mod totp_add;
@@ -1175,6 +1177,13 @@ pub fn build_frame_with_search(
     // where every revoke's is.
     let mut forget_ask: Option<(String, Vec<(String, String)>)> = None;
     let mut forgetting: Option<(String, Vec<(String, String)>)> = None;
+    // **Personal sharing** (design 6). The client is the window's line to
+    // the daemon's /sharing routes, or `None` in a window with no line --
+    // where Share offers a Send. The pane holds the daemon's view and what
+    // the user is in the middle of; the channel brings worker reports back.
+    let sharing_client = crate::daemon_link::sharing_client();
+    let mut sharing = share_ui::SharingPane::default();
+    let (sharing_tx, sharing_rx) = mpsc::channel::<share_ui::SharingReport>();
     // The `u64` is the `SendFetch` generation the fetch was started under, so
     // an answer to a question the user has since navigated away from can be
     // told apart from an answer to the current one. See
@@ -2008,6 +2017,14 @@ pub fn build_frame_with_search(
         if hub.as_ref().is_some_and(|hub| hub.sends_changed(Instant::now())) {
             send_fetch.invalidate();
         }
+        // The daemon said the sharing view moved: ask for it again, and re-read
+        // the address book -- the daemon re-keys it when a record comes home.
+        if hub.as_ref().is_some_and(|hub| hub.sharing_changed(Instant::now())) {
+            sharing.invalidate();
+            if let Some(path) = sent_history_path.as_deref() {
+                sent_history = crate::sent_history::SentHistory::load(path);
+            }
+        }
         let pushed = hub.as_ref().is_some_and(|hub| hub.settled(Instant::now()));
         let hub_live = hub.as_ref().is_some_and(crate::rest::notifications::HubListener::is_live);
         let focused = ui.ctx().input(|i| i.viewport().focused.unwrap_or(true));
@@ -2337,6 +2354,13 @@ pub fn build_frame_with_search(
         // The create's answer, on the same terms and for the same reason: a
         // published Send is a row the list on screen does not have.
         drain_send_create(&send_create_rx, &mut send_create, &mut send_fetch);
+        // The sharing worker's reports, and the view when it is stale -- one
+        // read at a time (`SharingPane::wants_view`), never in a window with
+        // no line to the daemon, whose Share control offers a Send.
+        share_ui::drain(&sharing_rx, &mut sharing, ui.ctx().input(|i| i.time));
+        if sharing.wants_view() && sharing_client.is_some() {
+            share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, share_ui::SharingCall::View);
+        }
         // **The Send made from a record exists now**: file what was sent, and
         // to whom, under the id the server gave it. Taken, so it is filed
         // once however many frames the report stays on screen; a failed
@@ -3267,8 +3291,11 @@ pub fn build_frame_with_search(
         // as the `VaultLists` built from it. It is filled by the sync
         // `rest::backend::RestBackend::synced` already makes; see
         // `rest::organizations`, and `sidebar::draw_organisations` for what
-        // an empty one draws, which is nothing.
-        let sharing = crate::rest::organizations::current();
+        // an empty one draws, which is nothing. Named `directory`, not
+        // `sharing`: that name is the window's `share_ui::SharingPane`, which
+        // the detail pane below reads too, and a shadowing local here would
+        // hand it the wrong type.
+        let directory = crate::rest::organizations::current();
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -3320,7 +3347,13 @@ pub fn build_frame_with_search(
                     // the same empty directory, and the rail then draws no
                     // ORGANISATIONS section at all -- see
                     // `sidebar::draw_organisations`.
-                    sharing: &sharing,
+                    sharing: &directory,
+                    // Personal sharing's half of the SHARING rows, off the
+                    // daemon's view the window holds: 0, 0 and no dot until
+                    // it has one, and in a window with no line to the daemon.
+                    shared_records: sharing.sent_pairs(),
+                    received_records: sharing.received_count(),
+                    invitation_waiting: sharing.has_incoming(),
                 };
                 match draw_sidebar(
                     ui,
@@ -3599,6 +3632,7 @@ pub fn build_frame_with_search(
                     // flattened to `&[]` here, because the search placeholder
                     // beneath the toolbar has to be able to tell "no items" from
                     // "no answer yet" -- see `list_unless_unfetched`.
+                    let row_people = item_list::RowPeople::from_view(sharing.view.as_ref());
                     let shown: Option<&[VaultItem]> = list_unless_unfetched(
                         filter.source(),
                         &items,
@@ -3624,10 +3658,10 @@ pub fn build_frame_with_search(
                         aux_error.is_some(),
                         &mut row_opened,
                         &shared_names,
-                        // Design 6's person marks. Empty until the window
-                        // holds the sharing view (Task 15), so no row wears a
-                        // person or a `view-only` chip before then.
-                        &item_list::RowPeople::default(),
+                        // Design 6's person marks, off the daemon's sharing
+                        // view: empty until the window holds one, so no row
+                        // wears a person or a `view-only` chip before then.
+                        &row_people,
                     ) {
                         // The kind the `+ New` menu was clicked on -- `empty_of`,
                         // not `empty`, which would open a login form whatever row

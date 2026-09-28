@@ -260,6 +260,13 @@ pub struct VaultLists<'a> {
     /// A borrow, so `VaultLists` stays `Copy` and the two places that build
     /// one keep costing nothing.
     pub sharing: &'a crate::rest::organizations::Directory,
+    /// Person shares, one per (record, person) -- added to Sent's count
+    /// (spec 6.10). 0 without a sharing view.
+    pub shared_records: usize,
+    /// Records others share with this account -- added to Shared with me.
+    pub received_records: usize,
+    /// An invitation is waiting: a dot on Shared with me (mock 6d).
+    pub invitation_waiting: bool,
 }
 
 impl<'a> VaultLists<'a> {
@@ -279,6 +286,11 @@ impl<'a> VaultLists<'a> {
             // about any sharing, and both want the same thing: a rail with no
             // ORGANISATIONS section in it at all.
             sharing: &crate::rest::organizations::NOTHING_SHARED,
+            // No sharing view either: nothing shared, nothing received,
+            // nobody waiting.
+            shared_records: 0,
+            received_records: 0,
+            invitation_waiting: false,
         }
     }
 }
@@ -1859,7 +1871,14 @@ fn screen_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'
     {
         let width = ui.available_width();
         let on = screens.sharing_is(SendScope::All);
-        let count = lists.sends.map(|c| c.all);
+        // Sends and person shares in one count (spec 6.10). Unknown Sends
+        // with no shares stay unknown; unknown Sends with shares count the
+        // shares -- they are known.
+        let count = match (lists.sends.map(|c| c.all), lists.shared_records) {
+            (Some(sends), shares) => Some(sends + shares),
+            (None, 0) => None,
+            (None, shares) => Some(shares),
+        };
         if sidebar_row(ui, SENDS_ROW_LABEL, count, on, false, width, 0.0).clicked() {
             screens.select_sharing(SendScope::All);
         }
@@ -1875,9 +1894,19 @@ fn screen_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'
     {
         let width = ui.available_width();
         let on = screens.is(Screen::Received);
-        if sidebar_row(ui, RECEIVED_ROW_LABEL, Some(lists.received), on, false, width, 0.0)
-            .clicked()
-        {
+        // Imported Sends and received records in one count (spec 6.10).
+        let count = Some(lists.received + lists.received_records);
+        let row = sidebar_row(ui, RECEIVED_ROW_LABEL, count, on, false, width, 0.0);
+        if lists.invitation_waiting {
+            // Mock 6d: a 6px blue dot, 6px left of the count -- somebody is
+            // waiting for an answer. Placed off the count's MEASURED width,
+            // as `sidebar_row` places the count itself, rather than a fixed
+            // offset from the edge that a two-digit count would run into.
+            let count_width = count_galley(ui, count).size().x;
+            let at = egui::pos2(row.rect.right() - ROW_INSET_X - count_width - 6.0 - 3.0, row.rect.center().y);
+            ui.painter().circle_filled(at, 3.0, crate::theme::BLUE);
+        }
+        if row.clicked() {
             screens.select(Screen::Received);
         }
     }
@@ -1963,6 +1992,17 @@ fn inset_hairline(ui: &mut egui::Ui, inset: f32) {
 /// the text and nothing else, and because a click target that shrank with the
 /// indent would make a sub-row harder to hit than the row above it. See
 /// [`SUB_ROW_EXTRA_INDENT`].
+/// A row's count, laid out as [`sidebar_row`] paints it -- one place for its
+/// font, so whatever sits beside the count (Shared with me's invitation dot)
+/// measures the same text the row drew.
+fn count_galley(ui: &egui::Ui, count: Option<usize>) -> std::sync::Arc<egui::Galley> {
+    ui.painter().layout_no_wrap(
+        badge_text(count),
+        egui::FontId::new(11.0, egui::FontFamily::Proportional),
+        theme::TEXT_GHOST,
+    )
+}
+
 fn sidebar_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -1984,12 +2024,7 @@ fn sidebar_row(
 
     // Count first: it's right-aligned, and its measured width is what bounds
     // how far the label may run before it would collide with it.
-    let count_text = badge_text(count);
-    let count_galley = ui.painter().layout_no_wrap(
-        count_text,
-        egui::FontId::new(11.0, egui::FontFamily::Proportional),
-        theme::TEXT_GHOST,
-    );
+    let count_galley = count_galley(ui, count);
     let count_width = count_galley.size().x;
     ui.painter().galley(
         egui::Pos2::new(
@@ -3842,6 +3877,9 @@ mod tests {
             received: 0,
             health_findings: 0,
             sharing: &crate::rest::organizations::NOTHING_SHARED,
+            shared_records: 0,
+            received_records: 0,
+            invitation_waiting: false,
         };
 
         assert_eq!(badge_for(&SidebarFilter::Trash, lists), Some(2));
@@ -4365,6 +4403,21 @@ mod tests {
         folders: &[Folder],
         delta: f32,
     ) -> (Vec<(String, egui::Rect)>, egui::Rect) {
+        let (shapes, bounds) = scrolled_rail_shapes(lists, folders, delta);
+        let mut rects = Vec::new();
+        for shape in &shapes {
+            collect_text_rects(shape, &mut rects);
+        }
+        (rects, bounds)
+    }
+
+    /// [`scrolled_rail`]'s last frame as painted shapes, for a test that
+    /// reads geometry text does not carry -- the invitation dot.
+    fn scrolled_rail_shapes(
+        lists: VaultLists<'_>,
+        folders: &[Folder],
+        delta: f32,
+    ) -> (Vec<egui::Shape>, egui::Rect) {
         const HEIGHT: f32 = 800.0;
         let ctx = egui::Context::default();
         let base = || egui::RawInput {
@@ -4413,11 +4466,8 @@ mod tests {
                 );
             }));
         }
-        let mut rects = Vec::new();
-        for clipped in &output.expect("four frames were run").shapes {
-            collect_text_rects(&clipped.shape, &mut rects);
-        }
-        (rects, bounds)
+        let shapes = output.expect("four frames were run").shapes.into_iter().map(|clipped| clipped.shape).collect();
+        (shapes, bounds)
     }
 
     /// **The invariant, asserted from the rows' NEW HOME.** `Screens` promises
@@ -5662,5 +5712,67 @@ mod tests {
         let labels: Vec<&str> = painted.iter().map(|(text, _)| text.as_str()).collect();
         assert!(labels.contains(&"Engineering"), "control: the rail drew no organisation at all: {labels:?}");
         assert!(!labels.iter().any(|l| l.starts_with("Shared by")), "a sharing org reached the rail: {labels:?}");
+    }
+
+    /// **Sent and Shared with me count records too** (spec 6.10), and a
+    /// pending invitation puts a dot on the Shared-with-me row (mock 6d).
+    #[test]
+    fn the_sharing_rows_count_person_shares_and_received_records() {
+        let lists = VaultLists { shared_records: 3, received_records: 2, invitation_waiting: true, ..VaultLists::live_only(&[]) };
+        let (painted, _bounds) = scrolled_rail(lists, &[], -6000.0);
+        let near = |label: &str| painted.iter().find(|(t, _)| t == label).map(|(_, r)| *r).expect(label);
+        let sent = near(SENDS_ROW_LABEL);
+        let received = near(RECEIVED_ROW_LABEL);
+        assert!(painted.iter().any(|(t, r)| t == "3" && (r.center().y - sent.center().y).abs() < 2.0), "Sent does not count 3: {painted:?}");
+        assert!(painted.iter().any(|(t, r)| t == "2" && (r.center().y - received.center().y).abs() < 2.0), "Shared with me does not count 2: {painted:?}");
+    }
+
+    /// Unknown Sends and no person shares stay unknown -- the en dash, not a
+    /// `0` -- and known Sends add to the shares.
+    #[test]
+    fn sent_is_unknown_only_while_both_halves_are() {
+        let (unknown, _) = scrolled_rail(VaultLists::live_only(&[]), &[], -6000.0);
+        assert_eq!(badge_beside(&unknown, SENDS_ROW_LABEL), UNKNOWN_COUNT);
+        let both = VaultLists {
+            sends: Some(SendCounts::over([crate::send::SendState::Waiting, crate::send::SendState::Used])),
+            shared_records: 3,
+            ..VaultLists::live_only(&[])
+        };
+        let (painted, _) = scrolled_rail(both, &[], -6000.0);
+        assert_eq!(badge_beside(&painted, SENDS_ROW_LABEL), "5");
+    }
+
+    /// **The invitation dot**: one blue 6px dot on the Shared-with-me row,
+    /// between its label and its count, 6px clear of the count -- and none
+    /// when nothing is waiting.
+    #[test]
+    fn a_waiting_invitation_dots_shared_with_me_beside_its_count() {
+        fn blue_dots(shape: &egui::Shape, out: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Circle(c) if c.fill == theme::BLUE && (c.radius - 3.0).abs() < 0.01 => out.push(c.center),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| blue_dots(s, out)),
+                _ => {}
+            }
+        }
+        let dots_of = |lists: VaultLists<'_>| {
+            let (shapes, _) = scrolled_rail_shapes(lists, &[], -6000.0);
+            let mut texts = Vec::new();
+            let mut dots = Vec::new();
+            for shape in &shapes {
+                collect_text_rects(shape, &mut texts);
+                blue_dots(shape, &mut dots);
+            }
+            (texts, dots)
+        };
+        let (_, none) = dots_of(VaultLists { received_records: 12, ..VaultLists::live_only(&[]) });
+        assert!(none.is_empty(), "no invitation, no dot: {none:?}");
+        let (texts, dots) = dots_of(VaultLists { received_records: 12, invitation_waiting: true, ..VaultLists::live_only(&[]) });
+        let label = texts.iter().find(|(t, _)| t == RECEIVED_ROW_LABEL).map(|(_, r)| *r).expect("the row");
+        let count = texts.iter().find(|(t, r)| t == "12" && (r.center().y - label.center().y).abs() < 2.0).map(|(_, r)| *r).expect("its count");
+        assert_eq!(dots.len(), 1, "{dots:?}");
+        let dot = dots[0];
+        assert!((dot.y - label.center().y).abs() < 2.0, "the dot is on the row");
+        assert!(dot.x > label.right(), "the dot is right of the label");
+        assert!((count.left() - (dot.x + 3.0) - 6.0).abs() < 0.5, "6px between the dot and a two-digit count: {dot:?} {count:?}");
     }
 }
