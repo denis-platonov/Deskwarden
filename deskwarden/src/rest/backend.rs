@@ -658,13 +658,16 @@ impl RestBackend {
             &response,
             &keys,
         );
+        drop(state);
         // The sharing engine takes what this read already paid for -- its
         // org's roster and person collections -- so its confirm pass asks the
-        // server for no roster of its own (spec 11.5). It locks nothing of the
-        // session's; see `Sharing::note_directory`.
+        // server for no roster of its own (spec 11.5). **After** the session
+        // lock is released: it reads `sharing_state.json` for the org id it
+        // cached, and a file read has no business holding up every other
+        // request this account makes. It locks nothing of the session's; see
+        // `Sharing::note_directory`.
         self.sharing.note_directory(&directory, response.profile.as_ref());
         crate::rest::organizations::remember(directory);
-        drop(state);
         let vault = Arc::new(vault);
         let keys = self.remember_keys(keys);
         // Filed under the revision read BEFORE the sync. `None` -- the server
@@ -1780,6 +1783,24 @@ pub mod tests {
         }
     }
 
+    /// **Every test `RestBackend` is built here**, and its sharing engine is
+    /// pointed at no files.
+    ///
+    /// `RestBackend::new` gives the engine [`crate::rest::sharing::SharingSetup::production`],
+    /// which is `%APPDATA%`'s `sharing_state.json` -- and once a test serves a
+    /// profile with an `id` and an `email` through `synced`, the engine reads
+    /// that file (and later tasks' writes would write it). A test must never
+    /// touch the user's real files, so the fix is made here, at the one door
+    /// test backends come through, rather than trusted to every test that
+    /// happens to serve such a profile. A `#[cfg(not(test))]` default in the
+    /// engine was the alternative, and the crate forbids it. Pinned by
+    /// `a_test_built_backend_points_its_sharing_engine_at_no_files`.
+    pub fn a_test_backend(client: RestClient, authenticated: Authenticated) -> RestBackend {
+        let backend = RestBackend::new(client, authenticated);
+        backend.sharing_engine().set_up(crate::rest::sharing::SharingSetup::none());
+        backend
+    }
+
     /// The 64 bytes of the user key every fixture vault is encrypted under.
     fn user_key_bytes() -> [u8; 64] {
         let mut bytes = [0u8; 64];
@@ -2136,7 +2157,67 @@ pub mod tests {
 
         let client = RestClient::new(server.url());
         let authenticated = fixture_login(&client);
-        (server, RestBackend::new(client, authenticated))
+        (server, a_test_backend(client, authenticated))
+    }
+
+    /// **A test backend's sharing engine touches no file** -- see
+    /// [`a_test_backend`]. Two halves: the backends the shared fixtures hand
+    /// out really are pointed at nothing, and no test anywhere in the crate
+    /// builds a `RestBackend` except through that door, so a test added later
+    /// cannot bypass it without going red here.
+    #[test]
+    fn a_test_built_backend_points_its_sharing_engine_at_no_files() {
+        for (fixture, backend) in [("signed_in_with_no_sync_route", signed_in_with_no_sync_route().1), ("logged_in", logged_in().1)] {
+            let setup = backend.sharing_engine().setup();
+            assert!(
+                setup.state_path.is_none() && setup.sent_path.is_none() && setup.fill_stats_path.is_none(),
+                "{fixture}'s backend would read and write the user's real sharing files"
+            );
+        }
+
+        // Spelled in two halves so this test is not a construction site itself.
+        let needle = concat!("RestBackend", "::new(");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stack = vec![root.clone()];
+        let mut sites = Vec::new();
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("a source directory") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a source file");
+                // The test half: from the first `#[cfg(test)]` that opens a
+                // module. Not the first `#[cfg(test)]` at all -- `main.rs` has
+                // test-only functions above its production backend builders.
+                let opens_a_module = |at: &usize| {
+                    let after = text[*at + "#[cfg(test)]".len()..].trim_start();
+                    ["mod ", "pub mod ", "pub(crate) mod "].iter().any(|head| after.starts_with(head))
+                };
+                let Some(start) = text.match_indices("#[cfg(test)]").map(|(at, _)| at).find(opens_a_module) else {
+                    continue;
+                };
+                // A match that opens a string literal is another pin's needle
+                // (`main.rs` spells `"RestBackend::new("` in a `concat!`), not
+                // a construction.
+                let half = &text[start..];
+                let count = half.match_indices(needle).filter(|(at, _)| !half[..*at].ends_with('"')).count();
+                if count > 0 {
+                    let name = path.strip_prefix(&root).unwrap_or(&path).display().to_string().replace('\\', "/");
+                    sites.push((name, count));
+                }
+            }
+        }
+        assert_eq!(
+            sites,
+            vec![("rest/backend.rs".to_string(), 1)],
+            "a test builds a RestBackend other than through `a_test_backend`, so its sharing \
+             engine starts on the user's real files"
+        );
     }
 
     /// The body the fixture server answers `GET /api/sync` with: a vault of
@@ -2453,7 +2534,7 @@ pub mod tests {
         server.mock("DELETE", "/api/folders/f1").with_status(200).expect(1).create();
         let client = RestClient::new(server.url());
         let authenticated = fixture_login(&client);
-        let backend = RestBackend::new(client, authenticated);
+        let backend = a_test_backend(client, authenticated);
         backend.delete_folder("f1").expect("the delete, with no sync behind it");
     }
 
@@ -2646,7 +2727,7 @@ pub mod tests {
             .create();
         let client = RestClient::new(server.url());
         let authenticated = fixture_login(&client);
-        let backend = RestBackend::new(client, authenticated);
+        let backend = a_test_backend(client, authenticated);
         backend.archive_item("live-1").expect("the archive, with no sync behind it");
     }
 
@@ -3579,7 +3660,7 @@ pub mod tests {
         server.mock("POST", "/identity/connect/token").with_status(401).create();
         server.mock("GET", "/api/sync?excludeDomains=true").with_status(401).create();
 
-        let backend = RestBackend::new(client, authenticated);
+        let backend = a_test_backend(client, authenticated);
         let err = backend.list_items().expect_err("a dead session");
         assert!(matches!(err, VaultError::Unauthorized), "{err:?}");
     }
@@ -3693,7 +3774,7 @@ pub mod tests {
 
         let client = RestClient::new(server.url());
         let authenticated = fixture_login(&client);
-        let backend = RestBackend::new(client, authenticated);
+        let backend = a_test_backend(client, authenticated);
         assert_eq!(backend.get_totp("no-totp").expect("no failure"), None);
         one.assert();
     }
@@ -3895,7 +3976,7 @@ pub mod tests {
         server.mock("GET", "/api/accounts/profile").with_status(401).create();
         let sync = server.mock("GET", "/api/sync?excludeDomains=true").expect(0).create();
 
-        let backend = RestBackend::new(client, authenticated);
+        let backend = a_test_backend(client, authenticated);
         let err = backend.verify_stored_login().expect_err("a dead session");
         assert!(matches!(err, VaultError::Unauthorized), "{err:?}");
         sync.assert();

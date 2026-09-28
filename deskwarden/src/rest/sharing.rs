@@ -42,7 +42,7 @@ use crate::rest::crypto::{CryptoError, EncString, SymmetricKey};
 use crate::rest::organizations::{
     Directory, Member, MemberStatus, Roster, collection_ids_of, normalise_email, organization_of, sharer_of,
 };
-use crate::rest::sharing_api::{self, IncomingInvitation};
+use crate::rest::sharing_api::{self, IncomingInvitation, KeyRoute};
 use crate::rest::sync::{Profile, VaultKeys};
 use crate::vault_bridge::{VaultError, VaultItem};
 
@@ -302,6 +302,10 @@ pub(crate) struct Account {
     #[allow(dead_code)]
     pub(crate) email: String,
     pub(crate) admin: bool,
+    /// The profile carries a private key, so the account has a key pair and
+    /// the server holds its public half. What lets the probe read a 404 from
+    /// the own-key route as "no route" -- see [`Sharing::ensure_probe`].
+    pub(crate) keyed: bool,
 }
 
 /// This account's own sharing org, as the last read left it.
@@ -444,7 +448,12 @@ impl Sharing {
 
     fn note_account(&self, profile: &Profile) {
         if let (Some(id), Some(email)) = (profile.id.clone(), profile.email.clone()) {
-            self.held().account = Some(Account { id, email, admin: profile.is_server_admin() });
+            self.held().account = Some(Account {
+                id,
+                email,
+                admin: profile.is_server_admin(),
+                keyed: profile.private_key.as_deref().is_some_and(|k| !k.is_empty()),
+            });
         }
     }
 
@@ -516,9 +525,14 @@ impl Sharing {
     }
 
     /// The view -- pure over what is held and the daemon's items.
+    ///
+    /// Built under the `held` lock rather than from a clone of [`Held`]: a
+    /// clone would copy every incoming invitation's `Zeroizing` token only to
+    /// read its id and drop it, and nothing here takes another lock or makes
+    /// a request, so the guard is short.
     #[must_use]
     pub fn view(&self, items: &[VaultItem]) -> SharingView {
-        let held = self.held().clone();
+        let held = self.held();
         let Some(probe) = held.probe else {
             return SharingView::unavailable(REASON_NOT_LOADED);
         };
@@ -589,6 +603,20 @@ impl Sharing {
     /// NodeWarden from the rest, and the own-key route tells NodeWarden with
     /// slice 1 from an older one (spec 7.1). A transport failure is not
     /// cached: the next pass asks again.
+    ///
+    /// # Only a missing ROUTE is "too old"
+    ///
+    /// The answer is cached for the session, so misreading it turns sharing
+    /// off until the next sign-in. A 200 is the route, with or without a key
+    /// in it. A 405 or 501 is no route. A 404 is the hard one: NodeWarden's
+    /// handler answers 404 for an account with no key pair too, and the status
+    /// alone cannot tell the two apart. The profile can: an account whose
+    /// profile carries a private key has its public half on the server, so
+    /// its 404 is the route missing. A keyless account's 404 is read as the
+    /// route present -- such an account can neither share nor be confirmed
+    /// (both need a key pair), so the share flow refuses it when it asks for
+    /// the keys, with a sentence about the keys rather than a wrong one about
+    /// the server's age.
     pub(crate) fn ensure_probe(&self) -> Result<Probe, SharingError> {
         if let Some(probe) = self.held().probe {
             return Ok(probe);
@@ -599,8 +627,14 @@ impl Sharing {
             Some(list) => {
                 self.held().incoming = list;
                 let own = self.account_id()?;
-                let key = self.call(|client, auth| sharing_api::user_public_key(client, &mut auth.session, &own))?;
-                Probe { dialect: Dialect::NodeWarden, slice_one: key.is_some() }
+                let keyed = self.held().account.as_ref().is_some_and(|a| a.keyed);
+                let route = self.call(|client, auth| sharing_api::key_route(client, &mut auth.session, &own))?;
+                let slice_one = match route {
+                    KeyRoute::Answered { .. } => true,
+                    KeyRoute::Absent => false,
+                    KeyRoute::NotFound => !keyed,
+                };
+                Probe { dialect: Dialect::NodeWarden, slice_one }
             }
         };
         self.held().probe = Some(probe);
@@ -706,7 +740,7 @@ pub(crate) fn now_millis() -> i64 {
 mod tests {
     use super::*;
     use crate::rest::backend::tests::{
-        FIXTURE_ORG, FIXTURE_USER_ID, fixture_key_pair, sharing_profile, signed_in_with_no_sync_route,
+        FIXTURE_USER_ID, fixture_key_pair, sharing_profile, signed_in_with_no_sync_route,
     };
 
     /// An engine with no server behind it, for the pure view.
@@ -743,7 +777,7 @@ mod tests {
         {
             let mut held = engine.held();
             held.probe = Some(Probe { dialect: Dialect::NodeWarden, slice_one: true });
-            held.account = Some(Account { id: "me".into(), email: "me@x.io".into(), admin: true });
+            held.account = Some(Account { id: "me".into(), email: "me@x.io".into(), admin: true, keyed: true });
             held.my_org = Some(MyOrg {
                 id: "org1".into(),
                 collections: ["anna", "bob", "carol", "dan", "eve", "fay", "gus", "hal"]
@@ -799,7 +833,7 @@ mod tests {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let engine = backend.sharing_engine();
         engine.set_up(SharingSetup { make_key_pair: fixture_key_pair, ..SharingSetup::none() });
-        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect(1).create();
+        let profile = server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect(1).create();
         let invitations = server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect(2).create();
         let key = server
             .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
@@ -809,27 +843,83 @@ mod tests {
         engine.refresh(Trigger::WholeRead).expect("a first pass");
         engine.refresh(Trigger::WholeRead).expect("a second pass");
         engine.refresh(Trigger::Batch).expect("a batch pass asks nothing");
+        profile.assert();
         invitations.assert();
         key.assert();
         assert!(engine.view(&[]).available);
-        let _ = FIXTURE_ORG;
+    }
+
+    /// One probe against a NodeWarden whose own-key route answers `route`,
+    /// for an account whose profile is `profile`; the view it leaves.
+    fn probed(profile: serde_json::Value, route: impl FnOnce(crate::test_http::Mock) -> crate::test_http::Mock) -> SharingView {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
+        route(server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())).create();
+        engine.refresh(Trigger::WholeRead).expect("a pass");
+        engine.view(&[])
+    }
+
+    /// The fixture profile with no key pair: `privateKey` null.
+    fn keyless_profile() -> serde_json::Value {
+        let mut profile = sharing_profile(serde_json::json!([]));
+        profile["privateKey"] = serde_json::Value::Null;
+        profile
     }
 
     /// **An old NodeWarden without slice 1 turns sharing off** (spec 7.1):
-    /// its own-key route answers 404, and without slice 1 a recipient could
-    /// edit the sharer's records (spec 12.3).
+    /// its own-key route answers 404 for an account that has a key, or 405
+    /// or 501, and without slice 1 a recipient could edit the sharer's
+    /// records (spec 12.3).
     #[test]
     fn an_old_nodewarden_without_slice_one_turns_sharing_off() {
-        let (mut server, backend) = signed_in_with_no_sync_route();
-        let engine = backend.sharing_engine();
-        engine.set_up(SharingSetup::none());
-        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
-        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str()).with_status(404).create();
-        engine.refresh(Trigger::WholeRead).expect("a pass");
-        let view = engine.view(&[]);
-        assert!(!view.available);
-        assert_eq!(view.reason.as_deref(), Some(REASON_TOO_OLD));
+        for status in [404, 405, 501] {
+            let view = probed(sharing_profile(serde_json::json!([])), |m| m.with_status(status));
+            assert!(!view.available, "{status}");
+            assert_eq!(view.reason.as_deref(), Some(REASON_TOO_OLD), "{status}");
+        }
+    }
+
+    /// **A 200 without a key is the route answering**, so slice 1 is there.
+    /// Read as "too old" it would turn sharing off for the whole session.
+    #[test]
+    fn an_own_key_answer_without_a_key_is_still_slice_one() {
+        let view = probed(sharing_profile(serde_json::json!([])), |m| {
+            m.with_body(serde_json::json!({ "userId": FIXTURE_USER_ID, "publicKey": null }).to_string())
+        });
+        assert!(view.available, "{view:?}");
+    }
+
+    /// **A keyless account's 404 is not taken for an old server.** NodeWarden
+    /// answers 404 for an account with no key pair, so the status says
+    /// nothing about the route; the profile's missing private key says why.
+    /// Sharing stays available, and the share flow refuses on the keys.
+    #[test]
+    fn a_keyless_accounts_404_is_not_read_as_an_old_server() {
+        let view = probed(keyless_profile(), |m| m.with_status(404));
+        assert!(view.available, "{view:?}");
+        let view = probed(keyless_profile(), |m| m.with_status(405));
+        assert_eq!(view.reason.as_deref(), Some(REASON_TOO_OLD), "a 405 is no route whoever asks");
+    }
+
+    /// **`Held`'s `Debug` never prints an invitation token** -- the reason it
+    /// is hand-written (see its doc).
+    #[test]
+    fn held_debug_never_prints_an_invitation_token() {
+        let held = Held {
+            incoming: vec![IncomingInvitation {
+                id: "inv-1".into(),
+                organization_id: "org-anna".into(),
+                organization_name: Some("Shared by anna@x.io".into()),
+                token: zeroize::Zeroizing::new("TOKEN-NEEDLE-7f3a".into()),
+                expires_at: None,
+            }],
+            ..Held::default()
+        };
+        let printed = format!("{held:?}");
+        assert!(!printed.contains("TOKEN-NEEDLE-7f3a"), "{printed}");
+        assert!(printed.contains("<1 invitations>"), "{printed}");
     }
 
     /// An official server has no invitation list: sharing is not offered.

@@ -220,6 +220,40 @@ pub fn user_public_key(
     }
 }
 
+/// What `GET /api/users/{userId}/public-key` said, for the dialect probe's
+/// second question -- "are the slice-1 routes here?" (spec 7.1).
+///
+/// **Not [`user_public_key`]'s `Option`**, which folds three answers into
+/// `None` because a confirm only wants the key. The probe needs the
+/// difference: a 200 with no key in it is the route answering, and caching it
+/// as "server too old" for the session would turn sharing off on a server
+/// that has it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRoute {
+    /// 200: the route is there, whether or not the answer carried a key.
+    Answered { key: bool },
+    /// 404: no such route -- OR, on NodeWarden, whose handler answers 404
+    /// "User public key not found" for an account with no key pair, the route
+    /// and a keyless account. The status alone cannot tell them apart; the
+    /// caller decides with what it knows about the account.
+    NotFound,
+    /// 405 or 501: no such route, unambiguously ([`route_absent`]'s others).
+    Absent,
+}
+
+/// `GET /api/users/{userId}/public-key`, answered as a [`KeyRoute`].
+pub fn key_route(client: &RestClient, session: &mut Session, user_id: &str) -> Result<KeyRoute, RestError> {
+    let path = format!("/api/users/{}/public-key", safe(user_id)?);
+    match send(client, session, &SharingRequest::new(SharingMethod::Get, path, None)) {
+        Ok(answer) => Ok(KeyRoute::Answered {
+            key: text_at(&answer, "publicKey").or_else(|| text_at(&answer, "key")).is_some(),
+        }),
+        Err(RestError::Status(404)) => Ok(KeyRoute::NotFound),
+        Err(e) if route_absent(&e) => Ok(KeyRoute::Absent),
+        Err(e) => Err(e),
+    }
+}
+
 /// `POST /api/organizations`, the official body. Returns the new org's id.
 pub fn create_organization(
     client: &RestClient,
@@ -575,6 +609,31 @@ mod tests {
             .with_status(404)
             .create();
         assert!(member_key_by_email(&client, &mut session, ORG, "nobody@example.com").expect("ok").is_none());
+    }
+
+    /// **The probe's reading of the own-key route keeps apart what
+    /// `user_public_key` folds together**: a 200 is the route whether or not
+    /// it carried a key, a 404 is ambiguous and says so, and a 405 or 501 is
+    /// no route at all.
+    #[test]
+    fn the_key_route_tells_an_answer_without_a_key_from_no_route() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        let spki = crate::rest::crypto::tests::fixture_public_spki();
+        server
+            .mock("GET", "/api/users/keyed/public-key")
+            .with_body(serde_json::json!({ "userId": "keyed", "publicKey": crate::rest::crypto::tests::base64(&spki) }).to_string())
+            .create();
+        server.mock("GET", "/api/users/keyless/public-key").with_body(r#"{"userId":"keyless","publicKey":null}"#).create();
+        server.mock("GET", "/api/users/missing/public-key").with_status(404).create();
+        server.mock("GET", "/api/users/refused/public-key").with_status(405).create();
+        server.mock("GET", "/api/users/unbuilt/public-key").with_status(501).create();
+        let asked = |id: &str, session: &mut Session| key_route(&client, session, id).expect("an answer");
+        assert_eq!(asked("keyed", &mut session), KeyRoute::Answered { key: true });
+        assert_eq!(asked("keyless", &mut session), KeyRoute::Answered { key: false });
+        assert_eq!(asked("missing", &mut session), KeyRoute::NotFound);
+        assert_eq!(asked("refused", &mut session), KeyRoute::Absent);
+        assert_eq!(asked("unbuilt", &mut session), KeyRoute::Absent);
     }
 
     /// NodeWarden's invite: read-only access to the one collection, and the
