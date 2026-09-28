@@ -1713,7 +1713,10 @@ fn draw_organisations(
     // **The whole of the empty case.** Not a guard around each paint below,
     // and not a caller's responsibility: a section that is dead weight for an
     // account with none is impossible from here rather than discouraged.
-    if lists.sharing.is_empty() {
+    // Sharing orgs never reach this rail: they are plumbing (spec 6.9), and
+    // their records are under Sent and Shared with me.
+    let organisations = lists.sharing.visible_organisations();
+    if organisations.is_empty() {
         return;
     }
 
@@ -1723,7 +1726,7 @@ fn draw_organisations(
     section_label(ui, ORGANISATIONS_SECTION_LABEL);
     ui.add_space(SECTION_LABEL_INSET);
     ui.spacing_mut().item_spacing.y = ROW_GAP;
-    for organisation in lists.sharing.organisations() {
+    for organisation in organisations {
         // `item_row`, the same helper every VAULT row uses, so an
         // organisation row clears the screen flags exactly as they do --
         // the invariant `Screens` exists to hold, obtained rather than
@@ -5629,5 +5632,32 @@ mod tests {
                 folders.len()
             );
         }
+    }
+
+    /// **The ORGANISATIONS rail never lists a sharing org** -- spec 6.9's
+    /// hidden org. It is plumbing; its records live under Shared with me and
+    /// Sent instead.
+    #[test]
+    fn sharing_orgs_are_absent_from_the_organisations_rail() {
+        let response: crate::rest::sync::SyncResponse = serde_json::from_value(serde_json::json!({
+            "profile": { "key": "2.a|b|c", "email": "me@example.com", "organizations": [
+                { "id": "o-eng", "name": "Engineering" },
+                { "id": "o-share", "name": "Shared by me@example.com", "role": "owner" }
+            ]},
+            "ciphers": [], "folders": [], "collections": []
+        })).expect("parses");
+        let sharing = crate::rest::organizations::Directory::from_sync(
+            &response,
+            &crate::rest::sync::tests::keys_from_user(&[1u8; 64]),
+        );
+        let lists = VaultLists { sharing: &sharing, ..VaultLists::live_only(&[]) };
+        // `scrolled_rail` is the sidebar tests' own harness (see the
+        // ORGANISATIONS overflow test above): it draws the real rail and
+        // returns every painted label with its rect. Scrolled to the end so
+        // the section is on screen whatever the rail's height.
+        let (painted, _bounds) = scrolled_rail(lists, &[], -6000.0);
+        let labels: Vec<&str> = painted.iter().map(|(text, _)| text.as_str()).collect();
+        assert!(labels.contains(&"Engineering"), "control: the rail drew no organisation at all: {labels:?}");
+        assert!(!labels.iter().any(|l| l.starts_with("Shared by")), "a sharing org reached the rail: {labels:?}");
     }
 }

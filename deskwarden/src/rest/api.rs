@@ -1472,19 +1472,23 @@ impl RestClient {
     /// caller and which skips this entirely for the zero-organisation case
     /// that is the owner's own.
     ///
-    /// # `/members`, and what a server that has never heard of it does
+    /// # `/users` first, `/members` when it is not there
     ///
-    /// The route is NodeWarden's (`router-authenticated.ts`); stock Bitwarden
-    /// spells the same list `/api/organizations/{id}/users`. This asks for one
-    /// of them and nothing else, because the caller treats *any* failure --
-    /// 404 from a server without the route, 403 from a member who may not
-    /// read it, a transport error, a body that is not a list -- as
-    /// [`crate::rest::organizations::Roster::Unknown`], which is a state the
-    /// UI already has to draw for "not fetched yet". Probing a second spelling
-    /// would buy a count on one more server and cost a second round trip on
-    /// every server for the case where neither answers; if the owner ever
-    /// points this client at a stock Bitwarden, the second probe belongs here
-    /// and nowhere else.
+    /// `/users?includeCollections=true` is the official route (stock
+    /// Bitwarden, and NodeWarden from slice 1): it answers invitations
+    /// alongside accepted and confirmed rows, and each collection entry
+    /// carries its own `readOnly` flag. `/members` is NodeWarden's older
+    /// route, from before slice 1 -- its rows ARE the account (no `userId`)
+    /// and it has no invitations at all. A 404, a 405 (method not allowed --
+    /// some proxies answer a missing route that way) or a 501 (not
+    /// implemented) from the first is read as "this server does not have
+    /// `/users`" and falls back; any other failure -- 403 from a member who
+    /// may not read the roster, a transport error, a body that is not a list
+    /// -- is *not* retried on the second spelling, because the caller treats
+    /// it identically to a 404 anyway: both become
+    /// [`crate::rest::organizations::Roster::Unknown`], a state the UI
+    /// already has to draw for "not fetched yet", and a needless second round
+    /// trip would only slow that down.
     ///
     /// **On `sync_agent`**, for [`Self::fetch_cipher`]'s reason exactly: this
     /// is a read of account data, and the read deadline is the one written for
@@ -1498,10 +1502,23 @@ impl RestClient {
         session: &mut Session,
         id: &str,
     ) -> Result<serde_json::Value, RestError> {
-        let url = self.organization_url(id, "/members")?;
-        self.refreshing(session, |session| {
-            self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
-        })
+        // `/users?includeCollections=true` first: the official route, which
+        // NodeWarden answers from slice 1 with invitations and per-collection
+        // read-only flags. `/members` only when that is not there (404, 405, or
+        // the 501 a server without it may send) -- an older NodeWarden.
+        let users = self.organization_url(id, "/users?includeCollections=true")?;
+        let answer = self.refreshing(session, |session| {
+            self.value_from(self.bearer(self.sync_agent.get(&users), session).call())
+        });
+        match answer {
+            Err(RestError::Status(404 | 405 | 501)) => {
+                let url = self.organization_url(id, "/members")?;
+                self.refreshing(session, |session| {
+                    self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
+                })
+            }
+            other => other,
+        }
     }
 
     /// **The one door every sharing route goes through.**

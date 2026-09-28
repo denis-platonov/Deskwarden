@@ -100,6 +100,82 @@ use crate::vault_bridge::VaultItem;
 /// decryption failure is that the two are different.
 pub const UNREADABLE_NAME: &str = "(name unreadable)";
 
+// ---- sharing organisations ---------------------------------------------------
+//
+// Personal sharing (spec 5.1) puts one hidden organisation behind each sharer,
+// named `Shared by <sharer email>` in plaintext. The name is the one place
+// every client can read -- the recipient's Deskwarden must recognise SOMEONE
+// ELSE'S sharing org to hide it and to say "from ...", and so must the
+// sharer's second PC -- so recognition is by name, and "mine" is the name plus
+// ownership.
+
+/// The exact prefix a sharing organisation's name starts with.
+pub const SHARING_ORG_PREFIX: &str = "Shared by ";
+
+/// Official servers probably cap org names at 50 (spec 4.3); names are kept
+/// within it everywhere, which leaves 40 characters for the email.
+const SHARING_ORG_NAME_LIMIT: usize = 50;
+
+/// An email as sharing compares it: trimmed and lower-cased.
+#[must_use]
+pub fn normalise_email(email: &str) -> String {
+    email.trim().to_lowercase()
+}
+
+/// The name a sharer's organisation is created with. An email longer than 40
+/// characters is cut to 39 and `…`, so the label reads
+/// `from denis.platonov@a-very-long-dom…` -- which is honest.
+#[must_use]
+pub fn sharing_org_name(email: &str) -> String {
+    let email = normalise_email(email);
+    let room = SHARING_ORG_NAME_LIMIT - SHARING_ORG_PREFIX.len();
+    let shown = if email.chars().count() > room {
+        let cut: String = email.chars().take(room - 1).collect();
+        format!("{cut}\u{2026}")
+    } else {
+        email
+    };
+    format!("{SHARING_ORG_PREFIX}{shown}")
+}
+
+/// The sharer a name claims, when it is a sharing org's: the prefix, then
+/// something that parses as an email (one `@`, no whitespace), optionally cut
+/// with `…`.
+#[must_use]
+pub fn sharer_of(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix(SHARING_ORG_PREFIX)?;
+    let bare = rest.strip_suffix('\u{2026}').unwrap_or(rest);
+    let mut halves = bare.split('@');
+    let (Some(local), Some(domain), None) = (halves.next(), halves.next(), halves.next()) else {
+        return None;
+    };
+    let plausible = !local.is_empty()
+        && !domain.is_empty()
+        && !bare.chars().any(char::is_whitespace);
+    plausible.then_some(rest)
+}
+
+/// Whether `claimed` -- what [`sharer_of`] read out of a name -- is `email`.
+/// A cut name matches every address it is a prefix of and that was long
+/// enough to have been cut.
+#[must_use]
+pub fn sharer_is(claimed: &str, email: &str) -> bool {
+    let email = normalise_email(email);
+    match claimed.strip_suffix('\u{2026}') {
+        Some(cut) => email.starts_with(&normalise_email(cut)) && sharing_org_name(&email).ends_with('\u{2026}'),
+        None => normalise_email(claimed) == email,
+    }
+}
+
+/// A sharing organisation, as the directory marks one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharingOrg {
+    /// The sharer's email as the name carries it (possibly cut with `…`).
+    pub sharer: String,
+    /// This account owns it and is the sharer it names.
+    pub mine: bool,
+}
+
 /// One organisation this account is a member of.
 ///
 /// `name` is plaintext on **every** implementation and that is not an
@@ -116,6 +192,9 @@ pub struct Organisation {
     /// Whether the organisation is switched on. A server that did not say is
     /// read as enabled -- see [`crate::rest::sync::Organization::enabled`].
     pub enabled: bool,
+    /// `Some` for a personal-sharing organisation -- hidden from every
+    /// organisations surface, see [`Directory::visible_organisations`].
+    pub sharing: Option<SharingOrg>,
 }
 
 impl Organisation {
@@ -164,36 +243,59 @@ impl Collection {
     }
 }
 
-/// One member of one organisation.
-///
-/// **This is the membership model, and it is deliberately thin.** It carries
-/// exactly what answering "who else can see this item" needs and not one
-/// field more: a role (because an owner or an admin reaches every collection
-/// regardless of what is listed against them), the collections listed against
-/// them, and whether the membership is confirmed. No permissions map, no
-/// avatar colour, no `type` -- those are the web vault's business, and this
-/// app does not write memberships at all.
+/// Where one membership stands. Bitwarden's three steps (spec 2): invited
+/// (a row, no account attached yet on NodeWarden), accepted (no org key yet),
+/// confirmed (holds the org key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MemberStatus {
+    Invited,
+    Accepted,
+    Confirmed,
+}
+
+/// One member of one organisation. See the module docs for what it carries
+/// and why it is thin; personal sharing added the org-user id, the account id,
+/// the three-state status, which collections are read-only, and an
+/// invitation's expiry -- each the answer to a question the confirm pass or
+/// the SHARING card asks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Member {
+    /// The org-user id (`ouId`) the membership routes take. On NodeWarden's
+    /// older `/members` rows it is the account id, which is what NodeWarden's
+    /// membership routes take.
     pub id: String,
+    /// The account behind the membership; `None` for an invitation.
+    pub user_id: Option<String>,
     pub email: String,
     /// The display name, when the server sent one. Not used for counting;
     /// kept so a surface that wants to *name* the other viewers can.
     pub name: Option<String>,
     /// Lower-cased, as NodeWarden's `normalizeRole` writes it: `owner`,
-    /// `admin`, `manager`, `member`. Read by [`Self::reaches_everything`] and
-    /// compared nowhere else.
+    /// `admin`, `manager`, `member`, `custom`.
     pub role: String,
-    /// Whether this membership is accepted. Bitwarden's `status` is `2` for
-    /// confirmed and NodeWarden's is `1`; both use `0` for staged or revoked,
-    /// so the test is "not zero" rather than a number, and a server that sent
-    /// no status at all is read as confirmed.
-    pub confirmed: bool,
+    pub status: MemberStatus,
     /// The collection ids listed against this member.
     pub collections: Vec<String>,
+    /// The subset of `collections` held read-only.
+    pub read_only: Vec<String>,
+    /// NodeWarden's `invitationExpirationDate`, for an invitation.
+    pub invitation_expires: Option<String>,
 }
 
 impl Member {
+    /// Holds the org key: Bitwarden's status 2.
+    #[must_use]
+    pub fn confirmed(&self) -> bool {
+        self.status == MemberStatus::Confirmed
+    }
+
+    /// Listed against `collection_id`.
+    #[must_use]
+    pub fn has_access(&self, collection_id: &str) -> bool {
+        self.collections.iter().any(|c| c == collection_id)
+    }
+
     /// Whether this member reaches every collection in the organisation
     /// without being listed against any of them.
     ///
@@ -261,13 +363,18 @@ pub enum Audience {
         /// a roster this app cannot find itself in.
         others: Option<usize>,
     },
+    /// In this account's own sharing org: the people it is shared with, by
+    /// their person collections' names. Never names the organisation.
+    SharedWithPeople { people: Vec<String> },
+    /// In someone else's sharing org: who shared it.
+    SharedWithMe { from: String },
 }
 
 impl Audience {
     /// Whether this item is owned by an organisation at all.
     #[must_use]
     pub fn is_shared(&self) -> bool {
-        matches!(self, Audience::Shared { .. })
+        !matches!(self, Audience::Personal)
     }
 }
 
@@ -318,6 +425,9 @@ pub struct Directory {
     /// handful of organisations at most, and a linear scan over four entries
     /// is not worth a hash.
     rosters: Vec<(String, Roster)>,
+    /// Accepted-but-unconfirmed sharing orgs from `profile.organizationsNew`
+    /// -- the recipient's "waiting for X to finish sharing".
+    waiting: Vec<Organisation>,
 }
 
 /// **Nothing shared at all, as a `static`** -- so a caller that needs a
@@ -334,6 +444,7 @@ pub static NOTHING_SHARED: Directory = Directory {
     organisations: Vec::new(),
     collections: Vec::new(),
     rosters: Vec::new(),
+    waiting: Vec::new(),
 };
 
 impl Directory {
@@ -366,6 +477,43 @@ impl Directory {
     #[must_use]
     pub fn organisations(&self) -> &[Organisation] {
         &self.organisations
+    }
+
+    /// The organisations an organisations surface may show: every one but the
+    /// sharing orgs, which are plumbing (spec 6.9).
+    #[must_use]
+    pub fn visible_organisations(&self) -> Vec<&Organisation> {
+        self.organisations.iter().filter(|o| o.sharing.is_none()).collect()
+    }
+
+    /// Every sharing organisation this account is in, its own and others'.
+    #[must_use]
+    pub fn sharing_orgs(&self) -> Vec<&Organisation> {
+        self.organisations.iter().filter(|o| o.sharing.is_some()).collect()
+    }
+
+    /// This account's own sharing org: the first in server order, which on
+    /// NodeWarden is creation order. The sharing engine prefers the id it
+    /// cached (`sharing_state.json`) over this.
+    #[must_use]
+    pub fn my_sharing_org(&self) -> Option<&Organisation> {
+        self.organisations.iter().find(|o| o.sharing.as_ref().is_some_and(|s| s.mine))
+    }
+
+    /// Sharing orgs this account has accepted and the sharer has not confirmed.
+    #[must_use]
+    pub fn waiting(&self) -> &[Organisation] {
+        &self.waiting
+    }
+
+    /// The person collection for `email` in `org`, by decrypted name, case
+    /// folded. Where two decrypt to one email, the first in server order.
+    #[must_use]
+    pub fn collection_named(&self, org: &str, email: &str) -> Option<&Collection> {
+        let email = normalise_email(email);
+        self.collections
+            .iter()
+            .find(|c| c.organization_id == org && c.name.as_deref().map(normalise_email) == Some(email.clone()))
     }
 
     /// The collections belonging to one organisation, in server order.
@@ -405,6 +553,19 @@ impl Directory {
             .iter()
             .find(|o| o.id == org_id)
             .map_or_else(|| org_id.to_string(), |o| o.label().to_string());
+        if let Some(sharing) = self.organisations.iter().find(|o| o.id == org_id).and_then(|o| o.sharing.as_ref()) {
+            return if sharing.mine {
+                Audience::SharedWithPeople {
+                    people: filed_in
+                        .iter()
+                        .filter_map(|id| self.collections.iter().find(|c| c.id == *id))
+                        .filter_map(|c| c.name.clone())
+                        .collect(),
+                }
+            } else {
+                Audience::SharedWithMe { from: sharing.sharer.clone() }
+            };
+        }
         let collections = filed_in
             .iter()
             .filter_map(|id| self.collections.iter().find(|c| c.id == *id))
@@ -412,10 +573,13 @@ impl Directory {
             .collect();
         let others = match self.roster_of(org_id) {
             Roster::Unknown => None,
+            // Anyone past the invitation counts as a viewer -- the rule this
+            // count always had (status "not zero"); a member still waiting
+            // for the key is about to see it.
             Roster::Known(members) => Some(
                 members
                     .iter()
-                    .filter(|m| m.confirmed && m.reaches(&filed_in))
+                    .filter(|m| m.status != MemberStatus::Invited && m.reaches(&filed_in))
                     .count()
                     // The viewer. See `Audience::Shared::others`.
                     .saturating_sub(1),
@@ -436,6 +600,18 @@ impl Directory {
     /// for and they may well decrypt.
     #[must_use]
     pub fn from_sync(response: &SyncResponse, keys: &VaultKeys) -> Self {
+        let account_email = response.profile.as_ref().and_then(|p| p.email.clone()).unwrap_or_default();
+        // Whether `org`'s name marks it as a sharing organisation, and if so
+        // whether this account is the sharer it names. Shared between the
+        // confirmed organisations below and `organizationsNew`'s
+        // not-yet-confirmed ones, since both read the same name.
+        let mark = |org: &crate::rest::sync::Organization| {
+            org.name.as_deref().and_then(sharer_of).map(|sharer| SharingOrg {
+                sharer: sharer.to_string(),
+                mine: org.is_owner() && !account_email.is_empty() && sharer_is(sharer, &account_email),
+            })
+        };
+
         let organisations: Vec<Organisation> = response
             .profile
             .as_ref()
@@ -449,6 +625,7 @@ impl Directory {
                         // A server that did not say is read as enabled. See
                         // `rest::sync::Organization::enabled`.
                         enabled: org.enabled.unwrap_or(true),
+                        sharing: mark(org),
                     })
                     .collect()
             })
@@ -461,7 +638,35 @@ impl Directory {
             .collect();
 
         let rosters = organisations.iter().map(|o| (o.id.clone(), Roster::Unknown)).collect();
-        Self { organisations, collections, rosters }
+
+        // `organizationsNew` carries every accepted-or-confirmed membership;
+        // `organizations` above is confirmed only. What is in the first and
+        // not the second is a sharing org this account has accepted and the
+        // sharer has not yet confirmed -- "waiting for X to finish sharing".
+        // Only ever somebody else's: this account's own sharing org is
+        // created already confirmed, so it can never appear only here.
+        let waiting: Vec<Organisation> = response
+            .profile
+            .as_ref()
+            .map(|profile| {
+                profile
+                    .organizations_new
+                    .iter()
+                    .filter(|org| !profile.organizations.iter().any(|confirmed| confirmed.id == org.id))
+                    .filter_map(|org| {
+                        let sharing = mark(org)?;
+                        (!sharing.mine).then(|| Organisation {
+                            id: org.id.clone(),
+                            name: org.name.clone(),
+                            enabled: org.enabled.unwrap_or(true),
+                            sharing: Some(sharing),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Self { organisations, collections, rosters, waiting }
     }
 
     /// Replaces what is known about one organisation's members.
@@ -506,7 +711,17 @@ impl Directory {
         keys: &VaultKeys,
     ) -> Self {
         let mut directory = Self::from_sync(response, keys);
-        for id in directory.organisations.iter().map(|o| o.id.clone()).collect::<Vec<_>>() {
+        // **Not other people's sharing orgs.** A recipient is a plain member,
+        // and NodeWarden answers a plain member's roster request with 404 on
+        // both routes -- two requests per org per sync for nothing. Their
+        // rosters are also none of this account's business (spec 10.2).
+        let wanted: Vec<String> = directory
+            .organisations
+            .iter()
+            .filter(|o| o.sharing.as_ref().is_none_or(|s| s.mine))
+            .map(|o| o.id.clone())
+            .collect();
+        for id in wanted {
             if let Ok(answer) = client.fetch_organization_members(session, &id) {
                 directory.set_roster(&id, &answer);
             }
@@ -626,40 +841,73 @@ fn map_members(answer: &Value) -> Option<Vec<Member>> {
 fn map_member(raw: &Value) -> Option<Member> {
     let object = raw.as_object()?;
     let id = object.get("id").and_then(Value::as_str)?.to_string();
+    // **Two row shapes, one reader.** `/users` rows (official, NodeWarden from
+    // slice 1) name the account in `userId` and say 0/1/2 in `status`.
+    // NodeWarden's older `/members` rows ARE the account -- `id` is the user
+    // id -- and say "accepted" as status 1 with `encryptedOrgKey: null`, which
+    // the old reader counted as confirmed. That was right for counting viewers
+    // and wrong for confirming (spec 3.2).
+    let legacy = object.contains_key("encryptedOrgKey");
+    let status = match object.get("status").and_then(Value::as_i64) {
+        // A server that sent no status is read as confirmed: the row is in
+        // the roster, and discounting it would under-count who can see an
+        // item.
+        None => MemberStatus::Confirmed,
+        Some(0) => MemberStatus::Invited,
+        Some(1) if legacy => {
+            if object.get("encryptedOrgKey").and_then(Value::as_str).is_some_and(|k| !k.is_empty()) {
+                MemberStatus::Confirmed
+            } else {
+                MemberStatus::Accepted
+            }
+        }
+        Some(1) => MemberStatus::Accepted,
+        Some(_) => MemberStatus::Confirmed,
+    };
+    let user_id = match object.get("userId") {
+        Some(value) => value.as_str().filter(|s| !s.is_empty()).map(str::to_string),
+        None if legacy => Some(id.clone()),
+        None => None,
+    };
+    // NodeWarden writes the role as a word and a constant `type: 0` beside it;
+    // official rows carry only the number. The word wins.
+    let role = match object.get("role").and_then(Value::as_str) {
+        Some(role) => role.to_ascii_lowercase(),
+        None => match object.get("type").and_then(Value::as_i64) {
+            Some(0) => "owner",
+            Some(1) => "admin",
+            Some(3) => "manager",
+            Some(4) => "custom",
+            _ => "member",
+        }
+        .to_string(),
+    };
+    let mut collections = Vec::new();
+    let mut read_only = Vec::new();
+    for entry in object.get("collections").and_then(Value::as_array).into_iter().flatten() {
+        // Bare id strings (NodeWarden's older rows) or `{id, readOnly, ..}`.
+        let Some(cid) = entry.as_str().or_else(|| entry.get("id").and_then(Value::as_str)).filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if entry.get("readOnly").and_then(Value::as_bool) == Some(true) {
+            read_only.push(cid.to_string());
+        }
+        collections.push(cid.to_string());
+    }
     Some(Member {
         id,
+        user_id,
         email: object.get("email").and_then(Value::as_str).unwrap_or_default().to_string(),
         name: object.get("name").and_then(Value::as_str).map(str::to_string),
-        role: object
-            .get("role")
+        role,
+        status,
+        collections,
+        read_only,
+        invitation_expires: object
+            .get("invitationExpirationDate")
             .and_then(Value::as_str)
-            .unwrap_or("member")
-            .to_ascii_lowercase(),
-        // A server that sent no status is read as confirmed: the row is in
-        // the roster, and inventing a reason to discount it would under-count
-        // the people who can see an item, which is the direction that
-        // misleads.
-        confirmed: object.get("status").and_then(Value::as_i64).is_none_or(|s| s != 0),
-        collections: object
-            .get("collections")
-            .and_then(Value::as_array)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|entry| {
-                        // Two shapes on the wire: NodeWarden's member row
-                        // carries bare id strings, and Bitwarden's carries
-                        // `{"id":..,"readOnly":..}` objects. Both are read,
-                        // because which one arrived says nothing about who
-                        // can see what.
-                        entry
-                            .as_str()
-                            .or_else(|| entry.get("id").and_then(Value::as_str))
-                            .filter(|id| !id.is_empty())
-                    })
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
+            .map(str::to_string),
     })
 }
 
@@ -685,6 +933,8 @@ struct WireDirectory {
     organisations: Vec<WireOrganisation>,
     collections: Vec<WireCollection>,
     rosters: Vec<WireRoster>,
+    #[serde(default)]
+    waiting: Vec<WireOrganisation>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -693,6 +943,10 @@ struct WireOrganisation {
     id: String,
     name: Option<String>,
     enabled: bool,
+    #[serde(default)]
+    sharer: Option<String>,
+    #[serde(default)]
+    mine: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -716,11 +970,48 @@ struct WireRoster {
 #[serde(rename_all = "camelCase")]
 struct WireMember {
     id: String,
+    #[serde(default)]
+    user_id: Option<String>,
     email: String,
     name: Option<String>,
     role: String,
-    confirmed: bool,
+    #[serde(default = "confirmed_status")]
+    status: MemberStatus,
     collections: Vec<String>,
+    #[serde(default)]
+    read_only: Vec<String>,
+    #[serde(default)]
+    invitation_expires: Option<String>,
+}
+
+/// [`WireMember::status`]'s default -- a wire row from before this field
+/// existed (the daemon's own cache, or `daemon_link`'s fixed test JSON) said
+/// nothing about status and meant confirmed: the old wire's `confirmed: bool`
+/// had no other value.
+fn confirmed_status() -> MemberStatus {
+    MemberStatus::Confirmed
+}
+
+/// One [`Organisation`], to the wire. Shared by `organisations` and `waiting`,
+/// which are the same shape wearing two different hats.
+fn organisation_to_wire(o: &Organisation) -> WireOrganisation {
+    WireOrganisation {
+        id: o.id.clone(),
+        name: o.name.clone(),
+        enabled: o.enabled,
+        sharer: o.sharing.as_ref().map(|s| s.sharer.clone()),
+        mine: o.sharing.as_ref().is_some_and(|s| s.mine),
+    }
+}
+
+/// The inverse of [`organisation_to_wire`].
+fn organisation_from_wire(o: WireOrganisation) -> Organisation {
+    Organisation {
+        id: o.id,
+        name: o.name,
+        enabled: o.enabled,
+        sharing: o.sharer.map(|sharer| SharingOrg { sharer, mine: o.mine }),
+    }
 }
 
 impl Directory {
@@ -728,11 +1019,7 @@ impl Directory {
     #[must_use]
     pub fn to_body(&self) -> Value {
         let wire = WireDirectory {
-            organisations: self
-                .organisations
-                .iter()
-                .map(|o| WireOrganisation { id: o.id.clone(), name: o.name.clone(), enabled: o.enabled })
-                .collect(),
+            organisations: self.organisations.iter().map(organisation_to_wire).collect(),
             collections: self
                 .collections
                 .iter()
@@ -754,17 +1041,21 @@ impl Directory {
                                 .iter()
                                 .map(|m| WireMember {
                                     id: m.id.clone(),
+                                    user_id: m.user_id.clone(),
                                     email: m.email.clone(),
                                     name: m.name.clone(),
                                     role: m.role.clone(),
-                                    confirmed: m.confirmed,
+                                    status: m.status,
                                     collections: m.collections.clone(),
+                                    read_only: m.read_only.clone(),
+                                    invitation_expires: m.invitation_expires.clone(),
                                 })
                                 .collect(),
                         ),
                     },
                 })
                 .collect(),
+            waiting: self.waiting.iter().map(organisation_to_wire).collect(),
         };
         serde_json::to_value(wire).unwrap_or(Value::Null)
     }
@@ -778,11 +1069,7 @@ impl Directory {
         let wire: WireDirectory =
             serde_json::from_value(body).map_err(|e| format!("not a sharing directory: {e}"))?;
         Ok(Self {
-            organisations: wire
-                .organisations
-                .into_iter()
-                .map(|o| Organisation { id: o.id, name: o.name, enabled: o.enabled })
-                .collect(),
+            organisations: wire.organisations.into_iter().map(organisation_from_wire).collect(),
             collections: wire
                 .collections
                 .into_iter()
@@ -799,11 +1086,14 @@ impl Directory {
                                 .into_iter()
                                 .map(|m| Member {
                                     id: m.id,
+                                    user_id: m.user_id,
                                     email: m.email,
                                     name: m.name,
                                     role: m.role,
-                                    confirmed: m.confirmed,
+                                    status: m.status,
                                     collections: m.collections,
+                                    read_only: m.read_only,
+                                    invitation_expires: m.invitation_expires,
                                 })
                                 .collect(),
                         ),
@@ -811,6 +1101,7 @@ impl Directory {
                     (r.organization_id, roster)
                 })
                 .collect(),
+            waiting: wire.waiting.into_iter().map(organisation_from_wire).collect(),
         })
     }
 }
@@ -1175,7 +1466,7 @@ mod tests {
             );
             // A server that sent no status is read as confirmed -- under-counting
             // the people who can see an item is the direction that misleads.
-            assert!(members[0].confirmed, "{which}: a member with no status was discounted");
+            assert!(members[0].confirmed(), "{which}: a member with no status was discounted");
         }
 
         // Anything that is not a list at all is `None`, which stays
@@ -1310,5 +1601,127 @@ mod tests {
         // Keys the server did not send at all.
         assert!(collection_ids_of(&bare_item()).is_empty());
         assert_eq!(organization_of(&bare_item()), None);
+    }
+
+    // ---- personal sharing -------------------------------------------------
+
+    /// `/users` rows (official shape, NodeWarden from slice 1) say the three
+    /// states in `status`; NodeWarden's older `/members` rows ARE the account
+    /// and say "accepted" as status 1 with no key. One roster reader serves
+    /// both, and `status 1` is never read as confirmed from either.
+    #[test]
+    fn a_roster_row_says_invited_accepted_or_confirmed_whichever_route_answered() {
+        let users = json!({ "data": [
+            { "object": "organizationUserUserDetails", "id": "ou-1", "userId": "u-1", "email": "a@x.io",
+              "type": 2, "status": 2, "collections": [{ "id": "c1", "readOnly": true, "hidePasswords": false, "manage": false }] },
+            { "object": "organizationUserUserDetails", "id": "ou-2", "userId": "u-2", "email": "b@x.io", "type": 2, "status": 1 },
+            { "object": "organizationUserUserDetails", "id": "inv-3", "userId": null, "email": "c@x.io", "type": 2, "status": 0,
+              "invitationExpirationDate": "2026-10-04T00:00:00Z" }
+        ]});
+        let members = map_members(&users).expect("a roster");
+        assert_eq!(members[0].status, MemberStatus::Confirmed);
+        assert_eq!(members[0].user_id.as_deref(), Some("u-1"));
+        assert!(members[0].has_access("c1"));
+        assert_eq!(members[0].read_only, ["c1"]);
+        assert_eq!(members[1].status, MemberStatus::Accepted);
+        assert!(!members[1].confirmed());
+        assert_eq!(members[2].status, MemberStatus::Invited);
+        assert_eq!(members[2].user_id, None);
+        assert_eq!(members[2].invitation_expires.as_deref(), Some("2026-10-04T00:00:00Z"));
+
+        let legacy = json!({ "data": [
+            { "object": "organizationMember", "id": "u-9", "email": "d@x.io", "role": "member", "type": 0, "status": 1, "encryptedOrgKey": null, "collections": ["c1"] },
+            { "object": "organizationMember", "id": "u-8", "email": "e@x.io", "role": "owner", "type": 0, "status": 1, "encryptedOrgKey": "4.k", "collections": [] }
+        ]});
+        let members = map_members(&legacy).expect("a roster");
+        assert_eq!(members[0].status, MemberStatus::Accepted, "status 1 with no key is accepted, not confirmed");
+        assert_eq!(members[0].user_id.as_deref(), Some("u-9"));
+        assert_eq!(members[0].role, "member", "NodeWarden's constant `type: 0` is not an owner");
+        assert_eq!(members[1].status, MemberStatus::Confirmed);
+        assert_eq!(members[1].role, "owner");
+    }
+
+    #[test]
+    fn a_sharing_org_is_named_after_the_sharer_and_a_long_address_is_cut_honestly() {
+        assert_eq!(sharing_org_name(" Denis@Example.com "), "Shared by denis@example.com");
+        let long = "denis.platonov@a-very-long-domain-name-indeed.example";
+        let name = sharing_org_name(long);
+        assert_eq!(name.chars().count(), 50);
+        assert!(name.ends_with('…'));
+        // `sharer_of` returns a literal substring of `name` after the 10-byte
+        // prefix, so it is exactly `name`'s 50 chars minus those 10 -- 40,
+        // ellipsis included -- matching `SHARING_ORG_NAME_LIMIT`'s own doc
+        // ("leaves 40 characters for the email").
+        assert_eq!(sharer_of(&name), Some("denis.platonov@a-very-long-domain-name-…"));
+        assert!(sharer_is(sharer_of(&name).expect("a sharer"), long));
+        assert!(!sharer_is(sharer_of(&name).expect("a sharer"), "someone@else.example"));
+        assert_eq!(sharer_of("Engineering"), None);
+        assert_eq!(sharer_of("Shared by nobody"), None, "no `@`, not an email");
+    }
+
+    /// **The rail never shows a sharing org, and an audience never names one.**
+    #[test]
+    fn sharing_orgs_are_left_out_of_the_visible_organisations_and_answer_as_people() {
+        let response: SyncResponse = serde_json::from_value(json!({
+            "profile": {
+                "key": "2.aaa|bbb|ccc",
+                "email": "denis@example.com",
+                "organizations": [
+                    { "id": ORG, "name": "Engineering", "enabled": true, "key": "4.zzz" },
+                    { "id": "mine", "name": "Shared by denis@example.com", "role": "owner", "key": "4.zzz" },
+                    { "id": "theirs", "name": "Shared by anna@example.com", "role": "member", "key": "4.zzz" }
+                ],
+                "organizationsNew": [
+                    { "id": "pending", "name": "Shared by carol@example.com", "role": "member", "status": 1 }
+                ]
+            },
+            "ciphers": [], "folders": [],
+            "collections": [ { "id": "c-bob", "organizationId": "mine", "name": "bob@example.com" } ]
+        })).expect("parses");
+        let directory = Directory::from_sync(&response, &keys());
+        let visible: Vec<&str> = directory.visible_organisations().iter().map(|o| o.id.as_str()).collect();
+        assert_eq!(visible, [ORG]);
+        assert_eq!(directory.my_sharing_org().map(|o| o.id.as_str()), Some("mine"));
+        assert_eq!(directory.waiting().iter().map(|o| o.id.as_str()).collect::<Vec<_>>(), ["pending"]);
+        assert_eq!(directory.collection_named("mine", "BOB@example.com").map(|c| c.id.as_str()), Some("c-bob"));
+
+        assert_eq!(
+            directory.audience_of(&item(Some("mine"), &["c-bob"])),
+            Audience::SharedWithPeople { people: vec!["bob@example.com".to_string()] }
+        );
+        assert_eq!(
+            directory.audience_of(&item(Some("theirs"), &[])),
+            Audience::SharedWithMe { from: "anna@example.com".to_string() }
+        );
+        assert!(directory.audience_of(&item(Some("theirs"), &[])).is_shared());
+
+        // The wire keeps all of it, for a window reading the daemon's copy.
+        let round = Directory::from_body(directory.to_body()).expect("reads back");
+        assert_eq!(round, directory);
+    }
+
+    /// **The roster route: `/users` first, `/members` when it is not there.**
+    #[test]
+    fn the_roster_reads_users_then_falls_back_to_members() {
+        let mut server = crate::test_http::server();
+        server.mock("POST", "/identity/connect/token")
+            .with_body(r#"{"access_token":"AT-1","expires_in":3600,"refresh_token":"RT-1","token_type":"Bearer"}"#)
+            .create();
+        let client = RestClient::new(server.url());
+        let device = Device::windows_desktop("11111111-2222-3333-4444-555555555555", "TEST-PC");
+        let mut session = client.password_grant("a@b.c", "HASH", &device).expect("grant");
+        let users = server
+            .mock("GET", format!("/api/organizations/{ORG}/users?includeCollections=true").as_str())
+            .with_status(404)
+            .expect(1)
+            .create();
+        let members = server
+            .mock("GET", format!("/api/organizations/{ORG}/members").as_str())
+            .with_body(r#"{"data":[]}"#)
+            .expect(1)
+            .create();
+        client.fetch_organization_members(&mut session, ORG).expect("the fallback answered");
+        users.assert();
+        members.assert();
     }
 }

@@ -10255,6 +10255,14 @@ fn owner_line(audience: &crate::rest::organizations::Audience) -> String {
                 format!("{organisation} \u{b7} {first} +{}", rest.len())
             }
         },
+        // A record in this account's own sharing org is still the owner's own:
+        // the org is plumbing and is never named (spec 6.9).
+        Audience::SharedWithPeople { people } => match people.len() {
+            0 => OWNER_PERSONAL.to_string(),
+            1 => format!("{OWNER_PERSONAL} \u{b7} shared with {}", people[0]),
+            n => format!("{OWNER_PERSONAL} \u{b7} shared with {n} people"),
+        },
+        Audience::SharedWithMe { from } => format!("Shared by {from}"),
     }
 }
 
