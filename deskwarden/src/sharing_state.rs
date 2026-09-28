@@ -33,6 +33,21 @@
 //! Written to a `.tmp` sibling and renamed over the file, in
 //! `service_keys::save`'s idiom: a torn pin file is a person whose key reads
 //! as changed.
+//!
+//! # A file that does not parse is never written over
+//!
+//! [`SharingState::load`] reads one as empty, for display -- a card with no
+//! pins shown is harmless. A WRITE is not: [`update`] used to load, change
+//! and persist, so the first share, pin or forget after a torn or hand-edited
+//! file replaced every pin in it with nothing, silently, and the next confirm
+//! trusted a swapped key on first use. Now [`update`] renames such a file
+//! aside (`sharing_state.json.unreadable-<unix ms>`, kept for whoever wants
+//! to look), logs it, and fails with [`UNREADABLE_SET_ASIDE`], so the
+//! operation that wanted to write says so and a retry starts from a fresh
+//! file. A file that exists but could not be READ (held open by another
+//! process, say) is not corrupt, and is neither renamed nor written: that
+//! failure is [`UNREADABLE_NOW`]. `update_never_writes_over_a_file_it_cannot_parse`
+//! pins it.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -41,6 +56,15 @@ use serde::{Deserialize, Serialize};
 
 /// The file's name, inside [`crate::settings::config_dir`].
 pub const SHARING_STATE_FILE_NAME: &str = "sharing_state.json";
+
+/// A write found the file there and unparseable, and set it aside. The plain
+/// sentence the operation that wanted to write fails with.
+pub const UNREADABLE_SET_ASIDE: &str =
+    "Deskwarden couldn't read what it keeps about sharing on this PC, so it set that file aside. Try again.";
+
+/// A write could not read the file at all (not a parse failure): nothing was
+/// renamed and nothing written.
+pub const UNREADABLE_NOW: &str = "Deskwarden couldn't read what it keeps about sharing on this PC. Try again.";
 
 /// Where the file lives, or `None` with no config directory.
 #[must_use]
@@ -100,9 +124,51 @@ pub enum Unfinished {
     PurgeOrgCopy { org_cipher_id: String, personal_id: String },
 }
 
+/// Why the file could not be read: the two cases [`update`] treats apart.
+enum ReadFailure {
+    /// There, and could not be read -- held open, no permission.
+    Io,
+    /// Read, and not the state: torn, hand-edited, another format.
+    Corrupt,
+}
+
+/// **Why a write did not happen**, carried inside the `io::Error` [`update`]
+/// returns so a caller can tell "the file could not be read" (fail the
+/// operation, with [`Self::sentence`]) from a disk that would not take the
+/// write. See [`unreadable`].
+#[derive(Debug)]
+pub struct Unreadable {
+    /// The file was unparseable and was renamed aside.
+    pub set_aside: bool,
+}
+
+impl Unreadable {
+    /// The plain sentence for it.
+    #[must_use]
+    pub fn sentence(&self) -> &'static str {
+        if self.set_aside { UNREADABLE_SET_ASIDE } else { UNREADABLE_NOW }
+    }
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.sentence())
+    }
+}
+
+impl std::error::Error for Unreadable {}
+
+/// The [`Unreadable`] inside an [`update`] error, when that is what it was.
+#[must_use]
+pub fn unreadable(error: &std::io::Error) -> Option<&Unreadable> {
+    error.get_ref().and_then(|inner| inner.downcast_ref::<Unreadable>())
+}
+
 impl SharingState {
     /// Reads the file. Absent, empty or unparseable is empty, as
-    /// `sent_history` reads its own.
+    /// `sent_history` reads its own -- **for display only**. Anything that
+    /// writes goes through [`update`], which does not read a broken file as
+    /// empty (see the module docs).
     #[must_use]
     pub fn load(path: &Path) -> Self {
         Self::read(path).unwrap_or_default()
@@ -115,15 +181,20 @@ impl SharingState {
     /// and every swapped key would be trusted on first use again.
     #[must_use]
     pub fn read(path: &Path) -> Option<Self> {
+        Self::read_checked(path).ok()
+    }
+
+    fn read_checked(path: &Path) -> Result<Self, ReadFailure> {
         let text = match std::fs::read_to_string(path) {
             Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Self::default()),
-            Err(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) if e.kind() == std::io::ErrorKind::InvalidData => return Err(ReadFailure::Corrupt),
+            Err(_) => return Err(ReadFailure::Io),
         };
         if text.trim().is_empty() {
-            return Some(Self::default());
+            return Ok(Self::default());
         }
-        serde_json::from_str(&text).ok()
+        serde_json::from_str(&text).map_err(|_| ReadFailure::Corrupt)
     }
 
     /// Writes the whole file atomically: a `.tmp` sibling, then a rename.
@@ -177,14 +248,45 @@ impl AccountSharing {
 /// Read, change, write -- `sent_history::update`'s shape, for its reason:
 /// another process may have written in between. Returns the state as written.
 ///
+/// **Never over a file it cannot parse**: that one is renamed aside and the
+/// write refused -- see the module docs.
+///
 /// # Errors
 ///
-/// See [`SharingState::persist`].
+/// An [`Unreadable`] (read it with [`unreadable`]) when the file is there and
+/// could not be read or parsed; otherwise see [`SharingState::persist`].
 pub fn update(path: &Path, change: impl FnOnce(&mut SharingState)) -> std::io::Result<SharingState> {
-    let mut state = SharingState::load(path);
+    let mut state = readable_for_a_write(path)?;
     change(&mut state);
     state.persist(path)?;
     Ok(state)
+}
+
+/// **The file, as a write may start from it** -- or, if it is there and does
+/// not parse, set aside, and the error that says so. [`update`]'s first
+/// step, and what a sharing write that must make a pin decision asks before
+/// it makes one (`Sharing::ensure_member`), so it refuses the way a write
+/// would rather than trusting a key on first use over pins it cannot see.
+///
+/// # Errors
+///
+/// An [`Unreadable`], read with [`unreadable`].
+pub fn readable_for_a_write(path: &Path) -> std::io::Result<SharingState> {
+    match SharingState::read_checked(path) {
+        Ok(state) => Ok(state),
+        Err(ReadFailure::Io) => Err(std::io::Error::other(Unreadable { set_aside: false })),
+        Err(ReadFailure::Corrupt) => {
+            let millis = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_millis());
+            let aside = path.with_file_name(format!("{SHARING_STATE_FILE_NAME}.unreadable-{millis}"));
+            match std::fs::rename(path, &aside) {
+                Ok(()) => log::warn!("the sharing state file did not parse; it was set aside as {}", aside.display()),
+                Err(e) => log::warn!("the sharing state file did not parse and could not be set aside ({e}); it was left as it is"),
+            }
+            Err(std::io::Error::other(Unreadable { set_aside: true }))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -220,7 +322,40 @@ mod tests {
         let raw = std::fs::read_to_string(&path).expect("reads");
         assert!(raw.contains("\"kind\": \"purgeOrgCopy\"") && raw.contains("\"orgCipherId\": \"c1\""), "{raw}");
         std::fs::write(&path, "{ not json").expect("writes");
-        assert_eq!(SharingState::load(&path), SharingState::default());
+        assert_eq!(SharingState::load(&path), SharingState::default(), "for display, a broken file reads as empty");
+    }
+
+    /// **`update` never writes over a file it cannot parse** (review of
+    /// Task 12): the file is renamed aside, byte for byte, the write is
+    /// refused with the plain sentence, the change is not applied anywhere,
+    /// and a retry starts from a fresh file.
+    #[test]
+    fn update_never_writes_over_a_file_it_cannot_parse() {
+        let (dir, path) = temp_path("corrupt");
+        let broken = "{ \"accounts\": { \"user-1\": { \"pins\": { torn";
+        std::fs::write(&path, broken).expect("writes");
+        let mut changed = false;
+        let refused = update(&path, |state| {
+            changed = true;
+            state.account_mut("user-1").sharing_org_id = Some("org-new".into());
+        })
+        .expect_err("a broken file is not written over");
+        assert!(!changed, "the change ran over a state read as empty");
+        assert_eq!(unreadable(&refused).map(Unreadable::sentence), Some(UNREADABLE_SET_ASIDE));
+        assert_eq!(refused.to_string(), UNREADABLE_SET_ASIDE);
+        assert!(!path.exists(), "nothing was written in its place");
+        let aside: Vec<PathBuf> = std::fs::read_dir(dir.path())
+            .expect("the directory")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sharing_state.json.unreadable-")))
+            .collect();
+        assert_eq!(aside.len(), 1, "{aside:?}");
+        assert_eq!(std::fs::read_to_string(&aside[0]).expect("reads"), broken, "the file was kept as it was");
+        // A retry starts from a fresh file.
+        update(&path, |state| state.account_mut("user-1").sharing_org_id = Some("org-new".into())).expect("the retry writes");
+        assert_eq!(SharingState::load(&path).account("user-1").sharing_org_id.as_deref(), Some("org-new"));
+        // A plain disk error is not an `Unreadable`.
+        assert!(unreadable(&std::io::Error::other("disk full")).is_none());
     }
 
     /// Forget removes a person's pin (spec 12.4: "forget removes a person from

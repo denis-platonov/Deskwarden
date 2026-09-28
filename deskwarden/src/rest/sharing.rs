@@ -917,6 +917,17 @@ enum Filing {
     Failed(SharingError),
 }
 
+/// A `sharing_state` read or write failure as the refusal to show: the
+/// file's own plain sentence when it could not be read (see
+/// [`crate::sharing_state::Unreadable`]), a generic one otherwise.
+fn state_refused(e: &std::io::Error) -> SharingError {
+    SharingError::Refused(
+        crate::sharing_state::unreadable(e)
+            .map_or(crate::sharing_state::UNREADABLE_NOW, crate::sharing_state::Unreadable::sentence)
+            .to_string(),
+    )
+}
+
 /// A crypto failure as a sharing error, mapped as the backend maps it.
 pub(crate) fn crypto(e: CryptoError) -> SharingError {
     SharingError::Vault(crate::rest::backend::crypto_error(e))
@@ -1169,6 +1180,13 @@ impl Sharing {
         }
         match self.call(|client, auth| sharing_api::member_key_by_email(client, &mut auth.session, &ctx.org_id, email))? {
             Some(account_key) => {
+                // **No pin decision over pins that cannot be read** -- the
+                // confirm pass's rule (`Self::confirm_pass`), for the direct
+                // add: read as empty they would be "no pin", and a key the
+                // server swapped would be wrapped to on first use. Refused
+                // before the invite, the file set aside if it did not parse
+                // (`a_direct_add_refuses_while_the_pins_cannot_be_read`).
+                self.pins_for_a_write()?;
                 // A changed key is not wrapped to (spec 12.1): they join
                 // without the key and the card says their key changed.
                 let trusted = self.pin_allows(&ctx.account.id, email, &account_key.public_key);
@@ -1357,6 +1375,12 @@ impl Sharing {
         if self.pending_move(&account.id, item_id).is_some() {
             return Err(SharingError::Refused(COMING_HOME.to_string()));
         }
+        // **Pins that cannot be read end the share here**, before an org, a
+        // collection or a membership is written: its direct add is a pin
+        // decision, and the state write below would be refused anyway. A
+        // file that did not parse is set aside by the check, so the Retry
+        // the sentence asks for starts from a fresh one.
+        self.pins_for_a_write()?;
         let mut keys = self.keys_from(&profile)?;
         let (record, failures) = self.fetch_record(item_id, &keys)?;
         let existing = self.my_org_id(&profile, &account);
@@ -1394,8 +1418,12 @@ impl Sharing {
                     me.moves.insert(record.item.id.clone(), moved);
                 }
             });
-            if let Err(e) = written {
-                log::warn!("the sharing state could not be written before a share: {e}");
+            match written {
+                Ok(_) => {}
+                // Unreadable since the check above (another process wrote
+                // it): refused as the check refuses, with nothing moved.
+                Err(e) if crate::sharing_state::unreadable(&e).is_some() => return Err(state_refused(&e)),
+                Err(e) => log::warn!("the sharing state could not be written before a share: {e}"),
             }
         }
         let mut ctx = Ctx { account, keys, org_id, org_key, collections };
@@ -2216,9 +2244,23 @@ impl Sharing {
     }
 
     /// Whether the pins can be read: no file configured (a test's setup),
-    /// no file yet, or one that parses. See [`Self::confirm_pass`].
+    /// no file yet, or one that parses. See [`Self::confirm_pass`], which
+    /// only asks -- it runs unasked, so it leaves a broken file where it is
+    /// and waits.
     fn pins_readable(&self) -> bool {
         self.setup().state_path.is_none_or(|path| crate::sharing_state::SharingState::read(&path).is_some())
+    }
+
+    /// The same question for a write the USER asked for that must decide on
+    /// a pin (a share's or re-invite's direct add): `Ok` when the pins can be
+    /// read, else the refusal a state write would give -- the file set aside
+    /// when it did not parse ([`crate::sharing_state::readable_for_a_write`]),
+    /// so the Retry the sentence asks for can go ahead.
+    fn pins_for_a_write(&self) -> Result<(), SharingError> {
+        let Some(path) = self.setup().state_path else {
+            return Ok(());
+        };
+        crate::sharing_state::readable_for_a_write(&path).map(|_| ()).map_err(|e| state_refused(&e))
     }
 
     /// Confirms one member to one key, pins it, and marks them confirmed in
@@ -4514,5 +4556,62 @@ mod tests {
         )
         .expect("opens under anna's private key");
         assert!(opened == crate::rest::backend::tests::fixture_org_key(), "the confirm wrapped some other key");
+    }
+
+    // ---- fix round 2: a direct add over pins that cannot be read ----------------
+
+    /// The files in `dir` that a broken state file was set aside as.
+    fn set_aside_in(dir: &crate::test_scratch::ScratchDir) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir.path())
+            .expect("the directory")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("sharing_state.json.unreadable-")))
+            .collect()
+    }
+
+    /// **A direct add refuses while the pins cannot be read** (review of Task
+    /// 12): the re-invite reaches the add with a key in hand, and over a
+    /// broken `sharing_state.json` it would trust that key on first use.
+    /// Refused with the plain sentence, no invite, the file kept aside.
+    #[test]
+    fn a_direct_add_refuses_while_the_pins_cannot_be_read() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
+            .with_body(anna_key())
+            .create();
+        let invite = server.mock("POST", Matcher::Any).expect(0).create();
+        std::fs::write(dir.join("sharing_state.json"), b"{ torn").expect("a corrupt file");
+        match engine.reinvite("anna@example.com") {
+            Err(SharingError::Refused(said)) => assert_eq!(said, crate::sharing_state::UNREADABLE_SET_ASIDE),
+            other => panic!("expected the unreadable-pins refusal, got {other:?}"),
+        }
+        invite.assert();
+        assert_eq!(set_aside_in(&dir).len(), 1, "the broken file was not kept aside");
+        assert!(!dir.join("sharing_state.json").exists(), "something was written over it");
+    }
+
+    /// **A share over pins that cannot be read writes nothing**: refused
+    /// before the org, the collection, the membership or the move, with the
+    /// same sentence, and the broken file kept aside for a Retry to start
+    /// fresh.
+    #[test]
+    fn a_share_over_unreadable_pins_is_refused_before_anything_is_written() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        let posts = server.mock("POST", Matcher::Any).expect(0).create();
+        let puts = server.mock("PUT", Matcher::Any).expect(0).create();
+        std::fs::write(dir.join("sharing_state.json"), b"{ torn").expect("a corrupt file");
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::Refused(said)) => assert_eq!(said, crate::sharing_state::UNREADABLE_SET_ASIDE),
+            other => panic!("expected the unreadable-pins refusal, got {other:?}"),
+        }
+        posts.assert();
+        puts.assert();
+        assert_eq!(set_aside_in(&dir).len(), 1);
     }
 }
