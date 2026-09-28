@@ -978,19 +978,30 @@ impl Sharing {
     /// The account and its sharing org, for a write that needs the org to
     /// exist already (stop, forget, reinvite, confirm).
     pub(crate) fn context(&self) -> Result<Ctx, SharingError> {
+        self.context_if_any()?.ok_or_else(|| SharingError::Refused("You are not sharing anything yet.".to_string()))
+    }
+
+    /// [`Self::context`], with "no sharing org" as `None` rather than a
+    /// refusal -- for `forget`, where it means there is nothing to forget.
+    ///
+    /// The org is looked for BEFORE the account's key pair is required: an
+    /// account with no org has shared nothing whether or not it has keys, so
+    /// that answer is the true one for both.
+    pub(crate) fn context_if_any(&self) -> Result<Option<Ctx>, SharingError> {
         self.require_available()?;
         let profile = self.profile()?;
-        let account = keyed_account(self.held().account.clone())?;
+        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
+        let Some(org_id) = self.my_org_id(&profile, &account) else {
+            return Ok(None);
+        };
+        let account = keyed_account(Some(account))?;
         let keys = self.keys_from(&profile)?;
-        let org_id = self
-            .my_org_id(&profile, &account)
-            .ok_or_else(|| SharingError::Refused("You are not sharing anything yet.".to_string()))?;
         let org_key = keys
             .organization(&org_id)
             .cloned()
             .ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
         let collections = self.collections_of(&org_id, &org_key)?;
-        Ok(Ctx { account, keys, org_id, org_key, collections })
+        Ok(Some(Ctx { account, keys, org_id, org_key, collections }))
     }
 
     /// **Creates the sharing org** (spec 9.1): a fresh org key wrapped to the
@@ -1745,20 +1756,60 @@ impl Sharing {
 
 // ---- people -----------------------------------------------------------------------
 
-/// A forget some of whose stops failed: how many records it could not stop.
-/// Counted, not said to be still visible to them -- a failed stop on a record whose
-/// move back is pending may not be one the person can still see (see
+/// One record a forget could not stop: its name, when it could be read, and
+/// why -- the stop's own sentence, or `None` for a failure that has none (a
+/// server that did not answer).
+struct Unstopped {
+    name: Option<String>,
+    reason: Option<String>,
+}
+
+/// The refusal of a forget some of whose stops failed.
+///
+/// **One record: its own reason, named**, so the user can act on it -- the
+/// trash ([`STOP_IN_TRASH`]), an attachment ([`MOVE_BACK_ATTACHMENTS`]), a
+/// part that did not decrypt ([`UNREADABLE_PART`]) each say what to do, and
+/// "This record" in them needs the name beside it: a trashed record is not
+/// in the daemon's copy, so the view cannot point at it. **Several: how
+/// many** -- a list of sentences is not a toast. The count is not said to be
+/// "still visible to them": a failed stop on a record whose move back is
+/// pending may not be one they can still see (see
 /// [`Sharing::finish_pending`]), and this sentence is true either way.
-fn forget_unstopped(email: &str, count: usize) -> String {
-    let records = if count == 1 { "one record".to_string() } else { format!("{count} records") };
-    format!("Couldn't forget {email}. Sharing couldn't be stopped on {records}.")
+fn forget_refused(email: &str, unstopped: &[Unstopped]) -> String {
+    match unstopped {
+        [Unstopped { name, reason: Some(reason) }] => match name {
+            Some(name) => format!("Couldn't forget {email}. Sharing \u{201c}{name}\u{201d} couldn't be stopped. {reason}"),
+            None => format!("Couldn't forget {email}. {reason}"),
+        },
+        [_] => format!("Couldn't forget {email}. Sharing couldn't be stopped on one record."),
+        several => format!("Couldn't forget {email}. Sharing couldn't be stopped on {} records.", several.len()),
+    }
 }
 
 impl Sharing {
     /// **Forget a person** (spec 6.8, the ✕ on a suggestion): every record
     /// shared with them stopped, their membership or invitation removed,
-    /// their collection deleted, their pin forgotten. `items` is the daemon's
-    /// vault, which says which records are filed in their collection.
+    /// their collection deleted, their pin forgotten.
+    ///
+    /// # Which records
+    ///
+    /// **The server's list of what their collection holds**
+    /// ([`sharing_api::collection_items`]), with any the daemon's `items`
+    /// file there added. The daemon's copy alone is not enough: it holds no
+    /// trash and no archive, so a trashed record filed only for them was
+    /// never stopped, and the collection delete then left it in the org under
+    /// a collection that no longer exists (review of Task 11). The server's
+    /// list names it, its stop refuses ([`STOP_IN_TRASH`]), and so the
+    /// forget stops short of the delete, below. A list that cannot be read
+    /// ends the forget before anything is written.
+    ///
+    /// # Nobody to forget
+    ///
+    /// No sharing org, or a server without sharing: nothing was ever shared
+    /// with anyone, so there is nothing to forget, and the answer is an
+    /// empty outcome rather than a refusal. The window's ✕ on a suggestion
+    /// names people the user only ever sent Sends to, and must not fail for
+    /// them.
     ///
     /// The address book (`sent_history`) is the window's to prune, after it
     /// has deleted the person's Sends -- the existing forget question does
@@ -1780,7 +1831,9 @@ impl Sharing {
     /// and never coming home.
     ///
     /// A session that ended (or sharing gone) ends the loop at once: every
-    /// later stop would fail the same way.
+    /// later stop would fail the same way. Only a stop that changed something
+    /// is reported in `stopped`; a record already off their collection is
+    /// not news.
     ///
     /// # Why a failure rides in the outcome
     ///
@@ -1794,46 +1847,84 @@ impl Sharing {
     ///
     /// # Errors
     ///
-    /// Before anything was written: the sentence to show, or the backend's
-    /// failure. The account's own address is refused ([`YOURSELF`]) -- its
+    /// Before anything was written -- the collection's list unread, say --
+    /// the sentence to show, or the backend's failure. The account's own
+    /// address is refused ([`YOURSELF`]) -- its
     /// membership is the org's owner.
     pub fn forget(&self, email: &str, items: &[VaultItem]) -> Result<ForgetOutcome, SharingError> {
         let _one = self.one_at_a_time();
-        let ctx = self.context()?;
+        let ctx = match self.context_if_any() {
+            Ok(Some(ctx)) => ctx,
+            Ok(None) | Err(SharingError::Unavailable(_)) => return Ok(ForgetOutcome::default()),
+            Err(e) => return Err(e),
+        };
         let email = normalise_email(email);
         if email == normalise_email(&ctx.account.email) {
             return Err(SharingError::Refused(YOURSELF.to_string()));
         }
         let mut outcome = ForgetOutcome::default();
         let collection = ctx.collection_for(&email).map(str::to_string);
-        outcome.failed = 'forget: {
-            if let Some(collection) = &collection {
-                let records: Vec<String> = items
-                    .iter()
-                    .filter(|item| organization_of(item) == Some(ctx.org_id.as_str()))
-                    .filter(|item| collection_ids_of(item).contains(&collection.as_str()))
-                    .map(|item| item.id.clone())
-                    .collect();
-                let mut unstopped = 0;
-                for id in records {
-                    match self.stop_with(&ctx, &id, &email) {
-                        Ok(stopped) => {
-                            outcome.stopped.push(id);
-                            outcome.changed.upserted.extend(stopped.changed.upserted);
-                            outcome.changed.removed.extend(stopped.changed.removed);
-                        }
-                        Err(ended @ (SharingError::Vault(VaultError::Unauthorized) | SharingError::Unavailable(_))) => {
-                            break 'forget Some(ended);
-                        }
-                        Err(e) => {
-                            log::info!("a record could not be stopped while forgetting a person: {e}");
-                            unstopped += 1;
-                        }
+        let records: Vec<String> = match &collection {
+            Some(collection) => {
+                let mut records = self
+                    .call(|client, auth| sharing_api::collection_items(client, &mut auth.session, &ctx.org_id, collection))
+                    .map_err(|e| e.or_say(&format!("Couldn't forget {email}. Deskwarden couldn't read what is shared with them. Try again.")))?;
+                for item in items {
+                    if organization_of(item) == Some(ctx.org_id.as_str())
+                        && collection_ids_of(item).contains(&collection.as_str())
+                        && !records.contains(&item.id)
+                    {
+                        records.push(item.id.clone());
                     }
                 }
-                if unstopped > 0 {
-                    break 'forget Some(SharingError::Refused(forget_unstopped(&email, unstopped)));
+                records
+            }
+            None => Vec::new(),
+        };
+        outcome.failed = 'forget: {
+            let mut unstopped = Vec::new();
+            for id in records {
+                match self.stop_with(&ctx, &id, &email) {
+                    Ok(stopped) => {
+                        if stopped.moved_to.is_some() || !stopped.changed.is_empty() {
+                            outcome.stopped.push(id);
+                        }
+                        outcome.changed.upserted.extend(stopped.changed.upserted);
+                        outcome.changed.removed.extend(stopped.changed.removed);
+                    }
+                    Err(ended @ (SharingError::Vault(VaultError::Unauthorized) | SharingError::Unavailable(_))) => {
+                        break 'forget Some(ended);
+                    }
+                    Err(e) => {
+                        log::info!("a record could not be stopped while forgetting a person: {e}");
+                        unstopped.push((id, e));
+                    }
                 }
+            }
+            if !unstopped.is_empty() {
+                // The name is read only for the one-record sentence, and
+                // from the server when the daemon's copy lacks the record
+                // (the trash) -- one more read, on this branch alone.
+                let named = |id: &str| {
+                    items
+                        .iter()
+                        .find(|item| item.id == id)
+                        .map(|item| item.name.clone())
+                        .or_else(|| self.fetch_record(id, &ctx.keys).ok().map(|(record, _)| record.item.name))
+                        .filter(|name| !name.is_empty())
+                };
+                let one = unstopped.len() == 1;
+                let unstopped: Vec<Unstopped> = unstopped
+                    .into_iter()
+                    .map(|(id, e)| Unstopped {
+                        name: if one { named(&id) } else { None },
+                        reason: match e {
+                            SharingError::Refused(sentence) => Some(sentence),
+                            _ => None,
+                        },
+                    })
+                    .collect();
+                break 'forget Some(SharingError::Refused(forget_refused(&email, &unstopped)));
             }
             // Past the stops, the person can see nothing of ours: the
             // sentence for a later step says so, and the server's own words
@@ -3403,6 +3494,7 @@ mod tests {
         }).expect("seeded");
         with_collections(&mut server, &[person_collection("c-anna", "anna@example.com"), person_collection("c-bob", "bob@example.com")]);
         with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]);
+        with_collection_items(&mut server, "c-anna", &["s1", "s2"]);
         server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Both", &["c-anna", "c-bob"]).to_string()).create();
         server.mock("GET", "/api/ciphers/s2").with_body(shared_cipher("s2", "Only anna", &["c-anna"]).to_string()).create();
         let off = server.mock("PUT", "/api/ciphers/s1/collections").match_body(Matcher::Json(serde_json::json!({ "collectionIds": ["c-bob"] })))
@@ -3444,8 +3536,20 @@ mod tests {
         invited.assert();
     }
 
-    /// The daemon's items for these server records: what `forget` reads to
-    /// find the records filed in a person's collection.
+    /// `GET .../collections/{collection}/items` answers `ids`: what the
+    /// server says the collection holds, the trash included.
+    fn with_collection_items(server: &mut MockServer, collection: &str, ids: &[&str]) {
+        let rows: Vec<serde_json::Value> =
+            ids.iter().map(|id| serde_json::json!({ "id": id, "collectionId": collection, "object": "collectionItem" })).collect();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections/{collection}/items").as_str())
+            .with_body(serde_json::json!({ "object": "list", "data": rows, "continuationToken": null }).to_string())
+            .expect_at_least(0)
+            .create();
+    }
+
+    /// The daemon's items for these server records, each named by its id:
+    /// what `forget` adds to the server's list of a person's collection.
     fn items_of(records: &[serde_json::Value]) -> Vec<VaultItem> {
         records
             .iter()
@@ -3468,6 +3572,7 @@ mod tests {
         }).expect("seeded");
         with_collections(server, &[person_collection("c-anna", "anna@example.com"), person_collection("c-bob", "bob@example.com")]);
         with_roster(server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]);
+        with_collection_items(server, "c-anna", &["s1", "s2"]);
         let mut stuck = shared_cipher("s1", "Has a file", &["c-anna"]);
         stuck["attachments"] = serde_json::json!([{ "id": "a1", "fileName": "2.x|y|z" }]);
         let both = shared_cipher("s2", "Both", &["c-anna", "c-bob"]);
@@ -3487,8 +3592,9 @@ mod tests {
     /// Every record is tried: the one that will not stop (an attachment
     /// cannot come home) does not keep the others shared. But while anna can
     /// still see it, nothing makes the forget look done: no membership
-    /// removed, no collection deleted, the pin kept, and a refusal that says
-    /// how many records did not stop. What DID stop is in the outcome.
+    /// removed, no collection deleted, the pin kept, and a refusal that names
+    /// the one record and carries its own reason, so the user can act on it.
+    /// What DID stop is in the outcome.
     #[test]
     fn a_forget_that_cannot_stop_one_record_keeps_the_person_and_says_so() {
         let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
@@ -3503,7 +3609,7 @@ mod tests {
         assert_eq!(outcome.changed.upserted.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["s2"]);
         match &outcome.failed {
             Some(SharingError::Refused(said)) => {
-                assert_eq!(said, "Couldn't forget anna@example.com. Sharing couldn't be stopped on one record.");
+                assert_eq!(said, &format!("Couldn't forget anna@example.com. Sharing \u{201c}s1\u{201d} couldn't be stopped. {MOVE_BACK_ATTACHMENTS}"));
             }
             other => panic!("expected the forget's refusal, got {other:?}"),
         }
@@ -3524,6 +3630,7 @@ mod tests {
         }).expect("seeded");
         with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
         with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]);
+        with_collection_items(&mut server, "c-anna", &[]);
         let member_path = format!("/api/organizations/{FIXTURE_ORG}/users/anna-id");
         let collection_path = format!("/api/organizations/{FIXTURE_ORG}/collections/c-anna");
         let refused = server.mock("DELETE", member_path.as_str()).with_status(500).expect(1).create();
@@ -3585,7 +3692,7 @@ mod tests {
         off.assert();
         deletes.assert();
         assert_eq!(answer.status, 400, "{}", answer.body);
-        assert!(answer.body.contains("Sharing couldn't be stopped on one record."), "{}", answer.body);
+        assert!(answer.body.contains(MOVE_BACK_ATTACHMENTS), "{}", answer.body);
         let changes = api.feed().wait_after(Some(0), false, std::time::Duration::ZERO).changes;
         use crate::change_feed::Change;
         use crate::rest::notifications::Announcement;
@@ -3595,5 +3702,135 @@ mod tests {
         );
         let s2 = cache.get_by_id("s2").expect("s2 is held");
         assert_eq!(collection_ids_of(&s2), ["c-bob"], "the daemon no longer shows anna on s2");
+    }
+
+    // ---- review round 1: what the server says the collection holds --------------
+
+    /// Anna, confirmed, alone in her collection, which the server says holds
+    /// `ids`; bob's collection beside it.
+    fn anna_holds(server: &mut MockServer, ids: &[&str]) {
+        with_collections(server, &[person_collection("c-anna", "anna@example.com"), person_collection("c-bob", "bob@example.com")]);
+        with_roster(server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]);
+        with_collection_items(server, "c-anna", ids);
+    }
+
+    /// **A trashed record the daemon never holds is still found, and keeps
+    /// the person** (review of Task 11). The daemon's copy has no trash, so
+    /// the record is known only from the server's list of anna's collection.
+    /// Its stop refuses -- it would come home live -- and so nothing is
+    /// deleted: not her membership, not her collection (which would leave
+    /// the record in the org under a collection that no longer exists). The
+    /// refusal names it, from the server, and says what to do.
+    #[test]
+    fn a_trashed_record_the_daemon_never_holds_keeps_the_person_and_deletes_nothing() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        anna_holds(&mut server, &["s1"]);
+        let mut trashed = shared_cipher("s1", "Acme VPN", &["c-anna"]);
+        trashed["deletedDate"] = serde_json::json!("2026-09-01T00:00:00.000Z");
+        server.mock("GET", "/api/ciphers/s1").with_body(trashed.to_string()).expect_at_least(1).create();
+        let posts = server.mock("POST", Matcher::Any).expect(0).create();
+        let puts = server.mock("PUT", Matcher::Any).expect(0).create();
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        let outcome = engine.forget("anna@example.com", &[]).expect("the stop was tried");
+        posts.assert();
+        puts.assert();
+        deletes.assert();
+        assert!(outcome.stopped.is_empty());
+        match &outcome.failed {
+            Some(SharingError::Refused(said)) => assert_eq!(
+                said,
+                &format!("Couldn't forget anna@example.com. Sharing \u{201c}Acme VPN\u{201d} couldn't be stopped. {STOP_IN_TRASH}")
+            ),
+            other => panic!("expected the trash refusal, got {other:?}"),
+        }
+    }
+
+    /// **A live record the daemon does not hold still comes home**, from the
+    /// server's list alone; and a record the daemon's stale copy files for
+    /// anna that the server no longer does (`s9`, personal now) is tried,
+    /// changes nothing, and is not reported stopped.
+    #[test]
+    fn a_record_the_daemon_does_not_hold_still_comes_home() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        anna_holds(&mut server, &["s2"]);
+        server.mock("GET", "/api/ciphers/s2").with_body(shared_cipher("s2", "Only anna", &["c-anna"]).to_string()).create();
+        server.mock("GET", "/api/ciphers/s9").with_body(personal_cipher("s9", "Went home").to_string()).expect(1).create();
+        let home = server.mock("POST", "/api/ciphers").with_body_from_request(echo("p2", None, &[])).expect(1).create();
+        server.mock("PUT", "/api/ciphers/s2/collections").with_body(shared_cipher("s2", "Only anna", &[]).to_string()).create();
+        let purged = server.mock("DELETE", "/api/ciphers/s2/delete").with_status(204).expect(1).create();
+        let member = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id").as_str()).with_status(204).expect(1).create();
+        let collection = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/collections/c-anna").as_str()).with_status(204).expect(1).create();
+        let stale = items_of(&[shared_cipher("s9", "Went home", &["c-anna"])]);
+        let outcome = engine.forget("anna@example.com", &stale).expect("forgotten");
+        home.assert();
+        purged.assert();
+        member.assert();
+        collection.assert();
+        assert!(outcome.failed.is_none(), "{:?}", outcome.failed);
+        assert_eq!(outcome.stopped, ["s2"], "s9 changed nothing");
+        assert_eq!(outcome.changed.removed, ["s2"]);
+        assert_eq!(outcome.changed.upserted.iter().map(|i| i.id.as_str()).collect::<Vec<_>>(), ["p2"]);
+    }
+
+    /// **Several records that will not stop are counted**, not listed.
+    #[test]
+    fn several_records_that_will_not_stop_are_counted() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        anna_holds(&mut server, &["s1", "s3"]);
+        let mut trashed = shared_cipher("s1", "Acme VPN", &["c-anna"]);
+        trashed["deletedDate"] = serde_json::json!("2026-09-01T00:00:00.000Z");
+        let mut filed = shared_cipher("s3", "Has a file", &["c-anna"]);
+        filed["attachments"] = serde_json::json!([{ "id": "a1", "fileName": "2.x|y|z" }]);
+        server.mock("GET", "/api/ciphers/s1").with_body(trashed.to_string()).create();
+        server.mock("GET", "/api/ciphers/s3").with_body(filed.to_string()).create();
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        let outcome = engine.forget("anna@example.com", &[]).expect("the stops were tried");
+        deletes.assert();
+        match &outcome.failed {
+            Some(SharingError::Refused(said)) => {
+                assert_eq!(said, "Couldn't forget anna@example.com. Sharing couldn't be stopped on 2 records.");
+            }
+            other => panic!("expected the counted refusal, got {other:?}"),
+        }
+    }
+
+    /// **A session that ends mid-forget ends the loop at once**: its own
+    /// error comes back (the window answers it with sign-in, not a retry),
+    /// no later record is even read, and nothing is deleted.
+    #[test]
+    fn a_session_that_ends_mid_forget_stops_the_loop_at_once() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        anna_holds(&mut server, &["s1", "s2"]);
+        server.mock("GET", "/api/ciphers/s1").with_status(401).expect_at_least(1).create();
+        let later = server.mock("GET", "/api/ciphers/s2").expect(0).create();
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        let outcome = engine.forget("anna@example.com", &[]).expect("the loop ran");
+        later.assert();
+        deletes.assert();
+        assert!(outcome.stopped.is_empty());
+        assert!(matches!(outcome.failed, Some(SharingError::Vault(VaultError::Unauthorized))), "{:?}", outcome.failed);
+    }
+
+    /// **Nobody to forget is not a failure**: an account that never shared
+    /// has no sharing org, and a server without sharing has none either --
+    /// the window's ✕ on a Sends-only contact must not fail. Nothing is
+    /// written, and the outcome is empty.
+    #[test]
+    fn forgetting_with_no_sharing_org_or_no_sharing_is_nothing_to_do() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
+        let outcome = engine.forget("anna@example.com", &[]).expect("nothing to forget");
+        deletes.assert();
+        assert!(outcome.stopped.is_empty() && outcome.changed.is_empty() && outcome.failed.is_none());
+
+        let (mut official, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        official.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
+        official.mock("GET", "/api/organizations/invitations/mine").with_status(404).create();
+        let deletes = official.mock("DELETE", Matcher::Any).expect(0).create();
+        let outcome = engine.forget("anna@example.com", &[]).expect("nothing to forget off NodeWarden");
+        deletes.assert();
+        assert!(outcome.stopped.is_empty() && outcome.failed.is_none());
     }
 }

@@ -324,6 +324,33 @@ pub fn delete_collection(
     }
 }
 
+/// `GET /api/organizations/{id}/collections/{cid}/items` -- the id of every
+/// cipher filed in one collection, **trashed and archived ones included**:
+/// NodeWarden reads its `collection_items` links, not a vault view, and the
+/// owner (who can reach every collection) is allowed. The daemon's own copy
+/// holds no trash or archive, so this is the only list of what a collection
+/// really holds. Answered `{data: [{id, collectionId}]}`.
+///
+/// **An answer that is not a list, or a row with no id, is an error --
+/// never fewer ids.** `forget` deletes the collection once every listed
+/// record has stopped; a record missed here would stay in the org under a
+/// collection that no longer exists, shared with nobody and never coming
+/// home. `organizations::map_members`'s rule, for the same reason.
+pub fn collection_items(
+    client: &RestClient,
+    session: &mut Session,
+    org: &str,
+    collection: &str,
+) -> Result<Vec<String>, RestError> {
+    let path = format!("/api/organizations/{}/collections/{}/items", safe(org)?, safe(collection)?);
+    let answer = send(client, session, &SharingRequest::new(SharingMethod::Get, path, None))?;
+    let listed = match answer.get("data") {
+        Some(Value::Array(rows)) => rows.clone(),
+        _ => answer.as_array().cloned().ok_or(RestError::Parse("the collection's items"))?,
+    };
+    listed.iter().map(|row| text_at(row, "id").ok_or(RestError::Parse("an item id in the collection"))).collect()
+}
+
 /// `GET /api/organizations/{id}/members/public-key?email=` -- whether the
 /// account exists, and its key (spec §7.2, the direct-add accelerator).
 pub fn member_key_by_email(
@@ -742,6 +769,31 @@ mod tests {
         leave_organization(&client, &mut session, ORG).expect("left");
         server.mock("POST", format!("/api/organizations/{ORG}/users/ou-1/reinvite").as_str()).with_body("").create();
         reinvite(&client, &mut session, ORG, "ou-1").expect("reinvited");
+    }
+
+    /// **A collection's items are its ids, and only a list is one**: an
+    /// answer that is not a list, or a row without an id, is an error rather
+    /// than fewer ids -- `forget` deletes the collection after stopping what
+    /// this listed.
+    #[test]
+    fn a_collections_items_are_read_as_ids_and_anything_else_is_an_error() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        let path = format!("/api/organizations/{ORG}/collections/c-1/items");
+        let listed = server
+            .mock("GET", path.as_str())
+            .match_header("Authorization", "Bearer AT-1")
+            .with_body(r#"{"object":"list","data":[{"id":"s1","collectionId":"c-1","object":"collectionItem"},{"id":"s2","collectionId":"c-1"}],"continuationToken":null}"#)
+            .expect(1)
+            .create();
+        assert_eq!(collection_items(&client, &mut session, ORG, "c-1").expect("a list"), ["s1", "s2"]);
+        listed.assert();
+        for body in [r#"{"message":"Not found"}"#, r#"{"data":[{"collectionId":"c-1"}]}"#] {
+            server.mock("GET", path.as_str()).with_body(body).expect(1).create();
+            assert!(matches!(collection_items(&client, &mut session, ORG, "c-1"), Err(RestError::Parse(_))), "{body}");
+        }
+        server.mock("GET", path.as_str()).with_body(r#"{"data":[]}"#).expect(1).create();
+        assert!(collection_items(&client, &mut session, ORG, "c-1").expect("an empty list").is_empty());
     }
 
     /// An id that is not path-safe is refused before any request is made.

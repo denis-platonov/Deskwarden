@@ -537,10 +537,17 @@ impl VaultApi {
     /// the refusal is the answer -- see `Sharing::forget` on why its failure
     /// rides in the outcome. The era is read before the engine's first round
     /// trip, as [`Self::share_item`] reads it.
+    ///
+    /// **A backend with no engine (`bw serve`) forgets nobody, and says so
+    /// with success** -- the engine's own rule for a server without sharing:
+    /// nothing was ever shared there, and the window's ✕ on a suggestion
+    /// must not fail for someone the user only sent Sends to. A vault not
+    /// loaded yet is still 503, which the window retries.
     fn forget_person(&self, body: &[u8]) -> ApiResponse {
         let era = self.cache.epoch().era();
         let engine = match self.engine() {
             Ok(engine) => engine,
+            Err(answer) if answer.status == 501 => return ApiResponse::ok(serde_json::json!({ "stopped": [] })),
             Err(answer) => return answer,
         };
         let Some(email) = email_in(body) else {
@@ -962,6 +969,11 @@ pub(crate) mod tests {
         assert_eq!(answer["data"]["available"], false);
         assert_eq!(answer["data"]["reason"], crate::rest::sharing::REASON_BW_SERVE);
         api.sharing_pass(crate::rest::sharing::Trigger::WholeRead);
+        // Forgetting a person there is nothing to do, not a failure: the
+        // window's ✕ on a suggestion must not fail for a Sends-only contact.
+        let forgot = ask(&api, "POST", "/sharing/person/forget", Some(&token), r#"{"email":"anna@example.com"}"#);
+        assert_eq!(forgot.status, 200, "{}", forgot.body);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&forgot.body).expect("json")["data"]["stopped"], serde_json::json!([]));
         nothing.assert();
     }
 
