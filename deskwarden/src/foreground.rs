@@ -1420,7 +1420,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 86] = [
+        const OPENS_NO_WINDOW: [&str; 87] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1572,6 +1572,10 @@ mod tests {
             // through `serde_json`. It touches one file and paints nothing.
             "receive_history",
             "sent_history",
+            // `sharing_state.json`: pins, moves and the sharing org's id,
+            // read and written through `serde_json`. It touches one file and
+            // paints nothing.
+            "sharing_state",
             // `scan_history.json`: five counts per scan, read and written
             // through `serde_json`. It touches one file and paints nothing.
             "scan_history",

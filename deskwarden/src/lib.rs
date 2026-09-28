@@ -111,6 +111,12 @@ pub mod record;
 /// **never the access URL**, which carries the Send's own decryption key.
 pub mod receive_history;
 pub mod sent_history;
+/// `sharing_state.json`: what personal sharing keeps on this PC per account
+/// -- the sharing org's id, the public-key pins that auto-confirm trusts on
+/// first use, where a shared record was before it left the personal vault,
+/// and the second half of a move that failed. Emails, ids and hashes; no
+/// secret.
+pub mod sharing_state;
 /// The 6b dimmed full-screen surface a QR code is dragged out of. **At the
 /// crate root and not under `vault_window`**, which carries a guard requiring
 /// every UI module there to have a production caller; this one has none until
