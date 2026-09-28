@@ -4219,6 +4219,11 @@ pub mod tests {
         org_key()
     }
 
+    /// The key every fixture cipher without its own key is sealed under.
+    pub fn fixture_user_key() -> SymmetricKey {
+        user_key()
+    }
+
     /// An org key pair without generating one: the OpenSSL fixture key,
     /// its private half under `org`. RSA-2048 generation is seconds in a
     /// debug build and is tested once, in `crypto`.

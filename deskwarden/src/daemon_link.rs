@@ -297,8 +297,14 @@ impl SharingClient {
     ///
     /// # Errors
     ///
-    /// The engine's sentence, or the daemon's.
+    /// The engine's sentence, or the daemon's. An id that could not be a
+    /// path segment is refused here, before any request: the daemon routes
+    /// by `/`-separated segment, and `rest::api`'s one rule for ids in paths
+    /// is the one applied.
     pub fn share(&self, item_id: &str, email: &str) -> Result<crate::rest::sharing::ShareResult, String> {
+        if !crate::rest::api::is_url_path_safe(item_id) {
+            return Err("That record can't be shared.".to_string());
+        }
         let data = self.post(&format!("/sharing/item/{item_id}"), serde_json::json!({ "email": email }))?;
         serde_json::from_value(data.get("result").cloned().unwrap_or_default())
             .map_err(|_| "The vault service answered something unreadable.".to_string())
@@ -474,6 +480,27 @@ mod tests {
     use super::*;
 
     const GRANT: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// **A record id that could not be a path segment never leaves the
+    /// window**: `share` refuses it before any request. A real one reaches
+    /// the route, and the result is read back.
+    #[test]
+    fn a_share_refuses_an_id_that_is_not_path_safe_before_any_request() {
+        let mut server = crate::test_http::server();
+        let any = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
+        let client = SharingClient::new(&server.url(), &Zeroizing::new(GRANT.to_string()));
+        for unsafe_id in ["../x", "a/b", "", "a?b=c", "a%2Fb"] {
+            assert!(client.share(unsafe_id, "anna@example.com").is_err(), "{unsafe_id:?}");
+        }
+        any.assert();
+        let shared = server
+            .mock("POST", "/sharing/item/p-1")
+            .with_body(r#"{"success":true,"data":{"result":"waitingAccount"}}"#)
+            .expect(1)
+            .create();
+        assert_eq!(client.share("p-1", "anna@example.com"), Ok(crate::rest::sharing::ShareResult::WaitingAccount));
+        shared.assert();
+    }
 
     /// **What the daemon writes is what a window reads**, and nothing else is.
     #[test]

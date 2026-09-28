@@ -80,7 +80,7 @@
 use serde_json::Value;
 use zeroize::Zeroizing;
 
-use crate::rest::crypto::{CryptoError, SymmetricKey, encrypt};
+use crate::rest::crypto::{CryptoError, EncString, SymmetricKey, decrypt, encrypt};
 use crate::rest::sync::{CipherKeys, DecryptedItem, Retained, VaultKeys};
 use crate::vault_bridge::{
     CardData, IdentityData, LoginData, SshKeyData, UriEntry, VaultField, VaultItem,
@@ -145,6 +145,104 @@ impl MappedCipher {
             self.body.as_object().map(|o| o.keys().map(String::as_str).collect()).unwrap_or_default();
         names.sort_unstable();
         names
+    }
+
+    /// **Every ciphertext the body carries, left under `to`** -- for a record
+    /// moving into an organisation (`rest::sharing`'s share).
+    ///
+    /// [`encrypt_item`] re-encrypts what this crate MODELS under the key the
+    /// body names, and carries everything else through as it arrived:
+    /// `login.uris[].uriChecksum`, `login.fido2Credentials`, NodeWarden's
+    /// types 6-8 (`bankAccount`, `driversLicense`, `passport`), its opaque
+    /// `data` string, and whatever a server adds next. For an edit that is
+    /// right -- the key has not changed. For a move it is not: a record with
+    /// no key of its own has all of those under the owner's USER key, and
+    /// NodeWarden merges the body over the stored row, so they would land in
+    /// the organisation readable by nobody in it.
+    ///
+    /// So every string leaf of the whole body is walked, at any depth, bar
+    /// the top-level `key` (the cipher key, wrapped under the organisation
+    /// key by the caller). A leaf that is ciphertext and already opens under
+    /// `to` is left -- it is one the mapper just wrote. One that opens under
+    /// `from` is re-encrypted under `to`. One that opens under neither is an
+    /// error: the move must not carry anything the organisation cannot read.
+    /// A string that is JSON (NodeWarden's `data`) is walked the same way and
+    /// written back only if something in it changed. With `from == to` this
+    /// is a pure check that every leaf opens under the key the body names --
+    /// what a record WITH its own key needs, since its fields do not change
+    /// key when that key is re-wrapped.
+    ///
+    /// Only type-2 ciphertext is ever re-keyed, and a wrong key is told from
+    /// a right one by its MAC, so "opens under `to`" cannot be a false yes.
+    /// A string of another recognised type (`Unsupported`) is refused rather
+    /// than guessed about. Pinned by `rest::sharing`'s
+    /// `a_record_without_its_own_key_moves_with_every_leaf_under_the_org_key`.
+    ///
+    /// # Errors
+    ///
+    /// A leaf that opens under neither key, or an unsupported ciphertext.
+    /// The body may then be partly re-keyed, so a caller that gets an error
+    /// sends nothing.
+    pub(crate) fn rekey_carried(&mut self, from: &SymmetricKey, to: &SymmetricKey) -> Result<(), CryptoError> {
+        let Some(object) = self.body.as_object_mut() else {
+            return Ok(());
+        };
+        for (name, value) in object.iter_mut() {
+            if name != "key" {
+                rekey_value(value, from, to)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`MappedCipher::rekey_carried`]'s walk. Returns whether anything changed.
+fn rekey_value(value: &mut Value, from: &SymmetricKey, to: &SymmetricKey) -> Result<bool, CryptoError> {
+    match value {
+        Value::String(text) => match rekey_text(text, from, to)? {
+            Some(rekeyed) => {
+                *text = rekeyed;
+                Ok(true)
+            }
+            None => Ok(false),
+        },
+        Value::Array(list) => {
+            let mut changed = false;
+            for entry in list {
+                changed |= rekey_value(entry, from, to)?;
+            }
+            Ok(changed)
+        }
+        Value::Object(map) => {
+            let mut changed = false;
+            for entry in map.values_mut() {
+                changed |= rekey_value(entry, from, to)?;
+            }
+            Ok(changed)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// One string leaf: `None` to leave it, `Some` for what replaces it.
+fn rekey_text(text: &str, from: &SymmetricKey, to: &SymmetricKey) -> Result<Option<String>, CryptoError> {
+    match text.parse::<EncString>() {
+        Ok(enc) => {
+            if decrypt(to, &enc).is_ok() {
+                return Ok(None);
+            }
+            let plain = decrypt(from, &enc)?;
+            Ok(Some(encrypt(to, &plain)?.to_string()))
+        }
+        Err(refused @ CryptoError::Unsupported(_)) => Err(refused),
+        // Not ciphertext -- an id, a date, a flag. Unless it is JSON with
+        // ciphertext inside, as NodeWarden's passthrough `data` may be.
+        Err(_) => match serde_json::from_str::<Value>(text) {
+            Ok(mut nested @ (Value::Object(_) | Value::Array(_))) => {
+                Ok(rekey_value(&mut nested, from, to)?.then(|| nested.to_string()))
+            }
+            _ => Ok(None),
+        },
     }
 }
 
@@ -1412,6 +1510,35 @@ pub(crate) mod tests {
         });
         let (item, keys) = round_trip_in(cipher);
         encrypt_item(&item, &keys).expect("the fixture maps")
+    }
+
+    /// **`MappedCipher::rekey_carried` moves what the mapper carried, and
+    /// refuses what it cannot move.** A URI checksum rides through
+    /// `encrypt_item` under the key it arrived under; re-keyed, it opens under
+    /// the new key and says what it said. One under a third key opens under
+    /// neither, and the walk refuses rather than send it on.
+    #[test]
+    fn rekeying_moves_carried_leaves_and_refuses_what_opens_under_neither_key() {
+        let (user, org, stranger) = (key(1), key(2), key(3));
+        let cipher = serde_json::json!({
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "type": 1,
+            "name": enc(&user, "Example"),
+            "login": { "password": enc(&user, "pw"), "uris": [{ "uri": enc(&user, "https://x.example"), "uriChecksum": enc(&user, "chk") }] },
+        });
+        let (item, keys) = round_trip_in(cipher.clone());
+        let mut mapped = encrypt_item(&item, &keys).expect("maps");
+        mapped.rekey_carried(&user, &org).expect("re-keyed");
+        let checksum: EncString =
+            mapped.body()["login"]["uris"][0]["uriChecksum"].as_str().expect("a leaf").parse().expect("ciphertext");
+        assert_eq!(&*decrypt(&org, &checksum).expect("under the new key"), b"chk");
+        assert!(decrypt(&user, &checksum).is_err(), "still under the old key");
+
+        let mut odd = cipher;
+        odd["login"]["uris"][0]["uriChecksum"] = serde_json::json!(enc(&stranger, "chk"));
+        let (item, keys) = round_trip_in(odd);
+        let mut mapped = encrypt_item(&item, &keys).expect("maps");
+        assert!(mapped.rekey_carried(&user, &org).is_err(), "a leaf under neither key was let through");
     }
 
     /// The plaintext folder name [`crate::rest::api`]'s folder tests search

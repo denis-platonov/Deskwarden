@@ -191,6 +191,8 @@ pub const UNREADABLE_PART: &str =
 pub const OTHER_ORG: &str = "This record belongs to an organisation. Share it from there.";
 pub const SHARE_FAILED: &str = "Couldn't share the record. It's still in your vault.";
 pub const ORG_FAILED: &str = "Deskwarden couldn't start sharing on this server.";
+/// The server's list of the people in the sharing org was not one.
+pub const ROSTER_UNREADABLE: &str = "Deskwarden couldn't read who you share with. Try again.";
 /// **An account with no key pair** -- one made before its server kept keys,
 /// and never opened since in an app that makes them. The probe leaves sharing
 /// on for it (NodeWarden answers its own-key question with a 404 that says
@@ -784,6 +786,13 @@ impl Ctx {
     }
 }
 
+/// How one try at filing a record failed: a stale revision, which is
+/// re-read and retried, or anything else, already in the dialog's words.
+enum Filing {
+    Stale(SharingError),
+    Failed(SharingError),
+}
+
 /// A crypto failure as a sharing error, mapped as the backend maps it.
 pub(crate) fn crypto(e: CryptoError) -> SharingError {
     SharingError::Vault(crate::rest::backend::crypto_error(e))
@@ -874,9 +883,14 @@ impl Sharing {
     }
 
     /// The org's roster, fresh: `/users`, or `/members` on an older server.
+    ///
+    /// **An answer that is not a roster is an error, never an empty one** --
+    /// [`crate::rest::organizations::Roster`]'s own distinction. Read as
+    /// nobody, it would have a share invite people who are already members,
+    /// and [`Self::reload_org`] hold a roster that shows everyone as `Gone`.
     pub(crate) fn fetch_roster(&self, org: &str) -> Result<Vec<Member>, SharingError> {
         let answer = self.call(|client, auth| client.fetch_organization_members(&mut auth.session, org))?;
-        Ok(crate::rest::organizations::map_members(&answer).unwrap_or_default())
+        crate::rest::organizations::map_members(&answer).ok_or_else(|| SharingError::Refused(ROSTER_UNREADABLE.to_string()))
     }
 
     /// One record, fresh from the server, decrypted with `keys`.
@@ -991,6 +1005,7 @@ impl Sharing {
     /// again (this build's decision 11).
     pub(crate) fn ensure_member(&self, ctx: &Ctx, email: &str, collection: &str) -> Result<ShareResult, SharingError> {
         let roster = self.fetch_roster(&ctx.org_id)?;
+        let refused = format!("Couldn't invite {email}.");
         if let Some(member) = roster.iter().find(|m| normalise_email(&m.email) == email) {
             if member.has_access(collection) {
                 return Ok(match member.status {
@@ -1000,9 +1015,9 @@ impl Sharing {
                 });
             }
             let ou = member.id.clone();
-            self.call(|client, auth| sharing_api::remove_user(client, &mut auth.session, &ctx.org_id, &ou))?;
+            self.call(|client, auth| sharing_api::remove_user(client, &mut auth.session, &ctx.org_id, &ou))
+                .map_err(|e| e.or_say(&refused))?;
         }
-        let refused = format!("Couldn't invite {email}.");
         match self.call(|client, auth| sharing_api::member_key_by_email(client, &mut auth.session, &ctx.org_id, email))? {
             Some(account_key) => {
                 // A changed key is not wrapped to (spec 12.1): they join
@@ -1034,21 +1049,52 @@ impl Sharing {
     }
 
     /// **Files a record into C(E)** (spec 9.3). Already in the org: one
-    /// `/collections` call with C(E) added. Personal: the whole record moves,
-    /// with `organizationId` set and -- when it has its own key -- that key
-    /// re-wrapped from the user key to the org key; `encrypt_item` then
-    /// re-encrypts every field under whatever key the body now names. A stale
-    /// revision is re-read and retried once (spec 13).
+    /// `/collections` call with C(E) added. Personal: the whole record moves
+    /// -- see [`Self::moved_body`].
+    ///
+    /// **A stale revision is re-read and retried once** (spec 13), and the
+    /// fresh copy is judged again by [`refuse_unmovable`] before it is: what
+    /// moved on the server in between may be a restore to the trash, an
+    /// attachment, or another PC's share into the org -- which the retry then
+    /// files with `/collections` rather than moving twice.
     fn file_into(
         &self,
         ctx: &Ctx,
         record: &crate::rest::sync::DecryptedItem,
         collection: &str,
     ) -> Result<VaultItem, SharingError> {
-        let decrypted = |answer: serde_json::Value| -> Result<VaultItem, SharingError> {
-            crate::rest::sync::decrypt_cipher(&answer, &ctx.keys)
-                .map(|(written, _)| written.item)
-                .ok_or_else(|| SharingError::Refused(SHARE_FAILED.to_string()))
+        match self.file_once(ctx, record, collection) {
+            Ok(written) => Ok(written),
+            Err(Filing::Failed(e)) => Err(e),
+            Err(Filing::Stale(_)) => {
+                let (fresh, failures) = self.fetch_record(&record.item.id, &ctx.keys)?;
+                refuse_unmovable(&fresh, &failures, Some(ctx.org_id.as_str()))?;
+                self.file_once(ctx, &fresh, collection).map_err(|filing| match filing {
+                    Filing::Stale(e) => e.or_say(SHARE_FAILED),
+                    Filing::Failed(e) => e,
+                })
+            }
+        }
+    }
+
+    /// One try at [`Self::file_into`]. A stale-revision refusal comes back
+    /// apart from every other failure, so the caller can re-read and retry.
+    fn file_once(
+        &self,
+        ctx: &Ctx,
+        record: &crate::rest::sync::DecryptedItem,
+        collection: &str,
+    ) -> Result<VaultItem, Filing> {
+        let answered = |answer: Result<serde_json::Value, SharingError>| -> Result<VaultItem, Filing> {
+            match answer {
+                Ok(answer) => crate::rest::sync::decrypt_cipher(&answer, &ctx.keys)
+                    .map(|(written, _)| written.item)
+                    .ok_or_else(|| Filing::Failed(SharingError::Refused(SHARE_FAILED.to_string()))),
+                Err(SharingError::Refused(said)) if said.to_lowercase().contains("out of date") => {
+                    Err(Filing::Stale(SharingError::Refused(said)))
+                }
+                Err(e) => Err(Filing::Failed(e.or_say(SHARE_FAILED))),
+            }
         };
         if organization_of(&record.item) == Some(ctx.org_id.as_str()) {
             let mut ids: Vec<String> = collection_ids_of(&record.item).into_iter().map(str::to_string).collect();
@@ -1056,33 +1102,71 @@ impl Sharing {
                 return Ok(record.item.clone());
             }
             ids.push(collection.to_string());
-            let answer = self
-                .call(|client, auth| sharing_api::set_cipher_collections(client, &mut auth.session, &record.item.id, &ids))
-                .map_err(|e| e.or_say(SHARE_FAILED))?;
-            return decrypted(answer);
+            return answered(
+                self.call(|client, auth| sharing_api::set_cipher_collections(client, &mut auth.session, &record.item.id, &ids)),
+            );
         }
-        let attempt = |record: &crate::rest::sync::DecryptedItem| -> Result<serde_json::Value, SharingError> {
-            let mut moved = crate::vault_bridge::with_revision_date_from(&record.item, &record.item);
-            moved.other.insert("organizationId".into(), serde_json::Value::String(ctx.org_id.clone()));
-            moved.other.remove("collectionIds");
-            if let Some(wrapped) = moved.other.get("key").and_then(serde_json::Value::as_str).map(str::to_string) {
-                let cipher_key = crate::rest::crypto::unwrap_key_under(&wrapped.parse::<EncString>().map_err(crypto)?, ctx.keys.user())
-                    .map_err(crypto)?;
+        let cipher = self.moved_body(ctx, record).map_err(Filing::Failed)?;
+        let ids = vec![collection.to_string()];
+        answered(self.call(|client, auth| sharing_api::share_cipher(client, &mut auth.session, &record.item.id, &cipher, &ids)))
+    }
+
+    /// **The body that moves a personal record into the org**: the record
+    /// with `organizationId` set, and **no ciphertext left under the user
+    /// key anywhere in it**.
+    ///
+    /// A record with its own key keeps it, re-wrapped from the user key to
+    /// the org key; its fields are under that key and do not change. A record
+    /// without one -- every record Deskwarden itself makes -- has its fields
+    /// under the user key, and `encrypt_item` re-encrypts only the ones this
+    /// crate models under the org key. The rest ride through as they arrived
+    /// (`uriChecksum`, passkeys, NodeWarden's types 6-8 and `data`), and
+    /// NodeWarden merges the body over the stored row, so they would land in
+    /// the org readable by nobody. [`crate::rest::write::MappedCipher::rekey_carried`]
+    /// walks the whole body and moves each of them to the org key; for a
+    /// keyed record the same walk checks that every leaf opens under its own
+    /// key. Anything that opens under neither refuses the share whole.
+    ///
+    /// Giving the record a fresh key of its own during the move -- the
+    /// official clients' way -- was the alternative. It needs the same walk
+    /// (the unmodelled leaves are under the user key either way), and adds a
+    /// per-item key Deskwarden never otherwise makes; so the smaller change
+    /// was taken.
+    ///
+    /// **Nothing stored can keep the old ciphertext either.** NodeWarden
+    /// spreads the body over the stored row, so a field the body left out
+    /// would survive. None is left out: its cipher answer passes every stored
+    /// field through (`cipherToResponse`'s `...passthrough`), so the record
+    /// read here names each one, and the body -- built over that record --
+    /// sends each back re-keyed. `data` included, which the answer gives as
+    /// `null` when it is not a string, and a `null` overwrites.
+    fn moved_body(
+        &self,
+        ctx: &Ctx,
+        record: &crate::rest::sync::DecryptedItem,
+    ) -> Result<crate::rest::write::MappedCipher, SharingError> {
+        let unreadable = |_: CryptoError| SharingError::Refused(UNREADABLE_PART.to_string());
+        let mut moved = crate::vault_bridge::with_revision_date_from(&record.item, &record.item);
+        moved.other.insert("organizationId".into(), serde_json::Value::String(ctx.org_id.clone()));
+        moved.other.remove("collectionIds");
+        let own_key = match moved.other.get("key").and_then(serde_json::Value::as_str).map(str::to_string) {
+            Some(wrapped) => {
+                let wrapped = wrapped.parse::<EncString>().map_err(unreadable)?;
+                let cipher_key = crate::rest::crypto::unwrap_key_under(&wrapped, ctx.keys.user()).map_err(unreadable)?;
                 let rewrapped = crate::rest::crypto::wrap_key_under(&cipher_key, &ctx.org_key).map_err(crypto)?;
                 moved.other.insert("key".into(), serde_json::Value::String(rewrapped.to_string()));
+                Some(cipher_key)
             }
-            let cipher = crate::rest::write::encrypt_item(&record.carrying(moved), &ctx.keys).map_err(crypto)?;
-            let ids = vec![collection.to_string()];
-            self.call(|client, auth| sharing_api::share_cipher(client, &mut auth.session, &record.item.id, &cipher, &ids))
+            None => None,
         };
-        match attempt(record) {
-            Ok(answer) => decrypted(answer),
-            Err(SharingError::Refused(said)) if said.to_lowercase().contains("out of date") => {
-                let (fresh, _) = self.fetch_record(&record.item.id, &ctx.keys)?;
-                decrypted(attempt(&fresh).map_err(|e| e.or_say(SHARE_FAILED))?)
-            }
-            Err(e) => Err(e.or_say(SHARE_FAILED)),
+        let mut cipher = crate::rest::write::encrypt_item(&record.carrying(moved), &ctx.keys)
+            .map_err(|e| crypto(e).or_say(SHARE_FAILED))?;
+        match &own_key {
+            Some(key) => cipher.rekey_carried(key, key),
+            None => cipher.rekey_carried(ctx.keys.user(), &ctx.org_key),
         }
+        .map_err(unreadable)?;
+        Ok(cipher)
     }
 
     /// Reads the org's roster and collections back into `held` after a write,
@@ -1130,6 +1214,12 @@ impl Sharing {
             None => {
                 let (org_id, org_key) = self.create_org(&profile, &account, &keys, &email)?;
                 keys = Arc::new(keys.with_organization(&org_id, org_key.clone()));
+                // Into the backend's key cache too, which `keys_from` filled:
+                // the moved record comes back under this org, and a read the
+                // backend makes before its next whole read (a hub push's
+                // one-record apply) needs the key the profile does not name
+                // yet.
+                *self.keys.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&keys));
                 // A server that made C(E) from `collectionName` (spec 9.5) is
                 // adopted here by name, like any other collection.
                 let collections = self.collections_of(&org_id, &org_key)?;
@@ -1620,13 +1710,18 @@ mod tests {
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"])]))
             .create();
-        server.mock("PUT", "/api/ciphers/live-1/share").with_status(500).create();
+        let moved = server.mock("PUT", "/api/ciphers/live-1/share").with_status(500).expect_at_least(1).create();
+        let before = serde_json::to_value(cache.get_by_id("live-1").expect("in the daemon's vault")).expect("json");
         let answer = crate::vault_api::tests::ask(&api, "POST", "/sharing/item/live-1", Some(&token), r#"{"email":"anna@example.com"}"#);
+        moved.assert();
         assert_eq!(answer.status, 400);
         let body: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
         assert_eq!(body["message"], SHARE_FAILED);
-        let held = cache.get_by_id("live-1").expect("still in the daemon's vault");
-        assert_eq!(organization_of(&held), None, "the record stayed personal");
+        // The move WAS tried (above) and failed: the daemon's copy is the one
+        // it held before, byte for byte, and no window was told otherwise.
+        let after = serde_json::to_value(cache.get_by_id("live-1").expect("still in the daemon's vault")).expect("json");
+        assert_eq!(after, before, "a failed move changed the daemon's copy");
+        assert!(api.feed().wait_after(Some(0), false, std::time::Duration::ZERO).changes.is_empty(), "a failed move was announced");
     }
 
     /// **What cannot move is refused before anything is sent** (spec 9.3,
@@ -1674,6 +1769,326 @@ mod tests {
             other => panic!("expected the keys refusal, got {other:?}"),
         }
         record.assert();
+        writes.assert();
+        puts.assert();
+    }
+
+    // ---- fix round 1: what a move carries, and the risks the review named ----
+
+    fn user_sealed(plain: &str) -> String {
+        crate::rest::crypto::tests::seal(&crate::rest::backend::tests::fixture_user_key(), plain.as_bytes())
+    }
+
+    /// The fixture org already has anna, confirmed, in her own collection: a
+    /// share of a personal record is its read and its `/share`.
+    fn anna_is_confirmed(server: &mut MockServer) {
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str())
+            .with_body(serde_json::json!({ "data": [person_collection("c-anna", "anna@example.com")] }).to_string())
+            .create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[
+                roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]),
+                roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"]),
+            ]))
+            .create();
+    }
+
+    /// `/share` for `id`, answered with the echo, the cipher it was sent kept
+    /// for the test.
+    fn share_captured(server: &mut MockServer, id: &'static str) -> (Arc<Mutex<Option<serde_json::Value>>>, crate::test_http::Mock) {
+        let captured = Arc::new(Mutex::new(None));
+        let keep = Arc::clone(&captured);
+        let reply = echo(id, Some(FIXTURE_ORG), &["c-anna"]);
+        let mock = server
+            .mock("PUT", format!("/api/ciphers/{id}/share").as_str())
+            .with_body_from_request(move |request| {
+                let body: serde_json::Value = serde_json::from_slice(request.body()).expect("json");
+                *keep.lock().expect("unpoisoned") = Some(body["cipher"].clone());
+                reply(request)
+            })
+            .expect(1)
+            .create();
+        (captured, mock)
+    }
+
+    /// Every ciphertext leaf of a cipher body but its own `key`, at any depth,
+    /// and inside a string that is JSON (NodeWarden's `data`).
+    fn ciphertext_leaves(cipher: &serde_json::Value) -> Vec<String> {
+        fn walk(value: &serde_json::Value, out: &mut Vec<String>) {
+            match value {
+                serde_json::Value::String(text) => {
+                    if text.parse::<EncString>().is_ok() {
+                        out.push(text.clone());
+                    } else if let Ok(nested @ (serde_json::Value::Object(_) | serde_json::Value::Array(_))) =
+                        serde_json::from_str::<serde_json::Value>(text)
+                    {
+                        walk(&nested, out);
+                    }
+                }
+                serde_json::Value::Array(list) => list.iter().for_each(|v| walk(v, out)),
+                serde_json::Value::Object(map) => map.values().for_each(|v| walk(v, out)),
+                _ => {}
+            }
+        }
+        let mut body = cipher.clone();
+        if let Some(object) = body.as_object_mut() {
+            object.remove("key");
+        }
+        let mut out = Vec::new();
+        walk(&body, &mut out);
+        out
+    }
+
+    fn opens_under(key: &SymmetricKey, leaf: &str) -> Option<String> {
+        let enc = leaf.parse::<EncString>().ok()?;
+        crate::rest::crypto::decrypt(key, &enc).ok().map(|plain| String::from_utf8_lossy(&plain).into_owned())
+    }
+
+    /// **A record without its own key moves with nothing left under the user
+    /// key** -- the Critical of the Task 9 review. `encrypt_item` re-encrypts
+    /// only what this crate models; a URI checksum, a passkey and
+    /// NodeWarden's `data` ride through, and NodeWarden merges the body over
+    /// the stored row, so each would have landed in the org unreadable by
+    /// everyone in it. Every leaf of what went on the wire opens under the
+    /// ORG key, and the carried ones say what they said before.
+    #[test]
+    fn a_record_without_its_own_key_moves_with_every_leaf_under_the_org_key() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let mut record = personal_cipher("p1", "Acme VPN");
+        record["login"]["uris"] =
+            serde_json::json!([{ "uri": user_sealed("https://acme.example"), "uriChecksum": user_sealed("checksum-1"), "match": null }]);
+        record["login"]["fido2Credentials"] = serde_json::json!([{
+            "credentialId": user_sealed("cred-1"), "keyType": user_sealed("public-key"), "keyAlgorithm": user_sealed("ECDSA"),
+            "keyCurve": user_sealed("P-256"), "keyValue": user_sealed("pkcs8-bytes"), "rpId": user_sealed("acme.example"),
+            "userHandle": user_sealed("handle"), "counter": user_sealed("0"), "discoverable": user_sealed("true"),
+            "creationDate": "2024-01-01T00:00:00.000Z"
+        }]);
+        record["passwordHistory"] =
+            serde_json::json!([{ "password": user_sealed("old-password"), "lastUsedDate": "2023-01-01T00:00:00.000Z" }]);
+        record["data"] =
+            serde_json::Value::String(serde_json::json!({ "name": user_sealed("Acme VPN"), "extra": [user_sealed("data-leaf")] }).to_string());
+        server.mock("GET", "/api/ciphers/p1").with_body(record.to_string()).create();
+        anna_is_confirmed(&mut server);
+        let (captured, share) = share_captured(&mut server, "p1");
+
+        let outcome = engine.share("p1", "anna@example.com").expect("shared");
+        share.assert();
+        assert_eq!(outcome.result, ShareResult::Shared);
+        let sent = captured.lock().expect("unpoisoned").clone().expect("a body went");
+        assert!(sent["key"].is_null(), "no key of its own was invented");
+        let org = crate::rest::backend::tests::fixture_org_key();
+        let leaves = ciphertext_leaves(&sent);
+        assert!(leaves.len() >= 18, "the walk saw only {} leaves", leaves.len());
+        for leaf in &leaves {
+            assert!(opens_under(&org, leaf).is_some(), "a leaf went to the org still under another key");
+        }
+        let open = |value: &serde_json::Value| value.as_str().and_then(|leaf| opens_under(&org, leaf));
+        assert_eq!(open(&sent["login"]["uris"][0]["uriChecksum"]).as_deref(), Some("checksum-1"));
+        assert_eq!(open(&sent["login"]["fido2Credentials"][0]["keyValue"]).as_deref(), Some("pkcs8-bytes"));
+        assert_eq!(open(&sent["passwordHistory"][0]["password"]).as_deref(), Some("old-password"));
+        let data: serde_json::Value = serde_json::from_str(sent["data"].as_str().expect("data stays a string")).expect("JSON");
+        assert_eq!(open(&data["extra"][0]).as_deref(), Some("data-leaf"));
+        assert_eq!(sent["login"]["fido2Credentials"][0]["creationDate"], "2024-01-01T00:00:00.000Z", "plaintext rides unchanged");
+    }
+
+    /// **NodeWarden's own types 6-8 move under the org key too.** This crate
+    /// models none of them, so every field of a bank account, a driver's
+    /// licence or a passport is carried -- and re-keyed by the walk.
+    #[test]
+    fn nodewardens_bank_account_licence_and_passport_move_under_the_org_key() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        anna_is_confirmed(&mut server);
+        let org = crate::rest::backend::tests::fixture_org_key();
+        for (id, kind, object) in [("b6", 6, "bankAccount"), ("b7", 7, "driversLicense"), ("b8", 8, "passport")] {
+            let mut record = personal_cipher(id, "Papers");
+            record["type"] = serde_json::json!(kind);
+            record["login"] = serde_json::Value::Null;
+            record[object] = serde_json::json!({ "number": user_sealed(&format!("{object}-number")), "holder": user_sealed("Denis") });
+            server.mock("GET", format!("/api/ciphers/{id}").as_str()).with_body(record.to_string()).create();
+            let (captured, share) = share_captured(&mut server, id);
+            engine.share(id, "anna@example.com").expect("shared");
+            share.assert();
+            let sent = captured.lock().expect("unpoisoned").clone().expect("a body went");
+            for leaf in ciphertext_leaves(&sent) {
+                assert!(opens_under(&org, &leaf).is_some(), "type {kind}: a leaf is not under the org key");
+            }
+            let number = sent[object]["number"].as_str().and_then(|leaf| opens_under(&org, leaf));
+            assert_eq!(number, Some(format!("{object}-number")), "type {kind}");
+        }
+    }
+
+    /// **A record with its own key keeps it, re-wrapped under the org key**,
+    /// and its fields -- carried ones included -- stay under that key.
+    #[test]
+    fn a_record_with_its_own_key_moves_that_key_rewrapped_under_the_org_key() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let own = crate::rest::crypto::generate_symmetric_key().expect("a key");
+        let sealed = |plain: &str| crate::rest::crypto::tests::seal(&own, plain.as_bytes());
+        let checksum = sealed("checksum-1");
+        let mut record = personal_cipher("k1", "Acme VPN");
+        record["key"] = serde_json::json!(
+            crate::rest::crypto::wrap_key_under(&own, &crate::rest::backend::tests::fixture_user_key()).expect("wrapped").to_string()
+        );
+        record["name"] = serde_json::json!(sealed("Acme VPN"));
+        record["login"] = serde_json::json!({
+            "username": sealed("u@example.com"), "password": sealed("p4ssw0rd"),
+            "uris": [{ "uri": sealed("https://acme.example"), "uriChecksum": checksum.clone(), "match": null }],
+            "fido2Credentials": []
+        });
+        server.mock("GET", "/api/ciphers/k1").with_body(record.to_string()).create();
+        anna_is_confirmed(&mut server);
+        let (captured, share) = share_captured(&mut server, "k1");
+
+        let outcome = engine.share("k1", "anna@example.com").expect("shared");
+        share.assert();
+        assert_eq!(outcome.changed.upserted[0].name, "Acme VPN");
+        let sent = captured.lock().expect("unpoisoned").clone().expect("a body went");
+        let rewrapped: EncString = sent["key"].as_str().expect("the key went").parse().expect("an EncString");
+        let unwrapped = crate::rest::crypto::unwrap_key_under(&rewrapped, &crate::rest::backend::tests::fixture_org_key())
+            .expect("the record's key opens under the org key");
+        assert_eq!(opens_under(&unwrapped, sent["name"].as_str().expect("a name")).as_deref(), Some("Acme VPN"));
+        for leaf in ciphertext_leaves(&sent) {
+            assert!(opens_under(&unwrapped, &leaf).is_some(), "a leaf is not under the record's own key");
+        }
+        assert_eq!(
+            sent["login"]["uris"][0]["uriChecksum"],
+            serde_json::json!(checksum),
+            "a carried leaf under the unchanged key is left alone"
+        );
+    }
+
+    /// **A key that differs from the pin is not wrapped to** (spec 12.1): the
+    /// person is added without the org key, the card will say their key
+    /// changed, and the pin is not moved to the new key.
+    #[test]
+    fn a_key_that_differs_from_the_pin_is_not_wrapped_to() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let state = dir.join("sharing_state.json");
+        let old = crate::sharing_state::Pin { sha256: "00".repeat(32), user_id: "anna-id".into(), at: 1 };
+        crate::sharing_state::update(&state, |s| s.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", old.clone())).expect("pinned");
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str())
+            .with_body(serde_json::json!({ "data": [person_collection("c-anna", "anna@example.com")] }).to_string())
+            .create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
+            .create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
+            .with_body(serde_json::json!({ "userId": "anna-id", "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        let invite = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
+            .match_request(|request| !request.utf8_lossy_body().contains("encryptedOrgKey"))
+            .with_body(r#"{"id":"anna-id","status":1,"object":"organizationMember"}"#)
+            .expect(1)
+            .create();
+        server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-anna"])).create();
+        let outcome = engine.share("p1", "anna@example.com").expect("shared");
+        invite.assert();
+        assert_eq!(outcome.result, ShareResult::WaitingAccept);
+        assert!(engine.held().key_changed.contains("anna@example.com"));
+        let pinned = crate::sharing_state::SharingState::load(&state).account(FIXTURE_USER_ID);
+        assert_eq!(pinned.pin_for("anna@example.com"), Some(&old), "the pin moved to a key nobody confirmed");
+    }
+
+    /// **The trash, another organisation, and a field that did not decrypt**
+    /// (spec 9.3): each refused with its own sentence, and nothing written.
+    #[test]
+    fn what_cannot_move_is_refused_with_its_own_sentence() {
+        let mut team = sharing_org_row();
+        team["id"] = serde_json::json!("org-team");
+        team["name"] = serde_json::json!("Team");
+        team["role"] = serde_json::json!("user");
+        team["type"] = serde_json::json!(2);
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row(), team]));
+        let mut trashed = personal_cipher("t1", "Old");
+        trashed["deletedDate"] = serde_json::json!("2026-09-01T00:00:00.000Z");
+        let mut theirs = shared_cipher("o1", "Team VPN", &[]);
+        theirs["organizationId"] = serde_json::json!("org-team");
+        let mut broken = personal_cipher("u1", "Half");
+        broken["notes"] =
+            serde_json::json!(crate::rest::crypto::tests::seal(&crate::rest::backend::tests::fixture_org_key(), b"not under this key"));
+        server.mock("GET", "/api/ciphers/t1").with_body(trashed.to_string()).create();
+        server.mock("GET", "/api/ciphers/o1").with_body(theirs.to_string()).create();
+        server.mock("GET", "/api/ciphers/u1").with_body(broken.to_string()).create();
+        let writes = server.mock("POST", Matcher::Any).expect(0).create();
+        let puts = server.mock("PUT", Matcher::Any).expect(0).create();
+        for (id, sentence) in [("t1", IN_TRASH), ("o1", OTHER_ORG), ("u1", UNREADABLE_PART)] {
+            match engine.share(id, "anna@example.com") {
+                Err(SharingError::Refused(said)) => assert_eq!(said, sentence, "{id}"),
+                other => panic!("{id}: expected a refusal, got {other:?}"),
+            }
+        }
+        writes.assert();
+        puts.assert();
+    }
+
+    fn stale_share(server: &mut MockServer, id: &str) -> crate::test_http::Mock {
+        server
+            .mock("PUT", format!("/api/ciphers/{id}/share").as_str())
+            .with_status(400)
+            .with_body(r#"{"message":"The client copy of this cipher is out of date. Resync the client and try again."}"#)
+            .expect(1)
+            .create()
+    }
+
+    /// **A stale revision is read again and retried once** (spec 13).
+    #[test]
+    fn a_stale_revision_is_read_again_and_retried_once() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        let read = server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).expect(2).create();
+        anna_is_confirmed(&mut server);
+        let stale = stale_share(&mut server, "p1");
+        let (_, retried) = share_captured(&mut server, "p1");
+        let outcome = engine.share("p1", "anna@example.com").expect("shared on the retry");
+        stale.assert();
+        retried.assert();
+        read.assert();
+        assert_eq!(outcome.result, ShareResult::Shared);
+    }
+
+    /// **The retry judges the fresh copy again**: one that went to the trash
+    /// in between is refused, not moved.
+    #[test]
+    fn a_stale_retry_refuses_a_fresh_copy_that_can_no_longer_move() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).expect(1).create();
+        let mut trashed = personal_cipher("p1", "Acme VPN");
+        trashed["deletedDate"] = serde_json::json!("2026-09-01T00:00:00.000Z");
+        server.mock("GET", "/api/ciphers/p1").with_body(trashed.to_string()).expect(1).create();
+        anna_is_confirmed(&mut server);
+        let stale = stale_share(&mut server, "p1");
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::Refused(said)) => assert_eq!(said, IN_TRASH),
+            other => panic!("expected the trash refusal, got {other:?}"),
+        }
+        stale.assert();
+    }
+
+    /// **An answer that is not a roster is an error, not nobody**: read as
+    /// empty, the share would invite a member again, and a reload would show
+    /// everyone as gone.
+    #[test]
+    fn an_unreadable_roster_is_an_error_and_nothing_is_invited() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str())
+            .with_body(serde_json::json!({ "data": [person_collection("c-anna", "anna@example.com")] }).to_string())
+            .create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(r#"{"message":"Not found"}"#)
+            .create();
+        let writes = server.mock("POST", Matcher::Any).expect(0).create();
+        let puts = server.mock("PUT", Matcher::Any).expect(0).create();
+        assert!(matches!(engine.fetch_roster(FIXTURE_ORG), Err(SharingError::Refused(s)) if s == ROSTER_UNREADABLE));
+        assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::Refused(s)) if s == ROSTER_UNREADABLE));
         writes.assert();
         puts.assert();
     }

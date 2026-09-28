@@ -2612,7 +2612,8 @@ fn kdf_from(parsed: &PreloginResponse) -> Result<Kdf, RestError> {
 /// GUID, so hex digits and hyphens is the whole of what a real one contains,
 /// and percent-encoding an id that is not one would send a well-formed
 /// request for a record that cannot exist. Refusing says the truer thing.
-/// `pub(crate)` for `rest::sharing_api`, which builds paths from server ids by the same rule.
+/// `pub(crate)` for `rest::sharing_api`, which builds paths from server ids by the same rule,
+/// and `daemon_link::SharingClient`, which puts a record id in the daemon's.
 pub(crate) fn is_url_path_safe(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
