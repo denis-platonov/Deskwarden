@@ -933,11 +933,21 @@ impl Sharing {
 
     /// Whether the ten-minute timer has anything to do: someone in this
     /// account's org is invited or accepted and not yet confirmed.
+    ///
+    /// **An invitation that has expired does not count** (final review): it
+    /// can no longer be accepted, so nothing the timer reads can move it --
+    /// only a Re-invite, which the user makes. Counted, one stale invitation
+    /// kept the timer reading the roster every ten minutes for good.
     #[must_use]
     pub fn wants_timer(&self) -> bool {
         let held = self.held();
+        let now = now_millis();
         held.my_org.as_ref().is_some_and(|org| {
-            org.roster.iter().any(|m| m.status != MemberStatus::Confirmed && org.authenticated_collection_for(&m.email).is_some())
+            org.roster.iter().any(|m| {
+                m.status != MemberStatus::Confirmed
+                    && !invitation_ran_out(m, now)
+                    && org.authenticated_collection_for(&m.email).is_some()
+            })
         })
     }
 }
@@ -1291,10 +1301,22 @@ impl Sharing {
                     Ok(ShareResult::WaitingAccept)
                 }
             }
+            // No key: no account -- or an account with no key pair yet,
+            // which NodeWarden adds directly (`InviteOutcome::Member`). That
+            // one HAS an account, so "waiting to create an account" would be
+            // wrong about it (final review): it waits to accept, and the
+            // confirm pass marks it waiting for a first sign-in once it sees
+            // no key.
             None => {
-                self.call(|client, auth| sharing_api::invite_member(client, &mut auth.session, &ctx.org_id, email, collection, None))
+                let outcome = self
+                    .call(|client, auth| sharing_api::invite_member(client, &mut auth.session, &ctx.org_id, email, collection, None))
                     .map_err(|e| e.or_say(&refused))?;
-                Ok(ShareResult::WaitingAccount)
+                Ok(match outcome {
+                    sharing_api::InviteOutcome::Member => ShareResult::WaitingAccept,
+                    sharing_api::InviteOutcome::Invitation { .. } | sharing_api::InviteOutcome::AlreadyThere => {
+                        ShareResult::WaitingAccount
+                    }
+                })
             }
         }
     }
@@ -2746,12 +2768,7 @@ fn person_state(member: Option<&Member>, collection_id: &str, held: &Held, now: 
     let email = normalise_email(&member.email);
     match member.status {
         MemberStatus::Invited => {
-            let expired = member
-                .invitation_expires
-                .as_deref()
-                .and_then(crate::send::parse_iso_utc_millis)
-                .is_some_and(|at| at < now);
-            if expired { PersonState::Expired } else { PersonState::WaitingAccount }
+            if invitation_ran_out(member, now) { PersonState::Expired } else { PersonState::WaitingAccount }
         }
         MemberStatus::Accepted if held.key_changed.contains(&email) => PersonState::KeyChanged,
         MemberStatus::Accepted if held.no_key.contains(&email) => PersonState::WaitingSignIn,
@@ -2759,6 +2776,14 @@ fn person_state(member: Option<&Member>, collection_id: &str, held: &Held, now: 
         MemberStatus::Confirmed if member.has_access(collection_id) => PersonState::Shared,
         MemberStatus::Confirmed => PersonState::Gone,
     }
+}
+
+/// A pending invitation whose expiry has passed -- the card's `Expired`, and
+/// what [`Sharing::wants_timer`] leaves out. A member past the invitation, or
+/// one with no expiry the server named, is not expired.
+fn invitation_ran_out(member: &Member, now: i64) -> bool {
+    member.status == MemberStatus::Invited
+        && member.invitation_expires.as_deref().and_then(crate::send::parse_iso_utc_millis).is_some_and(|at| at < now)
 }
 
 /// Now, UTC milliseconds.
@@ -4828,6 +4853,49 @@ mod tests {
         moved.assert();
         let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
         assert!(state.pin_for("anna@example.com").is_none(), "a refused key is not pinned");
+    }
+
+    /// **An expired invitation gives the timer nothing to do** (final
+    /// review): nobody can accept it, so only a Re-invite moves it. A live
+    /// one still does.
+    #[test]
+    fn an_expired_invitation_does_not_keep_the_timer_running() {
+        let engine = offline();
+        let set = |expires: &str| {
+            engine.held().my_org = Some(MyOrg {
+                id: "org1".into(),
+                collections: vec![authentic("c-dan", "dan@x.io")],
+                roster: vec![member("dan@x.io", MemberStatus::Invited, &["c-dan"], Some(expires))],
+            });
+        };
+        set("2000-01-01T00:00:00Z");
+        assert!(!engine.wants_timer(), "an expired invitation");
+        set("2999-01-01T00:00:00Z");
+        assert!(engine.wants_timer(), "control: a live invitation still wants the timer");
+    }
+
+    /// **A keyless account added directly is waiting to accept, not to
+    /// create an account** (final review): NodeWarden answers a member row,
+    /// not an invitation, for an address that has an account with no key.
+    #[test]
+    fn a_keyless_account_added_directly_is_waiting_to_accept() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[person_collection("c-kim", "kim@example.com")]);
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=kim%40example.com").as_str())
+            .with_status(404)
+            .create();
+        let added = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
+            .with_body(r#"{"id":"kim-id","userId":"kim-id","status":1,"object":"organizationUserUserDetails"}"#)
+            .expect(1)
+            .create();
+        server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-kim"])).create();
+        let outcome = engine.share("p1", "kim@example.com").expect("shared");
+        added.assert();
+        assert_eq!(outcome.result, ShareResult::WaitingAccept, "an existing account is never told to create one");
     }
 
     // ---- final review, I1: a plaintext name never starts a grant ----
