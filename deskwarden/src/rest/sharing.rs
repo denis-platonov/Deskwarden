@@ -989,9 +989,25 @@ fn state_refused(e: &std::io::Error) -> SharingError {
     )
 }
 
-/// A crypto failure as a sharing error, mapped as the backend maps it.
+/// A crypto failure as a sharing error, mapped as the backend maps it --
+/// except a person's key too short to wrap to, which is a refusal the user
+/// can read (final review, item 6): it is a fact about THEIR key, not this
+/// vault's cryptography failing.
 pub(crate) fn crypto(e: CryptoError) -> SharingError {
-    SharingError::Vault(crate::rest::backend::crypto_error(e))
+    match e {
+        CryptoError::RsaKeyTooShort { bits } => SharingError::Refused(key_too_short(bits)),
+        e => SharingError::Vault(crate::rest::backend::crypto_error(e)),
+    }
+}
+
+/// Their account's key is too short to hand the org key to.
+#[must_use]
+pub fn key_too_short(bits: usize) -> String {
+    format!(
+        "Their encryption key is only {bits} bits, too short to share with safely. \
+         Deskwarden needs at least {}.",
+        crate::rest::crypto::MIN_RSA_BITS
+    )
 }
 
 /// Plausibly an email: one `@` with something either side, no whitespace.
@@ -4781,6 +4797,37 @@ mod tests {
         key.assert();
         confirm.assert();
         assert!(!pass.changed);
+    }
+
+    /// **A direct add to a key under 2048 bits is refused before the member
+    /// is written** (final review, item 6): the server chooses which key an
+    /// email answers with, and the org key wrapped to a short one is not a
+    /// secret. The refusal says so; nothing is invited and nothing pinned.
+    #[test]
+    fn a_share_to_a_short_key_is_refused_before_anyone_is_added() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        let short = {
+            use rsa::pkcs8::EncodePublicKey;
+            let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).expect("a 1024-bit key");
+            private.to_public_key().to_public_key_der().expect("spki").as_bytes().to_vec()
+        };
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
+            .with_body(serde_json::json!({ "userId": "anna-id", "publicKey": crate::rest::crypto::tests::base64(&short) }).to_string())
+            .create();
+        let invite = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str()).expect(0).create();
+        let moved = server.mock("PUT", "/api/ciphers/p1/share").expect(0).create();
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, key_too_short(1024)),
+            other => panic!("a short key was shared to: {other:?}"),
+        }
+        invite.assert();
+        moved.assert();
+        let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert!(state.pin_for("anna@example.com").is_none(), "a refused key is not pinned");
     }
 
     // ---- final review, I1: a plaintext name never starts a grant ----

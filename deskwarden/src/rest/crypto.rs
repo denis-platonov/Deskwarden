@@ -161,6 +161,12 @@ pub enum CryptoError {
     /// unwrapping failed. One arm for both on purpose: distinguishing them
     /// tells a caller which half of a secret was wrong.
     Rsa,
+    /// **A public key too short to wrap to** -- [`encrypt_rsa`] refuses any
+    /// modulus under [`MIN_RSA_BITS`] (final review, item 6). The org key
+    /// wrapped to a 1024-bit key is an org key anyone who factors it holds,
+    /// and the server chooses which key a member's email answers with. The
+    /// size is of a PUBLIC key, so it may be printed.
+    RsaKeyTooShort { bits: usize },
 }
 
 impl std::fmt::Display for CryptoError {
@@ -179,6 +185,9 @@ impl std::fmt::Display for CryptoError {
             }
             Self::Rng => f.write_str("the operating system would not produce randomness"),
             Self::Rsa => f.write_str("RSA unwrapping failed"),
+            Self::RsaKeyTooShort { bits } => {
+                write!(f, "the RSA public key is {bits} bits; at least {MIN_RSA_BITS} are required")
+            }
         }
     }
 }
@@ -961,6 +970,11 @@ pub fn decrypt_rsa(
 /// client generates, and what type 4 (`Rsa2048_OaepSha1_B64`) is named for.
 pub const ORG_KEY_BITS: usize = 2048;
 
+/// **The shortest RSA modulus anything is wrapped to** -- Bitwarden's own
+/// size, and the one type 4 (`Rsa2048_OaepSha1_B64`) is named for. See
+/// [`CryptoError::RsaKeyTooShort`].
+pub const MIN_RSA_BITS: usize = 2048;
+
 /// The OS generator the `rsa` crate draws from, **asked first**.
 ///
 /// `rand_core`'s `OsRng` panics if the OS refuses randomness -- the trait it
@@ -978,9 +992,19 @@ fn os_rng_ready() -> Result<OsRng, CryptoError> {
 /// RSA-OAEP-SHA1 encryption to a public key given as SPKI DER, as a type-4
 /// [`EncString`] -- the inverse of [`decrypt_rsa`], and what an organisation
 /// key wrapped for a member is.
+///
+/// **A key under [`MIN_RSA_BITS`] is refused** with
+/// [`CryptoError::RsaKeyTooShort`], before any randomness is drawn -- so
+/// [`wrap_key_to_public`], which every org-key hand-over goes through, never
+/// wraps to one (`a_key_shorter_than_2048_bits_is_never_wrapped_to`).
 pub fn encrypt_rsa(public_key_spki_der: &[u8], plain: &[u8]) -> Result<EncString, CryptoError> {
+    use rsa::traits::PublicKeyParts;
     let key =
         RsaPublicKey::from_public_key_der(public_key_spki_der).map_err(|_| CryptoError::Rsa)?;
+    let bits = key.n().bits();
+    if bits < MIN_RSA_BITS {
+        return Err(CryptoError::RsaKeyTooShort { bits });
+    }
     let mut rng = os_rng_ready()?;
     let ct = key.encrypt(&mut rng, Oaep::new::<sha1::Sha1>(), plain).map_err(|_| CryptoError::Rsa)?;
     Ok(EncString::Rsa2048OaepSha1B64 { ct })
@@ -1947,11 +1971,33 @@ pub mod tests {
             CryptoError::Padding,
             CryptoError::KeyLength { expected: 64, got: 32 },
             CryptoError::Rsa,
+            CryptoError::RsaKeyTooShort { bits: 1024 },
         ] {
             let text = error.to_string();
             assert!(!text.is_empty());
             assert!(!text.contains("222"), "{text}");
         }
+    }
+
+    /// **Nothing is wrapped to an RSA key under 2048 bits** (final review,
+    /// item 6): a 1024-bit key -- one a server could serve for a member's
+    /// email -- is refused by name with its size, and a 2048-bit one still
+    /// wraps.
+    #[test]
+    fn a_key_shorter_than_2048_bits_is_never_wrapped_to() {
+        let mut rng = rsa::rand_core::OsRng;
+        let short = RsaPrivateKey::new(&mut rng, 1024).expect("a 1024-bit key");
+        let spki = short.to_public_key().to_public_key_der().expect("spki");
+        let org = generate_symmetric_key().expect("an org key");
+        match wrap_key_to_public(&org, spki.as_bytes()) {
+            Err(e @ CryptoError::RsaKeyTooShort { bits: 1024 }) => {
+                assert!(e.to_string().contains("1024 bits"), "{e}");
+                assert!(e.to_string().contains("2048"), "{e}");
+            }
+            other => panic!("a 1024-bit key was wrapped to: {other:?}"),
+        }
+        assert!(matches!(encrypt_rsa(spki.as_bytes(), b"x"), Err(CryptoError::RsaKeyTooShort { bits: 1024 })));
+        assert!(wrap_key_to_public(&org, &fixture_public_spki()).is_ok(), "the 2048-bit fixture still wraps");
     }
 
     // ---- the composition, against BITWARDEN's own published vectors -------
