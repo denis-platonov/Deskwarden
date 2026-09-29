@@ -2892,7 +2892,45 @@ pub fn action_button_width(painter: &egui::Painter, label: &str, pad_x: f32) -> 
 /// lets a pane reserve every slot on a row before it fills any of them. See
 /// [`ActionTone`] for why this exists at all.
 pub fn action_button(ui: &mut Ui, rect: Rect, label: &str, tone: ActionTone) -> Response {
+    placed_button(ui, rect, label, tone, ACTION_BUTTON_TEXT_PX, ACTION_BUTTON_RADIUS, true)
+}
+
+/// [`action_button`], able to say "not now": `enabled == false` paints
+/// [`OFF_FILL`] / [`OFF_EDGE`] / [`OFF_INK`] and senses nothing, for
+/// [`OFF_FILL`]'s reasons -- a refusal, not a faded live colour.
+pub fn action_button_enabled(ui: &mut Ui, rect: Rect, label: &str, tone: ActionTone, enabled: bool) -> Response {
+    placed_button(ui, rect, label, tone, ACTION_BUTTON_TEXT_PX, ACTION_BUTTON_RADIUS, enabled)
+}
+
+/// The design's small button, `.btn.sm { height: 28px; padding: 0 11px;
+/// font-size: 12px; border-radius: 7px }` -- 6d's invitation row's Accept and
+/// Decline. The same placed control as [`action_button`], one size down.
+pub const SMALL_BUTTON_HEIGHT: f32 = 28.0;
+pub const SMALL_BUTTON_PAD_X: f32 = 11.0;
+pub const SMALL_BUTTON_TEXT_PX: f32 = 12.0;
+pub const SMALL_BUTTON_RADIUS: u8 = 7;
+
+/// How wide `label` needs its small button to be: [`action_button_width`]'s
+/// measurement at [`SMALL_BUTTON_TEXT_PX`] and [`SMALL_BUTTON_PAD_X`].
+pub fn small_button_width(painter: &egui::Painter, label: &str) -> f32 {
+    let galley = painter.layout_no_wrap(
+        label.to_string(),
+        FontId::new(SMALL_BUTTON_TEXT_PX, FontFamily::Name(SEMIBOLD.into())),
+        INK,
+    );
+    galley.size().x + SMALL_BUTTON_PAD_X * 2.0
+}
+
+/// One `.btn.sm`, drawn into `rect` -- see [`action_button_enabled`] for
+/// `enabled`.
+pub fn small_action_button(ui: &mut Ui, rect: Rect, label: &str, tone: ActionTone, enabled: bool) -> Response {
+    placed_button(ui, rect, label, tone, SMALL_BUTTON_TEXT_PX, SMALL_BUTTON_RADIUS, enabled)
+}
+
+/// The one body of every rect-placed button above.
+fn placed_button(ui: &mut Ui, rect: Rect, label: &str, tone: ActionTone, text_px: f32, radius: u8, enabled: bool) -> Response {
     let (fill, stroke, ink) = match tone {
+        _ if !enabled => (OFF_FILL, Stroke::new(1.0, OFF_EDGE), OFF_INK),
         ActionTone::Primary => (BLUE, Stroke::NONE, Color32::WHITE),
         ActionTone::Secondary => (CARD, Stroke::new(1.0, BORDER_STRONG), INK),
         ActionTone::Destructive => (ERROR, Stroke::NONE, Color32::WHITE),
@@ -2928,12 +2966,13 @@ pub fn action_button(ui: &mut Ui, rect: Rect, label: &str, tone: ActionTone) -> 
     ui.spacing_mut().button_padding = Vec2::ZERO;
     let response = ui.put(
         rect,
-        egui::Button::new(semibold(label, ACTION_BUTTON_TEXT_PX).color(ink))
+        egui::Button::new(semibold(label, text_px).color(ink))
             .fill(fill)
             .stroke(stroke)
-            .corner_radius(CornerRadius::same(ACTION_BUTTON_RADIUS))
+            .corner_radius(CornerRadius::same(radius))
             .wrap_mode(egui::TextWrapMode::Extend)
-            .min_size(rect.size()),
+            .min_size(rect.size())
+            .sense(if enabled { Sense::click() } else { Sense::hover() }),
     );
     ui.spacing_mut().button_padding = saved;
     response

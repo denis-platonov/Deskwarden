@@ -4501,6 +4501,7 @@ pub fn build_frame_with_search(
             received: &received_share_rows,
             incoming: &incoming_rows,
             waiting: &waiting_from,
+            busy: sharing.is_busy(),
         };
         let open_record = apply_send_action(
             egui::CentralPanel::default()
@@ -6659,15 +6660,24 @@ pub fn build_frame_with_search(
             // press, by the view's id -- the token is the daemon's. Asked
             // about the invitation's own key, so a refusal stands on its pane
             // (`notice_about` above) and not on whatever record is shown next.
+            //
+            // A request that is REFUSED -- no line to the daemon, a write
+            // already out -- has its sentence pinned to the invitation too
+            // (`pin_notice_to`): said on its pane when that is on screen, and
+            // as a toast when the press came from a row beside another pick.
             Some(share_ui::PeopleAsk::Accept(id)) => {
                 let key = format!("{}{id}", share_ui::INVITE_KEY_PREFIX);
                 let call = share_ui::SharingCall::Accept(id);
-                let _ = share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                if !share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call) {
+                    sharing.pin_notice_to(&key);
+                }
             }
             Some(share_ui::PeopleAsk::Decline(id)) => {
                 let key = format!("{}{id}", share_ui::INVITE_KEY_PREFIX);
                 let call = share_ui::SharingCall::Decline(id);
-                let _ = share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
+                if !share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call) {
+                    sharing.pin_notice_to(&key);
+                }
             }
             None => {}
         }
@@ -7338,7 +7348,7 @@ pub fn build_frame_with_search(
         if let Some((org, from, record)) = leave_ask.clone() {
             match share_ui::draw_leave_confirm(ui.ctx(), &from) {
                 Some(true) => {
-                    let call = share_ui::SharingCall::Leave(org);
+                    let call = share_ui::SharingCall::Leave { organization_id: org, from };
                     let _ = share_ui::request_on(&mut sharing, &record, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
                     leave_ask = None;
                 }

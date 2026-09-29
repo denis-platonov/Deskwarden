@@ -73,6 +73,11 @@ pub(crate) fn confirmed_toast(email: &str) -> String {
     format!("Shared with {email} on their new key.")
 }
 
+/// Stop receiving went through: every record from them has left the vault.
+pub(crate) fn stopped_receiving_toast(from: &str) -> String {
+    format!("Stopped receiving from {from}.")
+}
+
 /// A Re-invite went through.
 pub(crate) fn reinvited_toast(email: &str) -> String {
     format!("Invitation sent to {email}.")
@@ -373,6 +378,25 @@ impl SharingPane {
     // the frame's own `incoming_rows` now -- the rows the list draws -- so
     // the badge = list rule holds for it as for the counts.
 
+    /// A write holds the one slot ([`request`]): what greys the invitations'
+    /// Accept and Decline ([`PeopleRows::busy`]).
+    pub(crate) fn is_busy(&self) -> bool {
+        self.busy
+    }
+
+    /// **A refused write's sentence, pinned to the thing it was asked on** --
+    /// an invitation's key, for an Accept or a Decline [`request`] would not
+    /// start. `request` says a refusal about no record in particular, and on
+    /// Shared with me that stands only on the invitation pane on screen; one
+    /// asked from a row while something else is picked would be said
+    /// nowhere. Pinned, it stands on that invitation's pane when it is shown
+    /// and goes to a toast otherwise ([`route_stray_notice`]).
+    pub(crate) fn pin_notice_to(&mut self, record: &str) {
+        if self.notice.is_some() {
+            self.notice_record = Some(record.to_string());
+        }
+    }
+
     /// Handed to the read pane by [`people_sharing`], for the SHARING card.
     pub(crate) fn confirming_for(&self, item_id: &str) -> Option<&str> {
         self.stop_confirming.as_ref().filter(|(id, _)| id == item_id).map(|(_, e)| e.as_str())
@@ -604,7 +628,10 @@ pub(crate) enum SharingCall {
     InviteCode { email: String, password: Zeroizing<String> },
     Accept(String),
     Decline(String),
-    Leave(String),
+    /// Stop receiving: the sharer's org, and the sharer as the view names
+    /// them -- for the toast that says it is done, which the daemon's plain
+    /// "done" cannot name.
+    Leave { organization_id: String, from: String },
 }
 
 impl SharingCall {
@@ -627,7 +654,8 @@ impl SharingCall {
             Self::InviteCode { .. } => SharingReport::InviteCode(Err(err)),
             Self::Reinvite(email) => SharingReport::Reinvited { email: email.clone(), result: Err(err) },
             Self::Confirm { email, .. } => SharingReport::Confirmed { email: email.clone(), result: Err(err) },
-            Self::Accept(_) | Self::Decline(_) | Self::Leave(_) => SharingReport::Done(Err(err)),
+            Self::Accept(_) | Self::Decline(_) => SharingReport::Done(Err(err)),
+            Self::Leave { from, .. } => SharingReport::Left { from: from.clone(), result: Err(err) },
         }
     }
 
@@ -654,6 +682,8 @@ pub(crate) enum SharingReport {
     Reinvited { email: String, result: Result<(), String> },
     /// Share anyway's answer, likewise.
     Confirmed { email: String, result: Result<(), String> },
+    /// Stop receiving's answer, with the sharer its toast names.
+    Left { from: String, result: Result<(), String> },
     Done(Result<(), String>),
     /// The names of the records a forget stopped -- decrypted names.
     Forgot(Result<Vec<String>, String>),
@@ -677,6 +707,7 @@ impl std::fmt::Debug for SharingReport {
             Self::Stopped { result, .. } => ("Stopped", outcome(result)),
             Self::Reinvited { result, .. } => ("Reinvited", outcome(result)),
             Self::Confirmed { result, .. } => ("Confirmed", outcome(result)),
+            Self::Left { result, .. } => ("Left", outcome(result)),
             Self::Done(r) => ("Done", outcome(r)),
             Self::Forgot(r) => ("Forgot", outcome(r)),
             Self::Fingerprint { result, .. } => ("Fingerprint", outcome(result)),
@@ -716,7 +747,10 @@ pub(crate) fn run(client: &SharingClient, call: SharingCall) -> SharingReport {
         SharingCall::InviteCode { email, password } => SharingReport::InviteCode(client.invite_code(&email, &password)),
         SharingCall::Accept(id) => SharingReport::Done(client.accept(&id)),
         SharingCall::Decline(id) => SharingReport::Done(client.decline(&id)),
-        SharingCall::Leave(org) => SharingReport::Done(client.leave(&org)),
+        SharingCall::Leave { organization_id, from } => {
+            let result = client.leave(&organization_id);
+            SharingReport::Left { from, result }
+        }
     }
 }
 
@@ -968,6 +1002,12 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
             Ok(()) => toast(pane, confirmed_toast(&email)),
             Err(sentence) => fail(pane, sentence),
         },
+        // The records have gone from the vault (the feed says so); the
+        // toast says why, since the record the user was reading went with them.
+        SharingReport::Left { from, result } => match result {
+            Ok(()) => toast(pane, stopped_receiving_toast(&from)),
+            Err(sentence) => fail(pane, sentence),
+        },
         SharingReport::Done(result) => {
             if let Err(sentence) = result {
                 fail(pane, sentence);
@@ -1022,8 +1062,11 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
     // on the card, and in an open dialog that was told it -- rather than
     // standing beside a slot that is no longer busy. A sentence this report
     // put up is a different one and stays.
+    // An Accept's or Decline's refusal pinned to its invitation
+    // (`SharingPane::pin_notice_to`) is spent the same way, tag and all.
     if pane.notice.as_deref() == Some(BUSY) {
         pane.notice = None;
+        pane.notice_record = None;
     }
     if let Some(dialog) = pane.dialog.as_mut().filter(|d| d.error.as_deref() == Some(BUSY)) {
         dialog.error = None;
@@ -2392,6 +2435,10 @@ pub struct PeopleRows<'a> {
     /// its member nothing until the sharer's daemon confirms them, and
     /// without the line an Accept would look like it did nothing.
     pub(crate) waiting: &'a [String],
+    /// **A sharing write is out** ([`SharingPane::is_busy`]): Accept and
+    /// Decline are drawn greyed and sense nothing, rather than being pressed
+    /// only for [`request`] to refuse them with [`BUSY`].
+    pub(crate) busy: bool,
 }
 
 impl PeopleRows<'static> {
@@ -2407,6 +2454,7 @@ impl PeopleRows<'static> {
             received: &[],
             incoming: &[],
             waiting: &[],
+            busy: false,
         }
     }
 }
@@ -2596,15 +2644,13 @@ pub(crate) const INVITE_EXPIRES_ROW: &str = "Invite expires";
 /// 6d's `.invite` geometry: `padding: 11px 12px`, a 40pt avatar (`.pav.lg`)
 /// 11pt from its words, `gap: 10px` down to the actions, which are
 /// `padding-left: 51px` in -- under the words, not the avatar -- and are
-/// `.btn.sm`: 28pt tall, 11pt of side padding, 8pt apart.
+/// `.btn.sm` (`theme::small_action_button`), 8pt apart.
 const INVITE_PAD_X: f32 = 12.0;
 const INVITE_PAD_Y: f32 = 11.0;
 pub(crate) const INVITER_AVATAR: f32 = 40.0;
 const INVITER_INITIAL_SIZE: f32 = 15.0;
 const INVITE_AVATAR_GAP: f32 = 11.0;
 const INVITE_ACTS_GAP: f32 = 10.0;
-const INVITE_BUTTON_HEIGHT: f32 = 28.0;
-const INVITE_BUTTON_PAD_X: f32 = 11.0;
 const INVITE_BUTTON_GAP: f32 = 8.0;
 const INVITE_RADIUS: u8 = 10;
 const INVITE_TITLE_SIZE: f32 = 13.0;
@@ -2613,7 +2659,7 @@ const INVITE_LINE_GAP: f32 = 2.0;
 /// One invitation row, whole: what `send_ui` adds to its list's measured
 /// height so the scroll bar is decided on the list really drawn.
 pub(crate) const INVITE_ROW_HEIGHT: f32 =
-    INVITE_PAD_Y + INVITER_AVATAR + INVITE_ACTS_GAP + INVITE_BUTTON_HEIGHT + INVITE_PAD_Y;
+    INVITE_PAD_Y + INVITER_AVATAR + INVITE_ACTS_GAP + theme::SMALL_BUTTON_HEIGHT + INVITE_PAD_Y;
 /// One [`waiting_line`]: 12pt words in a band as tall as a group eyebrow's
 /// row pair, inset as the eyebrows are.
 pub(crate) const WAITING_LINE_HEIGHT: f32 = 24.0;
@@ -2773,15 +2819,18 @@ pub(crate) fn draw_incoming_rows(ui: &mut egui::Ui, people: &mut PeopleRows<'_>,
         let slot = |x: f32, label: &str| {
             egui::Rect::from_min_size(
                 egui::pos2(x, acts_top),
-                egui::vec2(theme::action_button_width(ui.painter(), label, INVITE_BUTTON_PAD_X), INVITE_BUTTON_HEIGHT),
+                egui::vec2(theme::small_button_width(ui.painter(), label), theme::SMALL_BUTTON_HEIGHT),
             )
         };
         let accept = slot(text_left, ACCEPT_LABEL);
         let decline = slot(accept.right() + INVITE_BUTTON_GAP, DECLINE_LABEL);
-        if theme::action_button(ui, accept, ACCEPT_LABEL, theme::ActionTone::Primary).clicked() {
+        // Greyed, and deaf, while a sharing write is out: `request` would
+        // only refuse a second one with "still running".
+        let enabled = !people.busy;
+        if theme::small_action_button(ui, accept, ACCEPT_LABEL, theme::ActionTone::Primary, enabled).clicked() {
             people.asked = Some(PeopleAsk::Accept(row.id.clone()));
         }
-        if theme::action_button(ui, decline, DECLINE_LABEL, theme::ActionTone::Secondary).clicked() {
+        if theme::small_action_button(ui, decline, DECLINE_LABEL, theme::ActionTone::Secondary, enabled).clicked() {
             people.asked = Some(PeopleAsk::Decline(row.id.clone()));
         }
     }
@@ -2800,10 +2849,15 @@ pub(crate) fn draw_incoming_rows(ui: &mut egui::Ui, people: &mut PeopleRows<'_>,
     }
 }
 
-/// The height [`draw_incoming_rows`] takes, with the list's `gap` after each
-/// of its rows -- what `send_ui` adds to its row count's height.
+/// The height [`draw_incoming_rows`] takes, with the list's `gap` BETWEEN its
+/// rows -- `n` rows, `n - 1` gaps, and nothing for none. The gap joining them
+/// to rows under them is the caller's: only it knows whether there are any
+/// (`send_ui`'s `rows_area`, which counts gaps the same way).
 pub(crate) fn incoming_rows_height(people: &PeopleRows<'_>, row_gap: f32) -> f32 {
-    people.incoming.len() as f32 * (INVITE_ROW_HEIGHT + row_gap) + people.waiting.len() as f32 * (WAITING_LINE_HEIGHT + row_gap)
+    let rows = people.incoming.len() + people.waiting.len();
+    people.incoming.len() as f32 * INVITE_ROW_HEIGHT
+        + people.waiting.len() as f32 * WAITING_LINE_HEIGHT
+        + rows.saturating_sub(1) as f32 * row_gap
 }
 
 /// **The invitation's pane** (mock 6d): the sharer, Accept and Decline, what
@@ -3077,6 +3131,8 @@ mod tests {
             SharingReport::Done(Err(secret.into())),
             SharingReport::Reinvited { email: "anna@x.io".into(), result: Err(secret.into()) },
             SharingReport::Confirmed { email: "anna@x.io".into(), result: Err(secret.into()) },
+            SharingReport::Left { from: "anna@x.io".into(), result: Err(secret.into()) },
+            SharingReport::Left { from: "anna@x.io".into(), result: Ok(()) },
             SharingReport::Forgot(Err(secret.into())),
             SharingReport::Forgot(Ok(vec!["Acme VPN".into()])),
             SharingReport::Fingerprint { email: "anna@x.io".into(), result: Err(secret.into()) },
@@ -4311,5 +4367,95 @@ mod tests {
         }];
         let _ = ctx.run_ui(input(escape), |ui| answer = draw_leave_confirm(ui.ctx(), "denis@x.io"));
         assert_eq!(answer, Some(false));
+    }
+
+    /// **While a sharing write is out, Accept and Decline are greyed and
+    /// deaf** -- in the row and in the pane -- rather than pressed only to be
+    /// refused with "still running".
+    #[test]
+    fn a_busy_slot_greys_accept_and_decline_and_a_press_asks_nothing() {
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: None }];
+        let mut people = PeopleRows { incoming: &incoming, busy: true, ..PeopleRows::none() };
+        let mut selected = Some("invite:inv-1".to_string());
+        let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+        for label in [ACCEPT_LABEL, DECLINE_LABEL] {
+            let at = texts.iter().find(|(t, _)| t == label).map(|(_, r)| r.center()).expect(label);
+            let _ = ui_frame(400.0, click(at), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+            assert_eq!(people.asked, None, "the row's {label} answered while busy");
+        }
+        let texts = ui_frame(700.0, Vec::new(), |ui| draw_invitation_detail(ui, &mut people, "invite:inv-1"));
+        for label in [ACCEPT_LABEL, DECLINE_LABEL] {
+            let at = texts.iter().find(|(t, _)| t == label).map(|(_, r)| r.center()).expect(label);
+            let _ = ui_frame(700.0, click(at), |ui| draw_invitation_detail(ui, &mut people, "invite:inv-1"));
+            assert_eq!(people.asked, None, "the pane's {label} answered while busy");
+        }
+        // Control: the same press with the slot free answers.
+        people.busy = false;
+        let at = texts.iter().find(|(t, _)| t == ACCEPT_LABEL).map(|(_, r)| r.center()).expect("Accept");
+        let _ = ui_frame(700.0, click(at), |ui| draw_invitation_detail(ui, &mut people, "invite:inv-1"));
+        assert_eq!(people.asked, Some(PeopleAsk::Accept("inv-1".into())));
+    }
+
+    /// **A refused Accept is said where it can be seen**: pinned to its
+    /// invitation, it stands on that invitation's pane, and with something
+    /// else on screen it becomes a toast.
+    #[test]
+    fn a_refused_answer_stands_on_its_invitation_or_goes_to_a_toast() {
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel();
+        let mut pane = SharingPane::default();
+        let started = request_on(&mut pane, "invite:inv-1", None, &ctx, &tx, SharingCall::Accept("inv-1".into()));
+        assert!(!started, "no line to the daemon: refused");
+        pane.pin_notice_to("invite:inv-1");
+        assert_eq!(pane.notice_for("invite:inv-1"), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert_eq!(pane.notice_for("recv:r9"), None, "a pinned sentence stands on its own invitation only");
+        route_stray_notice(&mut pane, "recv:r9", 1.0);
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert!(pane.notice.is_none());
+    }
+
+    /// **"Still running", pinned to an invitation, is spent when the slot
+    /// frees** -- tag and all -- as it is for every other write.
+    #[test]
+    fn a_busy_refusal_pinned_to_an_invitation_is_spent_when_the_slot_frees() {
+        let mut pane = SharingPane { busy: true, ..SharingPane::default() };
+        pane.say(BUSY.to_string(), None);
+        pane.pin_notice_to("invite:inv-1");
+        assert_eq!(pane.notice_for("invite:inv-1"), Some(BUSY));
+        apply(&mut pane, SharingReport::Done(Ok(())), 0.0);
+        assert!(!pane.is_busy());
+        assert_eq!(pane.notice_for("invite:inv-1"), None);
+        assert!(pane.notice_record.is_none());
+    }
+
+    /// **A finished Stop receiving says so, by name**; a failed one says
+    /// the sentence instead, and a panicked worker reports as a leave.
+    #[test]
+    fn a_finished_leave_is_a_toast_naming_the_sharer() {
+        let mut pane = SharingPane { busy: true, ..SharingPane::default() };
+        apply(&mut pane, SharingReport::Left { from: "denis@x.io".into(), result: Ok(()) }, 0.0);
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Stopped receiving from denis@x.io."));
+        assert!(!pane.is_busy());
+        let call = SharingCall::Leave { organization_id: "org-denis".into(), from: "denis@x.io".into() };
+        pane.busy = true;
+        apply(&mut pane, call.failed(PANICKED), 1.0);
+        assert_eq!(pane.notice.as_deref(), Some(PANICKED));
+        assert!(!pane.is_busy());
+    }
+
+    /// **The invitations' measured height counts the gaps BETWEEN its rows**:
+    /// `n` rows, `n - 1` gaps -- the gap under them is the list's to add.
+    #[test]
+    fn the_invitations_height_counts_the_gaps_between_its_rows() {
+        let incoming = [IncomingRow { key: "invite:i".into(), id: "i".into(), from: "d@x.io".into(), expires: None }];
+        let waiting = ["e@x.io".to_string()];
+        let one = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
+        assert!((incoming_rows_height(&one, 6.0) - INVITE_ROW_HEIGHT).abs() < f32::EPSILON);
+        let two = PeopleRows { incoming: &incoming, waiting: &waiting, ..PeopleRows::none() };
+        assert!((incoming_rows_height(&two, 6.0) - (INVITE_ROW_HEIGHT + WAITING_LINE_HEIGHT + 6.0)).abs() < f32::EPSILON);
+        assert!(
+            (INVITE_ROW_HEIGHT - (11.0 + 40.0 + 10.0 + theme::SMALL_BUTTON_HEIGHT + 11.0)).abs() < f32::EPSILON,
+            "6d's `.invite`: padding, the avatar, the gap and a `.btn.sm`"
+        );
     }
 }

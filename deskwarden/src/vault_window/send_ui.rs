@@ -2057,16 +2057,26 @@ fn draw_send_list(
         // **An invitation is the first row** (6d, invite pending), and the
         // accepted-but-unfinished sharers' waiting lines follow it: both are
         // about what is ON ITS WAY, above what is here. The invitation is
-        // picked when nothing on this screen is, as 6d draws it (`.invite.sel`
+        // picked when nothing on THIS screen is, as 6d draws it (`.invite.sel`
         // beside its pane) -- picked here, before the detail column resolves
         // the selection in the same frame, so the two columns never disagree.
+        //
+        // **"Nothing on this screen" is no selection, or one of this screen's
+        // own keys that names no row now** -- an invitation just answered, a
+        // received record just gone. The selection is one slot for Sent and
+        // Shared with me both, and a Send or a share picked on Sent is the
+        // user's pick over there: it is left alone, and this screen says
+        // "nothing picked" beside it rather than taking it away.
         SendView::Received(rows) => {
             let names_a_row = selected.as_deref().is_some_and(|key| {
                 rows.iter().any(|r| r.key == key)
                     || people.received.iter().any(|r| r.key == key)
                     || people.incoming.iter().any(|r| r.key == key)
             });
-            if !names_a_row {
+            let this_screens_or_none = selected.as_deref().is_none_or(|key| {
+                key.starts_with(super::share_ui::INVITE_KEY_PREFIX) || key.starts_with(super::share_ui::RECEIVED_KEY_PREFIX)
+            });
+            if !names_a_row && this_screens_or_none {
                 if let Some(first) = people.incoming.first() {
                     *selected = Some(first.key.clone());
                 }
@@ -2075,9 +2085,18 @@ fn draw_send_list(
                 headline(ui, RECEIVED_EMPTY_HEADLINE, RECEIVED_EMPTY_DETAIL, theme::INK);
             } else {
                 let received = people.received.len();
-                let two_groups = received > 0 && !rows.is_empty();
+                // 6d's IMPORTED FROM SENDS stands over the imports whenever
+                // anything from people -- records, an invitation, a sharer
+                // being waited on -- is listed above them: the invite-pending
+                // list wears it too.
+                let from_people = received > 0 || !people.incoming.is_empty() || !people.waiting.is_empty();
+                let two_groups = !rows.is_empty() && from_people;
                 let eyebrows = usize::from(received > 0) + usize::from(two_groups);
-                let invitations = super::share_ui::incoming_rows_height(people, LIST_ROW_GAP);
+                // The invitations' own height and the gaps between them, and
+                // the one gap joining them to whatever is listed under them.
+                let others = rows.len() + received + eyebrows;
+                let invitations = super::share_ui::incoming_rows_height(people, LIST_ROW_GAP)
+                    + if others > 0 && !(people.incoming.is_empty() && people.waiting.is_empty()) { LIST_ROW_GAP } else { 0.0 };
                 rows_area(ui, rows.len() + received, eyebrows, invitations, &mut |ui| {
                     super::share_ui::draw_incoming_rows(ui, people, row_width, selected);
                     if let Some(open) = super::share_ui::draw_received_group(ui, people, row_width, ROW_HEIGHT, selected, records) {
@@ -3663,10 +3682,12 @@ pub(crate) fn draw_invitation_pane(
     };
     let accept_rect = slot(x0, sharing::ACCEPT_LABEL);
     let decline_rect = slot(accept_rect.right() + BUTTON_GAP, sharing::DECLINE_LABEL);
-    if theme::action_button(ui, accept_rect, sharing::ACCEPT_LABEL, theme::ActionTone::Primary).clicked() {
+    // Greyed while a sharing write is out, as the row's are.
+    let enabled = !people.busy;
+    if theme::action_button_enabled(ui, accept_rect, sharing::ACCEPT_LABEL, theme::ActionTone::Primary, enabled).clicked() {
         people.asked = Some(PeopleAsk::Accept(row.id.clone()));
     }
-    if theme::action_button(ui, decline_rect, sharing::DECLINE_LABEL, theme::ActionTone::Secondary).clicked() {
+    if theme::action_button_enabled(ui, decline_rect, sharing::DECLINE_LABEL, theme::ActionTone::Secondary, enabled).clicked() {
         people.asked = Some(PeopleAsk::Decline(row.id.clone()));
     }
 
@@ -9431,6 +9452,22 @@ mod paint_tests {
         // Picked elsewhere on this screen, the pick stands.
         let (_, kept) = paint_received_people(&rows, &mut people, Some("item-here".into()));
         assert_eq!(kept.as_deref(), Some("item-here"));
+        // A Send picked on Sent is that screen's pick: not taken away here.
+        let (_, sent) = paint_received_people(&rows, &mut people, Some("send-on-sent".into()));
+        assert_eq!(sent.as_deref(), Some("send-on-sent"));
+        // A key of this screen's that names nothing now is replaced.
+        let (_, stale) = paint_received_people(&rows, &mut people, Some("recv:gone".into()));
+        assert_eq!(stale.as_deref(), Some("invite:inv-1"));
+
+        // **6d's invite-pending list, exactly**: an invitation and imports,
+        // nobody's records yet -- IMPORTED FROM SENDS still stands over the
+        // imports, under the invitation, and no FROM PEOPLE over nothing.
+        let mut invite_only = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
+        let (pending, _) = paint_received_people(&rows, &mut invite_only, None);
+        let at = |label: &str| pending.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", pending.text)).top();
+        assert!(at("denis@x.io wants to share with you") < at(sharing::FROM_SENDS_EYEBROW));
+        assert!(at(sharing::FROM_SENDS_EYEBROW) < at("SAP Production"));
+        assert!(!pending.has(sharing::FROM_PEOPLE_EYEBROW), "{:?}", pending.text);
         // An invitation answered a moment ago names nothing: no pane for it.
         let mut answered = PeopleRows { received: &from_people, ..PeopleRows::none() };
         let (gone, _) = paint_received_people(&rows, &mut answered, Some("invite:inv-1".into()));
