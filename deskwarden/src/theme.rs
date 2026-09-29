@@ -8011,6 +8011,23 @@ pub fn share_record_button(ui: &mut Ui) -> Response {
     response
 }
 
+/// [`share_record_button`], greyed: the same 34-point box and glyph in
+/// [`TEXT_GHOST`], sensing hover only -- so its hover can say why it is
+/// greyed and a press reports nothing. No pointing hand: there is nothing to
+/// press. What `detail`'s strip draws where sharing exists but not for this
+/// record or not on this server yet (final review, I3); the same glyph, so
+/// `icon_probe::share_controls` finds it and the strip's reservation counts
+/// it like the live one.
+pub fn share_record_button_disabled(ui: &mut Ui) -> Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(HEADER_BUTTON_HEIGHT), Sense::hover());
+    paint_share_glyph(
+        ui.painter(),
+        Rect::from_center_size(rect.center(), Vec2::splat(SHARE_GLYPH)),
+        Stroke::new(ICON_STROKE, TEXT_GHOST),
+    );
+    response
+}
+
 /// **The Share glyph -- a person with a plus** -- in a 24-unit box scaled to
 /// `rect`, stroked with `stroke` as given: the mock's `ic('share', ...)`.
 ///

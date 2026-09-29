@@ -4141,20 +4141,25 @@ pub fn draw_detail_read(
                 // Fav"), and keeps 6a's own point -- Share straight after the
                 // ✉ -- beside it.
                 //
-                // Where sharing is not offered (not NodeWarden, no line to
-                // the daemon) it opens the Send composer: the owner's "a Send
-                // is offered instead", said on the hover so the press is no
-                // surprise. `None` draws no control, and `header_controls_for`
-                // reserves room for exactly that.
-                if let Some(offered) = people.share_control.filter(|_| writable) {
-                    let hover = if offered {
-                        super::share_ui::SHARE_TOOLTIP
-                    } else {
-                        super::share_ui::SHARE_UNAVAILABLE_TOOLTIP
-                    };
-                    if theme::share_record_button(ui).on_hover_text(hover).clicked() {
-                        action = if offered { DetailAction::ShareRecord } else { DetailAction::SendRecord };
+                // **Where sharing is not offered, no Share-shaped control
+                // opens a Send** (final review, I3). It used to, on every
+                // server but NodeWarden: a second door to the composer beside
+                // the ✉ that already is one. Now `share_ui::share_control`
+                // decides by the view's reason -- a server too old to share
+                // gets the control greyed, with its own reason on the hover;
+                // a record that cannot be shared (attachments) likewise; no
+                // sharing at all, or a view not heard yet, draws nothing.
+                // `header_controls_for` counts exactly what is painted.
+                match people.share_control.filter(|_| writable) {
+                    Some(ShareControl::Share) => {
+                        if theme::share_record_button(ui).on_hover_text(super::share_ui::SHARE_TOOLTIP).clicked() {
+                            action = DetailAction::ShareRecord;
+                        }
                     }
+                    Some(ShareControl::Disabled(why)) => {
+                        theme::share_record_button_disabled(ui).on_hover_text(why);
+                    }
+                    None => {}
                 }
                 // **"Send a record", MOVED HERE off the window titlebar** at
                 // the user's direction: "remove huge button Send a record on
@@ -6237,6 +6242,17 @@ pub struct SharedSend<'a> {
     pub revoking: bool,
 }
 
+/// **The header's Share control, when one is drawn** -- decided by
+/// `share_ui::share_control` from the daemon's view (final review, I3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareControl {
+    /// Opens the Share dialog.
+    Share,
+    /// Drawn greyed, and says why on its hover: sharing exists but not for
+    /// this record, or not on this server yet. It reports no action.
+    Disabled(&'static str),
+}
+
 /// **Personal sharing, as the read pane draws it** (design 6a, 6b, 6d),
 /// resolved by the window from the daemon's view -- see
 /// `share_ui::people_sharing`, which builds it. `Default` is "nothing about
@@ -6251,9 +6267,8 @@ pub struct SharedSend<'a> {
 /// ([`view_only_footer`]).
 #[derive(Clone, Copy, Default)]
 pub struct PeopleSharing<'a> {
-    /// The Share control: `Some(true)` shares, `Some(false)` offers a Send
-    /// instead, `None` draws none. See `share_ui::share_control`.
-    pub share_control: Option<bool>,
+    /// The Share control, or `None` for none. See `share_ui::share_control`.
+    pub share_control: Option<ShareControl>,
     pub people: &'a [super::share_ui::PersonLine],
     /// Stop sharing's step two is up for this email.
     pub confirming: Option<&'a str>,
@@ -10358,7 +10373,7 @@ mod tests {
         shared: Option<(crate::send::SendSummary, bool, bool)>,
         /// The header's Share control, as `share_ui::share_control` would
         /// resolve it. None unless a test sets it.
-        share_control: Option<bool>,
+        share_control: Option<ShareControl>,
         /// Design 6b's people on the SHARING card, and a standing sharing
         /// sentence -- empty and `None` unless a test sets them (see
         /// [`Pane::with_people`] and [`Pane::with_sharing_notice`]).
@@ -10813,9 +10828,9 @@ mod tests {
             }
         }
 
-        /// The same pane, with the header's Share control drawn: `true`
-        /// shares, `false` offers a Send instead (`share_ui::share_control`).
-        fn with_share_control(mut self, offered: bool) -> Self {
+        /// The same pane, with the header's Share control drawn as
+        /// `share_ui::share_control` would resolve it.
+        fn with_share_control(mut self, offered: ShareControl) -> Self {
             self.share_control = Some(offered);
             self
         }
@@ -17302,7 +17317,7 @@ mod tests {
     #[test]
     fn the_strips_controls_fit_the_apps_minimum_window() {
         let item = a_login();
-        let people = PeopleSharing { share_control: Some(true), ..PeopleSharing::default() };
+        let people = PeopleSharing { share_control: Some(ShareControl::Share), ..PeopleSharing::default() };
         let n = header_controls_for(&item, &people);
         assert_eq!(n, 6, "a login with the Share control is the widest strip there is");
         let content = MIN_PANE - f32::from(HEADER_PAD_X) * 2.0;
@@ -17334,7 +17349,7 @@ mod tests {
     #[test]
     fn six_controls_are_painted_inside_the_minimum_pane_and_apart() {
         let item = a_login();
-        let mut pane = Pane::wide(MIN_PANE).with_share_control(true);
+        let mut pane = Pane::wide(MIN_PANE).with_share_control(ShareControl::Share);
         let frame = pane.idle(&item, &TotpState::NoSecret);
         let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
         let (share, _) = frame.shares.first().copied().expect("the Share control");
@@ -17400,11 +17415,11 @@ mod tests {
         for (what, item, share, from) in [
             ("a login", a_login(), None, None),
             ("a card", a_full_card(), None, None),
-            ("a login with Share", a_login(), Some(true), None),
-            ("a card offered a Send", a_full_card(), Some(false), None),
+            ("a login with Share", a_login(), Some(ShareControl::Share), None),
+            ("a card with Share greyed", a_full_card(), Some(ShareControl::Disabled("too old")), None),
             ("a received login", a_login(), None, Some("denis@x.io")),
             ("a received card", a_full_card(), None, Some("denis@x.io")),
-            ("an unnamed edit:false login offered Share", unnamed, Some(true), None),
+            ("an unnamed edit:false login offered Share", unnamed, Some(ShareControl::Share), None),
         ] {
             let mut pane = Pane::wide(MIN_PANE);
             if let Some(offered) = share {
@@ -17688,12 +17703,15 @@ mod tests {
     }
 
     /// **The Share control sits right after the envelope** (mock 6a) and
-    /// reports `ShareRecord` -- or, where sharing is not offered, `SendRecord`:
-    /// the owner's "a Send is offered instead".
+    /// reports `ShareRecord` -- or, greyed, reports nothing at all. It never
+    /// opens a Send: the ✉ beside it is that door (final review, I3).
     #[test]
-    fn the_share_control_shares_or_offers_a_send() {
+    fn the_share_control_shares_or_is_greyed_and_never_sends() {
         let item = a_login();
-        for (offered, expected) in [(true, DetailAction::ShareRecord), (false, DetailAction::SendRecord)] {
+        for (offered, expected) in [
+            (ShareControl::Share, DetailAction::ShareRecord),
+            (ShareControl::Disabled(super::super::share_ui::SHARE_TOO_OLD_TOOLTIP), DetailAction::None),
+        ] {
             let mut pane = Pane::new().with_share_control(offered);
             let frame = pane.idle(&item, &TotpState::NoSecret);
             let (envelope, _) = frame.envelopes.first().copied().expect("the envelope");
@@ -17703,16 +17721,16 @@ mod tests {
         }
     }
 
-    /// **The Share control's hover says what it does**, in both answers: a
-    /// share is view-only, and where sharing is not offered the control says
-    /// that it sends a link instead -- so pressing it and getting the Send
-    /// composer is never a surprise.
+    /// **The Share control's hover says what it does**: a share is
+    /// view-only, and a greyed control says why it is greyed, in its own
+    /// words (final review, I3).
     #[test]
-    fn the_share_controls_hover_says_share_or_send() {
+    fn the_share_controls_hover_says_share_or_why_not() {
         let item = a_login();
         for (offered, words) in [
-            (true, super::super::share_ui::SHARE_TOOLTIP),
-            (false, super::super::share_ui::SHARE_UNAVAILABLE_TOOLTIP),
+            (ShareControl::Share, super::super::share_ui::SHARE_TOOLTIP),
+            (ShareControl::Disabled(super::super::share_ui::SHARE_TOO_OLD_TOOLTIP), super::super::share_ui::SHARE_TOO_OLD_TOOLTIP),
+            (ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS), crate::rest::sharing::HAS_ATTACHMENTS),
         ] {
             let mut pane = Pane::new().with_share_control(offered);
             let frame = pane.idle(&item, &TotpState::NoSecret);

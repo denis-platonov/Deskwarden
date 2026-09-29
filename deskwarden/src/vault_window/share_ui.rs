@@ -38,12 +38,20 @@ use crate::sent_history::{SentHistory, SentKind};
 use crate::theme;
 use crate::vault_bridge::VaultItem;
 
+use super::detail::ShareControl;
+
 // ---- the words (mock 6e's STATUS LINES) -----------------------------------------
 
 /// The header's Share tooltip (mock 6b's hover).
 pub(crate) const SHARE_TOOLTIP: &str = "Share with a person \u{b7} view-only";
-pub(crate) const SHARE_UNAVAILABLE_TOOLTIP: &str =
-    "Sharing with a person needs a NodeWarden server. This sends a link instead.";
+/// A sharing request from a window with no line to the daemon -- said on the
+/// card by [`request`]. It no longer ends "This sends a link instead": no
+/// Share-shaped control opens a Send any more (final review, I3), so the
+/// sentence says only what is missing.
+pub(crate) const SHARING_UNAVAILABLE: &str = "Sharing with a person needs a NodeWarden server.";
+/// The greyed Share control's hover on a NodeWarden too old to share
+/// (`server-too-old`, spec 7.1).
+pub(crate) const SHARE_TOO_OLD_TOOLTIP: &str = "Sharing with a person needs a newer NodeWarden server.";
 /// A "Share anyway" with no fingerprint behind it -- see
 /// [`SharingPane::share_anyway`]. The card never builds one (it offers the
 /// button only beside a fingerprint it fetched), so this is the sentence a
@@ -237,20 +245,51 @@ pub(crate) fn short_state(state: PersonState, expires_at: Option<&str>, now_ms: 
     }
 }
 
-/// **The header's Share control** for one record: `Some(true)` shares,
-/// `Some(false)` offers a Send instead (sharing is NodeWarden-only; owner's
-/// decision), `None` draws nothing -- a received record (view-only), or a
-/// window that has not heard from the daemon yet. Read by the header through
+/// **The header's Share control** for one record, decided BY THE REASON the
+/// view gives (final review, I3). Read by the header through
 /// [`people_sharing`].
-pub(crate) fn share_control(view: Option<&SharingView>, linked: bool, item: &VaultItem) -> Option<bool> {
+///
+/// - Sharing available: [`ShareControl::Share`] -- unless the record cannot
+///   be shared from here. One in another (real) organisation draws nothing:
+///   it is that organisation's to share. One with attachments is greyed with
+///   the engine's own sentence ([`crate::rest::sharing::HAS_ATTACHMENTS`]),
+///   rather than refused after the user has typed an address.
+/// - `server-too-old`: greyed, with [`SHARE_TOO_OLD_TOOLTIP`] -- NodeWarden,
+///   so sharing is a thing this server will do once updated.
+/// - `bw-serve`, `not-nodewarden`, `not-loaded`, any other reason, no view
+///   yet, no line to the daemon, a received record: **nothing**. It used to
+///   offer a Send on every server but NodeWarden; the controller's call is
+///   that the envelope beside it already is that door, so a Share-shaped
+///   control that opens the Send composer is a duplicate under a wrong name.
+///
+/// Whatever this answers, `detail::header_controls_for` reserves room for
+/// exactly what is painted.
+pub(crate) fn share_control(view: Option<&SharingView>, linked: bool, item: &VaultItem) -> Option<ShareControl> {
     if !linked {
-        return Some(false);
+        return None;
     }
     let view = view?;
     if view.received_from(&item.id).is_some() {
         return None;
     }
-    Some(view.available)
+    if !view.available {
+        return match view.reason.as_deref() {
+            Some(crate::rest::sharing::REASON_TOO_OLD) => Some(ShareControl::Disabled(SHARE_TOO_OLD_TOOLTIP)),
+            _ => None,
+        };
+    }
+    // In an organisation, and not in this account's sharing org (every
+    // record there has a `records` entry, shared with anyone or not).
+    let theirs = crate::rest::organizations::organization_of(item).is_some()
+        && !view.records.iter().any(|r| r.item_id == item.id);
+    if theirs {
+        return None;
+    }
+    let attached = item.other.get("attachments").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty());
+    if attached {
+        return Some(ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS));
+    }
+    Some(ShareControl::Share)
 }
 
 /// The names of the records shared with `email`, for the forget question
@@ -851,7 +890,7 @@ pub(crate) fn request(
         }
     }
     let Some(client) = client else {
-        pane.say(SHARE_UNAVAILABLE_TOOLTIP.to_string(), None);
+        pane.say(SHARING_UNAVAILABLE.to_string(), None);
         return false;
     };
     match &call {
@@ -3039,22 +3078,54 @@ mod tests {
         assert_eq!(short_state(PersonState::WaitingAccount, Some(&in_six), NOW), "6 days left");
     }
 
-    /// **Where the Share control goes** (owner decision: NodeWarden only,
-    /// a Send elsewhere): shares when available, offers a Send when not or
-    /// when the window has no line to the daemon, and is absent on a
-    /// received record and before the view is known.
+    /// **The Share control is decided by the view's reason** (final review,
+    /// I3): shares on NodeWarden, greyed with its own reason on a NodeWarden
+    /// too old to share, and ABSENT everywhere sharing does not exist --
+    /// `bw-serve`, `not-nodewarden`, `not-loaded`, no line, no view yet --
+    /// because the envelope beside it already offers the Send. Absent on a
+    /// received record too.
     #[test]
-    fn the_share_control_shares_on_nodewarden_offers_a_send_elsewhere_and_is_absent_on_a_received_record() {
+    fn the_share_control_is_decided_by_the_views_reason() {
+        use crate::rest::sharing::{REASON_BW_SERVE, REASON_NOT_LOADED, REASON_NOT_NODEWARDEN, REASON_TOO_OLD};
         let item = |id: &str| -> VaultItem { serde_json::from_value(serde_json::json!({ "id": id, "name": id })).expect("item") };
         let on = SharingView { available: true, ..SharingView::default() };
-        let off = SharingView::unavailable(crate::rest::sharing::REASON_NOT_NODEWARDEN);
+        assert_eq!(share_control(Some(&on), true, &item("mine")), Some(ShareControl::Share));
+        assert_eq!(
+            share_control(Some(&SharingView::unavailable(REASON_TOO_OLD)), true, &item("mine")),
+            Some(ShareControl::Disabled(SHARE_TOO_OLD_TOOLTIP)),
+            "server-too-old: greyed, saying why"
+        );
+        for reason in [REASON_NOT_LOADED, REASON_BW_SERVE, REASON_NOT_NODEWARDEN, "some-later-reason"] {
+            assert_eq!(share_control(Some(&SharingView::unavailable(reason)), true, &item("mine")), None, "{reason}: no control");
+        }
+        assert_eq!(share_control(None, false, &item("mine")), None, "no line to the daemon: the envelope is the Send");
+        assert_eq!(share_control(None, true, &item("mine")), None, "not known yet");
         let mut received = on.clone();
         received.received.push(crate::rest::sharing::ReceivedEntry { item_id: "theirs".into(), from: "d@x.io".into() });
-        assert_eq!(share_control(Some(&on), true, &item("mine")), Some(true));
-        assert_eq!(share_control(Some(&off), true, &item("mine")), Some(false));
-        assert_eq!(share_control(None, false, &item("mine")), Some(false), "no line to the daemon: a Send");
-        assert_eq!(share_control(None, true, &item("mine")), None, "not known yet");
         assert_eq!(share_control(Some(&received), true, &item("theirs")), None);
+    }
+
+    /// **A record that cannot be shared says so before anything is typed**:
+    /// one in another organisation draws no Share (it is that organisation's
+    /// to share), one with attachments is greyed with the engine's own
+    /// sentence -- while a record in this account's own sharing org, which
+    /// the view lists, is shared as usual.
+    #[test]
+    fn a_record_that_cannot_be_shared_is_not_offered_share() {
+        let on = SharingView {
+            available: true,
+            records: vec![RecordEntry { item_id: "in-mine".into(), people: vec![] }],
+            ..SharingView::default()
+        };
+        let item = |value: serde_json::Value| -> VaultItem { serde_json::from_value(value).expect("item") };
+        let other_org = item(serde_json::json!({ "id": "work", "name": "work", "organizationId": "acme" }));
+        assert_eq!(share_control(Some(&on), true, &other_org), None, "another organisation's record");
+        let mine = item(serde_json::json!({ "id": "in-mine", "name": "x", "organizationId": "my-sharing-org" }));
+        assert_eq!(share_control(Some(&on), true, &mine), Some(ShareControl::Share), "already in the sharing org");
+        let attached = item(serde_json::json!({ "id": "p1", "name": "x", "attachments": [{ "id": "a1" }] }));
+        assert_eq!(share_control(Some(&on), true, &attached), Some(ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS)));
+        let empty = item(serde_json::json!({ "id": "p2", "name": "x", "attachments": [] }));
+        assert_eq!(share_control(Some(&on), true, &empty), Some(ShareControl::Share), "an empty list is no attachment");
     }
 
     /// **With push off, the view is asked again once it is a minute old**
@@ -3146,7 +3217,7 @@ mod tests {
 
         let call = pane.share_anyway("eve@x.io").expect("a Confirm");
         assert!(!request(&mut pane, None, &ctx, &tx, call));
-        assert_eq!(pane.notice.as_deref(), Some(SHARE_UNAVAILABLE_TOOLTIP), "the matching Confirm reaches the line check");
+        assert_eq!(pane.notice.as_deref(), Some(SHARING_UNAVAILABLE), "the matching Confirm reaches the line check");
         assert!(pane.fingerprint.is_some(), "nothing was sent, so nothing was spent");
 
         let call = pane.share_anyway("eve@x.io").expect("a Confirm");
@@ -3591,7 +3662,7 @@ mod tests {
         assert_eq!(left, ShareDialogAction::None);
         let dialog = pane.dialog.as_ref().expect("the dialog stays open");
         assert!(!dialog.in_flight, "no line to the daemon: the spinner is down");
-        assert_eq!(dialog.error.as_deref(), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert_eq!(dialog.error.as_deref(), Some(SHARING_UNAVAILABLE));
         assert!(pane.notice.is_none(), "said once, in the dialog");
 
         let line = dead_line();
@@ -4146,9 +4217,9 @@ mod tests {
         // A refusal is about no record: it shows on any card, and is never
         // routed away -- a later refusal does not inherit the stop's record.
         assert!(!request(&mut pane, None, &ctx, &tx, SharingCall::Reinvite("x@x.io".into())));
-        assert_eq!(pane.notice_for("r1"), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert_eq!(pane.notice_for("r1"), Some(SHARING_UNAVAILABLE));
         route_stray_notice(&mut pane, "r1", 3.0);
-        assert_eq!(pane.notice.as_deref(), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert_eq!(pane.notice.as_deref(), Some(SHARING_UNAVAILABLE));
     }
 
     /// **The re-prompt question is asked of every record a membership
@@ -4512,10 +4583,10 @@ mod tests {
         let started = request_on(&mut pane, "invite:inv-1", None, &ctx, &tx, SharingCall::Accept("inv-1".into()));
         assert!(!started, "no line to the daemon: refused");
         pane.pin_notice_to("invite:inv-1");
-        assert_eq!(pane.notice_for("invite:inv-1"), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert_eq!(pane.notice_for("invite:inv-1"), Some(SHARING_UNAVAILABLE));
         assert_eq!(pane.notice_for("recv:r9"), None, "a pinned sentence stands on its own invitation only");
         route_stray_notice(&mut pane, "recv:r9", 1.0);
-        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some(SHARE_UNAVAILABLE_TOOLTIP));
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some(SHARING_UNAVAILABLE));
         assert!(pane.notice.is_none());
     }
 
