@@ -123,7 +123,13 @@ pub struct ReceivedEntry {
 #[serde(rename_all = "camelCase")]
 pub struct IncomingEntry {
     pub id: String,
-    pub from: String,
+    /// **Who sent it, as the SERVER attests** -- the inviting org's
+    /// `ownerEmail`, and never its plaintext "Shared by" name, which anyone
+    /// can set (final review, concern 1). `None` when the server does not
+    /// say: the window then shows a neutral "Someone on this server", not a
+    /// name-only claim.
+    #[serde(default)]
+    pub from: Option<String>,
     pub expires_at: Option<String>,
 }
 
@@ -801,9 +807,15 @@ impl Sharing {
         view.incoming = held
             .incoming
             .iter()
-            .filter_map(|invitation| {
-                let from = invitation.organization_name.as_deref().and_then(sharer_of)?;
-                Some(IncomingEntry { id: invitation.id.clone(), from: from.to_string(), expires_at: invitation.expires_at.clone() })
+            // The NAME says only that this is a personal-sharing invitation
+            // (a "Shared by" org); WHO sent it is the server's attested
+            // owner, whatever the name claims -- a forged "Shared by boss@"
+            // is shown as its real owner's -- or nobody when it does not say.
+            .filter(|invitation| invitation.organization_name.as_deref().and_then(sharer_of).is_some())
+            .map(|invitation| IncomingEntry {
+                id: invitation.id.clone(),
+                from: invitation.owner_email.clone(),
+                expires_at: invitation.expires_at.clone(),
             })
             .collect();
         view.waiting = held
@@ -2560,8 +2572,10 @@ impl Sharing {
     /// sharing" the moment the row goes rather than after the next whole
     /// read -- which is what fills [`Held::waiting`] otherwise, and which
     /// replaces this entry with the server's own answer when it comes. The
-    /// sharer is read off the org's name as the view's `incoming` reads it
-    /// (`sharer_of`), display only.
+    /// sharer is the invitation's attested owner, as the view's `incoming`
+    /// reads it; with none, no waiting line is filed -- the whole read's
+    /// directory, which holds the same rule (`organizations::sharing_mark`),
+    /// would not file one either.
     ///
     /// Accepting records no SSO consent and asks nothing more of the server:
     /// the token is the whole of it (NodeWarden's own decision).
@@ -2579,8 +2593,7 @@ impl Sharing {
         let mut held = self.held();
         let accepted = held.incoming.iter().position(|i| i.id == id).map(|at| held.incoming.remove(at));
         if let Some(invitation) = accepted {
-            let from = invitation.organization_name.as_deref().and_then(sharer_of).map(str::to_string);
-            if let Some(from) = from {
+            if let Some(from) = invitation.owner_email.clone() {
                 if !held.waiting.iter().any(|(org, _)| *org == invitation.organization_id) {
                     held.waiting.push((invitation.organization_id.clone(), from));
                 }
@@ -2975,6 +2988,7 @@ mod tests {
                 id: "inv-1".into(),
                 organization_id: "org-anna".into(),
                 organization_name: Some("Shared by anna@x.io".into()),
+                owner_email: Some("anna@x.io".into()),
                 token: zeroize::Zeroizing::new("TOKEN-NEEDLE-7f3a".into()),
                 expires_at: None,
             }],
@@ -5346,7 +5360,7 @@ mod tests {
             .mock("GET", "/api/organizations/invitations/mine")
             .with_body(serde_json::json!({ "data": [{
                 "id": "inv-1", "organizationId": "org-denis", "organizationName": "Shared by denis@example.com",
-                "token": "tok-1", "expirationDate": "2999-01-01T00:00:00.000Z"
+                "token": "tok-1", "expirationDate": "2999-01-01T00:00:00.000Z", "ownerEmail": "denis@example.com"
             }]}).to_string())
             .expect_at_least(0)
             .create();
@@ -5366,7 +5380,7 @@ mod tests {
             .create();
         engine.refresh(Trigger::WholeRead).expect("probed");
         let view = engine.view(&[]);
-        assert_eq!(view.incoming, vec![IncomingEntry { id: "inv-1".into(), from: "denis@example.com".into(), expires_at: Some("2999-01-01T00:00:00.000Z".into()) }]);
+        assert_eq!(view.incoming, vec![IncomingEntry { id: "inv-1".into(), from: Some("denis@example.com".into()), expires_at: Some("2999-01-01T00:00:00.000Z".into()) }]);
         // The token is the daemon's alone: what the window is sent has none.
         let sent = serde_json::to_string(&view).expect("json");
         assert!(!sent.contains("tok-1"), "{sent}");
@@ -5386,6 +5400,47 @@ mod tests {
             vec![WaitingEntry { organization_id: "org-denis".into(), from: "denis@example.com".into() }]
         );
         assert!(matches!(engine.accept("inv-1"), Err(SharingError::Refused(_))), "an invitation already answered is gone");
+    }
+
+    /// **An invitation's "from" is the server's attested owner, never the
+    /// name** (final review, concern 1). A forged "Shared by boss@" from
+    /// mallory's org says mallory; a matching name says its sharer; with no
+    /// `ownerEmail` it names nobody, and accepting it files no waiting line.
+    /// An invitation to an org with no sharing name is not a personal share.
+    #[test]
+    fn an_invitation_is_attributed_to_its_attested_owner_and_never_to_the_name() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
+        server
+            .mock("GET", "/api/organizations/invitations/mine")
+            .with_body(serde_json::json!({ "data": [
+                { "id": "forged", "organizationId": "o-mal", "organizationName": "Shared by boss@corp.example", "token": "t1", "ownerEmail": "mallory@evil.example" },
+                { "id": "real", "organizationId": "o-boss", "organizationName": "Shared by boss@corp.example", "token": "t2", "ownerEmail": "Boss@Corp.example" },
+                { "id": "bare", "organizationId": "o-old", "organizationName": "Shared by boss@corp.example", "token": "t3" },
+                { "id": "work", "organizationId": "o-work", "organizationName": "Engineering", "token": "t4", "ownerEmail": "cto@corp.example" }
+            ]}).to_string())
+            .create();
+        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        engine.refresh(Trigger::WholeRead).expect("probed");
+        let from = |view: &SharingView, id: &str| view.incoming.iter().find(|i| i.id == id).map(|i| i.from.clone());
+        let view = engine.view(&[]);
+        assert_eq!(from(&view, "forged"), Some(Some("mallory@evil.example".into())), "a forged name: the real owner");
+        assert_eq!(from(&view, "real"), Some(Some("boss@corp.example".into())), "a matching name: its sharer");
+        assert_eq!(from(&view, "bare"), Some(None), "no attestation: nobody named");
+        assert_eq!(from(&view, "work"), None, "not a personal share");
+
+        server.mock("POST", "/api/organizations/invitations/accept").with_body("").expect(2).create();
+        engine.accept("bare").expect("accepted");
+        assert!(engine.view(&[]).waiting.is_empty(), "no attested sharer, no waiting line naming one");
+        engine.accept("forged").expect("accepted");
+        assert_eq!(
+            engine.view(&[]).waiting,
+            vec![WaitingEntry { organization_id: "o-mal".into(), from: "mallory@evil.example".into() }]
+        );
     }
 
     #[test]

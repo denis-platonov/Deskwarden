@@ -2782,24 +2782,38 @@ pub(crate) fn waiting_line(from: &str) -> String {
     format!("Waiting for {from} to finish sharing")
 }
 
-/// 6d's `.t1`, the invitation row's first line.
-pub(crate) fn wants_to_share(from: &str) -> String {
-    format!("{from} wants to share with you")
+/// **Who an invitation is from when the server does not say** (final review,
+/// concern 1). An invitation's sender is its org's ATTESTED owner
+/// ([`crate::rest::sharing::IncomingEntry::from`]); the "Shared by" name is
+/// anyone's to write, so without the attestation nobody is named -- the
+/// invitation is real, and so is the server it came through.
+pub(crate) const SOMEONE_ON_THIS_SERVER: &str = "Someone on this server";
+
+/// 6d's `.t1`, the invitation row's first line -- "Someone on this server
+/// wants to share with you" when the sender is not attested.
+pub(crate) fn wants_to_share(from: Option<&str>) -> String {
+    format!("{} wants to share with you", from.unwrap_or(SOMEONE_ON_THIS_SERVER))
 }
 
 /// 6d's IF YOU ACCEPT, `You get`.
-pub(crate) fn you_get(from: &str) -> String {
-    format!("The records {from} shares with you, now and later")
+pub(crate) fn you_get(from: Option<&str>) -> String {
+    match from {
+        Some(from) => format!("The records {from} shares with you, now and later"),
+        None => "The records they share with you, now and later".to_string(),
+    }
 }
 
 /// 6d's IF YOU ACCEPT, `They change`.
-pub(crate) fn they_change(from: &str) -> String {
-    format!("When {from} edits them")
+pub(crate) fn they_change(from: Option<&str>) -> String {
+    match from {
+        Some(from) => format!("When {from} edits them"),
+        None => "When they edit them".to_string(),
+    }
 }
 
 /// 6d's `.meta` under the card.
-pub(crate) fn decline_note(from: &str) -> String {
-    format!("If you decline, nothing is added to your vault. {from} can invite you again later.")
+pub(crate) fn decline_note(from: Option<&str>) -> String {
+    format!("If you decline, nothing is added to your vault. {} can invite you again later.", from.unwrap_or("They"))
 }
 
 /// An invitation to answer, as Shared with me lists it.
@@ -2810,9 +2824,10 @@ pub(crate) struct IncomingRow {
     /// The view's invitation id: what Accept and Decline name. Never the
     /// token, which the window does not have.
     pub(crate) id: String,
-    /// The sharer, read off the sharing org's plaintext name -- display only,
-    /// for [`ReceivedShareRow::from`]'s reason: whoever made the org wrote it.
-    pub(crate) from: String,
+    /// The sender, as the server attests the inviting org's owner -- `None`
+    /// when it does not, and the row names nobody ([`SOMEONE_ON_THIS_SERVER`]).
+    /// Never the org's plaintext name (final review, concern 1).
+    pub(crate) from: Option<String>,
     /// "in 6 days", or `None` without an expiry.
     pub(crate) expires: Option<String>,
 }
@@ -2825,6 +2840,19 @@ fn expires_words(days: i64) -> String {
         ..=0 => "today".to_string(),
         1 => "in 1 day".to_string(),
         days => format!("in {days} days"),
+    }
+}
+
+impl IncomingRow {
+    /// Who to name: the attested sender, or [`SOMEONE_ON_THIS_SERVER`].
+    pub(crate) fn who(&self) -> &str {
+        self.from.as_deref().unwrap_or(SOMEONE_ON_THIS_SERVER)
+    }
+
+    /// The avatar's letter: the sender's initial, or `?` for nobody named --
+    /// an "S" would read as someone called S.
+    pub(crate) fn initial_of(&self) -> &str {
+        self.from.as_deref().unwrap_or("?")
     }
 }
 
@@ -2901,12 +2929,12 @@ pub(crate) fn draw_incoming_rows(ui: &mut egui::Ui, people: &mut PeopleRows<'_>,
             egui::pos2(rect.left() + INVITE_PAD_X, rect.top() + INVITE_PAD_Y),
             egui::Vec2::splat(INVITER_AVATAR),
         );
-        paint_inviter(&painter, avatar, &row.from);
+        paint_inviter(&painter, avatar, row.initial_of());
         let text_left = avatar.right() + INVITE_AVATAR_GAP;
         let text_width = rect.right() - INVITE_PAD_X - text_left;
         let title = one_line(
             &painter,
-            &wants_to_share(&row.from),
+            &wants_to_share(row.from.as_deref()),
             egui::FontId::new(INVITE_TITLE_SIZE, egui::FontFamily::Name(theme::BOLD.into())),
             theme::BLUE_DEEP,
             text_width,
@@ -3399,7 +3427,7 @@ mod tests {
             vec![("r1", vec!["anna@x.io", "bob@x.io"]), ("r2", vec!["anna@x.io"])],
         );
         v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "t1".into(), from: "d@x.io".into() });
-        v.incoming.push(crate::rest::sharing::IncomingEntry { id: "i1".into(), from: "e@x.io".into(), expires_at: None });
+        v.incoming.push(crate::rest::sharing::IncomingEntry { id: "i1".into(), from: Some("e@x.io".into()), expires_at: None });
         pane.view = Some(v);
         assert_eq!((received(&pane), invited(&pane)), (1, true));
         pane.stop_confirming = Some(("r1".into(), "bob@x.io".into()));
@@ -4482,12 +4510,34 @@ mod tests {
         assert!(received_share_rows(None, &items).is_empty());
     }
 
+    /// **An invitation the server does not attest names nobody** (final
+    /// review, concern 1): the row says "Someone on this server wants to
+    /// share with you", the pane's title and facts name nobody, and no
+    /// address -- not even the org's "Shared by" name -- is painted.
+    #[test]
+    fn an_unattested_invitation_names_nobody() {
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: None, expires: None }];
+        let mut people = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
+        let mut selected = None;
+        let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
+        assert!(texts.iter().any(|(t, _)| t == "Someone on this server wants to share with you"), "{texts:?}");
+        let texts = ui_frame(700.0, Vec::new(), |ui| draw_invitation_detail(ui, &mut people, "invite:inv-1"));
+        assert!(texts.iter().any(|(t, _)| t == SOMEONE_ON_THIS_SERVER), "the pane's title: {texts:?}");
+        assert!(texts.iter().any(|(t, _)| *t == decline_note(None)), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t.contains('@')), "an address was painted: {texts:?}");
+        let v = SharingView {
+            incoming: vec![crate::rest::sharing::IncomingEntry { id: "i".into(), from: None, expires_at: None }],
+            ..SharingView::default()
+        };
+        assert_eq!(incoming_rows(Some(&v), 0)[0].from, None, "the view's silence is carried, not filled in");
+    }
+
     /// **The invitation row and its pane** (mock 6d, invite pending): who
     /// wants to share, "Nothing reaches your vault until you accept.", and
     /// Accept / Decline in both places.
     #[test]
     fn an_invitation_is_the_first_row_and_accepting_it_is_one_press() {
-        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: Some("in 6 days".into()) }];
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: Some("denis@x.io".into()), expires: Some("in 6 days".into()) }];
         let mut people = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
         let mut selected = None;
         let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
@@ -4502,7 +4552,7 @@ mod tests {
         assert!(texts.iter().any(|(t, _)| t == "IF YOU ACCEPT"));
         assert!(texts.iter().any(|(t, _)| t == "in 6 days"));
         assert!(texts.iter().any(|(t, _)| t == DECLINE_LABEL));
-        assert!(texts.iter().any(|(t, _)| *t == decline_note("denis@x.io")), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| *t == decline_note(Some("denis@x.io"))), "{texts:?}");
         let decline = texts.iter().find(|(t, _)| t == DECLINE_LABEL).map(|(_, r)| r.center()).expect("Decline");
         let _ = ui_frame(700.0, click(decline), |ui| draw_invitation_detail(ui, &mut people, "invite:inv-1"));
         assert_eq!(people.asked, Some(PeopleAsk::Decline("inv-1".into())), "the pane's Decline answers the invitation");
@@ -4514,7 +4564,7 @@ mod tests {
     /// is registered first, so the buttons over it win the press.
     #[test]
     fn declining_is_one_press_and_the_cards_click_picks_it_without_taking_the_buttons() {
-        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: None }];
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: Some("denis@x.io".into()), expires: None }];
         let mut people = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
         let mut selected = None;
         let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
@@ -4555,7 +4605,7 @@ mod tests {
             format!("{:04}-{:02}-{:02}T{:02}:{:02}:00Z", parts.year, parts.month, parts.day, parts.hour, parts.minute)
         };
         for (id, expires) in [("i6", Some(iso(NOW + 6 * DAY - 60_000))), ("i1", Some(iso(NOW + DAY - 60_000))), ("i0", None)] {
-            v.incoming.push(crate::rest::sharing::IncomingEntry { id: id.into(), from: "denis@x.io".into(), expires_at: expires });
+            v.incoming.push(crate::rest::sharing::IncomingEntry { id: id.into(), from: Some("denis@x.io".into()), expires_at: expires });
         }
         let rows = incoming_rows(Some(&v), NOW);
         assert_eq!(rows.iter().map(|r| r.key.as_str()).collect::<Vec<_>>(), ["invite:i6", "invite:i1", "invite:i0"]);
@@ -4605,7 +4655,7 @@ mod tests {
     /// refused with "still running".
     #[test]
     fn a_busy_slot_greys_accept_and_decline_and_a_press_asks_nothing() {
-        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: None }];
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: Some("denis@x.io".into()), expires: None }];
         let mut people = PeopleRows { incoming: &incoming, busy: true, ..PeopleRows::none() };
         let mut selected = Some("invite:inv-1".to_string());
         let texts = ui_frame(400.0, Vec::new(), |ui| draw_incoming_rows(ui, &mut people, 376.0, &mut selected));
@@ -4678,7 +4728,7 @@ mod tests {
     /// `n` rows, `n - 1` gaps -- the gap under them is the list's to add.
     #[test]
     fn the_invitations_height_counts_the_gaps_between_its_rows() {
-        let incoming = [IncomingRow { key: "invite:i".into(), id: "i".into(), from: "d@x.io".into(), expires: None }];
+        let incoming = [IncomingRow { key: "invite:i".into(), id: "i".into(), from: Some("d@x.io".into()), expires: None }];
         let waiting = ["e@x.io".to_string()];
         let one = PeopleRows { incoming: &incoming, ..PeopleRows::none() };
         assert!((incoming_rows_height(&one, 6.0) - INVITE_ROW_HEIGHT).abs() < f32::EPSILON);

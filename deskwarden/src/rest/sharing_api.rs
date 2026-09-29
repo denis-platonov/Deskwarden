@@ -117,7 +117,14 @@ pub struct IncomingInvitation {
     pub id: String,
     pub organization_id: String,
     /// Plaintext on every server; for a sharing org, `Shared by <email>`.
+    /// Anyone can set it, so it says only THAT an invitation is a personal
+    /// share, never WHOSE -- see [`Self::owner_email`].
     pub organization_name: Option<String>,
+    /// **The inviting organisation's owner, as the server attests it** --
+    /// NodeWarden's `ownerEmail`, normalised. The one thing an invitation's
+    /// "from" is read off (`Sharing::view`); `None` from a server that does
+    /// not send it, and the window then names nobody.
+    pub owner_email: Option<String>,
     pub token: Zeroizing<String>,
     pub expires_at: Option<String>,
 }
@@ -208,6 +215,7 @@ pub fn my_invitations(
                         id: text_at(row, "id")?,
                         organization_id: text_at(row, "organizationId")?,
                         organization_name: text_at(row, "organizationName"),
+                        owner_email: text_at(row, "ownerEmail").map(|e| crate::rest::organizations::normalise_email(&e)),
                         token: Zeroizing::new(text_at(row, "token")?),
                         expires_at: text_at(row, "expirationDate"),
                     })
@@ -576,7 +584,8 @@ mod tests {
             .match_header("Authorization", "Bearer AT-1")
             .with_body(serde_json::json!({ "object": "list", "data": [{
                 "id": "inv-1", "organizationId": ORG, "organizationName": "Shared by denis@example.com",
-                "token": "tok-1", "expirationDate": "2026-10-04T00:00:00.000Z", "object": "organizationInvitation"
+                "token": "tok-1", "expirationDate": "2026-10-04T00:00:00.000Z", "object": "organizationInvitation",
+                "ownerEmail": " Denis@Example.com "
             }]}).to_string())
             .expect(1)
             .create();
@@ -584,6 +593,7 @@ mod tests {
         listed.assert();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].organization_name.as_deref(), Some("Shared by denis@example.com"));
+        assert_eq!(got[0].owner_email.as_deref(), Some("denis@example.com"), "read and normalised");
         assert_eq!(got[0].token.as_str(), "tok-1");
         assert_eq!(got[0].expires_at.as_deref(), Some("2026-10-04T00:00:00.000Z"));
 

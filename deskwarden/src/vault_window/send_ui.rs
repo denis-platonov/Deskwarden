@@ -3643,7 +3643,7 @@ pub(crate) fn draw_invitation_pane(
         );
         // 6d's `.pav.lg` is 40 against the record tile's 42: centred in the
         // tile's slot, so the title starts where a record's would.
-        sharing::paint_inviter(p, egui::Rect::from_center_size(tile.center(), egui::Vec2::splat(sharing::INVITER_AVATAR)), &row.from);
+        sharing::paint_inviter(p, egui::Rect::from_center_size(tile.center(), egui::Vec2::splat(sharing::INVITER_AVATAR)), row.initial_of());
         let text_left = tile.right() + ROW_TEXT_GAP;
         let text_right = strip.right() - DETAIL_PAD_X_F - if inline { actions_width + HEADER_ACTION_GAP } else { 0.0 };
         let clip = p.with_clip_rect(
@@ -3652,7 +3652,7 @@ pub(crate) fn draw_invitation_pane(
         );
         let title = elided(
             &clip,
-            &row.from,
+            row.who(),
             egui::FontId::new(TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
             theme::INK,
             (text_right - text_left).max(0.0),
@@ -3693,8 +3693,8 @@ pub(crate) fn draw_invitation_pane(
 
     // --- the body: IF YOU ACCEPT, what a decline does, and a sentence ---
     ui.advance_cursor_after_rect(strip);
-    let you_get = sharing::you_get(&row.from);
-    let they_change = sharing::they_change(&row.from);
+    let you_get = sharing::you_get(row.from.as_deref());
+    let they_change = sharing::they_change(row.from.as_deref());
     let mut facts = vec![
         (sharing::YOU_GET_ROW, CardValue::Plain(&you_get)),
         (sharing::ACCESS_ROW, CardValue::Plain(sharing::VIEW_ONLY)),
@@ -3715,7 +3715,7 @@ pub(crate) fn draw_invitation_pane(
                     draw_fact_card(ui, sharing::IF_YOU_ACCEPT_TITLE, None, &facts, false);
                     ui.add_space(CARD_STACK_GAP);
                     ui.add(
-                        egui::Label::new(egui::RichText::new(sharing::decline_note(&row.from)).size(12.0).color(theme::TEXT_FAINT))
+                        egui::Label::new(egui::RichText::new(sharing::decline_note(row.from.as_deref())).size(12.0).color(theme::TEXT_FAINT))
                             .wrap(),
                     );
                     // An Accept or a Decline that failed, said on the pane
@@ -9435,7 +9435,7 @@ mod paint_tests {
         };
         let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
         let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }];
-        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: "denis@x.io".into(), expires: Some("in 6 days".into()) }];
+        let incoming = [IncomingRow { key: "invite:inv-1".into(), id: "inv-1".into(), from: Some("denis@x.io".into()), expires: Some("in 6 days".into()) }];
         let mut people = PeopleRows { received: &from_people, incoming: &incoming, ..PeopleRows::none() };
         let (painted, selected) = paint_received_people(&rows, &mut people, None);
         assert_eq!(selected.as_deref(), Some("invite:inv-1"), "nothing picked: the invitation is");
