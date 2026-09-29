@@ -4170,6 +4170,8 @@ pub mod tests {
         serde_json::json!({
             "id": FIXTURE_ORG,
             "name": format!("Shared by {EMAIL}"),
+            // A NodeWarden that attests the owner -- this account.
+            "ownerEmail": EMAIL,
             "role": "owner",
             "type": 0,
             "status": 2,

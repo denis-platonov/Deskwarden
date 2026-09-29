@@ -695,11 +695,13 @@ impl Sharing {
         if let Some(profile) = profile {
             self.note_account(profile);
         }
-        let cached = self.cached_org_id();
-        let mine = cached
-            .as_deref()
-            .and_then(|id| directory.sharing_orgs().into_iter().find(|o| o.id == id && o.sharing.as_ref().is_some_and(|s| s.mine)))
-            .or_else(|| directory.my_sharing_org());
+        // **The writes' own rule** ([`Self::my_org_id`]), so the confirm pass
+        // never works on an org the writes would refuse: a planted org owned
+        // and named for this account, attested to someone else, is not held
+        // as ours. No profile, no attestation to check: nothing is held.
+        let account = self.held().account.clone();
+        let chosen = profile.zip(account).and_then(|(profile, account)| self.my_org_id(profile, &account));
+        let mine = chosen.and_then(|id| directory.sharing_orgs().into_iter().find(|o| o.id == id));
         let mut held = self.held();
         // The previous roster, kept for an org whose roster this read could
         // not fetch: a known roster is better than none for the confirm pass.
@@ -732,13 +734,6 @@ impl Sharing {
             .iter()
             .filter_map(|o| o.sharing.as_ref().map(|s| (o.id.clone(), s.sharer.clone())))
             .collect();
-    }
-
-    /// The org id `sharing_state.json` remembers for this account.
-    pub(crate) fn cached_org_id(&self) -> Option<String> {
-        let path = self.setup().state_path?;
-        let account = self.held().account.as_ref().map(|a| a.id.clone())?;
-        crate::sharing_state::SharingState::load(&path).account(&account).sharing_org_id
     }
 
     /// The view -- pure over what is held and the daemon's items.
@@ -1102,26 +1097,86 @@ fn keyed_account(account: Option<Account>) -> Result<Account, SharingError> {
 
 // ---- the owner's writes -----------------------------------------------------------
 
+/// **Whether `org` is this account's OWN sharing org** -- the one question
+/// every owner's write asks before it files a record anywhere (final
+/// re-review, CRITICAL).
+///
+/// Owning an org named "Shared by <me>" is not enough: another account can
+/// create one and make this account its owner (NodeWarden allowed an
+/// owner-to-owner direct add until `47869c4`), and then this account's next
+/// share -- on any PC without the cached id -- filed its record into
+/// someone else's org. So:
+///
+/// - **An attested owner** (`ownerEmail`): mine only when
+///   [`crate::rest::organizations::sharing_mark`] says `mine` -- owned, named
+///   for this account, AND the server's owner is this account.
+/// - **No attestation** (a server that does not send `ownerEmail`): mine only
+///   when it is the cached id this client itself CREATED (`created_here`),
+///   and still owned and named for this account. Never adopted by name: the
+///   first share there makes a fresh org instead.
+fn org_is_mine(org: &crate::rest::sync::Organization, account_email: &str, created_here: Option<&str>) -> bool {
+    let mark = crate::rest::organizations::sharing_mark(
+        org.name.as_deref().and_then(sharer_of),
+        org.owner_email.as_deref(),
+        org.is_owner(),
+        account_email,
+    );
+    if !mark.is_some_and(|m| m.mine) {
+        return false;
+    }
+    match org.owner_email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
+        Some(_) => true,
+        None => created_here == Some(org.id.as_str()),
+    }
+}
+
 impl Sharing {
-    /// This account's own sharing org among the profile's: the cached id while
-    /// the account still owns it, else the first owned org named for it.
+    /// **This account's own sharing org among the profile's** -- the cached id
+    /// while it still passes [`org_is_mine`], else the first org that passes
+    /// it on the server's attestation. See [`org_is_mine`] for why owning an
+    /// org named for this account is not enough.
+    ///
+    /// **A cached id that fails is dropped** from `sharing_state.json`, with
+    /// a plain warning naming nothing: it is not this account's to file
+    /// into, and a later share must not find it again. An org the profile no
+    /// longer lists fails too.
     pub(crate) fn my_org_id(&self, profile: &Profile, account: &Account) -> Option<String> {
-        let owned: Vec<&crate::rest::sync::Organization> =
-            profile.organizations.iter().filter(|o| o.is_owner()).collect();
-        if let Some(cached) = self.cached_org_id() {
-            if owned.iter().any(|o| o.id == cached) {
-                return Some(cached);
+        let (cached, created) = self.setup().state_path.map_or((None, false), |path| {
+            let me = crate::sharing_state::SharingState::load(&path).account(&account.id);
+            (me.sharing_org_id, me.sharing_org_created)
+        });
+        let created_here = cached.as_deref().filter(|_| created);
+        if let Some(cached) = cached.as_deref() {
+            if profile.organizations.iter().any(|o| o.id == cached && org_is_mine(o, &account.email, created_here)) {
+                return Some(cached.to_string());
             }
+            self.forget_cached_org(&account.id, cached);
         }
-        owned
+        profile
+            .organizations
             .iter()
-            .find(|o| {
-                o.name
-                    .as_deref()
-                    .and_then(sharer_of)
-                    .is_some_and(|sharer| crate::rest::organizations::sharer_is(sharer, &account.email))
-            })
+            .find(|o| o.owner_email.as_deref().is_some_and(|e| !e.trim().is_empty()) && org_is_mine(o, &account.email, None))
             .map(|o| o.id.clone())
+    }
+
+    /// Drops a cached sharing org id that failed [`org_is_mine`] -- only if
+    /// the file still holds that id, so a share that chose another in the
+    /// meantime is not undone.
+    fn forget_cached_org(&self, account: &str, id: &str) {
+        let Some(path) = self.setup().state_path else {
+            return;
+        };
+        log::warn!("the cached sharing organisation is not this account's own, so it is no longer used");
+        let dropped = crate::sharing_state::update(&path, |state| {
+            let me = state.account_mut(account);
+            if me.sharing_org_id.as_deref() == Some(id) {
+                me.sharing_org_id = None;
+                me.sharing_org_created = false;
+            }
+        });
+        if let Err(e) = dropped {
+            log::warn!("the cached sharing organisation could not be dropped: {e}");
+        }
     }
 
     /// The org's person collections, decrypted where they are ciphertext.
@@ -1504,11 +1559,11 @@ impl Sharing {
         let existing = self.my_org_id(&profile, &account);
         refuse_unmovable(&record, &failures, existing.as_deref())?;
 
-        let (org_id, org_key, collections) = match existing {
+        let (org_id, org_key, collections, created) = match existing {
             Some(org_id) => {
                 let org_key = keys.organization(&org_id).cloned().ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
                 let collections = self.collections_of(&org_id, &org_key)?;
-                (org_id, org_key, collections)
+                (org_id, org_key, collections, false)
             }
             None => {
                 let (org_id, org_key) = self.create_org(&profile, &account, &keys, &email)?;
@@ -1522,7 +1577,7 @@ impl Sharing {
                 // A server that made C(E) from `collectionName` (spec 9.5) is
                 // adopted here by name, like any other collection.
                 let collections = self.collections_of(&org_id, &org_key)?;
-                (org_id, org_key, collections)
+                (org_id, org_key, collections, true)
             }
         };
         if let Some(path) = self.setup().state_path {
@@ -1531,6 +1586,10 @@ impl Sharing {
             let moved = crate::sharing_state::Move { folder_id: record.item.folder_id.clone(), favorite: record.item.favorite };
             let written = crate::sharing_state::update(&path, |state| {
                 let me = state.account_mut(&account_id);
+                // Made here now, or made here before under this same id: on a
+                // server that attests no owner, only such an id is ever used
+                // again (`org_is_mine`).
+                me.sharing_org_created = created || (me.sharing_org_created && me.sharing_org_id.as_deref() == Some(org.as_str()));
                 me.sharing_org_id = Some(org);
                 if was_personal {
                     me.moves.insert(record.item.id.clone(), moved);
@@ -4910,6 +4969,113 @@ mod tests {
         let outcome = engine.share("p1", "kim@example.com").expect("shared");
         added.assert();
         assert_eq!(outcome.result, ShareResult::WaitingAccept, "an existing account is never told to create one");
+    }
+
+    // ---- final re-review, CRITICAL: an org is mine only on the server's word ----
+
+    /// The fixture's own sharing org, as a server attesting `owner` owns it:
+    /// owned by this account, named for it -- the planted shape when `owner`
+    /// is someone else. `None`: a server that attests nothing.
+    fn org_owned_by(owner: Option<&str>) -> serde_json::Value {
+        let mut row = sharing_org_row();
+        match owner {
+            Some(owner) => row["ownerEmail"] = serde_json::json!(owner),
+            None => {
+                row.as_object_mut().expect("an object").remove("ownerEmail");
+            }
+        }
+        row
+    }
+
+    fn cache_org(dir: &crate::test_scratch::ScratchDir, created: bool) {
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            let me = state.account_mut(FIXTURE_USER_ID);
+            me.sharing_org_id = Some(FIXTURE_ORG.into());
+            me.sharing_org_created = created;
+        })
+        .expect("seeded");
+    }
+
+    fn cached(dir: &crate::test_scratch::ScratchDir) -> (Option<String>, bool) {
+        let me = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        (me.sharing_org_id, me.sharing_org_created)
+    }
+
+    /// **A planted org -- owned by this account and named for it, but
+    /// attested to someone else -- is never this account's sharing org**
+    /// (final re-review, CRITICAL). Mallory creates "Shared by <me>" and adds
+    /// me as its owner: the share does not file into it, and a fresh org of
+    /// my own is created instead. Nothing is asked of the planted org.
+    #[test]
+    fn a_planted_org_attested_to_someone_else_is_not_used_and_a_fresh_one_is_made() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([org_owned_by(Some("mallory@evil.example"))]));
+        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([org_owned_by(Some("mallory@evil.example"))]))).expect("profile");
+        let account = engine.held().account.clone().expect("an account");
+        assert_eq!(engine.my_org_id(&profile, &account), None);
+
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        let planted = server.mock("GET", Matcher::Regex(format!("^/api/organizations/{FIXTURE_ORG}/"))).expect(0).create();
+        let planted_writes = server.mock("POST", Matcher::Regex(format!("^/api/organizations/{FIXTURE_ORG}/"))).expect(0).create();
+        let filed = server.mock("PUT", "/api/ciphers/p1/share").match_request(|r| r.utf8_lossy_body().contains(FIXTURE_ORG)).expect(0).create();
+        let fresh = server
+            .mock("POST", "/api/organizations")
+            .with_body(r#"{"id":"org-new","object":"organization"}"#)
+            .expect(1)
+            .create();
+        server.mock("GET", "/api/organizations/org-new/collections").with_body(r#"{"data":[]}"#).create();
+        // What follows the create is not this test's business; the create is.
+        let _ = engine.share("p1", "anna@example.com");
+        fresh.assert();
+        planted.assert();
+        planted_writes.assert();
+        filed.assert();
+        assert_eq!(cached(&dir), (Some("org-new".into()), true), "the fresh org is remembered as made here");
+        // And the whole read holds nothing of it for the confirm pass.
+        let directory = crate::rest::organizations::Directory::from_sync(
+            &serde_json::from_value(serde_json::json!({ "profile": sharing_profile(serde_json::json!([org_owned_by(Some("mallory@evil.example"))])), "ciphers": [], "folders": [], "collections": [] })).expect("sync"),
+            &engine.keys_from(&profile).expect("keys"),
+        );
+        engine.note_directory(&directory, Some(&profile));
+        assert!(engine.held().my_org.is_none(), "a planted org is not held as ours");
+    }
+
+    /// **A cached id pointing at a planted org is dropped** (final re-review,
+    /// CRITICAL): the cache is checked by the same rule, and a failure takes
+    /// it out of `sharing_state.json` so no later share finds it again.
+    #[test]
+    fn a_cached_id_pointing_at_a_planted_org_is_dropped() {
+        let (_server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
+        cache_org(&dir, true);
+        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([org_owned_by(Some("mallory@evil.example"))]))).expect("profile");
+        let account = engine.held().account.clone().expect("an account");
+        assert_eq!(engine.my_org_id(&profile, &account), None);
+        assert_eq!(cached(&dir), (None, false), "the cached id is gone");
+    }
+
+    /// **A genuine org is used** -- attested to this account, found with or
+    /// without a cache -- and on a server that attests nothing, only the id
+    /// this client created: an owned org named for it is never adopted by
+    /// name there, and a cached id it did not create is dropped.
+    #[test]
+    fn a_genuine_attested_org_is_used_and_an_unattested_one_only_if_made_here() {
+        let (_server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
+        let account = engine.held().account.clone().expect("an account");
+        let profile_with = |row: serde_json::Value| -> Profile { serde_json::from_value(sharing_profile(serde_json::json!([row]))).expect("profile") };
+
+        let attested = profile_with(org_owned_by(Some(&FIXTURE_EMAIL.to_uppercase())));
+        assert_eq!(engine.my_org_id(&attested, &account).as_deref(), Some(FIXTURE_ORG), "adopted on the server's word");
+        cache_org(&dir, false);
+        assert_eq!(engine.my_org_id(&attested, &account).as_deref(), Some(FIXTURE_ORG), "a cached attested id");
+        assert_eq!(cached(&dir).0.as_deref(), Some(FIXTURE_ORG), "kept");
+
+        let silent = profile_with(org_owned_by(None));
+        std::fs::remove_file(dir.join("sharing_state.json")).expect("cleared");
+        assert_eq!(engine.my_org_id(&silent, &account), None, "never adopted by name alone");
+        cache_org(&dir, true);
+        assert_eq!(engine.my_org_id(&silent, &account).as_deref(), Some(FIXTURE_ORG), "the id this client made");
+        cache_org(&dir, false);
+        assert_eq!(engine.my_org_id(&silent, &account), None, "a cached id this client did not make");
+        assert_eq!(cached(&dir), (None, false), "and it is dropped");
     }
 
     // ---- final review, I1: a plaintext name never starts a grant ----

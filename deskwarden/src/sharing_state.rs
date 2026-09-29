@@ -86,6 +86,14 @@ pub struct SharingState {
 pub struct AccountSharing {
     /// The account's own sharing organisation, once chosen.
     pub sharing_org_id: Option<String>,
+    /// **This client CREATED `sharing_org_id`** -- set by the share that made
+    /// it, kept while the id stays the same, cleared when another is chosen.
+    /// On a server that does not attest an org's owner (no `ownerEmail`) it
+    /// is the only thing that lets the cached id be used: an org merely OWNED
+    /// and NAMED for this account may be one someone else made and added it
+    /// to as owner (`Sharing::my_org_id`). `serde(default)`: a file from
+    /// before it reads as "not created here", the safe side.
+    pub sharing_org_created: bool,
     /// Public-key pins, by normalised email.
     pub pins: BTreeMap<String, Pin>,
     /// Where a shared record was, by its organisation cipher id.
