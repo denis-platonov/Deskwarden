@@ -225,6 +225,24 @@ fn rekey_value(value: &mut Value, from: &SymmetricKey, to: &SymmetricKey) -> Res
 }
 
 /// One string leaf: `None` to leave it, `Some` for what replaces it.
+///
+/// **What claims to be ciphertext and is not readable is refused, never
+/// passed through as plaintext** (final review, item 5). Two shapes used to
+/// slip by as "not ciphertext" and ride into the org under the user key --
+/// readable by nobody there, and a leaf the walk exists to catch:
+///
+/// - an all-digit type Bitwarden never defined (`CryptoError::UnknownType`,
+///   say `7.xxxx`): a format this crate cannot judge is not a plaintext
+///   either;
+/// - a `2.` string that does not parse as type 2 (`CryptoError::Malformed`):
+///   its prefix is the one every Bitwarden ciphertext of this era carries.
+///
+/// Every other parse failure -- no `.`, a type that is not a number (a
+/// date, a GUID, a URL) -- is ordinary plaintext, as before. The cost is a
+/// plaintext leaf that happens to look like `12.5`: the share refuses whole
+/// (`UNREADABLE_PART`) rather than guess, which is the rule this walk
+/// already applies to a leaf that opens under neither key. Pinned by
+/// `rekeying_refuses_an_unknown_type_and_a_malformed_type_two`.
 fn rekey_text(text: &str, from: &SymmetricKey, to: &SymmetricKey) -> Result<Option<String>, CryptoError> {
     match text.parse::<EncString>() {
         Ok(enc) => {
@@ -234,7 +252,8 @@ fn rekey_text(text: &str, from: &SymmetricKey, to: &SymmetricKey) -> Result<Opti
             let plain = decrypt(from, &enc)?;
             Ok(Some(encrypt(to, &plain)?.to_string()))
         }
-        Err(refused @ CryptoError::Unsupported(_)) => Err(refused),
+        Err(refused @ (CryptoError::Unsupported(_) | CryptoError::UnknownType)) => Err(refused),
+        Err(malformed @ CryptoError::Malformed(_)) if text.starts_with("2.") => Err(malformed),
         // Not ciphertext -- an id, a date, a flag. Unless it is JSON with
         // ciphertext inside, as NodeWarden's passthrough `data` may be.
         Err(_) => match serde_json::from_str::<Value>(text) {
@@ -1539,6 +1558,32 @@ pub(crate) mod tests {
         let (item, keys) = round_trip_in(odd);
         let mut mapped = encrypt_item(&item, &keys).expect("maps");
         assert!(mapped.rekey_carried(&user, &org).is_err(), "a leaf under neither key was let through");
+    }
+
+    /// **A leaf that claims to be ciphertext and cannot be read is refused**
+    /// (final review, item 5): an unknown all-digit type and a malformed `2.`
+    /// used to pass through as if plaintext, landing in the org under the
+    /// user key. A date, a GUID and a plain word -- each with no numeric
+    /// type -- still pass untouched.
+    #[test]
+    fn rekeying_refuses_an_unknown_type_and_a_malformed_type_two() {
+        let (user, org) = (key(1), key(2));
+        assert!(matches!(rekey_text("7.QUJD|REVG", &user, &org), Err(CryptoError::UnknownType)), "an unknown type");
+        assert!(matches!(rekey_text("2.not|a|cipher", &user, &org), Err(CryptoError::Malformed(_))), "a malformed type 2");
+        assert!(matches!(rekey_text("2.onlyonepart", &user, &org), Err(CryptoError::Malformed(_))), "a type 2 with one part");
+        for plain in ["2026-09-28T00:00:00.000Z", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "hello", "https://x.example/a.b"] {
+            assert_eq!(rekey_text(plain, &user, &org).expect(plain), None, "{plain} is plaintext and passes");
+        }
+        // Through the whole walk: one such leaf refuses the body.
+        let cipher = serde_json::json!({
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "type": 1,
+            "name": enc(&user, "Example"),
+            "login": { "password": enc(&user, "pw"), "uris": [{ "uri": enc(&user, "https://x.example"), "uriChecksum": "9.QUJD" }] },
+        });
+        let (item, keys) = round_trip_in(cipher);
+        let mut mapped = encrypt_item(&item, &keys).expect("maps");
+        assert!(mapped.rekey_carried(&user, &org).is_err(), "an unknown-type leaf was carried as plaintext");
     }
 
     /// The plaintext folder name [`crate::rest::api`]'s folder tests search
