@@ -253,6 +253,17 @@ pub struct Organization {
     /// 0 invited, 1 accepted, 2 confirmed.
     #[serde(default)]
     pub status: Option<i64>,
+    /// **The owner's email, as the SERVER attests it** -- NodeWarden's
+    /// `ownerEmail`, read off its own roster (the org's accepted owner), which
+    /// no member can write. `None` from a server that does not send it.
+    ///
+    /// It is what a sharing org's "Shared by <email>" NAME is checked
+    /// against ([`crate::rest::organizations::sharing_mark`]): anyone can
+    /// create an organisation with that name and add anyone to it, so the
+    /// name alone is a claim, and a recipient shown "Shared by boss@..."
+    /// must be shown it because the server says boss@ owns it.
+    #[serde(rename = "ownerEmail", default)]
+    pub owner_email: Option<String>,
 }
 
 // ---- what comes out ---------------------------------------------------------
@@ -2169,6 +2180,10 @@ pub mod tests {
         // nothing it was not told.
         let bare: Profile = serde_json::from_value(serde_json::json!({ "key": "2.a|b|c" })).expect("bare");
         assert!(bare.id.is_none() && bare.email.is_none() && bare.organizations_new.is_empty());
+        assert!(profile.organizations[0].owner_email.is_none(), "a server that does not attest says nothing");
+        let attested: Organization =
+            serde_json::from_value(serde_json::json!({ "id": "o3", "ownerEmail": "anna@example.com" })).expect("org");
+        assert_eq!(attested.owner_email.as_deref(), Some("anna@example.com"));
         assert!(!bare.is_server_admin());
     }
 
