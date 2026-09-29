@@ -2269,6 +2269,12 @@ pub fn build_frame_with_search(
             // is rare.
             trash_list.invalidate();
             archive_list.invalidate();
+            // The sharing view is read off the daemon's items, so a vault that
+            // has just been re-read -- a sync, a targeted refresh, the first
+            // load -- makes it suspect too. One loopback read, answered from
+            // the daemon's memory; and with push off, the only other thing
+            // that would ever ask again is the heartbeat (final review, I2).
+            sharing.invalidate();
         }
 
         // The on-demand trash/archive fetch reporting back. Non-blocking like
@@ -2378,6 +2384,12 @@ pub fn build_frame_with_search(
         // no line to the daemon, whose Share control offers a Send.
         let sharing_now = ui.ctx().input(|i| i.time);
         share_ui::drain(&sharing_rx, &mut sharing, sharing_now);
+        // **With no live push, the view ages** (final review, I2): the hub is
+        // the only thing that says the daemon's sharing view moved, and with
+        // push off it does not exist. `heartbeat` marks a view older than a
+        // minute stale; the frame schedule already wakes this line every half
+        // second, so it adds no repaint request of its own.
+        sharing.heartbeat(sharing_now, hub_live);
         if sharing.wants_view(sharing_now) && sharing_client.is_some() {
             // A view read is refused only with no line, which was just ruled
             // out; nothing is waiting on this one to take a spinner down.
@@ -41799,6 +41811,30 @@ mod forget_step_tests {
         assert!(!forgotten);
         assert_eq!(records, vec!["Acme VPN".to_string()], "the question names the shared record");
         assert!(ask.as_ref().is_some_and(|(_, sends)| sends.is_empty()));
+    }
+
+    /// **The sharing view is asked again without a push** (final review, I2):
+    /// every settled vault load marks it stale -- the view is read off the
+    /// daemon's items -- and the frame ages it (`SharingPane::heartbeat`)
+    /// before asking whether to read it, with the hub's liveness, so a
+    /// window with push off does not sit on its first view forever. The
+    /// heartbeat adds no repaint request: the frame-schedule census, which
+    /// counts them, is untouched by it.
+    #[test]
+    fn the_sharing_view_goes_stale_on_a_vault_load_and_on_the_heartbeat() {
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let production = &source[..source.find(concat!("#[cfg(", "test)]")).expect("a test marker")];
+        let load = production.find(concat!("vault_rx.try_", "recv()")).expect("the vault load drain");
+        let next = production[load..].find(concat!("aux_rx.try_", "recv()")).expect("the drain after it") + load;
+        assert!(
+            production[load..next].contains(concat!("sharing.", "invalidate();")),
+            "a settled vault load does not mark the sharing view stale"
+        );
+        let beat = production.find(concat!("sharing.heartbeat(sharing_now, ", "hub_live);")).expect("the heartbeat");
+        let ask = production.find(concat!("sharing.wants_", "view(")).expect("the view request");
+        assert!(beat < ask, "the heartbeat must age the view before the frame asks whether to read it");
+        let between = &production[beat..ask];
+        assert!(!between.contains(concat!("request_repaint", "_after(")), "the heartbeat must not schedule frames");
     }
 
     /// **The window sends the daemon's forget from one place**: the forget

@@ -281,6 +281,9 @@ pub(crate) struct SharingPane {
     /// The last view read failed: when, in egui seconds, to try again. See
     /// [`Self::wants_view`].
     retry_at: Option<f64>,
+    /// When, in egui seconds, the last view read landed -- what
+    /// [`Self::heartbeat`] ages the view by while no push can say it moved.
+    viewed_at: Option<f64>,
     /// A write is in flight; one at a time. A fingerprint is a read and
     /// does not take the slot -- see [`request`].
     busy: bool,
@@ -358,6 +361,14 @@ const TOAST_SECONDS: f64 = 5.0;
 /// second, so the check needs no timer of its own.
 pub(crate) const VIEW_RETRY_SECONDS: f64 = 30.0;
 
+/// **How old the view may get while nothing can push a change**, in
+/// seconds. With push off -- or the hub down -- the window hears of no
+/// sharing change: an invitation accepted, a confirm the daemon's timer ran,
+/// a record another PC shared. A view read is one loopback request answered
+/// from the daemon's memory (spec 11.3), so asking once a minute costs
+/// nothing worth saving (final review, I2). See [`SharingPane::heartbeat`].
+pub(crate) const VIEW_HEARTBEAT_SECONDS: f64 = 60.0;
+
 impl SharingPane {
     /// The daemon said the view changed, or this window changed it.
     pub(crate) fn invalidate(&mut self) {
@@ -381,6 +392,25 @@ impl SharingPane {
             None => self.view.is_none(),
         };
         !self.fetching && (self.stale || due)
+    }
+
+    /// **The view ages while no push is live** (final review, I2): once it
+    /// is [`VIEW_HEARTBEAT_SECONDS`] old it goes stale, and the frame's
+    /// [`Self::wants_view`] asks again. With the hub live, a sharing change
+    /// is pushed (`HubListener::sharing_changed`) and the view is left alone.
+    ///
+    /// No timer of its own and no repaint request: the vault window's frame
+    /// schedule already wakes it every half second (`FRAME_INTERVAL`), so the
+    /// check rides a frame that runs anyway, and the frame-schedule census is
+    /// unchanged. A view never read, or one whose read failed, is
+    /// [`Self::wants_view`]'s own business (`retry_at`): this stands down
+    /// while a retry is pending, or a view that is old AND failing would be
+    /// marked stale every frame -- and `stale` outranks `retry_at` there --
+    /// turning a failing daemon into a request per frame.
+    pub(crate) fn heartbeat(&mut self, now_seconds: f64, push_live: bool) {
+        if !push_live && self.retry_at.is_none() && self.viewed_at.is_some_and(|at| now_seconds - at >= VIEW_HEARTBEAT_SECONDS) {
+            self.stale = true;
+        }
     }
 
     /// A view request was started.
@@ -920,6 +950,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                     }
                     pane.view = Some(view);
                     pane.retry_at = None;
+                    pane.viewed_at = Some(now_seconds);
                 }
                 // The reason is NOT in the line: it is the daemon's sentence
                 // (module doc). The view on screen stays as it was, and the
@@ -3024,6 +3055,36 @@ mod tests {
         assert_eq!(share_control(None, false, &item("mine")), Some(false), "no line to the daemon: a Send");
         assert_eq!(share_control(None, true, &item("mine")), None, "not known yet");
         assert_eq!(share_control(Some(&received), true, &item("theirs")), None);
+    }
+
+    /// **With push off, the view is asked again once it is a minute old**
+    /// (final review, I2) -- and not before, not while the hub is live (a
+    /// push says when it moved), and not while a failed read waits for its
+    /// retry, which would otherwise make a failing daemon a request a frame.
+    #[test]
+    fn with_no_push_the_view_is_read_again_once_a_minute() {
+        let mut pane = SharingPane::default();
+        pane.begin_view();
+        apply(&mut pane, SharingReport::View(Ok(view(vec![], vec![]))), 100.0);
+        assert!(!pane.wants_view(100.0), "a fresh view is not asked again");
+
+        pane.heartbeat(100.0 + VIEW_HEARTBEAT_SECONDS - 1.0, false);
+        assert!(!pane.wants_view(100.0 + VIEW_HEARTBEAT_SECONDS - 1.0), "not a minute old yet");
+        pane.heartbeat(100.0 + VIEW_HEARTBEAT_SECONDS, true);
+        assert!(!pane.wants_view(100.0 + VIEW_HEARTBEAT_SECONDS), "a live hub pushes changes; no polling");
+        pane.heartbeat(100.0 + VIEW_HEARTBEAT_SECONDS, false);
+        assert!(pane.wants_view(100.0 + VIEW_HEARTBEAT_SECONDS), "push off: a minute-old view is asked again");
+
+        // That read fails: the heartbeat stands down until the retry is due.
+        pane.begin_view();
+        let failed_at = 100.0 + VIEW_HEARTBEAT_SECONDS;
+        apply(&mut pane, SharingReport::View(Err("unreachable".into())), failed_at);
+        for frame in 1..10 {
+            let now = failed_at + f64::from(frame) * 0.5;
+            pane.heartbeat(now, false);
+            assert!(!pane.wants_view(now), "a failing daemon is not asked every frame ({now})");
+        }
+        assert!(pane.wants_view(failed_at + VIEW_RETRY_SECONDS), "the retry still comes");
     }
 
     /// **A report updates the pane**: a view arrives, a share that landed
