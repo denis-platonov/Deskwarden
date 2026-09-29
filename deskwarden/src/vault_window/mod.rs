@@ -1184,6 +1184,12 @@ pub fn build_frame_with_search(
     // (spec 11.7) -- the question's second list. Stopped by the daemon's
     // forget on yes; cleared with the question either way.
     let mut forget_records: Vec<String> = Vec::new();
+    // **Whether the Yes asks the daemon's forget** -- decided with the
+    // question by `forget_request_for`, and NOT from `forget_records` alone
+    // (final review, I4): a person the view lists with no live record (their
+    // only share in the trash, or a collection left with nobody in it) still
+    // has a collection and a membership only the daemon can take away.
+    let mut forget_daemon = false;
     // The forget question was asked from the Share dialog's suggestions
     // rather than the Send composer's -- so a refusal, and the daemon's
     // answer, are said in that dialog (`SharingPane::begin_forget`).
@@ -7109,6 +7115,8 @@ pub fn build_frame_with_search(
                         &mut sent_unsaved,
                         sharing.view.as_ref(),
                         &items,
+                        &mut forget_daemon,
+                        sharing_client.is_some(),
                     );
                     forget_from_dialog = !forgotten;
                 }
@@ -7197,6 +7205,8 @@ pub fn build_frame_with_search(
                     &mut sent_unsaved,
                     sharing.view.as_ref(),
                     &items,
+                    &mut forget_daemon,
+                    sharing_client.is_some(),
                 );
             }
             match answer {
@@ -7320,12 +7330,24 @@ pub fn build_frame_with_search(
         if let Some((email, shares)) = &forget_ask {
             let mut names: Vec<String> = shares.iter().map(|(_, name)| name.clone()).collect();
             names.extend(forget_records.iter().cloned());
-            match record_ui::draw_forget_confirm(ui.ctx(), email, &names) {
+            // **Nothing to name, but the daemon to ask** (final review, I4):
+            // a person with no live Send and no live shared record, whom the
+            // daemon may still hold a collection or membership for. The ✕
+            // was the whole of the user's answer before -- such a person was
+            // forgotten at once -- so no question goes up (it would ask about
+            // "0 records"); the Yes is taken as given and only the daemon's
+            // forget is waited on.
+            let answer = if names.is_empty() {
+                Some(record_ui::ForgetAnswer::DeleteShares)
+            } else {
+                record_ui::draw_forget_confirm(ui.ctx(), email, &names)
+            };
+            match answer {
                 Some(record_ui::ForgetAnswer::DeleteShares) => {
-                    // Only records the view shows as shared send the daemon's
-                    // forget; its answer is waited on below
-                    // (`SharingPane::begin_forget`).
-                    let started = forget_records.is_empty() || {
+                    // The daemon's forget is sent wherever `forget_request_for`
+                    // said it is needed -- not only for named records -- and
+                    // its answer is waited on below (`SharingPane::begin_forget`).
+                    let started = !forget_daemon || {
                         let call = share_ui::SharingCall::Forget(email.clone());
                         let sent = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call);
                         if sent {
@@ -7334,6 +7356,7 @@ pub fn build_frame_with_search(
                         sent
                     };
                     forget_records.clear();
+                    forget_daemon = false;
                     if started {
                         forgetting = forget_ask.take();
                         send_delete.report = None;
@@ -7347,6 +7370,7 @@ pub fn build_frame_with_search(
                 Some(record_ui::ForgetAnswer::Keep) => {
                     forget_ask = None;
                     forget_records.clear();
+                    forget_daemon = false;
                 }
                 None => {}
             }
@@ -9308,9 +9332,22 @@ fn permit_reinvite(
 /// **The forget question's two lists** (spec 11.7): the person's live Sends,
 /// asked about and deleted through the Sent screen's one door, and the
 /// records shared with them, stopped by the daemon's forget when the answer
-/// is yes. With nothing on either list the person is forgotten at once and
-/// this answers `true`; otherwise the question is put up (`forget_ask` and
-/// `forget_records`) and it answers `false`.
+/// is yes. With nothing on either list AND nothing for the daemon to forget,
+/// the person is forgotten at once and this answers `true`; otherwise the
+/// question is put up (`forget_ask` and `forget_records`) and it answers
+/// `false`.
+///
+/// **Whether the daemon is asked** (`forget_daemon`) is its own decision
+/// (final review, I4). It used to follow the record list, which is read off
+/// the daemon's LIVE items: a person whose only share is in the trash, or
+/// whose collection holds nothing, had no records, was forgotten here, and
+/// kept their collection and membership on the server for good. Now the
+/// daemon is asked whenever the view lists the person at all, or -- with a
+/// line to the daemon -- whenever there is no view to say they are not
+/// there. The engine answers "nothing to forget" with success, and its
+/// server-side listing (the trash included) is what finds the rest. With no
+/// line (`linked == false`) there is no daemon to ask, and a view that says
+/// sharing is off here lists nobody.
 ///
 /// One function for the two places a person can be forgotten -- the Send
 /// composer's Recipient suggestions and the Share dialog's -- so the two ✕
@@ -9331,6 +9368,8 @@ fn forget_request_for(
     sent_unsaved: &mut Vec<share_ui::UnsavedSent>,
     sharing: Option<&crate::rest::sharing::SharingView>,
     items: &[VaultItem],
+    forget_daemon: &mut bool,
+    linked: bool,
 ) -> bool {
     let listed: Option<Vec<String>> = match &send_fetch.result {
         Some(Ok(rows)) => Some(rows.iter().map(|row| row.id.clone()).collect()),
@@ -9345,7 +9384,8 @@ fn forget_request_for(
         .map(|entry| (entry.send_id.clone(), entry.name.clone()))
         .collect();
     let records = share_ui::records_shared_with(sharing, email, items);
-    if shares.is_empty() && records.is_empty() {
+    let daemon = linked && (!records.is_empty() || sharing.is_none_or(|view| view.person(email).is_some()));
+    if shares.is_empty() && records.is_empty() && !daemon {
         sent_history.forget(email);
         if let Some(path) = sent_history_path {
             if let Err(e) = crate::sent_history::update(path, |h| {
@@ -9359,6 +9399,7 @@ fn forget_request_for(
     } else {
         *forget_ask = Some((email.to_string(), shares));
         *forget_records = records;
+        *forget_daemon = daemon;
         false
     }
 }
@@ -41802,15 +41843,50 @@ mod forget_step_tests {
         let fetch = super::send_ui::SendFetch::default();
         let (mut ask, mut records, mut unsaved) = (None, Vec::new(), Vec::new());
 
-        let forgotten = forget_request_for("bob@x.io", &mut ask, &mut records, &fetch, &mut history, None, &mut unsaved, Some(&view), &items);
+        let mut daemon = false;
+        let forgotten = forget_request_for("bob@x.io", &mut ask, &mut records, &fetch, &mut history, None, &mut unsaved, Some(&view), &items, &mut daemon, true);
         assert!(forgotten, "a share entry with no Send id is not a live Send, and the view shares nothing with bob");
-        assert!(ask.is_none() && records.is_empty());
+        assert!(ask.is_none() && records.is_empty() && !daemon);
         assert!(history.entries.is_empty(), "forgotten at once");
 
-        let forgotten = forget_request_for("Anna@x.io", &mut ask, &mut records, &fetch, &mut history, None, &mut unsaved, Some(&view), &items);
+        let forgotten = forget_request_for("Anna@x.io", &mut ask, &mut records, &fetch, &mut history, None, &mut unsaved, Some(&view), &items, &mut daemon, true);
         assert!(!forgotten);
         assert_eq!(records, vec!["Acme VPN".to_string()], "the question names the shared record");
         assert!(ask.as_ref().is_some_and(|(_, sends)| sends.is_empty()));
+        assert!(daemon, "named records are stopped by the daemon");
+    }
+
+    /// **A person the daemon may still hold is forgotten THROUGH it** (final
+    /// review, I4), even with no live record to name: the view lists them (a
+    /// share in the trash, an empty collection) or there is no view to say
+    /// they are not there. The engine answers "nothing to forget" with
+    /// success and its trash-aware server listing finds the rest. With no
+    /// line to the daemon, or a view that says sharing is off here, the
+    /// person is forgotten at once as before.
+    #[test]
+    fn a_person_with_no_live_record_is_still_forgotten_through_the_daemon() {
+        use crate::rest::sharing::{PersonEntry, PersonState, SharingView};
+        let items: Vec<crate::vault_bridge::VaultItem> = Vec::new();
+        let listed = SharingView {
+            available: true,
+            people: vec![PersonEntry { email: "anna@x.io".into(), state: PersonState::Gone, expires_at: None, authenticated: true }],
+            ..SharingView::default()
+        };
+        let off = SharingView::unavailable(crate::rest::sharing::REASON_NOT_NODEWARDEN);
+        let fetch = super::send_ui::SendFetch::default();
+        let ask_about = |view: Option<&SharingView>, linked: bool| {
+            let mut history = crate::sent_history::SentHistory::default();
+            let (mut ask, mut records, mut unsaved, mut daemon) = (None, Vec::new(), Vec::new(), false);
+            let forgotten =
+                forget_request_for("Anna@x.io", &mut ask, &mut records, &fetch, &mut history, None, &mut unsaved, view, &items, &mut daemon, linked);
+            (forgotten, ask.is_some(), records.is_empty(), daemon)
+        };
+        assert_eq!(ask_about(Some(&listed), true), (false, true, true, true), "listed, no live record: the daemon is asked");
+        assert_eq!(ask_about(None, true), (false, true, true, true), "no view yet, but a line: the daemon is asked");
+        assert_eq!(ask_about(None, false), (true, false, true, false), "no line: nothing to ask");
+        assert_eq!(ask_about(Some(&off), true), (true, false, true, false), "sharing off here: nobody to forget");
+        let empty = SharingView { available: true, ..SharingView::default() };
+        assert_eq!(ask_about(Some(&empty), true), (true, false, true, false), "a view that does not list them");
     }
 
     /// **The sharing view is asked again without a push** (final review, I2):
@@ -41838,9 +41914,12 @@ mod forget_step_tests {
     }
 
     /// **The window sends the daemon's forget from one place**: the forget
-    /// question's Yes, and only when the question named records -- so neither
-    /// ✕ sends a no-op forget that would take the write slot, and the send is
-    /// recorded (`begin_forget`) so the local forget waits for its answer.
+    /// question's Yes, and only where `forget_request_for` said the daemon has
+    /// someone to forget (`forget_daemon`: the view lists them, or there is
+    /// no view to say otherwise -- final review, I4) -- so neither ✕ sends a
+    /// no-op forget that would take the write slot for a person sharing
+    /// never knew, and the send is recorded (`begin_forget`) so the local
+    /// forget waits for its answer.
     #[test]
     fn the_daemons_forget_is_sent_only_for_named_records_and_is_waited_on() {
         let source = include_str!("mod.rs");
@@ -41849,7 +41928,7 @@ mod forget_step_tests {
         assert_eq!(production.matches(call).count(), 1, "the daemon's forget is sent from more than one place");
         let at = production.find(call).expect("the call");
         let before = &production[at.saturating_sub(200)..at];
-        assert!(before.contains(concat!("forget_records.is_", "empty() ||")), "the forget is not gated on named records");
+        assert!(before.contains(concat!("!forget_", "daemon ||")), "the forget is not gated on the daemon having someone to forget");
         let after = &production[at..at + 400];
         assert!(after.contains(concat!("sharing.begin_", "forget(")), "a sent forget is not recorded, so nothing waits for it");
     }
