@@ -7444,7 +7444,7 @@ const VIEW_ONLY_MARK_GAP: f32 = 5.0;
 const VIEW_ONLY_KIND_GAP: f32 = 8.0;
 /// Mock 6d's `.menu { width: 250px }`, which the view-only kebab's one line
 /// wraps inside rather than stretching the menu across the pane.
-const VIEW_ONLY_MENU_WIDTH: f32 = 250.0;
+pub(super) const VIEW_ONLY_MENU_WIDTH: f32 = 250.0;
 
 /// One run of the header's subtitle: **the same faint words in the same
 /// place, and now selectable with the mouse.** The user, of the detail

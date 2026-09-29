@@ -577,6 +577,20 @@ pub(super) fn out_of_vault_entries_for(item: &VaultItem, out: OutOfVault) -> Vec
     entries
 }
 
+/// **What an EMPTY row menu says instead of opening on nothing** (final
+/// review, item 7): [`super::detail::VIEW_ONLY_FOOTER`], the read pane's own
+/// words. Only a view-only record's menu can be empty -- every writable menu
+/// holds Edit or a restore -- and one with nothing to copy (a card, a note,
+/// a login with no username or password) or anything in the Trash or the
+/// Archive (whose every entry writes) used to open as a blank popup, a
+/// right-click that looked broken. `None` whenever there is an entry.
+///
+/// Pure, for [`menu_entries`]' reason: a decision made inside the popup's
+/// closure is one no test could reach.
+pub(super) fn empty_menu_footer(entries: &[MenuEntry]) -> Option<&'static str> {
+    entries.is_empty().then_some(super::detail::VIEW_ONLY_FOOTER)
+}
+
 /// [`out_of_vault_entries_for`] without the item: the menu for an item this
 /// account may write, which is what the tests that compare the two menus
 /// compare.
@@ -2665,7 +2679,14 @@ fn item_row(
     // here.
     let mut command = None;
     response.context_menu(|ui| {
-        for entry in menu_entries(item, folders, source, may_unfile) {
+        let entries = menu_entries(item, folders, source, may_unfile);
+        // Nothing to offer: say why, as the read pane's kebab does, rather
+        // than open a blank popup (`empty_menu_footer`).
+        if let Some(footer) = empty_menu_footer(&entries) {
+            ui.set_width(super::detail::VIEW_ONLY_MENU_WIDTH);
+            ui.add(egui::Label::new(RichText::new(footer).size(11.0).color(theme::TEXT_GHOST)).wrap());
+        }
+        for entry in entries {
             match entry {
                 MenuEntry::Command(entry) => {
                     if menu_command(ui, &entry) {
@@ -9067,6 +9088,34 @@ mod row_tile_tests {
         let items = vec![full_login("Ledgerline"), full_login("Vantage")];
         let p = open_menu_under(&items, vec![folder("f1", "Work")], 0, SidebarFilter::Trash);
         assert_out_of_vault_menu(&p, &["Restore", PURGE_LABEL]);
+    }
+
+    /// **A view-only row's menu that would be empty says why** (final
+    /// review, item 7): an `edit: false` card has nothing to copy and every
+    /// other entry writes, and an `edit: false` record in the Trash has only
+    /// writes -- both used to open a blank popup. A view-only login with a
+    /// username still offers the copy, and no footer.
+    #[test]
+    fn an_empty_view_only_menu_says_view_only_instead_of_opening_blank() {
+        let view_only = |mut item: VaultItem| {
+            item.other.insert("edit".into(), serde_json::Value::Bool(false));
+            item
+        };
+        let cards = [view_only(card("Visa (shared)"))];
+        assert!(menu_entries(&cards[0], &[], FilterSource::LiveVault, true).is_empty(), "the control: nothing to offer");
+        let p = open_menu(&cards, vec![], 0);
+        assert!(painted_strings(&p).contains(&super::super::detail::VIEW_ONLY_FOOTER), "{:?}", painted_strings(&p));
+
+        let trashed = [view_only(full_login("Ledgerline"))];
+        let p = open_menu_under(&trashed, vec![], 0, SidebarFilter::Trash);
+        assert!(painted_strings(&p).contains(&super::super::detail::VIEW_ONLY_FOOTER), "{:?}", painted_strings(&p));
+
+        let logins = [view_only(full_login("Ledgerline"))];
+        let p = open_menu(&logins, vec![], 0);
+        let painted = painted_strings(&p);
+        assert!(painted.contains(&"Copy username"), "{painted:?}");
+        assert!(!painted.contains(&super::super::detail::VIEW_ONLY_FOOTER), "a menu with entries has no footer: {painted:?}");
+        assert_eq!(empty_menu_footer(&menu_entries(&logins[0], &[], FilterSource::LiveVault, true)), None);
     }
 
     #[test]
