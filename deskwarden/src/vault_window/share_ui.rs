@@ -375,6 +375,12 @@ pub(crate) struct SharingPane {
     /// their normalised email, and `None` until the answer comes, then
     /// whether it stopped every share. See [`Self::daemon_forget`].
     daemon_forget: Option<(String, Option<bool>)>,
+    /// **A stop moved a record home under a new id**: `(old id, new id)`,
+    /// from the stop's answer (`StopOutcome::moved_to`), for the window to
+    /// re-point its selection -- the record the user was reading is still
+    /// theirs, under another id (final review). Taken by
+    /// [`Self::take_moved_home`].
+    moved_home: Option<(String, String)>,
 }
 
 /// Where the daemon's half of forgetting one person stands -- what the
@@ -409,6 +415,12 @@ pub(crate) const VIEW_RETRY_SECONDS: f64 = 30.0;
 pub(crate) const VIEW_HEARTBEAT_SECONDS: f64 = 60.0;
 
 impl SharingPane {
+    /// The last stop's move home, once: `(old id, new id)`. See
+    /// `vault_window::mod`'s `follow_moved_home`.
+    pub(crate) fn take_moved_home(&mut self) -> Option<(String, String)> {
+        self.moved_home.take()
+    }
+
     /// The daemon said the view changed, or this window changed it.
     pub(crate) fn invalidate(&mut self) {
         self.stale = true;
@@ -769,7 +781,9 @@ pub(crate) enum SharingReport {
     /// Stop receiving's answer, with the sharer its toast names.
     Left { from: String, result: Result<(), String> },
     Done(Result<(), String>),
-    /// The names of the records a forget stopped -- decrypted names.
+    /// The ids -- the OLD ids -- of the records a forget stopped
+    /// (`ForgetOutcome::stopped`, carried by the daemon's `stopped`). Ids,
+    /// not names: nothing in it was decrypted.
     Forgot(Result<Vec<String>, String>),
     Fingerprint { email: String, result: Result<Fingerprint, String> },
     InviteCode(Result<InviteCode, String>),
@@ -777,7 +791,7 @@ pub(crate) enum SharingReport {
 
 /// **Hand-written, and says only which report and whether it succeeded.**
 /// A derived `Debug` would print the engine's sentences -- which can name a
-/// decrypted record -- the record names a forget stopped, and the addresses
+/// decrypted record -- the record ids a forget stopped, and the addresses
 /// of the people involved, into whatever `{:?}` it reached. What a debugger
 /// needs is the shape; the words are the pane's.
 impl std::fmt::Debug for SharingReport {
@@ -1072,10 +1086,21 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
             }
         }
         SharingReport::Stopped { email, result } => {
-            pane.stopping = None;
+            // Which record the stop was on: `stopping` names it, and there
+            // is one write at a time (`request`), so it is this answer's.
+            let stopped = pane.stopping.take();
             pane.stop_confirming = None;
             match result {
-                Ok(_) => toast(pane, format!("Stopped sharing with {email}.")),
+                Ok(moved_to) => {
+                    // The last person went, and the record came home under a
+                    // new id: kept for the window, which re-points the
+                    // selection. Dropped here, the record open on screen
+                    // vanished from under the user.
+                    if let (Some((old, _)), Some(new)) = (stopped, moved_to) {
+                        pane.moved_home = Some((old, new));
+                    }
+                    toast(pane, format!("Stopped sharing with {email}."));
+                }
                 Err(sentence) => fail(pane, sentence),
             }
         }
@@ -2963,8 +2988,16 @@ pub(crate) fn stop_receiving_title(from: &str) -> String {
     format!("Stop receiving from {from}?")
 }
 
+///
+/// **Says plainly that they can add you back** (final review): on NodeWarden
+/// a manager adds an existing account directly -- no invitation to accept or
+/// decline -- so "They can invite you again later" promised a question that
+/// never comes.
 pub(crate) fn stop_receiving_body(from: &str) -> String {
-    format!("Every record {from} shares with you leaves your vault now. They can invite you again later.")
+    format!(
+        "Every record {from} shares with you leaves your vault now. On this server they can add you back \
+         directly, without asking you first."
+    )
 }
 
 /// **"Stop receiving from X?"** -- every record from them leaves this vault,
@@ -3126,6 +3159,28 @@ mod tests {
         assert_eq!(share_control(Some(&on), true, &attached), Some(ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS)));
         let empty = item(serde_json::json!({ "id": "p2", "name": "x", "attachments": [] }));
         assert_eq!(share_control(Some(&on), true, &empty), Some(ShareControl::Share), "an empty list is no attachment");
+    }
+
+    /// **A stop that moved the record home says where it went** (final
+    /// review): the old id and the new, once, for the window's selection. A
+    /// stop that left others on it, or failed, says nothing.
+    #[test]
+    fn a_stop_that_moved_the_record_home_hands_over_its_new_id() {
+        let mut pane = SharingPane::default();
+        pane.stopping = Some(("s1".into(), "anna@x.io".into()));
+        apply(&mut pane, SharingReport::Stopped { email: "anna@x.io".into(), result: Ok(Some("p-new".into())) }, 0.0);
+        assert_eq!(pane.take_moved_home(), Some(("s1".to_string(), "p-new".to_string())));
+        assert_eq!(pane.take_moved_home(), None, "handed over once");
+        assert!(pane.stopping.is_none());
+
+        pane.stopping = Some(("s2".into(), "bob@x.io".into()));
+        apply(&mut pane, SharingReport::Stopped { email: "bob@x.io".into(), result: Ok(None) }, 0.0);
+        assert_eq!(pane.take_moved_home(), None, "still shared with someone: the id did not change");
+        pane.stopping = Some(("s3".into(), "bob@x.io".into()));
+        apply(&mut pane, SharingReport::Stopped { email: "bob@x.io".into(), result: Err("no".into()) }, 0.0);
+        assert_eq!(pane.take_moved_home(), None);
+        assert!(stop_receiving_body("denis@x.io").contains("add you back directly"), "{}", stop_receiving_body("denis@x.io"));
+        assert!(!stop_receiving_body("denis@x.io").contains("invite you again"));
     }
 
     /// **With push off, the view is asked again once it is a minute old**

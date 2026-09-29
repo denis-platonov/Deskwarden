@@ -2390,6 +2390,7 @@ pub fn build_frame_with_search(
         // no line to the daemon, whose Share control offers a Send.
         let sharing_now = ui.ctx().input(|i| i.time);
         share_ui::drain(&sharing_rx, &mut sharing, sharing_now);
+        follow_moved_home(&mut selected_id, sharing.take_moved_home());
         // **With no live push, the view ages** (final review, I2): the hub is
         // the only thing that says the daemon's sharing view moved, and with
         // push off it does not exist. `heartbeat` marks a view older than a
@@ -9325,6 +9326,20 @@ fn permit_reinvite(
         crate::reprompt::Outcome::Cannot => {
             detail::note_refused(ctx, crate::reprompt::refusal_text(true));
             None
+        }
+    }
+}
+
+/// **The record on screen came home under a new id** (final review): a stop
+/// that took off the last person re-creates the record in the personal vault
+/// and deletes the org copy (`Sharing::move_back`), so the id the selection
+/// held is gone. Re-pointed here, the pane stays on the same record; left,
+/// the next vault load found the old id missing and closed the pane. Only
+/// the record actually selected moves the selection.
+fn follow_moved_home(selected_id: &mut Option<String>, moved: Option<(String, String)>) {
+    if let Some((old, new)) = moved {
+        if selected_id.as_deref() == Some(old.as_str()) {
+            *selected_id = Some(new);
         }
     }
 }
@@ -41792,7 +41807,7 @@ mod edit_history_copy_wiring {
 /// daemon forget the window sends, guarded at source level.
 #[cfg(test)]
 mod forget_step_tests {
-    use super::{forget_request_for, forget_step, share_ui, ForgetStep};
+    use super::{follow_moved_home, forget_request_for, forget_step, share_ui, ForgetStep};
     use share_ui::DaemonForget::{Failed, NotAsked, Stopped, Waiting};
 
     /// **Both outcomes of the daemon's forget**: with records shared, the
@@ -41887,6 +41902,28 @@ mod forget_step_tests {
         assert_eq!(ask_about(Some(&off), true), (true, false, true, false), "sharing off here: nobody to forget");
         let empty = SharingView { available: true, ..SharingView::default() };
         assert_eq!(ask_about(Some(&empty), true), (true, false, true, false), "a view that does not list them");
+    }
+
+    /// **A record that came home keeps the pane on it** (final review), and
+    /// only the selected record moves the selection.
+    #[test]
+    fn a_record_that_came_home_stays_selected_under_its_new_id() {
+        let mut selected = Some("s1".to_string());
+        follow_moved_home(&mut selected, Some(("s1".into(), "p-new".into())));
+        assert_eq!(selected.as_deref(), Some("p-new"));
+        follow_moved_home(&mut selected, Some(("other".into(), "p-2".into())));
+        assert_eq!(selected.as_deref(), Some("p-new"), "another record's move leaves the selection");
+        follow_moved_home(&mut selected, None);
+        assert_eq!(selected.as_deref(), Some("p-new"));
+        let mut none = None;
+        follow_moved_home(&mut none, Some(("s1".into(), "p-new".into())));
+        assert_eq!(none, None, "a closed pane is not reopened");
+        let source = include_str!("mod.rs").replace("\r\n", "\n");
+        let production = &source[..source.find(concat!("#[cfg(", "test)]")).expect("a test marker")];
+        assert!(
+            production.contains(concat!("follow_moved_home(&mut selected_id, sharing.take_", "moved_home());")),
+            "the frame does not follow a record home"
+        );
     }
 
     /// **The sharing view is asked again without a push** (final review, I2):
