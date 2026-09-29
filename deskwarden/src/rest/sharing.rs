@@ -87,6 +87,19 @@ pub struct PersonEntry {
     pub state: PersonState,
     /// An invitation's expiry, ISO 8601.
     pub expires_at: Option<String>,
+    /// **Their collection's name decrypted under the org key** -- rule 2
+    /// (see [`PersonCollection`]). `false` for a person known only from a
+    /// plaintext name, which the server can write: the card shows them,
+    /// marked unverified, and offers only Stop (a removal); Re-invite and
+    /// Share anyway are grants and are not offered (final review, I1).
+    ///
+    /// Shown rather than hidden because the record really is filed in that
+    /// collection -- the server says so -- and hiding the row would hide
+    /// who may see it, along with the one control that takes it back.
+    /// `serde(default)` reads an answer without the field as unverified,
+    /// the safe side.
+    #[serde(default)]
+    pub authenticated: bool,
 }
 
 /// One record this account shares, and with whom.
@@ -227,6 +240,17 @@ pub const INVITE_CODE_FAILED: &str = "Couldn't make an invite code.";
 /// The master password typed for an invite code was not this account's --
 /// the route's "Invalid password".
 pub const WRONG_PASSWORD: &str = "That master password isn't right.";
+
+/// A Re-invite of someone whose collection name Deskwarden did not write --
+/// see [`Sharing::reinvite`]. Says what to do instead: a share from the
+/// dialog starts from an address the user typed.
+#[must_use]
+pub fn not_vouched_for(email: &str) -> String {
+    format!(
+        "Deskwarden didn't set up sharing with {email}, so it won't re-invite them. \
+         Share a record with them from the Share dialog instead."
+    )
+}
 
 /// What a share ended as: the words the dialog chooses between (mock 6a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,14 +482,32 @@ pub(crate) struct PersonCollection {
     pub(crate) authenticated: bool,
 }
 
-/// The first collection for `email` in `collections`, authenticated or not
-/// as `authenticated_only` asks -- [`MyOrg`]'s and [`Ctx`]'s one lookup.
+/// The collection for `email` in `collections`, authenticated or not as
+/// `authenticated_only` asks -- [`MyOrg`]'s and [`Ctx`]'s one lookup.
+///
+/// **An authenticated match wins wherever it stands in server order.** Asked
+/// for any match, the first one used to come back, so a plaintext name the
+/// server listed ahead of the engine's own would be the collection a stop
+/// looked in and the view read the person's state off (final review, I1).
+/// The first plaintext match is the answer only when no authenticated one
+/// exists.
 fn person_collection_for<'a>(collections: &'a [PersonCollection], email: &str, authenticated_only: bool) -> Option<&'a str> {
     let email = normalise_email(email);
-    collections
-        .iter()
-        .find(|c| c.email == email && (c.authenticated || !authenticated_only))
-        .map(|c| c.id.as_str())
+    let authentic = collections.iter().find(|c| c.email == email && c.authenticated);
+    let any = || collections.iter().find(|c| c.email == email).filter(|_| !authenticated_only);
+    authentic.or_else(any).map(|c| c.id.as_str())
+}
+
+/// **Every collection named for `email`**, authenticated first -- what a
+/// REMOVAL reads (a stop, a forget), never a grant. A server can list a
+/// plaintext twin beside the engine's own collection, and a record filed in
+/// either is one the person may see; taking them off one and not the other
+/// would report a stop that did not happen. Grants read
+/// [`person_collection_for`] with `authenticated_only` instead.
+fn person_collections_for<'a>(collections: &'a [PersonCollection], email: &str) -> Vec<&'a str> {
+    let email = normalise_email(email);
+    let named = || collections.iter().filter(|c| c.email == email);
+    named().filter(|c| c.authenticated).chain(named().filter(|c| !c.authenticated)).map(|c| c.id.as_str()).collect()
 }
 
 /// This account's own sharing org, as the last read left it.
@@ -719,15 +761,19 @@ impl Sharing {
             ..SharingView::default()
         };
         if let Some(org) = &held.my_org {
-            for PersonCollection { id: collection_id, email, .. } in &org.collections {
+            for PersonCollection { email, .. } in &org.collections {
                 if view.people.iter().any(|p| &p.email == email) {
                     continue;
                 }
+                // The authenticated collection when there is one, wherever
+                // it stands in server order (`person_collection_for`).
+                let collection_id = person_collection_for(&org.collections, email, false).unwrap_or_default();
                 let member = org.member(email);
                 view.people.push(PersonEntry {
                     email: email.clone(),
                     state: person_state(member, collection_id, &held, now),
                     expires_at: member.and_then(|m| m.invitation_expires.clone()),
+                    authenticated: org.authenticated_collection_for(email).is_some(),
                 });
             }
             for item in items {
@@ -910,8 +956,13 @@ pub(crate) struct Ctx {
 }
 
 impl Ctx {
-    pub(crate) fn collection_for(&self, email: &str) -> Option<&str> {
-        person_collection_for(&self.collections, email, false)
+    /// Every collection for `email`, authenticated first -- see
+    /// [`person_collections_for`]. **Not for a grant**: nothing that creates
+    /// a membership, wraps the org key or files a record for someone reads
+    /// this (final review, I1). The old any-match `collection_for` went with
+    /// that rule: its last grant reader was `ensure_collection`.
+    pub(crate) fn collections_for(&self, email: &str) -> Vec<&str> {
+        person_collections_for(&self.collections, email)
     }
 
     /// Rule 2's lookup -- see [`PersonCollection`].
@@ -1127,12 +1178,19 @@ impl Sharing {
     /// C(E), found by decrypted name or created with this account as its
     /// manager (spec 5.2). Returns its id.
     ///
+    /// **Only an AUTHENTICATED name is found** -- rule 2 for a grant (final
+    /// review, I1). What comes back is the collection the person is invited
+    /// to and the record is filed into, so a plaintext name -- which the
+    /// server can write -- must not be it: a server that listed `anna@...` in
+    /// plaintext over a collection someone else already reaches would be
+    /// handed the record. Beside a plaintext twin, the engine makes its own.
+    ///
     /// The manager is named by the account's USER id: on NodeWarden a
     /// member's org-user id is its user id (`organization_members` is keyed
     /// by `user_id`), which is what its collection create resolves a grant
     /// against.
     fn ensure_collection(&self, ctx: &mut Ctx, email: &str) -> Result<String, SharingError> {
-        if let Some(id) = ctx.collection_for(email) {
+        if let Some(id) = ctx.authenticated_collection_for(email) {
             return Ok(id.to_string());
         }
         let name = crate::rest::crypto::encrypt(&ctx.org_key, email.as_bytes()).map_err(crypto)?;
@@ -1505,19 +1563,23 @@ impl Sharing {
             return self.finish_pending(ctx, item_id, &personal_id, &email);
         }
         let nothing = || StopOutcome { moved_to: None, changed: SharingOutcome::default() };
-        let Some(collection) = ctx.collection_for(&email).map(str::to_string) else {
+        // Every collection named for them, a plaintext twin included: a stop
+        // is a removal, and one that left the record in the twin would say
+        // "stopped" while they can still see it (`person_collections_for`).
+        let theirs: Vec<String> = ctx.collections_for(&email).into_iter().map(str::to_string).collect();
+        if theirs.is_empty() {
             return Ok(nothing());
-        };
+        }
         let (record, failures) = self.fetch_record(item_id, &ctx.keys)?;
         if organization_of(&record.item) != Some(ctx.org_id.as_str()) {
             self.drop_stale_move(&ctx.account.id, &record.item.id);
             return Ok(nothing());
         }
         let current: Vec<String> = collection_ids_of(&record.item).into_iter().map(str::to_string).collect();
-        if !current.contains(&collection) {
+        if !current.iter().any(|id| theirs.contains(id)) {
             return Ok(nothing());
         }
-        let remaining: Vec<String> = current.into_iter().filter(|id| *id != collection).collect();
+        let remaining: Vec<String> = current.into_iter().filter(|id| !theirs.contains(id)).collect();
         if !remaining.is_empty() {
             let answer = self
                 .call(|client, auth| sharing_api::set_cipher_collections(client, &mut auth.session, item_id, &remaining))
@@ -1694,11 +1756,11 @@ impl Sharing {
             }
             (Ok(answer), Err(_)) => changed.upserted.extend(self.readable(&answer, &ctx.keys)),
             (Err(_), Err(_)) => {
-                let theirs = ctx.collection_for(email);
-                let still_theirs = theirs.is_some_and(|collection| {
-                    self.fetch_record(old, &ctx.keys)
-                        .is_ok_and(|(org_copy, _)| collection_ids_of(&org_copy.item).contains(&collection))
-                });
+                let theirs = ctx.collections_for(email);
+                let still_theirs = !theirs.is_empty()
+                    && self
+                        .fetch_record(old, &ctx.keys)
+                        .is_ok_and(|(org_copy, _)| collection_ids_of(&org_copy.item).iter().any(|id| theirs.contains(id)));
                 return Err(SharingError::Refused(if still_theirs {
                     format!("{STOP_FAILED_PREFIX} {email} can still see it.")
                 } else {
@@ -1972,24 +2034,29 @@ impl Sharing {
             return Err(SharingError::Refused(YOURSELF.to_string()));
         }
         let mut outcome = ForgetOutcome::default();
-        let collection = ctx.collection_for(&email).map(str::to_string);
-        let records: Vec<String> = match &collection {
-            Some(collection) => {
-                let mut records = self
-                    .call(|client, auth| sharing_api::collection_items(client, &mut auth.session, &ctx.org_id, collection))
-                    .map_err(|e| e.or_say(&format!("Couldn't forget {email}. Deskwarden couldn't read what is shared with them. Try again.")))?;
-                for item in items {
-                    if organization_of(item) == Some(ctx.org_id.as_str())
-                        && collection_ids_of(item).contains(&collection.as_str())
-                        && !records.contains(&item.id)
-                    {
-                        records.push(item.id.clone());
-                    }
+        // Every collection named for them, a plaintext twin included -- a
+        // forget is a removal (`person_collections_for`), and a twin left
+        // standing would keep whatever is filed in it theirs.
+        let collections: Vec<String> = ctx.collections_for(&email).into_iter().map(str::to_string).collect();
+        let mut records: Vec<String> = Vec::new();
+        for collection in &collections {
+            let listed = self
+                .call(|client, auth| sharing_api::collection_items(client, &mut auth.session, &ctx.org_id, collection))
+                .map_err(|e| e.or_say(&format!("Couldn't forget {email}. Deskwarden couldn't read what is shared with them. Try again.")))?;
+            for id in listed {
+                if !records.contains(&id) {
+                    records.push(id);
                 }
-                records
             }
-            None => Vec::new(),
-        };
+        }
+        for item in items {
+            if organization_of(item) == Some(ctx.org_id.as_str())
+                && collection_ids_of(item).iter().any(|id| collections.iter().any(|c| c == id))
+                && !records.contains(&item.id)
+            {
+                records.push(item.id.clone());
+            }
+        }
         outcome.failed = 'forget: {
             let mut unstopped = Vec::new();
             for id in records {
@@ -2048,7 +2115,7 @@ impl Sharing {
                     break 'forget Some(e.or_say(&unfinished));
                 }
             }
-            if let Some(collection) = &collection {
+            for collection in &collections {
                 if let Err(e) = self.call(|client, auth| sharing_api::delete_collection(client, &mut auth.session, &ctx.org_id, collection)) {
                     break 'forget Some(e.or_say(&unfinished));
                 }
@@ -2081,6 +2148,21 @@ impl Sharing {
     /// The address is checked as a share checks it: the route takes any
     /// body, and the second branch can create a collection.
     ///
+    /// # Only someone this engine named
+    ///
+    /// **Refused unless the person has an AUTHENTICATED collection** -- rule
+    /// 2, for the one grant a card can start (final review, I1). A share
+    /// starts from an address the user TYPED; a Re-invite starts from a name
+    /// on the card, and a plaintext name is one the server can write. Its
+    /// second branch is a direct add that wraps the org key to whatever key
+    /// the server serves for that address and pins it on first use, so a
+    /// hostile server could list `mallory@...` in plaintext and have one
+    /// click hand her the org key. Refused before anything is read: no
+    /// roster, no key, no invite (`reinvite_refuses_a_plaintext_collection_name`).
+    /// The window does not offer it on such a card either
+    /// (`share_ui::PersonLine::reinvite`). Sharing a record with them from
+    /// the Share dialog -- an address typed on purpose -- is the way on.
+    ///
     /// # Errors
     ///
     /// The sentence to show, or the backend's failure.
@@ -2093,6 +2175,9 @@ impl Sharing {
         }
         if email == normalise_email(&ctx.account.email) {
             return Err(SharingError::Refused(YOURSELF.to_string()));
+        }
+        if ctx.authenticated_collection_for(&email).is_none() {
+            return Err(SharingError::Refused(not_vouched_for(&email)));
         }
         let refused = format!("Couldn't re-invite {email}.");
         let roster = self.fetch_roster(&ctx.org_id)?;
@@ -4690,12 +4775,147 @@ mod tests {
         confirm.assert();
         // And the pass, over the same names read into `held` by a reload.
         let ctx = engine.context().expect("a context");
-        assert!(ctx.collection_for("mallory@example.com").is_some() && ctx.authenticated_collection_for("mallory@example.com").is_none());
+        assert!(!ctx.collections_for("mallory@example.com").is_empty() && ctx.authenticated_collection_for("mallory@example.com").is_none());
         engine.reload_org(&ctx).expect("reloaded");
         let pass = engine.refresh(Trigger::Timer).expect("a pass");
         key.assert();
         confirm.assert();
         assert!(!pass.changed);
+    }
+
+    // ---- final review, I1: a plaintext name never starts a grant ----
+
+    /// A person collection whose name is PLAINTEXT -- one the server could
+    /// have written itself.
+    fn plaintext_collection(id: &str, email: &str) -> serde_json::Value {
+        serde_json::json!({ "id": id, "organizationId": FIXTURE_ORG, "name": email, "object": "collection" })
+    }
+
+    /// **Re-invite is refused for a person known only from a plaintext
+    /// name, before anything is read** (final review, I1). Its second branch
+    /// is a direct add that wraps the org key to the server's key for the
+    /// address and pins it; a hostile server that listed `mallory@...` in
+    /// plaintext would have one click hand her the org key. So: no roster
+    /// read, no key looked up, no member written, no pin.
+    #[test]
+    fn reinvite_refuses_a_plaintext_collection_name() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(&mut server, &[plaintext_collection("c-mal", "mallory@example.com")]);
+        let roster = server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).expect(0).create();
+        let key = server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=mallory%40example.com").as_str())
+            .expect(0)
+            .create();
+        let writes = server.mock("POST", Matcher::Any).expect(0).create();
+        match engine.reinvite("Mallory@example.com") {
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, not_vouched_for("mallory@example.com")),
+            other => panic!("a plaintext name was re-invited: {other:?}"),
+        }
+        roster.assert();
+        key.assert();
+        writes.assert();
+        let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert!(state.pin_for("mallory@example.com").is_none(), "nothing was pinned");
+    }
+
+    /// **A share beside a plaintext twin files into a collection the engine
+    /// names itself** (final review, I1): the plaintext `c-plain` is neither
+    /// the collection anna is invited to nor the one the record lands in.
+    #[test]
+    fn a_share_beside_a_plaintext_twin_makes_its_own_collection() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[plaintext_collection("c-plain", "anna@example.com")]);
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        let made = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str())
+            .with_body(r#"{"id":"c-anna","object":"collection"}"#)
+            .expect(1)
+            .create();
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
+            .with_status(404)
+            .create();
+        let invite = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
+            .match_request(|request| request.utf8_lossy_body().contains("c-anna") && !request.utf8_lossy_body().contains("c-plain"))
+            .with_body(r#"{"id":"inv-1","status":0,"object":"organizationInvitation"}"#)
+            .expect(1)
+            .create();
+        let moved = server
+            .mock("PUT", "/api/ciphers/p1/share")
+            .match_request(|request| request.utf8_lossy_body().contains("c-anna") && !request.utf8_lossy_body().contains("c-plain"))
+            .with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-anna"]))
+            .expect(1)
+            .create();
+        engine.share("p1", "anna@example.com").expect("shared");
+        made.assert();
+        invite.assert();
+        moved.assert();
+    }
+
+    /// **A stop takes the person off every collection named for them**, a
+    /// plaintext twin included: a removal that left the record in the twin
+    /// would say "stopped" while they can still see it.
+    #[test]
+    fn a_stop_takes_the_person_off_a_plaintext_twin_too() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        with_collections(
+            &mut server,
+            &[
+                plaintext_collection("c-plain", "anna@example.com"),
+                person_collection("c-anna", "anna@example.com"),
+                person_collection("c-bob", "bob@example.com"),
+            ],
+        );
+        with_roster(&mut server, &[]);
+        server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-plain", "c-anna", "c-bob"]).to_string()).create();
+        let off = server
+            .mock("PUT", "/api/ciphers/s1/collections")
+            .match_body(Matcher::Json(serde_json::json!({ "collectionIds": ["c-bob"] })))
+            .with_body(shared_cipher("s1", "Acme VPN", &["c-bob"]).to_string())
+            .expect(1)
+            .create();
+        engine.stop("s1", "anna@example.com").expect("stopped");
+        off.assert();
+    }
+
+    /// **The view marks a person known only from a plaintext name**, and
+    /// reads a person with both kinds off the authenticated collection
+    /// wherever it stands in server order (final review, I1).
+    #[test]
+    fn the_view_marks_a_plaintext_person_and_prefers_the_authenticated_collection() {
+        let engine = offline();
+        {
+            let mut held = engine.held();
+            held.probe = Some(Probe { dialect: Dialect::NodeWarden, slice_one: true });
+            held.my_org = Some(MyOrg {
+                id: "org1".into(),
+                collections: vec![
+                    PersonCollection { id: "c-plain".into(), email: "anna@x.io".into(), authenticated: false },
+                    authentic("c-anna", "anna@x.io"),
+                    PersonCollection { id: "c-mal".into(), email: "mal@x.io".into(), authenticated: false },
+                ],
+                roster: vec![
+                    member("anna@x.io", MemberStatus::Confirmed, &["c-anna"], None),
+                    member("mal@x.io", MemberStatus::Confirmed, &["c-mal"], None),
+                ],
+            });
+        }
+        let view = engine.view(&[]);
+        let anna = view.person("anna@x.io").expect("anna");
+        assert!(anna.authenticated);
+        assert_eq!(anna.state, PersonState::Shared, "read off c-anna, which she reaches, not the plaintext c-plain");
+        let mal = view.person("mal@x.io").expect("mal is shown");
+        assert!(!mal.authenticated, "a plaintext name is unverified");
+        assert_eq!(view.people.len(), 2, "one entry per person");
+        let json = serde_json::to_value(&view).expect("json");
+        let back: SharingView = serde_json::from_value(json).expect("round trip");
+        assert_eq!(back, view);
+        let mut bare = serde_json::to_value(anna).expect("json");
+        bare.as_object_mut().expect("an object").remove("authenticated");
+        let read: PersonEntry = serde_json::from_value(bare).expect("an entry without the field");
+        assert!(!read.authenticated, "an answer without the field is unverified");
     }
 
     /// **"Share anyway" confirms the key the user fingerprinted, or nothing**:

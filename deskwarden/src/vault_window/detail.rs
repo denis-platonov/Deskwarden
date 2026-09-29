@@ -19585,6 +19585,7 @@ mod tests {
             email: "anna@x.io".to_string(),
             state: crate::rest::sharing::PersonState::Shared,
             line: "Shared \u{b7} since 14 Sep".to_string(),
+            authenticated: true,
         }]
     }
 
@@ -19668,6 +19669,7 @@ mod tests {
             email: "carol@x.io".to_string(),
             state: crate::rest::sharing::PersonState::WaitingAccount,
             line: "Waiting to create an account \u{b7} 6 days left".to_string(),
+            authenticated: true,
         });
         let mut pane = Pane::wide(MIN_PANE).with_people(people);
         let frame = pane.idle(&item, &totp);

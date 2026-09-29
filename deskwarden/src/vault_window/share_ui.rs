@@ -106,7 +106,19 @@ pub struct PersonLine {
     pub(crate) state: PersonState,
     /// The status line under the address (mock 6b).
     pub(crate) line: String,
+    /// The view's [`crate::rest::sharing::PersonEntry::authenticated`]: their
+    /// collection's name was written under the org key. `false` is a person
+    /// known only from a plaintext name the server could have written -- the
+    /// card shows them, says so ([`UNVERIFIED_PREFIX`]), and offers Stop
+    /// alone: Re-invite and Share anyway are grants (final review, I1).
+    pub(crate) authenticated: bool,
 }
+
+/// What the status line of a person known only from a plaintext collection
+/// name opens with. Shown rather than hidden: the record is filed where the
+/// server says, so the row is who may see it, and Stop is the way to take it
+/// back.
+pub(crate) const UNVERIFIED_PREFIX: &str = "Not verified \u{b7} Deskwarden didn't name this person \u{b7} ";
 
 impl PersonLine {
     pub(crate) fn pill(&self) -> theme::SharePillKind {
@@ -120,9 +132,11 @@ impl PersonLine {
         }
     }
 
-    /// Re-invite is offered where a fresh invitation helps (spec 6.1).
+    /// Re-invite is offered where a fresh invitation helps (spec 6.1) -- and
+    /// never for an unverified person, whose Re-invite the engine refuses
+    /// anyway (`Sharing::reinvite`): it can wrap the org key to them.
     pub(crate) fn reinvite(&self) -> bool {
-        matches!(self.state, PersonState::WaitingAccount | PersonState::Expired | PersonState::Gone)
+        self.authenticated && matches!(self.state, PersonState::WaitingAccount | PersonState::Expired | PersonState::Gone)
     }
 
     /// Show fingerprint only where a key is held (mock 6b: "only for someone
@@ -135,7 +149,7 @@ impl PersonLine {
     /// button itself only ever sends [`SharingPane::share_anyway`]'s call,
     /// which does not exist until Show fingerprint has answered.
     pub(crate) fn share_anyway(&self) -> bool {
-        self.state == PersonState::KeyChanged
+        self.authenticated && self.state == PersonState::KeyChanged
     }
 }
 
@@ -203,7 +217,8 @@ pub(crate) fn person_lines(
                 PersonState::WaitingSignIn => "Waiting for them to sign in once to a Bitwarden app".to_string(),
                 PersonState::Gone => "No longer receiving this".to_string(),
             };
-            PersonLine { email: person.email.clone(), state: person.state, line }
+            let line = if person.authenticated { line } else { format!("{UNVERIFIED_PREFIX}{line}") };
+            PersonLine { email: person.email.clone(), state: person.state, line, authenticated: person.authenticated }
         })
         .collect()
 }
@@ -2306,7 +2321,7 @@ impl ShareRow {
     /// The pill the row and its detail wear -- the SHARING card's own
     /// ([`PersonLine::pill`]), so one person is one pill wherever they are.
     pub(crate) fn pill(&self) -> theme::SharePillKind {
-        PersonLine { email: self.email.clone(), state: self.state, line: String::new() }.pill()
+        PersonLine { email: self.email.clone(), state: self.state, line: String::new(), authenticated: true }.pill()
     }
 
     /// The subtitle's state words, after its middle dot. An address has no
@@ -2935,7 +2950,7 @@ mod tests {
     fn view(people: Vec<(&str, PersonState, Option<&str>)>, records: Vec<(&str, Vec<&str>)>) -> SharingView {
         SharingView {
             available: true,
-            people: people.into_iter().map(|(e, s, x)| PersonEntry { email: e.into(), state: s, expires_at: x.map(str::to_string) }).collect(),
+            people: people.into_iter().map(|(e, s, x)| PersonEntry { email: e.into(), state: s, expires_at: x.map(str::to_string), authenticated: true }).collect(),
             records: records.into_iter().map(|(id, p)| RecordEntry { item_id: id.into(), people: p.into_iter().map(str::to_string).collect() }).collect(),
             ..SharingView::default()
         }
@@ -3731,8 +3746,8 @@ mod tests {
 
     fn lines() -> Vec<PersonLine> {
         vec![
-            PersonLine { email: "anna@x.io".into(), state: PersonState::Shared, line: "Shared \u{b7} since 14 Sep".into() },
-            PersonLine { email: "carol@x.io".into(), state: PersonState::WaitingAccount, line: "Waiting to create an account \u{b7} 6 days left".into() },
+            PersonLine { email: "anna@x.io".into(), state: PersonState::Shared, line: "Shared \u{b7} since 14 Sep".into(), authenticated: true },
+            PersonLine { email: "carol@x.io".into(), state: PersonState::WaitingAccount, line: "Waiting to create an account \u{b7} 6 days left".into(), authenticated: true },
         ]
     }
 
@@ -3838,8 +3853,8 @@ mod tests {
     fn show_fingerprint_waits_while_one_is_being_fetched() {
         use super::super::detail::DetailAction;
         let people_lines = vec![
-            PersonLine { email: "anna@x.io".into(), state: PersonState::Shared, line: "Shared".into() },
-            PersonLine { email: "eve@x.io".into(), state: PersonState::Shared, line: "Shared".into() },
+            PersonLine { email: "anna@x.io".into(), state: PersonState::Shared, line: "Shared".into(), authenticated: true },
+            PersonLine { email: "eve@x.io".into(), state: PersonState::Shared, line: "Shared".into(), authenticated: true },
         ];
         let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(at_rest, Vec::new());
@@ -3862,6 +3877,7 @@ mod tests {
             email: "eve@x.io".into(),
             state: PersonState::KeyChanged,
             line: "Their key changed. Check the fingerprint before sharing.".into(),
+            authenticated: true,
         }];
         let unchecked = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(unchecked, Vec::new());
@@ -3899,6 +3915,7 @@ mod tests {
             email: "carol@x.io".into(),
             state: PersonState::Expired,
             line: "The invite ran out on 3 Oct \u{b7} they never created an account".into(),
+            authenticated: true,
         }];
         let people = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(people, Vec::new());
@@ -3906,6 +3923,33 @@ mod tests {
         assert!(!texts.iter().any(|(t, _)| t == SHOW_FINGERPRINT), "no key is held for an expired invite");
         let reinvite = centre_of(&texts, REINVITE_LABEL);
         assert_eq!(block_frame(people, click(reinvite)).0, DetailAction::Reinvite("carol@x.io".into()));
+    }
+
+    /// **A person known only from a plaintext name is shown, marked, and
+    /// offered Stop alone** (final review, I1): no Re-invite and no Share
+    /// anyway, whatever their state -- both are grants the engine refuses
+    /// for them -- and the status line says why.
+    #[test]
+    fn an_unverified_person_is_marked_and_offered_no_reinvite() {
+        let unverified = SharingView {
+            available: true,
+            people: vec![
+                PersonEntry { email: "mal@x.io".into(), state: PersonState::Expired, expires_at: None, authenticated: false },
+                PersonEntry { email: "eve@x.io".into(), state: PersonState::KeyChanged, expires_at: None, authenticated: false },
+            ],
+            records: vec![crate::rest::sharing::RecordEntry { item_id: "r1".into(), people: vec!["mal@x.io".into(), "eve@x.io".into()] }],
+            ..SharingView::default()
+        };
+        let lines = person_lines(Some(&unverified), "r1", &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
+        assert_eq!(lines.len(), 2, "both are shown");
+        for line in &lines {
+            assert!(!line.authenticated && !line.reinvite() && !line.share_anyway(), "{line:?}");
+            assert!(line.line.starts_with(UNVERIFIED_PREFIX), "{line:?}");
+        }
+        let people = super::super::detail::PeopleSharing { people: &lines, ..Default::default() };
+        let (_, texts) = block_frame(people, Vec::new());
+        assert!(!texts.iter().any(|(t, _)| t == REINVITE_LABEL || t == SHARE_ANYWAY_LABEL), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == STOP_LABEL), "Stop is still offered: {texts:?}");
     }
 
     /// **A fingerprint is a read with its own one-at-a-time slot**: asking

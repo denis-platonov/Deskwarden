@@ -41115,7 +41115,7 @@ mod reprompt_gating_tests {
         let mut pane = share_ui::SharingPane::default();
         pane.view = Some(SharingView {
             available: true,
-            people: vec![PersonEntry { email: "eve@x.io".into(), state, expires_at: None }],
+            people: vec![PersonEntry { email: "eve@x.io".into(), state, expires_at: None, authenticated: true }],
             records: vec![RecordEntry { item_id: item_id.into(), people: vec!["eve@x.io".into()] }],
             ..SharingView::default()
         });

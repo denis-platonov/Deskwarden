@@ -4371,7 +4371,7 @@ mod row_tile_tests {
     fn a_shared_record_wears_the_person_pill_and_a_received_one_says_view_only() {
         let view = crate::rest::sharing::SharingView {
             available: true,
-            people: vec![crate::rest::sharing::PersonEntry { email: "anna@x.io".into(), state: crate::rest::sharing::PersonState::Shared, expires_at: None }],
+            people: vec![crate::rest::sharing::PersonEntry { email: "anna@x.io".into(), state: crate::rest::sharing::PersonState::Shared, expires_at: None, authenticated: true }],
             records: vec![crate::rest::sharing::RecordEntry { item_id: "mine".into(), people: vec!["anna@x.io".into()] }],
             received: vec![crate::rest::sharing::ReceivedEntry { item_id: "theirs".into(), from: "denis@x.io".into() }],
             ..Default::default()
