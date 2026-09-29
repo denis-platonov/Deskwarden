@@ -1252,7 +1252,8 @@ fn map_http_err(e: ureq::Error) -> VaultError {
         // No status at all: DNS, a refused connection, a TLS failure, or the
         // agent's own timeout. `bw serve` dying while the window is open is
         // the everyday shape of this one.
-        ureq::Error::Transport(_) => VaultError::Unreachable(e.to_string()),
+        // The query cut off, as the REST client's is (`transport_text`).
+        ureq::Error::Transport(_) => VaultError::Unreachable(crate::rest::api::transport_text(&e)),
     }
 }
 

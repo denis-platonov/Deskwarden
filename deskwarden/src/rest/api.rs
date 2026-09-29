@@ -2087,7 +2087,7 @@ impl RestClient {
                 Err(SendGrantRefusal::Other(RestError::Status(code)))
             }
             Err(e @ ureq::Error::Transport(_)) => {
-                Err(SendGrantRefusal::Other(RestError::Transport(e.to_string())))
+                Err(SendGrantRefusal::Other(RestError::Transport(transport_text(&e))))
             }
         }
     }
@@ -2291,7 +2291,7 @@ impl RestClient {
             Err(ureq::Error::Status(401, _)) => Err(RestError::Unauthorized),
             Err(ureq::Error::Status(400, body)) => Err(classify_400(body)),
             Err(ureq::Error::Status(code, _)) => Err(RestError::Status(code)),
-            Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(e.to_string())),
+            Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(transport_text(&e))),
         }
     }
 
@@ -2339,7 +2339,7 @@ impl RestClient {
             Err(ureq::Error::Status(401, _)) => Err(RestError::Unauthorized),
             Err(ureq::Error::Status(400, body)) => Err(classify_400(body)),
             Err(ureq::Error::Status(code, _)) => Err(RestError::Status(code)),
-            Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(e.to_string())),
+            Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(transport_text(&e))),
         }
     }
 }
@@ -2487,8 +2487,30 @@ fn sharing_answer(
             Err(RestError::Rejected { error: string_at(&json, "error"), description: said })
         }
         Err(ureq::Error::Status(code, _)) => Err(RestError::Status(code)),
-        Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(e.to_string())),
+        Err(e @ ureq::Error::Transport(_)) => Err(RestError::Transport(transport_text(&e))),
     }
+}
+
+/// **A transport failure's text, with every URL's query string cut off**
+/// (final review). `ureq` names the URL it could not reach, and a sharing
+/// lookup's URL carries the person's address (`?email=...`) -- which then
+/// reached the log through `RestError::Transport` and `VaultError::Unreachable`.
+/// What the log needs is which route failed and why; the query is neither.
+pub(crate) fn transport_text(e: &ureq::Error) -> String {
+    without_query(&e.to_string())
+}
+
+/// `text` with the query of every URL in it cut off -- a word holding `://`
+/// loses everything from its `?`, keeping the `:` that `ureq` puts after the
+/// URL. Anything else is left as it was.
+pub(crate) fn without_query(text: &str) -> String {
+    text.split(' ')
+        .map(|word| match (word.contains("://"), word.find('?')) {
+            (true, Some(at)) => format!("{}{}", &word[..at], if word.ends_with(':') { ":" } else { "" }),
+            _ => word.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The `TwoFactorProviders` array as the strings the server sent, or `None`
@@ -2670,6 +2692,29 @@ pub(crate) fn base64_url_decode(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A transport failure never logs a query string** (final review): a
+    /// sharing lookup's `?email=` names a person, and `ureq`'s own error
+    /// text carries the URL. Read off a real failed request -- nothing listens
+    /// on port 1 -- and off the cutter itself.
+    #[test]
+    fn a_transport_failure_carries_no_query_string() {
+        let agent = crate::http_agent::bounded_total(std::time::Duration::from_secs(5), std::time::Duration::from_secs(5));
+        let failed = agent
+            .get("http://127.0.0.1:1/api/organizations/o/members/public-key?email=anna%40example.com")
+            .call()
+            .expect_err("nothing listens on port 1");
+        assert!(failed.to_string().contains("anna"), "control: ureq's own text names the address: {failed}");
+        let text = transport_text(&failed);
+        assert!(!text.contains("anna") && !text.contains("email="), "{text}");
+        assert!(text.contains("/members/public-key"), "the route is still named: {text}");
+        assert_eq!(
+            without_query("http://h/x?email=a%40b.c: Connection Failed: refused"),
+            "http://h/x: Connection Failed: refused"
+        );
+        assert_eq!(without_query("https://h/y?q=1"), "https://h/y");
+        assert_eq!(without_query("no url? here"), "no url? here", "a `?` outside a URL stays");
+    }
 
     /// A device fixture. Never a real identifier; nothing here reaches a real
     /// server.
