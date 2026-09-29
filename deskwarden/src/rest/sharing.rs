@@ -806,7 +806,7 @@ impl Sharing {
             // (a "Shared by" org); WHO sent it is the server's attested
             // owner, whatever the name claims -- a forged "Shared by boss@"
             // is shown as its real owner's -- or nobody when it does not say.
-            .filter(|invitation| invitation.organization_name.as_deref().and_then(sharer_of).is_some())
+            .filter(|invitation| is_personal_share(invitation))
             .map(|invitation| IncomingEntry {
                 id: invitation.id.clone(),
                 from: invitation.owner_email.clone(),
@@ -1097,6 +1097,21 @@ fn keyed_account(account: Option<Account>) -> Result<Account, SharingError> {
 
 // ---- the owner's writes -----------------------------------------------------------
 
+/// **Whether an invitation is a personal share** -- what Shared with me lists
+/// and Accept takes (final re-review, minor 1): a "Shared by" org name AND a
+/// plain `member` role. An owner, admin or manager invitation -- which
+/// NodeWarden now sends instead of making an existing account one directly
+/// (`47869c4`) -- is not "wants to share with you": accepting it would make
+/// this account run someone's organisation. It is not listed at all, rather
+/// than listed with its role spelled out: Shared with me is about records
+/// people share, and one line that asks something else of the user there
+/// would be the easier one to accept without reading. The web vault lists it,
+/// in its own words. A role the server did not name is not assumed to be
+/// `member` (NodeWarden has always named it).
+fn is_personal_share(invitation: &IncomingInvitation) -> bool {
+    invitation.organization_name.as_deref().and_then(sharer_of).is_some() && invitation.role.as_deref() == Some("member")
+}
+
 /// **Whether `org` is this account's OWN sharing org** -- the one question
 /// every owner's write asks before it files a record anywhere (final
 /// re-review, CRITICAL).
@@ -1138,8 +1153,16 @@ impl Sharing {
     ///
     /// **A cached id that fails is dropped** from `sharing_state.json`, with
     /// a plain warning naming nothing: it is not this account's to file
-    /// into, and a later share must not find it again. An org the profile no
-    /// longer lists fails too.
+    /// into, and a later share must not find it again.
+    ///
+    /// **Only an id the profile LISTS can fail.** One it does not list is
+    /// kept: the profile may be older than the id. A whole read that began
+    /// before a share's `create_org` and ends after its state write carries a
+    /// profile without the brand-new org -- and `note_directory` would have
+    /// dropped the id and its `sharing_org_created` flag, leaving it, on a
+    /// server that attests no owner, unusable for good (final re-review,
+    /// minor 2; `a_cached_id_the_profile_does_not_list_yet_is_kept`). Absent
+    /// here, it is simply not the answer this time.
     pub(crate) fn my_org_id(&self, profile: &Profile, account: &Account) -> Option<String> {
         let (cached, created) = self.setup().state_path.map_or((None, false), |path| {
             let me = crate::sharing_state::SharingState::load(&path).account(&account.id);
@@ -1147,10 +1170,12 @@ impl Sharing {
         });
         let created_here = cached.as_deref().filter(|_| created);
         if let Some(cached) = cached.as_deref() {
-            if profile.organizations.iter().any(|o| o.id == cached && org_is_mine(o, &account.email, created_here)) {
-                return Some(cached.to_string());
+            if let Some(listed) = profile.organizations.iter().find(|o| o.id == cached) {
+                if org_is_mine(listed, &account.email, created_here) {
+                    return Some(cached.to_string());
+                }
+                self.forget_cached_org(&account.id, cached);
             }
-            self.forget_cached_org(&account.id, cached);
         }
         profile
             .organizations
@@ -2613,11 +2638,15 @@ impl Sharing {
     /// `Zeroizing`, the view carries only the id ([`IncomingEntry`]), and the
     /// window's accept names that id. This clone is wiped when the write that
     /// asked for it returns.
+    ///
+    /// Only an invitation the view lists ([`is_personal_share`]): an elevated
+    /// role is not accepted from here even by an id the window was never
+    /// shown.
     fn token_of(&self, id: &str) -> Result<zeroize::Zeroizing<String>, SharingError> {
         self.held()
             .incoming
             .iter()
-            .find(|i| i.id == id)
+            .find(|i| i.id == id && is_personal_share(i))
             .map(|i| i.token.clone())
             .ok_or_else(|| SharingError::Refused(INVITATION_GONE.to_string()))
     }
@@ -3048,6 +3077,7 @@ mod tests {
                 organization_id: "org-anna".into(),
                 organization_name: Some("Shared by anna@x.io".into()),
                 owner_email: Some("anna@x.io".into()),
+                role: Some("member".into()),
                 token: zeroize::Zeroizing::new("TOKEN-NEEDLE-7f3a".into()),
                 expires_at: None,
             }],
@@ -5078,6 +5108,73 @@ mod tests {
         assert_eq!(cached(&dir), (None, false), "and it is dropped");
     }
 
+    /// **An owner, admin or manager invitation is not a personal share**
+    /// (final re-review, minor 1): Shared with me does not list it -- a
+    /// "Shared by" name notwithstanding -- and Accept will not take it by
+    /// id. A member invitation beside it is listed as before; one whose role
+    /// the server did not name is not assumed to be one.
+    #[test]
+    fn an_elevated_role_invitation_is_not_listed_or_accepted_as_a_share() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
+        let row = |id: &str, role: Option<&str>| {
+            let mut row = serde_json::json!({ "id": id, "organizationId": format!("o-{id}"), "organizationName": "Shared by denis@example.com",
+                "token": format!("t-{id}"), "ownerEmail": "denis@example.com" });
+            if let Some(role) = role {
+                row["role"] = serde_json::json!(role);
+            }
+            row
+        };
+        server
+            .mock("GET", "/api/organizations/invitations/mine")
+            .with_body(serde_json::json!({ "data": [
+                row("share", Some("member")), row("own", Some("owner")), row("adm", Some("Admin")), row("mgr", Some("manager")), row("unsaid", None)
+            ]}).to_string())
+            .create();
+        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
+            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
+            .create();
+        engine.refresh(Trigger::WholeRead).expect("probed");
+        let listed: Vec<String> = engine.view(&[]).incoming.into_iter().map(|i| i.id).collect();
+        assert_eq!(listed, ["share"], "only the member invitation is a share");
+        let accepted = server.mock("POST", "/api/organizations/invitations/accept").expect(0).create();
+        for id in ["own", "adm", "mgr", "unsaid"] {
+            match engine.accept(id) {
+                Err(SharingError::Refused(sentence)) => assert_eq!(sentence, INVITATION_GONE, "{id}"),
+                other => panic!("{id} was accepted as a share: {other:?}"),
+            }
+        }
+        accepted.assert();
+    }
+
+    /// **A cached id the profile does not list YET is kept** (final
+    /// re-review, minor 2): a whole read that began before a share's
+    /// `create_org` and ended after its state write carries a profile
+    /// without the new org. Through `note_directory` -- the race's own path
+    /// -- and `my_org_id`, the id and its `sharing_org_created` flag stay.
+    #[test]
+    fn a_cached_id_the_profile_does_not_list_yet_is_kept() {
+        let (_server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
+        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
+            let me = state.account_mut(FIXTURE_USER_ID);
+            me.sharing_org_id = Some("org-new".into());
+            me.sharing_org_created = true;
+        })
+        .expect("seeded");
+        let stale: Profile = serde_json::from_value(sharing_profile(serde_json::json!([]))).expect("profile");
+        let directory = crate::rest::organizations::Directory::from_sync(
+            &serde_json::from_value(serde_json::json!({ "profile": sharing_profile(serde_json::json!([])), "ciphers": [], "folders": [], "collections": [] })).expect("sync"),
+            &engine.keys_from(&stale).expect("keys"),
+        );
+        engine.note_directory(&directory, Some(&stale));
+        let account = engine.held().account.clone().expect("an account");
+        assert_eq!(engine.my_org_id(&stale, &account), None, "not the answer this time");
+        let me = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
+        assert_eq!((me.sharing_org_id.as_deref(), me.sharing_org_created), (Some("org-new"), true), "kept, flag and all");
+    }
+
     // ---- final review, I1: a plaintext name never starts a grant ----
 
     /// A person collection whose name is PLAINTEXT -- one the server could
@@ -5526,7 +5623,8 @@ mod tests {
             .mock("GET", "/api/organizations/invitations/mine")
             .with_body(serde_json::json!({ "data": [{
                 "id": "inv-1", "organizationId": "org-denis", "organizationName": "Shared by denis@example.com",
-                "token": "tok-1", "expirationDate": "2999-01-01T00:00:00.000Z", "ownerEmail": "denis@example.com"
+                "token": "tok-1", "expirationDate": "2999-01-01T00:00:00.000Z", "ownerEmail": "denis@example.com",
+                "role": "member"
             }]}).to_string())
             .expect_at_least(0)
             .create();
@@ -5582,10 +5680,10 @@ mod tests {
         server
             .mock("GET", "/api/organizations/invitations/mine")
             .with_body(serde_json::json!({ "data": [
-                { "id": "forged", "organizationId": "o-mal", "organizationName": "Shared by boss@corp.example", "token": "t1", "ownerEmail": "mallory@evil.example" },
-                { "id": "real", "organizationId": "o-boss", "organizationName": "Shared by boss@corp.example", "token": "t2", "ownerEmail": "Boss@Corp.example" },
-                { "id": "bare", "organizationId": "o-old", "organizationName": "Shared by boss@corp.example", "token": "t3" },
-                { "id": "work", "organizationId": "o-work", "organizationName": "Engineering", "token": "t4", "ownerEmail": "cto@corp.example" }
+                { "id": "forged", "organizationId": "o-mal", "organizationName": "Shared by boss@corp.example", "token": "t1", "ownerEmail": "mallory@evil.example", "role": "member" },
+                { "id": "real", "organizationId": "o-boss", "organizationName": "Shared by boss@corp.example", "token": "t2", "ownerEmail": "Boss@Corp.example", "role": "member" },
+                { "id": "bare", "organizationId": "o-old", "organizationName": "Shared by boss@corp.example", "token": "t3", "role": "member" },
+                { "id": "work", "organizationId": "o-work", "organizationName": "Engineering", "token": "t4", "ownerEmail": "cto@corp.example", "role": "member" }
             ]}).to_string())
             .create();
         server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())

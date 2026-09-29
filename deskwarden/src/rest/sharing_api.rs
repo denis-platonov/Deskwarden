@@ -125,6 +125,10 @@ pub struct IncomingInvitation {
     /// "from" is read off (`Sharing::view`); `None` from a server that does
     /// not send it, and the window then names nobody.
     pub owner_email: Option<String>,
+    /// The role the invitation grants, as NodeWarden words it (`member`,
+    /// `manager`, `admin`, `owner`). Only a `member` invitation is a personal
+    /// share (`Sharing::view`); `None` from a server that did not say.
+    pub role: Option<String>,
     pub token: Zeroizing<String>,
     pub expires_at: Option<String>,
 }
@@ -216,6 +220,7 @@ pub fn my_invitations(
                         organization_id: text_at(row, "organizationId")?,
                         organization_name: text_at(row, "organizationName"),
                         owner_email: text_at(row, "ownerEmail").map(|e| crate::rest::organizations::normalise_email(&e)),
+                        role: text_at(row, "role").map(|r| r.trim().to_lowercase()),
                         token: Zeroizing::new(text_at(row, "token")?),
                         expires_at: text_at(row, "expirationDate"),
                     })
@@ -585,7 +590,7 @@ mod tests {
             .with_body(serde_json::json!({ "object": "list", "data": [{
                 "id": "inv-1", "organizationId": ORG, "organizationName": "Shared by denis@example.com",
                 "token": "tok-1", "expirationDate": "2026-10-04T00:00:00.000Z", "object": "organizationInvitation",
-                "ownerEmail": " Denis@Example.com "
+                "ownerEmail": " Denis@Example.com ", "role": "Member"
             }]}).to_string())
             .expect(1)
             .create();
@@ -594,6 +599,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].organization_name.as_deref(), Some("Shared by denis@example.com"));
         assert_eq!(got[0].owner_email.as_deref(), Some("denis@example.com"), "read and normalised");
+        assert_eq!(got[0].role.as_deref(), Some("member"), "the role, lower-cased");
         assert_eq!(got[0].token.as_str(), "tok-1");
         assert_eq!(got[0].expires_at.as_deref(), Some("2026-10-04T00:00:00.000Z"));
 
