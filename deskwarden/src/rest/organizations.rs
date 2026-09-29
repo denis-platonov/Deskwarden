@@ -195,11 +195,14 @@ pub fn sharing_mark(claimed: Option<&str>, owner_email: Option<&str>, is_owner: 
     let owner = owner_email.map(normalise_email).filter(|o| !o.is_empty());
     let account = normalise_email(account_email);
     let names_me = !account.is_empty() && sharer_is(claimed, &account);
+    // **The attested owner is the sharer shown** wherever there is one
+    // (final re-review, Minor 3): the name is cut to fit the org name's 50
+    // characters (`sharing_org_name`), the attestation is the whole address.
     if is_owner && names_me && owner.as_deref().is_none_or(|o| o == account) {
-        return Some(SharingOrg { sharer: claimed.to_string(), mine: true });
+        return Some(SharingOrg { sharer: owner.unwrap_or_else(|| claimed.to_string()), mine: true });
     }
     match owner {
-        Some(owner) if sharer_is(claimed, &owner) => Some(SharingOrg { sharer: claimed.to_string(), mine: false }),
+        Some(owner) if sharer_is(claimed, &owner) => Some(SharingOrg { sharer: owner, mine: false }),
         Some(owner) if owner == account => None,
         Some(owner) => Some(SharingOrg { sharer: owner, mine: false }),
         None => None,
@@ -1791,6 +1794,11 @@ mod tests {
         );
         assert_eq!(mark("Shared by anna@example.com", Some(me), true), None, "my org named for someone else is no share");
         assert_eq!(mark("Engineering", Some("boss@corp.example"), false), None, "no sharing name, no sharing org");
+        // A long address is cut in the name; the attested owner is whole.
+        let long = "denis.platonov@a-very-long-domain-name-for-testing.example";
+        let cut = sharing_org_name(long);
+        assert!(cut.ends_with('\u{2026}'), "{cut}");
+        assert_eq!(mark(&cut, Some(long), false).map(|s| s.sharer), Some(long.to_string()), "the whole address, not the cut name");
 
         // Through a whole read: the forged org's records say who really
         // owns it, and a name-only org is an ordinary organisation.
