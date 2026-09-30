@@ -409,7 +409,7 @@ fn permitted_by_reprompt(
 
 /// [`fill_from_vault`] with the preflight's foreground lookup **injected**.
 ///
-/// The lookup is a live Win32 + COM round trip, so a test that reached the
+/// The lookup is a live Win32 round trip, so a test that reached the
 /// production gate would either be asking the machine it runs on where the
 /// mouse is, or -- worse -- would pass because that machine happened to answer
 /// the way the test wanted. Handing the gate in is what lets the fill be
@@ -687,18 +687,29 @@ pub fn fill_outcome_sink(
 ///
 /// It speaks for a fill that types **a bare secret into whatever holds
 /// focus**: [`FillChoice::Just`] of a password or a one-time code. That is
-/// precisely the case section 4b is written about, and it is the case where
-/// "the focused control is masked" is the right question -- the user put their
-/// caret in the password box and asked for the password.
+/// precisely the case section 4b is written about, and what the gate asks of
+/// it is whose window that focus is in: an item whose rule names a process is
+/// not typed into a different one. It asks nothing about the control itself
+/// -- the masking refusal was removed on the owner's ruling, and the reasons
+/// are in `vault_window::preflight`'s module doc -- so a one-time code typed
+/// into a web page's ordinary code box, in the rule's own browser, is sent.
 ///
-/// It deliberately does **not** speak for [`FillChoice::UserTabPass`] or
-/// [`FillChoice::Saved`], and the reason is not caution, it is arithmetic:
-/// both of those start by typing a username into a field that is not masked,
-/// so `preflight::verdict`'s `NotMasked` arm would refuse every one of them.
-/// The design's own 4b illustration is such a sequence (Ctrl+A, the address,
-/// Tab, the password, Enter) shown in the ALLOWED state, so applying the
-/// masking rule to a multi-step sequence would contradict the picture it comes
-/// from. That conflict is recorded rather than papered over.
+/// It deliberately does **not** speak for [`FillChoice::UserTabPass`],
+/// [`FillChoice::Saved`] or `Just` of a user name, and **the line is kept
+/// exactly where it was drawn**, now that the reason it was first drawn there
+/// is gone. That reason was arithmetic: both multi-step fills start by typing a
+/// user name into a field that is not masked, so the old `NotMasked` arm would
+/// have refused every one of them, the design's own 4b illustration (Ctrl+A,
+/// the address, Tab, the password, Enter, shown ALLOWED) included. Removing
+/// that arm does not by itself argue for moving the line the other way.
+/// Putting the wrong-process check in front of fills that work today and have
+/// never had it would be a new refusal, made as a side effect of a change
+/// whose whole point was to refuse less -- that is its own decision, with its
+/// own tests, and not this one. Nor are those fills unguarded where it counts:
+/// `UserTabPass` takes the UI-Automation-first path into the fields of the
+/// window the fill was started against, and a `Saved` sequence runs under
+/// `injector::sequence::run`'s per-step foreground re-check, which abandons
+/// the plan the instant that window stops being in front.
 pub fn preflight_guard_for<'a>(
     choice: &FillChoice,
     rule_image: Option<&'a str>,
@@ -6112,23 +6123,20 @@ mod fill_dispatch_tests {
     const PASS: &str = "Zq7-tremulous-BADGER";
 
     /// The foreground the gated fills below are told they are typing into:
-    /// the process `item_with`'s rule names, with a masked control focused.
-    /// A value, so no test asks the machine it runs on where the mouse is.
-    fn a_masked_box_in_the_rules_process() -> Option<crate::injector::target::SendTarget> {
+    /// the process `item_with`'s rule names. A value, so no test asks the
+    /// machine it runs on where the mouse is.
+    ///
+    /// **Nothing here says what kind of box holds focus**, because
+    /// `SendTarget` no longer carries it: the masking refusal was removed on
+    /// the owner's ruling, and with it the one field that told a password box
+    /// from an echoing one. This is equally Edge with the caret in a password
+    /// input or in a web page's one-time-code box -- and both are typed into.
+    fn the_rules_process_in_front() -> Option<crate::injector::target::SendTarget> {
         Some(crate::injector::target::SendTarget {
             title: "Work Microsoft 365 - Sign in".into(),
             image_name: "msedge.exe".into(),
             pid: 7412,
             class_name: "Chrome_WidgetWin_1".into(),
-            focused_is_masked: true,
-        })
-    }
-
-    /// The same window, with the caret in a box that echoes what is typed.
-    fn an_unmasked_box_in_the_rules_process() -> Option<crate::injector::target::SendTarget> {
-        Some(crate::injector::target::SendTarget {
-            focused_is_masked: false,
-            ..a_masked_box_in_the_rules_process().unwrap()
         })
     }
 
@@ -6139,7 +6147,6 @@ mod fill_dispatch_tests {
             image_name: "slack.exe".into(),
             pid: 9001,
             class_name: "Chrome_WidgetWin_1".into(),
-            focused_is_masked: false,
         })
     }
 
@@ -7228,7 +7235,7 @@ mod fill_dispatch_tests {
             FillChoice::Just(key_sequence::FieldRef::Totp),
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
-                a_masked_box_in_the_rules_process,
+                the_rules_process_in_front,
             ),
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7269,7 +7276,7 @@ mod fill_dispatch_tests {
             FillChoice::Just(key_sequence::FieldRef::Password),
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
-                a_masked_box_in_the_rules_process,
+                the_rules_process_in_front,
             ),
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7342,7 +7349,7 @@ mod fill_dispatch_tests {
                 FillChoice::Just(key_sequence::FieldRef::Password),
                 &sequence::RecordingNotifier::default(),
                 &crate::vault_window::preflight::SendGate::describing(
-                    a_masked_box_in_the_rules_process,
+                    the_rules_process_in_front,
                 ),
                 &mut ungated(&mut crate::reprompt::Proof::default()),
             );
@@ -7460,7 +7467,7 @@ mod fill_dispatch_tests {
             FillChoice::UserTabPass,
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
-                a_masked_box_in_the_rules_process,
+                the_rules_process_in_front,
             ),
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7564,12 +7571,67 @@ mod fill_dispatch_tests {
     // one.
     #[test]
     fn a_password_fill_types_only_when_the_preflight_allows_it() {
-        // Positive control on the instrument: with the right window and a
-        // masked control the fill really does type, so a count of zero below
-        // is a refusal and not a harness that never fills anything.
-        let (typed, said) = gated_password_fill(a_masked_box_in_the_rules_process);
+        // Positive control on the instrument: with the right window in front
+        // the fill really does type, so a count of zero below is a refusal and
+        // not a harness that never fills anything.
+        let (typed, said) = gated_password_fill(the_rules_process_in_front);
         assert_eq!(typed, 1, "the allowed case never typed; said: {said:?}");
         assert!(said.is_empty(), "an allowed fill told the user it was refused: {said:?}");
+    }
+
+    /// **The owner's ruling, driven from the entry point: a password or a
+    /// one-time code typed into an ordinary, echoing box in the rule's own
+    /// process is TYPED.** "Allow this - our app can enter TOTP or whatever to
+    /// web pages as well - if official Bitwarden fails to do."
+    ///
+    /// This used to be the middle case of the refusal test below -- "the right
+    /// process, with the caret in a box that echoes" -- and answered "Nothing
+    /// sent". The code half is the one that matters most: a web page's
+    /// one-time-code input is never masked, so under the old gate a bare code
+    /// fill into the box the site asked for it in was refused every time.
+    /// `SendTarget` no longer says what kind of box holds focus, so the fixture
+    /// is the rule's process and nothing more -- which is exactly the
+    /// observation the gate now makes.
+    #[test]
+    fn a_password_or_code_types_into_an_unmasked_box_in_the_rules_process() {
+        let (typed, said) = gated_password_fill(the_rules_process_in_front);
+        assert_eq!(typed, 1, "the password was not typed into its own process; said: {said:?}");
+        assert!(said.is_empty(), "a password fill into its own process was refused: {said:?}");
+
+        let _serialised = crate::injector::sequence_test_lock();
+        let mut server = crate::test_http::server();
+        let _totp = server
+            .mock("GET", "/object/totp/item-1")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"success":true,"data":{"data":"907142"}}"#)
+            .create();
+        let cache =
+            crate::test_vault::cache_at(server.url(), vec![item_with("")], Vec::new());
+        let rec = Arc::new(Recorder::default());
+        let injector = Injector { ui: NoUiAutomation, fallback: recording_filler(&rec) };
+        let (_scratch, stats) = scratch_stats("preflight-code-box");
+        let notifier = sequence::RecordingNotifier::default();
+        fill_from_vault_with(
+            &cache,
+            &injector,
+            &stats,
+            "item-1",
+            4242,
+            FillChoice::Just(key_sequence::FieldRef::Totp),
+            &notifier,
+            &crate::vault_window::preflight::SendGate::describing(the_rules_process_in_front),
+            &mut ungated(&mut crate::reprompt::Proof::default()),
+        );
+        let said = notifier.take();
+        assert!(said.is_empty(), "a code fill into its own process was refused: {said:?}");
+        let sequences = rec.sequences.lock().unwrap();
+        assert_eq!(sequences.len(), 1, "the one-time code was not typed; said: {said:?}");
+        assert_eq!(
+            sequences[0].1,
+            [Step::Text { text: "907142".to_string(), rate: sequence::DEFAULT_RATE }],
+            "something other than the code was typed"
+        );
     }
 
     #[test]
@@ -7577,11 +7639,6 @@ mod fill_dispatch_tests {
         // The design's own example: the wrong process in front.
         let (typed, said) = gated_password_fill(a_chat_box);
         assert_eq!(typed, 0, "the password was typed into a chat box");
-        assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
-
-        // The right process, with the caret in a box that echoes.
-        let (typed, said) = gated_password_fill(an_unmasked_box_in_the_rules_process);
-        assert_eq!(typed, 0, "the password was typed into an unmasked control");
         assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
 
         // Nowhere describable at all -- an unknown target is not a safe one.
@@ -8029,7 +8086,7 @@ mod fill_dispatch_tests {
             choice,
             &notifier,
             &crate::vault_window::preflight::SendGate::describing(
-                a_masked_box_in_the_rules_process,
+                the_rules_process_in_front,
             ),
             &mut Reprompt::with_gate_for(&mut proof, gate_for),
         );
@@ -8165,7 +8222,7 @@ mod fill_dispatch_tests {
                 FillChoice::Just(key_sequence::FieldRef::Password),
                 &notifier,
                 &crate::vault_window::preflight::SendGate::describing(
-                    a_masked_box_in_the_rules_process,
+                    the_rules_process_in_front,
                 ),
                 &mut Reprompt::with_gate_for(proof, gate_for),
             );
@@ -8268,7 +8325,7 @@ mod fill_dispatch_tests {
             FillChoice::Just(key_sequence::FieldRef::Password),
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
-                a_masked_box_in_the_rules_process,
+                the_rules_process_in_front,
             ),
             &mut reprompt,
         );
@@ -9749,17 +9806,21 @@ mod preflight_guard_tests {
             assert_eq!(
                 preflight_guard_for(&FillChoice::Just(field), None),
                 Guard::Preflight { rule_image: None },
-                "an item with no rule is still gated, on the masking half"
+                "an item with no rule is still gated, on the foreground being describable"
             );
         }
     }
 
-    /// The other choices are NOT gated, and this states the reason as a test
-    /// rather than only in prose: both begin by typing a username into a field
-    /// that is not masked, so `verdict`'s `NotMasked` arm would refuse every
-    /// one of them -- including the design's own 4b illustration.
+    /// The other choices are NOT gated, and the line is held where it was
+    /// drawn. It was first drawn by arithmetic -- both multi-step fills begin
+    /// by typing a username into a field that is not masked, so the old
+    /// `NotMasked` arm would have refused every one of them, the design's own
+    /// 4b illustration included. That arm is gone on the owner's ruling, and
+    /// gating these fills on the wrong-process check instead would be a NEW
+    /// refusal on fills that work today; see [`preflight_guard_for`] for why
+    /// that is its own decision and not a side effect of this one.
     #[test]
-    fn a_sequence_that_starts_by_typing_a_username_is_not_gated_on_masking() {
+    fn a_sequence_that_starts_by_typing_a_username_is_not_gated() {
         for choice in [
             FillChoice::UserTabPass,
             FillChoice::Saved,
@@ -9768,7 +9829,7 @@ mod preflight_guard_tests {
             assert_eq!(
                 preflight_guard_for(&choice, Some("saplogon.exe")),
                 Guard::NotRequired,
-                "{choice:?} would be refused on every legitimate fill"
+                "{choice:?} was brought under the gate -- a new refusal on a fill that works today"
             );
         }
     }

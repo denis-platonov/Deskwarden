@@ -61,12 +61,56 @@
 //! never fired. Deleting the card did not delete the refusal; it deleted the
 //! duplicate, and the survivor is the one with a test on it
 //! (`app::fill_dispatch_tests::a_password_fill_types_nothing_when_the_preflight_refuses`
-//! asserts the notifier was told, on all three refusing shapes).
+//! asserts the notifier was told, on both refusing shapes).
 //!
 //! [`REFUSED_HEADING`] -- "Nothing sent", design 4b's own word for this state
 //! -- survived the card by moving into those sentences, so it is still the
 //! first thing the user reads when a fill is declined. The rest of 4b's string
 //! table went with the screen that painted it.
+//!
+//! # The masking refusal went the same way, on the same ruling
+//!
+//! The gate used to refuse twice. Besides the wrong window it had `NotMasked`:
+//! a bare password or one-time code was not typed unless UI Automation
+//! reported the control holding focus as a masked field -- "Deskwarden will
+//! not type a password into a box that echoes it." The owner had that taken
+//! out too: *"allow this - our app can enter TOTP or whatever to web pages as
+//! well - if official Bitwarden fails to do - which it does a lot"*, and *"user
+//! can open the app and copy and paste if logged in - it is same anyways"*.
+//!
+//! Both halves are true, and between them they leave the check guarding
+//! nothing:
+//!
+//! - **It refused exactly the fills it was wanted for.** A browser does not
+//!   reliably report a web page's password input as masked through UI
+//!   Automation, and a one-time-code box is never masked at all -- it is an
+//!   ordinary text input on every site that has one. So the refusal's
+//!   commonest verdict was a correct fill declined: the code, typed into the
+//!   box the site asked for it in, on the very pages the official client's
+//!   own autofill misses.
+//! - **It protected a value that is one copy away.** The user who pressed the
+//!   hotkey is signed in, and the same secret is on the vault window's copy
+//!   button and on `picker_prompt`'s. A paste into a box that echoes shows
+//!   exactly what a typed fill shows. A refusal the clipboard walks around is
+//!   not a boundary; it is friction, charged to the user who is entitled to
+//!   the value.
+//! - **It was the confirmation's argument over again.** The user put the caret
+//!   in the box and asked for this value by name. *"User intentionally sends
+//!   the whatever needed - their right"* is the ruling that removed the card,
+//!   and it covers which box they chose as much as whether they are asked
+//!   twice.
+//!
+//! **What stays is a wrong-WINDOW guard, which is a different thing.**
+//! [`Refusal::WrongProcess`] is not about how a field draws what is typed into
+//! it but about whose field it is: an item whose app-match rule names
+//! `saplogon.exe` is not typed into Slack, because the likeliest way that
+//! happens is focus moving between the pick and the keystroke -- a fill the
+//! user did not ask for, into a window they did not choose. [`Gated::NoTarget`]
+//! stays with it: a foreground that cannot be described cannot be checked
+//! against a rule, and an unknown target must not read as a safe one. Neither
+//! needs UI Automation, so `injector::target::describe_foreground` no longer
+//! asks it anything, and a provider that fails to answer can no longer turn
+//! into a refused fill.
 
 use crate::injector::target::SendTarget;
 
@@ -74,12 +118,17 @@ use crate::injector::target::SendTarget;
 // The decision
 // ---------------------------------------------------------------------------
 
+/// Why the gate declined a fill.
+///
+/// **One reason, and it used to be two.** The second was `NotMasked` -- an
+/// unmasked control holding focus -- and it is gone on the owner's ruling; see
+/// the module doc. It is still an enum rather than a unit struct because the
+/// reason is what [`refusal_notice`] words, and a gate that grows a reason
+/// again should grow a variant and a sentence, not a boolean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// The focused window is not the process this rule was written for.
     WrongProcess,
-    /// The focused control is not a masked field, and this sequence types a secret.
-    NotMasked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,25 +139,25 @@ pub enum Verdict {
 
 /// The whole gate, as a pure function so it can be tested without a window.
 ///
-/// **Both arms are refusals outright, and neither was ever "ask the user".**
-/// That distinction mattered while a card stood in front of this function, so
-/// it is worth writing down what the card did and did not do: it *rendered*
-/// the verdict, in one of two shapes, and it could never change it. A
+/// **Its one refusal is outright, and was never "ask the user".** That
+/// distinction mattered while a card stood in front of this function, so it is
+/// worth writing down what the card did and did not do: it *rendered* the
+/// verdict, in one of two shapes, and it could never change it. A
 /// `Verdict::Refused` laid out no hold affordance at all -- there was nothing
 /// on the refused card a user could press to send anyway -- and `run_with`
 /// answered `Cancel` for a send event in that state as a third barrier. So
 /// there is no arm here that loses its meaning when the human leaves: removing
 /// the confirmation removed a screen, not a branch.
 ///
-/// Order matters for the message the user sees: naming the wrong process is
-/// more useful than naming the wrong control, because it is the more likely
-/// mistake and the more dangerous one.
-pub fn verdict(target: &SendTarget, rule_image: &str, sequence_has_secret: bool) -> Verdict {
+/// **What it asks is whose window this is, and nothing about the control in
+/// it.** It used to take a `sequence_has_secret` flag and refuse a secret into
+/// a control UI Automation did not report as masked. Every caller passed
+/// `true`, and the refusal it guarded went on the owner's ruling (see the
+/// module doc), so the flag went with it: a parameter that no longer changes
+/// the answer is one a reader would reasonably believe still does.
+pub fn verdict(target: &SendTarget, rule_image: &str) -> Verdict {
     if !crate::injector::target::matches_rule(target, rule_image) {
         return Verdict::Refused(Refusal::WrongProcess);
-    }
-    if sequence_has_secret && !target.focused_is_masked {
-        return Verdict::Refused(Refusal::NotMasked);
     }
     Verdict::Allowed
 }
@@ -120,8 +169,8 @@ pub fn verdict(target: &SendTarget, rule_image: &str, sequence_has_secret: bool)
 /// What a gated send did, or did not do.
 ///
 /// [`Self::NoTarget`] is its own arm rather than a `Refused`: it means the
-/// foreground could not be described at all, which is neither of the two
-/// refusals the design words and must not be reported as one.
+/// foreground could not be described at all, which is not the wrong-window
+/// refusal the design words and must not be reported as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Gated<T> {
     Sent(T),
@@ -140,17 +189,17 @@ pub enum Gated<T> {
 /// is `injector::target::describe_foreground` in production and a fixture in a
 /// test; `send` is the real fill in production and a recorder in a test. The
 /// assertions are then about ROUTING -- that `send` is NOT reached for a wrong
-/// process, an unmasked control or an undescribable foreground, and IS reached
-/// for the allowed case. Deleting the refusal branch, or neutralising it,
-/// breaks those assertions; a pin on [`verdict`] alone would break on neither.
+/// process or an undescribable foreground, and IS reached for the allowed case,
+/// which since the owner's ruling includes an unmasked control in the right
+/// process. Deleting the refusal branch, or neutralising it, breaks those
+/// assertions; a pin on [`verdict`] alone would break on neither.
 ///
 /// # One field, and it used to be two
 ///
 /// The second was `confirm`, the seam design 4b's card was hosted behind. It
 /// is gone with the card -- see the module doc for the owner's reasoning. The
 /// struct is kept for the field that is left, because that field is the whole
-/// reason a live Win32 + COM foreground lookup can be driven from a test at
-/// all.
+/// reason a live Win32 foreground lookup can be driven from a test at all.
 ///
 /// # `fn` pointer rather than `impl Fn` for `describe`
 ///
@@ -182,10 +231,12 @@ impl SendGate {
 /// Whether this particular fill is one the preflight speaks for.
 ///
 /// **[`Self::NotRequired`] does not call `describe` at all**, and that is not
-/// an optimisation. Describing the foreground is a COM round trip that can
-/// fail, and a failure is a refusal -- so asking the question about a fill the
-/// gate has nothing to say about would turn an unreachable UI Automation
-/// provider into a broken fill for every item in the vault.
+/// an optimisation. Describing the foreground is a Win32 round trip that can
+/// come back empty -- a window gone between the hotkey and the look, a process
+/// whose image name cannot be read -- and an empty answer is a refusal. So
+/// asking the question about a fill the gate has nothing to say about would
+/// turn a foreground Win32 could not name into a broken fill for every item in
+/// the vault.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Guard<'a> {
     /// This fill types a secret into **whatever holds focus**, which is the
@@ -220,13 +271,13 @@ pub fn dispatch_with<T>(
         return Gated::NoTarget;
     };
     // No rule was ever recorded for this item, so there is no process claim to
-    // check and the process half of `verdict` is satisfied by the target's own
-    // image. The masking half -- the one that matters for a bare secret typed
-    // at the caret -- is asked either way. Written as an explicit `None` arm
-    // rather than an `unwrap_or` so that "this item has no rule" is a state
-    // named in the source and not an argument that happens to compare equal.
+    // check and `verdict` is satisfied by the target's own image. What a
+    // rule-less item is still gated on is the line above: a foreground that
+    // could be described at all. Nothing is asked about the control holding
+    // focus, for either kind of item -- see the module doc for the owner's
+    // ruling that took the masking check out.
     let rule = rule_image.unwrap_or(target.image_name.as_str());
-    match verdict(&target, rule, true) {
+    match verdict(&target, rule) {
         Verdict::Refused(why) => Gated::Refused(why),
         Verdict::Allowed => Gated::Sent(send()),
     }
@@ -251,8 +302,14 @@ pub const REFUSED_HEADING: &str = "Nothing sent";
 /// computed in `app::confirmed_by_preflight` as well, the card was drawn in its
 /// refusal shape, and the fill returned before `dispatch_with` was ever
 /// reached -- so in production this function's text was what nobody saw. The
-/// surviving channel is the tested one, it fires on all three refusing shapes,
-/// and it says the same three facts the card said.
+/// surviving channel is the tested one, and it fires on both refusing shapes:
+/// the wrong window, and a window that could not be told at all.
+///
+/// **There were three sentences, and the third is gone with its refusal.** "The
+/// control holding focus is not a masked field" was the box a user met when
+/// they asked for a one-time code in the one-time-code box of a web page -- the
+/// fill the owner most wanted to work. It is not reworded into a warning; there
+/// is no longer anything to warn about.
 ///
 /// What is **not** offered any more is *Copy instead*, the escape the card put
 /// beside its refusal. It was an affordance of a screen, and it needed that
@@ -263,8 +320,6 @@ pub fn refusal_notice(gated_reason: Option<Refusal>) -> String {
     let why = match gated_reason {
         Some(Refusal::WrongProcess) => "The window in front is not the one this item's rule was \
              written for. Deskwarden will not type a password there.",
-        Some(Refusal::NotMasked) => "The control holding focus is not a masked field. Deskwarden \
-             will not type a password into a box that echoes it.",
         None => "Deskwarden could not tell which window is in front, so it did not type anything.",
     };
     format!("{REFUSED_HEADING}. {why}")
@@ -272,7 +327,7 @@ pub fn refusal_notice(gated_reason: Option<Refusal>) -> String {
 
 /// A gate whose foreground is a **fixture**, for the tests that drive a whole
 /// fill. Not available in a shipping build: `describe_foreground` is a live
-/// Win32 + COM round trip, and a test that reached it would be asking the
+/// Win32 round trip, and a test that reached it would be asking the
 /// machine it runs on where the mouse is.
 ///
 /// Written down here, below everything production, so that a source pin that
@@ -290,42 +345,38 @@ mod tests {
     use super::*;
     use crate::injector::target::SendTarget;
 
-    fn t(image: &str, masked: bool) -> SendTarget {
+    /// A target in `image`. **There is no masking bit to set**: `SendTarget`
+    /// stopped carrying one when the refusal that read it was removed, so
+    /// every fixture here is equally a password box, a user-name box or a
+    /// web page's one-time-code input -- which is the point.
+    fn t(image: &str) -> SendTarget {
         SendTarget {
             title: "SAP Logon 760 - Sign in".into(),
             image_name: image.into(),
             pid: 7412,
             class_name: "SAPFEWndClass".into(),
-            focused_is_masked: masked,
         }
     }
 
     #[test]
-    fn a_secret_sequence_needs_the_right_process_and_a_masked_control() {
-        assert_eq!(verdict(&t("saplogon.exe", true), "saplogon.exe", true), Verdict::Allowed);
+    fn a_secret_needs_the_right_process_and_nothing_about_the_control() {
         assert_eq!(
-            verdict(&t("slack.exe", true), "saplogon.exe", true),
+            verdict(&t("saplogon.exe"), "saplogon.exe"),
+            Verdict::Allowed,
+            "the rule's own process, whatever box holds focus in it, is where the user asked \
+             for this value to go"
+        );
+        assert_eq!(
+            verdict(&t("slack.exe"), "saplogon.exe"),
             Verdict::Refused(Refusal::WrongProcess),
             "the design's own example: a password must not reach a chat box"
         );
-        assert_eq!(
-            verdict(&t("saplogon.exe", false), "saplogon.exe", true),
-            Verdict::Refused(Refusal::NotMasked),
-            "right window, wrong field -- a password typed into a username box is echoed in clear"
-        );
-    }
-
-    #[test]
-    fn a_sequence_with_no_secret_does_not_require_a_masked_control() {
-        // A username-only sequence has nothing to leak into a visible field,
-        // and requiring a masked control would make it unusable.
-        assert_eq!(verdict(&t("saplogon.exe", false), "saplogon.exe", false), Verdict::Allowed);
     }
 
     /// **The refusal still says what happened, now that the card that said it
     /// is gone.**
     ///
-    /// This is the one surviving channel for a declined fill, so the three
+    /// This is the one surviving channel for a declined fill, so both
     /// sentences are asserted here rather than left to the surface that used
     /// to paint them. Each one leads with [`REFUSED_HEADING`] -- design 4b's
     /// own word for this state -- and each names the fact that is wrong, so a
@@ -334,22 +385,22 @@ mod tests {
     #[test]
     fn every_refusal_says_nothing_was_sent_and_why() {
         let wrong = refusal_notice(Some(Refusal::WrongProcess));
-        let unmasked = refusal_notice(Some(Refusal::NotMasked));
         let unknown = refusal_notice(None);
-        for notice in [&wrong, &unmasked, &unknown] {
+        for notice in [&wrong, &unknown] {
             assert!(
                 notice.starts_with(REFUSED_HEADING),
                 "{notice:?} does not lead with the design's word for this state"
             );
+            // The masking refusal is gone on the owner's ruling, so no notice
+            // may still blame the control -- a user told "not a masked field"
+            // would go looking for a setting that no longer exists.
+            assert!(!notice.contains("masked"), "{notice:?} still words the masking refusal");
         }
         assert!(wrong.contains("not the one this item's rule was written for"), "{wrong:?}");
-        assert!(unmasked.contains("not a masked field"), "{unmasked:?}");
         assert!(unknown.contains("could not tell which window is in front"), "{unknown:?}");
-        // Control on the instrument: the three are distinguishable, so a
+        // Control on the instrument: the two are distinguishable, so a
         // `refusal_notice` that answered one string for every reason would
-        // fail here rather than pass all four assertions above.
-        assert_ne!(wrong, unmasked);
-        assert_ne!(unmasked, unknown);
+        // fail here rather than pass the assertions above.
         assert_ne!(wrong, unknown);
     }
 
@@ -361,21 +412,21 @@ mod tests {
     // `let _ = decision(..);` was measured surviving this crate's whole suite
     // at zero warnings, because nothing observed the gate's POSITION.
 
-    fn right_and_masked() -> Option<SendTarget> {
-        Some(t("saplogon.exe", true))
-    }
-    fn right_and_unmasked() -> Option<SendTarget> {
-        Some(t("saplogon.exe", false))
+    /// The rule's own process with the caret in an ordinary, echoing box -- a
+    /// one-time-code input, or a web page's password field a browser does not
+    /// report as masked. The fill this gate used to refuse and now sends.
+    fn an_unmasked_box_in_the_right_process() -> Option<SendTarget> {
+        Some(t("saplogon.exe"))
     }
     fn a_chat_box() -> Option<SendTarget> {
-        Some(t("slack.exe", true))
+        Some(t("slack.exe"))
     }
     fn nothing_at_all() -> Option<SendTarget> {
         None
     }
     /// A `describe` that must never be called: `Guard::NotRequired` may not
-    /// pay for a COM round trip, and a fill it does not speak for may not be
-    /// broken by an unreachable UI Automation provider.
+    /// pay for a foreground lookup, and a fill it does not speak for may not be
+    /// broken by a foreground Win32 could not name.
     fn must_not_be_asked() -> Option<SendTarget> {
         panic!("the foreground was described for a fill the preflight does not speak for");
     }
@@ -395,7 +446,7 @@ mod tests {
     /// between a fill the user asked for and the keystrokes it types.
     #[test]
     fn the_sender_runs_only_for_an_allowed_verdict() {
-        let (gated, sent) = run(right_and_masked, RULE);
+        let (gated, sent) = run(an_unmasked_box_in_the_right_process, RULE);
         assert_eq!(gated, Gated::Sent(()));
         assert!(sent, "the allowed case did not reach the sender -- the gate is shut on everything");
     }
@@ -407,30 +458,43 @@ mod tests {
         assert_eq!(gated, Gated::Refused(Refusal::WrongProcess));
         assert!(!sent, "a password reached the sender with the wrong window in front");
 
-        // Right process, unmasked control: a password echoed in clear.
-        let (gated, sent) = run(right_and_unmasked, RULE);
-        assert_eq!(gated, Gated::Refused(Refusal::NotMasked));
-        assert!(!sent, "a password reached the sender with an unmasked control focused");
-
         // Nothing describable: an unknown target must not read as a safe one.
         let (gated, sent) = run(nothing_at_all, RULE);
         assert_eq!(gated, Gated::NoTarget);
         assert!(!sent, "a password reached the sender with no idea where it was going");
     }
 
-    /// The rule-less item: no process claim to check, and the masking half
-    /// still applies. Both directions, so this is not a gate that is simply
-    /// open.
+    /// **The owner's ruling, stated as a test: an unmasked control in the
+    /// right process is SENT.** "Allow this - our app can enter TOTP or
+    /// whatever to web pages as well" -- the one-time-code box of a web page is
+    /// never masked, and this is the fill that used to answer "Nothing sent".
+    ///
+    /// Asserted for a ruled item and a rule-less one, because the old refusal
+    /// applied to both: a rule-less item was gated on the masking half alone,
+    /// so it is the case a half-removed check would still break.
     #[test]
-    fn an_item_with_no_rule_is_still_gated_on_the_control_being_masked() {
-        let unruled = Guard::Preflight { rule_image: None };
-        let (gated, sent) = run(right_and_unmasked, unruled);
-        assert_eq!(gated, Gated::Refused(Refusal::NotMasked));
-        assert!(!sent, "a rule-less item typed a password into an unmasked control");
-
-        let (gated, sent) = run(right_and_masked, unruled);
+    fn an_unmasked_control_in_the_right_process_is_sent() {
+        let (gated, sent) = run(an_unmasked_box_in_the_right_process, RULE);
         assert_eq!(gated, Gated::Sent(()));
-        assert!(sent, "a rule-less item into a masked field was refused, which breaks every fill");
+        assert!(sent, "a ruled item was refused into its own process's echoing box");
+
+        let unruled = Guard::Preflight { rule_image: None };
+        let (gated, sent) = run(an_unmasked_box_in_the_right_process, unruled);
+        assert_eq!(gated, Gated::Sent(()));
+        assert!(sent, "a rule-less item was refused into an echoing box");
+    }
+
+    /// The rule-less item is still GATED, just not on the control: with no
+    /// process claim to check, what is left is that the foreground could be
+    /// described at all. Without this the test above would pass against a
+    /// `Guard::Preflight { rule_image: None }` that had quietly become
+    /// `NotRequired`.
+    #[test]
+    fn an_item_with_no_rule_is_still_refused_an_undescribable_foreground() {
+        let unruled = Guard::Preflight { rule_image: None };
+        let (gated, sent) = run(nothing_at_all, unruled);
+        assert_eq!(gated, Gated::NoTarget);
+        assert!(!sent, "a rule-less item typed a password with no idea where it was going");
     }
 
     /// `NotRequired` sends without describing anything at all -- asserted by
@@ -444,7 +508,7 @@ mod tests {
 
     /// The seam itself, pinned by ADDRESS. A seam that is unpinned only moves
     /// the hole: production could hand over a wrapper that always answers
-    /// "masked" and every routing test above would still pass.
+    /// "the rule's own process" and every routing test above would still pass.
     #[test]
     fn production_holds_the_real_foreground_lookup() {
         assert!(

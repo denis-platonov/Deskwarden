@@ -25,11 +25,21 @@
 //! # What is NOT reproduced, and why
 //!
 //! **4a's "Send for real -- needs SAP Logon focused".** A fill is a thing the
-//! overlay does, against a window the user has focused, through
-//! [`preflight::verdict`](super::preflight::verdict). A button here could only
-//! either send a real password from a screen that is itself the foreground --
-//! which is the one condition the gate refuses -- or pretend. 4d's rehearsal
-//! is the honest version of the same want, and it is on this screen.
+//! overlay does, against a window the user has focused, and
+//! `injector::sequence::run` abandons it the moment that window stops being in
+//! front. A button here could only either send a real password into a screen
+//! that is itself the foreground -- this one, which is not SAP Logon and is
+//! not what the rule was written for -- or pretend. 4d's rehearsal is the
+//! honest version of the same want, and it is on this screen.
+//!
+//! **4a's "gated on a masked control".** The design promises it twice -- a
+//! sub-band under the password step and a line on the checks card -- and this
+//! build keeps neither. The masking refusal was removed from
+//! [`preflight::verdict`](super::preflight::verdict) on the owner's ruling
+//! (that module's doc has the reasons: browsers and one-time-code boxes are not
+//! reported as masked, and the value is one copy away anyway), and a screen
+//! that still said the secret was gated would be stating a guarantee nothing
+//! enforces. See [`checks`].
 //!
 //! **The template's `{WAIT=250}` and `{CTRL+A}` spellings.** They are the
 //! design's, not KeePass's, and this app carries foreign sequences byte for
@@ -262,9 +272,10 @@ pub enum CheckTone {
     /// This sequence can go wrong in a named way, and here is the fix.
     Caution,
     /// **Not about this sequence at all** -- a guarantee the runner makes
-    /// whatever is typed here. 4a draws two of them, and they are worth
-    /// drawing for the reason 4e gives: the editor can only warn, and the
-    /// user's confidence has to come from what happens at send time.
+    /// whatever is typed here. 4a draws two of them and this build draws one
+    /// (see [`checks`] for the one that went), and it is worth drawing for the
+    /// reason 4e gives: the editor can only warn, and the user's confidence
+    /// has to come from what happens at send time.
     Fact,
 }
 
@@ -296,13 +307,22 @@ pub struct Check {
 /// 4a's checks card, for `sequence`.
 ///
 /// **Every one of these is a statement this crate can stand behind**, which is
-/// why there are four and not the six a plausible-looking card would have. The
-/// two `Fact`s are enforcements that really exist --
-/// [`preflight::verdict`](super::preflight::verdict) refuses a secret step
-/// against an unmasked control, and
+/// why there are three and not the six a plausible-looking card would have.
+/// The one `Fact` is an enforcement that really exists --
 /// [`crate::injector::sequence::plan`] emits no step for an empty text run --
 /// and the two others are properties of the token list that can be read off it
 /// without guessing.
+///
+/// **There were four, and the fourth was a `Fact` that stopped being one.**
+/// "The secret step is gated on a masked control" cited
+/// [`preflight::verdict`](super::preflight::verdict)'s refusal of a secret
+/// typed into an unmasked control. The owner had that refusal removed -- see
+/// the preflight module doc -- so the line went with it, and it is not
+/// reworded into a softer claim either: the gate that is left asks only whose
+/// window is in front, and only for a bare password or code, never for a
+/// stored sequence like the one on this screen. A `Fact` is drawn as a
+/// guarantee, and a guarantee the code does not enforce is the one thing this
+/// card must never say.
 pub fn checks(sequence: &str) -> Vec<Check> {
     let tokens = detail_edit::sequence_view(sequence).tokens;
     let secret_at = tokens
@@ -314,8 +334,7 @@ pub fn checks(sequence: &str) -> Vec<Check> {
         // **A field change before the secret.** The one mistake that puts a
         // password somewhere it can be read: with no Tab (or any other key)
         // between the user name and the password, both are typed into the box
-        // that had focus, and the second half of a user name box is not a
-        // masked control.
+        // that had focus, and a user name box shows what is typed into it.
         let changed = tokens[..secret_at].iter().any(|t| matches!(t, Token::Key(_)));
         // Nothing typed before it is not a missing field change -- the
         // sequence starts at the password, wherever focus already is.
@@ -336,13 +355,6 @@ pub fn checks(sequence: &str) -> Vec<Check> {
                 note: FIELD_CHANGE_NOTE.to_string(),
                 fix: None,
             }
-        });
-
-        out.push(Check {
-            tone: CheckTone::Fact,
-            line: MASKED_GATE.to_string(),
-            note: String::new(),
-            fix: None,
         });
     }
 
@@ -617,7 +629,6 @@ pub const FIELD_CHANGE_PASS: &str = "A field change happens before the secret is
 pub const FIELD_CHANGE_CAUTION: &str = "Nothing moves the cursor before the secret is typed.";
 pub const FIELD_CHANGE_NOTE: &str =
     "Whatever box had focus gets the user name and the password one after the other. Add a Tab.";
-pub const MASKED_GATE: &str = "The secret step is gated on a masked control.";
 pub const ENTER_CAUTION: &str = "No wait after Enter.";
 pub const ENTER_NOTE: &str =
     "If the dialog is slow to close, the next keystroke lands in the window behind it.";
@@ -2067,9 +2078,11 @@ fn step_keys(ui: &egui::Ui, count: usize, selected: &mut Option<usize>) -> Optio
 /// wash and edge, the index in [`theme::DANGER_QUIET`] (`#a2554d`), the kind
 /// chip in [`theme::ERROR`] behind white, the pill the same, and its runs in
 /// [`theme::SECRET_INK`]. The hatch is still not drawn -- see
-/// `detail_edit::SECRET_STEP_RADIUS` for the argument -- and the sub-band
-/// under it (`Sends only if the focused control is a masked field`) is not:
-/// that gate is `preflight`'s and is not a per-step setting in this build.
+/// `detail_edit::SECRET_STEP_RADIUS` for the argument -- and neither is the
+/// sub-band under it, 4a's "sends only if the focused control is masked". No
+/// such gate exists in this build: `preflight` stopped asking about the
+/// focused control on the owner's ruling (see its module doc), and a band in
+/// red promising otherwise would be a guarantee nothing enforces.
 ///
 /// **A selected row wears 8a's fresh-row treatment** -- `background:
 /// #eef2fc; border: 1px solid #b8c7ea`, the wash and edge `detail_edit`'s
@@ -3080,7 +3093,6 @@ mod tests {
         let found = checks("{USERNAME}{TAB}");
         assert!(!found.iter().any(|c| c.line == FIELD_CHANGE_PASS));
         assert!(!found.iter().any(|c| c.line == FIELD_CHANGE_CAUTION));
-        assert!(!found.iter().any(|c| c.line == MASKED_GATE));
     }
 
     #[test]
@@ -3113,10 +3125,33 @@ mod tests {
     }
 
     #[test]
-    fn the_two_facts_are_always_there_to_be_read() {
+    fn the_one_fact_is_always_there_to_be_read() {
         let found = checks("{USERNAME}{TAB}{PASSWORD}");
-        assert!(found.iter().any(|c| c.tone == CheckTone::Fact && c.line == MASKED_GATE));
         assert!(found.iter().any(|c| c.tone == CheckTone::Fact && c.line == NO_EMPTY_TEXT));
+    }
+
+    /// **The card never promises the masking gate.** It used to carry "The
+    /// secret step is gated on a masked control" as a `Fact`, and the refusal
+    /// behind it was removed on the owner's ruling -- so a secret sequence,
+    /// of all sequences, must not be told it is protected by something that no
+    /// longer runs. Asserted over the corpus and over the secret shapes that
+    /// used to draw the line, so it is not a test of one string.
+    #[test]
+    fn no_check_claims_the_secret_is_gated_on_a_masked_control() {
+        let secret_shapes = ["{PASSWORD}", "{USERNAME}{TAB}{PASSWORD}", "{TOTP}{ENTER}"];
+        for sequence in CORPUS.iter().copied().chain(secret_shapes) {
+            let found = checks(sequence);
+            assert!(
+                !found.iter().any(|c| c.line.contains("masked") || c.note.contains("masked")),
+                "{sequence:?}: a check still states the removed masking gate: {found:?}"
+            );
+            assert_eq!(
+                found.iter().filter(|c| c.tone == CheckTone::Fact).count(),
+                1,
+                "{sequence:?}: a Fact was added or lost -- every one must name an enforcement \
+                 that exists: {found:?}"
+            );
+        }
     }
 
     #[test]
