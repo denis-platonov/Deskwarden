@@ -23,7 +23,8 @@
 //! # Two halves, in this crate's idiom
 //!
 //! [`parse`], [`family_of_class`], [`Family::address_field`],
-//! [`is_browser_chrome`] and [`prefer_document`] are pure and tested. `read` is
+//! [`is_browser_chrome`], [`reading_order`] and [`prefer_document`] are pure
+//! and tested. `read` is
 //! the observation half -- one window-class lookup, one UI Automation query for
 //! the address field and, in a Chromium browser whose omnibox showed an elided
 //! address, one for the page's `Document`, all in `injector::ui_automation`
@@ -188,6 +189,31 @@ pub const MAX_FIELD_DEPTH: usize = 10;
 /// Document, 13 deep), and the depth bound is what refuses that one.
 pub fn is_browser_chrome(depth: Option<usize>, crosses_a_document: bool) -> bool {
     !crosses_a_document && depth.is_some_and(|depth| (1..=MAX_FIELD_DEPTH).contains(&depth))
+}
+
+/// **The order the examined candidates are read in**: the indices of those
+/// [`is_browser_chrome`] keeps, SHALLOWEST first, ties in tree order. Each
+/// entry of `walks` is one candidate's `(depth, crosses_a_document)`, in tree
+/// order.
+///
+/// Not "the first kept in tree order", because Firefox lists the page's
+/// content BEFORE its toolbar: a page field that slipped past the depth bound
+/// would be read ahead of the real URL bar. Shallowest first closes that,
+/// because a page's field can never be shallower than the content pane it is
+/// drawn in, and the toolbar is shallower than that pane (4 against 13 or
+/// more in Firefox on 2026-10-01). `injector::ui_automation`'s
+/// `address_field_text` tries the indices in this order and reads the first
+/// that gives a value.
+pub fn reading_order(walks: &[(Option<usize>, bool)]) -> Vec<usize> {
+    let mut kept: Vec<(usize, usize)> = walks
+        .iter()
+        .enumerate()
+        .filter(|(_, (depth, crosses_a_document))| is_browser_chrome(*depth, *crosses_a_document))
+        .filter_map(|(index, (depth, _))| depth.map(|depth| (depth, index)))
+        .collect();
+    // (depth, index): sorting the pairs is depth first, then tree order.
+    kept.sort_unstable();
+    kept.into_iter().map(|(_, index)| index).collect()
 }
 
 /// The longest address-bar text that is parsed at all, in bytes.
@@ -524,6 +550,33 @@ mod tests {
         assert!(!is_browser_chrome(None, false), "a walk that never reached the window proves nothing");
         assert!(!is_browser_chrome(Some(0), false), "zero steps is not a walk up to the window");
         assert!(is_browser_chrome(Some(1), false), "control: the lower bound itself is inside");
+    }
+
+    #[test]
+    fn the_shallowest_kept_candidate_is_read_first() {
+        assert_eq!(
+            reading_order(&[(Some(7), false), (Some(4), false)]),
+            vec![1, 0],
+            "Firefox lists the page before the toolbar: the shallower field is the toolbar's"
+        );
+        assert_eq!(reading_order(&[(Some(4), false), (Some(7), false)]), vec![0, 1]);
+    }
+
+    #[test]
+    fn equally_deep_candidates_are_read_in_tree_order() {
+        assert_eq!(reading_order(&[(Some(8), false), (Some(8), false)]), vec![0, 1]);
+        assert_eq!(reading_order(&[(Some(9), false), (Some(8), false), (Some(8), false)]), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn a_refused_candidate_is_never_in_the_reading_order() {
+        assert_eq!(
+            reading_order(&[(None, true), (Some(13), false), (Some(4), false), (Some(0), false), (Some(3), true), (None, false)]),
+            vec![2],
+            "only the kept candidate is read, however shallow the refused ones are"
+        );
+        assert!(reading_order(&[]).is_empty());
+        assert!(reading_order(&[(None, true)]).is_empty());
     }
 
     /// What Chrome's omnibox held on 2026-10-01: display text, no scheme.

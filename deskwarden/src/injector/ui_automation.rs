@@ -329,15 +329,18 @@ const MAX_ADDRESS_FIELD_MATCHES: usize = 16;
 /// are in the same tree, with the page's `id` as their `AutomationId`, and in
 /// Firefox the page comes BEFORE the toolbar in tree order -- so the first
 /// match could be a page's `<input id="urlbar-input">`. Every match is held to
-/// [`crate::browser_url::is_browser_chrome`] instead, and the first that
-/// passes is read.
+/// [`crate::browser_url::is_browser_chrome`] instead, and of those it keeps the
+/// SHALLOWEST is read, ties in tree order
+/// ([`crate::browser_url::reading_order`]) -- not the first kept in tree
+/// order, which in Firefox is a page's before it is the toolbar's.
 ///
 /// **At most [`MAX_ADDRESS_FIELD_MATCHES`] matches are examined**, kept or
 /// refused, and the walk up from each stops at the first `Document` (see
 /// [`Walk::StopAtDocument`]): a page that plants look-alike inputs costs a
-/// bounded pause and nothing more. A kept match that turns out to have no
-/// `ValuePattern`, or that will not give its value, is passed over for the
-/// next one rather than ending the read -- it still counts toward the bound.
+/// bounded pause and nothing more. All of them are walked before any is read,
+/// because the shallowest may be the last. A kept match that turns out to have
+/// no `ValuePattern`, or that will not give its value, is passed over for the
+/// next shallowest rather than ending the read.
 ///
 /// The text is returned to the caller and to nobody else: it is not logged
 /// here, and `browser_url::read` does not log it either.
@@ -349,18 +352,21 @@ pub fn address_field_text(
         let Some(query) = find_address_fields(hwnd, field)? else {
             return Ok(None);
         };
+        let mut examined = Vec::new();
+        let mut walks = Vec::new();
         for index in (0..query.found.Length()?).take(MAX_ADDRESS_FIELD_MATCHES) {
             let element = query.found.GetElement(index)?;
-            let (depth, crosses_a_document) = ancestry(
+            walks.push(ancestry(
                 &query.automation,
                 &query.walker,
                 &query.root,
                 &element,
                 Walk::StopAtDocument,
-            );
-            if !crate::browser_url::is_browser_chrome(depth, crosses_a_document) {
-                continue;
-            }
+            ));
+            examined.push(element);
+        }
+        for kept in crate::browser_url::reading_order(&walks) {
+            let element = &examined[kept];
             let Ok(value) =
                 element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
             else {
@@ -1021,6 +1027,18 @@ mod address_field_tests {
             1,
             "`address_field_text` grew a second loop over the matches, outside the bound"
         );
+        assert_eq!(
+            body.matches(concat!("query.found.", "GetElement(")).count(),
+            1,
+            "`address_field_text` takes a match from the query outside the bounded loop"
+        );
+        // The read itself goes over the matches that loop examined, shallowest
+        // kept first -- not over the query -- so it is inside the same bound.
+        assert!(
+            body.contains(concat!("for kept in crate::browser_url::reading_", "order(&walks)")),
+            "`address_field_text` no longer reads the shallowest kept candidate first"
+        );
+        assert!(body.contains(concat!("let element = &", "examined[kept];")));
         // The real read stops its walk at the first Document; only the probe
         // walks on.
         assert!(body.contains(concat!("Walk::StopAt", "Document")));

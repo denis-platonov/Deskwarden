@@ -39,6 +39,11 @@ string in a browser window that identifies the site.
   as the fallback; document exactly which properties are used per family.
 - Returns the field's text, or nothing. A failure, a missing control, or an unsupported
   browser is "no URL", never an error the user sees.
+- Only a candidate that is part of the browser's chrome counts (no `Document` above it, and at
+  most `MAX_FIELD_DEPTH` raw-view steps below the window). Of the at most 16 candidates
+  examined, the SHALLOWEST kept one is read, ties in tree order (`browser_url::reading_order`):
+  Firefox lists page content before its toolbar, and a page's field can never be shallower than
+  its content pane. A kept candidate without a `ValuePattern` is passed over for the next.
 - **Chrome's omnibox holds elided text** (measured live with UI Automation, 2026-10-01). The
   `ValuePattern` value of Chrome's `OmniboxViewViews` is the display text, e.g.
   `mail.google.com/...`: no `https://`, and Chrome also elides `www.` and `http://`. Edge's
