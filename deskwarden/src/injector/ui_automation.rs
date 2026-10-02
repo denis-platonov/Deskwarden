@@ -4,9 +4,12 @@ use windows::Win32::System::Com::{
     CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
 };
 use windows::Win32::UI::Accessibility::{
-    CUIAutomation, IUIAutomation, IUIAutomationValuePattern, TreeScope_Descendants,
-    UIA_ControlTypePropertyId, UIA_EditControlTypeId, UIA_IsPasswordPropertyId,
-    UIA_ValuePatternId,
+    CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationCondition,
+    IUIAutomationElement, IUIAutomationElementArray, IUIAutomationTreeWalker,
+    IUIAutomationValuePattern, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+    UIA_ClassNamePropertyId, UIA_ComboBoxControlTypeId, UIA_ControlTypePropertyId,
+    UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_IsPasswordPropertyId,
+    UIA_NamePropertyId, UIA_ValuePatternId,
 };
 
 /// A UTF-16 string handle whose buffer [`set_value_wiping`] zeroes before the
@@ -287,6 +290,219 @@ fn is_real_rect(r: RECT) -> bool {
     r.right > r.left && r.bottom > r.top
 }
 
+/// How long UI Automation may wait for a browser to accept the connection,
+/// and to answer one request, before [`address_field_text`] gives up.
+///
+/// The defaults are 2 s and 20 s, and this runs between a key press and the
+/// card it opens: a hung browser must cost the user a short pause and a
+/// picker ranked as before, never a frozen hotkey. Measured on 2026-10-01 the
+/// whole query took 50-95 ms in Chrome, Edge, Brave and Firefox.
+const ADDRESS_FIELD_CONNECTION_TIMEOUT_MS: u32 = 500;
+const ADDRESS_FIELD_TRANSACTION_TIMEOUT_MS: u32 = 1000;
+
+/// **The text of a browser's address field**, found by the properties
+/// `field` names, or `Ok(None)` when there is no such field that belongs to
+/// the browser's own chrome.
+///
+/// The same apartment handling as every function above (see
+/// [`find_address_fields`]). Created through `CUIAutomation8` rather than
+/// `CUIAutomation` because only that object answers for `IUIAutomation2`,
+/// which is where the two timeouts are set.
+///
+/// **`FindAll` and not `FindFirst`, on purpose.** A web page's own elements
+/// are in the same tree, with the page's `id` as their `AutomationId`, and in
+/// Firefox the page comes BEFORE the toolbar in tree order -- so the first
+/// match could be a page's `<input id="urlbar-input">`. Every match is held to
+/// [`crate::browser_url::is_browser_chrome`] instead, and the first that
+/// passes is read.
+///
+/// The text is returned to the caller and to nobody else: it is not logged
+/// here, and `browser_url::read` does not log it either.
+pub fn address_field_text(
+    hwnd: isize,
+    field: crate::browser_url::AddressField,
+) -> Result<Option<String>> {
+    unsafe {
+        let Some(query) = find_address_fields(hwnd, field)? else {
+            return Ok(None);
+        };
+        for index in 0..query.found.Length()? {
+            let element = query.found.GetElement(index)?;
+            let (depth, crosses_a_document) =
+                ancestry(&query.automation, &query.walker, &query.root, &element);
+            if !crate::browser_url::is_browser_chrome(depth, crosses_a_document) {
+                continue;
+            }
+            let value: IUIAutomationValuePattern =
+                element.GetCurrentPatternAs(UIA_ValuePatternId)?;
+            let text = value.CurrentValue()?.to_string();
+            return Ok((!text.is_empty()).then_some(text));
+        }
+        Ok(None)
+    }
+}
+
+/// One element [`address_field_text`]'s query matched, described by where it
+/// sits and what it calls itself -- **and never by what it holds**.
+///
+/// **Probe-only.** `examples/address_bar_probe.rs` prints these so a hand
+/// check in a new browser, a Firefox popup or a Chrome app window can see why
+/// each candidate was accepted or refused. Nothing in the app reads them.
+///
+/// There is deliberately no text field: a refused candidate may be a web
+/// page's own input, and its value is whatever the user typed into that page.
+/// `ClassName` and `AutomationId` are the two keys [`crate::browser_url::Family::address_field`]
+/// matches on; `Name` is left out because for a page's element it is the
+/// page's `aria-label`, which is page content.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AddressFieldCandidate {
+    /// The walk up to the window, as [`crate::browser_url::is_browser_chrome`] takes it.
+    pub depth: Option<usize>,
+    /// Whether a `Document` was crossed on the way up.
+    pub crosses_a_document: bool,
+    /// `UIA_ClassNamePropertyId`, or empty when the provider did not say.
+    pub class_name: String,
+    /// `UIA_AutomationIdPropertyId`, or empty when the provider did not say.
+    pub automation_id: String,
+}
+
+/// **Probe-only**: every element [`address_field_text`]'s query matches, in
+/// tree order, as an [`AddressFieldCandidate`], whether or not it would be
+/// read.
+///
+/// The same query through the same [`find_address_fields`] and the same
+/// [`ancestry`], so what the probe prints is what the app decides on. It
+/// never asks a candidate for its value -- `address_field_tests` holds this
+/// function to that.
+pub fn address_field_candidates(
+    hwnd: isize,
+    field: crate::browser_url::AddressField,
+) -> Result<Vec<AddressFieldCandidate>> {
+    unsafe {
+        let Some(query) = find_address_fields(hwnd, field)? else {
+            return Ok(Vec::new());
+        };
+        let mut candidates = Vec::new();
+        for index in 0..query.found.Length()? {
+            let element = query.found.GetElement(index)?;
+            let (depth, crosses_a_document) =
+                ancestry(&query.automation, &query.walker, &query.root, &element);
+            candidates.push(AddressFieldCandidate {
+                depth,
+                crosses_a_document,
+                class_name: element.CurrentClassName().map(|s| s.to_string()).unwrap_or_default(),
+                automation_id: element
+                    .CurrentAutomationId()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            });
+        }
+        Ok(candidates)
+    }
+}
+
+/// What [`find_address_fields`] hands back: the matches, and what is needed to
+/// walk each one up to the window.
+struct AddressFieldQuery {
+    automation: IUIAutomation2,
+    walker: IUIAutomationTreeWalker,
+    root: IUIAutomationElement,
+    found: IUIAutomationElementArray,
+}
+
+/// The query [`address_field_text`] and [`address_field_candidates`] share:
+/// every descendant of `hwnd` whose control type is one of `field.kinds` AND
+/// that has any of the listed property values. `Ok(None)` when `field` lists
+/// no kind or no key, which matches nothing.
+///
+/// One function rather than two copies so the probe cannot drift from the
+/// read it is the hand check for.
+unsafe fn find_address_fields(
+    hwnd: isize,
+    field: crate::browser_url::AddressField,
+) -> Result<Option<AddressFieldQuery>> {
+    let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+        log::warn!("CoInitializeEx failed unexpectedly: {hr:?}");
+    }
+
+    let automation: IUIAutomation2 =
+        CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
+    // A refusal leaves the defaults in place, which is slower and still
+    // correct, so neither answer is worth an error.
+    let _ = automation.SetConnectionTimeout(ADDRESS_FIELD_CONNECTION_TIMEOUT_MS);
+    let _ = automation.SetTransactionTimeout(ADDRESS_FIELD_TRANSACTION_TIMEOUT_MS);
+
+    let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void))?;
+
+    // (control type is one of `field.kinds`) AND (any listed property).
+    let mut kind: Option<IUIAutomationCondition> = None;
+    for wanted in field.kinds {
+        let id = match wanted {
+            crate::browser_url::FieldKind::Edit => UIA_EditControlTypeId,
+            crate::browser_url::FieldKind::ComboBox => UIA_ComboBoxControlTypeId,
+        };
+        let one =
+            automation.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(id.0))?;
+        kind = Some(match kind {
+            None => one,
+            Some(earlier) => automation.CreateOrCondition(&earlier, &one)?,
+        });
+    }
+    let mut key: Option<IUIAutomationCondition> = None;
+    let wanted = field
+        .class_names
+        .iter()
+        .map(|value| (UIA_ClassNamePropertyId, *value))
+        .chain(field.automation_ids.iter().map(|value| (UIA_AutomationIdPropertyId, *value)))
+        .chain(field.names.iter().map(|value| (UIA_NamePropertyId, *value)));
+    for (property, value) in wanted {
+        let one = automation.CreatePropertyCondition(property, &VARIANT::from(value))?;
+        key = Some(match key {
+            None => one,
+            Some(earlier) => automation.CreateOrCondition(&earlier, &one)?,
+        });
+    }
+    let (Some(kind), Some(key)) = (kind, key) else {
+        return Ok(None);
+    };
+    let address = automation.CreateAndCondition(&kind, &key)?;
+
+    let found = root.FindAll(TreeScope_Descendants, &address)?;
+    let walker = automation.RawViewWalker()?;
+    Ok(Some(AddressFieldQuery { automation, walker, root, found }))
+}
+
+/// The walk from `element` up to `root`: how many steps it took (the root
+/// included), or `None` if it did not arrive within
+/// [`crate::browser_url::MAX_FIELD_DEPTH`]; and whether any ancestor on the
+/// way was a `Document`, which is what a web page is exposed as.
+///
+/// A failed step is "did not arrive", which [`crate::browser_url::is_browser_chrome`]
+/// refuses -- an element whose ancestry cannot be shown is not the address bar.
+unsafe fn ancestry(
+    automation: &IUIAutomation2,
+    walker: &IUIAutomationTreeWalker,
+    root: &IUIAutomationElement,
+    element: &IUIAutomationElement,
+) -> (Option<usize>, bool) {
+    let mut crosses_a_document = false;
+    let mut current = element.clone();
+    for depth in 1..=crate::browser_url::MAX_FIELD_DEPTH {
+        let Ok(parent) = walker.GetParentElement(&current) else {
+            return (None, crosses_a_document);
+        };
+        if automation.CompareElements(&parent, root).is_ok_and(|same| same.as_bool()) {
+            return (Some(depth), crosses_a_document);
+        }
+        if parent.CurrentControlType().is_ok_and(|kind| kind == UIA_DocumentControlTypeId) {
+            crosses_a_document = true;
+        }
+        current = parent;
+    }
+    (None, crosses_a_document)
+}
+
 /// **What can and cannot be tested about the UIA fill path.**
 ///
 /// Nothing in this crate can call [`fill_via_ui_automation`]: it needs a real
@@ -444,5 +660,49 @@ mod bstr_wipe_tests {
         assert_eq!(fixture.matches("set_value_wiping(BSTR::from_wide(").count(), 1);
         assert_eq!(fixture.matches(".SetValue(").count(), 2);
         assert_eq!(fixture.matches(concat!("SetValue(&BSTR", "::from")).count(), 1);
+    }
+}
+
+/// **The probe's view of the address query never carries a field's text.**
+///
+/// `address_field_candidates` exists so `examples/address_bar_probe.rs` can
+/// say why each candidate was kept or refused, and a refused candidate may be
+/// a web page's own input holding what the user typed into it. Like
+/// `address_field_text`, it needs a live browser and cannot be run here, so
+/// this is a source pin, with a positive control on its needles.
+#[cfg(test)]
+mod address_field_tests {
+    #[test]
+    fn the_probe_only_candidate_list_never_reads_a_value_or_a_name() {
+        let source = include_str!("ui_automation.rs");
+        let start = source
+            .find(concat!("pub fn address_field_", "candidates("))
+            .expect("`address_field_candidates` is in this file");
+        let body: String = source[start..]
+            .lines()
+            .take_while(|line| !line.trim_end().eq("}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains(concat!("CurrentAutomation", "Id()")),
+            "control: the slice being scanned is not the function that describes candidates"
+        );
+        for needle in [
+            concat!("UIA_Value", "PatternId"),
+            concat!("Current", "Value"),
+            concat!("Current", "Name"),
+            concat!("log", "::"),
+        ] {
+            assert!(
+                !body.contains(needle),
+                "`address_field_candidates` reaches for {needle}: a refused candidate may be a \
+                 page's own field, and its text is what the user typed into that page"
+            );
+        }
+        // Control: the text read really is spelled this way, so an absence
+        // above is an absence and not a needle that matches nothing.
+        let text = &source[source.find(concat!("pub fn address_field_", "text(")).unwrap()..start];
+        assert!(text.contains(concat!("UIA_Value", "PatternId")));
+        assert!(text.contains(concat!("Current", "Value")));
     }
 }

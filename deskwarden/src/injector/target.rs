@@ -77,10 +77,16 @@ pub fn describe_foreground() -> Option<SendTarget> {
 }
 
 /// The window class of `hwnd`, or `None` if Win32 declined to say.
-fn class_name_of(hwnd: isize) -> Option<String> {
+///
+/// `pub(crate)` for `browser_url::read`, which tells a browser's engine by
+/// its top-level window class -- the same observation, asked once, here.
+pub(crate) fn class_name_of(hwnd: isize) -> Option<String> {
     let mut buffer = [0u16; 256];
-    // SAFETY: `hwnd` came from `GetForegroundWindow` this call, and the buffer
-    // is a live stack array whose length is handed to the call.
+    // SAFETY: the buffer is a live stack array whose length is handed to the
+    // call. `hwnd` is a foreground window observed moments ago; one that has
+    // since closed makes the call fail and return 0, which is `None` below,
+    // not undefined behaviour -- a window handle is a lookup key, not a
+    // pointer this process dereferences.
     let copied = unsafe { GetClassNameW(HWND(hwnd as *mut core::ffi::c_void), &mut buffer) };
     if copied <= 0 {
         return None;

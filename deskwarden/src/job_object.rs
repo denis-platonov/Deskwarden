@@ -3429,6 +3429,11 @@ mod tests {
             root_names,
             vec![
                 "build.rs",
+                // Prints what `browser_url::read` reads from the foreground
+                // browser's address bar, and why each candidate field was kept
+                // or refused: the hand check for a UI Automation query no test
+                // process can make.
+                "examples/address_bar_probe.rs",
                 "examples/field_locator_probe.rs",
                 "examples/generate_preview.rs",
                 "examples/icon_probe.rs",

@@ -217,6 +217,26 @@ pub fn parse(text: &str) -> Option<url::Url> {
     looks_like_a_site.then_some(url)
 }
 
+/// **The observation half**: the address in the browser window `hwnd`, or
+/// `None` -- a browser this module has no field for, no field found, a field
+/// that is a page's rather than the browser's, a UI Automation failure, or
+/// text that is not a web address. None of those is an error the user sees;
+/// each leaves the account picker ranking as it did before.
+///
+/// Called by `app::handle_no_match` once per `CTRL+ALT+B` press, and only
+/// for a window `app::browser_window` says is a browser. Never on a focus
+/// change, never in the background. No test can run it -- it needs a real
+/// window and a real UI Automation tree -- so `examples/address_bar_probe.rs`
+/// is its hand check.
+pub fn read(hwnd: isize) -> Option<url::Url> {
+    let class = crate::injector::target::class_name_of(hwnd)?;
+    let family = family_of_class(&class)?;
+    let text = crate::injector::ui_automation::address_field_text(hwnd, family.address_field())
+        .ok()
+        .flatten()?;
+    parse(&text)
+}
+
 /// Whether `text` starts with a URL scheme: what precedes its first `://` is
 /// `[A-Za-z][A-Za-z0-9+.-]*`. Checked by hand, because this crate has no regex
 /// need here and a dependency for one character class is not worth it.

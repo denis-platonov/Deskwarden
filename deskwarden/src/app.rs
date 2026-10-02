@@ -3304,14 +3304,47 @@ pub fn picker_follow_up(
 fn picker_offers_for(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
+    page: Option<&url::Url>,
 ) -> PickerCard {
     // **`project`, not `items()`.** `items()` deep-clones the whole vault --
     // every password included -- and the picker needs an id, a name, a
     // username and some URIs. See `ItemFacts`.
     let facts = cache.project(ItemFacts::of);
     let candidates =
-        crate::app_candidates::candidates(&window.exe_name, &window.title, &facts, None);
+        crate::app_candidates::candidates(&window.exe_name, &window.title, &facts, page);
     PickerCard { offers: picker_offers(&candidates, &facts), corpus: picker_corpus(&facts) }
+}
+
+/// **The page the browser in front of the user is showing**, for the account
+/// picker's ranking -- or `None`, which ranks exactly as before.
+///
+/// Read once per `CTRL+ALT+B` press, from [`handle_no_match`] and nowhere
+/// else, and that placement is the whole of two promises:
+///
+/// * **Never on a focus change.** In a browser the automatic foreground path
+///   never reaches the unmatched card: [`disposition`] answers
+///   [`Open::Nothing`] for a browser on [`Trigger::Foreground`]
+///   (`a_browser_gets_neither_unmatched_card_even_with_the_prompt_on`), so
+///   only the hotkey's [`Trigger::Hotkey`] gets here.
+/// * **The five-minute recall still wins.** `main` offers the remembered
+///   record first and reaches this card only when that offer answers
+///   `Offered::No` (`main`'s
+///   `the_remembered_record_is_offered_ahead_of_the_account_picker`), so a
+///   multi-page sign-in keeps its record and costs no read.
+fn page_address(window: &crate::window_watch::ForegroundEvent) -> Option<url::Url> {
+    page_address_with(window, crate::browser_url::read)
+}
+
+/// [`page_address`] with the reader passed in -- this crate's `fn`-pointer
+/// seam, so a test can prove a native app's window is never asked at all.
+fn page_address_with(
+    window: &crate::window_watch::ForegroundEvent,
+    read: fn(isize) -> Option<url::Url>,
+) -> Option<url::Url> {
+    match browser_window(&window.exe_name) {
+        BrowserWindow::Yes => read(window.hwnd),
+        BrowserWindow::No => None,
+    }
 }
 
 /// What one press of the hotkey needs before a card can go up: the candidate
@@ -3444,7 +3477,12 @@ pub fn handle_no_match(
     // `MatchEngine` on purpose -- see its module doc for why that is safe here
     // and would not be there -- and an empty answer leaves every line below
     // this one doing exactly what it did before.
-    let PickerCard { offers, corpus } = picker_offers_for(cache, window);
+    //
+    // **The address bar is read first, once, and only in a browser** -- see
+    // `page_address`. It decides which row is on top and nothing else, and it
+    // is never logged: it is the website the user is on.
+    let page = page_address(window);
+    let PickerCard { offers, corpus } = picker_offers_for(cache, window, page.as_ref());
     // **Parked for the card's search seam, and cleared when it comes down.**
     // See `SEARCH_CORPUS`: no secret is in it, and a `fn` pointer cannot close
     // over the cache it came from.
@@ -10734,6 +10772,118 @@ mod picker_wiring_tests {
              puts a modal card on screen -- so the copy would be alive for as long as the user \
              looks at it. Take it inside `picker_offers_for`, which returns offers and no items \
              and therefore drops it before the card is raised"
+        );
+    }
+
+    fn at_window(exe: &str, title: &str) -> crate::window_watch::ForegroundEvent {
+        crate::window_watch::ForegroundEvent {
+            hwnd: 0x5150,
+            pid: 77,
+            exe_name: exe.to_string(),
+            title: title.to_string(),
+        }
+    }
+
+    fn never_asked(_hwnd: isize) -> Option<url::Url> {
+        panic!("a native app's window was asked for a browser address")
+    }
+
+    fn reads_example(hwnd: isize) -> Option<url::Url> {
+        assert_eq!(hwnd, 0x5150, "the address was read from a different window");
+        url::Url::parse("https://example.com/login").ok()
+    }
+
+    /// **Only a browser is asked for an address.** A native app's window is
+    /// not read at all -- not read and ignored -- so the cost and the reach
+    /// of the UI Automation query are confined to the windows it is for.
+    #[test]
+    fn only_a_browser_window_is_asked_for_its_address() {
+        assert_eq!(page_address_with(&at_window("Slack.exe", "Slack"), never_asked), None);
+        let read = page_address_with(&at_window(BROWSER_IMAGE_NAMES[0], ""), reads_example);
+        assert_eq!(read.map(|url| url.to_string()), Some("https://example.com/login".to_string()));
+    }
+
+    /// **The wiring the hotkey runs, minus the window.** `picker_offers_for`
+    /// is the function `handle_no_match` hands the address to; given one, the
+    /// login saved for that website is the first offer -- the row the card
+    /// focuses when it opens -- and without one the card is what it was.
+    #[test]
+    fn the_login_saved_for_the_page_is_the_first_offer() {
+        let item = |id: &str, name: &str, uri: &str| -> VaultItem {
+            serde_json::from_str(&format!(
+                r#"{{"id":"{id}","name":"{name}","type":1,"login":{{"username":"ada","password":"pw","uris":[{{"uri":"{uri}","match":null}}]}}}}"#
+            ))
+            .expect("the fixture item is valid")
+        };
+        let cache = crate::test_vault::cache_with_items(vec![
+            item("title", "Example portal", "https://portal.example.org"),
+            item("url", "Work login", "https://example.com"),
+        ]);
+        let window = at_window(BROWSER_IMAGE_NAMES[0], "Example portal");
+        let page = url::Url::parse("https://accounts.example.com/").unwrap();
+
+        let ranked = picker_offers_for(&cache, &window, Some(&page));
+        let order: Vec<&str> = ranked.offers.iter().map(|o| o.candidate.id.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["url", "title"],
+            "the login saved for the page in the address bar is not the first row, so Enter on \
+             the card that just opened takes the title's guess instead"
+        );
+
+        let unranked = picker_offers_for(&cache, &window, None);
+        let order: Vec<&str> = unranked.offers.iter().map(|o| o.candidate.id.as_str()).collect();
+        assert_eq!(order, vec!["title"], "with no address the card must be today's card");
+    }
+
+    /// **Read once, on the picker's path, and never spelled.** The read is
+    /// a cross-process query against the window the user is typing into, and
+    /// its answer is the website they are on: one call site, in
+    /// `handle_no_match`, and no log line that could carry it.
+    #[test]
+    fn the_address_is_read_once_on_the_pickers_path_and_never_logged() {
+        let source = include_str!("app.rs");
+        let boundary = source
+            .find(concat!("mod ", "tests {"))
+            .expect("app.rs's first test module is gone");
+        let production = &source[..boundary];
+        assert_eq!(
+            production.matches(concat!("crate::browser_url::", "read")).count(),
+            1,
+            "the address bar is read from somewhere other than `page_address`"
+        );
+        assert_eq!(
+            production.matches(concat!("page_address(", "window)")).count(),
+            1,
+            "`page_address` is called from somewhere other than `handle_no_match`"
+        );
+
+        let start = source
+            .find(concat!("pub fn handle_no", "_match("))
+            .expect("`handle_no_match` is in this file");
+        let body: String = source[start..]
+            .lines()
+            .take_while(|line| !line.trim_end().eq("}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains(concat!("let page = page_address(", "window);")),
+            "control: `handle_no_match` no longer reads the address, so the checks below are vacuous"
+        );
+        assert!(
+            body.contains(concat!("picker_offers_for(cache, window, page.", "as_ref())")),
+            "`handle_no_match` reads the address and does not rank by it"
+        );
+        for spelling in ["{page", "page:?", "page.as_str()", "page.to_string()", "page.host"] {
+            assert!(
+                !body.contains(spelling),
+                "`handle_no_match` spells the address ({spelling}); it is the website the user \
+                 is on and must not reach a log line"
+            );
+        }
+        assert!(
+            !include_str!("main.rs").contains(concat!("browser_", "url")),
+            "main.rs reaches the address bar itself, around the one read this file pins"
         );
     }
 }
