@@ -133,11 +133,22 @@ impl Family {
 }
 
 /// How many ancestors, the window itself included, may stand between a
-/// candidate field and the browser window.
+/// candidate field and the browser window, **counted in UI Automation's RAW
+/// view** -- the `RawViewWalker` that `injector::ui_automation`'s `ancestry`
+/// walks. The control and content views leave out elements the raw view
+/// counts, so a depth read through either is smaller and does not compare
+/// with this bound; a hand measurement must use the raw view too.
 ///
-/// Measured on 2026-10-01, counting the window: Firefox's URL bar is 4 steps
-/// below its window, the Chromium omnibox 8 (Chrome, Edge and Brave alike). A
-/// web page's own fields were 13 or more in every browser, because a page is
+/// Measured by hand on 2026-10-01 in the raw view, counting the window as the
+/// first step:
+/// - Chrome and Edge, normal tabbed windows: the `OmniboxViewViews` field is
+///   at depth 8, with no `Document` above it.
+/// - Firefox, normal windows: the `urlbar-input` field is at depth 4, with no
+///   `Document` above it.
+/// - Firefox popup windows and Chrome app/PWA windows: not yet measured.
+///   `examples/address_bar_probe.rs` is the hand check for both.
+///
+/// A web page's own fields were 13 or more in every browser, because a page is
 /// drawn inside a content pane the browser nests several levels down -- and no
 /// page can make its elements shallower than the pane it is drawn in. 10
 /// leaves room on both sides. A browser that one day nests its omnibox deeper than 10 loses the

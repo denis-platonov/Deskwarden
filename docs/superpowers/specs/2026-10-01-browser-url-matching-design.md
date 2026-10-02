@@ -81,8 +81,9 @@ string in a browser window that identifies the site.
   it is noise there.
 - Inside `RANK_URL`, the stricter rule first, then vault order: Exact, StartsWith, Regex, Host,
   base domain. An item with several matching websites counts by its strictest one.
-- The picker pre-selects the first candidate when it came from `RANK_URL`. The five-minute fill
-  recall (`fill_recall`) still wins when it applies, so a multi-page sign-in keeps its record.
+- The picker already focuses its first row on every card, so a `RANK_URL` login is pre-selected
+  by being first; nothing about the focus changes. The five-minute fill recall (`fill_recall`)
+  still wins when it applies, so a multi-page sign-in keeps its record.
 
 ### Safety
 
@@ -101,9 +102,15 @@ string in a browser window that identifies the site.
 - `app_candidates`: URL-matched items rank first; no exe-stem rank in a browser; a non-match
   falls back to today's ranking; no URL = today's behaviour, except that a browser's
   executable name no longer ranks anything.
-- The picker pre-selects a URL-ranked first row and not otherwise; recall still wins.
+- The picker already focuses its first row on every card, so a URL-ranked login is pre-selected
+  by being first, and nothing about the focus changes; recall still wins.
 - The UI Automation read is a thin, documented observation layer and is not unit-tested; it is
   checked by hand in Chrome, Edge and Firefox.
+- Hand check, 2026-10-01: Chrome, Edge and Firefox, against 12 live windows. Every address bar
+  was read correctly. Depths, counted in the raw view (`RawViewWalker`) with the window as the
+  first step: the Chrome and Edge `OmniboxViewViews` field at 8 and the Firefox `urlbar-input`
+  field at 4 in normal windows, with no `Document` above either. Firefox popup windows and
+  Chrome app/PWA windows are not yet measured.
 
 ## Non-goals
 

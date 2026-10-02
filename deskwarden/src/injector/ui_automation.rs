@@ -300,6 +300,23 @@ fn is_real_rect(r: RECT) -> bool {
 const ADDRESS_FIELD_CONNECTION_TIMEOUT_MS: u32 = 500;
 const ADDRESS_FIELD_TRANSACTION_TIMEOUT_MS: u32 = 1000;
 
+/// How many of the query's matches [`address_field_text`] examines before it
+/// gives up and reads nothing.
+///
+/// The timeouts above bound ONE call, not how many calls are made. A page can
+/// plant as many inputs with `id="urlbar-input"` (or `aria-label="Address and
+/// search bar"`) as it likes, every one of them matches the query, and each
+/// costs up to about 20 cross-process calls on the way up to the window -- on
+/// the main run loop, between a key press and the card it opens. A browser's
+/// own address field is a single match in every window measured, so 16 is
+/// generous for the toolbar and still bounds a decoy page to a short pause.
+/// Running out is "no address read", which ranks the picker as before: the
+/// safe direction to fail in. The rejected alternative, a deadline on the
+/// loop, would make the outcome depend on how busy the machine was.
+/// `address_field_tests::the_address_read_examines_a_bounded_number_of_matches`
+/// pins the bound to the loop.
+const MAX_ADDRESS_FIELD_MATCHES: usize = 16;
+
 /// **The text of a browser's address field**, found by the properties
 /// `field` names, or `Ok(None)` when there is no such field that belongs to
 /// the browser's own chrome.
@@ -316,6 +333,13 @@ const ADDRESS_FIELD_TRANSACTION_TIMEOUT_MS: u32 = 1000;
 /// [`crate::browser_url::is_browser_chrome`] instead, and the first that
 /// passes is read.
 ///
+/// **At most [`MAX_ADDRESS_FIELD_MATCHES`] matches are examined**, kept or
+/// refused, and the walk up from each stops at the first `Document` (see
+/// [`Walk::StopAtDocument`]): a page that plants look-alike inputs costs a
+/// bounded pause and nothing more. A kept match that turns out to have no
+/// `ValuePattern`, or that will not give its value, is passed over for the
+/// next one rather than ending the read -- it still counts toward the bound.
+///
 /// The text is returned to the caller and to nobody else: it is not logged
 /// here, and `browser_url::read` does not log it either.
 pub fn address_field_text(
@@ -326,16 +350,27 @@ pub fn address_field_text(
         let Some(query) = find_address_fields(hwnd, field)? else {
             return Ok(None);
         };
-        for index in 0..query.found.Length()? {
+        for index in (0..query.found.Length()?).take(MAX_ADDRESS_FIELD_MATCHES) {
             let element = query.found.GetElement(index)?;
-            let (depth, crosses_a_document) =
-                ancestry(&query.automation, &query.walker, &query.root, &element);
+            let (depth, crosses_a_document) = ancestry(
+                &query.automation,
+                &query.walker,
+                &query.root,
+                &element,
+                Walk::StopAtDocument,
+            );
             if !crate::browser_url::is_browser_chrome(depth, crosses_a_document) {
                 continue;
             }
-            let value: IUIAutomationValuePattern =
-                element.GetCurrentPatternAs(UIA_ValuePatternId)?;
-            let text = value.CurrentValue()?.to_string();
+            let Ok(value) =
+                element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+            else {
+                continue;
+            };
+            let Ok(text) = value.CurrentValue() else {
+                continue;
+            };
+            let text = text.to_string();
             return Ok((!text.is_empty()).then_some(text));
         }
         Ok(None)
@@ -371,8 +406,11 @@ pub struct AddressFieldCandidate {
 /// read.
 ///
 /// The same query through the same [`find_address_fields`] and the same
-/// [`ancestry`], so what the probe prints is what the app decides on. It
-/// never asks a candidate for its value -- `address_field_tests` holds this
+/// [`ancestry`], so what the probe prints is what the app decides on, with two
+/// differences that only add detail: every match is listed, not just the first
+/// [`MAX_ADDRESS_FIELD_MATCHES`] the app examines, and each walk goes on past a
+/// `Document` ([`Walk::Full`]) so a refused candidate still shows its depth.
+/// It never asks a candidate for its value -- `address_field_tests` holds this
 /// function to that.
 pub fn address_field_candidates(
     hwnd: isize,
@@ -385,8 +423,13 @@ pub fn address_field_candidates(
         let mut candidates = Vec::new();
         for index in 0..query.found.Length()? {
             let element = query.found.GetElement(index)?;
-            let (depth, crosses_a_document) =
-                ancestry(&query.automation, &query.walker, &query.root, &element);
+            let (depth, crosses_a_document) = ancestry(
+                &query.automation,
+                &query.walker,
+                &query.root,
+                &element,
+                Walk::Full,
+            );
             candidates.push(AddressFieldCandidate {
                 depth,
                 crosses_a_document,
@@ -421,6 +464,9 @@ unsafe fn find_address_fields(
     hwnd: isize,
     field: crate::browser_url::AddressField,
 ) -> Result<Option<AddressFieldQuery>> {
+    // No matching `CoUninitialize`, as in `fill_via_ui_automation`: the app
+    // calls this on the long-lived main thread, where process exit is
+    // adequate cleanup, and the probe calls it once before it exits.
     let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     if hr.is_err() && hr != RPC_E_CHANGED_MODE {
         log::warn!("CoInitializeEx failed unexpectedly: {hr:?}");
@@ -473,10 +519,30 @@ unsafe fn find_address_fields(
     Ok(Some(AddressFieldQuery { automation, walker, root, found }))
 }
 
-/// The walk from `element` up to `root`: how many steps it took (the root
-/// included), or `None` if it did not arrive within
-/// [`crate::browser_url::MAX_FIELD_DEPTH`]; and whether any ancestor on the
-/// way was a `Document`, which is what a web page is exposed as.
+/// How far [`ancestry`] walks once it has crossed a `Document`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    /// Stop at the first `Document`: the candidate is refused whatever its
+    /// depth, so every further step is a cross-process call spent on nothing.
+    /// What [`address_field_text`] uses.
+    StopAtDocument,
+    /// Walk on to the window or to [`crate::browser_url::MAX_FIELD_DEPTH`],
+    /// so the probe can print a refused candidate's depth.
+    /// What [`address_field_candidates`] uses, and nothing else.
+    Full,
+}
+
+/// The walk from `element` up to `root`, **in UI Automation's RAW view** --
+/// `walker` is the `RawViewWalker`, the view
+/// [`crate::browser_url::MAX_FIELD_DEPTH`] was measured in: how many steps it
+/// took (the root included), or `None` if it did not arrive within that bound;
+/// and whether any ancestor on the way was a `Document`, which is what a web
+/// page is exposed as.
+///
+/// With [`Walk::StopAtDocument`] the walk returns `(None, true)` as soon as it
+/// crosses a `Document`, because [`crate::browser_url::is_browser_chrome`]
+/// refuses that candidate whatever its depth -- a page that plants decoy
+/// inputs then costs a few steps per decoy rather than the full depth.
 ///
 /// A failed step is "did not arrive", which [`crate::browser_url::is_browser_chrome`]
 /// refuses -- an element whose ancestry cannot be shown is not the address bar.
@@ -485,6 +551,7 @@ unsafe fn ancestry(
     walker: &IUIAutomationTreeWalker,
     root: &IUIAutomationElement,
     element: &IUIAutomationElement,
+    walk: Walk,
 ) -> (Option<usize>, bool) {
     let mut crosses_a_document = false;
     let mut current = element.clone();
@@ -497,6 +564,9 @@ unsafe fn ancestry(
         }
         if parent.CurrentControlType().is_ok_and(|kind| kind == UIA_DocumentControlTypeId) {
             crosses_a_document = true;
+            if walk == Walk::StopAtDocument {
+                return (None, true);
+            }
         }
         current = parent;
     }
@@ -670,29 +740,57 @@ mod bstr_wipe_tests {
 /// a web page's own input holding what the user typed into it. Like
 /// `address_field_text`, it needs a live browser and cannot be run here, so
 /// this is a source pin, with a positive control on its needles.
+///
+/// The same goes for the two helpers the probe shares with the real read,
+/// `find_address_fields` and `ancestry`: they run on every candidate, kept or
+/// refused, so neither may read a value or a name either. And the bound that
+/// keeps a decoy page from stalling the main run loop,
+/// `MAX_ADDRESS_FIELD_MATCHES`, is pinned to the loop it bounds.
 #[cfg(test)]
 mod address_field_tests {
+    use super::*;
+
+    /// Every spelling of reading what an element holds or calls itself. A
+    /// candidate's `Name` is a page's `aria-label` when the candidate is a
+    /// page's element, so it counts as page content too.
+    const READ_NEEDLES: [&str; 7] = [
+        concat!("UIA_Value", "PatternId"),
+        concat!("Current", "Value"),
+        concat!("Current", "Name"),
+        // `GetCurrentPropertyValue` / `GetCachedPropertyValue`, which can ask
+        // for any property by id, the value and the name included.
+        concat!("Property", "Value"),
+        // The MSAA bridge, whose pattern carries its own name and value.
+        concat!("Legacy", "IAccessible"),
+        concat!("Cached", "Name"),
+        concat!("Cached", "Value"),
+    ];
+
+    /// `source` from the line that starts `signature` down to the function's
+    /// closing brace at column 0.
+    fn body_of(source: &str, signature: &str) -> String {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("`{signature}` is in this file"));
+        source[start..]
+            .lines()
+            .take_while(|line| !line.trim_end().eq("}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn the_probe_only_candidate_list_never_reads_a_value_or_a_name() {
         let source = include_str!("ui_automation.rs");
         let start = source
             .find(concat!("pub fn address_field_", "candidates("))
             .expect("`address_field_candidates` is in this file");
-        let body: String = source[start..]
-            .lines()
-            .take_while(|line| !line.trim_end().eq("}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+        let body = body_of(source, concat!("pub fn address_field_", "candidates("));
         assert!(
             body.contains(concat!("CurrentAutomation", "Id()")),
             "control: the slice being scanned is not the function that describes candidates"
         );
-        for needle in [
-            concat!("UIA_Value", "PatternId"),
-            concat!("Current", "Value"),
-            concat!("Current", "Name"),
-            concat!("log", "::"),
-        ] {
+        for needle in READ_NEEDLES.iter().copied().chain([concat!("log", "::")]) {
             assert!(
                 !body.contains(needle),
                 "`address_field_candidates` reaches for {needle}: a refused candidate may be a \
@@ -704,5 +802,84 @@ mod address_field_tests {
         let text = &source[source.find(concat!("pub fn address_field_", "text(")).unwrap()..start];
         assert!(text.contains(concat!("UIA_Value", "PatternId")));
         assert!(text.contains(concat!("Current", "Value")));
+    }
+
+    #[test]
+    fn the_query_and_the_walk_shared_with_the_probe_never_read_a_value_or_a_name() {
+        let source = include_str!("ui_automation.rs");
+        for (signature, control) in [
+            (concat!("unsafe fn find_address_", "fields("), concat!("Find", "All(")),
+            (concat!("unsafe fn ances", "try("), concat!("GetParent", "Element(")),
+        ] {
+            let body = body_of(source, signature);
+            assert!(
+                body.contains(control),
+                "control: the slice scanned for `{signature}` is not that function"
+            );
+            for needle in READ_NEEDLES {
+                assert!(
+                    !body.contains(needle),
+                    "`{signature}` reaches for {needle}: it runs on every candidate, and a \
+                     refused candidate may be a page's own field holding what the user typed"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_read_needles_are_real_spellings() {
+        // Positive control on the needles no production line carries: each
+        // matches the call it stands for, so an absence above is a real
+        // absence and not a typo that matches nothing.
+        let fixture = concat!(
+            "e.GetCurrent",
+            "PropertyValue(UIA_ValueValuePropertyId)?;\n",
+            "e.GetCached",
+            "PropertyValue(UIA_NamePropertyId)?;\n",
+            "e.GetCurrentPatternAs::<IUIAutomationLegacy",
+            "IAccessiblePattern>(UIA_Legacy",
+            "IAccessiblePatternId)?;\n",
+            "e.Cached",
+            "Name()?;\n",
+            "v.Cached",
+            "Value()?;\n",
+        );
+        assert_eq!(fixture.matches(concat!("Property", "Value")).count(), 2);
+        assert_eq!(fixture.matches(concat!("Legacy", "IAccessible")).count(), 2);
+        assert_eq!(fixture.matches(concat!("Cached", "Name")).count(), 1);
+        assert_eq!(fixture.matches(concat!("Cached", "Value")).count(), 1);
+    }
+
+    #[test]
+    fn the_address_read_examines_a_bounded_number_of_matches() {
+        // Small enough that a decoy page costs a short pause on the main run
+        // loop (each match is up to about 20 cross-process calls), and more
+        // than the one match a browser's own toolbar has.
+        assert!((2..=32).contains(&MAX_ADDRESS_FIELD_MATCHES));
+
+        let source = include_str!("ui_automation.rs");
+        let body = body_of(source, concat!("pub fn address_field_", "text("));
+        assert!(
+            body.contains(concat!("for index in (0..query.found.Length()?).take(", "MAX_ADDRESS_FIELD_MATCHES)")),
+            "`address_field_text` no longer bounds its loop by MAX_ADDRESS_FIELD_MATCHES: a page \
+             that plants look-alike inputs can stall the main run loop"
+        );
+        assert_eq!(
+            body.matches(concat!("for ", "index in")).count(),
+            1,
+            "`address_field_text` grew a second loop over the matches, outside the bound"
+        );
+        // The real read stops its walk at the first Document; only the probe
+        // walks on.
+        assert!(body.contains(concat!("Walk::StopAt", "Document")));
+        assert!(!body.contains(concat!("Walk::", "Full")));
+        let probe = body_of(source, concat!("pub fn address_field_", "candidates("));
+        assert!(probe.contains(concat!("Walk::", "Full")));
+        // And `ancestry` really does stop there.
+        let walk = body_of(source, concat!("unsafe fn ances", "try("));
+        assert!(
+            walk.contains(concat!("if walk == Walk::StopAt", "Document {\n                return (None, true);")),
+            "`ancestry` no longer returns as soon as it crosses a Document in the read's mode"
+        );
     }
 }
