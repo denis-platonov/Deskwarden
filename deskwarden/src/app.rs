@@ -3081,8 +3081,12 @@ pub struct ItemFacts {
     /// apart by a masked username, which is design 2a's decision applied
     /// here.
     pub username: String,
-    /// Every URI, for `app_candidates`' host matching.
-    pub uris: Vec<String>,
+    /// Every saved website, with the match rule Bitwarden saved beside it:
+    /// `app_candidates` ranks on these -- by host against the executable's
+    /// name, and by [`crate::uri_match::matches`] against a browser's
+    /// address bar. A website is not a secret; it is what the card's icon
+    /// is already keyed by.
+    pub uris: Vec<crate::uri_match::SavedUri>,
     /// Which fields this item has, as names. No values -- see
     /// [`crate::key_sequence::field_palette`].
     pub palette: Vec<crate::key_sequence::FieldRef>,
@@ -3120,7 +3124,7 @@ impl ItemFacts {
             uris: item
                 .login
                 .as_ref()
-                .map(|l| l.uris.iter().filter_map(|u| u.uri.clone()).collect())
+                .map(|l| l.uris.iter().filter_map(crate::uri_match::SavedUri::of).collect())
                 .unwrap_or_default(),
             palette: key_sequence::field_palette(item),
             has_sequence: !sequence_for(item).is_empty(),
@@ -3305,7 +3309,8 @@ fn picker_offers_for(
     // every password included -- and the picker needs an id, a name, a
     // username and some URIs. See `ItemFacts`.
     let facts = cache.project(ItemFacts::of);
-    let candidates = crate::app_candidates::candidates(&window.exe_name, &window.title, &facts);
+    let candidates =
+        crate::app_candidates::candidates(&window.exe_name, &window.title, &facts, None);
     PickerCard { offers: picker_offers(&candidates, &facts), corpus: picker_corpus(&facts) }
 }
 

@@ -373,12 +373,15 @@ impl UriMatchChoice {
 /// instead of a control. Both halves of that argument were sound and one of
 /// them was answering the wrong question.
 ///
-/// The sound half: **nothing in Deskwarden reads `match`.** That is still
-/// true. The autofill path matches on the foreground *window*
-/// (`match_engine`, [`AppMatchDraft`]); the icon loader
-/// (`favicon::icon_domain_for`) and the read pane's AUTOFILL TARGETS card
-/// both take `login.uris.first()` and nothing else. No expression in this
-/// crate names `match`, and none is added by this pass.
+/// The sound half, when it was written: **nothing in Deskwarden read
+/// `match`.** Browser URL matching changed that, and only for the account
+/// picker: `uri_match::MatchType::from_wire` reads the value through
+/// [`UriMatchChoice::from_wire`], so the six numbers are still spelled once,
+/// and the picker uses the answer to choose which login it puts on top in a
+/// browser. Nothing is filled by it: the autofill path still matches on the
+/// foreground *window* (`match_engine`, [`AppMatchDraft`]), and the icon
+/// loader (`favicon::icon_domain_for`) and the read pane's AUTOFILL TARGETS
+/// card both still take `login.uris.first()` and nothing else.
 ///
 /// The half that was answering the wrong question: the rule this file
 /// enforces everywhere -- `AppMatch::trigger`, 8a's `On field focus`, 8a's
