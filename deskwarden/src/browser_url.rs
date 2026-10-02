@@ -22,11 +22,13 @@
 //!
 //! # Two halves, in this crate's idiom
 //!
-//! [`parse`], [`family_of_class`], [`Family::address_field`] and
-//! [`is_browser_chrome`] are pure and tested. `read` is the observation half --
-//! one window-class lookup and one UI Automation query, in
-//! `injector::ui_automation` beside the crate's other UI Automation helpers --
-//! and decides nothing a test could not decide.
+//! [`parse`], [`family_of_class`], [`Family::address_field`],
+//! [`is_browser_chrome`] and [`prefer_document`] are pure and tested. `read` is
+//! the observation half -- one window-class lookup, one UI Automation query for
+//! the address field and, in a Chromium browser whose omnibox showed an elided
+//! address, one for the page's `Document`, all in `injector::ui_automation`
+//! beside the crate's other UI Automation helpers -- and decides nothing a test
+//! could not decide.
 //!
 //! **The address is never logged**, by this module or by its caller;
 //! `the_address_is_never_logged` holds this file to it.
@@ -128,6 +130,22 @@ impl Family {
                 automation_ids: &["urlbar-input"],
                 names: &[],
             },
+        }
+    }
+
+    /// Whether [`read`] may ask the window's first `Document` for the page's
+    /// full address when the address field showed it elided (see
+    /// [`prefer_document`]).
+    ///
+    /// **Chromium only, as measured on 2026-10-01.** Chrome's first `Document`
+    /// under the window held the active tab's URL. Firefox's first `Document`
+    /// was a DIFFERENT tab's page -- so in the Firefox family the `Document`
+    /// says nothing about the page in front of the user, and is never read.
+    /// Firefox's `urlbar-input` holds the full address anyway, scheme included.
+    pub fn reads_the_page_document(self) -> bool {
+        match self {
+            Family::Chromium => true,
+            Family::Firefox => false,
         }
     }
 }
@@ -239,13 +257,98 @@ pub fn parse(text: &str) -> Option<url::Url> {
 /// change, never in the background. No test can run it -- it needs a real
 /// window and a real UI Automation tree -- so `examples/address_bar_probe.rs`
 /// is its hand check.
+///
+/// # Chrome's omnibox holds elided text; the page's `Document` holds the URL
+///
+/// Measured live with UI Automation on 2026-10-01: the `ValuePattern` value of
+/// Chrome's `OmniboxViewViews` is the DISPLAY text, `mail.google.com/...` --
+/// no `https://`, and Chrome elides `www.` and `http://` too. Edge's omnibox
+/// holds the full `https://...`. Chrome's first `Document` under the window
+/// has a `ValuePattern` value with the full URL of the active tab,
+/// `https://mail.google.com/...`; the browser sets it, and it is the document
+/// URL. So in the Chromium family ([`Family::reads_the_page_document`]), and
+/// only when the field's text came without a scheme, the `Document` is read as
+/// well and [`prefer_document`] decides whether it may restore the scheme, the
+/// `www.` and the path. **The address field stays the authority for the
+/// host**: a `Document` that names another host is ignored. In Firefox the
+/// first `Document` was another tab's page, so it is never read there.
 pub fn read(hwnd: isize) -> Option<url::Url> {
     let class = crate::injector::target::class_name_of(hwnd)?;
     let family = family_of_class(&class)?;
     let text = crate::injector::ui_automation::address_field_text(hwnd, family.address_field())
         .ok()
         .flatten()?;
-    parse(&text)
+    let omnibox = parse(&text)?;
+    let had_scheme = has_scheme(text.trim());
+    let document = (family.reads_the_page_document() && !had_scheme)
+        .then(|| crate::injector::ui_automation::page_document_text(hwnd).ok().flatten())
+        .flatten();
+    Some(prefer_document(&omnibox, had_scheme, document.as_deref()))
+}
+
+/// **The page's address: the address field's, or the page `Document`'s when
+/// that is the same page spelled in full.**
+///
+/// `omnibox` is the address field's text after [`parse`]; `omnibox_had_scheme`
+/// is whether that text started with a scheme; `document_text` is the value of
+/// the window's first `Document`, when one was read (see [`read`] for why, and
+/// for the 2026-10-01 measurement this rests on).
+///
+/// The document's URL is used only when ALL of these hold, and otherwise
+/// `omnibox` is returned unchanged:
+///
+/// * the address field's text had **no** scheme -- an elided display text.
+///   Text with a scheme (Edge, or Chrome with "Always show full URLs") is
+///   already the full address, and the `Document` is not consulted at all;
+/// * the document text itself starts with a scheme, and [`parse`] accepts it:
+///   `http` or `https` only (`chrome://`, `devtools://` and `about:` are not
+///   pages), within [`MAX_ADDRESS_LEN`], userinfo dropped;
+/// * its host, lowercased and without a trailing dot, **equals** the address
+///   field's, or equals `www.` followed by it -- the one prefix Chrome elides.
+///   Equality, never "ends with" or "contains":
+///   `evil-mail.google.com.attacker.net` is not `mail.google.com`;
+/// * its port is the address field's. Chrome shows a non-default port in the
+///   elided text, so a mismatch is another server on the same host -- a stale
+///   `Document`, not the page -- and is refused like any other mismatch.
+///
+/// So the address field stays the authority for the host, and the `Document`
+/// only restores what the elision hid: the scheme (`http` for a plain-HTTP
+/// site the field showed bare), the `www.`, and the full path and query. A
+/// `Document` that names another host -- devtools docked in the window, a
+/// side panel, a document left over from the previous page -- changes nothing.
+pub fn prefer_document(
+    omnibox: &url::Url,
+    omnibox_had_scheme: bool,
+    document_text: Option<&str>,
+) -> url::Url {
+    if omnibox_had_scheme {
+        return omnibox.clone();
+    }
+    let Some(text) = document_text.map(str::trim) else {
+        return omnibox.clone();
+    };
+    if !has_scheme(text) {
+        return omnibox.clone();
+    }
+    let Some(document) = parse(text) else {
+        return omnibox.clone();
+    };
+    let (Some(shown), Some(page)) = (comparable_host(omnibox), comparable_host(&document)) else {
+        return omnibox.clone();
+    };
+    let same_host = page == shown || page.strip_prefix("www.") == Some(shown.as_str());
+    if same_host && document.port() == omnibox.port() {
+        document
+    } else {
+        omnibox.clone()
+    }
+}
+
+/// A URL's host as [`prefer_document`] compares it: lowercased, without a
+/// trailing dot.
+fn comparable_host(url: &url::Url) -> Option<String> {
+    let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
+    (!host.is_empty()).then_some(host)
 }
 
 /// Whether `text` starts with a URL scheme: what precedes its first `://` is
@@ -421,6 +524,155 @@ mod tests {
         assert!(!is_browser_chrome(None, false), "a walk that never reached the window proves nothing");
         assert!(!is_browser_chrome(Some(0), false), "zero steps is not a walk up to the window");
         assert!(is_browser_chrome(Some(1), false), "control: the lower bound itself is inside");
+    }
+
+    /// What Chrome's omnibox held on 2026-10-01: display text, no scheme.
+    fn elided(text: &str) -> url::Url {
+        assert!(!has_scheme(text), "fixture: an elided omnibox text has no scheme");
+        parse(text).expect("the fixture omnibox text parses")
+    }
+
+    fn preferred(omnibox: &str, document: Option<&str>) -> String {
+        prefer_document(&elided(omnibox), false, document).to_string()
+    }
+
+    #[test]
+    fn a_document_on_the_same_host_restores_the_full_address() {
+        assert_eq!(
+            preferred("mail.google.com/mail/u/0/", Some("https://mail.google.com/mail/u/0/#inbox")),
+            "https://mail.google.com/mail/u/0/#inbox"
+        );
+        assert_eq!(
+            preferred("MAIL.google.com./x", Some("https://mail.google.com/x?a=1")),
+            "https://mail.google.com/x?a=1",
+            "hosts compare lowercased and without a trailing dot"
+        );
+    }
+
+    #[test]
+    fn a_document_may_restore_the_www_chrome_elided() {
+        assert_eq!(
+            preferred("example.com/login", Some("https://www.example.com/login?next=%2F")),
+            "https://www.example.com/login?next=%2F"
+        );
+    }
+
+    #[test]
+    fn a_document_restores_http_for_a_plain_http_site_the_omnibox_showed_bare() {
+        assert_eq!(elided("example.com/login").scheme(), "https", "control: the bare text reads as https");
+        assert_eq!(
+            preferred("example.com/login", Some("http://example.com/login")),
+            "http://example.com/login"
+        );
+        assert_eq!(
+            preferred("localhost:3000/login", Some("http://localhost:3000/login")),
+            "http://localhost:3000/login"
+        );
+    }
+
+    #[test]
+    fn a_document_on_another_host_is_refused() {
+        for document in [
+            "https://accounts.google.com/",
+            "https://google.com/",
+            "https://evil.example/mail.google.com/",
+            "https://mail.google.com.evil.example/",
+        ] {
+            assert_eq!(preferred("mail.google.com/x", Some(document)), "https://mail.google.com/x", "{document}");
+        }
+        assert_eq!(
+            preferred("www.example.com/x", Some("https://example.com/x")),
+            "https://www.example.com/x",
+            "only a `www.` the omnibox elided is restored, never one it showed and the document lacks"
+        );
+        assert_eq!(
+            preferred("example.com:8443/x", Some("https://example.com:9443/x")),
+            "https://example.com:8443/x",
+            "another port on the same host is another server: a stale document, not the page"
+        );
+    }
+
+    #[test]
+    fn a_document_whose_host_merely_contains_the_omnibox_host_is_refused() {
+        for document in [
+            "https://evil-mail.google.com.attacker.net/",
+            "https://www.mail.google.com.attacker.net/",
+            "https://xmail.google.com/",
+            "https://wwwmail.google.com/",
+        ] {
+            assert_eq!(preferred("mail.google.com/", Some(document)), "https://mail.google.com/", "{document}");
+        }
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_web_page_is_refused() {
+        for document in [
+            "chrome://settings/",
+            "devtools://devtools/bundled/inspector.html?mail.google.com",
+            "about:blank",
+            "file:///C:/mail.google.com/x.html",
+            "mail.google.com/x",
+            "",
+            "https://mail.google.com/a b",
+        ] {
+            assert_eq!(preferred("mail.google.com/x", Some(document)), "https://mail.google.com/x", "{document:?}");
+        }
+        let oversized = format!("https://mail.google.com/{}", "a".repeat(MAX_ADDRESS_LEN));
+        assert_eq!(preferred("mail.google.com/x", Some(&oversized)), "https://mail.google.com/x");
+    }
+
+    #[test]
+    fn a_documents_userinfo_is_not_kept() {
+        let url = prefer_document(&elided("bank.com/x"), false, Some("https://user:pass@bank.com/x/full"));
+        assert_eq!(url.path(), "/x/full", "control: the document's address was taken");
+        assert_eq!((url.username(), url.password()), ("", None));
+    }
+
+    #[test]
+    fn an_omnibox_that_showed_a_scheme_is_not_second_guessed() {
+        let full = parse("https://mail.google.com/x").unwrap();
+        assert_eq!(
+            prefer_document(&full, true, Some("https://mail.google.com/x/elsewhere")).as_str(),
+            "https://mail.google.com/x",
+            "Edge, or Chrome showing full URLs: the field's own text is the address"
+        );
+    }
+
+    #[test]
+    fn no_document_keeps_the_omnibox_address() {
+        assert_eq!(preferred("mail.google.com/x", None), "https://mail.google.com/x");
+    }
+
+    #[test]
+    fn only_the_chromium_family_reads_the_page_document() {
+        assert!(Family::Chromium.reads_the_page_document());
+        assert!(
+            !Family::Firefox.reads_the_page_document(),
+            "Firefox's first Document was another tab's page on 2026-10-01"
+        );
+    }
+
+    /// `read` asks for the document in one place, behind both conditions.
+    #[test]
+    fn the_page_document_is_fetched_once_and_only_for_an_elided_chromium_address() {
+        let source = include_str!("browser_url.rs").replace('\r', "");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .map_or(source.as_str(), |(above, _)| above);
+        assert!(production.len() < source.len(), "control: the test gate was not found");
+        assert_eq!(
+            production.matches(concat!("page_document_", "text(")).count(),
+            1,
+            "the page's Document is read from a second place in this module"
+        );
+        assert!(
+            production.contains(concat!(
+                "(family.reads_the_page_document() && !had_scheme)\n",
+                "        .then(|| crate::injector::ui_automation::page_document_",
+                "text(hwnd)"
+            )),
+            "the Document read is no longer behind the family and the elided-text conditions"
+        );
     }
 
     #[test]

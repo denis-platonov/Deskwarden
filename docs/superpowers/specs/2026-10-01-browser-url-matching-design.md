@@ -39,6 +39,21 @@ string in a browser window that identifies the site.
   as the fallback; document exactly which properties are used per family.
 - Returns the field's text, or nothing. A failure, a missing control, or an unsupported
   browser is "no URL", never an error the user sees.
+- **Chrome's omnibox holds elided text** (measured live with UI Automation, 2026-10-01). The
+  `ValuePattern` value of Chrome's `OmniboxViewViews` is the display text, e.g.
+  `mail.google.com/...`: no `https://`, and Chrome also elides `www.` and `http://`. Edge's
+  omnibox holds the full `https://...`. Chrome's first `ControlType.Document` under the window
+  has a `ValuePattern` value with the full URL of the active tab; the browser sets it. In
+  Firefox the first `Document` under the window was a different tab's page.
+  So, in the Chromium family only, and only when the omnibox text had no scheme, `read` also
+  takes the first `Document`'s value (`FindFirst`, descendants, same session and timeouts) and
+  `browser_url::prefer_document` (pure) uses it as the page URL only if it parses as `http` or
+  `https` (userinfo dropped, the same 8192-byte cap) and its host, lowercased and without a
+  trailing dot, equals the omnibox host or `www.` + it, and its port is the omnibox's.
+  Otherwise the omnibox-derived URL stands. The omnibox stays the authority for the host; the
+  `Document` only restores the scheme, the `www.` and the full path. Omnibox text that already
+  had a scheme (Edge, Chrome with "Always show full URLs") never triggers the `Document` read.
+  The `Document` is never read in the Firefox family, and its text is never logged.
 - Lives beside `injector::ui_automation` and keeps the same apartment handling.
 
 ### `browser_url::parse` (pure)
@@ -96,6 +111,10 @@ string in a browser window that identifies the site.
 
 - `browser_url::parse`: scheme added, `http`/`https` only, search text rejected, `localhost`,
   IP addresses, ports, internationalised domains.
+- `browser_url::prefer_document`: an agreeing host, a `www.`-prefixed document host, an `http`
+  document for an elided `http` site, a mismatching host, a non-web scheme (`chrome://`,
+  `devtools://`), a document host that merely contains the omnibox host, an omnibox that had a
+  scheme, and no document.
 - `uri_match`: every match type; base-domain edge cases (`co.uk`, `github.io`-style private
   suffixes, subdomains, IPs, `localhost`, ports); an invalid regex; `None` = base domain;
   `Never`.

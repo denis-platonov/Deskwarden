@@ -291,7 +291,8 @@ fn is_real_rect(r: RECT) -> bool {
 }
 
 /// How long UI Automation may wait for a browser to accept the connection,
-/// and to answer one request, before [`address_field_text`] gives up.
+/// and to answer one request, before [`address_field_text`] (or
+/// [`page_document_text`], in the same [`address_session`]) gives up.
 ///
 /// The defaults are 2 s and 20 s, and this runs between a key press and the
 /// card it opens: a hung browser must cost the user a short pause and a
@@ -321,10 +322,8 @@ const MAX_ADDRESS_FIELD_MATCHES: usize = 16;
 /// `field` names, or `Ok(None)` when there is no such field that belongs to
 /// the browser's own chrome.
 ///
-/// The same apartment handling as every function above (see
-/// [`find_address_fields`]). Created through `CUIAutomation8` rather than
-/// `CUIAutomation` because only that object answers for `IUIAutomation2`,
-/// which is where the two timeouts are set.
+/// The same apartment handling as every function above, in the session
+/// [`address_session`] opens with the two short timeouts below.
 ///
 /// **`FindAll` and not `FindFirst`, on purpose.** A web page's own elements
 /// are in the same tree, with the page's `id` as their `AutomationId`, and in
@@ -374,6 +373,61 @@ pub fn address_field_text(
             return Ok((!text.is_empty()).then_some(text));
         }
         Ok(None)
+    }
+}
+
+/// **The value of the first `Document` in the window `hwnd`** -- in a Chromium
+/// browser, the full URL of the active tab's page -- or `Ok(None)` when there
+/// is no `Document`, it has no `ValuePattern`, or its value is empty or longer
+/// than [`crate::browser_url::MAX_ADDRESS_LEN`] could ever accept.
+///
+/// **Why this is read at all.** Measured on 2026-10-01, Chrome's omnibox holds
+/// elided display text (`mail.google.com/...`, no scheme, no `www.`), and its
+/// first `Document` under the window holds the URL the browser set for the
+/// page. `crate::browser_url::read` calls this only for the Chromium family and
+/// only when the omnibox text had no scheme, and hands the text to
+/// `crate::browser_url::prefer_document`, which uses it only if it names the
+/// omnibox's own host. This function decides nothing.
+///
+/// **Never for the Firefox family**: there the first `Document` was another
+/// tab's page. `crate::browser_url::Family::reads_the_page_document` says so.
+///
+/// The same session as [`find_address_fields`] -- [`address_session`], so the
+/// same apartment handling and the same short timeouts. `FindFirst` in tree
+/// order rather than a walk for the shallowest: a page's own frames are
+/// `Document`s below its top `Document`, so they come after it in that order;
+/// a `Document` of the browser's own (devtools, a side panel) can come first,
+/// and is what the host check in `prefer_document` refuses. `FindFirst`
+/// answers `Err` for "nothing found" as well as for a failure (see
+/// [`window_has_password_field`]), and both are "no document".
+///
+/// It reads the one value and nothing else -- no name, no other element -- and
+/// the text goes back to the caller and to nobody else: it is not logged, and
+/// `address_field_tests` holds this function to both.
+pub fn page_document_text(hwnd: isize) -> Result<Option<String>> {
+    unsafe {
+        let (automation, root) = address_session(hwnd)?;
+        let is_document = automation.CreatePropertyCondition(
+            UIA_ControlTypePropertyId,
+            &VARIANT::from(UIA_DocumentControlTypeId.0),
+        )?;
+        let Ok(document) = root.FindFirst(TreeScope_Descendants, &is_document) else {
+            return Ok(None);
+        };
+        let Ok(value) =
+            document.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+        else {
+            return Ok(None);
+        };
+        let Ok(text) = value.CurrentValue() else {
+            return Ok(None);
+        };
+        // A UTF-16 unit is at least one UTF-8 byte, so a value longer than the
+        // cap in units is past it in bytes too: refused before it is copied.
+        if text.is_empty() || text.len() > crate::browser_url::MAX_ADDRESS_LEN {
+            return Ok(None);
+        }
+        Ok(Some(text.to_string()))
     }
 }
 
@@ -464,22 +518,7 @@ unsafe fn find_address_fields(
     hwnd: isize,
     field: crate::browser_url::AddressField,
 ) -> Result<Option<AddressFieldQuery>> {
-    // No matching `CoUninitialize`, as in `fill_via_ui_automation`: the app
-    // calls this on the long-lived main thread, where process exit is
-    // adequate cleanup, and the probe calls it once before it exits.
-    let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
-    if hr.is_err() && hr != RPC_E_CHANGED_MODE {
-        log::warn!("CoInitializeEx failed unexpectedly: {hr:?}");
-    }
-
-    let automation: IUIAutomation2 =
-        CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
-    // A refusal leaves the defaults in place, which is slower and still
-    // correct, so neither answer is worth an error.
-    let _ = automation.SetConnectionTimeout(ADDRESS_FIELD_CONNECTION_TIMEOUT_MS);
-    let _ = automation.SetTransactionTimeout(ADDRESS_FIELD_TRANSACTION_TIMEOUT_MS);
-
-    let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void))?;
+    let (automation, root) = address_session(hwnd)?;
 
     // (control type is one of `field.kinds`) AND (any listed property).
     let mut kind: Option<IUIAutomationCondition> = None;
@@ -517,6 +556,34 @@ unsafe fn find_address_fields(
     let found = root.FindAll(TreeScope_Descendants, &address)?;
     let walker = automation.RawViewWalker()?;
     Ok(Some(AddressFieldQuery { automation, walker, root, found }))
+}
+
+/// The UI Automation session every address-bar query runs in --
+/// [`find_address_fields`]'s and [`page_document_text`]'s -- and the element
+/// for the window `hwnd`.
+///
+/// Created through `CUIAutomation8` rather than `CUIAutomation` because only
+/// that object answers for `IUIAutomation2`, which is where the two timeouts
+/// are set. One function so the document read cannot drift onto the 2 s and
+/// 20 s defaults the address read was moved off.
+unsafe fn address_session(hwnd: isize) -> Result<(IUIAutomation2, IUIAutomationElement)> {
+    // No matching `CoUninitialize`, as in `fill_via_ui_automation`: the app
+    // calls this on the long-lived main thread, where process exit is
+    // adequate cleanup, and the probe calls it once before it exits.
+    let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+    if hr.is_err() && hr != RPC_E_CHANGED_MODE {
+        log::warn!("CoInitializeEx failed unexpectedly: {hr:?}");
+    }
+
+    let automation: IUIAutomation2 =
+        CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)?;
+    // A refusal leaves the defaults in place, which is slower and still
+    // correct, so neither answer is worth an error.
+    let _ = automation.SetConnectionTimeout(ADDRESS_FIELD_CONNECTION_TIMEOUT_MS);
+    let _ = automation.SetTransactionTimeout(ADDRESS_FIELD_TRANSACTION_TIMEOUT_MS);
+
+    let root = automation.ElementFromHandle(HWND(hwnd as *mut core::ffi::c_void))?;
+    Ok((automation, root))
 }
 
 /// How far [`ancestry`] walks once it has crossed a `Document`.
@@ -746,6 +813,11 @@ mod bstr_wipe_tests {
 /// refused, so neither may read a value or a name either. And the bound that
 /// keeps a decoy page from stalling the main run loop,
 /// `MAX_ADDRESS_FIELD_MATCHES`, is pinned to the loop it bounds.
+///
+/// The one value read outside `address_field_text` is `page_document_text`'s:
+/// the Chromium page `Document`'s URL, which `browser_url::read` asks for when
+/// the omnibox showed an elided address. It is pinned to read that one value
+/// and nothing else, and the probe and the shared helpers never reach it.
 #[cfg(test)]
 mod address_field_tests {
     use super::*;
@@ -810,6 +882,7 @@ mod address_field_tests {
         for (signature, control) in [
             (concat!("unsafe fn find_address_", "fields("), concat!("Find", "All(")),
             (concat!("unsafe fn ances", "try("), concat!("GetParent", "Element(")),
+            (concat!("unsafe fn address_", "session("), concat!("ElementFrom", "Handle(")),
         ] {
             let body = body_of(source, signature);
             assert!(
@@ -823,6 +896,85 @@ mod address_field_tests {
                      refused candidate may be a page's own field holding what the user typed"
                 );
             }
+        }
+    }
+
+    /// **The page-document read is the one other legitimate value read**, and
+    /// it reads that value and nothing more: no name, no other property, no
+    /// second element, no log line. Its text is the page's full address.
+    #[test]
+    fn the_page_document_read_takes_its_one_value_and_logs_nothing() {
+        let source = include_str!("ui_automation.rs");
+        let body = body_of(source, concat!("pub fn page_document_", "text("));
+        for control in [
+            concat!("UIA_Document", "ControlTypeId"),
+            concat!("Find", "First("),
+            concat!("UIA_Value", "PatternId"),
+            concat!("Current", "Value()"),
+            concat!("address_", "session(hwnd)"),
+        ] {
+            assert!(
+                body.contains(control),
+                "control: the slice scanned is not the document read (no {control})"
+            );
+        }
+        for needle in READ_NEEDLES
+            .iter()
+            .copied()
+            .filter(|needle| {
+                *needle != concat!("UIA_Value", "PatternId") && *needle != concat!("Current", "Value")
+            })
+            .chain([
+                concat!("log", "::"),
+                concat!("Find", "All("),
+                concat!("GetParent", "Element("),
+                concat!("Current", "ClassName"),
+                concat!("Current", "AutomationId"),
+            ])
+        {
+            assert!(
+                !body.contains(needle),
+                "`page_document_text` reaches for {needle}: it reads the first Document's value \
+                 and nothing else, and never logs it"
+            );
+        }
+    }
+
+    /// Every value this file reads is one of the two address reads -- the
+    /// field's and the page document's -- and neither the probe-only list nor
+    /// the helpers it shares with the app ever reaches the document read.
+    #[test]
+    fn the_only_value_reads_are_the_address_field_and_the_page_document() {
+        let source = include_str!("ui_automation.rs");
+        let production = source
+            .split_once(concat!("#[cfg(", "test)]"))
+            .map_or(source, |(above, _)| above);
+        assert!(production.len() < source.len(), "control: the test gate was not found");
+        assert_eq!(
+            production.matches(concat!("Current", "Value()")).count(),
+            2,
+            "a value is read somewhere other than `address_field_text` and `page_document_text`"
+        );
+        for signature in [
+            concat!("pub fn address_field_", "text("),
+            concat!("pub fn page_document_", "text("),
+        ] {
+            assert!(
+                body_of(source, signature).contains(concat!("Current", "Value()")),
+                "control: `{signature}` no longer reads the value this pin counts"
+            );
+        }
+        for signature in [
+            concat!("pub fn address_field_", "candidates("),
+            concat!("unsafe fn find_address_", "fields("),
+            concat!("unsafe fn ances", "try("),
+            concat!("unsafe fn address_", "session("),
+            concat!("pub fn address_field_", "text("),
+        ] {
+            assert!(
+                !body_of(source, signature).contains(concat!("page_document_", "text(")),
+                "`{signature}` reads the page's Document: only `browser_url::read` may ask for it"
+            );
         }
     }
 
