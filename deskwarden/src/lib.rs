@@ -45,6 +45,9 @@ pub mod breach;
 /// distinct password, bounded concurrency, failures counted out loud, and
 /// nothing that starts on its own.
 pub mod breach_scan;
+/// The page a browser window is showing, read from its address bar through UI
+/// Automation when the account picker is asked for -- and never logged.
+pub mod browser_url;
 /// `#[cfg(test)]` for [`below_cut`]'s reason: it reads this crate's own
 /// source text to guard it, and nothing in it can ship.
 #[cfg(test)]
