@@ -53,7 +53,11 @@ string in a browser window that identifies the site.
 - `matches(saved: &str, match_type: Option<MatchType>, page: &Url) -> bool`, following
   Bitwarden's semantics:
   - **Base domain** (`0`, and `None`): the registrable domains (eTLD+1 via the public-suffix
-    list) are equal. IP addresses and `localhost` compare by host (and port, as Bitwarden does).
+    list) are equal. IP addresses and `localhost` compare by host alone, never the port
+    (Bitwarden's `Utils.getDomain` returns the hostname without one). Two Bitwarden details:
+    its `DomainMatchBlacklist` (`google.com` never matches a page on `script.google.com`)
+    applies to this rule only, and a saved website whose scheme is not http or https
+    (`androidapp://...`) matches nothing under this rule or the host rule.
   - **Host** (`1`): host and port equal.
   - **Starts with** (`2`): the page URL string starts with the saved string.
   - **Exact** (`3`): the URL strings are equal.

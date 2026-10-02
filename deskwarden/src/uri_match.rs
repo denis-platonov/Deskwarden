@@ -13,10 +13,15 @@
 //!
 //! * **Base domain** (`0`, and the absent key): the registrable domains --
 //!   eTLD+1, by the public-suffix list -- are equal. `localhost` and IP
-//!   addresses have no registrable domain, so they compare by host and port.
+//!   addresses have no registrable domain, so they compare by host ALONE:
+//!   Bitwarden's `Utils.getDomain` returns the hostname without a port, so a
+//!   login saved for `localhost:3000` is offered on `localhost:8080` too. (The
+//!   Host rule below does compare the port.)
 //!   Bitwarden asks the list with private suffixes ON (`allowPrivateDomains`),
 //!   which is what keeps `alice.github.io` and `bob.github.io` apart, and the
 //!   `psl` crate's compiled list carries that section.
+//!   Its `DomainMatchBlacklist` applies here and to no other rule: a login
+//!   saved for `google.com` is not offered on `script.google.com`.
 //! * **Host** (`1`): host and port equal. The scheme is not compared, exactly
 //!   as Bitwarden's `getHost` does not: `http://example.com` saved matches
 //!   `https://example.com` in the address bar.
@@ -25,11 +30,14 @@
 //! * **Regular expression** (`4`): the saved pattern, case-insensitive (the
 //!   `i` flag Bitwarden compiles it with), against the page URL. A pattern this
 //!   crate's `regex` cannot compile -- including JavaScript-only syntax such as
-//!   look-behind -- matches nothing.
+//!   look-behind -- matches nothing. Rust's `\d` and `\w` are Unicode classes,
+//!   not ASCII as in JavaScript; that is harmless for URLs, which are ASCII once
+//!   parsed.
 //! * **Never** (`5`): nothing.
 //!
-//! A saved website without `://` is read as `http://` for the two host rules,
-//! which is Bitwarden's `getUrl` rule.
+//! A saved website without a scheme is read as `http://` for the two host
+//! rules, which is Bitwarden's `getUrl` rule. Those two rules also ignore a
+//! saved website whose scheme is not `http` or `https` (`androidapp://...`).
 //!
 //! # What is not here, on purpose
 //!
@@ -119,7 +127,9 @@ pub fn matches(saved: &str, match_type: Option<MatchType>, page: &Url) -> bool {
     }
     match match_type.unwrap_or(MatchType::BaseDomain) {
         MatchType::BaseDomain => match (saved_url(saved), base_domain(page)) {
-            (Some(saved), Some(page)) => base_domain(&saved) == Some(page),
+            (Some(saved), Some(page_domain)) => {
+                base_domain(&saved) == Some(page_domain) && !blacklisted(&saved, page)
+            }
             _ => false,
         },
         MatchType::Host => match (saved_url(saved), host_and_port(page)) {
@@ -137,14 +147,41 @@ pub fn matches(saved: &str, match_type: Option<MatchType>, page: &Url) -> bool {
     }
 }
 
-/// A saved website as a URL, reading one without `://` as `http://`.
+/// A saved website as a web URL for the two host rules.
+///
+/// It is parsed as written first, and only when that fails -- or yields a URL
+/// with no host, which is what `localhost:3000` does (scheme `localhost`, path
+/// `3000`) -- is it retried with `http://` in front. A test for the substring
+/// `://` was the first version and was wrong: `example.com/r?u=https://other.com`
+/// contains one, and is a scheme-less website with a redirect in its query.
+///
+/// **A scheme that is not `http` or `https` yields `None`**: `androidapp://com.example.app`
+/// parses with a host, and must not match a page on `example.app`. A scheme-less
+/// string has been given `http://` by then, so it is never caught by this.
 fn saved_url(saved: &str) -> Option<Url> {
     let saved = saved.trim();
-    if saved.contains("://") {
-        Url::parse(saved).ok()
-    } else {
-        Url::parse(&format!("http://{saved}")).ok()
-    }
+    let url = match Url::parse(saved) {
+        Ok(url) if url.has_host() => url,
+        _ => Url::parse(&format!("http://{saved}")).ok()?,
+    };
+    matches!(url.scheme(), "http" | "https").then_some(url)
+}
+
+/// Bitwarden's `DomainMatchBlacklist`: saved base domain -> page hosts that the
+/// base-domain rule must NOT match it with, though the registrable domains are
+/// equal. `script.google.com` runs arbitrary user scripts, so a login saved for
+/// `google.com` is not offered there. Only the base-domain rule asks.
+const DOMAIN_MATCH_BLACKLIST: &[(&str, &[&str])] = &[("google.com", &["script.google.com"])];
+
+/// Whether `page`'s host is excluded for the website `saved` (already known to
+/// share `page`'s registrable domain).
+fn blacklisted(saved: &Url, page: &Url) -> bool {
+    let (Some(domain), Some(host)) = (base_domain(saved), host_and_port(page).map(|(host, _)| host)) else {
+        return false;
+    };
+    DOMAIN_MATCH_BLACKLIST
+        .iter()
+        .any(|(listed, hosts)| *listed == domain && hosts.contains(&host.as_str()))
 }
 
 /// The host, lowercased and without a trailing dot, and the port as the URL
@@ -159,20 +196,25 @@ fn host_and_port(url: &Url) -> Option<(String, Option<u16>)> {
 }
 
 /// What base domain compares: the registrable domain, or -- for `localhost`
-/// and an IP address, which have none -- the host and port.
+/// and an IP address, which have none -- the host, WITHOUT a port.
+///
+/// Bitwarden's `Utils.getDomain` returns the hostname for those, and a
+/// hostname has no port, so `localhost:3000` and `localhost:8080` are one
+/// domain to the base-domain rule. (The Host rule is the one that compares
+/// ports: see [`host_and_port`].)
 ///
 /// **The IP arm is not an optimisation.** The public-suffix list knows nothing
 /// about addresses: asked about `192.168.1.10` it answers `1.10`, so every
 /// address ending in `.1.10` would be one "domain".
-fn base_domain(url: &Url) -> Option<(String, Option<u16>)> {
+fn base_domain(url: &Url) -> Option<String> {
     match url.host()? {
-        Host::Ipv4(_) | Host::Ipv6(_) => host_and_port(url),
+        Host::Ipv4(_) | Host::Ipv6(_) => host_and_port(url).map(|(host, _)| host),
         Host::Domain(domain) => {
             let domain = domain.trim_end_matches('.');
             if domain.eq_ignore_ascii_case("localhost") {
-                return host_and_port(url);
+                return host_and_port(url).map(|(host, _)| host);
             }
-            psl::domain_str(domain).map(|registrable| (registrable.to_ascii_lowercase(), None))
+            psl::domain_str(domain).map(|registrable| registrable.to_ascii_lowercase())
         }
     }
 }
@@ -228,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn base_domain_compares_ip_addresses_by_address_and_port() {
+    fn base_domain_compares_ip_addresses_by_address_and_not_by_port() {
         assert!(base("192.168.1.10", "https://192.168.1.10/login"));
         assert!(!base("192.168.1.10", "https://192.168.1.11/"));
         assert!(
@@ -236,15 +278,87 @@ mod tests {
             "the suffix list reads both of these as `1.10`; an address is not a domain"
         );
         assert!(base("192.168.1.10:8443", "https://192.168.1.10:8443/"));
-        assert!(!base("192.168.1.10:8443", "https://192.168.1.10:9443/"));
+        assert!(
+            base("192.168.1.10:8443", "https://192.168.1.10:9443/"),
+            "Bitwarden's getDomain returns the hostname, which has no port"
+        );
         assert!(base("https://[::1]:8080", "http://[::1]:8080/"));
+        assert!(base("https://[::1]:8080", "http://[::1]:9090/"));
+        assert!(!base("https://[::1]:8080", "http://[::2]:8080/"));
     }
 
     #[test]
-    fn base_domain_compares_localhost_by_port() {
+    fn base_domain_compares_localhost_by_host_and_not_by_port() {
         assert!(base("http://localhost:3000", "http://localhost:3000/login"));
-        assert!(!base("http://localhost:3000", "http://localhost:8080/"));
+        assert!(
+            base("http://localhost:3000", "http://localhost:8080/"),
+            "Bitwarden's getDomain returns the hostname, which has no port"
+        );
         assert!(base("localhost", "https://localhost/"));
+        assert!(base("localhost:3000", "http://localhost:8080/"));
+    }
+
+    #[test]
+    fn host_still_compares_the_port_for_localhost_and_ip_addresses() {
+        let host = |saved: &str, at: &str| matches(saved, Some(MatchType::Host), &page(at));
+        assert!(host("http://localhost:3000", "http://localhost:3000/login"));
+        assert!(!host("http://localhost:3000", "http://localhost:8080/"));
+        assert!(host("192.168.1.10:8443", "https://192.168.1.10:8443/"));
+        assert!(!host("192.168.1.10:8443", "https://192.168.1.10:9443/"));
+    }
+
+    #[test]
+    fn a_saved_website_is_parsed_as_written_before_http_is_put_in_front() {
+        assert!(
+            base("example.com/r?u=https://other.com", "https://www.example.com/"),
+            "a `://` in the query does not make the website a URL with a scheme"
+        );
+        assert!(
+            !base("example.com/r?u=https://other.com", "https://other.com/"),
+            "and it is example.com that was saved, not other.com"
+        );
+        assert!(base("localhost:3000", "http://localhost:3000/"));
+        assert!(base("example.com:8443", "https://example.com/"));
+    }
+
+    #[test]
+    fn google_com_is_not_offered_on_script_google_com_under_base_domain() {
+        assert!(!base("https://google.com", "https://script.google.com/home"));
+        assert!(!base("google.com", "https://script.google.com/"));
+        assert!(
+            !base("https://accounts.google.com", "https://script.google.com/"),
+            "the blacklist is keyed by the saved website's base domain, whatever its subdomain"
+        );
+        assert!(base("https://google.com", "https://mail.google.com/"), "control: the rest of google.com still matches");
+        assert!(
+            !base("https://script.google.com", "https://script.google.com/"),
+            "as in Bitwarden, the key is the saved base domain: a login for script.google.com itself needs the Host rule"
+        );
+        assert!(
+            base("https://google.com", "https://other.script.google.com/"),
+            "control: Bitwarden's set holds exactly the one host, as written"
+        );
+    }
+
+    #[test]
+    fn the_blacklist_belongs_to_base_domain_alone() {
+        let page = page("https://script.google.com/home");
+        assert!(matches("https://script.google.com", Some(MatchType::Host), &page));
+        assert!(matches("https://script.google.com", Some(MatchType::StartsWith), &page));
+        assert!(matches("^https://script\\.google\\.com/", Some(MatchType::RegularExpression), &page));
+        assert!(matches("https://script.google.com/home", Some(MatchType::Exact), &page));
+    }
+
+    #[test]
+    fn base_domain_and_host_ignore_a_saved_website_that_is_not_http_or_https() {
+        let at = page("https://example.app/");
+        for rule in [None, Some(MatchType::BaseDomain), Some(MatchType::Host)] {
+            assert!(!matches("androidapp://com.example.app", rule, &at), "{rule:?}");
+            assert!(!matches("androidapp://example.app", rule, &at), "{rule:?}");
+            assert!(!matches("ftp://example.app/", rule, &at), "{rule:?}");
+        }
+        assert!(matches("example.app", Some(MatchType::BaseDomain), &at), "control: no scheme is http");
+        assert!(matches("http://example.app", Some(MatchType::Host), &at), "control: http is a web scheme");
     }
 
     #[test]
