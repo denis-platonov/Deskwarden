@@ -58,13 +58,18 @@ string in a browser window that identifies the site.
     and its port is the omnibox's. Its URL is the page URL.
   - **Unusable**: no `Document`, a read error, an empty value, a value that does not start with
     a scheme or that `parse` refuses (`chrome://`, `devtools://`, `about:`, too long,
-    whitespace), or the omnibox's host on another port (a stale `Document`). The
-    omnibox-derived URL stands.
-  - **Disagrees**: a valid `http`/`https` page on any other host. The omnibox is holding typed
+    whitespace). The omnibox-derived URL stands.
+  - **Disagrees**: a valid `http`/`https` page on any other host, or on the omnibox's host
+    behind another port (Chrome shows a non-default port, so a port mismatch is typed text:
+    `localhost:8080` typed over `http://localhost:3000/`). The omnibox is holding typed
     text -- the user is mid-edit, e.g. `bank.com` typed over `https://news.example/` -- so
     `read` returns nothing and the picker ranks by the title as before. A side panel or docked
     devtools showing a page on another host looks the same and also withdraws the address;
     that is accepted, because it fails to today's title ranking.
+  - **Residual: text typed over a page that is not a web page.** On the new-tab page or
+    `about:blank` the `Document` is not an `http`/`https` page, so typed text there gets the
+    Unusable verdict and the typed address is used for ranking. That costs at most a
+    pre-picked row: the user still confirms the fill with a key press.
   The omnibox stays the authority for the host: the `Document` only restores the scheme, the
   `www.` and the full path, and a disagreeing `Document` only ever withdraws the address --
   it never supplies one. Omnibox text that already had a scheme (Edge, Chrome with "Always
@@ -73,8 +78,9 @@ string in a browser window that identifies the site.
 - **`read` returns a `PageAddress { url, complete }`.** `complete` is true when the field's
   text had a scheme of its own, or when the Chromium `Document` agreed and supplied the URL.
   It is false when the URL was built by putting `https://` in front of scheme-less text:
-  Firefox's trimmed text (Firefox trims both `https://` and `http://`,
-  `browser.urlbar.trimURLs` / `trimHttps`, so its host is exact and its scheme a guess) and a
+  Firefox's trimmed text (Firefox trims exactly one scheme: `https://` when
+  `browser.urlbar.trimHttps` is on, otherwise `http://` by `browser.urlbar.trimURLs`; which one
+  is not known, so its host is exact and its scheme a guess) and a
   Chromium field whose `Document` was unusable (the host is exact, `www.` aside; the scheme,
   the `www.` and the path are guesses). The picker uses it to decide which refusals are real
   (below).
@@ -104,9 +110,18 @@ string in a browser window that identifies the site.
     already a dependency); an invalid pattern matches nothing.
   - **Never** (`5`): never matches.
 - `same_site(saved, page)`: the saved website's base domain is the page's, whatever its rule.
-  `refuses_by_host_alone(saved, match_type, page)`: on the same site, and refused by `Never` or
-  by the base-domain rule (which, on the same site, is the blacklist; asked through `matches`,
-  not a second copy). Both are for the picker's exclusion rule below, never for a match.
+  `refuses_by_host_alone(saved, match_type, page)`: on the same site, and refused by what the
+  page's host alone decides. The page's real host is the shown host `H` or `www.` + `H`
+  (Firefox never elides `www.`; Chrome only removes it). So: `Never`; the base-domain rule
+  (which, on the same site, is the blacklist; asked through `matches`, not a second copy); and
+  Host, Exact and StartsWith when the saved website's host and port are none of `(H, port)`,
+  `(www.H, port)` and `(H` without a leading `www.`, `port)` -- the last is harmless, it only
+  offers more. A StartsWith saved as `http://` or `https://` plus a bare authority, with no
+  `/`, `?` or `#` after it, is not judged by host: it is a prefix of longer authorities
+  (`https://x.com:8` of `https://x.com:8080/`). Regex never refuses by host. The port is the
+  guess's, so a real `http` page on port 443 shown as `x.com:443` refuses a login saved for
+  `http://x.com:443`; accepted, because that direction offers less. Both functions are for the
+  picker's exclusion rule below, never for a match.
 - Saved URIs without a scheme are parsed as `http://` for host comparisons, as Bitwarden does.
 - The match type is read from the URI entry's `match` value (`UriEntry::other["match"]`).
   The account's default match setting (Bitwarden's "default URI match detection") is out of
@@ -137,9 +152,13 @@ string in a browser window that identifies the site.
   is false the URL's scheme, `www.` and path are guesses, and a login saved as Host `www.x.com`
   or Exact `http://x.com/login` may have refused the guess `https://x.com/` rather than the
   page. Then a same-site item is left out only if one of its same-site URIs refuses the page
-  by a rule that reads the host alone (`uri_match::refuses_by_host_alone`): `Never`, or the
-  base-domain rule refused by the blacklist (`google.com` on `script.google.com`), which the
-  field shows exactly. Any other same-site item keeps its title or name rank.
+  by what the host alone decides (`uri_match::refuses_by_host_alone`), which the field shows
+  exactly, `www.` aside: `Never`; the base-domain rule refused by the blacklist (`google.com`
+  on `script.google.com`); or a Host, Exact or StartsWith website on another host or port of
+  the site (Host `mail.google.com` on a guessed `https://accounts.google.com/`, Exact
+  `https://mail.x.com/a` on a guessed `https://x.com/`). Any other same-site item -- Host
+  `www.x.com` or Exact `http://x.com/login` on a guessed `https://x.com/`, or a Regex -- keeps
+  its title or name rank.
 - The picker already focuses its first row on every card, so a `RANK_URL` login is pre-selected
   by being first; nothing about the focus changes. The five-minute fill recall (`fill_recall`)
   still wins when it applies, so a multi-page sign-in keeps its record.
@@ -158,19 +177,23 @@ string in a browser window that identifies the site.
 - `browser_url::document_verdict` / `prefer_document`: an agreeing host, a `www.`-prefixed
   document host, an `http` document for an elided `http` site; a mismatching web host, typed
   text over another page (`bank.com` over `https://news.example/`), a side panel on another
-  host and a document host that merely contains the omnibox host, all of which give no
-  address; a non-web scheme (`chrome://`, `devtools://`), an empty or oversized value and the
-  same host on another port, which keep the omnibox; an omnibox that had a scheme; and no
-  document.
+  host, a document host that merely contains the omnibox host and the same host on another
+  port (`localhost:8080` typed over `http://localhost:3000/`), all of which give no address; a
+  non-web scheme (`chrome://`, `devtools://`) and an empty or oversized value, which keep the
+  omnibox; an omnibox that had a scheme; and no document.
 - `uri_match`: every match type; base-domain edge cases (`co.uk`, `github.io`-style private
   suffixes, subdomains, IPs, `localhost`, ports); an invalid regex; `None` = base domain;
   `Never`.
 - `app_candidates`: URL-matched items rank first; no exe-stem rank in a browser; a non-match
   falls back to today's ranking, except a login saved for the page's own site whose rule refused
   the page (`google.com` on `script.google.com`, Exact elsewhere on the site), which the title
-  does not bring back; on an incomplete address only `Never` and the blacklist keep such a
-  login out (Host `www.x.com` on a guessed `https://x.com/` is still offered by the title, and
-  excluded on the complete one); no URL = today's behaviour, except that a browser's
+  does not bring back; on an incomplete address only `Never`, the blacklist and a Host, Exact
+  or StartsWith website on another host or port of the site keep such a login out (Host
+  `mail.google.com` on a guessed `https://accounts.google.com/` and Exact `https://mail.x.com/a`
+  on a guessed `https://x.com/` are excluded; Host `www.x.com` on a guessed `https://x.com/`,
+  Exact `http://x.com/login` on a guessed `https://x.com/other` and a same-site Regex are still
+  offered by the title, and excluded on the complete address); no URL = today's behaviour,
+  except that a browser's
   executable name no longer ranks anything.
 - `browser_url::prefer_document`: `complete` is true for an omnibox with a scheme and for an
   agreeing `Document`, false for an unusable one or none.

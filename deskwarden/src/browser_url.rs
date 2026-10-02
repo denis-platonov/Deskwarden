@@ -142,10 +142,11 @@ impl Family {
     /// under the window held the active tab's URL. Firefox's first `Document`
     /// was a DIFFERENT tab's page -- so in the Firefox family the `Document`
     /// says nothing about the page in front of the user, and is never read.
-    /// Firefox trims `https://` and `http://` from its `urlbar-input` too
-    /// (`browser.urlbar.trimURLs`, `trimHttps`), so a trimmed Firefox address
-    /// keeps its exact host and a guessed scheme: a [`PageAddress`] that is not
-    /// `complete`.
+    /// Firefox trims exactly one scheme from its `urlbar-input` too: `https://`
+    /// when `browser.urlbar.trimHttps` is on, otherwise `http://`
+    /// (`browser.urlbar.trimURLs`). Which one was trimmed is not known, so a
+    /// trimmed Firefox address keeps its exact host and a guessed scheme: a
+    /// [`PageAddress`] that is not `complete`.
     pub fn reads_the_page_document(self) -> bool {
         match self {
             Family::Chromium => true,
@@ -279,8 +280,10 @@ pub fn parse(text: &str) -> Option<url::Url> {
 /// known.**
 ///
 /// The address bar does not always hold the whole address. Chrome's omnibox
-/// shows `x.com` for `https://www.x.com/`, and Firefox trims `https://` and
-/// `http://` too (`browser.urlbar.trimURLs`, `trimHttps`). [`parse`] puts
+/// shows `x.com` for `https://www.x.com/`, and Firefox trims exactly one
+/// scheme: `https://` when `browser.urlbar.trimHttps` is on, otherwise
+/// `http://` (`browser.urlbar.trimURLs`) -- and which one is not known from
+/// the text, so the page is not `complete`. [`parse`] puts
 /// `https://` in front of such text, so the `url` it gives is right about the
 /// host -- which the field shows exactly, `www.` aside -- and a GUESS about the
 /// scheme, the `www.` and, in Chrome, the path.
@@ -355,12 +358,12 @@ pub enum DocumentVerdict {
     /// The same page, spelled in full: this is the page's address.
     Agrees(url::Url),
     /// Nothing the address field can be checked against -- no `Document`, an
-    /// empty one, one that is not a web page (`chrome://`, `devtools://`), or
-    /// one on the field's own host behind another port. The field's text
-    /// stands.
+    /// empty one, or one that is not a web page (`chrome://`, `devtools://`).
+    /// The field's text stands.
     Unusable,
-    /// **A web page on another host.** The field is not showing the page: the
-    /// user is typing another address into it. Nothing is the page's address.
+    /// **A web page on another host, or on the field's host behind another
+    /// port.** The field is not showing the page: the user is typing another
+    /// address into it. Nothing is the page's address.
     Disagrees,
 }
 
@@ -384,11 +387,13 @@ pub enum DocumentVerdict {
 ///   Equality, never "ends with" or "contains":
 ///   `evil-mail.google.com.attacker.net` is not `mail.google.com`. Userinfo is
 ///   dropped, as [`parse`] drops it.
-/// * The same host on another port is [`DocumentVerdict::Unusable`]: Chrome
-///   shows a non-default port in the elided text, so that is another server
-///   on the field's host -- a stale `Document` -- and the field, whose host is
-///   right either way, stands.
-/// * [`DocumentVerdict::Disagrees`] when it is a web page on any other host.
+/// * [`DocumentVerdict::Disagrees`] when it is a web page on any other host,
+///   **or on the field's host behind another port**. Chrome shows a
+///   non-default port in the elided text, so a page on `localhost:3000` under
+///   a field reading `localhost:8080` is the user typing `localhost:8080` over
+///   it -- typed text, exactly as another host is. (This was `Unusable` at
+///   first, keeping the field's address on the strength of its host; but the
+///   field's port, and so the server, was then the typed one.)
 ///
 /// # Why a disagreeing page withdraws the address instead of being ignored
 ///
@@ -421,12 +426,10 @@ pub fn document_verdict(omnibox: &url::Url, document_text: Option<&str>) -> Docu
         return DocumentVerdict::Unusable;
     };
     let same_host = page == shown || page.strip_prefix("www.") == Some(shown.as_str());
-    if !same_host {
-        DocumentVerdict::Disagrees
-    } else if document.port() == omnibox.port() {
+    if same_host && document.port() == omnibox.port() {
         DocumentVerdict::Agrees(document)
     } else {
-        DocumentVerdict::Unusable
+        DocumentVerdict::Disagrees
     }
 }
 
@@ -782,13 +785,24 @@ mod tests {
         assert_eq!(preferred("mail.google.com/x", Some("https://www.google.com/search?q=x")), None);
     }
 
+    /// **Chrome shows a non-default port**, so a field whose port is not the
+    /// page's holds typed text: `localhost:8080` typed over
+    /// `http://localhost:3000/`.
     #[test]
-    fn another_port_on_the_same_host_keeps_the_field() {
-        assert_eq!(verdict("example.com:8443/x", Some("https://example.com:9443/x")), DocumentVerdict::Unusable);
+    fn another_port_on_the_same_host_withdraws_the_address() {
+        assert_eq!(verdict("localhost:8080", Some("http://localhost:3000/")), DocumentVerdict::Disagrees);
+        assert_eq!(preferred("localhost:8080", Some("http://localhost:3000/")), None);
+        assert_eq!(verdict("example.com:8443/x", Some("https://example.com:9443/x")), DocumentVerdict::Disagrees);
+        assert_eq!(preferred("example.com:8443/x", Some("https://example.com:9443/x")), None);
         assert_eq!(
-            preferred("example.com:8443/x", Some("https://example.com:9443/x")),
-            kept("https://example.com:8443/x"),
-            "another port on the same host is a stale document; the field's host is right either way"
+            preferred("example.com/x", Some("https://www.example.com:8443/x")),
+            None,
+            "a `www.` the field elided does not excuse a port it did not show"
+        );
+        assert_eq!(
+            preferred("localhost:3000/login", Some("http://localhost:3000/login")),
+            kept("http://localhost:3000/login"),
+            "control: the same port agrees"
         );
     }
 
@@ -860,7 +874,7 @@ mod tests {
     fn an_address_built_on_elided_text_is_not_complete() {
         assert_eq!(complete("x.com", None), Some(false), "no Document: Firefox's trimmed text, or Chrome's");
         assert_eq!(complete("x.com", Some("devtools://devtools/x")), Some(false), "an unusable Document");
-        assert_eq!(complete("x.com:8443/", Some("https://x.com:9443/")), Some(false), "a stale Document");
+        assert_eq!(complete("x.com:8443/", Some("https://x.com:9443/")), None, "another port: typed text");
         assert_eq!(complete("x.com", Some("http://www.x.com/")), Some(true), "the Document agreed and said it all");
         assert_eq!(complete("x.com", Some("https://news.example/")), None, "control: typed text is no address");
         let full = parse("http://x.com/login").unwrap();

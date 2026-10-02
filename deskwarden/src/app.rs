@@ -10884,7 +10884,7 @@ mod picker_wiring_tests {
             body.contains(concat!("picker_offers_for(cache, window, page.", "as_ref())")),
             "`handle_no_match` reads the address and does not rank by it"
         );
-        for spelling in ["{page", "page:?", "page.as_str()", "page.to_string()", "page.host"] {
+        for spelling in ["{page", "page:?", "page.as_str()", "page.to_string()", "page.host", "page.url"] {
             assert!(
                 !body.contains(spelling),
                 "`handle_no_match` spells the address ({spelling}); it is the website the user \

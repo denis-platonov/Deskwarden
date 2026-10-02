@@ -110,10 +110,14 @@ fn ranked(
         // `browser_url::parse`'s guess, and a login saved as Host `www.x.com`
         // or Exact `http://x.com/login` "refused" the guess, not the page.
         // Leaving it out on that would hide the user's own login on its own
-        // site. What the guess cannot have caused is a refusal that reads the
-        // host alone, which the field shows exactly: a `Never`, and the
-        // blacklist (`uri_match::refuses_by_host_alone`). Only those keep the
-        // login out of a guessed page; any other keeps its title guess below.
+        // site. What the guess cannot have caused is a refusal decided by the
+        // host, which the field shows exactly, `www.` aside
+        // (`uri_match::refuses_by_host_alone`): a `Never`, the blacklist, and
+        // a Host, Exact or StartsWith website on another host or port of the
+        // site -- Host `mail.google.com` on a guessed
+        // `https://accounts.google.com/` -- which no scheme, path or `www.`
+        // could make match. Only those keep the login out of a guessed page;
+        // any other keeps its title guess below.
         let refused = |saved: &crate::uri_match::SavedUri| {
             if *complete {
                 crate::uri_match::same_site(&saved.uri, page)
@@ -177,8 +181,9 @@ fn ranked(
 /// candidate at all: no title or name guess brings it back (see [`ranked`]).
 /// When the address is a guess built on elided text
 /// ([`crate::browser_url::PageAddress::complete`] is `false`), only a refusal
-/// by `Never` or by Bitwarden's blacklist -- the two that read the host alone
-/// -- keeps a login out that way.
+/// the page's host decides keeps a login out that way: `Never`, Bitwarden's
+/// blacklist, or a Host, Exact or StartsWith website on another host or port
+/// of the site (see [`crate::uri_match::refuses_by_host_alone`]).
 pub fn candidates(
     exe_name: &str,
     title: &str,
@@ -579,6 +584,69 @@ mod tests {
             ids(&candidates("chrome.exe", "Google Sign-in - Google Chrome", &items, Some(&guessed("https://accounts.google.com/")))),
             vec!["g"],
             "control: on the rest of google.com the guessed address matches it"
+        );
+    }
+
+    /// **Another host on the site is refused on a guessed address too.** The
+    /// field shows the host exactly, `www.` aside, so Host `mail.google.com`
+    /// refuses `accounts.google.com` whatever the scheme and path turn out to
+    /// be -- and a title naming the login does not bring it back.
+    #[test]
+    fn a_login_saved_for_another_host_on_the_site_refuses_a_guessed_address() {
+        let mail = saved_with("m", "Google", "me@gmail.com", Some("mail.google.com"), Some(serde_json::json!(1)));
+        let found = candidates(
+            "firefox.exe",
+            "Google Sign-in - Mozilla Firefox",
+            &[mail.clone()],
+            Some(&guessed("https://accounts.google.com/")),
+        );
+        assert!(found.is_empty(), "Host `mail.google.com` was offered on `accounts.google.com` by the title");
+        assert_eq!(
+            ids(&candidates("firefox.exe", "Google Sign-in - Mozilla Firefox", &[mail], None)),
+            vec!["m"],
+            "control: the title does name it, so the emptiness above is the refusal"
+        );
+
+        let exact = saved_with("e", "Twitter", "me@x", Some("https://mail.x.com/a"), Some(serde_json::json!(3)));
+        let found = candidates("chrome.exe", "Twitter - Google Chrome", &[exact.clone()], Some(&guessed("https://x.com/")));
+        assert!(found.is_empty(), "Exact `https://mail.x.com/a` was offered on `x.com` by the title");
+        assert_eq!(ids(&candidates("chrome.exe", "Twitter - Google Chrome", &[exact], None)), vec!["e"], "control");
+    }
+
+    /// What the guess is unsure of -- the `www.`, the scheme, the path --
+    /// still never hides a login on a guessed address.
+    #[test]
+    fn a_guessed_address_still_offers_what_only_its_guess_refused() {
+        let title = "Twitter - Google Chrome";
+        let host = saved_with("h", "Twitter", "me@x", Some("www.x.com"), Some(serde_json::json!(1)));
+        assert_eq!(
+            ids(&candidates("chrome.exe", title, &[host], Some(&guessed("https://x.com/")))),
+            vec!["h"],
+            "Chrome elides the `www.`"
+        );
+        let exact = saved_with("e", "Twitter", "me@x", Some("http://x.com/login"), Some(serde_json::json!(3)));
+        assert_eq!(
+            ids(&candidates("chrome.exe", title, &[exact.clone()], Some(&guessed("https://x.com/other")))),
+            vec!["e"],
+            "only the scheme and the path are uncertain"
+        );
+        assert!(
+            candidates("chrome.exe", title, &[exact], Some(&page("https://x.com/other"))).is_empty(),
+            "control: against the whole address the refusal is real"
+        );
+        let regex = saved_with("r", "Twitter", "me@x", Some("https://x.com/acc.*"), Some(serde_json::json!(4)));
+        assert!(
+            crate::uri_match::same_site("https://x.com/acc.*", &url::Url::parse("https://x.com/other").unwrap()),
+            "control: the pattern reads as a website on this very site"
+        );
+        assert_eq!(
+            ids(&candidates("chrome.exe", title, &[regex.clone()], Some(&guessed("https://x.com/other")))),
+            vec!["r"],
+            "a pattern reads whatever it says, so its refusal may be the guess's"
+        );
+        assert!(
+            candidates("chrome.exe", title, &[regex], Some(&page("https://x.com/other"))).is_empty(),
+            "control: against the whole address the refusal is real"
         );
     }
 

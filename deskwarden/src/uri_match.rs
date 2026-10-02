@@ -171,23 +171,51 @@ pub fn same_site(saved: &str, page: &Url) -> bool {
     }
 }
 
-/// **Whether the website `saved`, on `page`'s own site, refuses `page` by a
-/// rule that reads nothing but the page's host** -- so the refusal holds
-/// whatever the page's scheme and path turn out to be.
+/// **Whether the website `saved`, on `page`'s own site, refuses `page` by
+/// what the page's host alone decides** -- so the refusal holds whatever the
+/// page's scheme and path turn out to be, and whether or not Chrome elided a
+/// `www.` from it.
 ///
-/// Two rules do: **Never**, which refuses every page; and the **base-domain**
-/// rule (also what no match type means) when Bitwarden's blacklist excludes
-/// the page's host for the saved base domain (`google.com` on
-/// `script.google.com`). For a website [`same_site`] accepts, the base-domain
-/// rule refusing IS the blacklist: [`matches`] compares the same base domains
-/// and then asks the one blacklist, so this asks [`matches`] rather than
-/// keeping a second copy of either.
+/// `app_candidates::ranked` asks this when the page address is a guess built
+/// on elided text (`browser_url::PageAddress`), where only a refusal the guess
+/// cannot have caused may keep a login out. What such a guess knows: the host
+/// the field showed, `H`, and its port. Firefox trims a scheme and never a
+/// `www.`; Chrome elides the scheme and only ever REMOVES a `www.`. So the
+/// page's real host is `H` or `www.` + `H`, and nothing else.
 ///
-/// Every other rule reads more than the host -- Exact and StartsWith the
-/// whole URL string, Regex whatever its pattern says, Host the `www.` Chrome
-/// elides -- and is `false` here. `app_candidates::ranked` asks this when the
-/// page address is a guess built on elided text (`browser_url::PageAddress`),
-/// where only a refusal the guess cannot have caused may keep a login out.
+/// * **Never** refuses every page.
+/// * **Base domain** (also what no match type means) refuses when Bitwarden's
+///   blacklist excludes the page's host for the saved base domain
+///   (`google.com` on `script.google.com`). For a website [`same_site`]
+///   accepts, the base-domain rule refusing IS the blacklist: [`matches`]
+///   compares the same base domains and then asks the one blacklist, so this
+///   asks [`matches`] rather than keeping a second copy of either.
+/// * **Host, Exact and StartsWith** each fix a host and port, and refuse when
+///   that host and port is none the page can have: not `(H, port)`, not
+///   `(www.H, port)`, and not `(H` without a leading `www.`, `port)` -- the
+///   last is not a host the page can have, and accepting it only ever offers
+///   more. Host `mail.google.com` on a guessed `https://accounts.google.com/`
+///   is refused; Host `www.x.com` and Exact `http://x.com/login` on a guessed
+///   `https://x.com/` are not, because only the `www.`, the scheme and the path
+///   are in doubt there (see `could_be_the_pages_host`).
+/// * **StartsWith saved as `http://` or `https://` and an authority with
+///   nothing after it** is the exception, and is `false`: such a string is a
+///   prefix of LONGER authorities -- `https://x.com:8` of `https://x.com:8080/`,
+///   `https://a.x.com` of `https://a.x.com-b.x.com/` -- so its host is not the
+///   only host it matches. Once anything follows the authority (a `/`, `?` or
+///   `#`), the page's serialised authority must end exactly where the saved one
+///   does, and the saved host and port are the only ones it can match. A saved
+///   string without `http://` or `https://` in front can never be a prefix of a
+///   page's address at all, so judging it by its host is never wrong. (Ending
+///   exactly at the authority was the other rule considered, and is precisely
+///   the case that is not safe.)
+/// * **Regex** reads whatever its pattern says, and is `false`.
+///
+/// The port is the guess's: `host_and_port` reads `None` for the default of
+/// the guessed `https`. A real `http` page on port `443` would show as
+/// `x.com:443` and be guessed as `https://x.com/` with no port, refusing a
+/// login saved for `http://x.com:443` -- a refusal the guess caused, accepted
+/// because it is the direction that offers less.
 pub fn refuses_by_host_alone(saved: &str, match_type: Option<MatchType>, page: &Url) -> bool {
     if !same_site(saved, page) {
         return false;
@@ -195,8 +223,38 @@ pub fn refuses_by_host_alone(saved: &str, match_type: Option<MatchType>, page: &
     match match_type.unwrap_or(MatchType::BaseDomain) {
         MatchType::Never => true,
         MatchType::BaseDomain => !matches(saved, match_type, page),
-        MatchType::Host | MatchType::StartsWith | MatchType::Exact | MatchType::RegularExpression => false,
+        MatchType::StartsWith if ends_at_its_authority(saved) => false,
+        MatchType::Host | MatchType::StartsWith | MatchType::Exact => !could_be_the_pages_host(saved, page),
+        MatchType::RegularExpression => false,
     }
+}
+
+/// Whether the saved website `saved` names a host and port `page`'s real
+/// address can have, when `page` was built on elided text: its host `H`, or
+/// `www.` + `H` (the `www.` Chrome elides), or `H` without a leading `www.`
+/// (harmless: it only ever offers more). A saved website with no web host
+/// says nothing, and is `true`, so it refuses nothing.
+fn could_be_the_pages_host(saved: &str, page: &Url) -> bool {
+    let (Some((saved_host, saved_port)), Some((host, port))) =
+        (saved_url(saved).as_ref().and_then(host_and_port), host_and_port(page))
+    else {
+        return true;
+    };
+    saved_port == port
+        && (saved_host == host
+            || saved_host.strip_prefix("www.") == Some(host.as_str())
+            || host.strip_prefix("www.") == Some(saved_host.as_str()))
+}
+
+/// Whether `saved` is `http://` or `https://` followed by an authority and
+/// nothing else -- no `/`, `?` or `#` after it -- which, as a StartsWith
+/// string, is also a prefix of longer authorities. See
+/// [`refuses_by_host_alone`].
+fn ends_at_its_authority(saved: &str) -> bool {
+    saved
+        .strip_prefix("https://")
+        .or_else(|| saved.strip_prefix("http://"))
+        .is_some_and(|rest| !rest.contains(['/', '?', '#']))
 }
 
 /// A saved website as a web URL for the two host rules.
@@ -557,17 +615,73 @@ mod tests {
     }
 
     #[test]
-    fn a_rule_that_reads_more_than_the_host_does_not_refuse_by_the_host_alone() {
+    fn a_refusal_the_guess_may_have_caused_is_not_a_refusal_by_the_host_alone() {
         let at = page("https://x.com/");
         assert!(!refuses_by_host_alone("www.x.com", Some(MatchType::Host), &at), "Chrome elides the `www.`");
         assert!(!refuses_by_host_alone("http://x.com/login", Some(MatchType::Exact), &at));
         assert!(!refuses_by_host_alone("http://x.com/", Some(MatchType::StartsWith), &at));
+        assert!(!refuses_by_host_alone("https://www.x.com/a", Some(MatchType::StartsWith), &at));
+        assert!(
+            !refuses_by_host_alone("x.com", Some(MatchType::Host), &page("https://www.x.com/")),
+            "a `www.` the field showed, missing from the saved host: harmless to accept"
+        );
         assert!(!refuses_by_host_alone(r"^http://x\.com/", Some(MatchType::RegularExpression), &at));
         assert!(
             !refuses_by_host_alone("https://y.com", Some(MatchType::Never), &at),
             "a Never on another site says nothing about this one"
         );
         assert!(!refuses_by_host_alone("google.com", None, &page("https://script.google.org/")));
+    }
+
+    /// **Another host on the same site is refused by the host alone.** The
+    /// page's real host is the one the field showed, or `www.` + it; a Host,
+    /// Exact or StartsWith website fixing any other host refuses the page
+    /// whatever its scheme and path.
+    #[test]
+    fn another_host_on_the_site_refuses_by_the_host_alone() {
+        let at = page("https://accounts.google.com/");
+        assert!(refuses_by_host_alone("mail.google.com", Some(MatchType::Host), &at));
+        assert!(refuses_by_host_alone("https://www.google.com", Some(MatchType::Host), &at));
+        assert!(refuses_by_host_alone("https://mail.x.com/a", Some(MatchType::Exact), &page("https://x.com/")));
+        assert!(refuses_by_host_alone("https://mail.x.com/", Some(MatchType::StartsWith), &page("https://x.com/")));
+        assert!(refuses_by_host_alone("https://mail.x.com?a", Some(MatchType::StartsWith), &page("https://x.com/")));
+        assert!(
+            refuses_by_host_alone("mail.x.com", Some(MatchType::StartsWith), &page("https://x.com/")),
+            "no scheme in front: never a prefix of any page's address"
+        );
+        assert!(
+            refuses_by_host_alone("https://www.www.x.com/a", Some(MatchType::Exact), &page("https://x.com/")),
+            "Chrome elides one `www.`, not two"
+        );
+        assert!(
+            !refuses_by_host_alone(r"^https://mail\.x\.com/", Some(MatchType::RegularExpression), &page("https://x.com/")),
+            "a pattern names no host"
+        );
+    }
+
+    #[test]
+    fn another_port_on_the_same_host_refuses_by_the_host_alone() {
+        let at = page("https://x.com:8443/");
+        assert!(refuses_by_host_alone("x.com:9443", Some(MatchType::Host), &at));
+        assert!(refuses_by_host_alone("https://x.com/login", Some(MatchType::Exact), &at));
+        assert!(refuses_by_host_alone("https://x.com:8/", Some(MatchType::StartsWith), &page("https://x.com:8080/")));
+        assert!(!refuses_by_host_alone("x.com:8443", Some(MatchType::Host), &at), "control: the same port");
+    }
+
+    /// A StartsWith string that stops at its authority is a prefix of longer
+    /// authorities, so its host is not the only one it can match.
+    #[test]
+    fn a_starts_with_that_ends_at_its_authority_does_not_refuse_by_the_host_alone() {
+        let longer_port = page("https://x.com:8080/");
+        assert!(matches("https://x.com:8", Some(MatchType::StartsWith), &longer_port), "control: it does match");
+        assert!(!refuses_by_host_alone("https://x.com:8", Some(MatchType::StartsWith), &longer_port));
+        let longer_host = page("https://a.x.com-b.x.com/");
+        assert!(matches("https://a.x.com", Some(MatchType::StartsWith), &longer_host), "control: it does match");
+        assert!(!refuses_by_host_alone("https://a.x.com", Some(MatchType::StartsWith), &longer_host));
+        assert!(
+            refuses_by_host_alone("https://a.x.com", Some(MatchType::Host), &longer_host),
+            "control: the Host rule compares the host whole"
+        );
     }
 
     #[test]
