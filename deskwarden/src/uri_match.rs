@@ -147,6 +147,28 @@ pub fn matches(saved: &str, match_type: Option<MatchType>, page: &Url) -> bool {
     }
 }
 
+/// Whether the website `saved` is on the same site as `page` -- an `http` or
+/// `https` website (or one without a scheme, read as `http`) whose base domain
+/// is `page`'s, by the same comparison the base-domain rule makes: the
+/// registrable domain, or the host alone for `localhost` and an IP address.
+///
+/// **Not a match, and the opposite of one in how it is used.** It ignores the
+/// entry's own rule and Bitwarden's blacklist on purpose: the account picker
+/// asks it of a login [`matches`] REFUSED, to tell "saved for some other
+/// website" (the title may still guess it) from "saved for this very site,
+/// under a rule that refuses this page" -- an Exact address elsewhere on the
+/// site, a `Never`, `google.com` on `script.google.com` -- which the title
+/// must not bring back. See `app_candidates::ranked`.
+pub fn same_site(saved: &str, page: &Url) -> bool {
+    if saved.trim().is_empty() {
+        return false;
+    }
+    match (saved_url(saved), base_domain(page)) {
+        (Some(saved), Some(page_domain)) => base_domain(&saved) == Some(page_domain),
+        _ => false,
+    }
+}
+
 /// A saved website as a web URL for the two host rules.
 ///
 /// It is parsed as written first, and only when that fails -- or yields a URL
@@ -460,6 +482,36 @@ mod tests {
         );
         let no_uri: crate::vault_bridge::UriEntry = serde_json::from_str(r#"{"match":3}"#).unwrap();
         assert_eq!(SavedUri::of(&no_uri), None, "an entry with no website is not a website");
+    }
+
+    #[test]
+    fn same_site_is_the_base_domain_whatever_the_rule_or_the_blacklist_says() {
+        let at = page("https://script.google.com/home");
+        assert!(same_site("https://google.com", &at), "the blacklist is a rule, not another site");
+        assert!(!matches("https://google.com", None, &at), "control: the rule itself refuses this page");
+        assert!(same_site("google.com", &page("https://accounts.google.com/")));
+        assert!(same_site("https://bank.com/login", &page("https://bank.com/other")));
+        assert!(!same_site("https://google.org", &at));
+        assert!(!same_site("https://bbc.co.uk", &page("https://other.co.uk/")), "the public-suffix list still decides");
+        assert!(!same_site("https://alice.github.io", &page("https://bob.github.io/")));
+    }
+
+    #[test]
+    fn same_site_compares_localhost_and_ip_addresses_by_host_alone() {
+        assert!(same_site("http://localhost:3000", &page("http://localhost:8080/")));
+        assert!(same_site("192.168.1.10:8443", &page("https://192.168.1.10/")));
+        assert!(!same_site("10.0.1.10", &page("https://192.168.1.10/")), "the suffix list's `1.10` is not a site");
+    }
+
+    #[test]
+    fn same_site_needs_a_web_website() {
+        let at = page("https://example.app/");
+        assert!(!same_site("androidapp://example.app", &at));
+        assert!(!same_site("", &at));
+        assert!(!same_site("   ", &at));
+        assert!(!same_site(r"^https://example\.app/", &at), "a pattern is not a website");
+        assert!(same_site("example.app", &at), "control: no scheme is http");
+        assert!(!same_site("https://co.uk", &page("https://co.uk/")), "a bare public suffix is no site");
     }
 
     #[test]

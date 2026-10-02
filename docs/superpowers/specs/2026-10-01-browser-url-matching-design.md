@@ -101,6 +101,14 @@ string in a browser window that identifies the site.
   it is noise there.
 - Inside `RANK_URL`, the stricter rule first, then vault order: Exact, StartsWith, Regex, Host,
   base domain. An item with several matching websites counts by its strictest one.
+- **A title guess never brings back a login its own website refuses.** With a page URL, an item
+  that has a saved `http`/`https` website (or one without a scheme) whose registrable domain is
+  the page's (`uri_match::same_site`; IP addresses and `localhost` by host alone), but which got
+  no `RANK_URL` -- because its own rule (Exact, StartsWith, Regex, Host, Never) or the
+  `google.com` / `script.google.com` blacklist refused the page -- gets no title or name rank
+  and is left out of the candidates. The title is written by the page; it must not undo the
+  user's rule. An item with no website on that site, or none at all, keeps today's title
+  ranking, and with no page URL nothing changes.
 - The picker already focuses its first row on every card, so a `RANK_URL` login is pre-selected
   by being first; nothing about the focus changes. The five-minute fill recall (`fill_recall`)
   still wins when it applies, so a multi-page sign-in keeps its record.
@@ -124,7 +132,9 @@ string in a browser window that identifies the site.
   suffixes, subdomains, IPs, `localhost`, ports); an invalid regex; `None` = base domain;
   `Never`.
 - `app_candidates`: URL-matched items rank first; no exe-stem rank in a browser; a non-match
-  falls back to today's ranking; no URL = today's behaviour, except that a browser's
+  falls back to today's ranking, except a login saved for the page's own site whose rule refused
+  the page (`google.com` on `script.google.com`, Exact elsewhere on the site), which the title
+  does not bring back; no URL = today's behaviour, except that a browser's
   executable name no longer ranks anything.
 - The picker already focuses its first row on every card, so a URL-ranked login is pre-selected
   by being first, and nothing about the focus changes; recall still wins.

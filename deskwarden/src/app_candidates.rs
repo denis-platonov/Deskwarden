@@ -90,6 +90,20 @@ fn ranked(
         if let Some(strictest) = strictest {
             return Some((RANK_URL, strictest));
         }
+        // **A guess must not overrule the login's own saved website.** This
+        // login was saved for this very site, and the rule it was saved with
+        // -- Exact or StartsWith elsewhere on the site, a regex, Host on
+        // another subdomain, Never, or Bitwarden's `google.com` /
+        // `script.google.com` blacklist -- just refused this page. The title
+        // is written by the page; letting it rank the login anyway would
+        // undo the user's rule on the strength of the one string a page
+        // controls (a "Google Sign-in" title on `script.google.com`, where
+        // anyone's script runs, offering the user's Google login). So it is
+        // left out. A login saved for some OTHER site, or for none, knows
+        // nothing about this page and keeps the title's guess below.
+        if item.uris.iter().any(|saved| crate::uri_match::same_site(&saved.uri, page)) {
+            return None;
+        }
     }
 
     // **No executable-name rank in a browser.** `chrome` against item names
@@ -138,7 +152,9 @@ fn ranked(
 ///
 /// `page` is the browser's address, when one was read; `None` everywhere
 /// else, and then nothing about the URL rank applies. In a browser the
-/// exe-stem ranks are dropped even when `page` is `None`.
+/// exe-stem ranks are dropped even when `page` is `None`. With a `page`, a
+/// login saved for that same site whose own rule refused the page is not a
+/// candidate at all: no title or name guess brings it back (see [`ranked`]).
 pub fn candidates(
     exe_name: &str,
     title: &str,
@@ -405,6 +421,73 @@ mod tests {
         // emptiness above is the browser rule and not a broken stem.
         let native = vec![item("s", "Slack notes", "me@example.com", None)];
         assert_eq!(ids(&candidates("slack.exe", "", &native, None)), vec!["s"]);
+    }
+
+    /// **The title must not resurrect a login its own website refuses.**
+    /// Edge on `script.google.com`, where anyone's Apps Script runs, titled
+    /// "Google Sign-in": the `google.com` login is refused by Bitwarden's
+    /// blacklist, and a title the page wrote must not offer it anyway.
+    #[test]
+    fn a_title_guess_does_not_bring_back_a_login_refused_on_its_own_site() {
+        let items = vec![item("g", "Google", "me@gmail.com", Some("google.com"))];
+        let found = candidates(
+            "msedge.exe",
+            "Google Sign-in - Microsoft Edge",
+            &items,
+            Some(&page("https://script.google.com/")),
+        );
+        assert!(found.is_empty(), "the google.com login was offered on script.google.com by the title");
+        // Control: the same title does name it, and on its own site the
+        // login is offered by its saved website.
+        let at_home = candidates(
+            "msedge.exe",
+            "Google Sign-in - Microsoft Edge",
+            &items,
+            Some(&page("https://accounts.google.com/")),
+        );
+        assert_eq!(ids(&at_home), vec!["g"]);
+    }
+
+    #[test]
+    fn a_title_guess_does_not_override_an_exact_rule_elsewhere_on_the_site() {
+        let exact = saved_with(
+            "b",
+            "Bank",
+            "me@x",
+            Some("https://bank.com/login"),
+            Some(serde_json::json!(3)),
+        );
+        let found = candidates("chrome.exe", "Bank - other page - Google Chrome", &[exact], Some(&page("https://bank.com/other")));
+        assert!(found.is_empty(), "an Exact-saved login was offered by the title on another page of its site");
+    }
+
+    #[test]
+    fn a_login_with_no_website_is_still_offered_by_the_title() {
+        let items = vec![
+            item("none", "Google", "me@gmail.com", None),
+            item("g", "Google", "me@gmail.com", Some("google.com")),
+        ];
+        let found = candidates(
+            "msedge.exe",
+            "Google Sign-in - Microsoft Edge",
+            &items,
+            Some(&page("https://script.google.com/")),
+        );
+        assert_eq!(ids(&found), vec!["none"], "a login saved for no site knows nothing about this page");
+    }
+
+    #[test]
+    fn with_no_page_a_login_saved_for_the_site_is_still_offered_by_the_title() {
+        let items = vec![
+            item("g", "Google", "me@gmail.com", Some("google.com")),
+            saved_with("b", "Bank", "me@x", Some("https://bank.com/login"), Some(serde_json::json!(3))),
+        ];
+        assert_eq!(
+            ids(&candidates("msedge.exe", "Google Sign-in - Microsoft Edge", &items, None)),
+            vec!["g"],
+            "no address read is today's ranking"
+        );
+        assert_eq!(ids(&candidates("firefox.exe", "Bank - Mozilla Firefox", &items, None)), vec!["b"]);
     }
 
     /// A page no login is saved for falls back to the title, as before.
