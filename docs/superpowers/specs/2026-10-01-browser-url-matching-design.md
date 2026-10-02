@@ -79,6 +79,8 @@ string in a browser window that identifies the site.
   added to `ItemFacts`.
 - In a browser, the existing exe-stem rank (`chrome` against item domains/names) is not applied:
   it is noise there.
+- Inside `RANK_URL`, the stricter rule first, then vault order: Exact, StartsWith, Regex, Host,
+  base domain. An item with several matching websites counts by its strictest one.
 - The picker pre-selects the first candidate when it came from `RANK_URL`. The five-minute fill
   recall (`fill_recall`) still wins when it applies, so a multi-page sign-in keeps its record.
 
@@ -97,7 +99,8 @@ string in a browser window that identifies the site.
   suffixes, subdomains, IPs, `localhost`, ports); an invalid regex; `None` = base domain;
   `Never`.
 - `app_candidates`: URL-matched items rank first; no exe-stem rank in a browser; a non-match
-  falls back to today's ranking; no URL = today's behaviour exactly.
+  falls back to today's ranking; no URL = today's behaviour, except that a browser's
+  executable name no longer ranks anything.
 - The picker pre-selects a URL-ranked first row and not otherwise; recall still wins.
 - The UI Automation read is a thin, documented observation layer and is not unit-tested; it is
   checked by hand in Chrome, Edge and Firefox.

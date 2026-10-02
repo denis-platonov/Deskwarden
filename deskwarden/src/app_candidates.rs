@@ -14,8 +14,10 @@
 //! which the card focuses when it opens -- is the one Enter takes. It never
 //! types anything by itself, for this module's reason above.
 //!
-//! Pure, and takes `&[VaultItem]` rather than a cache, so the whole of it is
-//! testable with fixtures and no window, no vault and no clock.
+//! Reads one thing besides its inputs -- `app::browser_window`'s fixed list of
+//! browser executables -- and is otherwise pure: it takes `&[ItemFacts]` rather
+//! than a cache, so the whole of it is testable with fixtures and no window, no
+//! vault and no clock.
 
 
 /// One row of the picker. **Display strings and an id -- never a password.**
@@ -43,6 +45,24 @@ const RANK_URI_HOST: u8 = 1;
 const RANK_NAME: u8 = 2;
 const RANK_TITLE: u8 = 3;
 
+/// How strict the rule that accepted a page was; smaller is stricter. Only
+/// the `RANK_URL` tier uses it, to break ties inside the tier: of two logins
+/// saved for the page, the one the user saved most exactly is the one the card
+/// focuses. The order is Bitwarden's rules by how much of the page each one
+/// has to see: Exact, StartsWith, Regex, Host, then base domain (also what no
+/// match type means). `Never` cannot have accepted a page, so it shares the
+/// loosest value rather than needing an arm that can't happen.
+fn strictness(rule: Option<crate::uri_match::MatchType>) -> u8 {
+    use crate::uri_match::MatchType;
+    match rule {
+        Some(MatchType::Exact) => 0,
+        Some(MatchType::StartsWith) => 1,
+        Some(MatchType::RegularExpression) => 2,
+        Some(MatchType::Host) => 3,
+        Some(MatchType::BaseDomain) | Some(MatchType::Never) | None => 4,
+    }
+}
+
 /// The exe name without its extension, lowercased: `Slack.exe` -> `slack`.
 fn stem(exe_name: &str) -> String {
     exe_name
@@ -57,14 +77,18 @@ fn ranked(
     title: &str,
     item: &crate::app::ItemFacts,
     page: Option<&url::Url>,
-) -> Option<u8> {
+) -> Option<(u8, u8)> {
     if let Some(page) = page {
-        if item
+        // An item with several accepted websites is as strict as its
+        // strictest one.
+        let strictest = item
             .uris
             .iter()
-            .any(|saved| crate::uri_match::matches(&saved.uri, saved.match_type, page))
-        {
-            return Some(RANK_URL);
+            .filter(|saved| crate::uri_match::matches(&saved.uri, saved.match_type, page))
+            .map(|saved| strictness(saved.match_type))
+            .min();
+        if let Some(strictest) = strictest {
+            return Some((RANK_URL, strictest));
         }
     }
 
@@ -83,18 +107,18 @@ fn ranked(
         for saved in &item.uris {
             let Some(domain) = crate::favicon::domain_from_uri(&saved.uri) else { continue };
             if domain.to_ascii_lowercase().contains(&stem) {
-                return Some(RANK_URI_HOST);
+                return Some((RANK_URI_HOST, 0));
             }
         }
         if !name.is_empty() && name.contains(&stem) {
-            return Some(RANK_NAME);
+            return Some((RANK_NAME, 0));
         }
     }
 
     if !name.is_empty() {
         for word in title.to_ascii_lowercase().split(|c: char| !c.is_alphanumeric()) {
             if word.len() >= MIN_TITLE_WORD && name.contains(word) {
-                return Some(RANK_TITLE);
+                return Some((RANK_TITLE, 0));
             }
         }
     }
@@ -103,7 +127,9 @@ fn ranked(
 }
 
 /// The ranked candidates for this window, strongest first. Ties keep the
-/// vault's own order, so the list is stable between presses.
+/// vault's own order, so the list is stable between presses. Inside the
+/// `RANK_URL` tier a tie is first broken by the stricter saved rule (see
+/// [`strictness`]), and only then by vault order.
 /// Takes [`crate::app::ItemFacts`] rather than `VaultItem`s, and that is the
 /// point rather than a convenience: a `VaultItem` carries a password, so a
 /// matcher over a slice of them meant the daemon holding every password in
@@ -111,14 +137,15 @@ fn ranked(
 /// URIs.
 ///
 /// `page` is the browser's address, when one was read; `None` everywhere
-/// else, and then nothing about the URL rank applies.
+/// else, and then nothing about the URL rank applies. In a browser the
+/// exe-stem ranks are dropped even when `page` is `None`.
 pub fn candidates(
     exe_name: &str,
     title: &str,
     items: &[crate::app::ItemFacts],
     page: Option<&url::Url>,
 ) -> Vec<Candidate> {
-    let mut scored: Vec<(u8, Candidate)> = Vec::new();
+    let mut scored: Vec<((u8, u8), Candidate)> = Vec::new();
     for item in items {
         // No id, nothing to fill from later: not a candidate, however well it
         // reads.
@@ -135,6 +162,7 @@ pub fn candidates(
             },
         ));
     }
+    // `sort_by_key` is stable, which is what keeps ties in vault order.
     scored.sort_by_key(|(rank, _)| *rank);
     scored.into_iter().map(|(_, c)| c).collect()
 }
@@ -276,6 +304,70 @@ mod tests {
             "the login saved for this website must be the first row, which is the row the card \
              focuses when it opens"
         );
+    }
+
+    /// **Inside the URL tier the stricter saved rule wins**, so the row the
+    /// card focuses is the website the user saved most exactly -- even when
+    /// the looser login comes first in the vault.
+    #[test]
+    fn among_logins_saved_for_the_page_the_stricter_rule_ranks_first() {
+        let at = page("https://example.com/login");
+        let loose = item("loose", "Example", "a@x", Some("https://example.com"));
+        let exact = saved_with(
+            "exact",
+            "Example login",
+            "b@x",
+            Some("https://example.com/login"),
+            Some(serde_json::json!(3)),
+        );
+        let found = candidates("chrome.exe", "", &[loose, exact], Some(&at));
+        assert_eq!(ids(&found), vec!["exact", "loose"], "Exact is stricter than the base domain");
+    }
+
+    /// The full order, strongest first, fed in reverse so vault order cannot
+    /// be what produces it.
+    #[test]
+    fn the_url_tier_orders_exact_then_starts_with_then_regex_then_host_then_base_domain() {
+        let at = page("https://example.com/login");
+        let by = |id: &str, saved: &str, rule: Option<u8>| {
+            saved_with(id, id, "u@x", Some(saved), rule.map(|n| serde_json::json!(n)))
+        };
+        let vault = vec![
+            by("base", "https://example.com", Some(0)),
+            by("host", "example.com", Some(1)),
+            by("regex", "^https://example\\.com/", Some(4)),
+            by("starts", "https://example.com/", Some(2)),
+            by("exact", "https://example.com/login", Some(3)),
+        ];
+        let found = candidates("chrome.exe", "", &vault, Some(&at));
+        assert_eq!(ids(&found), vec!["exact", "starts", "regex", "host", "base"]);
+    }
+
+    /// An item saved for the page several ways is as strict as its strictest
+    /// website, wherever in its list that website is.
+    #[test]
+    fn an_item_with_several_matching_websites_ranks_by_its_strictest() {
+        let at = page("https://example.com/login");
+        let single = item("single", "Single", "a@x", Some("https://example.com"));
+        let mut many = saved_with("many", "Many", "b@x", Some("example.com"), Some(serde_json::json!(1)));
+        many.uris.push(crate::uri_match::SavedUri {
+            uri: "https://example.com/login".to_string(),
+            match_type: Some(crate::uri_match::MatchType::Exact),
+        });
+        let found = candidates("chrome.exe", "", &[single, many], Some(&at));
+        assert_eq!(ids(&found), vec!["many", "single"], "the Exact website, second in its list, decides");
+    }
+
+    /// Ties at the same strength are not reshuffled.
+    #[test]
+    fn equally_strict_matches_keep_vault_order() {
+        let at = page("https://example.com/login");
+        let first = item("first", "First", "a@x", Some("https://example.com"));
+        let second = item("second", "Second", "b@x", Some("https://www.example.com"));
+        let found = candidates("chrome.exe", "", &[first.clone(), second.clone()], Some(&at));
+        assert_eq!(ids(&found), vec!["first", "second"]);
+        let found = candidates("chrome.exe", "", &[second, first], Some(&at));
+        assert_eq!(ids(&found), vec!["second", "first"], "vault order, not name or id order");
     }
 
     /// The URL rank is Bitwarden's rule for the entry, not "the host looks
