@@ -54,6 +54,11 @@ pub enum Family {
 /// The family a top-level window class belongs to, or `None` -- which is
 /// every other browser, Internet Explorer's `IEFrame` included, and means "no
 /// address is read".
+///
+/// Any `Chrome_WidgetWin_*` is Chromium: `_1` is the class every measured
+/// browser uses, but the suffix is a counter of Chromium's own and a build may
+/// number its top-level window otherwise. `MozillaWindowClass` is the one
+/// Gecko class.
 pub fn family_of_class(class_name: &str) -> Option<Family> {
     if class_name.starts_with("Chrome_WidgetWin_") {
         Some(Family::Chromium)
@@ -143,7 +148,9 @@ pub const MAX_FIELD_DEPTH: usize = 10;
 ///
 /// `depth` is how many ancestors the walk up from the field took to reach the
 /// browser window (the window included), or `None` if it did not reach it
-/// within [`MAX_FIELD_DEPTH`]. `crosses_a_document` is whether any ancestor on
+/// within [`MAX_FIELD_DEPTH`]. Only `1..=MAX_FIELD_DEPTH` counts: the window
+/// itself is the first step, so `Some(0)` describes a walk that never left the
+/// field and proves nothing. `crosses_a_document` is whether any ancestor on
 /// the way was a UI Automation `Document` -- which is what a web page is
 /// exposed as, and which the toolbar never sits inside.
 ///
@@ -151,7 +158,7 @@ pub const MAX_FIELD_DEPTH: usize = 10;
 /// measured but one (a Firefox tab whose page was exposed without its
 /// Document, 13 deep), and the depth bound is what refuses that one.
 pub fn is_browser_chrome(depth: Option<usize>, crosses_a_document: bool) -> bool {
-    !crosses_a_document && depth.is_some_and(|depth| depth <= MAX_FIELD_DEPTH)
+    !crosses_a_document && depth.is_some_and(|depth| (1..=MAX_FIELD_DEPTH).contains(&depth))
 }
 
 /// The longest address-bar text that is parsed at all, in bytes.
@@ -164,16 +171,25 @@ pub const MAX_ADDRESS_LEN: usize = 8192;
 /// The address-bar text as a URL, or `None` when it is not a web address.
 ///
 /// * trimmed;
-/// * `https://` is put in front of text with no `://` -- browsers hide the
-///   scheme, so `example.com/login` is what the field often holds;
+/// * `https://` is put in front of text that does not start with a scheme --
+///   browsers hide it, so `example.com/login` is what the field often holds.
+///   Text has a scheme only when what precedes its FIRST `://` is a valid one
+///   (`[A-Za-z][A-Za-z0-9+.-]*`): `accounts.example.com/signin?continue=https://mail.example.com`
+///   has a `://` too, but it is in the query of a scheme-less address. Trying
+///   `Url::parse` first would be wrong the other way, because `localhost:3000`
+///   and `example.com:8443/x` parse, with `localhost` and `example.com` as the
+///   scheme;
 /// * only `http` and `https` are kept: `chrome://settings`, `about:blank`,
 ///   `file:///` and `edge://newtab` are not websites;
 /// * text with whitespace in it is a search the user is typing, not an
 ///   address;
 /// * the host must be `localhost`, an IP address, or a name with a dot in it
 ///   -- `intranet` and `printer` are single words the user typed, which a
-///   browser would search for;
-/// * anything the `url` crate does not parse is `None`.
+///   browser would search for. A trailing dot is not a dot: `intranet.` is
+///   still a dotless name, while `example.com.` and `localhost.` are fine;
+/// * anything the `url` crate does not parse is `None`;
+/// * userinfo is dropped: a user who typed `user:pass@host` has put a password
+///   in the field, and a `Url` that kept it would print it under `Debug`.
 ///
 /// **Never trusted for anything but choosing a highlighted row.**
 pub fn parse(text: &str) -> Option<url::Url> {
@@ -181,19 +197,36 @@ pub fn parse(text: &str) -> Option<url::Url> {
     if text.is_empty() || text.len() > MAX_ADDRESS_LEN || text.chars().any(char::is_whitespace) {
         return None;
     }
-    let url = if text.contains("://") {
+    let mut url = if has_scheme(text) {
         url::Url::parse(text).ok()?
     } else {
         url::Url::parse(&format!("https://{text}")).ok()?
     };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
     if url.scheme() != "http" && url.scheme() != "https" {
         return None;
     }
     let looks_like_a_site = match url.host()? {
         url::Host::Ipv4(_) | url::Host::Ipv6(_) => true,
-        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost") || name.contains('.'),
+        url::Host::Domain(name) => {
+            let name = name.trim_end_matches('.');
+            name.eq_ignore_ascii_case("localhost") || name.contains('.')
+        }
     };
     looks_like_a_site.then_some(url)
+}
+
+/// Whether `text` starts with a URL scheme: what precedes its first `://` is
+/// `[A-Za-z][A-Za-z0-9+.-]*`. Checked by hand, because this crate has no regex
+/// need here and a dependency for one character class is not worth it.
+fn has_scheme(text: &str) -> bool {
+    let Some((scheme, _)) = text.split_once("://") else {
+        return false;
+    };
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|first| first.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
 }
 
 #[cfg(test)]
@@ -244,6 +277,53 @@ mod tests {
         assert_eq!(ip.host(), Some(url::Host::Ipv4(std::net::Ipv4Addr::new(192, 168, 1, 1))));
         assert_eq!(ip.port(), Some(8443));
         assert!(parse("[::1]:8080").is_some(), "an IPv6 literal has no dot and is still an address");
+    }
+
+    #[test]
+    fn a_scheme_less_address_may_carry_a_url_in_its_query_or_fragment() {
+        let url = parse("accounts.example.com/signin?continue=https://mail.example.com/x")
+            .expect("a sign-in page with a redirect in its query");
+        assert_eq!(url.host_str(), Some("accounts.example.com"));
+        assert_eq!(url.scheme(), "https");
+        assert_eq!(url.query(), Some("continue=https://mail.example.com/x"));
+        let fragment = parse("example.com/#https://x").expect("a URL in the fragment");
+        assert_eq!(fragment.host_str(), Some("example.com"));
+        assert_eq!(parse("http://example.com/r?u=https://other.com").unwrap().scheme(), "http");
+        // Controls: these parse with a bogus scheme under "try Url::parse first".
+        assert_eq!(parse("localhost:3000/login").unwrap().host_str(), Some("localhost"));
+        assert_eq!(parse("example.com:8443/x").unwrap().host_str(), Some("example.com"));
+        for text in ["javascript:alert(1)", "chrome://settings", "file:///c:/x"] {
+            assert_eq!(parsed(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_scheme_is_letters_digits_plus_dot_and_minus_after_a_letter() {
+        assert!(has_scheme("https://x"));
+        assert!(has_scheme("a+b.c-d1://x"));
+        for text in ["example.com", "://x", "1http://x", "-a://x", "a b://x", "example.com/p?u=https://x", "a/b://x"] {
+            assert!(!has_scheme(text), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_dotless_name_with_a_trailing_dot_is_still_dotless() {
+        assert_eq!(parsed("intranet."), None);
+        assert_eq!(parsed("intranet./login"), None);
+        assert_eq!(parsed("example.com."), Some("https://example.com./".to_string()));
+        assert!(parse("localhost.").is_some());
+        assert!(parse("localhost.:3000/x").is_some());
+    }
+
+    #[test]
+    fn typed_userinfo_is_not_kept() {
+        let url = parse("user:pass@bank.com").expect("an address with userinfo");
+        assert_eq!(url.host_str(), Some("bank.com"));
+        assert_eq!(url.username(), "");
+        assert_eq!(url.password(), None);
+        assert!(!format!("{url:?}").contains("pass@") && !format!("{url:?}").contains("\"pass\""),"Debug must not print the typed password");
+        let with_scheme = parse("https://user:pass@bank.com/x").unwrap();
+        assert_eq!((with_scheme.username(), with_scheme.password()), ("", None));
     }
 
     #[test]
@@ -308,6 +388,8 @@ mod tests {
         assert!(!is_browser_chrome(Some(13), false), "a page exposed without its Document is still too deep");
         assert!(!is_browser_chrome(Some(MAX_FIELD_DEPTH + 1), false));
         assert!(!is_browser_chrome(None, false), "a walk that never reached the window proves nothing");
+        assert!(!is_browser_chrome(Some(0), false), "zero steps is not a walk up to the window");
+        assert!(is_browser_chrome(Some(1), false), "control: the lower bound itself is inside");
     }
 
     #[test]
