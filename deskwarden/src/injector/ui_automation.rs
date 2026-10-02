@@ -982,6 +982,94 @@ mod address_field_tests {
                 "`{signature}` reads the page's Document: only `browser_url::read` may ask for it"
             );
         }
+        the_page_document_is_asked_for_from_one_call_site_in_the_whole_crate();
+    }
+
+    /// Every `.rs` file under `src/`, as (path relative to `src/`, the text
+    /// above its first test gate with `//` comment lines dropped).
+    ///
+    /// Walked off disk and not listed with `include_str!`, for the reason
+    /// `http_agent`'s `crate_source_files` gives: the caller this pin is
+    /// afraid of is a *future* one, in a file a hand-written list would not
+    /// name. `page_document_text` is `pub`, so `app.rs` or a new module can
+    /// call it as easily as `browser_url.rs` does.
+    fn production_sources_under_src() -> Vec<(String, String)> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+            for entry in std::fs::read_dir(dir).expect("src/ is readable").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(root, &path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                    let rel = path
+                        .strip_prefix(root)
+                        .expect("walked from root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    let text = std::fs::read_to_string(&path).expect("source is UTF-8");
+                    let production = text
+                        .split_once(concat!("#[cfg(", "test)]"))
+                        .map_or(text.as_str(), |(above, _)| above);
+                    let code: String = production
+                        .lines()
+                        .filter(|line| !line.trim_start().starts_with("//"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    out.push((rel, code));
+                }
+            }
+        }
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        walk(root, root, &mut files);
+        files
+    }
+
+    /// **`page_document_text` has exactly one caller in the whole crate**, and
+    /// it is `browser_url::read`, behind the Chromium-family and elided-text
+    /// conditions that `browser_url`'s own pin holds. The function is `pub`, so
+    /// a call from `app.rs` (or any module added later) would read the page's
+    /// address without those conditions; the per-function checks above and
+    /// `browser_url`'s own count cannot see it, so this one counts call sites
+    /// in every file under `src/`, outside test modules and not counting the
+    /// definition. Run from
+    /// `the_only_value_reads_are_the_address_field_and_the_page_document`
+    /// rather than as a test of its own: it is the same claim, and the README's
+    /// test-count badge is pinned to the number of `#[test]` fns.
+    fn the_page_document_is_asked_for_from_one_call_site_in_the_whole_crate() {
+        let files = production_sources_under_src();
+        // Controls: the walk found this crate's sources, and the needle matches
+        // live code -- the definition is here, and the one call is where the
+        // doc comments say it is -- so a count of one is a count and not a
+        // needle that matches nothing.
+        assert!(files.len() > 50, "control: the walk did not find the crate's sources");
+        let call = concat!("page_document_", "text(");
+        let definition = concat!("fn page_document_", "text(");
+        let in_file = |name: &str| {
+            files
+                .iter()
+                .find(|(path, _)| path == name)
+                .unwrap_or_else(|| panic!("control: `{name}` is not under src/"))
+                .1
+                .as_str()
+        };
+        assert_eq!(
+            in_file("injector/ui_automation.rs").matches(definition).count(),
+            1,
+            "control: the definition is no longer in ui_automation.rs, so the count below is vacuous"
+        );
+        let mut callers: Vec<(String, usize)> = Vec::new();
+        for (path, code) in &files {
+            let sites = code.matches(call).count() - code.matches(definition).count();
+            if sites > 0 {
+                callers.push((path.clone(), sites));
+            }
+        }
+        assert_eq!(
+            callers,
+            vec![("browser_url.rs".to_string(), 1)],
+            "the page's Document is read from somewhere other than the one call in \
+             `browser_url::read` (file, call sites)"
+        );
     }
 
     #[test]

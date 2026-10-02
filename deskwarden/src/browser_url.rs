@@ -718,14 +718,38 @@ mod tests {
             1,
             "the page's Document is read from a second place in this module"
         );
+        // Whitespace is removed from both sides, so a rustfmt reflow of the
+        // call (a different indent, the `.then` joined onto the line above)
+        // cannot turn this red while the two conditions are still in front of
+        // the read. What is pinned is the order of the tokens, not their layout.
+        let squashed = |text: &str| -> String { text.chars().filter(|c| !c.is_whitespace()).collect() };
+        let production = squashed(production);
+        let needle = squashed(concat!(
+            "(family.reads_the_page_document() && !had_scheme)\n",
+            "        .then(|| crate::injector::ui_automation::page_document_",
+            "text(hwnd)"
+        ));
         assert!(
-            production.contains(concat!(
-                "(family.reads_the_page_document() && !had_scheme)\n",
-                "        .then(|| crate::injector::ui_automation::page_document_",
-                "text(hwnd)"
-            )),
+            needle.len() > 40 && !needle.contains(char::is_whitespace),
+            "control: the needle was not squashed, so the comparison below is layout-bound again"
+        );
+        assert!(
+            production.contains(&needle),
             "the Document read is no longer behind the family and the elided-text conditions"
         );
+        // Controls on the comparison itself: a reflowed spelling of the same
+        // call still matches, and the call with the elided-text condition
+        // dropped does not.
+        let reflowed = squashed(
+            "(family.reads_the_page_document()\n    && !had_scheme).then(||\n  \
+             crate::injector::ui_automation::page_document_text(hwnd)",
+        );
+        let unconditional = squashed(
+            "(family.reads_the_page_document()).then(|| \
+             crate::injector::ui_automation::page_document_text(hwnd)",
+        );
+        assert_eq!(reflowed, needle, "control: whitespace still decides the comparison");
+        assert!(!unconditional.contains(&needle), "control: the needle ignores `!had_scheme`");
     }
 
     #[test]
