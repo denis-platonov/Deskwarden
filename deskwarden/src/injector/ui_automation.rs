@@ -393,7 +393,8 @@ pub fn address_field_text(
 /// page. `crate::browser_url::read` calls this only for the Chromium family and
 /// only when the omnibox text had no scheme, and hands the text to
 /// `crate::browser_url::prefer_document`, which uses it only if it names the
-/// omnibox's own host. This function decides nothing.
+/// omnibox's own host, and withdraws the omnibox's address if it is a web page
+/// on another host (the user is typing). This function decides nothing.
 ///
 /// **Never for the Firefox family**: there the first `Document` was another
 /// tab's page. `crate::browser_url::Family::reads_the_page_document` says so.
@@ -403,7 +404,8 @@ pub fn address_field_text(
 /// order rather than a walk for the shallowest: a page's own frames are
 /// `Document`s below its top `Document`, so they come after it in that order;
 /// a `Document` of the browser's own (devtools, a side panel) can come first,
-/// and is what the host check in `prefer_document` refuses. `FindFirst`
+/// and the host check in `browser_url::document_verdict` never lets it supply
+/// an address -- at most, a web page on another host withdraws one. `FindFirst`
 /// answers `Err` for "nothing found" as well as for a failure (see
 /// [`window_has_password_field`]), and both are "no document".
 ///

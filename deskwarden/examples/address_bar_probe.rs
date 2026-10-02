@@ -52,8 +52,8 @@ fn main() {
     match deskwarden::browser_url::read(window.hwnd) {
         Some(url) => println!("Address bar: {url}"),
         None => println!(
-            "Address bar: nothing (not a supported browser, no address field found, or not a \
-             web address)"
+            "Address bar: nothing (not a supported browser, no address field found, not a web \
+             address, or typed text over a page on another host)"
         ),
     }
 }

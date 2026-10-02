@@ -23,8 +23,8 @@
 //! # Two halves, in this crate's idiom
 //!
 //! [`parse`], [`family_of_class`], [`Family::address_field`],
-//! [`is_browser_chrome`], [`reading_order`] and [`prefer_document`] are pure
-//! and tested. `read` is
+//! [`is_browser_chrome`], [`reading_order`], [`document_verdict`] and
+//! [`prefer_document`] are pure and tested. `read` is
 //! the observation half -- one window-class lookup, one UI Automation query for
 //! the address field and, in a Chromium browser whose omnibox showed an elided
 //! address, one for the page's `Document`, all in `injector::ui_automation`
@@ -296,8 +296,10 @@ pub fn parse(text: &str) -> Option<url::Url> {
 /// only when the field's text came without a scheme, the `Document` is read as
 /// well and [`prefer_document`] decides whether it may restore the scheme, the
 /// `www.` and the path. **The address field stays the authority for the
-/// host**: a `Document` that names another host is ignored. In Firefox the
-/// first `Document` was another tab's page, so it is never read there.
+/// host**: a `Document` that is a web page on another host never supplies an
+/// address -- it only withdraws the field's, because then the field is holding
+/// what the user is typing, not the page (see [`document_verdict`]). In Firefox
+/// the first `Document` was another tab's page, so it is never read there.
 pub fn read(hwnd: isize) -> Option<url::Url> {
     let class = crate::injector::target::class_name_of(hwnd)?;
     let family = family_of_class(&class)?;
@@ -309,68 +311,126 @@ pub fn read(hwnd: isize) -> Option<url::Url> {
     let document = (family.reads_the_page_document() && !had_scheme)
         .then(|| crate::injector::ui_automation::page_document_text(hwnd).ok().flatten())
         .flatten();
-    Some(prefer_document(&omnibox, had_scheme, document.as_deref()))
+    prefer_document(&omnibox, had_scheme, document.as_deref())
 }
 
-/// **The page's address: the address field's, or the page `Document`'s when
-/// that is the same page spelled in full.**
+/// What the window's first `Document` says about an elided address field.
+/// See [`document_verdict`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DocumentVerdict {
+    /// The same page, spelled in full: this is the page's address.
+    Agrees(url::Url),
+    /// Nothing the address field can be checked against -- no `Document`, an
+    /// empty one, one that is not a web page (`chrome://`, `devtools://`), or
+    /// one on the field's own host behind another port. The field's text
+    /// stands.
+    Unusable,
+    /// **A web page on another host.** The field is not showing the page: the
+    /// user is typing another address into it. Nothing is the page's address.
+    Disagrees,
+}
+
+/// **Whether the window's first `Document` confirms, cannot speak to, or
+/// contradicts the address field's elided text.**
+///
+/// `omnibox` is the address field's text after [`parse`]; `document_text` is
+/// the value of the window's first `Document`, when one was read (see [`read`]
+/// for why, and for the 2026-10-01 measurement this rests on). Only asked when
+/// the field's text had no scheme -- see [`prefer_document`].
+///
+/// * [`DocumentVerdict::Unusable`] when there is no document text, or it does
+///   not itself start with a scheme, or [`parse`] refuses it: `http` or
+///   `https` only (`chrome://`, `devtools://` and `about:` are not pages),
+///   within [`MAX_ADDRESS_LEN`], no whitespace. Such a `Document` says nothing
+///   about which web page is in front of the user, so it neither confirms nor
+///   contradicts the field.
+/// * [`DocumentVerdict::Agrees`] when its host, lowercased and without a
+///   trailing dot, **equals** the address field's, or equals `www.` followed
+///   by it -- the one prefix Chrome elides -- and its port is the field's.
+///   Equality, never "ends with" or "contains":
+///   `evil-mail.google.com.attacker.net` is not `mail.google.com`. Userinfo is
+///   dropped, as [`parse`] drops it.
+/// * The same host on another port is [`DocumentVerdict::Unusable`]: Chrome
+///   shows a non-default port in the elided text, so that is another server
+///   on the field's host -- a stale `Document` -- and the field, whose host is
+///   right either way, stands.
+/// * [`DocumentVerdict::Disagrees`] when it is a web page on any other host.
+///
+/// # Why a disagreeing page withdraws the address instead of being ignored
+///
+/// The `Document` is the page the browser is showing; the address field is
+/// what it is showing ABOVE that page -- and while the user edits it, that is
+/// whatever they have typed so far. Typing `bank.com` over
+/// `https://news.example/` leaves an elided `bank.com` in the field and
+/// `https://news.example/` in the `Document`: reading the field then would
+/// rank the bank's login first on the news site. Ignoring the `Document` (the
+/// first version of this function) did exactly that.
+///
+/// **The field is still the authority for the host.** A disagreeing
+/// `Document` never supplies an address -- a page on another host could be a
+/// side panel, docked devtools showing a page, or a document left over from
+/// the previous page as easily as the real one -- it only takes the field's
+/// away. The cost of a false alarm (a side panel on another `https` host) is
+/// the picker ranking by the window title as it did before any address was
+/// read, which is the safe direction to fail in.
+pub fn document_verdict(omnibox: &url::Url, document_text: Option<&str>) -> DocumentVerdict {
+    let Some(text) = document_text.map(str::trim) else {
+        return DocumentVerdict::Unusable;
+    };
+    if !has_scheme(text) {
+        return DocumentVerdict::Unusable;
+    }
+    let Some(document) = parse(text) else {
+        return DocumentVerdict::Unusable;
+    };
+    let (Some(shown), Some(page)) = (comparable_host(omnibox), comparable_host(&document)) else {
+        return DocumentVerdict::Unusable;
+    };
+    let same_host = page == shown || page.strip_prefix("www.") == Some(shown.as_str());
+    if !same_host {
+        DocumentVerdict::Disagrees
+    } else if document.port() == omnibox.port() {
+        DocumentVerdict::Agrees(document)
+    } else {
+        DocumentVerdict::Unusable
+    }
+}
+
+/// **The page's address: the address field's, the page `Document`'s when
+/// that is the same page spelled in full, or `None` when the `Document` shows
+/// the field is holding typed text.**
 ///
 /// `omnibox` is the address field's text after [`parse`]; `omnibox_had_scheme`
 /// is whether that text started with a scheme; `document_text` is the value of
-/// the window's first `Document`, when one was read (see [`read`] for why, and
-/// for the 2026-10-01 measurement this rests on).
+/// the window's first `Document`, when one was read.
 ///
-/// The document's URL is used only when ALL of these hold, and otherwise
-/// `omnibox` is returned unchanged:
+/// * The field's text had a scheme (Edge, or Chrome with "Always show full
+///   URLs"): it is already the full address, the `Document` is not consulted
+///   at all, and `omnibox` is the answer.
+/// * Otherwise the [`document_verdict`] decides: `Agrees` gives the
+///   document's URL -- restoring what the elision hid: the scheme (`http` for
+///   a plain-HTTP site the field showed bare), the `www.`, and the full path
+///   and query; `Unusable` keeps `omnibox`; `Disagrees` is `None`, and the
+///   picker ranks by the title as it did before.
 ///
-/// * the address field's text had **no** scheme -- an elided display text.
-///   Text with a scheme (Edge, or Chrome with "Always show full URLs") is
-///   already the full address, and the `Document` is not consulted at all;
-/// * the document text itself starts with a scheme, and [`parse`] accepts it:
-///   `http` or `https` only (`chrome://`, `devtools://` and `about:` are not
-///   pages), within [`MAX_ADDRESS_LEN`], userinfo dropped;
-/// * its host, lowercased and without a trailing dot, **equals** the address
-///   field's, or equals `www.` followed by it -- the one prefix Chrome elides.
-///   Equality, never "ends with" or "contains":
-///   `evil-mail.google.com.attacker.net` is not `mail.google.com`;
-/// * its port is the address field's. Chrome shows a non-default port in the
-///   elided text, so a mismatch is another server on the same host -- a stale
-///   `Document`, not the page -- and is refused like any other mismatch.
-///
-/// So the address field stays the authority for the host, and the `Document`
-/// only restores what the elision hid: the scheme (`http` for a plain-HTTP
-/// site the field showed bare), the `www.`, and the full path and query. A
-/// `Document` that names another host -- devtools docked in the window, a
-/// side panel, a document left over from the previous page -- changes nothing.
+/// So the `Document` can restore what the field elided, or withdraw the
+/// field's address, and nothing else: it never names a host the field did not.
 pub fn prefer_document(
     omnibox: &url::Url,
     omnibox_had_scheme: bool,
     document_text: Option<&str>,
-) -> url::Url {
+) -> Option<url::Url> {
     if omnibox_had_scheme {
-        return omnibox.clone();
+        return Some(omnibox.clone());
     }
-    let Some(text) = document_text.map(str::trim) else {
-        return omnibox.clone();
-    };
-    if !has_scheme(text) {
-        return omnibox.clone();
-    }
-    let Some(document) = parse(text) else {
-        return omnibox.clone();
-    };
-    let (Some(shown), Some(page)) = (comparable_host(omnibox), comparable_host(&document)) else {
-        return omnibox.clone();
-    };
-    let same_host = page == shown || page.strip_prefix("www.") == Some(shown.as_str());
-    if same_host && document.port() == omnibox.port() {
-        document
-    } else {
-        omnibox.clone()
+    match document_verdict(omnibox, document_text) {
+        DocumentVerdict::Agrees(document) => Some(document),
+        DocumentVerdict::Unusable => Some(omnibox.clone()),
+        DocumentVerdict::Disagrees => None,
     }
 }
 
-/// A URL's host as [`prefer_document`] compares it: lowercased, without a
+/// A URL's host as [`document_verdict`] compares it: lowercased, without a
 /// trailing dot.
 fn comparable_host(url: &url::Url) -> Option<String> {
     let host = url.host_str()?.trim_end_matches('.').to_ascii_lowercase();
@@ -585,20 +645,33 @@ mod tests {
         parse(text).expect("the fixture omnibox text parses")
     }
 
-    fn preferred(omnibox: &str, document: Option<&str>) -> String {
-        prefer_document(&elided(omnibox), false, document).to_string()
+    fn preferred(omnibox: &str, document: Option<&str>) -> Option<String> {
+        prefer_document(&elided(omnibox), false, document).map(|url| url.to_string())
+    }
+
+    fn verdict(omnibox: &str, document: Option<&str>) -> DocumentVerdict {
+        document_verdict(&elided(omnibox), document)
+    }
+
+    fn kept(url: &str) -> Option<String> {
+        Some(url.to_string())
     }
 
     #[test]
     fn a_document_on_the_same_host_restores_the_full_address() {
         assert_eq!(
             preferred("mail.google.com/mail/u/0/", Some("https://mail.google.com/mail/u/0/#inbox")),
-            "https://mail.google.com/mail/u/0/#inbox"
+            kept("https://mail.google.com/mail/u/0/#inbox")
         );
         assert_eq!(
             preferred("MAIL.google.com./x", Some("https://mail.google.com/x?a=1")),
-            "https://mail.google.com/x?a=1",
+            kept("https://mail.google.com/x?a=1"),
             "hosts compare lowercased and without a trailing dot"
+        );
+        assert_eq!(
+            verdict("mail.google.com/x", Some("  https://mail.google.com/x/full  ")),
+            DocumentVerdict::Agrees(parse("https://mail.google.com/x/full").unwrap()),
+            "the verdict carries the document's own address, trimmed"
         );
     }
 
@@ -606,7 +679,7 @@ mod tests {
     fn a_document_may_restore_the_www_chrome_elided() {
         assert_eq!(
             preferred("example.com/login", Some("https://www.example.com/login?next=%2F")),
-            "https://www.example.com/login?next=%2F"
+            kept("https://www.example.com/login?next=%2F")
         );
     }
 
@@ -615,50 +688,82 @@ mod tests {
         assert_eq!(elided("example.com/login").scheme(), "https", "control: the bare text reads as https");
         assert_eq!(
             preferred("example.com/login", Some("http://example.com/login")),
-            "http://example.com/login"
+            kept("http://example.com/login")
         );
         assert_eq!(
             preferred("localhost:3000/login", Some("http://localhost:3000/login")),
-            "http://localhost:3000/login"
+            kept("http://localhost:3000/login")
+        );
+    }
+
+    /// **The user is typing another address over the page.** The field holds
+    /// what they typed, the `Document` the page they are still on: ranking by
+    /// the field would put the bank's login on top on the news site.
+    #[test]
+    fn typing_another_address_over_a_page_is_no_address() {
+        assert_eq!(verdict("bank.com", Some("https://news.example/")), DocumentVerdict::Disagrees);
+        assert_eq!(preferred("bank.com", Some("https://news.example/")), None);
+        assert_eq!(
+            preferred("bank.com", Some("https://bank.com/")),
+            kept("https://bank.com/"),
+            "control: once the page IS the bank, the field and the page agree"
         );
     }
 
     #[test]
-    fn a_document_on_another_host_is_refused() {
+    fn a_web_page_on_another_host_withdraws_the_address() {
         for document in [
             "https://accounts.google.com/",
             "https://google.com/",
             "https://evil.example/mail.google.com/",
             "https://mail.google.com.evil.example/",
+            "http://accounts.google.com/",
         ] {
-            assert_eq!(preferred("mail.google.com/x", Some(document)), "https://mail.google.com/x", "{document}");
+            assert_eq!(verdict("mail.google.com/x", Some(document)), DocumentVerdict::Disagrees, "{document}");
+            assert_eq!(preferred("mail.google.com/x", Some(document)), None, "{document}");
         }
         assert_eq!(
             preferred("www.example.com/x", Some("https://example.com/x")),
-            "https://www.example.com/x",
-            "only a `www.` the omnibox elided is restored, never one it showed and the document lacks"
+            None,
+            "only a `www.` the omnibox elided is the same host, never one it showed and the document lacks"
         );
+    }
+
+    /// A side panel or docked devtools showing a page on another `https` host
+    /// comes first in tree order too, and is told apart from typed text by
+    /// nothing. It withdraws the address as typed text does: the picker ranks
+    /// by the title, as it did before any address was read. Accepted, because
+    /// that is the safe direction -- the other would let a `Document` the
+    /// field never named decide the page.
+    #[test]
+    fn a_side_panel_on_another_host_also_withdraws_the_address() {
+        assert_eq!(preferred("mail.google.com/x", Some("https://www.google.com/search?q=x")), None);
+    }
+
+    #[test]
+    fn another_port_on_the_same_host_keeps_the_field() {
+        assert_eq!(verdict("example.com:8443/x", Some("https://example.com:9443/x")), DocumentVerdict::Unusable);
         assert_eq!(
             preferred("example.com:8443/x", Some("https://example.com:9443/x")),
-            "https://example.com:8443/x",
-            "another port on the same host is another server: a stale document, not the page"
+            kept("https://example.com:8443/x"),
+            "another port on the same host is a stale document; the field's host is right either way"
         );
     }
 
     #[test]
-    fn a_document_whose_host_merely_contains_the_omnibox_host_is_refused() {
+    fn a_document_whose_host_merely_contains_the_omnibox_host_is_another_host() {
         for document in [
             "https://evil-mail.google.com.attacker.net/",
             "https://www.mail.google.com.attacker.net/",
             "https://xmail.google.com/",
             "https://wwwmail.google.com/",
         ] {
-            assert_eq!(preferred("mail.google.com/", Some(document)), "https://mail.google.com/", "{document}");
+            assert_eq!(preferred("mail.google.com/", Some(document)), None, "{document}");
         }
     }
 
     #[test]
-    fn a_document_that_is_not_a_web_page_is_refused() {
+    fn a_document_that_is_not_a_web_page_keeps_the_field() {
         for document in [
             "chrome://settings/",
             "devtools://devtools/bundled/inspector.html?mail.google.com",
@@ -666,17 +771,22 @@ mod tests {
             "file:///C:/mail.google.com/x.html",
             "mail.google.com/x",
             "",
+            "   ",
             "https://mail.google.com/a b",
+            "https://news.example/a b",
         ] {
-            assert_eq!(preferred("mail.google.com/x", Some(document)), "https://mail.google.com/x", "{document:?}");
+            assert_eq!(verdict("mail.google.com/x", Some(document)), DocumentVerdict::Unusable, "{document:?}");
+            assert_eq!(preferred("mail.google.com/x", Some(document)), kept("https://mail.google.com/x"), "{document:?}");
         }
-        let oversized = format!("https://mail.google.com/{}", "a".repeat(MAX_ADDRESS_LEN));
-        assert_eq!(preferred("mail.google.com/x", Some(&oversized)), "https://mail.google.com/x");
+        let oversized = format!("https://news.example/{}", "a".repeat(MAX_ADDRESS_LEN));
+        assert_eq!(verdict("mail.google.com/x", Some(&oversized)), DocumentVerdict::Unusable);
+        assert_eq!(preferred("mail.google.com/x", Some(&oversized)), kept("https://mail.google.com/x"));
     }
 
     #[test]
     fn a_documents_userinfo_is_not_kept() {
-        let url = prefer_document(&elided("bank.com/x"), false, Some("https://user:pass@bank.com/x/full"));
+        let url = prefer_document(&elided("bank.com/x"), false, Some("https://user:pass@bank.com/x/full"))
+            .expect("the same host agrees");
         assert_eq!(url.path(), "/x/full", "control: the document's address was taken");
         assert_eq!((url.username(), url.password()), ("", None));
     }
@@ -684,16 +794,19 @@ mod tests {
     #[test]
     fn an_omnibox_that_showed_a_scheme_is_not_second_guessed() {
         let full = parse("https://mail.google.com/x").unwrap();
-        assert_eq!(
-            prefer_document(&full, true, Some("https://mail.google.com/x/elsewhere")).as_str(),
-            "https://mail.google.com/x",
-            "Edge, or Chrome showing full URLs: the field's own text is the address"
-        );
+        for document in [Some("https://mail.google.com/x/elsewhere"), Some("https://news.example/"), None] {
+            assert_eq!(
+                prefer_document(&full, true, document).map(|url| url.to_string()),
+                kept("https://mail.google.com/x"),
+                "Edge, or Chrome showing full URLs: the field's own text is the address ({document:?})"
+            );
+        }
     }
 
     #[test]
     fn no_document_keeps_the_omnibox_address() {
-        assert_eq!(preferred("mail.google.com/x", None), "https://mail.google.com/x");
+        assert_eq!(verdict("mail.google.com/x", None), DocumentVerdict::Unusable);
+        assert_eq!(preferred("mail.google.com/x", None), kept("https://mail.google.com/x"));
     }
 
     #[test]

@@ -51,14 +51,25 @@ string in a browser window that identifies the site.
   has a `ValuePattern` value with the full URL of the active tab; the browser sets it. In
   Firefox the first `Document` under the window was a different tab's page.
   So, in the Chromium family only, and only when the omnibox text had no scheme, `read` also
-  takes the first `Document`'s value (`FindFirst`, descendants, same session and timeouts) and
-  `browser_url::prefer_document` (pure) uses it as the page URL only if it parses as `http` or
-  `https` (userinfo dropped, the same 8192-byte cap) and its host, lowercased and without a
-  trailing dot, equals the omnibox host or `www.` + it, and its port is the omnibox's.
-  Otherwise the omnibox-derived URL stands. The omnibox stays the authority for the host; the
-  `Document` only restores the scheme, the `www.` and the full path. Omnibox text that already
-  had a scheme (Edge, Chrome with "Always show full URLs") never triggers the `Document` read.
-  The `Document` is never read in the Firefox family, and its text is never logged.
+  takes the first `Document`'s value (`FindFirst`, descendants, same session and timeouts), and
+  `browser_url::document_verdict` (pure) judges it against the omnibox:
+  - **Agrees**: it parses as `http` or `https` (userinfo dropped, the same 8192-byte cap) and
+    its host, lowercased and without a trailing dot, equals the omnibox host or `www.` + it,
+    and its port is the omnibox's. Its URL is the page URL.
+  - **Unusable**: no `Document`, a read error, an empty value, a value that does not start with
+    a scheme or that `parse` refuses (`chrome://`, `devtools://`, `about:`, too long,
+    whitespace), or the omnibox's host on another port (a stale `Document`). The
+    omnibox-derived URL stands.
+  - **Disagrees**: a valid `http`/`https` page on any other host. The omnibox is holding typed
+    text -- the user is mid-edit, e.g. `bank.com` typed over `https://news.example/` -- so
+    `read` returns nothing and the picker ranks by the title as before. A side panel or docked
+    devtools showing a page on another host looks the same and also withdraws the address;
+    that is accepted, because it fails to today's title ranking.
+  The omnibox stays the authority for the host: the `Document` only restores the scheme, the
+  `www.` and the full path, and a disagreeing `Document` only ever withdraws the address --
+  it never supplies one. Omnibox text that already had a scheme (Edge, Chrome with "Always
+  show full URLs") never triggers the `Document` read. The `Document` is never read in the
+  Firefox family, and its text is never logged.
 - Lives beside `injector::ui_automation` and keeps the same apartment handling.
 
 ### `browser_url::parse` (pure)
@@ -124,10 +135,13 @@ string in a browser window that identifies the site.
 
 - `browser_url::parse`: scheme added, `http`/`https` only, search text rejected, `localhost`,
   IP addresses, ports, internationalised domains.
-- `browser_url::prefer_document`: an agreeing host, a `www.`-prefixed document host, an `http`
-  document for an elided `http` site, a mismatching host, a non-web scheme (`chrome://`,
-  `devtools://`), a document host that merely contains the omnibox host, an omnibox that had a
-  scheme, and no document.
+- `browser_url::document_verdict` / `prefer_document`: an agreeing host, a `www.`-prefixed
+  document host, an `http` document for an elided `http` site; a mismatching web host, typed
+  text over another page (`bank.com` over `https://news.example/`), a side panel on another
+  host and a document host that merely contains the omnibox host, all of which give no
+  address; a non-web scheme (`chrome://`, `devtools://`), an empty or oversized value and the
+  same host on another port, which keep the omnibox; an omnibox that had a scheme; and no
+  document.
 - `uri_match`: every match type; base-domain edge cases (`co.uk`, `github.io`-style private
   suffixes, subdomains, IPs, `localhost`, ports); an invalid regex; `None` = base domain;
   `Never`.
