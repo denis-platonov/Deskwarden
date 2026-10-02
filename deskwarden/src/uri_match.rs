@@ -158,7 +158,9 @@ pub fn matches(saved: &str, match_type: Option<MatchType>, page: &Url) -> bool {
 /// website" (the title may still guess it) from "saved for this very site,
 /// under a rule that refuses this page" -- an Exact address elsewhere on the
 /// site, a `Never`, `google.com` on `script.google.com` -- which the title
-/// must not bring back. See `app_candidates::ranked`.
+/// must not bring back. See `app_candidates::ranked`, which asks it only of a
+/// page address that is the browser's whole one, and [`refuses_by_host_alone`]
+/// of one built on elided text.
 pub fn same_site(saved: &str, page: &Url) -> bool {
     if saved.trim().is_empty() {
         return false;
@@ -166,6 +168,34 @@ pub fn same_site(saved: &str, page: &Url) -> bool {
     match (saved_url(saved), base_domain(page)) {
         (Some(saved), Some(page_domain)) => base_domain(&saved) == Some(page_domain),
         _ => false,
+    }
+}
+
+/// **Whether the website `saved`, on `page`'s own site, refuses `page` by a
+/// rule that reads nothing but the page's host** -- so the refusal holds
+/// whatever the page's scheme and path turn out to be.
+///
+/// Two rules do: **Never**, which refuses every page; and the **base-domain**
+/// rule (also what no match type means) when Bitwarden's blacklist excludes
+/// the page's host for the saved base domain (`google.com` on
+/// `script.google.com`). For a website [`same_site`] accepts, the base-domain
+/// rule refusing IS the blacklist: [`matches`] compares the same base domains
+/// and then asks the one blacklist, so this asks [`matches`] rather than
+/// keeping a second copy of either.
+///
+/// Every other rule reads more than the host -- Exact and StartsWith the
+/// whole URL string, Regex whatever its pattern says, Host the `www.` Chrome
+/// elides -- and is `false` here. `app_candidates::ranked` asks this when the
+/// page address is a guess built on elided text (`browser_url::PageAddress`),
+/// where only a refusal the guess cannot have caused may keep a login out.
+pub fn refuses_by_host_alone(saved: &str, match_type: Option<MatchType>, page: &Url) -> bool {
+    if !same_site(saved, page) {
+        return false;
+    }
+    match match_type.unwrap_or(MatchType::BaseDomain) {
+        MatchType::Never => true,
+        MatchType::BaseDomain => !matches(saved, match_type, page),
+        MatchType::Host | MatchType::StartsWith | MatchType::Exact | MatchType::RegularExpression => false,
     }
 }
 
@@ -512,6 +542,32 @@ mod tests {
         assert!(!same_site(r"^https://example\.app/", &at), "a pattern is not a website");
         assert!(same_site("example.app", &at), "control: no scheme is http");
         assert!(!same_site("https://co.uk", &page("https://co.uk/")), "a bare public suffix is no site");
+    }
+
+    #[test]
+    fn never_and_the_blacklist_refuse_by_the_host_alone() {
+        let at = page("https://script.google.com/");
+        for rule in [None, Some(MatchType::BaseDomain)] {
+            assert!(refuses_by_host_alone("google.com", rule, &at), "{rule:?}: the blacklist");
+            assert!(refuses_by_host_alone("https://accounts.google.com", rule, &at), "{rule:?}");
+            assert!(!refuses_by_host_alone("google.com", rule, &page("https://mail.google.com/")), "{rule:?}: control");
+        }
+        assert!(refuses_by_host_alone("https://x.com", Some(MatchType::Never), &page("https://x.com/")));
+        assert!(refuses_by_host_alone("http://www.x.com/a", Some(MatchType::Never), &page("https://x.com/b")));
+    }
+
+    #[test]
+    fn a_rule_that_reads_more_than_the_host_does_not_refuse_by_the_host_alone() {
+        let at = page("https://x.com/");
+        assert!(!refuses_by_host_alone("www.x.com", Some(MatchType::Host), &at), "Chrome elides the `www.`");
+        assert!(!refuses_by_host_alone("http://x.com/login", Some(MatchType::Exact), &at));
+        assert!(!refuses_by_host_alone("http://x.com/", Some(MatchType::StartsWith), &at));
+        assert!(!refuses_by_host_alone(r"^http://x\.com/", Some(MatchType::RegularExpression), &at));
+        assert!(
+            !refuses_by_host_alone("https://y.com", Some(MatchType::Never), &at),
+            "a Never on another site says nothing about this one"
+        );
+        assert!(!refuses_by_host_alone("google.com", None, &page("https://script.google.org/")));
     }
 
     #[test]

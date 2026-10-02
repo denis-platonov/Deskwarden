@@ -3304,7 +3304,7 @@ pub fn picker_follow_up(
 fn picker_offers_for(
     cache: &VaultCache,
     window: &crate::window_watch::ForegroundEvent,
-    page: Option<&url::Url>,
+    page: Option<&crate::browser_url::PageAddress>,
 ) -> PickerCard {
     // **`project`, not `items()`.** `items()` deep-clones the whole vault --
     // every password included -- and the picker needs an id, a name, a
@@ -3331,7 +3331,9 @@ fn picker_offers_for(
 ///   `Offered::No` (`main`'s
 ///   `the_remembered_record_is_offered_ahead_of_the_account_picker`), so a
 ///   multi-page sign-in keeps its record and costs no read.
-fn page_address(window: &crate::window_watch::ForegroundEvent) -> Option<url::Url> {
+fn page_address(
+    window: &crate::window_watch::ForegroundEvent,
+) -> Option<crate::browser_url::PageAddress> {
     page_address_with(window, crate::browser_url::read)
 }
 
@@ -3339,8 +3341,8 @@ fn page_address(window: &crate::window_watch::ForegroundEvent) -> Option<url::Ur
 /// seam, so a test can prove a native app's window is never asked at all.
 fn page_address_with(
     window: &crate::window_watch::ForegroundEvent,
-    read: fn(isize) -> Option<url::Url>,
-) -> Option<url::Url> {
+    read: fn(isize) -> Option<crate::browser_url::PageAddress>,
+) -> Option<crate::browser_url::PageAddress> {
     match browser_window(&window.exe_name) {
         BrowserWindow::Yes => read(window.hwnd),
         BrowserWindow::No => None,
@@ -10784,13 +10786,14 @@ mod picker_wiring_tests {
         }
     }
 
-    fn never_asked(_hwnd: isize) -> Option<url::Url> {
+    fn never_asked(_hwnd: isize) -> Option<crate::browser_url::PageAddress> {
         panic!("a native app's window was asked for a browser address")
     }
 
-    fn reads_example(hwnd: isize) -> Option<url::Url> {
+    fn reads_example(hwnd: isize) -> Option<crate::browser_url::PageAddress> {
         assert_eq!(hwnd, 0x5150, "the address was read from a different window");
-        url::Url::parse("https://example.com/login").ok()
+        let url = url::Url::parse("https://example.com/login").ok()?;
+        Some(crate::browser_url::PageAddress { url, complete: false })
     }
 
     /// **Only a browser is asked for an address.** A native app's window is
@@ -10800,7 +10803,11 @@ mod picker_wiring_tests {
     fn only_a_browser_window_is_asked_for_its_address() {
         assert_eq!(page_address_with(&at_window("Slack.exe", "Slack"), never_asked), None);
         let read = page_address_with(&at_window(BROWSER_IMAGE_NAMES[0], ""), reads_example);
-        assert_eq!(read.map(|url| url.to_string()), Some("https://example.com/login".to_string()));
+        assert_eq!(
+            read.map(|page| (page.url.to_string(), page.complete)),
+            Some(("https://example.com/login".to_string(), false)),
+            "the reader's answer reaches the picker whole, completeness included"
+        );
     }
 
     /// **The wiring the hotkey runs, minus the window.** `picker_offers_for`
@@ -10820,7 +10827,10 @@ mod picker_wiring_tests {
             item("url", "Work login", "https://example.com"),
         ]);
         let window = at_window(BROWSER_IMAGE_NAMES[0], "Example portal");
-        let page = url::Url::parse("https://accounts.example.com/").unwrap();
+        let page = crate::browser_url::PageAddress {
+            url: url::Url::parse("https://accounts.example.com/").unwrap(),
+            complete: true,
+        };
 
         let ranked = picker_offers_for(&cache, &window, Some(&page));
         let order: Vec<&str> = ranked.offers.iter().map(|o| o.candidate.id.as_str()).collect();

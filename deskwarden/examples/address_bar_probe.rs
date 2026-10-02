@@ -2,8 +2,9 @@
 //!
 //! Run it, switch to a browser window within five seconds, and it prints what
 //! Deskwarden would rank the account picker by: the address it read, or
-//! "nothing". It prints to this console only -- the app itself never logs the
-//! address.
+//! "nothing" -- and whether that address is the browser's whole one or was
+//! built on elided text (`browser_url::PageAddress::complete`). It prints to
+//! this console only -- the app itself never logs the address.
 //!
 //! ```text
 //! cargo run --example address_bar_probe
@@ -50,7 +51,12 @@ fn main() {
     );
     describe_candidates(window.hwnd);
     match deskwarden::browser_url::read(window.hwnd) {
-        Some(url) => println!("Address bar: {url}"),
+        Some(page) => println!(
+            "Address bar: {} (complete: {}{})",
+            page.url,
+            page.complete,
+            if page.complete { "" } else { ", the scheme was guessed from elided text" }
+        ),
         None => println!(
             "Address bar: nothing (not a supported browser, no address field found, not a web \
              address, or typed text over a page on another host)"

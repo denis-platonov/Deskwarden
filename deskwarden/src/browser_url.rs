@@ -142,7 +142,10 @@ impl Family {
     /// under the window held the active tab's URL. Firefox's first `Document`
     /// was a DIFFERENT tab's page -- so in the Firefox family the `Document`
     /// says nothing about the page in front of the user, and is never read.
-    /// Firefox's `urlbar-input` holds the full address anyway, scheme included.
+    /// Firefox trims `https://` and `http://` from its `urlbar-input` too
+    /// (`browser.urlbar.trimURLs`, `trimHttps`), so a trimmed Firefox address
+    /// keeps its exact host and a guessed scheme: a [`PageAddress`] that is not
+    /// `complete`.
     pub fn reads_the_page_document(self) -> bool {
         match self {
             Family::Chromium => true,
@@ -272,6 +275,34 @@ pub fn parse(text: &str) -> Option<url::Url> {
     looks_like_a_site.then_some(url)
 }
 
+/// **The page a browser window is showing, and how much of its address is
+/// known.**
+///
+/// The address bar does not always hold the whole address. Chrome's omnibox
+/// shows `x.com` for `https://www.x.com/`, and Firefox trims `https://` and
+/// `http://` too (`browser.urlbar.trimURLs`, `trimHttps`). [`parse`] puts
+/// `https://` in front of such text, so the `url` it gives is right about the
+/// host -- which the field shows exactly, `www.` aside -- and a GUESS about the
+/// scheme, the `www.` and, in Chrome, the path.
+///
+/// `app_candidates::ranked` needs to know which: its rule that a login saved
+/// for this very site, whose own rule refused the page, is not offered by the
+/// title either, holds only for a refusal the guess cannot have caused. Exact
+/// `http://x.com/login` "refusing" a guessed `https://x.com/` says nothing
+/// about the real page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageAddress {
+    /// The page's address, as well as it is known.
+    pub url: url::Url,
+    /// **Whether `url` is the browser's whole address**: the field's text had
+    /// a scheme of its own (Edge; Chrome with "Always show full URLs"; Firefox
+    /// with trimming off), or Chrome's page `Document` agreed with the field
+    /// and supplied the address ([`DocumentVerdict::Agrees`]). `false` when
+    /// the scheme was put in front of elided text by [`parse`] -- Firefox's
+    /// trimmed text, or a Chromium field whose `Document` was unusable.
+    pub complete: bool,
+}
+
 /// **The observation half**: the address in the browser window `hwnd`, or
 /// `None` -- a browser this module has no field for, no field found, a field
 /// that is a page's rather than the browser's, a UI Automation failure, or
@@ -300,7 +331,10 @@ pub fn parse(text: &str) -> Option<url::Url> {
 /// address -- it only withdraws the field's, because then the field is holding
 /// what the user is typing, not the page (see [`document_verdict`]). In Firefox
 /// the first `Document` was another tab's page, so it is never read there.
-pub fn read(hwnd: isize) -> Option<url::Url> {
+///
+/// The answer says whether it is the browser's whole address or a guess built
+/// on elided text: [`PageAddress::complete`].
+pub fn read(hwnd: isize) -> Option<PageAddress> {
     let class = crate::injector::target::class_name_of(hwnd)?;
     let family = family_of_class(&class)?;
     let text = crate::injector::ui_automation::address_field_text(hwnd, family.address_field())
@@ -311,7 +345,7 @@ pub fn read(hwnd: isize) -> Option<url::Url> {
     let document = (family.reads_the_page_document() && !had_scheme)
         .then(|| crate::injector::ui_automation::page_document_text(hwnd).ok().flatten())
         .flatten();
-    prefer_document(&omnibox, had_scheme, document.as_deref())
+    prefer_document(omnibox, had_scheme, document.as_deref())
 }
 
 /// What the window's first `Document` says about an elided address field.
@@ -406,26 +440,29 @@ pub fn document_verdict(omnibox: &url::Url, document_text: Option<&str>) -> Docu
 ///
 /// * The field's text had a scheme (Edge, or Chrome with "Always show full
 ///   URLs"): it is already the full address, the `Document` is not consulted
-///   at all, and `omnibox` is the answer.
+///   at all, and `omnibox` is the answer, `complete`.
 /// * Otherwise the [`document_verdict`] decides: `Agrees` gives the
-///   document's URL -- restoring what the elision hid: the scheme (`http` for
-///   a plain-HTTP site the field showed bare), the `www.`, and the full path
-///   and query; `Unusable` keeps `omnibox`; `Disagrees` is `None`, and the
-///   picker ranks by the title as it did before.
+///   document's URL, `complete` -- restoring what the elision hid: the scheme
+///   (`http` for a plain-HTTP site the field showed bare), the `www.`, and the
+///   full path and query; `Unusable` keeps `omnibox`, NOT complete, because
+///   its scheme is [`parse`]'s guess; `Disagrees` is `None`, and the picker
+///   ranks by the title as it did before.
 ///
 /// So the `Document` can restore what the field elided, or withdraw the
 /// field's address, and nothing else: it never names a host the field did not.
+/// The Firefox family reaches here with no document text, so its trimmed text
+/// is `Unusable`'s case: the field's host, not complete.
 pub fn prefer_document(
-    omnibox: &url::Url,
+    omnibox: url::Url,
     omnibox_had_scheme: bool,
     document_text: Option<&str>,
-) -> Option<url::Url> {
+) -> Option<PageAddress> {
     if omnibox_had_scheme {
-        return Some(omnibox.clone());
+        return Some(PageAddress { url: omnibox, complete: true });
     }
-    match document_verdict(omnibox, document_text) {
-        DocumentVerdict::Agrees(document) => Some(document),
-        DocumentVerdict::Unusable => Some(omnibox.clone()),
+    match document_verdict(&omnibox, document_text) {
+        DocumentVerdict::Agrees(document) => Some(PageAddress { url: document, complete: true }),
+        DocumentVerdict::Unusable => Some(PageAddress { url: omnibox, complete: false }),
         DocumentVerdict::Disagrees => None,
     }
 }
@@ -646,7 +683,12 @@ mod tests {
     }
 
     fn preferred(omnibox: &str, document: Option<&str>) -> Option<String> {
-        prefer_document(&elided(omnibox), false, document).map(|url| url.to_string())
+        prefer_document(elided(omnibox), false, document).map(|page| page.url.to_string())
+    }
+
+    /// Whether the answer for an elided field is the whole address.
+    fn complete(omnibox: &str, document: Option<&str>) -> Option<bool> {
+        prefer_document(elided(omnibox), false, document).map(|page| page.complete)
     }
 
     fn verdict(omnibox: &str, document: Option<&str>) -> DocumentVerdict {
@@ -785,8 +827,9 @@ mod tests {
 
     #[test]
     fn a_documents_userinfo_is_not_kept() {
-        let url = prefer_document(&elided("bank.com/x"), false, Some("https://user:pass@bank.com/x/full"))
-            .expect("the same host agrees");
+        let url = prefer_document(elided("bank.com/x"), false, Some("https://user:pass@bank.com/x/full"))
+            .expect("the same host agrees")
+            .url;
         assert_eq!(url.path(), "/x/full", "control: the document's address was taken");
         assert_eq!((url.username(), url.password()), ("", None));
     }
@@ -796,9 +839,10 @@ mod tests {
         let full = parse("https://mail.google.com/x").unwrap();
         for document in [Some("https://mail.google.com/x/elsewhere"), Some("https://news.example/"), None] {
             assert_eq!(
-                prefer_document(&full, true, document).map(|url| url.to_string()),
-                kept("https://mail.google.com/x"),
-                "Edge, or Chrome showing full URLs: the field's own text is the address ({document:?})"
+                prefer_document(full.clone(), true, document),
+                Some(PageAddress { url: full.clone(), complete: true }),
+                "Edge, or Chrome showing full URLs: the field's own text is the whole address \
+                 ({document:?})"
             );
         }
     }
@@ -807,6 +851,23 @@ mod tests {
     fn no_document_keeps_the_omnibox_address() {
         assert_eq!(verdict("mail.google.com/x", None), DocumentVerdict::Unusable);
         assert_eq!(preferred("mail.google.com/x", None), kept("https://mail.google.com/x"));
+    }
+
+    /// **Complete only when the browser said the whole address.** A scheme
+    /// [`parse`] put in front of elided text is a guess: Chrome showed `x.com`
+    /// for what may be `http://www.x.com/`.
+    #[test]
+    fn an_address_built_on_elided_text_is_not_complete() {
+        assert_eq!(complete("x.com", None), Some(false), "no Document: Firefox's trimmed text, or Chrome's");
+        assert_eq!(complete("x.com", Some("devtools://devtools/x")), Some(false), "an unusable Document");
+        assert_eq!(complete("x.com:8443/", Some("https://x.com:9443/")), Some(false), "a stale Document");
+        assert_eq!(complete("x.com", Some("http://www.x.com/")), Some(true), "the Document agreed and said it all");
+        assert_eq!(complete("x.com", Some("https://news.example/")), None, "control: typed text is no address");
+        let full = parse("http://x.com/login").unwrap();
+        assert!(
+            prefer_document(full, true, None).is_some_and(|page| page.complete),
+            "the field's own scheme: the whole address"
+        );
     }
 
     #[test]

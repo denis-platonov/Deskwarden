@@ -76,11 +76,12 @@ fn ranked(
     exe_name: &str,
     title: &str,
     item: &crate::app::ItemFacts,
-    page: Option<&url::Url>,
+    page: Option<&crate::browser_url::PageAddress>,
 ) -> Option<(u8, u8)> {
-    if let Some(page) = page {
+    if let Some(crate::browser_url::PageAddress { url: page, complete }) = page {
         // An item with several accepted websites is as strict as its
-        // strictest one.
+        // strictest one. A guessed address (`complete == false`) ranks
+        // exactly as a whole one: what it matches, it matches.
         let strictest = item
             .uris
             .iter()
@@ -101,7 +102,26 @@ fn ranked(
         // anyone's script runs, offering the user's Google login). So it is
         // left out. A login saved for some OTHER site, or for none, knows
         // nothing about this page and keeps the title's guess below.
-        if item.uris.iter().any(|saved| crate::uri_match::same_site(&saved.uri, page)) {
+        //
+        // **Only a refusal the address can vouch for.** When `page` is the
+        // browser's whole address, every refusal above is real. When it was
+        // built on elided text -- Chrome showing `x.com`, Firefox trimming
+        // the scheme -- its scheme, its `www.` and (in Chrome) its path are
+        // `browser_url::parse`'s guess, and a login saved as Host `www.x.com`
+        // or Exact `http://x.com/login` "refused" the guess, not the page.
+        // Leaving it out on that would hide the user's own login on its own
+        // site. What the guess cannot have caused is a refusal that reads the
+        // host alone, which the field shows exactly: a `Never`, and the
+        // blacklist (`uri_match::refuses_by_host_alone`). Only those keep the
+        // login out of a guessed page; any other keeps its title guess below.
+        let refused = |saved: &crate::uri_match::SavedUri| {
+            if *complete {
+                crate::uri_match::same_site(&saved.uri, page)
+            } else {
+                crate::uri_match::refuses_by_host_alone(&saved.uri, saved.match_type, page)
+            }
+        };
+        if item.uris.iter().any(refused) {
             return None;
         }
     }
@@ -155,11 +175,15 @@ fn ranked(
 /// exe-stem ranks are dropped even when `page` is `None`. With a `page`, a
 /// login saved for that same site whose own rule refused the page is not a
 /// candidate at all: no title or name guess brings it back (see [`ranked`]).
+/// When the address is a guess built on elided text
+/// ([`crate::browser_url::PageAddress::complete`] is `false`), only a refusal
+/// by `Never` or by Bitwarden's blacklist -- the two that read the host alone
+/// -- keeps a login out that way.
 pub fn candidates(
     exe_name: &str,
     title: &str,
     items: &[crate::app::ItemFacts],
-    page: Option<&url::Url>,
+    page: Option<&crate::browser_url::PageAddress>,
 ) -> Vec<Candidate> {
     let mut scored: Vec<((u8, u8), Candidate)> = Vec::new();
     for item in items {
@@ -232,8 +256,19 @@ mod tests {
         })
     }
 
-    fn page(text: &str) -> url::Url {
-        url::Url::parse(text).expect("the fixture page is a URL")
+    /// The browser's whole address: its own scheme, or Chrome's `Document`
+    /// agreed. What every test before `PageAddress::complete` meant by a page.
+    fn page(text: &str) -> crate::browser_url::PageAddress {
+        crate::browser_url::PageAddress {
+            url: url::Url::parse(text).expect("the fixture page is a URL"),
+            complete: true,
+        }
+    }
+
+    /// An address built on elided text: `browser_url::parse` put the scheme
+    /// in front, so only its host is the browser's.
+    fn guessed(text: &str) -> crate::browser_url::PageAddress {
+        crate::browser_url::PageAddress { complete: false, ..page(text) }
     }
 
     fn ids(found: &[Candidate]) -> Vec<&str> {
@@ -488,6 +523,73 @@ mod tests {
             "no address read is today's ranking"
         );
         assert_eq!(ids(&candidates("firefox.exe", "Bank - Mozilla Firefox", &items, None)), vec!["b"]);
+    }
+
+    /// **A guessed address does not decide a refusal it may have caused.**
+    /// Chrome shows `x.com` and its `Document` was unusable, so the address
+    /// is a guessed `https://x.com/`. A login saved as Host `www.x.com` may
+    /// well be the page's (`https://www.x.com/` elides to `x.com`); with the
+    /// title naming it, it is still offered.
+    #[test]
+    fn a_guessed_address_does_not_hide_a_login_its_guess_refused() {
+        let host = saved_with("h", "Twitter", "me@x", Some("www.x.com"), Some(serde_json::json!(1)));
+        let exact = saved_with("e", "Twitter login", "me@x", Some("http://x.com/login"), Some(serde_json::json!(3)));
+        let items = vec![host, exact];
+        let found = candidates("chrome.exe", "Twitter - Google Chrome", &items, Some(&guessed("https://x.com/")));
+        assert_eq!(ids(&found), vec!["h", "e"], "the user's own logins on their own site were hidden");
+        // Control: the same logins against the whole address are refused by
+        // their own rules, and the title does not bring them back.
+        let whole = candidates("chrome.exe", "Twitter - Google Chrome", &items, Some(&page("https://x.com/")));
+        assert!(whole.is_empty(), "against the browser's whole address the refusal is real");
+    }
+
+    #[test]
+    fn a_guessed_address_still_ranks_what_it_matches() {
+        let items = vec![
+            item("t", "X portal", "t@x", None),
+            item("b", "Work", "b@x", Some("https://x.com")),
+        ];
+        let found = candidates("chrome.exe", "X portal - Google Chrome", &items, Some(&guessed("https://x.com/")));
+        assert_eq!(ids(&found), vec!["b", "t"], "a base-domain match outranks the title on a guessed address too");
+    }
+
+    #[test]
+    fn a_never_rule_on_the_site_refuses_a_guessed_address_too() {
+        let never = saved_with("n", "Twitter", "me@x", Some("https://x.com"), Some(serde_json::json!(5)));
+        let found = candidates("chrome.exe", "Twitter - Google Chrome", &[never.clone()], Some(&guessed("https://x.com/")));
+        assert!(found.is_empty(), "`Never` refuses whatever the scheme and path turn out to be");
+        assert_eq!(
+            ids(&candidates("chrome.exe", "Twitter - Google Chrome", &[never], None)),
+            vec!["n"],
+            "control: the title does name it, so the emptiness above is the refusal"
+        );
+    }
+
+    #[test]
+    fn the_blacklist_refuses_a_guessed_address_too() {
+        let items = vec![item("g", "Google", "me@gmail.com", Some("google.com"))];
+        let found = candidates(
+            "chrome.exe",
+            "Google Sign-in - Google Chrome",
+            &items,
+            Some(&guessed("https://script.google.com/")),
+        );
+        assert!(found.is_empty(), "the blacklist reads the host alone, and the field shows the host exactly");
+        assert_eq!(
+            ids(&candidates("chrome.exe", "Google Sign-in - Google Chrome", &items, Some(&guessed("https://accounts.google.com/")))),
+            vec!["g"],
+            "control: on the rest of google.com the guessed address matches it"
+        );
+    }
+
+    /// No address at all is today's ranking, whatever a guessed one would do.
+    #[test]
+    fn with_no_page_completeness_changes_nothing() {
+        let items = vec![
+            saved_with("n", "Twitter", "me@x", Some("https://x.com"), Some(serde_json::json!(5))),
+            saved_with("h", "Twitter", "me@x", Some("www.x.com"), Some(serde_json::json!(1))),
+        ];
+        assert_eq!(ids(&candidates("chrome.exe", "Twitter - Google Chrome", &items, None)), vec!["n", "h"]);
     }
 
     /// A page no login is saved for falls back to the title, as before.

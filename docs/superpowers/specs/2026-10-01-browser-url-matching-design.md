@@ -70,6 +70,14 @@ string in a browser window that identifies the site.
   it never supplies one. Omnibox text that already had a scheme (Edge, Chrome with "Always
   show full URLs") never triggers the `Document` read. The `Document` is never read in the
   Firefox family, and its text is never logged.
+- **`read` returns a `PageAddress { url, complete }`.** `complete` is true when the field's
+  text had a scheme of its own, or when the Chromium `Document` agreed and supplied the URL.
+  It is false when the URL was built by putting `https://` in front of scheme-less text:
+  Firefox's trimmed text (Firefox trims both `https://` and `http://`,
+  `browser.urlbar.trimURLs` / `trimHttps`, so its host is exact and its scheme a guess) and a
+  Chromium field whose `Document` was unusable (the host is exact, `www.` aside; the scheme,
+  the `www.` and the path are guesses). The picker uses it to decide which refusals are real
+  (below).
 - Lives beside `injector::ui_automation` and keeps the same apartment handling.
 
 ### `browser_url::parse` (pure)
@@ -95,6 +103,10 @@ string in a browser window that identifies the site.
   - **Regular expression** (`4`): the saved pattern matches the page URL (the `regex` crate,
     already a dependency); an invalid pattern matches nothing.
   - **Never** (`5`): never matches.
+- `same_site(saved, page)`: the saved website's base domain is the page's, whatever its rule.
+  `refuses_by_host_alone(saved, match_type, page)`: on the same site, and refused by `Never` or
+  by the base-domain rule (which, on the same site, is the blacklist; asked through `matches`,
+  not a second copy). Both are for the picker's exclusion rule below, never for a match.
 - Saved URIs without a scheme are parsed as `http://` for host comparisons, as Bitwarden does.
 - The match type is read from the URI entry's `match` value (`UriEntry::other["match"]`).
   The account's default match setting (Bitwarden's "default URI match detection") is out of
@@ -104,8 +116,9 @@ string in a browser window that identifies the site.
 
 ### Picker ranking (`app_candidates`)
 
-- `candidates` gains the page URL (`Option<&Url>`) and a new top rank, `RANK_URL`, above
-  `RANK_URI_HOST`, for items with any saved URI that `uri_match::matches` accepts.
+- `candidates` gains the page address (`Option<&browser_url::PageAddress>`) and a new top
+  rank, `RANK_URL`, above `RANK_URI_HOST`, for items with any saved URI that
+  `uri_match::matches` accepts against its `url`, complete or not.
 - `ItemFacts` carries what the matcher needs: each URI string with its match type. No secret is
   added to `ItemFacts`.
 - In a browser, the existing exe-stem rank (`chrome` against item domains/names) is not applied:
@@ -120,6 +133,13 @@ string in a browser window that identifies the site.
   and is left out of the candidates. The title is written by the page; it must not undo the
   user's rule. An item with no website on that site, or none at all, keeps today's title
   ranking, and with no page URL nothing changes.
+- **That exclusion holds as written only for a complete address.** When `PageAddress::complete`
+  is false the URL's scheme, `www.` and path are guesses, and a login saved as Host `www.x.com`
+  or Exact `http://x.com/login` may have refused the guess `https://x.com/` rather than the
+  page. Then a same-site item is left out only if one of its same-site URIs refuses the page
+  by a rule that reads the host alone (`uri_match::refuses_by_host_alone`): `Never`, or the
+  base-domain rule refused by the blacklist (`google.com` on `script.google.com`), which the
+  field shows exactly. Any other same-site item keeps its title or name rank.
 - The picker already focuses its first row on every card, so a `RANK_URL` login is pre-selected
   by being first; nothing about the focus changes. The five-minute fill recall (`fill_recall`)
   still wins when it applies, so a multi-page sign-in keeps its record.
@@ -148,8 +168,12 @@ string in a browser window that identifies the site.
 - `app_candidates`: URL-matched items rank first; no exe-stem rank in a browser; a non-match
   falls back to today's ranking, except a login saved for the page's own site whose rule refused
   the page (`google.com` on `script.google.com`, Exact elsewhere on the site), which the title
-  does not bring back; no URL = today's behaviour, except that a browser's
+  does not bring back; on an incomplete address only `Never` and the blacklist keep such a
+  login out (Host `www.x.com` on a guessed `https://x.com/` is still offered by the title, and
+  excluded on the complete one); no URL = today's behaviour, except that a browser's
   executable name no longer ranks anything.
+- `browser_url::prefer_document`: `complete` is true for an omnibox with a scheme and for an
+  agreeing `Document`, false for an unusable one or none.
 - The picker already focuses its first row on every card, so a URL-ranked login is pre-selected
   by being first, and nothing about the focus changes; recall still wins.
 - The UI Automation read is a thin, documented observation layer and is not unit-tested; it is
