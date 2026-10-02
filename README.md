@@ -63,6 +63,11 @@ open.
   than a straight username/password pair.
 - **A picker when a match is ambiguous**, and a save prompt when you sign in
   to something the vault does not know yet.
+- **In a browser, the hotkey puts the site's login on top.** `CTRL+ALT+B`
+  opens the account picker with the logins saved for the website in the
+  address bar first, ranked by Bitwarden's own URI match rules (base domain,
+  host, starts with, exact, regular expression, never). Nothing is typed
+  until you press Enter.
 
 ### The vault
 
@@ -169,7 +174,7 @@ beside it. Free tiers only.
 
 | | Fills native Windows apps | Fills web forms in a browser | Where the vault lives | Free tier | Open source | Platforms |
 | --- | --- | --- | --- | --- | --- | --- |
-| **Deskwarden** | Yes -- matched by process name, entered as keystrokes | No -- Bitwarden's browser extension does that | No vault of its own: whichever Bitwarden-compatible server your account is already on | Free and complete, but it needs a separate Bitwarden-compatible account, is unofficial and unaffiliated with Bitwarden, and is one person's project | Yes, AGPL-3.0 | Windows only |
+| **Deskwarden** | Yes -- matched by process name, entered as keystrokes | On the hotkey only -- through the account picker, with the logins saved for the site in the address bar on top; nothing is typed until you press Enter. Anything more is Bitwarden's browser extension | No vault of its own: whichever Bitwarden-compatible server your account is already on | Free and complete, but it needs a separate Bitwarden-compatible account, is unofficial and unaffiliated with Bitwarden, and is one person's project | Yes, AGPL-3.0 | Windows only |
 | **Bitwarden** | Not documented -- the autofill pages cover the browser extension and the mobile apps; the desktop app's page describes vault management, generation and biometric unlock, and no filling into other applications | Yes, browser extension | Bitwarden's servers, or a server you host | Unlimited passwords, unlimited devices, browser/mobile/desktop apps, sharing with one other user | Yes | Windows, macOS, Linux, nine browsers, iOS, Android, web vault, CLI |
 | **Apple Passwords** | No -- on Windows it is a browser extension plus an app to view passwords in | Yes on Windows, through an extension for Chrome, Edge and Firefox | iCloud Keychain, on Apple's servers | Included with the operating system at no separate charge; the Apple Account needs two-factor authentication | No | iOS 18, iPadOS 18, macOS Sequoia, visionOS 2; Windows through iCloud Passwords |
 | **Keeper** | In the paid desktop app, yes: KeeperFill for Apps fills native applications from a hotkey, with custom keystroke sequences, and works in RDP sessions. The free version does not reach it | The browser extension is not in the free version | Keeper's servers | 10 records, one mobile device, no sharing, no browser extension, no web vault, no unlimited sync | No | Desktop apps for Windows and macOS, browser extensions, mobile |
@@ -428,7 +433,9 @@ Everything Deskwarden links against, and what it's for:
 | `directories` | Locating the standard Windows config/cache directories. |
 | `semver` | Comparing versions for the update checker. |
 | `log`, `env_logger` | The log file — this is a console-less GUI-subsystem binary, so the log file is the only diagnostic channel. |
-| `mockito` (dev-only) | Mocking `bw serve`'s HTTP API in tests. |
+| `url` | Parsing the browser's address bar and a login's saved websites into URLs, so the two are compared as hosts and ports rather than as strings. |
+| `psl` (pinned to one exact version) | Mozilla's public-suffix list, compiled in. Bitwarden's default "base domain" URI match compares registrable domains: `accounts.google.com` matches a login saved for `google.com`, `bbc.co.uk` does not match `other.co.uk`. Pinned because the list is data, and it decides which login the picker puts on top. |
+| `regex` | Bitwarden's "regular expression" URI match rule. |
 
 Full versions and feature flags: [`deskwarden/Cargo.toml`](deskwarden/Cargo.toml).
 

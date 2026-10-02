@@ -63,7 +63,7 @@ Each app match has one of three trigger modes:
 | Mode | Behaviour |
 | --- | --- |
 | `prompt` | A small overlay appears offering to fill. Nothing happens unless you click Fill. |
-| `hotkey` | Nothing happens automatically; press **Ctrl+Alt+B** while the matched window is focused to fill. |
+| `hotkey` | Nothing happens automatically; press **Ctrl+Alt+B** while the matched window is focused to fill. A browser is never matched: there, Ctrl+Alt+B opens the account picker with the logins saved for the site in the address bar on top, and Enter fills. |
 | `auto` | Fills as soon as the matched window comes to the foreground. |
 
 App matches are stored in your vault, in a custom field named
