@@ -3733,6 +3733,11 @@ fn main() {
                 // shortcut in front of the picker, never a replacement for it
                 // -- and it is why the card's way back answers
                 // `Offered::No` rather than opening anything itself.
+                log::info!(
+                    "the fill hotkey was pressed at window {}; keyboard focus is in {}",
+                    event.hwnd,
+                    deskwarden::injector::send_input::describe_keyboard_focus()
+                );
                 let offered = offer_the_remembered_record(
                     &event,
                     &estate.cache,

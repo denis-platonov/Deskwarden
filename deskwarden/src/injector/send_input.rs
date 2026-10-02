@@ -39,10 +39,14 @@ const FOREGROUND_RETRY_ATTEMPTS: u32 = 5;
 pub fn ensure_foreground(hwnd: isize) -> Result<(), String> {
     let current = unsafe { GetForegroundWindow() }.0 as isize;
     if may_type_into(hwnd, current) {
+        log::info!(
+            "typing into window {hwnd}: it was already in front; keyboard focus is in {}",
+            describe_keyboard_focus()
+        );
         return Ok(());
     }
 
-    for _ in 0..FOREGROUND_RETRY_ATTEMPTS {
+    for attempt in 1..=FOREGROUND_RETRY_ATTEMPTS {
         // Only call SetForegroundWindow when it's actually needed: calling it
         // on a window that is already foreground can reset focus to that
         // window's default control, undoing the field the user just clicked
@@ -54,6 +58,11 @@ pub fn ensure_foreground(hwnd: isize) -> Result<(), String> {
 
         let current = unsafe { GetForegroundWindow() }.0 as isize;
         if may_type_into(hwnd, current) {
+            log::info!(
+                "typing into window {hwnd}: brought it to the front on attempt {attempt}; \
+                 keyboard focus is in {}",
+                describe_keyboard_focus()
+            );
             return Ok(());
         }
     }
@@ -63,6 +72,42 @@ pub fn ensure_foreground(hwnd: isize) -> Result<(), String> {
         "refusing to type: target window {hwnd} is not foreground (foreground is {current}) \
          after {FOREGROUND_RETRY_ATTEMPTS} attempts"
     ))
+}
+
+/// **Where keystrokes sent now would land**, for the log: the window class and
+/// owning process id of the foreground thread's keyboard-focus window.
+///
+/// Diagnostic only, and it names no text: a class name and a number. It exists
+/// because a window can be in front while its keyboard focus is not in the
+/// field the user was in -- a Microsoft account dialog is an `explorer.exe`
+/// frame around a `WWAHost.exe` page, and the frame can hold the focus itself
+/// -- and "typed, but nothing appeared" is otherwise invisible in the log.
+pub fn describe_keyboard_focus() -> String {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetClassNameW, GetGUIThreadInfo, GetWindowThreadProcessId, GUITHREADINFO,
+    };
+    let foreground = unsafe { GetForegroundWindow() };
+    let thread = unsafe { GetWindowThreadProcessId(foreground, None) };
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: `info` is a live, correctly sized GUITHREADINFO; a thread that
+    // has gone away makes the call fail, which is reported rather than read.
+    if unsafe { GetGUIThreadInfo(thread, &mut info) }.is_err() {
+        return "an unknown window (GetGUIThreadInfo failed)".to_string();
+    }
+    if info.hwndFocus.0.is_null() {
+        return "no window (the foreground thread has no focus window)".to_string();
+    }
+    let mut buffer = [0u16; 128];
+    // SAFETY: the buffer is a live stack array whose length is handed over.
+    let copied = unsafe { GetClassNameW(info.hwndFocus, &mut buffer) };
+    let class = String::from_utf16_lossy(&buffer[..copied.max(0) as usize]);
+    let mut pid = 0u32;
+    // SAFETY: `pid` is a live u32 the call writes through.
+    unsafe { GetWindowThreadProcessId(info.hwndFocus, Some(&mut pid)) };
+    format!("a {class:?} window of process {pid} (focus window {:?})", info.hwndFocus.0)
 }
 
 // `fill_via_send_input`, its `type_text` and its `press_tab` used to live here:
