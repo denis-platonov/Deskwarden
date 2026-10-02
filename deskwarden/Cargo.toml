@@ -439,14 +439,35 @@ rsa = "0.9"
 # and it is never run -- not even `bw --version` -- so a malformed archive
 # yields a refusal, not a process.
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# OPTIONAL, AND OFF IN EVERY BUILD THAT SHIPS. The engine behind
-# `test_http::Matcher::Regex`, which five call sites use. It is named here as
-# well as in `[dev-dependencies]` because `test_http` has to compile in two
-# configurations: the library's own test target, where the dev-dependency
-# supplies it, and the library built for `main.rs`'s test target, where
-# `test-support` does. `cargo build` turns on neither, so `regex` is not
-# linked into the shipped binary.
-regex = { version = "1", optional = true }
+# The address bar's text as a URL (src/browser_url.rs), and a login's saved
+# websites parsed into the same type (src/uri_match.rs), so the page and the
+# saved website are compared as hosts and ports rather than as strings.
+# ALREADY in this tree at this version, through `ureq` and `webbrowser`:
+# naming it makes it direct rather than transitive and adds no crate.
+url = "2"
+# Mozilla's public-suffix list, compiled in (src/uri_match.rs). Bitwarden's
+# default URI match rule, "base domain", compares REGISTRABLE domains, so
+# `accounts.google.com` matches a login saved for `google.com` while
+# `bbc.co.uk` does not match `other.co.uk`. That cannot be answered without
+# the list. `no_std`, `#![forbid(unsafe_code)]`, no build script and no I/O:
+# the list is generated Rust source. It adds two crates, `psl` and its
+# `psl-types`, both `MIT/Apache-2.0`, already on `deny.toml`'s allow-list.
+#
+# **Pinned to one exact version**, unlike every other entry here. The list is
+# DATA that changes with almost every release, and which login the account
+# picker pre-picks is decided by it; a `cargo update` that quietly moved that
+# decision is a change somebody should make on purpose, with this line.
+psl = "=2.1.238"
+# Bitwarden's "regular expression" URI match rule (src/uri_match.rs), and the
+# engine behind `test_http::Matcher::Regex`.
+#
+# **This used to be OPTIONAL and off in every build that ships**, named only
+# so `test_http` could compile under `test-support`. The URI matcher made it
+# a runtime dependency, so it is now linked into the shipped binary. Same
+# crate and same version: `Cargo.lock` held `regex 1.13.1` before this line
+# changed and holds it after. A saved pattern is compiled with a size limit,
+# and one that does not compile matches nothing -- see `uri_match`.
+regex = "1"
 
 [features]
 # The one thing this feature does is un-gate `test_http` and `test_vault` in
@@ -460,7 +481,7 @@ regex = { version = "1", optional = true }
 # disappears with it. It only decides whether two test-only modules are
 # compiled, and nothing outside a test target ever turns it on -- the
 # dev-dependency below is the only thing that does.
-test-support = ["dep:regex"]
+test-support = []
 
 [dev-dependencies]
 # THIS CRATE, ON ITSELF, WITH `test-support` ON. A dev-dependency cycle is
@@ -475,14 +496,6 @@ test-support = ["dep:regex"]
 # a path or a fork runs foreign code. This points a name at the crate that
 # name already means.
 deskwarden = { path = ".", features = ["test-support"] }
-# The same crate as the optional `regex` above, named again here because the
-# library's OWN test target compiles `test_http` under `cfg(test)` with no
-# feature turned on. `mockito` -- which brought `regex` and its three
-# dependencies into the tree in the first place, at this version, for exactly
-# the same matcher -- is GONE from this manifest: `main.rs` was its last user
-# and `test_http::no_module_in_this_crate_builds_a_mockito_server` is what
-# keeps it gone.
-regex = "1"
 
 [build-dependencies]
 # Embeds assets/deskwarden.ico as the executable's icon resource (see

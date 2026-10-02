@@ -1420,7 +1420,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 87] = [
+        const OPENS_NO_WINDOW: [&str; 88] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1685,6 +1685,11 @@ mod tests {
             // creates none of its own. The showing is a viewport command sent
             // by the process that owns the window, in `vault_window`.
             "ui_show",
+            // Bitwarden's six URI match rules as one pure function: a saved
+            // website and the page in the address bar in, a yes or no out.
+            // No I/O and no window -- the card whose row order it decides is
+            // `picker_prompt`'s.
+            "uri_match",
             // One account's DPAPI-wrapped master key and refresh token: a
             // path, two file reads and a byte layout. It draws nothing, and
             // the master password it saves the user from being asked for is

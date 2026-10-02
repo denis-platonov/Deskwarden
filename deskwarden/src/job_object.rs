@@ -3022,7 +3022,40 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (28448, 0xb267_ad6c_296a_55e3) exactly, so it is measuring
             // what this test measures.
-            (28452, 0x278a_e1ce_2972_4f1c_u64),
+            // **29248 bytes, new hash: TWO DEPENDENCIES ADDED AND ONE MADE
+            // NON-OPTIONAL, and this is the hop this pin exists for.** All three
+            // from crates.io, none with a path, a git source or a `[patch]`, for
+            // browser URL matching (`src/browser_url.rs`, `src/uri_match.rs`):
+            //
+            //  * `url = "2"` -- ADDED. Already in the tree at 2.5.8 through
+            //    `ureq` and `webbrowser`, so naming it adds no crate.
+            //  * `psl = "=2.1.238"` -- ADDED, pinned to one exact version because
+            //    the public-suffix list is data, and it decides which login the
+            //    account picker puts on top. It brings `psl` and `psl-types`, both
+            //    `MIT/Apache-2.0`; `cargo deny check licenses` passes with no
+            //    change to `deny.toml`.
+            //  * `regex` -- was `{ version = "1", optional = true }`, turned on
+            //    only by `test-support`; now a plain `"1"`, because
+            //    `uri_match`'s regular-expression rule runs in the shipped
+            //    binary. Same crate, still 1.13.1 in `Cargo.lock`.
+            //    `test-support` is now `[]`, and the `[dev-dependencies]` copy of
+            //    `regex` is REMOVED: a normal dependency already reaches every
+            //    test target.
+            //
+            // Nothing else moved: no existing dependency was re-pointed or
+            // re-featured, no `[patch]`/`[replace]`/`[workspace.dependencies]`
+            // table appeared, no path or fork appeared, and `[build-dependencies]`
+            // still reads exactly `winresource = "0.1"`. 28452 -> 29248 bytes: the
+            // three entries and the comments above them, less the removed
+            // dev-dependency and its comment.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over the file
+            // with CRLF normalised to LF, in a separate implementation outside this
+            // crate -- rather than copied out of the failure message. That
+            // implementation was first run against the PREVIOUS pinned pair and
+            // reproduced (28452, 0x278a_e1ce_2972_4f1c) exactly, so it is measuring
+            // what this test measures.
+            (29248, 0x52ff_8223_157c_4464_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

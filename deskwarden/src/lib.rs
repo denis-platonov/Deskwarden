@@ -209,6 +209,10 @@ pub mod unlock_prompt;
 /// non-secret result file, plus the exit code that carries `locked` even if
 /// the file is lost).
 pub mod ui_process;
+/// Bitwarden's URI match rules -- base domain, host, starts with, exact,
+/// regular expression, never -- as one pure function over a saved website and
+/// the page in a browser's address bar. It only ever orders the account picker.
+pub mod uri_match;
 /// One account's master key and refresh token, DPAPI-wrapped, at a path its
 /// caller chooses -- `session_store`'s idiom applied to a stronger secret.
 /// See its own docs for what a caller owes the user when a stored record
