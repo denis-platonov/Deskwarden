@@ -5577,6 +5577,20 @@ pub fn build_frame_with_search(
                                         ),
                                     }
                                 }
+                                // A CUSTOM FIELDS row, by index for the
+                                // reason the history row above is: the value
+                                // is a `Zeroizing` on the item. Resolved
+                                // through the function the row painted with,
+                                // so what is copied is what was shown.
+                                DetailAction::CopyField(index) => {
+                                    match detail::custom_field_copy_text(item, index) {
+                                        Some(value) => crate::clipboard::copy_secret(value),
+                                        None => log::warn!(
+                                            "copy requested for custom field {index}, which has \
+                                             nothing to copy on this item"
+                                        ),
+                                    }
+                                }
                                 // **The header's ✕: clear the selection, and
                                 // that is the entire mechanism.** With
                                 // nothing selected the `Read` arm is not
@@ -8894,6 +8908,7 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         | DetailAction::CopySshPrivateKey
         | DetailAction::CopyValue(_)
         | DetailAction::CopyPasswordHistory(_)
+        | DetailAction::CopyField(_)
         // **`Clone` for `Edit`'s reason, and a slightly stronger one.** What
         // it opens is the same form holding this item's password in a draft
         // behind the same reveal control, so an unproven user reaching it
@@ -9085,6 +9100,7 @@ fn reveal_gained(before: &detail::RevealState, after: &detail::RevealState) -> b
         password_history,
         ssh_private_key,
         totp_secret,
+        custom_fields,
     } = *after;
     (password && !before.password)
         || (card_number && !before.card_number)
@@ -9099,6 +9115,10 @@ fn reveal_gained(before: &detail::RevealState, after: &detail::RevealState) -> b
         // either side.
         || (0..detail::MAX_HISTORY_ROWS)
             .any(|i| password_history[i] && !before.password_history[i])
+        // A hidden custom field is a secret like any of the above, and its
+        // flags are indexed the same way.
+        || (0..detail::MAX_FIELD_ROWS)
+            .any(|i| custom_fields[i] && !before.custom_fields[i])
 }
 
 /// **The view-only gate** (spec 6.9): an item the server marks `edit: false`
@@ -40672,6 +40692,7 @@ mod reprompt_gating_tests {
             (DetailAction::CopySshPrivateKey, true),
             (DetailAction::CopyValue("Visa".to_string()), true),
             (DetailAction::CopyPasswordHistory(0), true),
+            (DetailAction::CopyField(0), true),
             (DetailAction::OpenWebsite("https://example.com".to_string()), false),
             (DetailAction::Delete, false),
             (DetailAction::ToggleFavorite(true), false),
@@ -40837,6 +40858,7 @@ mod reprompt_gating_tests {
             DetailAction::CopySshPrivateKey,
             DetailAction::CopyValue("Visa".to_string()),
             DetailAction::CopyPasswordHistory(0),
+            DetailAction::CopyField(0),
             DetailAction::Edit,
         ] {
             let refused = permit_detail_action(
@@ -40959,6 +40981,8 @@ mod reprompt_gating_tests {
         seed.totp_secret = true;
         let mut history = off;
         history.password_history[detail::MAX_HISTORY_ROWS - 1] = true;
+        let mut field = off;
+        field.custom_fields[detail::MAX_FIELD_ROWS - 1] = true;
         for (name, after) in [
             ("password", password),
             ("card number", number),
@@ -40966,6 +40990,7 @@ mod reprompt_gating_tests {
             ("ssh private key", ssh),
             ("totp secret", seed),
             ("the last previous-password row", history),
+            ("the last custom-field row", field),
         ] {
             assert!(
                 reveal_gained(&off, &after),

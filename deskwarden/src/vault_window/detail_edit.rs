@@ -632,7 +632,11 @@ pub struct FieldDraft {
 /// The same test `key_sequence::field_palette` applies. Stated here as a
 /// `const` rather than a literal so the two cannot drift apart in silence;
 /// `the_editor_hides_the_same_prefix_the_palette_hides` holds them together.
-const OURS_PREFIX: &str = "deskwarden:";
+///
+/// The read pane's `CUSTOM FIELDS` card hides the same prefix, and reads it
+/// from here rather than spelling it a third time -- see
+/// `detail::custom_field_rows`.
+pub(super) const OURS_PREFIX: &str = "deskwarden:";
 
 /// The next [`FieldDraft::row_id`].
 ///

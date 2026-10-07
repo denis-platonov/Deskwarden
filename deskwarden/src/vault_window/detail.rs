@@ -644,7 +644,23 @@ pub struct RevealState {
     /// be rotated afterwards, and a TOTP seed cannot -- it is the long-lived
     /// shared secret every future code is derived from.
     pub totp_secret: bool,
+    /// One flag per CUSTOM FIELDS row, indexed by the field's position in
+    /// `item.fields` -- the same index [`DetailAction::CopyField`] carries --
+    /// so a hidden field is revealed by its own eye and no other.
+    ///
+    /// An array, for [`Self::password_history`]'s reason: one shared flag
+    /// would reveal every hidden field at once, and a fixed size keeps this
+    /// struct `Copy`. A hidden field past [`MAX_FIELD_ROWS`] is still drawn,
+    /// masked, and still copies; its eye has no flag to keep, so it does not
+    /// stay revealed -- see [`custom_fields_card_rows`].
+    pub custom_fields: [bool; MAX_FIELD_ROWS],
 }
+
+/// How many custom fields can keep a reveal flag in [`RevealState`].
+///
+/// Thirty-two because that is the largest array `Default` is implemented for,
+/// and `RevealState` derives it. A real item carries a handful.
+pub const MAX_FIELD_ROWS: usize = 32;
 
 /// How many PREVIOUS PASSWORDS rows the pane will draw.
 ///
@@ -972,6 +988,15 @@ pub enum DetailAction {
     /// non-zeroizing home inside this enum. [`Self::CopyValue`]'s door is for
     /// non-secrets and this must not use it.
     CopyPasswordHistory(usize),
+    /// One CUSTOM FIELDS row was clicked, identified by its **index** into
+    /// `item.fields`.
+    ///
+    /// The index and not the value, for [`Self::CopyPasswordHistory`]'s
+    /// reason: every custom field's value is a `Zeroizing<String>` on the
+    /// item, and a hidden one is a secret by definition. The caller resolves
+    /// it through [`custom_field_copy_text`], the function the row painted
+    /// its value with, so what is copied is what was on screen.
+    CopyField(usize),
     /// The `MATCHED APP` card's Remove was clicked: the item should stop
     /// being bound to any app at all.
     ///
@@ -4665,6 +4690,21 @@ pub fn draw_detail_read(
                 pane_writable(item, &people),
                 &mut action,
             );
+        });
+        ui.add_space(CARD_GAP);
+    }
+
+    // **The CUSTOM FIELDS card, for every kind.** `fields` is item-level --
+    // `bw` sends it on every type -- so this is outside the `detail_body_for`
+    // match rather than in one of its arms; an arm would be this card's
+    // absence again on every other kind. Under MATCHED APP and above SHARING
+    // and NOTES, which is the edit form's own order (`Section::ALL`: the fill
+    // rule, then custom fields, then notes). Drawn only when it has a row,
+    // the absent-rather-than-empty rule the rest of this pane follows.
+    let custom_fields = custom_field_rows(item);
+    if !custom_fields.is_empty() {
+        card(ui, CUSTOM_FIELDS_CARD_HEADING, |ui| {
+            custom_fields_card_rows(ui, &custom_fields, reveal, &mut action);
         });
         ui.add_space(CARD_GAP);
     }
@@ -9134,6 +9174,228 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
     }
 }
 
+// ---------------------------------------------------------------------------
+// The CUSTOM FIELDS card.
+//
+// Reported: "this record has custom field but it is not shown in details
+// screen" -- an identity whose one custom field was in the vault and nowhere
+// on this pane. It was not an identity bug: nothing on the read pane read
+// `item.fields` at all, for any kind. The data arrived (the sync, the daemon's
+// item read and the announced-change apply all keep the array), the edit
+// form drew it (`detail_edit::custom_fields_block`), and the read pane simply
+// had no card for it.
+//
+// Every decision is `custom_field_rows`, a pure function, and the card only
+// draws what it hands back -- this file's standing reason.
+// ---------------------------------------------------------------------------
+
+/// The card's heading: the edit form's `Custom fields` card, in this pane's
+/// uppercase. `the_custom_fields_card_is_titled_as_the_edit_forms_is` holds
+/// the two together.
+const CUSTOM_FIELDS_CARD_HEADING: &str = "CUSTOM FIELDS";
+
+/// The label a field with no name is drawn under -- the edit form's own words
+/// for the same row.
+const UNNAMED_FIELD_LABEL: &str = "(unnamed field)";
+
+/// What one custom field draws as, by its Bitwarden `type`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CustomFieldFace<'a> {
+    /// `type: 0`, or no `type` at all (which is how this app writes its own
+    /// fields, and how `bw` reads them back). A plain copy row.
+    Text(&'a str),
+    /// `type: 1`, a secret: masked, with its own eye. Also any `type` this
+    /// build does not know -- masking an unknown field is the side that cannot
+    /// leak.
+    Hidden(&'a str),
+    /// `type: 2`. The wire value is the string `"true"` or `"false"`.
+    Boolean(bool),
+    /// `type: 3`: no value of its own, but a `linkedId` naming the item field
+    /// it stands for. `None` when that id is not one this build can name.
+    Linked(Option<&'static str>),
+}
+
+/// Hand-written so a hidden field's value never reaches a formatter -- the
+/// rule `vault_bridge::VaultField`'s own `Debug` keeps for the same value.
+impl std::fmt::Debug for CustomFieldFace<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text(v) => f.debug_tuple("Text").field(v).finish(),
+            Self::Hidden(_) => f.write_str("Hidden(<elided>)"),
+            Self::Boolean(b) => f.debug_tuple("Boolean").field(b).finish(),
+            Self::Linked(to) => f.debug_tuple("Linked").field(to).finish(),
+        }
+    }
+}
+
+/// One CUSTOM FIELDS row: which field (`index` into `item.fields`, which is
+/// what a copy and a reveal flag are keyed by), under what label, as what.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CustomFieldRow<'a> {
+    index: usize,
+    label: &'a str,
+    face: CustomFieldFace<'a>,
+}
+
+/// The rows the CUSTOM FIELDS card draws, in the item's own order.
+///
+/// * **Deskwarden's own fields are not drawn** -- the `deskwarden:` prefix
+///   the edit form and the keystroke palette already hide. The app match has
+///   its own card, and the icon and the billing postcode are bookkeeping.
+/// * **A blank text or hidden field draws nothing**, the identity rows' rule:
+///   a label over no value reads as a value that failed to load. Values are
+///   trimmed, as the identity's are.
+/// * Booleans and linked fields are always drawn: `false` and "linked to the
+///   password" are both something to say.
+fn custom_field_rows(item: &VaultItem) -> Vec<CustomFieldRow<'_>> {
+    item.fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let label = match field.name.as_deref() {
+                Some(name) if name.starts_with(super::detail_edit::OURS_PREFIX) => return None,
+                Some(name) if !name.trim().is_empty() => name,
+                _ => UNNAMED_FIELD_LABEL,
+            };
+            let value = field
+                .value
+                .as_deref()
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty());
+            let face = match field.other.get("type") {
+                None => CustomFieldFace::Text(value?),
+                Some(kind) => match kind.as_i64() {
+                    Some(0) => CustomFieldFace::Text(value?),
+                    Some(2) => CustomFieldFace::Boolean(value == Some("true")),
+                    Some(3) => CustomFieldFace::Linked(
+                        field
+                            .other
+                            .get("linkedId")
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(linked_field_name),
+                    ),
+                    // `1`, and anything this build has not seen.
+                    _ => CustomFieldFace::Hidden(value?),
+                },
+            };
+            Some(CustomFieldRow { index, label, face })
+        })
+        .collect()
+}
+
+/// What a CUSTOM FIELDS row's click puts on the clipboard: the text that row
+/// painted, or `None` for a row that copies nothing (a boolean, a linked
+/// field, a blank or internal one, an index past the end).
+///
+/// The one producer `vault_window::mod`'s [`DetailAction::CopyField`] arm
+/// reads, so a copy and the row it came from cannot disagree about trimming.
+pub fn custom_field_copy_text(item: &VaultItem, index: usize) -> Option<&str> {
+    custom_field_rows(item)
+        .into_iter()
+        .find(|row| row.index == index)
+        .and_then(|row| match row.face {
+            CustomFieldFace::Text(v) | CustomFieldFace::Hidden(v) => Some(v),
+            CustomFieldFace::Boolean(_) | CustomFieldFace::Linked(_) => None,
+        })
+}
+
+/// The item field a linked custom field's `linkedId` names, in Bitwarden's
+/// own numbering (`LoginLinkedId`, `CardLinkedId`, `IdentityLinkedId`).
+fn linked_field_name(id: i64) -> Option<&'static str> {
+    Some(match id {
+        100 => "Username",
+        101 => "Password",
+        300 => "Cardholder name",
+        301 => "Expiration month",
+        302 => "Expiration year",
+        303 => "Security code",
+        304 => "Brand",
+        305 => "Number",
+        400 => "Title",
+        401 => "Middle name",
+        402 => "Address 1",
+        403 => "Address 2",
+        404 => "Address 3",
+        405 => "City",
+        406 => "State",
+        407 => "Postal code",
+        408 => "Country",
+        409 => "Company",
+        410 => "Email",
+        411 => "Phone",
+        412 => "SSN",
+        413 => "Username",
+        414 => "Passport number",
+        415 => "License number",
+        416 => "First name",
+        417 => "Last name",
+        418 => "Full name",
+        _ => return None,
+    })
+}
+
+/// The CUSTOM FIELDS rows, drawn with the rows the rest of the pane uses: a
+/// text field is a [`credential_row`] and a hidden one a [`masked_row`], so a
+/// custom field copies on click and masks behind an eye exactly as the
+/// password beside it does. The lighter rule goes between rows, as on the
+/// LOGIN CREDENTIALS card.
+fn custom_fields_card_rows(
+    ui: &mut egui::Ui,
+    rows: &[CustomFieldRow<'_>],
+    reveal: &mut RevealState,
+    action: &mut DetailAction,
+) {
+    for (n, row) in rows.iter().enumerate() {
+        if n > 0 {
+            theme::row_rule(ui);
+        }
+        match row.face {
+            CustomFieldFace::Text(value) => credential_row(
+                ui,
+                row.label,
+                value,
+                None,
+                action,
+                DetailAction::CopyField(row.index),
+            ),
+            CustomFieldFace::Hidden(value) => {
+                // A field past `MAX_FIELD_ROWS` has no flag to keep, so its
+                // eye toggles a flag that is gone next frame: it stays masked,
+                // which is the safe way to run out.
+                let mut unkept = false;
+                let revealed = reveal.custom_fields.get_mut(row.index).unwrap_or(&mut unkept);
+                masked_row(
+                    ui,
+                    row.label,
+                    value,
+                    revealed,
+                    action,
+                    DetailAction::CopyField(row.index),
+                    MaskedFace::default(),
+                );
+            }
+            CustomFieldFace::Boolean(on) => plain_value_row(ui, row.label, if on { "Yes" } else { "No" }),
+            CustomFieldFace::Linked(to) => {
+                let text = to.map_or_else(|| "Linked field".to_string(), |to| format!("Linked to {to}"));
+                plain_value_row(ui, row.label, &text);
+            }
+        }
+    }
+}
+
+/// A row that shows a value and copies nothing -- a boolean's Yes/No, or what
+/// a linked field stands for. Neither is a value anyone pastes.
+fn plain_value_row(ui: &mut egui::Ui, label: &str, value: &str) {
+    row(
+        ui,
+        label,
+        |ui| {
+            ui.label(RichText::new(value).size(ROW_VALUE_SIZE).color(theme::INK));
+        },
+        |_ui| {},
+    );
+}
+
 /// The TOTP countdown, as the user asked for it: **"9s left - show just 9s"**.
 ///
 /// A pure function rather than a `format!` inside the paint closure, for this
@@ -12856,6 +13118,7 @@ mod tests {
             password_history: [false; MAX_HISTORY_ROWS],
             ssh_private_key: false,
             totp_secret: false,
+            custom_fields: [false; MAX_FIELD_ROWS],
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, reveal);
         // **Re-pinned to the grouped form, not loosened.** A revealed number
@@ -12919,6 +13182,7 @@ mod tests {
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
                 totp_secret: false,
+                custom_fields: [false; MAX_FIELD_ROWS],
             },
             "clicking the card number's eye did not write through to the caller's \
              RevealState, or wrote through to the wrong field"
@@ -13256,7 +13520,7 @@ mod tests {
     /// card. `the_card_heading_list_is_complete` counts the `card(` call sites
     /// in this file against it, so a ninth card fails the build's own suite
     /// rather than quietly narrowing the ordering claim.
-    const EVERY_CARD_HEADING: [&str; 11] = [
+    const EVERY_CARD_HEADING: [&str; 12] = [
         "LOGIN CREDENTIALS",
         TOTP_CARD_HEADING,
         "CARD DETAILS",
@@ -13266,6 +13530,7 @@ mod tests {
         "PREVIOUS PASSWORDS",
         "AUTOFILL TARGETS",
         APP_CARD_HEADING,
+        CUSTOM_FIELDS_CARD_HEADING,
         SHARING_CARD_HEADING,
         "NOTES",
     ];
@@ -15615,6 +15880,7 @@ mod tests {
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
                 totp_secret: false,
+                custom_fields: [false; MAX_FIELD_ROWS],
             },
         );
         assert!(
@@ -15637,6 +15903,7 @@ mod tests {
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
                 totp_secret: false,
+                custom_fields: [false; MAX_FIELD_ROWS],
             },
         );
         assert!(
@@ -15775,6 +16042,7 @@ mod tests {
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
                 totp_secret: false,
+                custom_fields: [false; MAX_FIELD_ROWS],
             },
         );
         // The security code is painted verbatim: three digits need no
@@ -16377,6 +16645,7 @@ mod tests {
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: true,
                 totp_secret: false,
+                custom_fields: [false; MAX_FIELD_ROWS],
             },
         );
         assert!(
@@ -16430,6 +16699,7 @@ mod tests {
             password_history: [false; MAX_HISTORY_ROWS],
             ssh_private_key: true,
             totp_secret: false,
+            custom_fields: [false; MAX_FIELD_ROWS],
         };
         let texts = painted_with_reveal(&an_ssh_key_item(), &TotpState::NoSecret, ssh_only);
         assert!(
@@ -16459,6 +16729,7 @@ mod tests {
             password_history: [false; MAX_HISTORY_ROWS],
             ssh_private_key: false,
             totp_secret: false,
+            custom_fields: [false; MAX_FIELD_ROWS],
         };
         let texts = painted_with_reveal(&a_full_card(), &TotpState::NoSecret, card_only);
         assert!(
@@ -16611,6 +16882,214 @@ mod tests {
             ..Default::default()
         };
         assert!(identity_groups(&identity).is_empty());
+    }
+
+    /// One custom field as `bw` sends it: `name`, `value`, and the `type`
+    /// riding `other` (0 text, 1 hidden, 2 boolean, 3 linked). `None` sends
+    /// no `type` key at all, which is how this app writes its own fields.
+    fn custom_field(
+        name: &str,
+        value: Option<&str>,
+        field_type: Option<i64>,
+    ) -> crate::vault_bridge::VaultField {
+        let mut other = serde_json::Map::new();
+        if let Some(t) = field_type {
+            other.insert("type".to_string(), serde_json::json!(t));
+        }
+        crate::vault_bridge::VaultField {
+            name: Some(name.to_string()),
+            value: value.map(|v| zeroize::Zeroizing::new(v.to_string())),
+            other,
+        }
+    }
+
+    /// The reported record, as its screenshot shows it: an identity called
+    /// "Napps LLC" with Email and Company under Contact, an SSN under
+    /// Government IDs -- and a custom field, which the pane did not draw.
+    fn napps_llc() -> VaultItem {
+        let mut item = an_item(Some(4));
+        item.name = "Napps LLC".to_string();
+        item.identity = Some(crate::vault_bridge::IdentityData {
+            email: Some("office@napps.example".to_string()),
+            company: Some("Napps LLC".to_string()),
+            ssn: Some("12-3456789".to_string()),
+            ..Default::default()
+        });
+        item.fields = vec![custom_field("D-U-N-S number", Some("080012345"), Some(0))];
+        item
+    }
+
+    /// **The report: "this record has custom field but it is not shown in
+    /// details screen".** The read pane drew no custom fields for any kind --
+    /// only the edit form ever read `item.fields` -- so an identity's one
+    /// custom field was in the vault and nowhere on screen.
+    #[test]
+    fn an_identitys_custom_field_is_drawn_on_the_read_pane() {
+        let item = napps_llc();
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        // CONTROL: this is the identity pane of the screenshot, so the
+        // assertions below are about that pane and not about an empty one.
+        for shown in ["IDENTITY", "Email", "Company", "SSN"] {
+            assert!(frame.painted(shown), "the identity card lost {shown:?}: {:?}", frame.strings());
+        }
+        assert!(
+            frame.painted(CUSTOM_FIELDS_CARD_HEADING),
+            "an identity with a custom field drew no {CUSTOM_FIELDS_CARD_HEADING:?} card: {:?}",
+            frame.strings()
+        );
+        assert!(frame.painted("D-U-N-S number"), "the field's name is missing: {:?}", frame.strings());
+        assert!(frame.painted("080012345"), "the field's value is missing: {:?}", frame.strings());
+    }
+
+    /// The same card on **every** kind, and above NOTES, which stays last.
+    /// Custom fields are item-level -- `bw` sends `fields` on every type --
+    /// so a card drawn for one body and not another would be this report
+    /// again on a different kind.
+    #[test]
+    fn every_kind_draws_its_custom_fields_above_notes() {
+        for kind in EVERY_KIND {
+            let mut item = a_noted_item(item_type_for(kind));
+            item.fields = vec![custom_field("Account number", Some("ACC-4471"), Some(0))];
+            let mut pane = Pane::new();
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            assert!(frame.painted("Account number"), "{kind:?} drew no field name: {:?}", frame.strings());
+            assert!(frame.painted("ACC-4471"), "{kind:?} drew no field value: {:?}", frame.strings());
+            let headings = frame.card_headings();
+            let names: Vec<&str> = headings.iter().map(|(h, _)| *h).collect();
+            assert!(names.contains(&CUSTOM_FIELDS_CARD_HEADING), "{kind:?} drew {names:?}");
+            assert_eq!(names.last(), Some(&"NOTES"), "{kind:?}: NOTES is not last in {names:?}");
+        }
+    }
+
+    /// A hidden field (`type: 1`) is a secret: masked until its own eye is
+    /// clicked, exactly as the password is, and revealed by its own flag.
+    #[test]
+    fn a_hidden_custom_field_is_masked_until_its_own_flag_reveals_it() {
+        let mut item = an_item(Some(4));
+        item.fields = vec![
+            custom_field("Plain", Some("visible-value"), Some(0)),
+            custom_field("Recovery code", Some("s3cret-recovery"), Some(1)),
+        ];
+        let masked = painted(&item, &TotpState::NoSecret);
+        assert!(contains(&masked, "Recovery code"), "the hidden field's name is missing: {masked:?}");
+        assert!(
+            !contains(&masked, "s3cret-recovery"),
+            "a hidden custom field was painted in the clear: {masked:?}"
+        );
+        // CONTROL: the text field beside it is painted, so the absence above
+        // is masking and not a card that drew nothing.
+        assert!(contains(&masked, "visible-value"), "{masked:?}");
+
+        let mut reveal = RevealState::default();
+        reveal.custom_fields[1] = true;
+        let revealed = painted_with_reveal(&item, &TotpState::NoSecret, reveal);
+        assert!(contains(&revealed, "s3cret-recovery"), "the reveal flag did nothing: {revealed:?}");
+
+        // The flag is the field's own: index 0's does not reveal index 1.
+        let mut other = RevealState::default();
+        other.custom_fields[0] = true;
+        let wrong = painted_with_reveal(&item, &TotpState::NoSecret, other);
+        assert!(!contains(&wrong, "s3cret-recovery"), "another row's flag revealed it: {wrong:?}");
+    }
+
+    /// Deskwarden's own bookkeeping (`deskwarden:app-match`,
+    /// `deskwarden:icon`, `deskwarden:billing-zip`) is not the user's data and
+    /// is drawn by its own card or not at all -- the edit form hides the same
+    /// prefix. An item carrying only those draws no CUSTOM FIELDS card.
+    #[test]
+    fn deskwardens_own_fields_draw_no_custom_fields_card() {
+        let mut item = an_item(Some(1));
+        item.fields = vec![
+            custom_field(crate::item_icon::ICON_FIELD_NAME, Some("example.com"), None),
+            custom_field(crate::vault_bridge::BILLING_ZIP_FIELD, Some("SW1A 1AA"), None),
+        ];
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(!contains(&texts, CUSTOM_FIELDS_CARD_HEADING), "{texts:?}");
+        assert!(!contains(&texts, "SW1A 1AA"), "{texts:?}");
+        assert!(custom_field_rows(&item).is_empty());
+
+        // CONTROL: one field of the user's own, and the card is back -- with
+        // that field and still without ours.
+        item.fields.push(custom_field("PIN hint", Some("birthday"), Some(0)));
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(contains(&texts, CUSTOM_FIELDS_CARD_HEADING), "{texts:?}");
+        assert!(contains(&texts, "birthday"), "{texts:?}");
+        assert!(!contains(&texts, "SW1A 1AA"), "{texts:?}");
+    }
+
+    /// What each field type draws as, decided by one pure function.
+    #[test]
+    fn custom_field_rows_draw_each_type_as_what_it_is() {
+        let mut item = an_item(Some(1));
+        item.fields = vec![
+            custom_field("Text", Some(" padded "), Some(0)),
+            custom_field("Untyped", Some("u"), None),
+            custom_field("Hidden", Some("h"), Some(1)),
+            custom_field("On", Some("true"), Some(2)),
+            custom_field("Off", Some("false"), Some(2)),
+            custom_field("Blank", Some("   "), Some(0)),
+            custom_field("Blank secret", None, Some(1)),
+            custom_field("Mystery", Some("m"), Some(9)),
+        ];
+        let mut linked = custom_field("Sign-in", None, Some(3));
+        linked.other.insert("linkedId".to_string(), serde_json::json!(100));
+        item.fields.push(linked);
+        let mut nameless = custom_field("", Some("orphan"), Some(0));
+        nameless.name = None;
+        item.fields.push(nameless);
+
+        let rows = custom_field_rows(&item);
+        let got: Vec<(usize, &str, CustomFieldFace<'_>)> =
+            rows.iter().map(|r| (r.index, r.label, r.face)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, "Text", CustomFieldFace::Text("padded")),
+                (1, "Untyped", CustomFieldFace::Text("u")),
+                (2, "Hidden", CustomFieldFace::Hidden("h")),
+                (3, "On", CustomFieldFace::Boolean(true)),
+                (4, "Off", CustomFieldFace::Boolean(false)),
+                // 5 and 6 are blank and draw nothing, the identity rows' rule.
+                // A type this build does not know is masked, not shown.
+                (7, "Mystery", CustomFieldFace::Hidden("m")),
+                (8, "Sign-in", CustomFieldFace::Linked(Some("Username"))),
+                (9, UNNAMED_FIELD_LABEL, CustomFieldFace::Text("orphan")),
+            ]
+        );
+        // What a click copies is what the row shows, trimmed.
+        assert_eq!(custom_field_copy_text(&item, 0), Some("padded"));
+        assert_eq!(custom_field_copy_text(&item, 2), Some("h"));
+        // A boolean, a linked field and a blank one offer nothing to copy.
+        assert_eq!(custom_field_copy_text(&item, 3), None);
+        assert_eq!(custom_field_copy_text(&item, 5), None);
+        assert_eq!(custom_field_copy_text(&item, 8), None);
+        assert_eq!(custom_field_copy_text(&item, 99), None);
+    }
+
+    /// A click on a custom field copies it, **by index** -- the value is a
+    /// `Zeroizing` on the item and must not get a second home in the action.
+    #[test]
+    fn clicking_a_custom_field_copies_it_by_index() {
+        let mut item = an_item(Some(4));
+        item.fields = vec![
+            custom_field(crate::item_icon::ICON_FIELD_NAME, Some("example.com"), None),
+            custom_field("Member ID", Some("M-1234"), Some(0)),
+        ];
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let clicked = pane.click(&item, &TotpState::NoSecret, laid_out.rect_of("M-1234").center());
+        assert_eq!(clicked.action, DetailAction::CopyField(1));
+    }
+
+    /// The read pane's card and the edit form's card are one card, so they
+    /// say one thing.
+    #[test]
+    fn the_custom_fields_card_is_titled_as_the_edit_forms_is() {
+        assert_eq!(
+            CUSTOM_FIELDS_CARD_HEADING,
+            super::super::detail_edit::FIELDS_BLOCK_HEADING.to_uppercase()
+        );
     }
 
     /// `address3` is absent from Bitwarden's captured template but present in
@@ -21188,6 +21667,7 @@ mod tests {
         password_history: [true; MAX_HISTORY_ROWS],
         ssh_private_key: true,
         totp_secret: true,
+        custom_fields: [true; MAX_FIELD_ROWS],
     };
 
     /// The card [`a_full_card`] would be if its expiry carried **no
@@ -22055,6 +22535,7 @@ mod tests {
                 password_history: [false; MAX_HISTORY_ROWS],
                 ssh_private_key: false,
                 totp_secret: false,
+                custom_fields: [false; MAX_FIELD_ROWS],
             },
         );
         assert!(
