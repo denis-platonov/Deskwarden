@@ -7547,15 +7547,27 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     // drag-to-select are untouched -- and this catches only the padding round
     // it.
     let surround = ui.interact(outer, ui.next_auto_id().with("field-box"), Sense::click());
-    let response = ui.put(
-        inner,
-        egui::TextEdit::singleline(value)
-            .hint_text(shape.hint)
-            .frame(egui::Frame::new())
-            .margin(Margin::ZERO)
-            .desired_width(inner.width())
-            .layouter(&mut layouter),
-    );
+    let mut edit = egui::TextEdit::singleline(value)
+        .frame(egui::Frame::new())
+        .margin(Margin::ZERO)
+        .desired_width(inner.width());
+    // **No hint at all for a box with none, and a real one set at the line.**
+    //
+    // egui 0.35 counts `hint_text("")` as a hint -- one empty text atom -- and
+    // while the value is empty it puts the caret's text area on THAT atom,
+    // laid out in egui's default 14-point row. The caret is drawn at this
+    // box's own line (25 points in the 20-point name box) and clipped to the
+    // text area, so an empty name box showed a caret cut to 16 points that
+    // grew back the moment a letter was typed. The owner: "when no entry -
+    // text cursor is too small in name". A real placeholder had the same
+    // clip, smaller (1.7 points off an 18-point caret), because it too was
+    // set in the default row rather than this box's face and line.
+    if !shape.hint.is_empty() {
+        edit = edit.hint_text(
+            egui::RichText::new(shape.hint).font(font.clone()).line_height(Some(line)),
+        );
+    }
+    let response = ui.put(inner, edit.layouter(&mut layouter));
 
     // **The box claims the height it allocated**, which `ui.put` above had
     // just given back.
@@ -11071,6 +11083,68 @@ mod tests {
         apply(&ctx);
         let _ = ctx.run_ui(input(), |_ui| {});
         ctx
+    }
+
+    /// **An empty box clips its caret exactly as a filled one does.**
+    ///
+    /// The owner: "when no entry - text cursor is too small in name". egui
+    /// 0.35 treats `hint_text("")` as a hint and, while the value is empty,
+    /// clips the caret to that hint's default 14-point row -- 16 points of a
+    /// 25-point caret in the 20-point name box, growing back on the first
+    /// keystroke. Measured here off the frame egui really paints: the clip
+    /// rect around the caret segment, empty against filled, for the name box
+    /// and for a box with a real placeholder.
+    #[test]
+    fn an_empty_field_clips_its_caret_like_a_filled_one() {
+        let ctx = ctx_with_fonts();
+        let caret_clip = |start: &str, hinted: bool| -> (f32, f32) {
+            let mut value = start.to_string();
+            let input = || egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 200.0))),
+                focused: true,
+                ..Default::default()
+            };
+            let mut out = None;
+            for frame in 0..4 {
+                out = Some(ctx.run_ui(input(), |ui| {
+                    let r = if hinted {
+                        hinted_field(ui, &mut value, "Search", false)
+                    } else {
+                        title_field_within(ui, &mut value, 700.0)
+                    };
+                    if frame == 0 {
+                        r.request_focus();
+                    }
+                }));
+            }
+            let mut found = None;
+            for clipped in out.expect("four frames ran").shapes {
+                let mut look = |s: &egui::Shape| {
+                    if let egui::Shape::LineSegment { points, .. } = s {
+                        if (points[0].x - points[1].x).abs() < 0.01 {
+                            found = Some((clipped.clip_rect.min.y, clipped.clip_rect.max.y));
+                        }
+                    }
+                };
+                look(&clipped.shape);
+                if let egui::Shape::Vec(v) = &clipped.shape {
+                    v.iter().for_each(&mut look);
+                }
+            }
+            found.expect("a focused field paints a vertical caret segment")
+        };
+        for hinted in [false, true] {
+            let empty = caret_clip("", hinted);
+            let filled = caret_clip("Apple", hinted);
+            assert!(
+                (empty.0 - filled.0).abs() < 0.01 && (empty.1 - filled.1).abs() < 0.01,
+                "hinted={hinted}: an empty box clips its caret to {empty:?}, a filled one to {filled:?}"
+            );
+        }
+        // Control: the name box's caret clip is a full line tall, not the
+        // default 14-point row the defect clipped it to.
+        let (top, bottom) = caret_clip("", false);
+        assert!(bottom - top > 20.0, "the empty name box clips its caret to {}", bottom - top);
     }
 
     /// **The measured evidence behind drawing the detail pane's icons as
