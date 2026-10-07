@@ -9154,11 +9154,19 @@ fn identity_rows(ui: &mut egui::Ui, groups: Option<IdentityGroups>, action: &mut
         empty_pane_note(ui, "No identity details on this item.");
         return;
     }
-    for (group_name, rows) in groups.iter() {
+    for (group_index, (group_name, rows)) in groups.iter().enumerate() {
         // A group boundary is the heavier rule -- the same one that sits under
         // the card's own heading, because a group heading is what follows it.
         // The lighter rule goes between the rows within a group.
-        theme::hairline(ui);
+        //
+        // **Not above the FIRST group**, whose top edge IS the card heading's
+        // rule: `card` has already drawn it, and drawing it again here put
+        // two parallel lines under IDENTITY -- reported off the "Napps LLC"
+        // screenshot. Pinned by
+        // `exactly_one_hairline_separates_a_card_heading_from_what_follows_it`.
+        if group_index > 0 {
+            theme::hairline(ui);
+        }
         egui::Frame::new()
             .inner_margin(Margin::symmetric(CARD_PAD_X, CARD_HEADING_PAD_Y))
             .show(ui, |ui| {
@@ -17090,6 +17098,87 @@ mod tests {
             CUSTOM_FIELDS_CARD_HEADING,
             super::super::detail_edit::FIELDS_BLOCK_HEADING.to_uppercase()
         );
+    }
+
+    /// How many `theme::hairline` rules -- the heavier, `HAIRLINE`-coloured
+    /// 1pt fill -- this frame painted between the bottom of `heading` and the
+    /// top of the first string painted below it.
+    fn hairlines_under(frame: &Frame, heading: &str) -> usize {
+        let head = frame.rect_of(heading);
+        let next = frame
+            .texts
+            .iter()
+            .filter(|(t, r)| !t.is_empty() && r.top() > head.bottom())
+            .map(|(_, r)| r.top())
+            .fold(f32::INFINITY, f32::min);
+        assert!(next.is_finite(), "nothing was painted under {heading:?}: {:?}", frame.strings());
+        let mut rects = Vec::new();
+        collect_rects(&frame.shapes, &mut rects);
+        rects
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::HAIRLINE
+                    && r.height() <= 1.5
+                    && r.top() >= head.bottom()
+                    && r.bottom() <= next
+            })
+            .count()
+    }
+
+    /// **Reported with the "Napps LLC" screenshot: two parallel 1px lines
+    /// right under the IDENTITY heading.** `card` draws the heading's own
+    /// rule, and `identity_rows` drew a group-boundary rule above EVERY group
+    /// -- including the first, whose top edge is that heading's rule. So the
+    /// first group heading sat under two.
+    ///
+    /// Asked of every card a kind's body can open with, so a second card
+    /// that draws its own leading rule is caught too.
+    #[test]
+    fn exactly_one_hairline_separates_a_card_heading_from_what_follows_it() {
+        let mut fielded = a_noted_item(Some(2));
+        fielded.fields = vec![custom_field("Account number", Some("ACC-4471"), Some(0))];
+        for (item, heading) in [
+            (napps_llc(), "IDENTITY"),
+            (napps_llc(), CUSTOM_FIELDS_CARD_HEADING),
+            (a_login(), "LOGIN CREDENTIALS"),
+            (a_full_card(), "CARD DETAILS"),
+            (an_ssh_key_item(), "SSH KEY"),
+            (fielded.clone(), "NOTES"),
+            (fielded, CUSTOM_FIELDS_CARD_HEADING),
+        ] {
+            let mut pane = Pane::new();
+            let frame = pane.idle(&item, &TotpState::NoSecret);
+            assert_eq!(
+                hairlines_under(&frame, heading),
+                1,
+                "{heading:?} is not separated from its first content by exactly one rule"
+            );
+        }
+    }
+
+    /// The positive control on the repair: the rule between two identity
+    /// GROUPS is still drawn. Only the first group's was a duplicate -- the
+    /// one above "Government IDs" is the only thing that separates it from
+    /// the Contact rows.
+    #[test]
+    fn the_rule_between_two_identity_groups_is_still_drawn() {
+        let item = napps_llc();
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        let contact = frame.rect_of("Contact");
+        let government = frame.rect_of("Government IDs");
+        let mut rects = Vec::new();
+        collect_rects(&frame.shapes, &mut rects);
+        let between = rects
+            .iter()
+            .filter(|(r, fill)| {
+                *fill == theme::HAIRLINE
+                    && r.height() <= 1.5
+                    && r.top() >= contact.bottom()
+                    && r.bottom() <= government.top()
+            })
+            .count();
+        assert_eq!(between, 1, "the Contact and Government IDs groups lost their boundary");
     }
 
     /// `address3` is absent from Bitwarden's captured template but present in
