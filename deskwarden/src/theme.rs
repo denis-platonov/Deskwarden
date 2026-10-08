@@ -811,6 +811,11 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.active.corner_radius = CornerRadius::same(7);
     v.widgets.open.weak_bg_fill = BLUE_WASH;
     v.widgets.open.bg_stroke = Stroke::new(1.0, BLUE);
+    // The one state that kept egui's own 2-point corner: a drop-down's button
+    // while its list is open drew square beside the rounded boxes either side
+    // of it. The owner, with the folder list open: "when selected - it is not
+    // rounded".
+    v.widgets.open.corner_radius = CornerRadius::same(7);
 
     style.visuals = v;
     ctx.set_theme(egui::Theme::Light);

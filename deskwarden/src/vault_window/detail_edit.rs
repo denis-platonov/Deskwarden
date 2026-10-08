@@ -10514,9 +10514,26 @@ const FORM_COMBO_HEIGHT: f32 = 420.0;
 /// has NOT asked for a gutter gets -- `theme::apply` sets no `ScrollStyle`,
 /// and `scrollbar_in_gutter` is a per-surface opt-in a drop-down never took.
 /// The rest of the context's style is untouched: this writes one field.
+///
+/// **And the bar is never painted.** egui keeps a popup a few points clear of
+/// the window's bottom edge, so a list whose button sits low gets a viewport
+/// a point or two shorter than its rows -- and a floating bar whose handle
+/// fills the whole track, for a list the user can already see all of. The
+/// owner, with six folders open and that bar down the side: "remove scroll
+/// here". The bar is floating, so it takes no room; with every opacity at
+/// zero it takes no ink either. The wheel still scrolls the rare list that
+/// truly outruns [`FORM_COMBO_HEIGHT`], whose cut-off last row says so.
 fn form_popup_style() -> egui::style::StyleModifier {
     egui::style::StyleModifier::new(|style| {
-        style.spacing.scroll = egui::style::ScrollStyle::default();
+        style.spacing.scroll = egui::style::ScrollStyle {
+            dormant_background_opacity: 0.0,
+            active_background_opacity: 0.0,
+            interact_background_opacity: 0.0,
+            dormant_handle_opacity: 0.0,
+            active_handle_opacity: 0.0,
+            interact_handle_opacity: 0.0,
+            ..egui::style::ScrollStyle::default()
+        };
     })
 }
 
@@ -29367,6 +29384,109 @@ mod edit_pane_layout_tests {
     /// and the owner reported the bar still there. What has to be true is
     /// that [`form_popup_style`] takes the gutter off a style that has one;
     /// the popup itself is drawn in a layer this harness does not collect.
+    /// **An open folder list paints no scroll bar, and its button stays
+    /// rounded.**
+    ///
+    /// Both from one screenshot of the folder drop-down open on the edit form.
+    /// "remove scroll here": egui keeps a popup a few points clear of the
+    /// window's bottom edge, so with the button low in a short window the
+    /// list's viewport came out two points shorter than its rows and a bar
+    /// whose handle filled the whole track was painted beside a list that was
+    /// entirely on screen -- reproduced here at 420 points, where it was
+    /// measured. "when selected - it is not rounded": the button, while its
+    /// list is open, drew egui's own 2-point corner beside 7-point neighbours.
+    #[test]
+    fn an_open_folder_list_paints_no_scroll_bar_and_its_button_stays_rounded() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 420.0);
+        let ctx = styled_context(pane);
+        let folders: Vec<Folder> = ["VirtualZones", "Napps", "OMF", "TVT", "Test Pro", "F7", "F8"]
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Folder { id: format!("f{i}"), name: n.to_string(), other: serde_json::Map::new() })
+            .collect();
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        draft.folder_id = Some("f1".into());
+        let mut run = |events: &[egui::Event]| {
+            let mut apps = AppIdentityCache::default();
+            ctx.run_ui(raw_input(pane, events), |ui| {
+                let _ = draw_detail_edit(
+                    ui,
+                    &mut draft,
+                    &folders,
+                    false,
+                    &mut apps,
+                    Some(&item),
+                    0,
+                    &crate::rest::organizations::Audience::Personal,
+                    &detail::TotpState::NoSecret,
+                    None,
+                );
+            })
+        };
+        #[derive(Default)]
+        struct Seen {
+            texts: Vec<(String, Rect)>,
+            rects: Vec<egui::epaint::RectShape>,
+        }
+        fn collect(shape: &egui::Shape, seen: &mut Seen) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    seen.texts.push((t.galley.text().to_string(), Rect::from_min_size(t.pos, t.galley.size())))
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, seen)),
+                egui::Shape::Rect(r) => seen.rects.push(r.clone()),
+                _ => {}
+            }
+        }
+        let seen_of = |out: egui::FullOutput| {
+            let mut seen = Seen::default();
+            out.shapes.iter().for_each(|c| collect(&c.shape, &mut seen));
+            seen
+        };
+        let mut button = None;
+        for _ in 0..3 {
+            let seen = seen_of(run(&[]));
+            button = seen.texts.into_iter().find(|(s, _)| s == "Napps").map(|(_, r)| r);
+        }
+        let at = button.expect("the folder button shows the item's folder").center();
+        let _ = run(&[
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        let _ = run(&[egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        let mut seen = Seen::default();
+        for _ in 0..4 {
+            seen = seen_of(run(&[egui::Event::PointerMoved(Pos2::new(300.0, 300.0))]));
+        }
+        assert!(
+            seen.texts.iter().any(|(s, _)| s == "F8"),
+            "the premise failed: the folder list did not open, so nothing below is measured"
+        );
+        // A scroll bar is a tall rect a few points wide; the form's own sits
+        // flush with the pane's right edge and is not the list's.
+        let painted_bars: Vec<Rect> = seen
+            .rects
+            .iter()
+            .filter(|r| r.rect.width() < 14.0 && r.rect.height() > 20.0 && r.rect.max.x < pane.x - 0.5)
+            .filter(|r| r.fill.a() > 0 || r.stroke.color.a() > 0)
+            .map(|r| r.rect)
+            .collect();
+        assert!(painted_bars.is_empty(), "the open folder list paints a scroll bar: {painted_bars:?}");
+        // The button's own frame: the rect round the selected folder's name.
+        let frame = seen
+            .rects
+            .iter()
+            .filter(|r| r.rect.contains(at) && r.rect.height() < 60.0)
+            .max_by(|a, b| a.rect.area().total_cmp(&b.rect.area()))
+            .expect("the open button paints a frame");
+        assert!(
+            frame.corner_radius.nw >= 7,
+            "the folder button draws {:?} corners while its list is open",
+            frame.corner_radius
+        );
+    }
+
     #[test]
     fn a_drop_down_on_this_form_does_not_inherit_its_scroll_gutter() {
         // A style carrying the form's own lane, exactly as `draw_detail_edit`
