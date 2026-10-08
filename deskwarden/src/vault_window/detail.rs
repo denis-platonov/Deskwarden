@@ -1355,6 +1355,16 @@ pub struct CardFields {
     pub expiry: Option<String>,
     /// Masked until revealed. See [`Self::number`].
     pub code: Option<String>,
+    /// The bank the user picked for this card in the edit form -- a domain,
+    /// stored on the item as the `favicon::BANK_DOMAIN_FIELD` custom field,
+    /// not on the `card` object (Bitwarden's card has no bank). Only
+    /// [`card_pane_fields`] fills it; [`card_fields`] sees the `card` object
+    /// alone and leaves it `None`.
+    pub bank: Option<String>,
+    /// The card's billing ZIP or postcode -- the
+    /// `vault_bridge::BILLING_ZIP_FIELD` custom field, for the same reason
+    /// and filled by the same function as [`Self::bank`].
+    pub billing_zip: Option<String>,
 }
 
 impl CardFields {
@@ -1368,12 +1378,23 @@ impl CardFields {
             number,
             expiry,
             code,
+            bank,
+            billing_zip,
         } = self;
-        cardholder.is_none() && brand.is_none() && number.is_none() && expiry.is_none() && code.is_none()
+        cardholder.is_none()
+            && brand.is_none()
+            && number.is_none()
+            && expiry.is_none()
+            && code.is_none()
+            && bank.is_none()
+            && billing_zip.is_none()
     }
 }
 
-/// See [`CardFields`].
+/// See [`CardFields`]. The `card` object's fields only -- what the copy
+/// handlers in `vault_window::mod` read the number and the code from. The
+/// pane itself draws [`card_pane_fields`], which adds the two facts the edit
+/// form keeps beside the `card` object.
 pub fn card_fields(data: &CardData) -> CardFields {
     CardFields {
         cardholder: non_empty(data.cardholder_name.as_deref()).map(str::to_string),
@@ -1381,7 +1402,42 @@ pub fn card_fields(data: &CardData) -> CardFields {
         number: non_empty(data.number.as_deref().map(|n| n.as_str())).map(str::to_string),
         expiry: card_expiry_text(data.exp_month.as_deref(), data.exp_year.as_deref()),
         code: non_empty(data.code.as_deref().map(|c| c.as_str())).map(str::to_string),
+        bank: None,
+        billing_zip: None,
     }
+}
+
+/// Everything the CARD DETAILS card draws: the `card` object's fields
+/// ([`card_fields`]) **and the bank and billing ZIP the edit form saves as
+/// `deskwarden:` custom fields** (`EditDraft::apply_card_fields_to`).
+///
+/// Those two are Deskwarden's own names, so the CUSTOM FIELDS card hides them
+/// with the rest of the prefix ([`custom_field_rows`]); before this read them,
+/// a card's bank and ZIP were in the vault and on neither card. They are read
+/// here exactly as the edit form reads them back, so the two panes agree:
+///
+/// * the bank through `favicon::icon_domain_for`, which is the reader the
+///   card's icon and the edit form's bank row already share;
+/// * the ZIP off `BILLING_ZIP_FIELD`, trimmed, blank meaning absent.
+///
+/// `None` only when there is nothing at all -- no `card` object and neither
+/// extra -- which `card_rows` turns into the "No card details" note. A card
+/// with no `card` object but a bank or a ZIP shows them.
+fn card_pane_fields(item: &VaultItem) -> Option<CardFields> {
+    let bank = crate::favicon::icon_domain_for(item);
+    let billing_zip = item
+        .fields
+        .iter()
+        .find(|f| f.name.as_deref() == Some(crate::vault_bridge::BILLING_ZIP_FIELD))
+        .and_then(|f| non_empty(f.value.as_deref().map(|v| v.as_str())))
+        .map(str::to_string);
+    if item.card.is_none() && bank.is_none() && billing_zip.is_none() {
+        return None;
+    }
+    let mut fields = item.card.as_ref().map(card_fields).unwrap_or_default();
+    fields.bank = bank;
+    fields.billing_zip = billing_zip;
+    Some(fields)
 }
 
 /// Which network a card is on, as everything the pane draws from it needs it:
@@ -4569,7 +4625,7 @@ pub fn draw_detail_read(
         DetailBody::NotesOnly => {}
         DetailBody::Card => {
             card(ui, "CARD DETAILS", |ui| {
-                card_rows(ui, item.card.as_ref().map(card_fields), reveal, &mut action);
+                card_rows(ui, card_pane_fields(item), reveal, &mut action);
             });
             ui.add_space(CARD_GAP);
         }
@@ -8423,8 +8479,9 @@ fn empty_pane_note(ui: &mut egui::Ui, text: &str) {
 }
 
 /// The CARD DETAILS rows. Empty fields do not render, exactly as the identity
-/// pane's do not -- a card populates five fields at most and a blank "Brand"
-/// label is noise.
+/// pane's do not -- a card populates seven fields at most (the `card` object's
+/// five, and the bank and billing ZIP of [`card_pane_fields`]) and a blank
+/// "Brand" label is noise.
 ///
 /// The number and the security code are the only masked values on either
 /// pane, and their reveal flags come from the caller (see [`RevealState`]).
@@ -8468,6 +8525,8 @@ fn card_rows(
         number,
         expiry,
         code,
+        bank,
+        billing_zip,
     } = fields;
 
     // Whether the card's FACE -- the number line and the expiry/code line --
@@ -8595,6 +8654,23 @@ fn card_rows(
             DetailAction::CopyValue(v.clone()),
         );
     }
+
+    // **The bank, then the billing ZIP, under the cardholder** -- the two
+    // facts the edit form keeps beside the `card` object, in that form's order
+    // (`Slot::all_for(ItemKind::Card)`: ... code, bank, ZIP). Plain copy rows
+    // like the Cardholder above them, with no chord: the chords are for the
+    // values a checkout form asks for most. The lighter rule goes between
+    // rows, as on the LOGIN CREDENTIALS card, and never above the first thing
+    // the card draws -- the heading's own rule is already there.
+    let mut above = face || cardholder.is_some();
+    for (label, value) in [(CARD_BANK_LABEL, &bank), (CARD_BILLING_ZIP_LABEL, &billing_zip)] {
+        let Some(v) = value else { continue };
+        if above {
+            theme::row_rule(ui);
+        }
+        above = true;
+        credential_row(ui, label, v, None, action, DetailAction::CopyValue(v.clone()));
+    }
 }
 
 /// The card pane's row names, in one place each: the row paints it, the copy
@@ -8616,6 +8692,12 @@ const CODE_LABEL: &str = "Code";
 /// description follows it, so the row, the toast and the shortcut list say
 /// one thing.
 const CARDHOLDER_LABEL: &str = "Cardholder";
+/// The edit form's own word for the bank row (`detail_edit::BANK_LABEL`), so
+/// the row is called one thing on the two panes.
+const CARD_BANK_LABEL: &str = super::detail_edit::BANK_LABEL;
+/// The edit form's own words for the billing postcode row
+/// (`detail_edit::BILLING_ZIP_LABEL`), for the same reason.
+const CARD_BILLING_ZIP_LABEL: &str = super::detail_edit::BILLING_ZIP_LABEL;
 
 /// How wide a digits run wants to be, unwrapped -- the question
 /// [`digits_fit`] asks, asked from outside a row.
@@ -9249,7 +9331,9 @@ struct CustomFieldRow<'a> {
 ///
 /// * **Deskwarden's own fields are not drawn** -- the `deskwarden:` prefix
 ///   the edit form and the keystroke palette already hide. The app match has
-///   its own card, and the icon and the billing postcode are bookkeeping.
+///   its own card, a card's bank and billing postcode are rows on CARD
+///   DETAILS ([`card_pane_fields`]) -- drawing them here as well would show
+///   them twice -- and the icon is the header's picture.
 /// * **A blank text or hidden field draws nothing**, the identity rows' rule:
 ///   a label over no value reads as a value that failed to load. Values are
 ///   trimmed, as the identity's are.
@@ -17098,6 +17182,136 @@ mod tests {
             CUSTOM_FIELDS_CARD_HEADING,
             super::super::detail_edit::FIELDS_BLOCK_HEADING.to_uppercase()
         );
+    }
+
+    /// The reported card, as its screenshot shows it -- "Napps (Brex)", a
+    /// Mastercard ending 6075, expiring 10/29, held by Denis Platonov -- with
+    /// the bank and the billing ZIP the edit form offers a card, **stored the
+    /// way the edit form stores them**: `EditDraft::apply_card_fields_to` writes
+    /// both through `vault_bridge::with_custom_field`, under the namespaced
+    /// names, and so does this.
+    fn napps_brex() -> VaultItem {
+        let mut item = an_item(Some(3));
+        item.name = "Napps (Brex)".to_string();
+        item.card = Some(crate::vault_bridge::CardData {
+            cardholder_name: Some("Denis Platonov".to_string()),
+            brand: Some("Mastercard".to_string()),
+            number: Some("5555555555556075".to_string().into()),
+            exp_month: Some("10".to_string()),
+            exp_year: Some("2029".to_string()),
+            code: Some("321".to_string().into()),
+            other: serde_json::Map::new(),
+        });
+        let item = crate::vault_bridge::with_custom_field(
+            &item,
+            crate::favicon::BANK_DOMAIN_FIELD,
+            "brex.com",
+        );
+        crate::vault_bridge::with_custom_field(&item, crate::vault_bridge::BILLING_ZIP_FIELD, "94107")
+    }
+
+    /// **The report: "no zip code shown or bank".** The edit form offers a
+    /// card a bank and a billing ZIP and saves them as `deskwarden:` custom
+    /// fields; the CARD DETAILS rows were built from the `card` object alone,
+    /// and the CUSTOM FIELDS card hides that prefix -- so both were in the
+    /// vault and on neither card.
+    ///
+    /// They belong on CARD DETAILS, after the cardholder, Bank before ZIP --
+    /// the edit form's own order (`Slot::all_for(ItemKind::Card)`). Each is
+    /// painted **exactly once** (`rect_of` asserts the count), so a fix that
+    /// also let them into CUSTOM FIELDS fails here too.
+    #[test]
+    fn a_cards_bank_and_billing_zip_are_drawn_on_its_card_details() {
+        let item = napps_brex();
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        // CONTROL: the card of the screenshot.
+        for shown in ["CARD DETAILS", CARDHOLDER_LABEL, "Denis Platonov", "Expires", "10/29"] {
+            assert!(frame.painted(shown), "the card lost {shown:?}: {:?}", frame.strings());
+        }
+        let heading = frame.rect_of("CARD DETAILS");
+        let holder = frame.rect_of("Denis Platonov");
+        let bank_label = frame.rect_of(CARD_BANK_LABEL);
+        let bank = frame.rect_of("brex.com");
+        let zip_label = frame.rect_of(CARD_BILLING_ZIP_LABEL);
+        let zip = frame.rect_of("94107");
+        assert!(heading.bottom() < holder.top(), "the cardholder is not under the heading");
+        assert!(holder.bottom() <= bank.top(), "the bank is not under the cardholder");
+        assert!(bank.bottom() <= zip.top(), "the ZIP is not under the bank, the edit form's order");
+        assert!(
+            (bank_label.center().y - bank.center().y).abs() < 4.0
+                && (zip_label.center().y - zip.center().y).abs() < 4.0,
+            "a label is not on its value's row"
+        );
+        // Not in a CUSTOM FIELDS card of their own: the card has no field of
+        // the user's, so there is no such card at all.
+        assert!(!frame.painted(CUSTOM_FIELDS_CARD_HEADING), "{:?}", frame.strings());
+    }
+
+    /// Copy-on-click, as the Cardholder row above them does.
+    #[test]
+    fn clicking_a_cards_bank_or_billing_zip_copies_it() {
+        let item = napps_brex();
+        for value in ["brex.com", "94107"] {
+            let mut pane = Pane::new();
+            let laid_out = pane.idle(&item, &TotpState::NoSecret);
+            let clicked = pane.click(&item, &TotpState::NoSecret, laid_out.rect_of(value).center());
+            assert_eq!(clicked.action, DetailAction::CopyValue(value.to_string()));
+        }
+    }
+
+    /// The labels sit in the fixed [`ROW_LABEL_WIDTH`] column, which wraps.
+    /// Each must be one line there, as Cardholder is: a two-line label would
+    /// make its row taller than every other row on the card.
+    #[test]
+    fn a_cards_bank_and_billing_zip_labels_fit_on_one_line() {
+        let item = napps_brex();
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        let one_line = frame.rect_of(CARDHOLDER_LABEL).height();
+        for label in [CARD_BANK_LABEL, CARD_BILLING_ZIP_LABEL] {
+            assert!(
+                frame.rect_of(label).height() <= one_line + 0.5,
+                "{label:?} wraps in the label column"
+            );
+        }
+    }
+
+    /// A card whose only facts are a bank and a ZIP is not "No card details
+    /// on this item." -- [`CardFields::is_empty`] counts them -- and a blank
+    /// one (written by some other client) draws no row, the pane's rule.
+    #[test]
+    fn a_card_with_only_a_bank_and_billing_zip_is_not_an_empty_card() {
+        let mut item = napps_brex();
+        item.card = Some(crate::vault_bridge::CardData::default());
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(!contains(&texts, "No card details on this item."), "{texts:?}");
+        assert!(contains(&texts, "brex.com") && contains(&texts, "94107"), "{texts:?}");
+
+        item.card = None;
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(!contains(&texts, "No card details on this item."), "{texts:?}");
+        assert!(contains(&texts, "brex.com") && contains(&texts, "94107"), "{texts:?}");
+
+        // Blank values: no rows, and the note is back.
+        for field in &mut item.fields {
+            field.value = Some(zeroize::Zeroizing::new("   ".to_string()));
+        }
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(!contains(&texts, CARD_BANK_LABEL), "{texts:?}");
+        assert!(!contains(&texts, CARD_BILLING_ZIP_LABEL), "{texts:?}");
+        assert!(contains(&texts, "No card details on this item."), "{texts:?}");
+    }
+
+    /// The bank is read through `favicon::icon_domain_for` -- the reader the
+    /// card's icon and the edit form's bank row use -- so the three cannot
+    /// disagree about which bank a card has.
+    #[test]
+    fn a_cards_bank_row_reads_what_its_icon_reads() {
+        let item = napps_brex();
+        let fields = card_pane_fields(&item).expect("the card has fields");
+        assert_eq!(fields.bank, crate::favicon::icon_domain_for(&item));
+        assert_eq!(fields.billing_zip.as_deref(), Some("94107"));
     }
 
     /// How many `theme::hairline` rules -- the heavier, `HAIRLINE`-coloured
