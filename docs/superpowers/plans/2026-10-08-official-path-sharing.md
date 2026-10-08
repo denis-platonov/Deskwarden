@@ -4034,6 +4034,79 @@ Expected: `src/rest/sharing.rs 0`
 Run: `cargo check -j 2 2>&1 | grep -E "^(error|warning)" | sort | uniq -c`
 Expected: no `error` in the library. (The test module still names the old items, but `cargo check` does not build tests.) If a `warning: unused` names `route_absent`, `refusal` or `text_at` in `sharing_api.rs`: `route_absent` is still used by `my_invitations`, and `refusal` and `text_at` by `confirm_member` and others. Any other unused item named is one this step left behind. Delete it.
 
+- [ ] **Step 15b: "Delete forever" purges with Bitwarden's route too (owner, 2026-10-08)**
+
+The owner decided this project also moves Deskwarden's general purge onto Bitwarden's route. It covers "empty trash" and "delete forever", not just sharing's move back.
+- **Today:** `RestClient::hard_delete_cipher` (`deskwarden/src/rest/api.rs` lines 1633–1669) sends NodeWarden-only `DELETE /api/ciphers/{id}/delete`. Its doc explains why: NodeWarden's bare `DELETE` used to trash a live item.
+- **What changed:** NW2 makes the bare route permanent, as on Bitwarden.
+- **Why it matters:** the suffix route does not exist on Vaultwarden or official Bitwarden, so "delete forever" fails there today.
+
+First the test. In `deskwarden/src/rest/api.rs`, in the test about lines 4590–4620 (the one ending in `"the purge went to the compat route, …"`), swap the two mocks' roles:
+- `hard` becomes `server.mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")` with `.expect(1)`.
+- The other mock is renamed `suffix` and becomes `server.mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete").with_status(200).create()`.
+- The final assertion becomes:
+
+```rust
+        assert!(
+            !suffix.matched(),
+            "the purge went to NodeWarden's `/delete` suffix, a route Vaultwarden and \
+             Bitwarden do not have; Bitwarden's permanent delete is the bare DELETE"
+        );
+```
+
+- Replace the comment above the mocks with:
+
+```rust
+        // `DELETE .../{id}`, Bitwarden's permanent delete -- on every server,
+        // NodeWarden included since it matches Bitwarden (its NW2). NOT
+        // NodeWarden's old `DELETE .../delete` suffix, which no other server
+        // has. The `suffix` mock below is the assertion that this client no
+        // longer goes there.
+```
+
+Run: `cargo test --lib -j 2 rest::api` with `CARGO_TARGET_DIR` as in Global Constraints.
+Expected: that test FAILS, because `hard` is not matched.
+
+Then the code. Replace the doc and body of `hard_delete_cipher` (lines 1633–1669) with:
+
+```rust
+    /// `DELETE /api/ciphers/{id}` -- Bitwarden's permanent delete: gone, with
+    /// no trash to recover it from.
+    ///
+    /// Named `hard_delete` rather than `delete` so that no caller reaches for
+    /// it by autocomplete when they meant [`Self::trash_cipher`]. This module
+    /// will not decide for a caller which one they want, but it will make the
+    /// irreversible one the longer word.
+    ///
+    /// # Why the bare route, and why it used to be the suffix
+    ///
+    /// For a while this sent NodeWarden's `DELETE /api/ciphers/{id}/delete`,
+    /// because NodeWarden's bare `DELETE` soft-deleted a LIVE item -- a call
+    /// named `hard_delete` reporting success for a trash. NodeWarden now
+    /// answers the bare route exactly as Bitwarden does (permanent, live or
+    /// trashed), and the suffix route exists on no other server, so a purge
+    /// against Vaultwarden or official Bitwarden failed outright. One route,
+    /// Bitwarden's, on every server -- the owner's "100% compatible" rule.
+    pub fn hard_delete_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
+        let url = self.cipher_url(id, "")?;
+        self.refreshing(session, |session| {
+            self.unit_from(self.bearer(self.write_agent.delete(&url), session).call())
+        })
+    }
+```
+
+- Check `cipher_url(id, "")` gives the bare `{base}/api/ciphers/{id}`. `grep -n "fn cipher_url" deskwarden/src/rest/api.rs` shows a suffix appended verbatim, and other callers already pass `""` (`grep -n 'cipher_url(id, "")'`).
+- If `sharing_api::delete_cipher` (Step 15) now does the same thing, leave it; it carries sharing's 404 rule. Its doc may say it matches `hard_delete_cipher`.
+
+Run: `cargo test --lib -j 2 rest::api`.
+Expected: PASS.
+
+Check: `grep -rn "/delete\")" deskwarden/src/rest/api.rs` lists no `DELETE` built on the `/delete` suffix. `trash_cipher`'s `PUT …/delete` is Bitwarden's trash route and stays.
+
+**Release dependency, for DW5:** this purge is permanent only once NodeWarden carries NW2. Against an older NodeWarden, the bare route trashes a live item instead. That is safe, since nothing is lost, but it is wrong. Deploy NodeWarden before releasing this Deskwarden build, as the release order already requires.
+
+Add `deskwarden/src/rest/api.rs` to Step 19's `git add` if it is not there (it is).
+
 - [ ] **Step 16: Rewrite the engine's tests for the one path**
 
 Every test below is replaced whole with `dw_cut`. Write each replacement to `$TEMP/dw/` first. All of them use the existing helpers (`on_nodewarden`, `roster`, `roster_row`, `with_roster`, `with_collections`, `echo`, `anna_key`, `person_collection`, `plaintext_collection`, `cache_org`, `cached`, `offline`, `authentic`, `member`).
@@ -4846,6 +4919,9 @@ names the sharer by its own org-user id from that roster, which is not
 the user id on official servers or Vaultwarden. A record leaves the org
 by Bitwarden's DELETE /api/ciphers/{id}, and the roster is read from
 /users only.
+
+"Delete forever" also purges with Bitwarden's bare DELETE /api/ciphers/{id}
+instead of NodeWarden's /delete suffix, which no other server has.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
