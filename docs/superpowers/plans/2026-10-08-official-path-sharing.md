@@ -1223,6 +1223,38 @@ If `pnpm exec tsc --noEmit` then reports `softDeleteCipher` as unused, check `gr
 
 Run the LF checks on the four edited `src` files.
 
+- [ ] **Step 6b: NodeWarden's own web vault trashes with the trash route, not DELETE**
+
+**This step is not optional.** NodeWarden's web vault moves an item to the trash by calling the route that Step 6 makes permanent:
+- `webapp/src/lib/api/vault.ts`, `deleteCipher`, about line 1502: `DELETE /api/ciphers/{id}`;
+- called from `webapp/src/hooks/useVaultSendActions.ts`, about line 674, as "delete item" (to trash).
+
+Left as it is, the web vault's ordinary Delete would destroy the item with no trash. Bitwarden's trash route is `PUT /api/ciphers/{id}/delete`. NodeWarden routes it to `handleDeleteCipher` → `softDeleteCipher` (`src/router-authenticated.ts` line 392), which answers the cipher as JSON. So the function's return type does not change.
+
+In `webapp/src/lib/api/vault.ts`, replace:
+
+```ts
+export async function deleteCipher(authedFetch: AuthedFetch, cipherId: string): Promise<Cipher> {
+  const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(cipherId)}`, { method: 'DELETE' });
+```
+
+with:
+
+```ts
+// Bitwarden's trash route. `DELETE /api/ciphers/{id}` is Bitwarden's
+// PERMANENT delete, which NodeWarden matches since this change: calling it
+// here would destroy the item instead of moving it to the trash.
+export async function deleteCipher(authedFetch: AuthedFetch, cipherId: string): Promise<Cipher> {
+  const resp = await authedFetch(`/api/ciphers/${encodeURIComponent(cipherId)}/delete`, { method: 'PUT' });
+```
+
+Then:
+- Check that no other web vault code sends a bare `DELETE` to a cipher. Run `grep -rn "api/ciphers/\${" webapp/src | grep "DELETE"`. The only hits must be `permanentDeleteCipher` (`…/delete`, DELETE) and attachment deletes (`…/attachment/…`).
+- Run `pnpm run test:webapp` and expect it to pass. If the webapp tests mock the trash call by method and path, update the mock to `PUT …/delete` in the same commit.
+- Run the LF check on `webapp/src/lib/api/vault.ts`.
+
+**Deploy note for DW5 and the release:** the server and the web vault ship in the same Worker deploy. A browser tab left open across the deploy still runs the old web vault, whose Delete would now be permanent. The release notes must tell the owner to reload any open NodeWarden web vault tabs after deploying.
+
 - [ ] **Step 7: Run the tests to see them pass**
 
 Run: `pnpm run test:sharing 2>&1 | grep -E "^# (pass|fail)"`
@@ -1239,7 +1271,7 @@ Expected: `# fail 0` everywhere, and `tsc` silent.
 - [ ] **Step 9: Commit**
 
 ```bash
-git add src/handlers/organizations.ts src/handlers/organization-users.ts src/router-authenticated.ts src/handlers/ciphers.ts scripts/sharing-confirmed-manager.test.ts scripts/sharing-org-user-details.test.ts
+git add src/handlers/organizations.ts src/handlers/organization-users.ts src/router-authenticated.ts src/handlers/ciphers.ts scripts/sharing-confirmed-manager.test.ts scripts/sharing-org-user-details.test.ts webapp/src/lib/api/vault.ts
 git commit -F - <<'EOF'
 One org user can be read and edited on the official routes, and DELETE on a cipher is permanent
 
@@ -1257,6 +1289,8 @@ Direct add of an existing account stays member-only.
 
 DELETE /api/ciphers/{id} soft-deleted a live cipher. It now deletes
 permanently, as Bitwarden's does; trash is PUT /ciphers/{id}/delete.
+NodeWarden's own web vault trashed through that DELETE, so it now uses
+PUT /ciphers/{id}/delete too; otherwise its Delete would destroy items.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 EOF
