@@ -1,7 +1,9 @@
-//! **NodeWarden's sharing routes**, one typed function each -- the NodeWarden
-//! column of spec §7.3, with the request and answer shapes of §10 and of the
-//! routes NodeWarden already has (`/members/*`, `/invitations/*`,
-//! `/users/{ouId}/registration-invite`).
+//! **The sharing routes**, one typed function each -- Bitwarden's own, the
+//! official column of spec §7.3, which every server answers
+//! (`docs/superpowers/specs/2026-10-08-official-path-sharing-design.md`).
+//! Two NodeWarden routes remain, each said where it is: the recipient's
+//! invitation list (until the paste-a-link accept replaces it) and the
+//! administrator's registration code.
 //!
 //! No policy lives here. Which route to call, in what order, and what a
 //! refusal means for the user is `rest::sharing`'s. What lives here is the
@@ -63,20 +65,6 @@ fn safe(id: &str) -> Result<&str, RestError> {
     if is_url_path_safe(id) { Ok(id) } else { Err(RestError::UnsafeId) }
 }
 
-/// Percent-encodes a query value. An email carries `@` and may carry `+`,
-/// and a `+` left bare is a space to the server.
-fn query_value(text: &str) -> String {
-    text.bytes()
-        .map(|b| {
-            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-                (b as char).to_string()
-            } else {
-                format!("%{b:02X}")
-            }
-        })
-        .collect()
-}
-
 /// A server without this route: its whole answer is "not here".
 fn route_absent(error: &RestError) -> bool {
     matches!(error, RestError::Status(404 | 405 | 501))
@@ -133,23 +121,13 @@ pub struct IncomingInvitation {
     pub expires_at: Option<String>,
 }
 
-/// An account's id and public key, looked up by email.
+/// An account's id and public key: what a confirm wraps the org key to, and
+/// what a pin records.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountKey {
     pub user_id: String,
     /// SPKI DER.
     pub public_key: Vec<u8>,
-}
-
-/// Which branch NodeWarden's invite took.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InviteOutcome {
-    /// An existing account became a member at once (direct membership).
-    Member,
-    /// No account: a pending invitation, with its own id.
-    Invitation { id: String },
-    /// Already a member or already invited -- another PC got there first.
-    AlreadyThere,
 }
 
 /// A collection as the org's own listing answers it: the name still ciphertext.
@@ -251,40 +229,6 @@ pub fn user_public_key(
     }
 }
 
-/// What `GET /api/users/{userId}/public-key` said, for the dialect probe's
-/// second question -- "are the slice-1 routes here?" (spec 7.1).
-///
-/// **Not [`user_public_key`]'s `Option`**, which folds three answers into
-/// `None` because a confirm only wants the key. The probe needs the
-/// difference: a 200 with no key in it is the route answering, and caching it
-/// as "server too old" for the session would turn sharing off on a server
-/// that has it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyRoute {
-    /// 200: the route is there, whether or not the answer carried a key.
-    Answered { key: bool },
-    /// 404: no such route -- OR, on NodeWarden, whose handler answers 404
-    /// "User public key not found" for an account with no key pair, the route
-    /// and a keyless account. The status alone cannot tell them apart; the
-    /// caller decides with what it knows about the account.
-    NotFound,
-    /// 405 or 501: no such route, unambiguously ([`route_absent`]'s others).
-    Absent,
-}
-
-/// `GET /api/users/{userId}/public-key`, answered as a [`KeyRoute`].
-pub fn key_route(client: &RestClient, session: &mut Session, user_id: &str) -> Result<KeyRoute, RestError> {
-    let path = format!("/api/users/{}/public-key", safe(user_id)?);
-    match send(client, session, &SharingRequest::new(SharingMethod::Get, path, None)) {
-        Ok(answer) => Ok(KeyRoute::Answered {
-            key: text_at(&answer, "publicKey").or_else(|| text_at(&answer, "key")).is_some(),
-        }),
-        Err(RestError::Status(404)) => Ok(KeyRoute::NotFound),
-        Err(e) if route_absent(&e) => Ok(KeyRoute::Absent),
-        Err(e) => Err(e),
-    }
-}
-
 /// `POST /api/organizations`, the official body. Returns the new org's id.
 pub fn create_organization(
     client: &RestClient,
@@ -382,59 +326,34 @@ pub fn collection_items(
     listed.iter().map(|row| text_at(row, "id").ok_or(RestError::Parse("an item id in the collection"))).collect()
 }
 
-/// `GET /api/organizations/{id}/members/public-key?email=` -- whether the
-/// account exists, and its key (spec §7.2, the direct-add accelerator).
-pub fn member_key_by_email(
-    client: &RestClient,
-    session: &mut Session,
-    org: &str,
-    email: &str,
-) -> Result<Option<AccountKey>, RestError> {
-    let path = format!("/api/organizations/{}/members/public-key?email={}", safe(org)?, query_value(email));
-    match send(client, session, &SharingRequest::new(SharingMethod::Get, path, None)) {
-        Ok(answer) => {
-            let (Some(user_id), Some(key)) = (text_at(&answer, "userId"), text_at(&answer, "publicKey")) else {
-                return Ok(None);
-            };
-            let public_key = spki_from_base64(&key).map_err(|_| RestError::Parse("a public key"))?;
-            Ok(Some(AccountKey { user_id, public_key }))
-        }
-        Err(RestError::Status(404)) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// `POST /api/organizations/{id}/members/invite`: read-only access to one
-/// collection, with the org key already wrapped when the account exists.
-pub fn invite_member(
+/// `POST /api/organizations/{id}/users/invite` -- Bitwarden's invite, with
+/// the official body of the official-path spec §3.2: one email, the User
+/// type, read-only access to the person's own collection, no groups, no
+/// custom permissions, no Secrets Manager.
+///
+/// **Answered with an empty 200 on every server**, and the answer says
+/// nothing: not the new org-user id, not whether the address has an account,
+/// not whether the server accepted it at once (Vaultwarden and NodeWarden
+/// with mail off do, for an existing account). The caller reads the roster
+/// after it for all three. An address already in the org is skipped by the
+/// server, silently, so a two-PC race is a success here too.
+pub fn invite_user(
     client: &RestClient,
     session: &mut Session,
     org: &str,
     email: &str,
     collection_id: &str,
-    key: Option<&EncString>,
-) -> Result<InviteOutcome, RestError> {
-    let path = format!("/api/organizations/{}/members/invite", safe(org)?);
-    let mut json = json!({
-        "email": email,
-        "role": "member",
+) -> Result<(), RestError> {
+    let path = format!("/api/organizations/{}/users/invite", safe(org)?);
+    let json = json!({
+        "emails": [email],
+        "type": 2,
         "collections": [{ "id": collection_id, "readOnly": true, "hidePasswords": false, "manage": false }],
+        "groups": [],
+        "permissions": null,
+        "accessSecretsManager": false,
     });
-    if let (Some(key), Some(object)) = (key, json.as_object_mut()) {
-        object.insert("encryptedOrgKey".into(), Value::String(key.to_string()));
-    }
-    match send(client, session, &SharingRequest::new(SharingMethod::Post, path, Some(json))) {
-        Ok(answer) => Ok(match answer.get("object").and_then(Value::as_str) {
-            Some("organizationInvitation") => {
-                InviteOutcome::Invitation { id: text_at(&answer, "id").unwrap_or_default() }
-            }
-            _ => InviteOutcome::Member,
-        }),
-        Err(e) if refusal(&e).is_some_and(|s| s.contains("already a member") || s.contains("already been invited")) => {
-            Ok(InviteOutcome::AlreadyThere)
-        }
-        Err(e) => Err(e),
-    }
+    send(client, session, &SharingRequest::new(SharingMethod::Post, path, Some(json))).map(|_| ())
 }
 
 /// `POST /api/organizations/{id}/users/{ouId}/confirm {key}`. "Already
@@ -465,6 +384,29 @@ pub fn reinvite(client: &RestClient, session: &mut Session, org: &str, ou_id: &s
 /// Already gone is done.
 pub fn remove_user(client: &RestClient, session: &mut Session, org: &str, ou_id: &str) -> Result<(), RestError> {
     let path = format!("/api/organizations/{}/users/{}", safe(org)?, safe(ou_id)?);
+    match send(client, session, &SharingRequest::new(SharingMethod::Delete, path, None)) {
+        Ok(_) | Err(RestError::Status(404)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// `DELETE /api/ciphers/{id}` -- Bitwarden's permanent delete, the second
+/// half of moving a record back (base spec §7.3: "`POST /api/ciphers`
+/// (personal) then `DELETE /api/ciphers/{orgId}`" on every server).
+///
+/// **The same route as `RestClient::hard_delete_cipher`**, sent through
+/// sharing's one door and with sharing's 404 rule below. Both used to send
+/// NodeWarden's own `DELETE /api/ciphers/{id}/delete`: official servers and
+/// Vaultwarden have no such route, and the 404 they answered was read here
+/// as "already gone", so the org copy stayed in the org, filed nowhere.
+/// NodeWarden's bare route was a soft delete for a live cipher until it was
+/// made Bitwarden's.
+///
+/// A 404 is done: the org copy is already gone. Matched on the status
+/// itself -- a 403 is not "gone", and must stay an error so the move back is
+/// retried rather than dropped.
+pub fn delete_cipher(client: &RestClient, session: &mut Session, id: &str) -> Result<(), RestError> {
+    let path = format!("/api/ciphers/{}", safe(id)?);
     match send(client, session, &SharingRequest::new(SharingMethod::Delete, path, None)) {
         Ok(_) | Err(RestError::Status(404)) => Ok(()),
         Err(e) => Err(e),
@@ -662,104 +604,57 @@ mod tests {
         created.assert();
     }
 
-    /// Direct membership (spec 7.2): the key lookup answers both "does the
-    /// account exist" and "what is its key"; a 404 is "no account".
+    /// **The invite is Bitwarden's, body and all** (official-path spec §3.2):
+    /// one email, the User type, read-only access to one collection, and the
+    /// rest of `OrganizationUserInviteRequestModel` spelled out. Answered with
+    /// an empty 200 on every server, which is a success.
     #[test]
-    fn an_accounts_key_is_looked_up_by_email_and_a_404_is_no_account() {
+    fn an_invite_is_the_official_body_on_the_official_route() {
         let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
-        let spki = crate::rest::crypto::tests::fixture_public_spki();
-        let found = server
-            .mock("GET", format!("/api/organizations/{ORG}/members/public-key?email=anna%40example.com").as_str())
-            .with_body(serde_json::json!({ "userId": "anna-id", "publicKey": crate::rest::crypto::tests::base64(&spki) }).to_string())
-            .expect(1)
-            .create();
-        let key = member_key_by_email(&client, &mut session, ORG, "anna@example.com").expect("ok").expect("found");
-        found.assert();
-        assert_eq!(key, AccountKey { user_id: "anna-id".into(), public_key: spki });
-
-        server
-            .mock("GET", format!("/api/organizations/{ORG}/members/public-key?email=nobody%40example.com").as_str())
-            .with_status(404)
-            .create();
-        assert!(member_key_by_email(&client, &mut session, ORG, "nobody@example.com").expect("ok").is_none());
-    }
-
-    /// **The probe's reading of the own-key route keeps apart what
-    /// `user_public_key` folds together**: a 200 is the route whether or not
-    /// it carried a key, a 404 is ambiguous and says so, and a 405 or 501 is
-    /// no route at all.
-    #[test]
-    fn the_key_route_tells_an_answer_without_a_key_from_no_route() {
-        let mut server = crate::test_http::server();
-        let (client, mut session) = granted(&mut server);
-        let spki = crate::rest::crypto::tests::fixture_public_spki();
-        server
-            .mock("GET", "/api/users/keyed/public-key")
-            .with_body(serde_json::json!({ "userId": "keyed", "publicKey": crate::rest::crypto::tests::base64(&spki) }).to_string())
-            .create();
-        server.mock("GET", "/api/users/keyless/public-key").with_body(r#"{"userId":"keyless","publicKey":null}"#).create();
-        server.mock("GET", "/api/users/missing/public-key").with_status(404).create();
-        server.mock("GET", "/api/users/refused/public-key").with_status(405).create();
-        server.mock("GET", "/api/users/unbuilt/public-key").with_status(501).create();
-        let asked = |id: &str, session: &mut Session| key_route(&client, session, id).expect("an answer");
-        assert_eq!(asked("keyed", &mut session), KeyRoute::Answered { key: true });
-        assert_eq!(asked("keyless", &mut session), KeyRoute::Answered { key: false });
-        assert_eq!(asked("missing", &mut session), KeyRoute::NotFound);
-        assert_eq!(asked("refused", &mut session), KeyRoute::Absent);
-        assert_eq!(asked("unbuilt", &mut session), KeyRoute::Absent);
-    }
-
-    /// NodeWarden's invite: read-only access to the one collection, and the
-    /// org key already wrapped for an existing account. The answer's `object`
-    /// says which of the two branches the server took.
-    #[test]
-    fn an_invite_carries_read_only_access_and_says_which_branch_the_server_took() {
-        let mut server = crate::test_http::server();
-        let (client, mut session) = granted(&mut server);
-        let member = server
-            .mock("POST", format!("/api/organizations/{ORG}/members/invite").as_str())
-            .match_body(Matcher::PartialJson(serde_json::json!({
-                "email": "anna@example.com",
-                "role": "member",
+        let invited = server
+            .mock("POST", format!("/api/organizations/{ORG}/users/invite").as_str())
+            .match_body(Matcher::Json(serde_json::json!({
+                "emails": ["anna@example.com"],
+                "type": 2,
                 "collections": [{ "id": "c-anna", "readOnly": true, "hidePasswords": false, "manage": false }],
-                "encryptedOrgKey": "4.AAAA"
+                "groups": [],
+                "permissions": null,
+                "accessSecretsManager": false
             })))
-            .with_body(r#"{"id":"anna-id","status":1,"object":"organizationMember"}"#)
+            .with_body("")
             .expect(1)
             .create();
-        let outcome = invite_member(&client, &mut session, ORG, "anna@example.com", "c-anna", Some(&an_enc())).expect("invited");
-        member.assert();
-        assert_eq!(outcome, InviteOutcome::Member);
-
-        let mut other = crate::test_http::server();
-        let (client, mut session) = granted(&mut other);
-        other
-            .mock("POST", format!("/api/organizations/{ORG}/members/invite").as_str())
-            .match_request(|request| !request.utf8_lossy_body().contains("encryptedOrgKey"))
-            .with_body(r#"{"id":"inv-9","status":0,"object":"organizationInvitation"}"#)
-            .create();
-        assert_eq!(
-            invite_member(&client, &mut session, ORG, "carol@example.com", "c-carol", None).expect("invited"),
-            InviteOutcome::Invitation { id: "inv-9".into() }
-        );
+        invite_user(&client, &mut session, ORG, "anna@example.com", "c-anna").expect("invited");
+        invited.assert();
+        let any = server.mock("POST", Matcher::Any).expect(0).create();
+        assert_eq!(invite_user(&client, &mut session, "../x", "anna@example.com", "c"), Err(RestError::UnsafeId));
+        any.assert();
     }
 
-    /// "Already a member" and "already confirmed" are the two-PC race (spec
-    /// 13): success, not an error.
+    /// **A record leaves the org by Bitwarden's permanent delete**,
+    /// `DELETE /api/ciphers/{id}` -- not NodeWarden's `/delete` suffix, which
+    /// official servers and Vaultwarden do not have. Already gone is done; a
+    /// refusal is not.
+    #[test]
+    fn a_purge_is_the_official_delete_and_a_404_is_done() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        let deleted = server.mock("DELETE", "/api/ciphers/c1").with_status(204).expect(1).create();
+        delete_cipher(&client, &mut session, "c1").expect("deleted");
+        deleted.assert();
+        server.mock("DELETE", "/api/ciphers/gone").with_status(404).create();
+        delete_cipher(&client, &mut session, "gone").expect("already gone is done");
+        server.mock("DELETE", "/api/ciphers/theirs").with_status(403).create();
+        assert_eq!(delete_cipher(&client, &mut session, "theirs"), Err(RestError::Status(403)));
+    }
+
+    /// "Already confirmed" and a removal already made are the two-PC race
+    /// (spec 13): success, not an error.
     #[test]
     fn a_race_another_pc_already_won_is_a_success() {
         let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
-        server
-            .mock("POST", format!("/api/organizations/{ORG}/members/invite").as_str())
-            .with_status(400)
-            .with_body(r#"{"error":"User is already a member","error_description":"User is already a member"}"#)
-            .create();
-        assert_eq!(
-            invite_member(&client, &mut session, ORG, "anna@example.com", "c", None).expect("a race"),
-            InviteOutcome::AlreadyThere
-        );
         server
             .mock("POST", format!("/api/organizations/{ORG}/users/anna-id/confirm").as_str())
             .with_status(400)

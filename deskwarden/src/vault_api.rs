@@ -1099,7 +1099,7 @@ pub(crate) mod tests {
         assert!(page.changes.contains(&crate::change_feed::Change::Sharing), "{:?}", page.changes);
         let after: serde_json::Value = serde_json::from_str(&ask(&api, "GET", "/sharing", Some(&token), "").body).expect("json");
         assert_eq!(after["data"]["available"], true);
-        assert_eq!(after["data"]["dialect"], "nodewarden");
+        assert!(after["data"].get("dialect").is_none(), "there is no dialect any more: {after}");
     }
 
     /// **`bw serve` answers "unavailable" and makes no request** (spec 7.4).

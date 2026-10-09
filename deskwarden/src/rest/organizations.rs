@@ -1222,7 +1222,7 @@ pub fn forget() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rest::api::{Device, RestClient};
+    use crate::rest::api::{Device, RestClient, RestError};
     use crate::rest::crypto::encrypt;
     use crate::rest::sync::tests::keys_with_organisation;
     use serde_json::json;
@@ -1558,7 +1558,7 @@ mod tests {
             )
             .create();
         let members = server
-            .mock("GET", format!("/api/organizations/{ORG}/members").as_str())
+            .mock("GET", format!("/api/organizations/{ORG}/users?includeCollections=true").as_str())
             .with_status(404)
             .with_body(r#"{"message":"Not found"}"#)
             .expect(1)
@@ -1829,9 +1829,11 @@ mod tests {
         );
     }
 
-    /// **The roster route: `/users` first, `/members` when it is not there.**
+    /// **The roster route is `/users` and nothing else**: NodeWarden's older
+    /// `/members` is never asked, even when `/users` is missing -- sharing is
+    /// on Bitwarden's routes only, and that server is one it calls too old.
     #[test]
-    fn the_roster_reads_users_then_falls_back_to_members() {
+    fn the_roster_reads_users_and_never_the_old_members_route() {
         let mut server = crate::test_http::server();
         server.mock("POST", "/identity/connect/token")
             .with_body(r#"{"access_token":"AT-1","expires_in":3600,"refresh_token":"RT-1","token_type":"Bearer"}"#)
@@ -1844,12 +1846,8 @@ mod tests {
             .with_status(404)
             .expect(1)
             .create();
-        let members = server
-            .mock("GET", format!("/api/organizations/{ORG}/members").as_str())
-            .with_body(r#"{"data":[]}"#)
-            .expect(1)
-            .create();
-        client.fetch_organization_members(&mut session, ORG).expect("the fallback answered");
+        let members = server.mock("GET", format!("/api/organizations/{ORG}/members").as_str()).expect(0).create();
+        assert_eq!(client.fetch_organization_members(&mut session, ORG), Err(RestError::Status(404)));
         users.assert();
         members.assert();
     }

@@ -19,17 +19,23 @@
 //!
 //! It holds only what the last whole read already paid for (the sharing
 //! org's roster and person collections, handed over by `synced` through
-//! [`Sharing::note_directory`]), the dialect probe's answer, the recipient's
+//! [`Sharing::note_directory`]), the [`Capabilities`] it has learned, the recipient's
 //! incoming invitations, and two sets the confirm pass learns (keys that
 //! changed, accounts with no key yet). Every WRITE reads current server
 //! state first and does only the missing steps (spec 13), so a Retry is the
 //! same call and two PCs converge.
 //!
-//! # NodeWarden only, in this build
+//! # One path, on every server
 //!
-//! The owner's decision: slices 2 and 3 target NodeWarden. The probe tells
-//! the dialects apart (spec 7.1), and on anything but NodeWarden with the
-//! slice-1 routes the view says `available: false` and every write refuses.
+//! `docs/superpowers/specs/2026-10-08-official-path-sharing-design.md`
+//! amends the design: NodeWarden, Vaultwarden and official Bitwarden are all
+//! shared on through Bitwarden's own routes and bodies, and nothing asks
+//! which server this is. What differs between them is learned as
+//! [`Capabilities`], each from an official route sharing needs anyway: a
+//! route answering as missing turns sharing off (`server-too-old`), and a
+//! roster read after an invite says whether the server accepted at once.
+//! The recipient's invitation list is the one NodeWarden route left, until
+//! the paste-a-link accept replaces it.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -42,22 +48,18 @@ use crate::rest::crypto::{CryptoError, EncString, SymmetricKey};
 use crate::rest::organizations::{
     Directory, Member, MemberStatus, Roster, collection_ids_of, normalise_email, organization_of, sharer_of,
 };
-use crate::rest::sharing_api::{self, IncomingInvitation, KeyRoute};
+use crate::rest::sharing_api::{self, IncomingInvitation};
 use crate::rest::sync::{Profile, VaultKeys};
 use crate::vault_bridge::{VaultError, VaultItem};
 
 // ---- what the daemon answers `GET /sharing` with --------------------------------
 
-/// Why sharing is not available. Spec 11.3's reasons, plus `not-nodewarden`:
-/// the owner's decision leaves official servers for a later slice, and the
-/// spec's list had no word for that.
+/// Why sharing is not available (spec 11.3). `server-too-old` is a route
+/// sharing needs answering as missing (official-path spec §2). There is no
+/// "not NodeWarden" any more: every server shares on the one path.
 pub const REASON_BW_SERVE: &str = "bw-serve";
-pub const REASON_NOT_NODEWARDEN: &str = "not-nodewarden";
 pub const REASON_TOO_OLD: &str = "server-too-old";
 pub const REASON_NOT_LOADED: &str = "not-loaded";
-
-/// The one dialect this build shares on.
-pub const DIALECT_NODEWARDEN: &str = "nodewarden";
 
 /// Spec 6.1's per-person states.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,7 +151,6 @@ pub struct WaitingEntry {
 pub struct SharingView {
     pub available: bool,
     pub reason: Option<String>,
-    pub dialect: Option<String>,
     /// Always false on NodeWarden (slice 1 makes rosters manager-only).
     pub roster_visible_to_recipients: bool,
     /// The account is NodeWarden's administrator and may mint invite codes.
@@ -229,9 +230,9 @@ pub const MOVE_BACK_ATTACHMENTS: &str =
 /// would come home as a live personal record.
 pub const STOP_IN_TRASH: &str = "This record is in the trash or the archive. Restore it before you stop sharing it.";
 /// **An account with no key pair** -- one made before its server kept keys,
-/// and never opened since in an app that makes them. The probe leaves sharing
-/// on for it (NodeWarden answers its own-key question with a 404 that says
-/// nothing about the route; see [`Sharing::ensure_probe`]), so the refusal is
+/// and never opened since in an app that makes them. Sharing is on for it --
+/// nothing about the server is wrong, and nothing asks the server about its
+/// own key ([`Sharing::ensure_loaded`]) -- so the refusal is
 /// here, and says what is actually missing rather than blaming the server's
 /// age or the organisation. Bitwarden's web vault makes the pair at sign-in.
 pub const NO_KEY_PAIR: &str =
@@ -441,19 +442,32 @@ impl SharingSetup {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Dialect {
-    NodeWarden,
-    Official,
-}
-
-/// The probe's answer, once per engine (spec 7.1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Probe {
-    pub(crate) dialect: Dialect,
-    /// NodeWarden answers `GET /api/users/{id}/public-key`: the slice-1 routes
-    /// (read-only collections, `/share`, `/users`) are there.
-    pub(crate) slice_one: bool,
+/// **What this server does, as sharing has learned it this session**
+/// (official-path spec §2) -- in place of a dialect probe. Each fact comes
+/// from an official route sharing needs anyway; none is asked for its own
+/// sake, and none names a server.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Capabilities {
+    /// The first pass has read the account: the view may say "available".
+    pub(crate) loaded: bool,
+    /// A route sharing needs answered as missing -- 405 or 501 from one of
+    /// them ([`Sharing::route`]), or 404 from the sharer's own org roster
+    /// ([`Sharing::fetch_roster`]). Sharing is off with [`REASON_TOO_OLD`]
+    /// until the next sign-in.
+    pub(crate) too_old: bool,
+    /// A recipient's `GET …/users/mini-details` answered 200 (`Some(true)`) or
+    /// 403/404 (`Some(false)`). Whether "Shared by" can be verified.
+    pub(crate) roster_readable: Option<bool>,
+    /// The roster read after the last invite showed the person Accepted
+    /// (`Some(true)`, Vaultwarden and NodeWarden with mail off) or Invited
+    /// (`Some(false)`). A share then goes straight to confirm, or waits.
+    pub(crate) accepts_on_invite: Option<bool>,
+    /// `POST /organizations` was refused (`Some(false)`, official
+    /// self-hosted): the user creates the sharing org in the web vault.
+    pub(crate) creates_orgs: Option<bool>,
+    /// `GET /config`'s `server.name`, read once. Decides the
+    /// roster-visibility warning.
+    pub(crate) server_name: Option<String>,
 }
 
 /// The signed-in account, as the profile says.
@@ -465,8 +479,8 @@ pub(crate) struct Account {
     pub(crate) email: String,
     pub(crate) admin: bool,
     /// The profile carries a private key, so the account has a key pair and
-    /// the server holds its public half. What lets the probe read a 404 from
-    /// the own-key route as "no route" -- see [`Sharing::ensure_probe`].
+    /// the server holds its public half. Every owner's write asks this before
+    /// its first key is touched -- see [`NO_KEY_PAIR`].
     pub(crate) keyed: bool,
 }
 
@@ -555,7 +569,7 @@ impl MyOrg {
 /// prints the invitations as a count and never a token.
 #[derive(Clone, Default)]
 pub(crate) struct Held {
-    pub(crate) probe: Option<Probe>,
+    pub(crate) capabilities: Capabilities,
     pub(crate) account: Option<Account>,
     pub(crate) my_org: Option<MyOrg>,
     /// Other people's sharing orgs: `(org id, sharer)`.
@@ -572,7 +586,7 @@ pub(crate) struct Held {
 impl std::fmt::Debug for Held {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Held")
-            .field("probe", &self.probe)
+            .field("capabilities", &self.capabilities)
             .field("account", &self.account)
             .field("my_org", &self.my_org)
             .field("others", &self.others)
@@ -653,6 +667,36 @@ impl Sharing {
         })
     }
 
+    /// [`Self::call`], for a route sharing needs (official-path spec §2): a
+    /// 405 or 501 is the server saying it has no such route, so sharing is
+    /// off for the session with [`REASON_TOO_OLD`] and the answer is
+    /// [`SharingError::Unavailable`]. Only the routes that are sharing's
+    /// learn it this way -- a `/config` or a cipher read answering 405 says
+    /// nothing about sharing, and goes through [`Self::call`].
+    ///
+    /// A 404 is not read here: from `/share` or `/confirm` it is a record or
+    /// a person that has gone. The one 404 that means "no route" is the
+    /// sharer's own roster's, which [`Self::fetch_roster`] reads.
+    pub(crate) fn route<T>(
+        &self,
+        request: impl FnOnce(&RestClient, &mut Authenticated) -> Result<T, RestError>,
+    ) -> Result<T, SharingError> {
+        let state = self.state.upgrade().ok_or(SharingError::Vault(VaultError::Unauthorized))?;
+        let answer = {
+            let mut guard = state.lock().unwrap_or_else(PoisonError::into_inner);
+            request(&self.client, &mut guard)
+        };
+        match answer {
+            Ok(value) => Ok(value),
+            Err(RestError::Status(405 | 501)) => {
+                self.held().capabilities.too_old = true;
+                Err(SharingError::Unavailable(REASON_TOO_OLD))
+            }
+            Err(RestError::Rejected { description, .. }) if !description.is_empty() => Err(SharingError::Refused(description)),
+            Err(other) => Err(SharingError::Vault(crate::rest::backend::rest_error(other))),
+        }
+    }
+
     /// `GET /api/accounts/profile`, and what it says about the account.
     pub(crate) fn profile(&self) -> Result<Profile, SharingError> {
         let profile = self.call(|client, auth| client.profile(&mut auth.session))?;
@@ -697,10 +741,23 @@ impl Sharing {
         }
         // **The writes' own rule** ([`Self::my_org_id`]), so the confirm pass
         // never works on an org the writes would refuse: a planted org owned
-        // and named for this account, attested to someone else, is not held
-        // as ours. No profile, no attestation to check: nothing is held.
+        // and named for this account, whose roster names another owner, is
+        // not held as ours. No profile, nothing to check: nothing is held.
         let account = self.held().account.clone();
-        let chosen = profile.zip(account).and_then(|(profile, account)| self.my_org_id(profile, &account));
+        let previous_id = self.held().my_org.as_ref().map(|o| o.id.clone());
+        // The roster this whole read already fetched is the attestation
+        // ([`Self::choose_org`]); an org whose roster it could not fetch keeps
+        // the word it had when it was last held. No request is made here.
+        let chosen = profile.zip(account).and_then(|(profile, account)| {
+            self.choose_org(profile, &account, &mut |id| {
+                Ok(match directory.roster_of(id) {
+                    Roster::Known(members) => roster_says_mine(members, &account.id),
+                    Roster::Unknown => previous_id.as_deref() == Some(id),
+                })
+            })
+            .ok()
+            .flatten()
+        });
         let mine = chosen.and_then(|id| directory.sharing_orgs().into_iter().find(|o| o.id == id));
         let mut held = self.held();
         // The previous roster, kept for an org whose roster this read could
@@ -745,19 +802,15 @@ impl Sharing {
     #[must_use]
     pub fn view(&self, items: &[VaultItem]) -> SharingView {
         let held = self.held();
-        let Some(probe) = held.probe else {
+        if !held.capabilities.loaded {
             return SharingView::unavailable(REASON_NOT_LOADED);
-        };
-        if probe.dialect != Dialect::NodeWarden {
-            return SharingView::unavailable(REASON_NOT_NODEWARDEN);
         }
-        if !probe.slice_one {
+        if held.capabilities.too_old {
             return SharingView::unavailable(REASON_TOO_OLD);
         }
         let now = now_millis();
         let mut view = SharingView {
             available: true,
-            dialect: Some(DIALECT_NODEWARDEN.to_string()),
             can_mint_invites: held.account.as_ref().is_some_and(|a| a.admin),
             ..SharingView::default()
         };
@@ -821,55 +874,32 @@ impl Sharing {
         view
     }
 
-    /// **The probe**, once per engine: `GET /invitations/mine` tells
-    /// NodeWarden from the rest, and the own-key route tells NodeWarden with
-    /// slice 1 from an older one (spec 7.1). A transport failure is not
-    /// cached: the next pass asks again.
+    /// **The first pass's one question**, once per engine: who the account
+    /// is. Sharing is "not loaded" until it has an answer, and is then
+    /// available on every server -- unless a route it needs answers as
+    /// missing ([`Self::route`], [`Self::fetch_roster`]), which turns it off
+    /// with [`REASON_TOO_OLD`] for the session.
     ///
-    /// # Only a missing ROUTE is "too old"
-    ///
-    /// The answer is cached for the session, so misreading it turns sharing
-    /// off until the next sign-in. A 200 is the route, with or without a key
-    /// in it. A 405 or 501 is no route. A 404 is the hard one: NodeWarden's
-    /// handler answers 404 for an account with no key pair too, and the status
-    /// alone cannot tell the two apart. The profile can: an account whose
-    /// profile carries a private key has its public half on the server, so
-    /// its 404 is the route missing. A keyless account's 404 is read as the
-    /// route present -- such an account can neither share nor be confirmed
-    /// (both need a key pair), so the share flow refuses it when it asks for
-    /// the keys, with a sentence about the keys rather than a wrong one about
-    /// the server's age.
-    pub(crate) fn ensure_probe(&self) -> Result<Probe, SharingError> {
-        if let Some(probe) = self.held().probe {
-            return Ok(probe);
+    /// This replaces the dialect probe (official-path spec §2). The probe
+    /// asked NodeWarden's `/invitations/mine` to tell the servers apart and
+    /// turned sharing off everywhere else; nothing asks which server this is
+    /// now. The profile is usually already held -- the whole read that called
+    /// [`Self::note_directory`] filed it -- so a first pass costs no request.
+    /// A transport failure is not remembered: the next pass asks again.
+    pub(crate) fn ensure_loaded(&self) -> Result<(), SharingError> {
+        if self.held().capabilities.loaded {
+            return Ok(());
         }
-        let invitations = self.call(|client, auth| sharing_api::my_invitations(client, &mut auth.session))?;
-        let probe = match invitations {
-            None => Probe { dialect: Dialect::Official, slice_one: false },
-            Some(list) => {
-                self.held().incoming = list;
-                let own = self.account_id()?;
-                let keyed = self.held().account.as_ref().is_some_and(|a| a.keyed);
-                let route = self.call(|client, auth| sharing_api::key_route(client, &mut auth.session, &own))?;
-                let slice_one = match route {
-                    KeyRoute::Answered { .. } => true,
-                    KeyRoute::Absent => false,
-                    KeyRoute::NotFound => !keyed,
-                };
-                Probe { dialect: Dialect::NodeWarden, slice_one }
-            }
-        };
-        self.held().probe = Some(probe);
-        Ok(probe)
+        self.account_id()?;
+        self.held().capabilities.loaded = true;
+        Ok(())
     }
 
-    /// Refuses unless this is NodeWarden with slice 1.
+    /// Refuses unless sharing is loaded and no route it needs has answered
+    /// as missing.
     pub(crate) fn require_available(&self) -> Result<(), SharingError> {
-        let probe = self.ensure_probe()?;
-        if probe.dialect != Dialect::NodeWarden {
-            return Err(SharingError::Unavailable(REASON_NOT_NODEWARDEN));
-        }
-        if !probe.slice_one {
+        self.ensure_loaded()?;
+        if self.held().capabilities.too_old {
             return Err(SharingError::Unavailable(REASON_TOO_OLD));
         }
         Ok(())
@@ -888,7 +918,7 @@ impl Sharing {
             .ok_or_else(|| SharingError::Refused("The server did not say which account this is.".to_string()))
     }
 
-    /// **One pass** (spec 11.5): the probe, then the incoming invitations on a
+    /// **One pass** (spec 11.5): the account, then the incoming invitations on a
     /// whole read or the timer, then every move back whose delete failed
     /// ([`Self::finish_unfinished`]) -- on every trigger, since each is one
     /// file read when nothing is pending -- and last the confirm pass
@@ -905,16 +935,16 @@ impl Sharing {
     ///
     /// # Errors
     ///
-    /// The probe could not be made; a later pass tries again.
+    /// The account could not be read; a later pass tries again.
     pub fn refresh(&self, trigger: Trigger) -> Result<SharingPass, SharingError> {
         let _one = self.one_at_a_time();
-        let had_probe = self.held().probe.is_some();
-        let probe = self.ensure_probe()?;
-        let mut pass = SharingPass { changed: !had_probe, ..SharingPass::default() };
-        if probe.dialect != Dialect::NodeWarden || !probe.slice_one {
+        let was_loaded = self.held().capabilities.loaded;
+        self.ensure_loaded()?;
+        let mut pass = SharingPass { changed: !was_loaded, ..SharingPass::default() };
+        if self.held().capabilities.too_old {
             return Ok(pass);
         }
-        if had_probe && matches!(trigger, Trigger::WholeRead | Trigger::Timer) {
+        if matches!(trigger, Trigger::WholeRead | Trigger::Timer) {
             match self.call(|client, auth| sharing_api::my_invitations(client, &mut auth.session)) {
                 Ok(Some(list)) => {
                     let mut held = self.held();
@@ -970,9 +1000,25 @@ pub(crate) struct Ctx {
     pub(crate) org_id: String,
     pub(crate) org_key: SymmetricKey,
     pub(crate) collections: Vec<PersonCollection>,
+    /// The org's roster, read at the start of the write (spec 13) and again
+    /// after an invite, which is how the write learns the new person's
+    /// org-user id and status (the invite answers nothing).
+    pub(crate) roster: Vec<Member>,
+    /// **This account's own org-user id** in that roster ([`own_row`]): what
+    /// a person collection names as its manager. On NodeWarden it is the
+    /// user id; on an official server and on Vaultwarden it is not, which is
+    /// why it is read and never assumed. `None` when the roster does not list
+    /// the account -- such a write cannot create a collection.
+    pub(crate) own_ou_id: Option<String>,
 }
 
 impl Ctx {
+    /// One person's row in [`Self::roster`], by email in any case.
+    pub(crate) fn member(&self, email: &str) -> Option<&Member> {
+        let email = normalise_email(email);
+        self.roster.iter().find(|m| normalise_email(&m.email) == email)
+    }
+
     /// Every collection for `email`, authenticated first -- see
     /// [`person_collections_for`]. **Not for a grant**: nothing that creates
     /// a membership, wraps the org key or files a record for someone reads
@@ -1112,80 +1158,97 @@ fn is_personal_share(invitation: &IncomingInvitation) -> bool {
     invitation.organization_name.as_deref().and_then(sharer_of).is_some() && invitation.role.as_deref() == Some("member")
 }
 
-/// **Whether `org` is this account's OWN sharing org** -- the one question
-/// every owner's write asks before it files a record anywhere (final
-/// re-review, CRITICAL).
-///
-/// Owning an org named "Shared by <me>" is not enough: another account can
-/// create one and make this account its owner (NodeWarden allowed an
-/// owner-to-owner direct add until `47869c4`), and then this account's next
-/// share -- on any PC without the cached id -- filed its record into
-/// someone else's org. So:
-///
-/// - **An attested owner** (`ownerEmail`): mine only when
-///   [`crate::rest::organizations::sharing_mark`] says `mine` -- owned, named
-///   for this account, AND the server's owner is this account.
-/// - **No attestation** (a server that does not send `ownerEmail`): mine only
-///   when it is the cached id this client itself CREATED (`created_here`),
-///   and still owned and named for this account. Never adopted by name: the
-///   first share there makes a fresh org instead.
-fn org_is_mine(org: &crate::rest::sync::Organization, account_email: &str, created_here: Option<&str>) -> bool {
-    let mark = crate::rest::organizations::sharing_mark(
-        org.name.as_deref().and_then(sharer_of),
-        org.owner_email.as_deref(),
-        org.is_owner(),
-        account_email,
-    );
-    if !mark.is_some_and(|m| m.mine) {
-        return false;
-    }
-    match org.owner_email.as_deref().map(str::trim).filter(|e| !e.is_empty()) {
-        Some(_) => true,
-        None => created_here == Some(org.id.as_str()),
-    }
+/// **Owned by this account and named for it** -- what makes an org a
+/// CANDIDATE for this account's own sharing org (spec 5.1). Not enough on its
+/// own: another account can create "Shared by <me>" and make this account an
+/// owner of it. [`Sharing::my_org_id`] asks the roster too.
+fn owned_and_named(org: &crate::rest::sync::Organization, account_email: &str) -> bool {
+    crate::rest::organizations::sharing_mark(org.name.as_deref().and_then(sharer_of), None, org.is_owner(), account_email)
+        .is_some_and(|mark| mark.mine)
+}
+
+/// **The roster's word that a candidate org is this account's own**
+/// (official-path spec §3.1): no OTHER account holds the owner role there.
+/// It replaces NodeWarden's `ownerEmail` attestation, which no other server
+/// sends. A planted org -- someone else's "Shared by <me>" that made this
+/// account an owner -- still lists its maker as an owner, and fails here. A
+/// pending invitation in the owner role counts as another owner too: it has
+/// no account behind it yet, so it cannot be this one.
+fn roster_says_mine(roster: &[Member], account_id: &str) -> bool {
+    !roster.iter().any(|m| m.role == "owner" && m.user_id.as_deref() != Some(account_id))
+}
+
+/// This account's own row in a roster -- see [`Ctx::own_ou_id`].
+fn own_row<'a>(roster: &'a [Member], account_id: &str) -> Option<&'a Member> {
+    roster.iter().find(|m| m.user_id.as_deref() == Some(account_id))
 }
 
 impl Sharing {
-    /// **This account's own sharing org among the profile's** -- the cached id
-    /// while it still passes [`org_is_mine`], else the first org that passes
-    /// it on the server's attestation. See [`org_is_mine`] for why owning an
-    /// org named for this account is not enough.
+    /// **This account's own sharing org among the profile's** -- the cached
+    /// id while it still passes, else the first candidate that passes
+    /// (official-path spec §3.1). A candidate is owned and named for this
+    /// account ([`owned_and_named`]); it passes when this client CREATED it
+    /// (the cached `sharing_org_created` id) or when its roster names no
+    /// other owner ([`roster_says_mine`]), read fresh.
+    ///
+    /// **A roster that cannot be read is a refusal, not a "no"**
+    /// ([`ROSTER_UNREADABLE`]): read as "not mine", a share would create a
+    /// second sharing org beside the real one.
     ///
     /// **A cached id that fails is dropped** from `sharing_state.json`, with
-    /// a plain warning naming nothing: it is not this account's to file
-    /// into, and a later share must not find it again.
+    /// a plain warning naming nothing. **Only an id the profile LISTS can
+    /// fail.** One it does not list is kept: the profile may be older than
+    /// the id (`a_cached_id_the_profile_does_not_list_yet_is_kept`).
     ///
-    /// **Only an id the profile LISTS can fail.** One it does not list is
-    /// kept: the profile may be older than the id. A whole read that began
-    /// before a share's `create_org` and ends after its state write carries a
-    /// profile without the brand-new org -- and `note_directory` would have
-    /// dropped the id and its `sharing_org_created` flag, leaving it, on a
-    /// server that attests no owner, unusable for good (final re-review,
-    /// minor 2; `a_cached_id_the_profile_does_not_list_yet_is_kept`). Absent
-    /// here, it is simply not the answer this time.
-    pub(crate) fn my_org_id(&self, profile: &Profile, account: &Account) -> Option<String> {
+    /// # Errors
+    ///
+    /// The roster of a candidate could not be read.
+    pub(crate) fn my_org_id(&self, profile: &Profile, account: &Account) -> Result<Option<String>, SharingError> {
+        self.choose_org(profile, account, &mut |id| self.attested_mine(id, &account.id))
+    }
+
+    /// [`Self::my_org_id`] with the roster question asked by `attest` -- a
+    /// fresh read for a write, the whole read's own rosters for
+    /// [`Self::note_directory`].
+    fn choose_org(
+        &self,
+        profile: &Profile,
+        account: &Account,
+        attest: &mut dyn FnMut(&str) -> Result<bool, SharingError>,
+    ) -> Result<Option<String>, SharingError> {
         let (cached, created) = self.setup().state_path.map_or((None, false), |path| {
             let me = crate::sharing_state::SharingState::load(&path).account(&account.id);
             (me.sharing_org_id, me.sharing_org_created)
         });
-        let created_here = cached.as_deref().filter(|_| created);
         if let Some(cached) = cached.as_deref() {
             if let Some(listed) = profile.organizations.iter().find(|o| o.id == cached) {
-                if org_is_mine(listed, &account.email, created_here) {
-                    return Some(cached.to_string());
+                if owned_and_named(listed, &account.email) && (created || attest(cached)?) {
+                    return Ok(Some(cached.to_string()));
                 }
                 self.forget_cached_org(&account.id, cached);
             }
         }
-        profile
-            .organizations
-            .iter()
-            .find(|o| o.owner_email.as_deref().is_some_and(|e| !e.trim().is_empty()) && org_is_mine(o, &account.email, None))
-            .map(|o| o.id.clone())
+        for org in profile.organizations.iter().filter(|o| Some(o.id.as_str()) != cached.as_deref()) {
+            if owned_and_named(org, &account.email) && attest(&org.id)? {
+                return Ok(Some(org.id.clone()));
+            }
+        }
+        Ok(None)
     }
 
-    /// Drops a cached sharing org id that failed [`org_is_mine`] -- only if
-    /// the file still holds that id, so a share that chose another in the
+    /// One candidate's roster, read now, and its word ([`roster_says_mine`]).
+    /// Through [`Self::call`], not [`Self::route`]: this is a question about
+    /// an org this account may not even be the sharer of, and its failure
+    /// says nothing about the server's routes.
+    fn attested_mine(&self, org: &str, account_id: &str) -> Result<bool, SharingError> {
+        let answer = self.call(|client, auth| client.fetch_organization_members(&mut auth.session, org))?;
+        let roster = crate::rest::organizations::map_members(&answer)
+            .ok_or_else(|| SharingError::Refused(ROSTER_UNREADABLE.to_string()))?;
+        Ok(roster_says_mine(&roster, account_id))
+    }
+
+    /// Drops a cached sharing org id that failed [`Self::my_org_id`] -- only
+    /// if the file still holds that id, so a share that chose another in the
     /// meantime is not undone.
     fn forget_cached_org(&self, account: &str, id: &str) {
         let Some(path) = self.setup().state_path else {
@@ -1213,14 +1276,22 @@ impl Sharing {
             .collect())
     }
 
-    /// The org's roster, fresh: `/users`, or `/members` on an older server.
+    /// The org's roster, fresh, from `/users?includeCollections=true`.
     ///
     /// **An answer that is not a roster is an error, never an empty one** --
     /// [`crate::rest::organizations::Roster`]'s own distinction. Read as
     /// nobody, it would have a share invite people who are already members,
     /// and [`Self::reload_org`] hold a roster that shows everyone as `Gone`.
+    ///
+    /// **The sharer's own org only**, so a 404 is the route missing, not a
+    /// member refused: every server gives the owner ManageUsers. It turns
+    /// sharing off as [`Self::route`]'s 405 and 501 do (official-path spec
+    /// §2) -- an older NodeWarden had no `/users`.
     pub(crate) fn fetch_roster(&self, org: &str) -> Result<Vec<Member>, SharingError> {
-        let answer = self.call(|client, auth| client.fetch_organization_members(&mut auth.session, org))?;
+        let answer = self.route(|client, auth| match client.fetch_organization_members(&mut auth.session, org) {
+            Err(RestError::Status(404)) => Err(RestError::Status(501)),
+            other => other,
+        })?;
         crate::rest::organizations::map_members(&answer).ok_or_else(|| SharingError::Refused(ROSTER_UNREADABLE.to_string()))
     }
 
@@ -1251,7 +1322,7 @@ impl Sharing {
         self.require_available()?;
         let profile = self.profile()?;
         let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
-        let Some(org_id) = self.my_org_id(&profile, &account) else {
+        let Some(org_id) = self.my_org_id(&profile, &account)? else {
             return Ok(None);
         };
         let account = keyed_account(Some(account))?;
@@ -1261,7 +1332,9 @@ impl Sharing {
             .cloned()
             .ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
         let collections = self.collections_of(&org_id, &org_key)?;
-        Ok(Some(Ctx { account, keys, org_id, org_key, collections }))
+        let roster = self.fetch_roster(&org_id)?;
+        let own_ou_id = own_row(&roster, &account.id).map(|row| row.id.clone());
+        Ok(Some(Ctx { account, keys, org_id, org_key, collections, roster, own_ou_id }))
     }
 
     /// **Creates the sharing org** (spec 9.1): a fresh org key wrapped to the
@@ -1303,17 +1376,18 @@ impl Sharing {
     /// plaintext over a collection someone else already reaches would be
     /// handed the record. Beside a plaintext twin, the engine makes its own.
     ///
-    /// The manager is named by the account's USER id: on NodeWarden a
-    /// member's org-user id is its user id (`organization_members` is keyed
-    /// by `user_id`), which is what its collection create resolves a grant
-    /// against.
+    /// The manager is named by this account's own ORG-USER id
+    /// ([`Ctx::own_ou_id`]), read off the roster. It used to be the user id,
+    /// which is NodeWarden's org-user id and nobody else's: an official
+    /// server or Vaultwarden would have answered "no such user".
     fn ensure_collection(&self, ctx: &mut Ctx, email: &str) -> Result<String, SharingError> {
         if let Some(id) = ctx.authenticated_collection_for(email) {
             return Ok(id.to_string());
         }
+        let manager = ctx.own_ou_id.clone().ok_or_else(|| SharingError::Refused(ORG_FAILED.to_string()))?;
         let name = crate::rest::crypto::encrypt(&ctx.org_key, email.as_bytes()).map_err(crypto)?;
         let id = self
-            .call(|client, auth| sharing_api::create_collection(client, &mut auth.session, &ctx.org_id, &name, &ctx.account.id))
+            .route(|client, auth| sharing_api::create_collection(client, &mut auth.session, &ctx.org_id, &name, &manager))
             .map_err(|e| e.or_say(&format!("Couldn't prepare sharing with {email}. Try again.")))?;
         // Authenticated: this engine wrote the name, under the org key.
         ctx.collections.push(PersonCollection { id: id.clone(), email: email.to_string(), authenticated: true });
@@ -1344,73 +1418,33 @@ impl Sharing {
         }
     }
 
-    /// **The person's membership, with access to C(E)** (spec 7.2): nothing if
-    /// they have it; otherwise the direct add with the key already wrapped
-    /// (and pinned), or a pending invitation for an address with no account.
-    /// A member without access to their own collection is removed and invited
-    /// again (this build's decision 11).
-    pub(crate) fn ensure_member(&self, ctx: &Ctx, email: &str, collection: &str) -> Result<ShareResult, SharingError> {
-        let roster = self.fetch_roster(&ctx.org_id)?;
+    /// **The person's membership, with access to C(E)** (official-path spec
+    /// §3.2): nothing if they have it; otherwise Bitwarden's invite, then a
+    /// roster read -- the invite answers nothing, and the roster says the new
+    /// org-user id and whether the server accepted at once
+    /// ([`Capabilities::accepts_on_invite`]). A member without access to
+    /// their own collection is removed and invited again (decision 11).
+    ///
+    /// No key is touched here. NodeWarden's direct add -- the org key wrapped
+    /// to whatever key the server served for the address, at invite time --
+    /// is gone with the route; a key is wrapped only by the confirm pass,
+    /// under its pin rule (spec 11.5).
+    pub(crate) fn ensure_member(&self, ctx: &mut Ctx, email: &str, collection: &str) -> Result<ShareResult, SharingError> {
         let refused = format!("Couldn't invite {email}.");
-        if let Some(member) = roster.iter().find(|m| normalise_email(&m.email) == email) {
+        if let Some(member) = ctx.member(email).cloned() {
             if member.has_access(collection) {
-                return Ok(match member.status {
-                    MemberStatus::Confirmed => ShareResult::Shared,
-                    MemberStatus::Accepted => ShareResult::WaitingAccept,
-                    MemberStatus::Invited => ShareResult::WaitingAccount,
-                });
+                return Ok(share_result_of(&member));
             }
             let ou = member.id.clone();
             self.call(|client, auth| sharing_api::remove_user(client, &mut auth.session, &ctx.org_id, &ou))
                 .map_err(|e| e.or_say(&refused))?;
         }
-        match self.call(|client, auth| sharing_api::member_key_by_email(client, &mut auth.session, &ctx.org_id, email))? {
-            Some(account_key) => {
-                // **No pin decision over pins that cannot be read** -- the
-                // confirm pass's rule (`Self::confirm_pass`), for the direct
-                // add: read as empty they would be "no pin", and a key the
-                // server swapped would be wrapped to on first use. Refused
-                // before the invite, the file set aside if it did not parse
-                // (`a_direct_add_refuses_while_the_pins_cannot_be_read`).
-                self.pins_for_a_write()?;
-                // A changed key is not wrapped to (spec 12.1): they join
-                // without the key and the card says their key changed.
-                let trusted = self.pin_allows(&ctx.account.id, email, &account_key.public_key);
-                let wrapped = if trusted {
-                    Some(crate::rest::crypto::wrap_key_to_public(&ctx.org_key, &account_key.public_key).map_err(crypto)?)
-                } else {
-                    None
-                };
-                self.call(|client, auth| {
-                    sharing_api::invite_member(client, &mut auth.session, &ctx.org_id, email, collection, wrapped.as_ref())
-                })
-                .map_err(|e| e.or_say(&refused))?;
-                if trusted {
-                    self.pin(&ctx.account.id, email, &account_key);
-                    Ok(ShareResult::Shared)
-                } else {
-                    self.held().key_changed.insert(email.to_string());
-                    Ok(ShareResult::WaitingAccept)
-                }
-            }
-            // No key: no account -- or an account with no key pair yet,
-            // which NodeWarden adds directly (`InviteOutcome::Member`). That
-            // one HAS an account, so "waiting to create an account" would be
-            // wrong about it (final review): it waits to accept, and the
-            // confirm pass marks it waiting for a first sign-in once it sees
-            // no key.
-            None => {
-                let outcome = self
-                    .call(|client, auth| sharing_api::invite_member(client, &mut auth.session, &ctx.org_id, email, collection, None))
-                    .map_err(|e| e.or_say(&refused))?;
-                Ok(match outcome {
-                    sharing_api::InviteOutcome::Member => ShareResult::WaitingAccept,
-                    sharing_api::InviteOutcome::Invitation { .. } | sharing_api::InviteOutcome::AlreadyThere => {
-                        ShareResult::WaitingAccount
-                    }
-                })
-            }
-        }
+        self.route(|client, auth| sharing_api::invite_user(client, &mut auth.session, &ctx.org_id, email, collection))
+            .map_err(|e| e.or_say(&refused))?;
+        ctx.roster = self.fetch_roster(&ctx.org_id)?;
+        let invited = ctx.member(email).cloned().ok_or_else(|| SharingError::Refused(refused.clone()))?;
+        self.held().capabilities.accepts_on_invite = Some(invited.status != MemberStatus::Invited);
+        Ok(share_result_of(&invited))
     }
 
     /// **Files a record into C(E)** (spec 9.3). Already in the org: one
@@ -1468,12 +1502,12 @@ impl Sharing {
             }
             ids.push(collection.to_string());
             return answered(
-                self.call(|client, auth| sharing_api::set_cipher_collections(client, &mut auth.session, &record.item.id, &ids)),
+                self.route(|client, auth| sharing_api::set_cipher_collections(client, &mut auth.session, &record.item.id, &ids)),
             );
         }
         let cipher = self.moved_body(ctx, record).map_err(Filing::Failed)?;
         let ids = vec![collection.to_string()];
-        answered(self.call(|client, auth| sharing_api::share_cipher(client, &mut auth.session, &record.item.id, &cipher, &ids)))
+        answered(self.route(|client, auth| sharing_api::share_cipher(client, &mut auth.session, &record.item.id, &cipher, &ids)))
     }
 
     /// **The body that moves a personal record into the org**: the record
@@ -1543,10 +1577,18 @@ impl Sharing {
         Ok(())
     }
 
-    /// **Share one record with one person** (spec 6.2-6.5). Ordered so a
-    /// failure leaves the record untouched: nothing moves it until org,
-    /// collection and membership exist. Every step reads what is there first,
-    /// so a Retry is the same call.
+    /// **Share one record with one person** (spec 6.2-6.5, official-path
+    /// spec §3). Ordered so a failure leaves the record untouched: nothing
+    /// moves it until org, collection and membership exist. Every step reads
+    /// what is there first, so a Retry is the same call.
+    ///
+    /// **Accepted at invite goes straight to confirm** (official-path spec
+    /// §2, "Accepts on invite"). Vaultwarden, and NodeWarden with invitation
+    /// email off, make an existing account Accepted the moment it is
+    /// invited; the confirm pass then runs here, under its pin rule, so the
+    /// dialog can say "Shared" rather than "waiting" for a person who will
+    /// never be asked anything. A server that leaves an invitation waits for
+    /// the person to accept, and the daemon confirms on a later pass.
     ///
     /// # Errors
     ///
@@ -1574,14 +1616,20 @@ impl Sharing {
             return Err(SharingError::Refused(COMING_HOME.to_string()));
         }
         // **Pins that cannot be read end the share here**, before an org, a
-        // collection or a membership is written: its direct add is a pin
-        // decision, and the state write below would be refused anyway. A
-        // file that did not parse is set aside by the check, so the Retry
-        // the sentence asks for starts from a fresh one.
+        // collection or a membership is written: the confirm a share may run
+        // straight after its invite is a pin decision, and the state write
+        // below would be refused anyway. A file that did not parse is set
+        // aside by the check, so the Retry the sentence asks for starts from
+        // a fresh one.
         self.pins_for_a_write()?;
         let mut keys = self.keys_from(&profile)?;
         let (record, failures) = self.fetch_record(item_id, &keys)?;
-        let existing = self.my_org_id(&profile, &account);
+        // The record's own refusals first -- the trash, an attachment, a part
+        // that did not decrypt -- judged against its own org, so a record
+        // that cannot move is refused before the sharing org is looked for
+        // (which reads a roster). The org check follows, against ours.
+        refuse_unmovable(&record, &failures, organization_of(&record.item))?;
+        let existing = self.my_org_id(&profile, &account)?;
         refuse_unmovable(&record, &failures, existing.as_deref())?;
 
         let (org_id, org_key, collections, created) = match existing {
@@ -1611,9 +1659,9 @@ impl Sharing {
             let moved = crate::sharing_state::Move { folder_id: record.item.folder_id.clone(), favorite: record.item.favorite };
             let written = crate::sharing_state::update(&path, |state| {
                 let me = state.account_mut(&account_id);
-                // Made here now, or made here before under this same id: on a
-                // server that attests no owner, only such an id is ever used
-                // again (`org_is_mine`).
+                // Made here now, or made here before under this same id: such
+                // an id is this account's without a roster read
+                // (`Sharing::choose_org`).
                 me.sharing_org_created = created || (me.sharing_org_created && me.sharing_org_id.as_deref() == Some(org.as_str()));
                 me.sharing_org_id = Some(org);
                 if was_personal {
@@ -1628,9 +1676,11 @@ impl Sharing {
                 Err(e) => log::warn!("the sharing state could not be written before a share: {e}"),
             }
         }
-        let mut ctx = Ctx { account, keys, org_id, org_key, collections };
+        let roster = self.fetch_roster(&org_id)?;
+        let own_ou_id = own_row(&roster, &account.id).map(|row| row.id.clone());
+        let mut ctx = Ctx { account, keys, org_id, org_key, collections, roster, own_ou_id };
         let collection = self.ensure_collection(&mut ctx, &email)?;
-        let result = self.ensure_member(&ctx, &email, &collection)?;
+        let mut result = self.ensure_member(&mut ctx, &email, &collection)?;
         let written = self.file_into(&ctx, &record, &collection)?;
         if let Some(path) = self.setup().sent_path {
             let entry = crate::sent_history::SentRecord {
@@ -1647,6 +1697,20 @@ impl Sharing {
         }
         if let Err(e) = self.reload_org(&ctx) {
             log::info!("the sharing view could not be re-read after a share: {e}");
+        }
+        if result == ShareResult::WaitingAccept {
+            if let Err(e) = self.confirm_pass(Trigger::Own) {
+                log::info!("the confirm after a share stopped early: {e}");
+            }
+            let confirmed = self
+                .held()
+                .my_org
+                .as_ref()
+                .and_then(|org| org.member(&email))
+                .is_some_and(|member| member.status == MemberStatus::Confirmed);
+            if confirmed {
+                result = ShareResult::Shared;
+            }
         }
         Ok(ShareOutcome { result, changed: SharingOutcome { upserted: vec![written], removed: Vec::new() } })
     }
@@ -1846,7 +1910,7 @@ impl Sharing {
                 // Never the org copy's id: a server echoing that one back is
                 // not naming a copy it made.
                 if let Some(made) = answer.get("id").and_then(serde_json::Value::as_str).filter(|id| !id.is_empty() && *id != old) {
-                    if let Err(e) = self.call(|client, auth| client.hard_delete_cipher(&mut auth.session, made)) {
+                    if let Err(e) = self.call(|client, auth| sharing_api::delete_cipher(client, &mut auth.session, made)) {
                         log::warn!("a personal copy whose answer could not be read was left behind: {e}");
                     }
                 }
@@ -1956,20 +2020,17 @@ impl Sharing {
         }
     }
 
-    /// `DELETE /api/ciphers/{id}/delete` -- NodeWarden's unconditional
-    /// permanent delete; the bare route only trashes (see
-    /// `RestClient::hard_delete_cipher`).
+    /// `DELETE /api/ciphers/{id}` -- Bitwarden's permanent delete, on every
+    /// server ([`sharing_api::delete_cipher`] says why it is not NodeWarden's
+    /// `/delete` suffix any more).
     ///
-    /// **A 404 is done**: the org copy is already gone. Matched on the status
-    /// itself, not on the [`VaultError::Http`] it maps to -- that one is every
-    /// 4xx, and reading a 403 as "gone" would drop the retry and leave the
-    /// copy in the org, filed nowhere, for good. A 5xx or a lost connection
-    /// stays an error, and so pending.
+    /// **A 404 is done**: the org copy is already gone. `delete_cipher`
+    /// matches the status itself, not the [`VaultError::Http`] it maps to --
+    /// that one is every 4xx, and reading a 403 as "gone" would drop the
+    /// retry and leave the copy in the org, filed nowhere, for good. A 5xx
+    /// or a lost connection stays an error, and so pending.
     fn purge_org_copy(&self, id: &str) -> Result<(), SharingError> {
-        self.call(|client, auth| match client.hard_delete_cipher(&mut auth.session, id) {
-            Err(RestError::Status(404)) => Ok(()),
-            other => other,
-        })
+        self.call(|client, auth| sharing_api::delete_cipher(client, &mut auth.session, id))
     }
 
     /// Every local file that holds a record by id follows it to its new one
@@ -2273,10 +2334,10 @@ impl Sharing {
     }
 
     /// **Re-invite** (spec 6.1's Re-invite action): a pending invitation is
-    /// renewed -- a new token and a new 7 days, expired or not; anyone else
+    /// renewed -- `POST …/users/{ouId}/reinvite` on every server (official-path
+    /// spec §3.4), a new token and a new lifetime, expired or not; anyone else
     /// without access to their collection is invited again the way a share
-    /// would ([`Self::ensure_member`]: the direct add when they have an
-    /// account, an invitation when not). Someone who still has access is left
+    /// would ([`Self::ensure_member`]). Someone who still has access is left
     /// as they are, and the answer says which of the three they are.
     ///
     /// The address is checked as a share checks it: the route takes any
@@ -2288,11 +2349,11 @@ impl Sharing {
     /// 2, for the one grant a card can start (final review, I1). A share
     /// starts from an address the user TYPED; a Re-invite starts from a name
     /// on the card, and a plaintext name is one the server can write. Its
-    /// second branch is a direct add that wraps the org key to whatever key
-    /// the server serves for that address and pins it on first use, so a
-    /// hostile server could list `mallory@...` in plaintext and have one
-    /// click hand her the org key. Refused before anything is read: no
-    /// roster, no key, no invite (`reinvite_refuses_a_plaintext_collection_name`).
+    /// second branch invites the address into the org, and on a server that
+    /// accepts at once the confirm pass would then hand her the org key, so
+    /// a hostile server could list `mallory@...` in plaintext and have one
+    /// click make her a recipient. Refused before anything is written: no
+    /// key, no invite (`reinvite_refuses_a_plaintext_collection_name`).
     /// The window does not offer it on such a card either
     /// (`share_ui::PersonLine::reinvite`). Sharing a record with them from
     /// the Share dialog -- an address typed on purpose -- is the way on.
@@ -2314,17 +2375,16 @@ impl Sharing {
             return Err(SharingError::Refused(not_vouched_for(&email)));
         }
         let refused = format!("Couldn't re-invite {email}.");
-        let roster = self.fetch_roster(&ctx.org_id)?;
-        let result = match roster.iter().find(|m| normalise_email(&m.email) == email) {
+        let result = match ctx.member(&email).cloned() {
             Some(member) if member.status == MemberStatus::Invited => {
                 let ou = member.id.clone();
-                self.call(|client, auth| sharing_api::reinvite(client, &mut auth.session, &ctx.org_id, &ou))
+                self.route(|client, auth| sharing_api::reinvite(client, &mut auth.session, &ctx.org_id, &ou))
                     .map_err(|e| e.or_say(&refused))?;
                 ShareResult::WaitingAccount
             }
             _ => {
                 let collection = self.ensure_collection(&mut ctx, &email)?;
-                self.ensure_member(&ctx, &email, &collection)?
+                self.ensure_member(&mut ctx, &email, &collection)?
             }
         };
         if let Err(e) = self.reload_org(&ctx) {
@@ -2794,7 +2854,7 @@ impl Sharing {
         let email = normalise_email(email);
         let no_invitation = || SharingError::Refused(format!("There is no invitation waiting for {email}."));
         let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(INVITE_CODE_FAILED.to_string()))?;
-        let Some(org) = self.my_org_id(&profile, &account) else {
+        let Some(org) = self.my_org_id(&profile, &account)? else {
             return Err(no_invitation());
         };
         let member = self.fetch_roster(&org)?.into_iter().find(|m| normalise_email(&m.email) == email).ok_or_else(no_invitation)?;
@@ -2857,6 +2917,15 @@ fn invite_code_refused(error: SharingError, email: &str) -> SharingError {
         SharingError::Refused(invitation_expired(email))
     } else {
         error.or_say(INVITE_CODE_FAILED)
+    }
+}
+
+/// What a share or a re-invite ends as, read off the person's roster row.
+fn share_result_of(member: &Member) -> ShareResult {
+    match member.status {
+        MemberStatus::Confirmed => ShareResult::Shared,
+        MemberStatus::Accepted => ShareResult::WaitingAccept,
+        MemberStatus::Invited => ShareResult::WaitingAccount,
     }
 }
 
@@ -2940,7 +3009,7 @@ mod tests {
         let engine = offline();
         {
             let mut held = engine.held();
-            held.probe = Some(Probe { dialect: Dialect::NodeWarden, slice_one: true });
+            held.capabilities.loaded = true;
             held.account = Some(Account { id: "me".into(), email: "me@x.io".into(), admin: true, keyed: true });
             held.my_org = Some(MyOrg {
                 id: "org1".into(),
@@ -2980,7 +3049,8 @@ mod tests {
         assert_eq!(view.received_from("r3"), None);
     }
 
-    /// Before the probe has answered, sharing is "not loaded", never "on".
+    /// Before the first pass has read the account, sharing is "not loaded",
+    /// never "on".
     #[test]
     fn an_engine_that_has_not_probed_says_not_loaded() {
         let view = offline().view(&[]);
@@ -2988,83 +3058,42 @@ mod tests {
         assert_eq!(view.reason.as_deref(), Some(REASON_NOT_LOADED));
     }
 
-    /// **The dialect probe is made once per session** (spec 7.1): the
-    /// slice-one key route is asked once however many passes run. The
-    /// invitation list doubles as the recipient's incoming list, so every
-    /// whole read asks it again.
+    /// **The first pass reads the account, once, and turns sharing on** --
+    /// on any server: nothing asks which one it is (official-path spec §2).
+    /// A batch pass asks nothing at all.
     #[test]
-    fn the_dialect_probe_is_made_once_per_session() {
+    fn the_first_pass_reads_the_account_once_and_turns_sharing_on() {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let engine = backend.sharing_engine();
         engine.set_up(SharingSetup { make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         let profile = server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect(1).create();
-        let invitations = server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect(2).create();
-        let key = server
-            .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
-            .with_body(serde_json::json!({ "userId": FIXTURE_USER_ID, "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
-            .expect(1)
-            .create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_status(404).expect_at_least(0).create();
+        let key = server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str()).expect(0).create();
         engine.refresh(Trigger::WholeRead).expect("a first pass");
         engine.refresh(Trigger::WholeRead).expect("a second pass");
-        engine.refresh(Trigger::Batch).expect("a batch pass asks nothing");
+        engine.refresh(Trigger::Batch).expect("a batch pass");
         profile.assert();
-        invitations.assert();
         key.assert();
         assert!(engine.view(&[]).available);
+        assert!(engine.held().capabilities.loaded);
     }
 
-    /// One probe against a NodeWarden whose own-key route answers `route`,
-    /// for an account whose profile is `profile`; the view it leaves.
-    fn probed(profile: serde_json::Value, route: impl FnOnce(crate::test_http::Mock) -> crate::test_http::Mock) -> SharingView {
-        let (mut server, backend) = signed_in_with_no_sync_route();
-        let engine = backend.sharing_engine();
-        server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
-        route(server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())).create();
-        engine.refresh(Trigger::WholeRead).expect("a pass");
-        engine.view(&[])
-    }
-
-    /// The fixture profile with no key pair: `privateKey` null.
-    fn keyless_profile() -> serde_json::Value {
-        let mut profile = sharing_profile(serde_json::json!([]));
-        profile["privateKey"] = serde_json::Value::Null;
-        profile
-    }
-
-    /// **An old NodeWarden without slice 1 turns sharing off** (spec 7.1):
-    /// its own-key route answers 404 for an account that has a key, or 405
-    /// or 501, and without slice 1 a recipient could edit the sharer's
-    /// records (spec 12.3).
+    /// **A route sharing needs that answers as missing turns sharing off for
+    /// the session** (official-path spec §2): the sharer's own roster
+    /// answering 404 -- every server gives the owner ManageUsers, so that is
+    /// no route -- or any of sharing's routes answering 405 or 501.
     #[test]
-    fn an_old_nodewarden_without_slice_one_turns_sharing_off() {
+    fn a_missing_route_turns_sharing_off_for_the_session() {
         for status in [404, 405, 501] {
-            let view = probed(sharing_profile(serde_json::json!([])), |m| m.with_status(status));
+            let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+            server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).with_status(status).create();
+            assert!(engine.view(&[]).available, "{status}: available before");
+            assert!(matches!(engine.fetch_roster(FIXTURE_ORG), Err(SharingError::Unavailable(REASON_TOO_OLD))), "{status}");
+            let view = engine.view(&[]);
             assert!(!view.available, "{status}");
             assert_eq!(view.reason.as_deref(), Some(REASON_TOO_OLD), "{status}");
+            assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::Unavailable(REASON_TOO_OLD))), "{status}: refused");
         }
-    }
-
-    /// **A 200 without a key is the route answering**, so slice 1 is there.
-    /// Read as "too old" it would turn sharing off for the whole session.
-    #[test]
-    fn an_own_key_answer_without_a_key_is_still_slice_one() {
-        let view = probed(sharing_profile(serde_json::json!([])), |m| {
-            m.with_body(serde_json::json!({ "userId": FIXTURE_USER_ID, "publicKey": null }).to_string())
-        });
-        assert!(view.available, "{view:?}");
-    }
-
-    /// **A keyless account's 404 is not taken for an old server.** NodeWarden
-    /// answers 404 for an account with no key pair, so the status says
-    /// nothing about the route; the profile's missing private key says why.
-    /// Sharing stays available, and the share flow refuses on the keys.
-    #[test]
-    fn a_keyless_accounts_404_is_not_read_as_an_old_server() {
-        let view = probed(keyless_profile(), |m| m.with_status(404));
-        assert!(view.available, "{view:?}");
-        let view = probed(keyless_profile(), |m| m.with_status(405));
-        assert_eq!(view.reason.as_deref(), Some(REASON_TOO_OLD), "a 405 is no route whoever asks");
     }
 
     /// **`Held`'s `Debug` never prints an invitation token** -- the reason it
@@ -3088,24 +3117,33 @@ mod tests {
         assert!(printed.contains("<1 invitations>"), "{printed}");
     }
 
-    /// An official server has no invitation list: sharing is not offered.
+    /// The fixture profile with no key pair: `privateKey` null.
+    fn keyless_profile() -> serde_json::Value {
+        let mut profile = sharing_profile(serde_json::json!([]));
+        profile["privateKey"] = serde_json::Value::Null;
+        profile
+    }
+
+    /// **An official server shares on the same path**: one that has no
+    /// NodeWarden invitation list (404) is not told sharing is off, and its
+    /// view is available after the first pass.
     #[test]
-    fn an_official_server_is_told_sharing_is_nodewarden_only() {
+    fn an_official_server_shares_on_the_same_routes() {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let engine = backend.sharing_engine();
         engine.set_up(SharingSetup::none());
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
         server.mock("GET", "/api/organizations/invitations/mine").with_status(404).create();
-        let key = server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str()).expect(0).create();
         engine.refresh(Trigger::WholeRead).expect("a pass");
-        key.assert();
-        assert_eq!(engine.view(&[]).reason.as_deref(), Some(REASON_NOT_NODEWARDEN));
+        let view = engine.view(&[]);
+        assert!(view.available, "{view:?}");
+        assert_eq!(view.reason, None);
     }
 
     use crate::test_http::{Matcher, MockServer};
 
-    /// A probed engine on a NodeWarden with slice 1, over the fixture
-    /// account, with its files in a scratch directory.
+    /// A loaded engine (its first pass made) on a NodeWarden, over the
+    /// fixture account, with its files in a scratch directory.
     fn on_nodewarden(organizations: serde_json::Value) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>, crate::test_scratch::ScratchDir) {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let dir = crate::test_scratch::ScratchDir::new("sharing-flow");
@@ -3147,8 +3185,11 @@ mod tests {
         }
     }
 
-    /// **The first share ever** (spec 6.2): org, collection, direct add,
-    /// move -- each once, in that order's dependencies, and no sync.
+    /// **The first share ever** (spec 6.2, official-path spec §3): org,
+    /// collection, Bitwarden's invite, move -- and, because this server
+    /// accepted the person at invite, the confirm at once. The collection
+    /// names the sharer by its own ORG-USER id off the roster, which is not
+    /// its user id here, as on an official server.
     #[test]
     fn a_first_share_creates_the_org_the_collection_the_invite_and_moves_once() {
         let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
@@ -3165,42 +3206,46 @@ mod tests {
             .expect(1)
             .create();
         // The org's collections: empty when the org is new, then the one the
-        // share made. NodeWarden's web vault may leave a name in plaintext,
-        // and the engine reads that too -- which is what lets this answer
-        // name c-anna without the org key the test cannot know.
+        // share made -- with the name the share sent, so it decrypts under the
+        // new org key (which the test cannot know) and is authenticated, as
+        // the confirm pass's rule 2 requires.
+        let made_name = Arc::new(Mutex::new(String::new()));
         server.mock("GET", "/api/organizations/org-new/collections").with_body(r#"{"data":[]}"#).expect(1).create();
+        let read_back = Arc::clone(&made_name);
         server
             .mock("GET", "/api/organizations/org-new/collections")
-            .with_body(r#"{"data":[{"id":"c-anna","organizationId":"org-new","name":"anna@example.com"}]}"#)
+            .with_body_from_request(move |_| {
+                let name = read_back.lock().expect("unpoisoned").clone();
+                serde_json::json!({ "data": [{ "id": "c-anna", "organizationId": "org-new", "name": name }] }).to_string().into_bytes()
+            })
             .create();
+        let owner = || roster_row("owner-ou", Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]);
+        server
+            .mock("GET", "/api/organizations/org-new/users?includeCollections=true")
+            .with_body(roster(&[owner()]))
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/api/organizations/org-new/users?includeCollections=true")
+            .with_body(roster(&[owner(), roster_row("anna-ou", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]))
+            .create();
+        let keep = Arc::clone(&made_name);
         let collection = server
             .mock("POST", "/api/organizations/org-new/collections")
             .match_body(Matcher::PartialJson(serde_json::json!({
-                "users": [{ "id": FIXTURE_USER_ID, "readOnly": false, "hidePasswords": false, "manage": true }]
+                "users": [{ "id": "owner-ou", "readOnly": false, "hidePasswords": false, "manage": true }]
             })))
-            .with_body(r#"{"id":"c-anna","object":"collection"}"#)
+            .with_body_from_request(move |request| {
+                let body: serde_json::Value = serde_json::from_slice(request.body()).expect("json");
+                *keep.lock().expect("unpoisoned") = body["name"].as_str().unwrap_or_default().to_string();
+                br#"{"id":"c-anna","object":"collection"}"#.to_vec()
+            })
             .expect(1)
-            .create();
-        server
-            .mock("GET", "/api/organizations/org-new/users?includeCollections=true")
-            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
-            .expect(1)
-            .create();
-        server
-            .mock("GET", "/api/organizations/org-new/users?includeCollections=true")
-            .with_body(roster(&[
-                roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]),
-                roster_row("anna-id", Some("anna-id"), "anna@example.com", 2, &["c-anna"]),
-            ]))
-            .create();
-        server
-            .mock("GET", "/api/organizations/org-new/members/public-key?email=anna%40example.com")
-            .with_body(serde_json::json!({ "userId": "anna-id", "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
             .create();
         let invite = server
-            .mock("POST", "/api/organizations/org-new/members/invite")
-            .match_request(|request| request.utf8_lossy_body().contains("\"encryptedOrgKey\":\"4."))
-            .with_body(r#"{"id":"anna-id","status":1,"object":"organizationMember"}"#)
+            .mock("POST", "/api/organizations/org-new/users/invite")
+            .match_body(Matcher::PartialJson(serde_json::json!({ "emails": ["anna@example.com"], "type": 2 })))
+            .with_body("")
             .expect(1)
             .create();
         let share = server
@@ -3209,14 +3254,28 @@ mod tests {
             .with_body_from_request(echo("p1", Some("org-new"), &["c-anna"]))
             .expect(1)
             .create();
+        let key = server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).expect(1).create();
+        let confirm = server
+            .mock("POST", "/api/organizations/org-new/users/anna-ou/confirm")
+            .match_request(|request| request.utf8_lossy_body().contains("\"key\":\"4."))
+            .with_body("")
+            .expect(1)
+            .create();
+        let direct = server.mock("POST", "/api/organizations/org-new/members/invite").expect(0).create();
+        let lookup = server.mock("GET", Matcher::Regex("members/public-key".into())).expect(0).create();
 
         let outcome = engine.share("p1", " Anna@Example.com ").expect("shared");
         org.assert();
         collection.assert();
         invite.assert();
         share.assert();
+        key.assert();
+        confirm.assert();
+        direct.assert();
+        lookup.assert();
         sync.assert();
-        assert_eq!(outcome.result, ShareResult::Shared);
+        assert_eq!(outcome.result, ShareResult::Shared, "accepted at invite, confirmed at once");
+        assert_eq!(engine.held().capabilities.accepts_on_invite, Some(true));
         assert_eq!(outcome.changed.upserted.len(), 1);
         let moved = &outcome.changed.upserted[0];
         assert_eq!(moved.name, "Acme VPN", "the moved record decrypts under the new org key");
@@ -3224,11 +3283,10 @@ mod tests {
         let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
         assert_eq!(state.sharing_org_id.as_deref(), Some("org-new"));
         assert_eq!(state.moves.get("p1").and_then(|m| m.folder_id.as_deref()), Some("f1"));
-        assert!(state.pin_for("anna@example.com").is_some(), "a direct add pins the key at that moment");
+        assert!(state.pin_for("anna@example.com").is_some(), "the confirm pins the key it wrapped to");
         let sent = crate::sent_history::SentHistory::load(&dir.join("sent_history.json"));
         assert_eq!(sent.entries[0].kind, crate::sent_history::SentKind::Share);
         assert_eq!(sent.entries[0].recipient, "anna@example.com");
-        assert_eq!(engine.view(std::slice::from_ref(moved)).person("anna@example.com").map(|p| p.state), Some(PersonState::Shared));
     }
 
     /// **An existing person, another record already in the org** (spec 6.3,
@@ -3262,37 +3320,34 @@ mod tests {
         assert_eq!(outcome.result, ShareResult::Shared);
     }
 
-    /// **A person with no account** (spec 6.5): a pending invitation, no key
-    /// wrapped, and the dialog is told so.
+    /// **A server that leaves an invitation** (official Bitwarden, or any
+    /// server with invitation email): the share files the record and says
+    /// so, and nothing is confirmed until the person accepts.
     #[test]
-    fn a_share_to_someone_without_an_account_leaves_an_invitation() {
+    fn a_share_the_server_leaves_invited_waits_for_the_accept() {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
-        server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str())
-            .with_body(serde_json::json!({ "data": [person_collection("c-carol", "carol@example.com")] }).to_string())
-            .create();
+        with_collections(&mut server, &[person_collection("c-carol", "carol@example.com")]);
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
+            .expect(2)
             .create();
         server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=carol%40example.com").as_str())
-            .with_status(404)
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[
+                roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]),
+                roster_row("inv-1", None, "carol@example.com", 0, &["c-carol"]),
+            ]))
             .create();
-        let invite = server
-            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
-            .match_request(|request| !request.utf8_lossy_body().contains("encryptedOrgKey"))
-            .with_body(r#"{"id":"inv-1","status":0,"object":"organizationInvitation"}"#)
-            .expect(1)
-            .create();
-        server
-            .mock("PUT", "/api/ciphers/p1/share")
-            .with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-carol"]))
-            .create();
+        let invite = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").expect(1).create();
+        let confirms = server.mock("POST", Matcher::Regex("/confirm$".into())).expect(0).create();
+        server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-carol"])).create();
         let outcome = engine.share("p1", "carol@example.com").expect("shared");
         invite.assert();
+        confirms.assert();
         assert_eq!(outcome.result, ShareResult::WaitingAccount);
+        assert_eq!(engine.held().capabilities.accepts_on_invite, Some(false));
     }
 
     /// **A failure at the move leaves the record personal** (spec 6.2, 13),
@@ -3352,12 +3407,11 @@ mod tests {
     }
 
     /// **A keyless account is refused on its keys, before anything is read
-    /// or written.** The probe leaves sharing on for it -- NodeWarden's 404
-    /// for its own key is no evidence of an old server (see
-    /// `a_keyless_accounts_404_is_not_read_as_an_old_server`) -- so this is
-    /// where it is stopped: with no private key there is no org key it could
-    /// wrap to itself or unwrap, and a sentence about the server's age or a
-    /// failed organisation would send the user looking in the wrong place.
+    /// or written.** Sharing is on for it -- nothing about the server is
+    /// wrong -- so this is where it is stopped: with no private key there is
+    /// no org key it could wrap to itself or unwrap, and a sentence about the
+    /// server's age or a failed organisation would send the user looking in
+    /// the wrong place.
     #[test]
     fn a_keyless_account_is_refused_with_a_sentence_about_keys() {
         let (mut server, backend) = signed_in_with_no_sync_route();
@@ -3369,8 +3423,8 @@ mod tests {
         let record = server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).expect(0).create();
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
         let puts = server.mock("PUT", Matcher::Any).expect(0).create();
-        engine.refresh(Trigger::WholeRead).expect("probed");
-        assert!(engine.view(&[]).available, "control: the probe left sharing on for a keyless account");
+        engine.refresh(Trigger::WholeRead).expect("a first pass");
+        assert!(engine.view(&[]).available, "control: sharing is on for a keyless account");
         match engine.share("p1", "anna@example.com") {
             Err(SharingError::Refused(sentence)) => assert_eq!(sentence, NO_KEY_PAIR),
             other => panic!("expected the keys refusal, got {other:?}"),
@@ -3567,8 +3621,9 @@ mod tests {
     }
 
     /// **A key that differs from the pin is not wrapped to** (spec 12.1): the
-    /// person is added without the org key, the card will say their key
-    /// changed, and the pin is not moved to the new key.
+    /// person is accepted at invite, the confirm at once finds their key
+    /// changed and does not confirm, the card will say so, and the pin is not
+    /// moved to the new key.
     #[test]
     fn a_key_that_differs_from_the_pin_is_not_wrapped_to() {
         let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
@@ -3576,27 +3631,20 @@ mod tests {
         let old = crate::sharing_state::Pin { sha256: "00".repeat(32), user_id: "anna-id".into(), at: 1 };
         crate::sharing_state::update(&state, |s| s.account_mut(FIXTURE_USER_ID).set_pin("anna@example.com", old.clone())).expect("pinned");
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
-        server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str())
-            .with_body(serde_json::json!({ "data": [person_collection("c-anna", "anna@example.com")] }).to_string())
-            .create();
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
+            .expect(2)
             .create();
-        server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
-            .with_body(serde_json::json!({ "userId": "anna-id", "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
-            .create();
-        let invite = server
-            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
-            .match_request(|request| !request.utf8_lossy_body().contains("encryptedOrgKey"))
-            .with_body(r#"{"id":"anna-id","status":1,"object":"organizationMember"}"#)
-            .expect(1)
-            .create();
+        with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
+        let invite = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").expect(1).create();
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
+        let confirm = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id/confirm").as_str()).expect(0).create();
         server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-anna"])).create();
         let outcome = engine.share("p1", "anna@example.com").expect("shared");
         invite.assert();
+        confirm.assert();
         assert_eq!(outcome.result, ShareResult::WaitingAccept);
         assert!(engine.held().key_changed.contains("anna@example.com"));
         let pinned = crate::sharing_state::SharingState::load(&state).account(FIXTURE_USER_ID);
@@ -3613,6 +3661,7 @@ mod tests {
         team["role"] = serde_json::json!("user");
         team["type"] = serde_json::json!(2);
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row(), team]));
+        with_roster(&mut server, &[]);
         let mut trashed = personal_cipher("t1", "Old");
         trashed["deletedDate"] = serde_json::json!("2026-09-01T00:00:00.000Z");
         let mut theirs = shared_cipher("o1", "Team VPN", &[]);
@@ -3765,7 +3814,7 @@ mod tests {
             .expect(1)
             .create();
         let unfile = server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).expect(1).create();
-        let delete = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        let delete = server.mock("DELETE", "/api/ciphers/s1").with_status(204).expect(1).create();
         let outcome = engine.stop("s1", "anna@example.com").expect("stopped");
         create.assert();
         unfile.assert();
@@ -3792,14 +3841,14 @@ mod tests {
         server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
         server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).create();
         server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).create();
-        server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).expect(1).create();
+        server.mock("DELETE", "/api/ciphers/s1").with_status(500).expect(1).create();
         let outcome = engine.stop("s1", "anna@example.com").expect("the personal copy is made; the delete waits");
         assert_eq!(outcome.moved_to.as_deref(), Some("p-new"));
         assert!(outcome.changed.removed.is_empty(), "the org copy is still there");
         let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
         assert_eq!(state.unfinished.len(), 1);
 
-        let retried = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        let retried = server.mock("DELETE", "/api/ciphers/s1").with_status(204).expect(1).create();
         let pass = engine.refresh(Trigger::Batch).expect("a pass");
         retried.assert();
         assert_eq!(pass.outcome.removed, ["s1"]);
@@ -3821,7 +3870,7 @@ mod tests {
             .with_body(shared_cipher(id, "Acme VPN", &[]).to_string())
             .expect_at_least(0)
             .create();
-        server.mock("DELETE", format!("/api/ciphers/{id}/delete").as_str()).with_status(204).expect_at_least(0).create();
+        server.mock("DELETE", format!("/api/ciphers/{id}").as_str()).with_status(204).expect_at_least(0).create();
     }
 
     /// `POST /api/ciphers`, answered with the echo as `new_id`, the body it
@@ -4020,7 +4069,7 @@ mod tests {
         let create = reply(server.mock("POST", "/api/ciphers")).expect(1).create();
         let puts = server.mock("PUT", Matcher::Any).expect(0).create();
         let deletes = server.mock("DELETE", Matcher::Any).expect(0).create();
-        let cleaned = orphan.map(|id| server.mock("DELETE", format!("/api/ciphers/{id}/delete").as_str()).with_status(204).expect(1).create());
+        let cleaned = orphan.map(|id| server.mock("DELETE", format!("/api/ciphers/{id}").as_str()).with_status(204).expect(1).create());
         match engine.stop("s1", "anna@example.com") {
             Err(SharingError::Refused(said)) => assert_eq!(said, MOVE_BACK_FAILED),
             other => panic!("expected the move-back refusal, got {other:?}"),
@@ -4074,7 +4123,7 @@ mod tests {
         server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
         let create = server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).expect(1).create();
         let unfile_fails = server.mock("PUT", "/api/ciphers/s1/collections").with_status(500).expect(2).create();
-        let delete_fails = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).expect(2).create();
+        let delete_fails = server.mock("DELETE", "/api/ciphers/s1").with_status(500).expect(2).create();
         let still_sees = format!("{STOP_FAILED_PREFIX} anna@example.com can still see it.");
         for attempt in ["first", "second"] {
             match engine.stop("s1", "anna@example.com") {
@@ -4094,7 +4143,7 @@ mod tests {
             .with_body(shared_cipher("s1", "Acme VPN", &[]).to_string())
             .expect(1)
             .create();
-        let deleted = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        let deleted = server.mock("DELETE", "/api/ciphers/s1").with_status(204).expect(1).create();
         server.mock("GET", "/api/ciphers/p-new").with_body(personal_cipher("p-new", "Acme VPN").to_string()).create();
         let pass = engine.refresh(Trigger::Batch).expect("a pass");
         unfiled.assert();
@@ -4115,10 +4164,10 @@ mod tests {
         server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
         let create = server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).expect(1).create();
         server.mock("PUT", "/api/ciphers/s1/collections").with_status(500).expect(1).create();
-        server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).expect(1).create();
+        server.mock("DELETE", "/api/ciphers/s1").with_status(500).expect(1).create();
         assert!(engine.stop("s1", "anna@example.com").is_err(), "the person can still see it");
         server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).expect(1).create();
-        let deleted = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        let deleted = server.mock("DELETE", "/api/ciphers/s1").with_status(204).expect(1).create();
         server.mock("GET", "/api/ciphers/p-new").with_body(personal_cipher("p-new", "Acme VPN").to_string()).create();
         let outcome = engine.stop("s1", "anna@example.com").expect("finished");
         deleted.assert();
@@ -4141,7 +4190,7 @@ mod tests {
         server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
         server.mock("POST", "/api/ciphers").with_body_from_request(echo("p-new", None, &[])).create();
         server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).create();
-        server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).create();
+        server.mock("DELETE", "/api/ciphers/s1").with_status(500).create();
         let outcome = engine.stop("s1", "anna@example.com").expect("stopped");
         assert_eq!(outcome.moved_to.as_deref(), Some("p-new"));
         let org_copy = outcome.changed.upserted.iter().find(|i| i.id == "s1").expect("the unfiled org copy is announced");
@@ -4161,7 +4210,7 @@ mod tests {
         }).expect("seeded");
         server.mock("GET", "/api/organizations/invitations/mine").with_status(500).create();
         server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).create();
-        let deleted = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(204).expect(1).create();
+        let deleted = server.mock("DELETE", "/api/ciphers/s1").with_status(204).expect(1).create();
         let pass = engine.refresh(Trigger::WholeRead).expect("the pass runs on");
         deleted.assert();
         assert_eq!(pass.outcome.removed, ["s1"]);
@@ -4214,7 +4263,7 @@ mod tests {
         with_roster(&mut server, &[]);
         server.mock("GET", "/api/ciphers/s1").with_body(shared_cipher("s1", "Acme VPN", &["c-anna"]).to_string()).create();
         server.mock("PUT", "/api/ciphers/s1/collections").with_status(500).create();
-        server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).create();
+        server.mock("DELETE", "/api/ciphers/s1").with_status(500).create();
         let creates = server.mock("POST", Matcher::Any).expect(0).create();
         for (email, sentence) in [
             ("bob@example.com", STOP_FAILED_PREFIX.to_string()),
@@ -4245,7 +4294,7 @@ mod tests {
             .with_body(shared_cipher("s1", "Acme VPN", &[]).to_string())
             .expect(1)
             .create();
-        let delete_fails = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(500).expect(1).create();
+        let delete_fails = server.mock("DELETE", "/api/ciphers/s1").with_status(500).expect(1).create();
         server.mock("GET", "/api/ciphers/p-new").with_body(personal_cipher("p-new", "Acme VPN").to_string()).create();
         let creates = server.mock("POST", Matcher::Any).expect(0).create();
         let outcome = engine.stop("s1", "anna@example.com").expect("the person has lost it");
@@ -4298,8 +4347,8 @@ mod tests {
                 me.unfinished.push(crate::sharing_state::Unfinished::PurgeOrgCopy { org_cipher_id: org.into(), personal_id: personal.into() });
             }
         }).expect("seeded");
-        let gone = server.mock("DELETE", "/api/ciphers/s1/delete").with_status(404).expect(1).create();
-        let forbidden = server.mock("DELETE", "/api/ciphers/s2/delete").with_status(403).expect(1).create();
+        let gone = server.mock("DELETE", "/api/ciphers/s1").with_status(404).expect(1).create();
+        let forbidden = server.mock("DELETE", "/api/ciphers/s2").with_status(403).expect(1).create();
         let pass = engine.refresh(Trigger::Batch).expect("a pass");
         gone.assert();
         forbidden.assert();
@@ -4367,7 +4416,7 @@ mod tests {
             .with_body(shared_cipher("s1", "Both", &["c-bob"]).to_string()).expect(1).create();
         server.mock("POST", "/api/ciphers").with_body_from_request(echo("p2", None, &[])).expect(1).create();
         server.mock("PUT", "/api/ciphers/s2/collections").with_body(shared_cipher("s2", "Only anna", &[]).to_string()).create();
-        server.mock("DELETE", "/api/ciphers/s2/delete").with_status(204).create();
+        server.mock("DELETE", "/api/ciphers/s2").with_status(204).create();
         let member = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id").as_str()).with_status(204).expect(1).create();
         let collection = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/collections/c-anna").as_str()).with_status(204).expect(1).create();
         let items: Vec<VaultItem> = [shared_cipher("s1", "Both", &["c-anna", "c-bob"]), shared_cipher("s2", "Only anna", &["c-anna"])]
@@ -4384,20 +4433,32 @@ mod tests {
         assert!(state.pin_for("anna@example.com").is_none());
     }
 
-    /// **Re-invite** (spec 6.5): a pending invitation gets a new token and 7
-    /// days; a person who is gone is invited again.
+    /// **Re-invite** (official-path spec §3.4): a pending invitation is
+    /// renewed with `POST …/users/{ouId}/reinvite`; a person who is gone is
+    /// invited again with Bitwarden's invite.
     #[test]
     fn reinviting_renews_an_invitation_and_invites_a_gone_person_again() {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         with_collections(&mut server, &[person_collection("c-carol", "carol@example.com"), person_collection("c-gus", "gus@example.com")]);
-        with_roster(&mut server, &[roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"])]);
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"])]))
+            .expect(5)
+            .create();
+        with_roster(
+            &mut server,
+            &[roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"]), roster_row("inv-gus", None, "gus@example.com", 0, &["c-gus"])],
+        );
         let renewed = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/inv-carol/reinvite").as_str()).with_body("").expect(1).create();
         assert_eq!(engine.reinvite("carol@example.com").expect("renewed"), ShareResult::WaitingAccount);
         renewed.assert();
 
-        server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=gus%40example.com").as_str()).with_status(404).create();
-        let invited = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
-            .with_body(r#"{"id":"inv-gus","status":0,"object":"organizationInvitation"}"#).expect(1).create();
+        let invited = server
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str())
+            .match_body(Matcher::PartialJson(serde_json::json!({ "emails": ["gus@example.com"] })))
+            .with_body("")
+            .expect(1)
+            .create();
         assert_eq!(engine.reinvite("gus@example.com").expect("invited"), ShareResult::WaitingAccount);
         invited.assert();
     }
@@ -4623,7 +4684,7 @@ mod tests {
         server.mock("GET", "/api/ciphers/s9").with_body(personal_cipher("s9", "Went home").to_string()).expect(1).create();
         let home = server.mock("POST", "/api/ciphers").with_body_from_request(echo("p2", None, &[])).expect(1).create();
         server.mock("PUT", "/api/ciphers/s2/collections").with_body(shared_cipher("s2", "Only anna", &[]).to_string()).create();
-        let purged = server.mock("DELETE", "/api/ciphers/s2/delete").with_status(204).expect(1).create();
+        let purged = server.mock("DELETE", "/api/ciphers/s2").with_status(204).expect(1).create();
         let member = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/users/anna-id").as_str()).with_status(204).expect(1).create();
         let collection = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/collections/c-anna").as_str()).with_status(204).expect(1).create();
         let stale = items_of(&[shared_cipher("s9", "Went home", &["c-anna"])]);
@@ -4927,33 +4988,37 @@ mod tests {
         assert!(!pass.changed);
     }
 
-    /// **A direct add to a key under 2048 bits is refused before the member
-    /// is written** (final review, item 6): the server chooses which key an
-    /// email answers with, and the org key wrapped to a short one is not a
-    /// secret. The refusal says so; nothing is invited and nothing pinned.
+    /// **A key under 2048 bits is never wrapped to** (final review, item 6):
+    /// the server chooses which key an account answers with, and the org key
+    /// wrapped to a short one is not a secret. The person is invited --
+    /// nothing about the address is wrong -- but the confirm at once refuses
+    /// the key, so nobody is confirmed and nothing is pinned.
     #[test]
-    fn a_share_to_a_short_key_is_refused_before_anyone_is_added() {
+    fn a_share_to_a_short_key_confirms_nobody() {
         let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
         with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
-        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
+            .expect(2)
+            .create();
+        with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
         let short = {
             use rsa::pkcs8::EncodePublicKey;
             let private = rsa::RsaPrivateKey::new(&mut rsa::rand_core::OsRng, 1024).expect("a 1024-bit key");
             private.to_public_key().to_public_key_der().expect("spki").as_bytes().to_vec()
         };
         server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
+            .mock("GET", "/api/users/anna-id/public-key")
             .with_body(serde_json::json!({ "userId": "anna-id", "publicKey": crate::rest::crypto::tests::base64(&short) }).to_string())
             .create();
-        let invite = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str()).expect(0).create();
-        let moved = server.mock("PUT", "/api/ciphers/p1/share").expect(0).create();
-        match engine.share("p1", "anna@example.com") {
-            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, key_too_short(1024)),
-            other => panic!("a short key was shared to: {other:?}"),
-        }
-        invite.assert();
-        moved.assert();
+        server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").create();
+        server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-anna"])).create();
+        let confirm = server.mock("POST", Matcher::Regex("/confirm$".into())).expect(0).create();
+        let outcome = engine.share("p1", "anna@example.com").expect("shared, not confirmed");
+        confirm.assert();
+        assert_eq!(outcome.result, ShareResult::WaitingAccept);
         let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
         assert!(state.pin_for("anna@example.com").is_none(), "a refused key is not pinned");
     }
@@ -4977,43 +5042,35 @@ mod tests {
         assert!(engine.wants_timer(), "control: a live invitation still wants the timer");
     }
 
-    /// **A keyless account added directly is waiting to accept, not to
-    /// create an account** (final review): NodeWarden answers a member row,
-    /// not an invitation, for an address that has an account with no key.
+    /// **An account with no key yet is waiting to accept, not to create an
+    /// account**: the server accepted it at invite, the confirm at once finds
+    /// no key, and the view says it waits for a first sign-in.
     #[test]
-    fn a_keyless_account_added_directly_is_waiting_to_accept() {
+    fn an_accepted_account_with_no_key_waits_for_a_first_sign_in() {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
         with_collections(&mut server, &[person_collection("c-kim", "kim@example.com")]);
-        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
         server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=kim%40example.com").as_str())
-            .with_status(404)
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
+            .expect(2)
             .create();
-        let added = server
-            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
-            .with_body(r#"{"id":"kim-id","userId":"kim-id","status":1,"object":"organizationUserUserDetails"}"#)
-            .expect(1)
-            .create();
+        with_roster(&mut server, &[roster_row("kim-ou", Some("kim-id"), "kim@example.com", 1, &["c-kim"])]);
+        server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").expect(1).create();
+        server.mock("GET", "/api/users/kim-id/public-key").with_status(404).create();
         server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-kim"])).create();
         let outcome = engine.share("p1", "kim@example.com").expect("shared");
-        added.assert();
         assert_eq!(outcome.result, ShareResult::WaitingAccept, "an existing account is never told to create one");
+        assert_eq!(engine.view(&[]).person("kim@example.com").map(|p| p.state), Some(PersonState::WaitingSignIn));
     }
 
-    // ---- final re-review, CRITICAL: an org is mine only on the server's word ----
+    // ---- an org is mine only on the roster's word (official-path spec §3.1) ----
 
-    /// The fixture's own sharing org, as a server attesting `owner` owns it:
-    /// owned by this account, named for it -- the planted shape when `owner`
-    /// is someone else. `None`: a server that attests nothing.
-    fn org_owned_by(owner: Option<&str>) -> serde_json::Value {
-        let mut row = sharing_org_row();
-        match owner {
-            Some(owner) => row["ownerEmail"] = serde_json::json!(owner),
-            None => {
-                row.as_object_mut().expect("an object").remove("ownerEmail");
-            }
-        }
+    /// A roster row of another account in the OWNER role -- the planted
+    /// shape: Mallory made "Shared by <me>" and added me as an owner.
+    fn other_owner() -> serde_json::Value {
+        let mut row = roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", 2, &[]);
+        row["type"] = serde_json::json!(0);
         row
     }
 
@@ -5031,81 +5088,92 @@ mod tests {
         (me.sharing_org_id, me.sharing_org_created)
     }
 
-    /// **A planted org -- owned by this account and named for it, but
-    /// attested to someone else -- is never this account's sharing org**
-    /// (final re-review, CRITICAL). Mallory creates "Shared by <me>" and adds
-    /// me as its owner: the share does not file into it, and a fresh org of
-    /// my own is created instead. Nothing is asked of the planted org.
+    /// **A planted org -- owned by this account and named for it, but with
+    /// another owner on its roster -- is never this account's sharing org**
+    /// (final re-review, CRITICAL, now on the roster's word). The share does
+    /// not file into it, and a fresh org of my own is created instead.
+    /// Nothing is written to the planted org.
     #[test]
-    fn a_planted_org_attested_to_someone_else_is_not_used_and_a_fresh_one_is_made() {
-        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([org_owned_by(Some("mallory@evil.example"))]));
-        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([org_owned_by(Some("mallory@evil.example"))]))).expect("profile");
+    fn a_planted_org_with_another_owner_is_not_used_and_a_fresh_one_is_made() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), other_owner()]))
+            .create();
+        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
         let account = engine.held().account.clone().expect("an account");
-        assert_eq!(engine.my_org_id(&profile, &account), None);
+        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer"), None);
 
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
-        let planted = server.mock("GET", Matcher::Regex(format!("^/api/organizations/{FIXTURE_ORG}/"))).expect(0).create();
+        let planted_collections = server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str()).expect(0).create();
         let planted_writes = server.mock("POST", Matcher::Regex(format!("^/api/organizations/{FIXTURE_ORG}/"))).expect(0).create();
         let filed = server.mock("PUT", "/api/ciphers/p1/share").match_request(|r| r.utf8_lossy_body().contains(FIXTURE_ORG)).expect(0).create();
-        let fresh = server
-            .mock("POST", "/api/organizations")
-            .with_body(r#"{"id":"org-new","object":"organization"}"#)
-            .expect(1)
-            .create();
+        let fresh = server.mock("POST", "/api/organizations").with_body(r#"{"id":"org-new","object":"organization"}"#).expect(1).create();
         server.mock("GET", "/api/organizations/org-new/collections").with_body(r#"{"data":[]}"#).create();
         // What follows the create is not this test's business; the create is.
         let _ = engine.share("p1", "anna@example.com");
         fresh.assert();
-        planted.assert();
+        planted_collections.assert();
         planted_writes.assert();
         filed.assert();
         assert_eq!(cached(&dir), (Some("org-new".into()), true), "the fresh org is remembered as made here");
-        // And the whole read holds nothing of it for the confirm pass.
-        let directory = crate::rest::organizations::Directory::from_sync(
-            &serde_json::from_value(serde_json::json!({ "profile": sharing_profile(serde_json::json!([org_owned_by(Some("mallory@evil.example"))])), "ciphers": [], "folders": [], "collections": [] })).expect("sync"),
+    }
+
+    /// **A whole read holds no planted org for the confirm pass** -- the
+    /// roster that read fetched names another owner.
+    #[test]
+    fn a_whole_read_does_not_hold_a_planted_org() {
+        let (_server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
+        let mut directory = crate::rest::organizations::Directory::from_sync(
+            &serde_json::from_value(serde_json::json!({ "profile": sharing_profile(serde_json::json!([sharing_org_row()])), "ciphers": [], "folders": [], "collections": [] })).expect("sync"),
             &engine.keys_from(&profile).expect("keys"),
         );
+        directory.set_roster(FIXTURE_ORG, &serde_json::json!({ "data": [roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), other_owner()] }));
         engine.note_directory(&directory, Some(&profile));
         assert!(engine.held().my_org.is_none(), "a planted org is not held as ours");
+        directory.set_roster(FIXTURE_ORG, &serde_json::json!({ "data": [roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])] }));
+        engine.note_directory(&directory, Some(&profile));
+        assert_eq!(engine.held().my_org.as_ref().map(|o| o.id.as_str()), Some(FIXTURE_ORG), "control: alone as owner, it is ours");
     }
 
-    /// **A cached id pointing at a planted org is dropped** (final re-review,
-    /// CRITICAL): the cache is checked by the same rule, and a failure takes
-    /// it out of `sharing_state.json` so no later share finds it again.
+    /// **A cached id the roster disowns is dropped** -- unless this client
+    /// made it: an org this client created cannot have been planted.
     #[test]
-    fn a_cached_id_pointing_at_a_planted_org_is_dropped() {
-        let (_server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
-        cache_org(&dir, true);
-        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([org_owned_by(Some("mallory@evil.example"))]))).expect("profile");
+    fn a_cached_id_the_roster_disowns_is_dropped_unless_made_here() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), other_owner()]))
+            .create();
+        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
         let account = engine.held().account.clone().expect("an account");
-        assert_eq!(engine.my_org_id(&profile, &account), None);
-        assert_eq!(cached(&dir), (None, false), "the cached id is gone");
-    }
-
-    /// **A genuine org is used** -- attested to this account, found with or
-    /// without a cache -- and on a server that attests nothing, only the id
-    /// this client created: an owned org named for it is never adopted by
-    /// name there, and a cached id it did not create is dropped.
-    #[test]
-    fn a_genuine_attested_org_is_used_and_an_unattested_one_only_if_made_here() {
-        let (_server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
-        let account = engine.held().account.clone().expect("an account");
-        let profile_with = |row: serde_json::Value| -> Profile { serde_json::from_value(sharing_profile(serde_json::json!([row]))).expect("profile") };
-
-        let attested = profile_with(org_owned_by(Some(&FIXTURE_EMAIL.to_uppercase())));
-        assert_eq!(engine.my_org_id(&attested, &account).as_deref(), Some(FIXTURE_ORG), "adopted on the server's word");
         cache_org(&dir, false);
-        assert_eq!(engine.my_org_id(&attested, &account).as_deref(), Some(FIXTURE_ORG), "a cached attested id");
+        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer"), None);
+        assert_eq!(cached(&dir), (None, false), "the cached id is gone");
+        cache_org(&dir, true);
+        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG), "the id this client made");
+    }
+
+    /// **A genuine org is used** -- owned, named for this account, and alone
+    /// as owner on its roster -- found with or without a cache; and **a
+    /// roster that cannot be read refuses rather than answering "not mine"**,
+    /// which would have a share make a second org beside the real one.
+    #[test]
+    fn a_genuine_org_is_adopted_on_the_roster_and_an_unreadable_roster_refuses() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
+        let account = engine.held().account.clone().expect("an account");
+        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
+        let path = format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true");
+        server.mock("GET", path.as_str()).with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])])).expect(2).create();
+        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG), "adopted on the roster's word");
+        cache_org(&dir, false);
+        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG), "a cached id the roster owns");
         assert_eq!(cached(&dir).0.as_deref(), Some(FIXTURE_ORG), "kept");
 
-        let silent = profile_with(org_owned_by(None));
-        std::fs::remove_file(dir.join("sharing_state.json")).expect("cleared");
-        assert_eq!(engine.my_org_id(&silent, &account), None, "never adopted by name alone");
-        cache_org(&dir, true);
-        assert_eq!(engine.my_org_id(&silent, &account).as_deref(), Some(FIXTURE_ORG), "the id this client made");
-        cache_org(&dir, false);
-        assert_eq!(engine.my_org_id(&silent, &account), None, "a cached id this client did not make");
-        assert_eq!(cached(&dir), (None, false), "and it is dropped");
+        server.mock("GET", path.as_str()).with_body(r#"{"message":"Not found"}"#).create();
+        assert!(matches!(engine.my_org_id(&profile, &account), Err(SharingError::Refused(s)) if s == ROSTER_UNREADABLE));
+        assert_eq!(cached(&dir).0.as_deref(), Some(FIXTURE_ORG), "an unreadable roster drops nothing");
     }
 
     /// **An owner, admin or manager invitation is not a personal share**
@@ -5170,7 +5238,7 @@ mod tests {
         );
         engine.note_directory(&directory, Some(&stale));
         let account = engine.held().account.clone().expect("an account");
-        assert_eq!(engine.my_org_id(&stale, &account), None, "not the answer this time");
+        assert_eq!(engine.my_org_id(&stale, &account).expect("an answer"), None, "not the answer this time");
         let me = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
         assert_eq!((me.sharing_org_id.as_deref(), me.sharing_org_created), (Some("org-new"), true), "kept, flag and all");
     }
@@ -5184,26 +5252,22 @@ mod tests {
     }
 
     /// **Re-invite is refused for a person known only from a plaintext
-    /// name, before anything is read** (final review, I1). Its second branch
-    /// is a direct add that wraps the org key to the server's key for the
-    /// address and pins it; a hostile server that listed `mallory@...` in
-    /// plaintext would have one click hand her the org key. So: no roster
-    /// read, no key looked up, no member written, no pin.
+    /// name, before anything is written** (final review, I1). Its second
+    /// branch invites the address, and on a server that accepts at once the
+    /// confirm pass would hand her the org key; a hostile server that listed
+    /// `mallory@...` in plaintext would have one click make her a recipient.
+    /// So: no invite, no key looked up, no pin.
     #[test]
     fn reinvite_refuses_a_plaintext_collection_name() {
         let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         with_collections(&mut server, &[plaintext_collection("c-mal", "mallory@example.com")]);
-        let roster = server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).expect(0).create();
-        let key = server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=mallory%40example.com").as_str())
-            .expect(0)
-            .create();
+        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        let key = server.mock("GET", Matcher::Regex("/public-key$".into())).expect(0).create();
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
         match engine.reinvite("Mallory@example.com") {
             Err(SharingError::Refused(sentence)) => assert_eq!(sentence, not_vouched_for("mallory@example.com")),
             other => panic!("a plaintext name was re-invited: {other:?}"),
         }
-        roster.assert();
         key.assert();
         writes.assert();
         let state = crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID);
@@ -5218,20 +5282,24 @@ mod tests {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
         with_collections(&mut server, &[plaintext_collection("c-plain", "anna@example.com")]);
-        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
+            .expect(2)
+            .create();
+        with_roster(
+            &mut server,
+            &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), roster_row("inv-1", None, "anna@example.com", 0, &["c-anna"])],
+        );
         let made = server
             .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str())
             .with_body(r#"{"id":"c-anna","object":"collection"}"#)
             .expect(1)
             .create();
-        server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
-            .with_status(404)
-            .create();
         let invite = server
-            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/members/invite").as_str())
+            .mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str())
             .match_request(|request| request.utf8_lossy_body().contains("c-anna") && !request.utf8_lossy_body().contains("c-plain"))
-            .with_body(r#"{"id":"inv-1","status":0,"object":"organizationInvitation"}"#)
+            .with_body("")
             .expect(1)
             .create();
         let moved = server
@@ -5280,7 +5348,7 @@ mod tests {
         let engine = offline();
         {
             let mut held = engine.held();
-            held.probe = Some(Probe { dialect: Dialect::NodeWarden, slice_one: true });
+            held.capabilities.loaded = true;
             held.my_org = Some(MyOrg {
                 id: "org1".into(),
                 collections: vec![
@@ -5427,30 +5495,6 @@ mod tests {
             .collect()
     }
 
-    /// **A direct add refuses while the pins cannot be read** (review of Task
-    /// 12): the re-invite reaches the add with a key in hand, and over a
-    /// broken `sharing_state.json` it would trust that key on first use.
-    /// Refused with the plain sentence, no invite, the file kept aside.
-    #[test]
-    fn a_direct_add_refuses_while_the_pins_cannot_be_read() {
-        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
-        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
-        with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]);
-        server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/members/public-key?email=anna%40example.com").as_str())
-            .with_body(anna_key())
-            .create();
-        let invite = server.mock("POST", Matcher::Any).expect(0).create();
-        std::fs::write(dir.join("sharing_state.json"), b"{ torn").expect("a corrupt file");
-        match engine.reinvite("anna@example.com") {
-            Err(SharingError::Refused(said)) => assert_eq!(said, crate::sharing_state::UNREADABLE_SET_ASIDE),
-            other => panic!("expected the unreadable-pins refusal, got {other:?}"),
-        }
-        invite.assert();
-        assert_eq!(set_aside_in(&dir).len(), 1, "the broken file was not kept aside");
-        assert!(!dir.join("sharing_state.json").exists(), "something was written over it");
-    }
-
     /// **A share over pins that cannot be read writes nothing**: refused
     /// before the org, the collection, the membership or the move, with the
     /// same sentence, and the broken file kept aside for a Retry to start
@@ -5498,7 +5542,7 @@ mod tests {
 
     /// The fixture account on NodeWarden, owning the sharing org, as the
     /// server's administrator or not. No files (`SharingSetup::none`), and
-    /// not probed yet: the mint probes, as every write does.
+    /// not loaded yet: the mint loads, as every write does.
     fn on_nodewarden_as(admin: bool) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>) {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let engine = backend.sharing_engine();

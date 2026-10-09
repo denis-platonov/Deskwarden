@@ -2508,7 +2508,7 @@ pub mod tests {
         let (mut server, backend) = logged_in();
         let delete = server.mock("DELETE", "/api/folders/f1").with_status(204).expect(1).create();
         let cipher_edit = server.mock("PUT", "/api/ciphers/live-1").with_status(200).create();
-        let cipher_delete = server.mock("DELETE", "/api/ciphers/live-1/delete").with_status(200).create();
+        let cipher_delete = server.mock("DELETE", "/api/ciphers/live-1").with_status(200).create();
 
         backend.delete_folder("f1").expect("an empty 204 is a delete that happened");
         delete.assert();
@@ -3602,7 +3602,7 @@ pub mod tests {
         let (mut server, backend) = logged_in();
         let trash = server.mock("PUT", "/api/ciphers/live-1/delete").create();
         let restore = server.mock("PUT", "/api/ciphers/trash-1/restore").create();
-        let purge = server.mock("DELETE", "/api/ciphers/trash-1/delete").create();
+        let purge = server.mock("DELETE", "/api/ciphers/trash-1").create();
 
         backend.delete_item("live-1").expect("the soft delete");
         backend.restore_item("trash-1").expect("the restore");

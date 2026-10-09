@@ -41912,7 +41912,7 @@ mod forget_step_tests {
             people: vec![PersonEntry { email: "anna@x.io".into(), state: PersonState::Gone, expires_at: None, authenticated: true }],
             ..SharingView::default()
         };
-        let off = SharingView::unavailable(crate::rest::sharing::REASON_NOT_NODEWARDEN);
+        let off = SharingView::unavailable(crate::rest::sharing::REASON_BW_SERVE);
         let fetch = super::send_ui::SendFetch::default();
         let ask_about = |view: Option<&SharingView>, linked: bool| {
             let mut history = crate::sent_history::SentHistory::default();

@@ -3147,7 +3147,7 @@ mod tests {
     /// received record too.
     #[test]
     fn the_share_control_is_decided_by_the_views_reason() {
-        use crate::rest::sharing::{REASON_BW_SERVE, REASON_NOT_LOADED, REASON_NOT_NODEWARDEN, REASON_TOO_OLD};
+        use crate::rest::sharing::{REASON_BW_SERVE, REASON_NOT_LOADED, REASON_TOO_OLD};
         let item = |id: &str| -> VaultItem { serde_json::from_value(serde_json::json!({ "id": id, "name": id })).expect("item") };
         let on = SharingView { available: true, ..SharingView::default() };
         assert_eq!(share_control(Some(&on), true, &item("mine")), Some(ShareControl::Share));
@@ -3156,7 +3156,9 @@ mod tests {
             Some(ShareControl::Disabled(SHARE_TOO_OLD_TOOLTIP)),
             "server-too-old: greyed, saying why"
         );
-        for reason in [REASON_NOT_LOADED, REASON_BW_SERVE, REASON_NOT_NODEWARDEN, "some-later-reason"] {
+        // "not-nodewarden" is a reason an older daemon could still answer
+        // with: like any reason this window does not name, it draws nothing.
+        for reason in [REASON_NOT_LOADED, REASON_BW_SERVE, "not-nodewarden", "some-later-reason"] {
             assert_eq!(share_control(Some(&SharingView::unavailable(reason)), true, &item("mine")), None, "{reason}: no control");
         }
         assert_eq!(share_control(None, false, &item("mine")), None, "no line to the daemon: the envelope is the Send");

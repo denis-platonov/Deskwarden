@@ -1472,23 +1472,19 @@ impl RestClient {
     /// caller and which skips this entirely for the zero-organisation case
     /// that is the owner's own.
     ///
-    /// # `/users` first, `/members` when it is not there
+    /// # `/users`, and only `/users`
     ///
     /// `/users?includeCollections=true` is the official route (stock
-    /// Bitwarden, and NodeWarden from slice 1): it answers invitations
-    /// alongside accepted and confirmed rows, and each collection entry
-    /// carries its own `readOnly` flag. `/members` is NodeWarden's older
-    /// route, from before slice 1 -- its rows ARE the account (no `userId`)
-    /// and it has no invitations at all. A 404, a 405 (method not allowed --
-    /// some proxies answer a missing route that way) or a 501 (not
-    /// implemented) from the first is read as "this server does not have
-    /// `/users`" and falls back; any other failure -- 403 from a member who
-    /// may not read the roster, a transport error, a body that is not a list
-    /// -- is *not* retried on the second spelling, because the caller treats
-    /// it identically to a 404 anyway: both become
-    /// [`crate::rest::organizations::Roster::Unknown`], a state the UI
-    /// already has to draw for "not fetched yet", and a needless second round
-    /// trip would only slow that down.
+    /// Bitwarden, Vaultwarden, and NodeWarden from slice 1): it answers
+    /// invitations alongside accepted and confirmed rows, and each collection
+    /// entry carries its own `readOnly` flag. NodeWarden's older `/members`
+    /// is no longer tried when it fails: sharing is on Bitwarden's routes
+    /// only (`docs/superpowers/specs/2026-10-08-official-path-sharing-design.md`),
+    /// and a server without `/users` is one sharing calls too old. Every
+    /// failure -- 404, 403 from a member who may not read the roster, a
+    /// transport error -- becomes
+    /// [`crate::rest::organizations::Roster::Unknown`] for the directory, a
+    /// state the UI already draws for "not fetched yet".
     ///
     /// **On `sync_agent`**, for [`Self::fetch_cipher`]'s reason exactly: this
     /// is a read of account data, and the read deadline is the one written for
@@ -1502,23 +1498,10 @@ impl RestClient {
         session: &mut Session,
         id: &str,
     ) -> Result<serde_json::Value, RestError> {
-        // `/users?includeCollections=true` first: the official route, which
-        // NodeWarden answers from slice 1 with invitations and per-collection
-        // read-only flags. `/members` only when that is not there (404, 405, or
-        // the 501 a server without it may send) -- an older NodeWarden.
         let users = self.organization_url(id, "/users?includeCollections=true")?;
-        let answer = self.refreshing(session, |session| {
+        self.refreshing(session, |session| {
             self.value_from(self.bearer(self.sync_agent.get(&users), session).call())
-        });
-        match answer {
-            Err(RestError::Status(404 | 405 | 501)) => {
-                let url = self.organization_url(id, "/members")?;
-                self.refreshing(session, |session| {
-                    self.value_from(self.bearer(self.sync_agent.get(&url), session).call())
-                })
-            }
-            other => other,
-        }
+        })
     }
 
     /// **The one door every sharing route goes through.**
@@ -1630,39 +1613,25 @@ impl RestClient {
         })
     }
 
-    /// `DELETE /api/ciphers/{id}/delete` -- gone, with no trash to recover it
-    /// from.
+    /// `DELETE /api/ciphers/{id}` -- Bitwarden's permanent delete: gone, with
+    /// no trash to recover it from.
     ///
     /// Named `hard_delete` rather than `delete` so that no caller reaches for
     /// it by autocomplete when they meant [`Self::trash_cipher`]. This module
     /// will not decide for a caller which one they want, but it will make the
     /// irreversible one the longer word.
     ///
-    /// # The suffix, and why the bare route is wrong here
+    /// # Why the bare route, and why it used to be the suffix
     ///
-    /// This sent `DELETE /api/ciphers/{id}` -- Bitwarden's own hard-delete
-    /// route -- until a live run showed what NodeWarden does with it. That
-    /// path reaches `handleDeleteCipherCompat`, which is **conditional**: it
-    /// hard-deletes a cipher that is *already trashed* and otherwise falls
-    /// through to `handleDeleteCipher`, the soft delete. So a purge of a LIVE
-    /// item against this server returned `200` and put the item in the trash
-    /// instead of destroying it -- a call named `hard_delete` reporting
-    /// success for a soft delete.
-    ///
-    /// It went unnoticed because the app only purges from the trash view,
-    /// where `deletedAt` is already set and the compat route does the right
-    /// thing. The probe purged a restored item, which the app never does, and
-    /// two probe items survived a run that said it had cleaned up after
-    /// itself.
-    ///
-    /// `DELETE /api/ciphers/{id}/delete` is `handlePermanentDeleteCipher`,
-    /// which is unconditional: it deletes the attachments, deletes the
-    /// cipher, and answers `204` whatever state the cipher was in. Same path
-    /// as [`Self::trash_cipher`], different verb -- `PUT` trashes, `DELETE`
-    /// destroys -- which is NodeWarden's own pairing and not an invention
-    /// here.
+    /// For a while this sent NodeWarden's `DELETE /api/ciphers/{id}/delete`,
+    /// because NodeWarden's bare `DELETE` soft-deleted a LIVE item -- a call
+    /// named `hard_delete` reporting success for a trash. NodeWarden now
+    /// answers the bare route exactly as Bitwarden does (permanent, live or
+    /// trashed), and the suffix route exists on no other server, so a purge
+    /// against Vaultwarden or official Bitwarden failed outright. One route,
+    /// Bitwarden's, on every server -- the owner's "100% compatible" rule.
     pub fn hard_delete_cipher(&self, session: &mut Session, id: &str) -> Result<(), RestError> {
-        let url = self.cipher_url(id, "/delete")?;
+        let url = self.cipher_url(id, "")?;
         self.refreshing(session, |session| {
             self.unit_from(self.bearer(self.write_agent.delete(&url), session).call())
         })
@@ -4592,20 +4561,20 @@ mod tests {
             .with_body("")
             .expect(1)
             .create();
-        // `DELETE .../delete`, NOT `DELETE .../{id}`. The bare route is
-        // NodeWarden's `handleDeleteCipherCompat`, which soft-deletes a live
-        // cipher and answers 200 -- a purge that trashes. See
-        // `hard_delete_cipher`. The `bare` mock below is the assertion that
-        // this client no longer goes there.
+        // `DELETE .../{id}`, Bitwarden's permanent delete -- on every server,
+        // NodeWarden included since it matches Bitwarden (its NW2). NOT
+        // NodeWarden's old `DELETE .../delete` suffix, which no other server
+        // has. The `suffix` mock below is the assertion that this client no
+        // longer goes there.
         let hard = server
-            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .match_header("Authorization", "Bearer AT-1")
             .with_status(200)
             .with_body("")
             .expect(1)
             .create();
-        let bare = server
-            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
+        let suffix = server
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
             .with_status(200)
             .create();
 
@@ -4616,9 +4585,9 @@ mod tests {
         restore.assert();
         hard.assert();
         assert!(
-            !bare.matched(),
-            "the purge went to the compat route, which trashes a live item instead of \
-             destroying it and reports success either way"
+            !suffix.matched(),
+            "the purge went to NodeWarden's `/delete` suffix, a route Vaultwarden and \
+             Bitwarden do not have; Bitwarden's permanent delete is the bare DELETE"
         );
     }
 
@@ -5085,7 +5054,7 @@ mod tests {
             .expect(1)
             .create();
         let deletes = server
-            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee/delete")
+            .mock("DELETE", "/api/ciphers/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
             .with_status(401)
             .expect(2)
             .create();
