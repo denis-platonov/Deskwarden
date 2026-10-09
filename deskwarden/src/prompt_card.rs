@@ -122,13 +122,17 @@ pub struct Row {
 
 /// **How many rows the card has room for.**
 ///
-/// `crate::app::fill_choices` is bounded at four by construction -- username +
-/// tab + password, username, password, one-time code, and custom `{S:Field}`
-/// rows are deliberately absent precisely because an unbounded row count is a
-/// geometry hazard for a card that cannot scroll. This is that bound written
-/// where the geometry can be checked against it, and
-/// [`the_row_cap_is_the_choice_lists_own_bound`] holds the two together.
-pub const ROW_CAP: usize = 4;
+/// `crate::app::fill_choices` is bounded at five by construction -- a saved
+/// sequence, username + tab + password, username, password, one-time code,
+/// and custom `{S:Field}` rows are deliberately absent precisely because an
+/// unbounded row count is a geometry hazard for a card that cannot scroll.
+/// **Six, not five**, because the remembered record's card
+/// (`crate::app::recall_rows`) draws all of those and its way back under
+/// them; at four it cut a record's password and one-time code off to make
+/// room. This is that bound written where the geometry can be checked against
+/// it, and [`the_row_cap_is_the_choice_lists_own_bound`] holds the two
+/// together.
+pub const ROW_CAP: usize = 6;
 
 /// The rows the card paints, for this match and this choice list.
 ///
@@ -2001,23 +2005,31 @@ mod tests {
     /// **The card's row cap is the choice list's own bound.**
     #[test]
     fn the_row_cap_is_the_choice_lists_own_bound() {
+        // A record with a saved sequence, a username, a password and a
+        // one-time code: the longest list `app::fill_choices` can build.
         let widest = vec![
+            FillChoice::Saved,
             FillChoice::UserTabPass,
             FillChoice::Just(FieldRef::Username),
             FillChoice::Just(FieldRef::Password),
             FillChoice::Just(FieldRef::Totp),
         ];
         assert_eq!(
-            widest.len(),
+            widest.len() + 1,
             ROW_CAP,
-            "`app::fill_choices` can offer {} rows and the card lays out {ROW_CAP}. A row past \
-             the bottom edge of a frameless window with no scrollbar is unreachable",
+            "`app::fill_choices` can offer {} rows, the remembered record's card adds its way \
+             back under them, and the card lays out {ROW_CAP}. A row past the bottom edge of a \
+             frameless window with no scrollbar is unreachable",
             widest.len()
         );
-        assert_eq!(rows(APP, "x", Some("y"), &widest).len(), ROW_CAP);
+        assert_eq!(
+            rows(APP, "x", Some("y"), &widest).len(),
+            widest.len(),
+            "the matched app's card dropped one of the record's values"
+        );
         // And a longer list is truncated rather than allowed to grow the card.
         let mut over = widest.clone();
-        over.push(FillChoice::Saved);
+        over.extend([FillChoice::Saved, FillChoice::Saved]);
         assert_eq!(rows(APP, "x", Some("y"), &over).len(), ROW_CAP);
     }
 

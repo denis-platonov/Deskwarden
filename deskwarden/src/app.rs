@@ -942,25 +942,33 @@ impl FillShortcut {
 /// itself is [`key_sequence::field_palette`]'s, reused rather than restated --
 /// it already answers "what does this item have" and is already tested.
 ///
-/// An item with a stored sequence offers that sequence and nothing else: the
-/// user wrote it precisely because the generic rows were not what that app
-/// wanted, so offering them back alongside it would be offering the thing they
-/// already rejected.
+/// **An item with a stored sequence offers that sequence first, and every
+/// value it has beneath it.** It used to offer the sequence and nothing else,
+/// on the argument that the user wrote it because the generic rows were not
+/// what that app wanted. But a sequence is saved with ONE app's binding, and
+/// the same record is offered on screens it was not written for -- the account
+/// picker in a browser tab, the remembered record on a second sign-in step --
+/// where it hid the username, the password and the one-time code entirely.
+/// The owner: "it only shows sequence now but it should show all of values
+/// for the record". First, so the row Enter takes on the matched app's own
+/// card is still the sequence written for it.
 ///
 /// **Custom `{S:Field}` rows are deliberately absent.** An item may carry any
 /// number of custom fields, and an unbounded row count is a geometry hazard
 /// for a fixed-size overlay; the sequence builder already covers them. That
-/// cap is what makes this list at most four rows long, by construction.
+/// cap is what makes this list at most five rows long, by construction --
+/// one fewer than [`crate::prompt_card::ROW_CAP`], so the remembered record's
+/// card has room for its way back under all of them.
 pub fn fill_choices(item: &VaultItem) -> Vec<FillChoice> {
-    if !sequence_for(item).is_empty() {
-        return vec![FillChoice::Saved];
-    }
     let palette = key_sequence::field_palette(item);
     let has = |field: key_sequence::FieldRef| palette.contains(&field);
     let username = has(key_sequence::FieldRef::Username);
     let password = has(key_sequence::FieldRef::Password);
 
     let mut out = Vec::new();
+    if !sequence_for(item).is_empty() {
+        out.push(FillChoice::Saved);
+    }
     if username && password {
         // First, because it is what the overwhelming majority of screens
         // want; the single-field rows below exist for the ones that do not.
@@ -4295,20 +4303,24 @@ mod tests {
         assert_eq!(clamp_into_work_area(tiny, 0.0, 0.0, 4), (100.0, 200.0));
     }
 
-    /// Every row count the card can have (`fill_choices` caps at four) fits,
-    /// with the loop's own visit count asserted -- a loop that ran zero times
+    /// Every row count the card can have (`prompt_card::ROW_CAP`) fits, with
+    /// the loop's own visit count asserted -- a loop that ran zero times
     /// would otherwise pass green.
     #[test]
     fn no_card_the_overlay_can_show_is_clamped_off_the_bottom() {
         let mut checked = 0;
-        for rows in 1..=4 {
+        for rows in 1..=crate::prompt_card::ROW_CAP {
             let height = overlay_height(rows);
             let (_x, y) = clamp_into_work_area(WORK, 200.0, 9999.0, rows);
             assert!(y + height <= WORK.3, "{rows} rows: {y} + {height}");
             assert!(y >= WORK.1);
             checked += 1;
         }
-        assert_eq!(checked, 4, "the loop must have visited all four row counts");
+        assert_eq!(
+            checked,
+            crate::prompt_card::ROW_CAP,
+            "the loop must have visited every row count"
+        );
     }
 
     // ---- The Prompt arm's wiring (review 32's Important 1) ----
@@ -6568,23 +6580,37 @@ mod fill_dispatch_tests {
         }
     }
 
+    /// **A stored sequence is offered first, and every value beside it.**
+    ///
+    /// This used to answer the sequence alone, on the argument that the user
+    /// wrote it because the generic rows were not what that app wanted. The
+    /// owner's report says otherwise: "it only shows sequence now but it
+    /// should show all of values for the record". A sequence is saved with
+    /// ONE app's binding, and the same record is picked on other screens --
+    /// a browser tab, a second sign-in step -- where the sequence is the
+    /// wrong thing and the record had no other row to offer.
+    ///
+    /// First, so the row Enter takes on the matched app's card is still the
+    /// sequence its user wrote for it.
     #[test]
-    fn an_item_with_a_stored_sequence_offers_only_the_saved_sequence() {
-        // The user wrote a sequence precisely because the generic rows were
-        // not what this app wanted; offering them back is offering the thing
-        // they already rejected.
+    fn an_item_with_a_stored_sequence_offers_it_first_and_every_value_beside_it() {
         let item = item_having("{USERNAME}{TAB}{PASSWORD}", Some(USER), Some(PASS), Some(SEED));
-        // The item has every credential, so the generic rows are all
-        // *available* -- which is what makes their absence meaningful.
         assert_eq!(
-            fill_choices(&item_having("", Some(USER), Some(PASS), Some(SEED))).len(),
-            4
+            fill_choices(&item),
+            vec![
+                FillChoice::Saved,
+                FillChoice::UserTabPass,
+                FillChoice::Just(key_sequence::FieldRef::Username),
+                FillChoice::Just(key_sequence::FieldRef::Password),
+                FillChoice::Just(key_sequence::FieldRef::Totp),
+            ]
         );
-        assert_eq!(fill_choices(&item), vec![FillChoice::Saved]);
+        // And a sequence on an item with nothing else is still a row.
+        assert_eq!(fill_choices(&item_having("{TAB}", None, None, None)), vec![FillChoice::Saved]);
     }
 
     #[test]
-    fn no_item_ever_offers_more_than_four_rows() {
+    fn no_item_ever_offers_more_than_five_rows() {
         let items = [
             item_having("", None, None, None),
             item_having("", Some(USER), None, None),
@@ -6595,7 +6621,14 @@ mod fill_dispatch_tests {
         ];
         let mut visited = 0;
         for item in &items {
-            assert!(fill_choices(item).len() <= 4, "{:?}", fill_choices(item));
+            assert!(fill_choices(item).len() <= 5, "{:?}", fill_choices(item));
+            // Below the cards' cap, not at it: the remembered record's card
+            // draws these and its way back, and neither may fall off it.
+            assert!(
+                fill_choices(item).len() < crate::prompt_card::ROW_CAP,
+                "{:?} leaves no room for the recall card's way back",
+                fill_choices(item)
+            );
             visited += 1;
         }
         // The loop above is worthless if it ran zero times.
@@ -10846,6 +10879,66 @@ mod picker_wiring_tests {
         assert_eq!(order, vec!["title"], "with no address the card must be today's card");
     }
 
+    /// **A record with a saved sequence still offers every value it has.**
+    ///
+    /// The owner's report: `CTRL+ALT+B` in Edge, pick the account, and the
+    /// second step "only shows sequence now but it should show all of values
+    /// for the record". The record had a username, a password, a one-time
+    /// code and a sequence saved with its app binding (for another app, as it
+    /// happens). Driven through the wiring the hotkey runs -- the daemon's
+    /// projection, the browser's page, the ranking -- so what is asserted is
+    /// the card the owner saw, not a palette built by hand.
+    #[test]
+    fn a_record_with_a_saved_sequence_offers_every_value_in_a_browser() {
+        let binding = serde_json::json!({
+            "process": "Island.exe",
+            "trigger": "prompt",
+            "sequence": "{USERNAME}{TAB}{PASSWORD}{ENTER}",
+        })
+        .to_string();
+        let item: VaultItem = serde_json::from_value(serde_json::json!({
+            "id": "sequenced",
+            "name": "Work login",
+            "type": 1,
+            "login": {
+                "username": "ada",
+                "password": "pw",
+                "totp": "JBSWY3DPEHPK3PXP",
+                "uris": [{ "uri": "https://example.com", "match": null }],
+            },
+            "fields": [{ "name": crate::app_match::APP_MATCH_FIELD_NAME, "value": binding, "type": 0 }],
+        }))
+        .expect("the fixture item is valid");
+        assert!(!sequence_for(&item).is_empty(), "control: the fixture has no saved sequence");
+
+        let cache = crate::test_vault::cache_with_items(vec![item]);
+        let window = at_window(BROWSER_IMAGE_NAMES[0], "Sign in");
+        let page = crate::browser_url::PageAddress {
+            url: url::Url::parse("https://example.com/login").unwrap(),
+            complete: true,
+        };
+        let card = picker_offers_for(&cache, &window, Some(&page));
+        let offer = card
+            .offers
+            .iter()
+            .find(|o| o.candidate.id == "sequenced")
+            .expect("control: the login saved for the page was not offered at all");
+
+        use crate::key_sequence::FieldRef;
+        use crate::picker_prompt::Send;
+        assert_eq!(
+            crate::picker_prompt::palette_rows(&offer.palette),
+            vec![
+                Send::Sequence,
+                Send::All,
+                Send::Field(FieldRef::Username),
+                Send::Field(FieldRef::Password),
+                Send::Field(FieldRef::Totp),
+            ],
+            "the picked record's saved sequence hid every other value it has"
+        );
+    }
+
     /// **Read once, on the picker's path, and never spelled.** The read is
     /// a cross-process query against the window the user is typing into, and
     /// its answer is the website they are on: one call site, in
@@ -10965,6 +11058,33 @@ mod recall_tests {
             ]
         );
         assert_eq!(rows, recall_rows_from(prompt_choices(Some(&item))));
+    }
+
+    /// **A remembered record with a saved sequence offers every value too,
+    /// and none of them is cut to make room for the way back.**
+    #[test]
+    fn a_remembered_record_with_a_saved_sequence_offers_every_value_and_a_way_back() {
+        let mut item = login("denis@example.com", "hunter2");
+        item.login.as_mut().unwrap().totp = Some("JBSWY3DPEHPK3PXP".to_string().into());
+        let binding = crate::app_match::AppMatch {
+            sequence: "{USERNAME}{TAB}{PASSWORD}{ENTER}".to_string(),
+            ..crate::app_match::AppMatch::for_process(
+                "Island.exe",
+                crate::app_match::TriggerMode::Prompt,
+            )
+        };
+        let item = crate::vault_bridge::with_app_match(&item, &binding);
+        assert_eq!(
+            recall_rows(Some(&item)),
+            vec![
+                RecallRow::Fill(FillChoice::Saved),
+                RecallRow::Fill(FillChoice::UserTabPass),
+                RecallRow::Fill(FillChoice::Just(key_sequence::FieldRef::Username)),
+                RecallRow::Fill(FillChoice::Just(key_sequence::FieldRef::Password)),
+                RecallRow::Fill(FillChoice::Just(key_sequence::FieldRef::Totp)),
+                RecallRow::Back,
+            ]
+        );
     }
 
     /// **The way back is the one row that is always there.** A cache miss

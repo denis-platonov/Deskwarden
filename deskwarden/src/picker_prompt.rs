@@ -513,16 +513,17 @@ pub fn describe_send(send: &Send) -> &'static str {
 /// answered it the same way, with the same reason: the sequence builder
 /// already covers custom fields, and an unbounded row count is a geometry
 /// hazard for a fixed-size surface. This is that decision again rather than a
-/// second one.
+/// second one. At most five rows -- a saved sequence, the pair, and the three
+/// fields -- against the [`LIST_ROWS`] slots the card lays out.
 pub fn palette_rows(palette: &Palette) -> Vec<Send> {
-    // The item's own sequence and nothing else, for `fill_choices`' reason:
-    // the user wrote it precisely because the generic rows were not what that
-    // app wanted, so offering them back is offering the thing they rejected.
-    if palette.has_sequence {
-        return vec![Send::Sequence];
-    }
     let has = |field: FieldRef| palette.fields.contains(&field);
     let mut out = Vec::new();
+    // The item's own sequence first, and every value under it -- not instead
+    // of them, for `fill_choices`' reason: a sequence is saved with one app's
+    // binding, and the record is picked on screens it was not written for.
+    if palette.has_sequence {
+        out.push(Send::Sequence);
+    }
     if has(FieldRef::Username) && has(FieldRef::Password) {
         // First, because it is what the overwhelming majority of screens want;
         // the single-field rows below exist for the ones that do not.
@@ -1222,8 +1223,8 @@ pub fn row_shortcut(index: usize) -> Option<String> {
 /// is no *Search the vault* row a digit must be kept off -- but a digit past
 /// the end is still a promise the card cannot keep.
 ///
-/// The second step is at most four rows ([`palette_rows`]: *Username + Tab +
-/// Password* and the three fields, or a saved sequence alone), so the nine
+/// The second step is at most five rows ([`palette_rows`]: a saved sequence,
+/// *Username + Tab + Password* and the three fields), so the nine
 /// digits are never the binding constraint here; the bound is written against
 /// `rows` anyway, because a cap that is slack today is not an argument.
 pub fn palette_shortcut(index: usize, rows: usize) -> Option<String> {
@@ -3525,18 +3526,6 @@ mod card_tests {
     }
 
     #[test]
-    fn an_item_with_a_stored_sequence_offers_that_and_nothing_else() {
-        let rows = palette_rows(&palette(vec![FieldRef::Username, FieldRef::Password], true));
-        assert_eq!(
-            rows,
-            vec![Send::Sequence],
-            "the user wrote the sequence precisely because the generic rows were not what that \
-             app wanted, so offering them back is offering the thing they rejected -- the same \
-             decision `app::fill_choices` makes"
-        );
-    }
-
-    #[test]
     fn both_credentials_put_the_pair_first_and_then_each_alone() {
         assert_eq!(
             palette_rows(&palette(vec![FieldRef::Username, FieldRef::Password], false)),
@@ -3669,15 +3658,17 @@ mod card_tests {
     /// fields -- and this card cannot grow or scroll, so a row past
     /// [`ROW_CAP`] is one the user can neither see nor reach. The rows are
     /// therefore built from the three fields that are bounded, plus at most a
-    /// pair row, which is four; the custom fields are covered by the sequence
-    /// builder, exactly as `app::fill_choices` records.
+    /// pair row and a saved sequence, which is five; the custom fields are
+    /// covered by the sequence builder, exactly as `app::fill_choices`
+    /// records. Asked with a saved sequence, because that is the longest
+    /// list this step can build.
     #[test]
     fn a_wall_of_custom_fields_cannot_push_a_row_off_the_card() {
         let customs: Vec<FieldRef> = (0..40)
             .map(|i| FieldRef::Custom(format!("field {i}")))
             .chain([FieldRef::Username, FieldRef::Password, FieldRef::Totp])
             .collect();
-        let rows = palette_rows(&palette(customs, false));
+        let rows = palette_rows(&palette(customs, true));
         assert!(
             rows.len() <= LIST_ROWS,
             "the second step offered {} rows onto a card with room for {LIST_ROWS}, and this \
@@ -3692,12 +3683,35 @@ mod card_tests {
         assert_eq!(
             rows,
             vec![
+                Send::Sequence,
                 Send::All,
                 Send::Field(FieldRef::Username),
                 Send::Field(FieldRef::Password),
                 Send::Field(FieldRef::Totp),
             ]
         );
+    }
+
+    /// **A saved sequence does not hide the record's other values.** It is
+    /// offered first, and every field the record has is offered under it --
+    /// the owner's "it only shows sequence now but it should show all of
+    /// values for the record". A sequence alone is still a row of its own.
+    #[test]
+    fn a_saved_sequence_is_offered_beside_every_value_and_not_instead_of_them() {
+        assert_eq!(
+            palette_rows(&palette(vec![FieldRef::Password, FieldRef::Totp], true)),
+            vec![Send::Sequence, Send::Field(FieldRef::Password), Send::Field(FieldRef::Totp)]
+        );
+        assert_eq!(
+            palette_rows(&palette(vec![FieldRef::Username, FieldRef::Password], true)),
+            vec![
+                Send::Sequence,
+                Send::All,
+                Send::Field(FieldRef::Username),
+                Send::Field(FieldRef::Password),
+            ]
+        );
+        assert_eq!(palette_rows(&palette(vec![], true)), vec![Send::Sequence]);
     }
 
     /// The label on screen defers to `FieldRef::label`, so a field renamed
@@ -4997,6 +5011,10 @@ mod tests {
             login(vec![FieldRef::Password]),
             login(vec![FieldRef::Totp]),
             Palette { fields: vec![], has_sequence: true },
+            Palette {
+                fields: vec![FieldRef::Username, FieldRef::Password, FieldRef::Totp],
+                has_sequence: true,
+            },
         ] {
             let rows = palette_rows(&palette);
             let marks: Vec<_> = rows.iter().map(send_mark).collect();
