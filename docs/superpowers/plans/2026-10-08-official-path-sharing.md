@@ -218,17 +218,25 @@ Each one is implemented as stated, and each is repeated in the final report.
    - Today Deskwarden avoids that with NodeWarden's own `DELETE /api/ciphers/{id}/delete`, which official and Vaultwarden do not have. On them, the 404 it gets back is read as "already gone", and the org copy stays.
    - `bw delete item <id> --permanent` on a live item also only trashed it on NodeWarden.
    - **Owner to confirm.**
-7. **Deskwarden's general trash purge still uses `DELETE /api/ciphers/{id}/delete`** (`RestClient::hard_delete_cipher`). It is not on the sharing path, so it is out of scope. It is flagged in the report.
+7. **Deskwarden's general purge uses Bitwarden's bare `DELETE /api/ciphers/{id}` on every server** (`RestClient::hard_delete_cipher`), by the owner's decision (DW1 Step 15b). It covers "Delete forever" and "Empty trash" as well as the move back.
+   - NodeWarden's `DELETE /api/ciphers/{id}/delete` suffix is no longer sent. No other server has it, so a purge there used to fail.
+   - Against a NodeWarden without NW2, the bare route trashes a live item instead of deleting it. NodeWarden ships first.
 8. **The invite code (`…/users/{ouId}/registration-invite`) stays.** It is NodeWarden-only, but it is account administration, not the share path.
    - It is offered only to an account whose profile says `role: "admin"`. Only NodeWarden sends that, so on other servers it is never offered and never called.
    - Its band now opens "Waiting for X to accept", not "to create an account".
    - **Owner to confirm.**
-9. **"Mine" without `ownerEmail` (spec §3.1).** An org is this account's own sharing org when:
-   - it is owned by the account and named for it; and
-   - either this client created it (the cached `sharing_org_created` id), or the roster lists **no other account in the owner role**.
-   - A roster that cannot be read refuses a write ("Deskwarden couldn't read who you share with"). It does not adopt the org, and it does not create a second one.
+9. **"Mine": made here, or chosen by the user (spec §3.1, amended by DW1 fix round 1, owner-approved).** An org is written to only when it is owned by the account, named for it, and either this client created it (`sharing_org_created`) or the user adopted it (`sharing_org_adopted`).
+   - Any other org is only a candidate. It is offered to the user only when its roster passes all three rules:
+     1. the account's own row is owner and confirmed;
+     2. every other row is a plain `member`, in any status (an owner, admin, manager or custom row, even invited or revoked, fails it);
+     3. each member's collections are a subset of the one authenticated collection named for their email, held read-only.
+   - The share then stops before writing anything and asks: "Use the organisation "<name>" (<short id>) for sharing? Deskwarden did not create it." Yes pins the id as adopted. No pins nothing and shares from a new org; a server that will not make one is said.
+   - Group-granted access cannot be seen from the roster, so the question is the backstop.
+   - Two or more candidates that pass, with none made or adopted, refuse the share rather than pick one.
+   - A roster that cannot be read refuses the share ("Deskwarden couldn't read who you share with"). It forgets no cached id, and a whole read never forgets one or writes state.
    - The sharer's own org-user id, which the person-collection create names, is read off the same roster: the row whose `userId` is the account's. Today's code sends the *user* id, which is right on NodeWarden only.
 10. **`server-too-old` is learned, not probed.**
+    - **Amended by DW1 fix round 1:** a 404 from the sharer's own roster re-reads the profile. Sharing goes off only when the profile still lists the org with the owner role. Otherwise the org was deleted or this account is no longer its owner: the org and its cached id are dropped, and the next share makes a new one.
     - Sharing is off for the session when a route it needs answers 405 or 501, or the sharer's own org roster (`…/users?includeCollections=true`) answers 404.
     - A 404 anywhere else is a missing record, not a missing route.
 11. **Accepted at invite goes straight to confirm.** When the roster read after an invite shows the person Accepted (spec §2's "Accepts on invite"), the share runs the confirm pass at once. So an existing NodeWarden or Vaultwarden account is `Shared` when the dialog closes.

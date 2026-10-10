@@ -64,12 +64,24 @@ If one of them answers 404, sharing is off with the reason `server-too-old` (unc
   - created on the first share with the official body (base spec §9.5);
   - named `Shared by <email>` (base spec §5.1).
 - **Not creatable** (official self-hosted). The Share dialog says *"Your server needs an organisation for sharing. Create one named "Shared by <your email>" in the web vault, then try again."* Deskwarden adopts it by name and ownership (base spec §5.1). Seat limits are the licence's. When an invite fails for lack of seats, the dialog shows the server's own error text.
-- **Recognising the sharer's own org.** It stays as built:
-  - the account's role in it is Owner;
-  - the cached `sharing_org_created` flag or id;
-  - the server's word, never the name alone.
+- **Recognising the sharer's own org** (amended after DW1's review, owner-approved). An org is written to only when the account owns it, it is named for the account, and one of these holds:
+  - this client created it (the cached `sharing_org_created` id); or
+  - the user adopted it (the cached `sharing_org_adopted` id, set by the question below).
 
-  The owner-email field this used on NodeWarden is replaced by the roster. On every server the sharer has ManageUsers, so the sharer can read `GET …/users` and find their own row with type Owner.
+  The owner-email field this used on NodeWarden is gone. The name alone is never enough, and nor is the roster alone: an attacker can make "Shared by <you>", add you as owner, then step down to admin or keep a member seat on a person collection, and read every share.
+
+- **Adopting an org Deskwarden did not create.** Any other org owned by and named for the account is a candidate. It is offered only when its roster (`GET …/users?includeCollections=true`, which the owner can read on every server) passes all three rules:
+  1. the account's own row is Owner and Confirmed;
+  2. every other row has the `member` (User) role, whatever its status: any Owner, Admin, Manager or Custom row fails it, invited and revoked rows included;
+  3. each other row's collections are a subset of the single authenticated collection named for that row's email, held read-only. No row reaches any other collection.
+
+  The first time, the share stops before it writes anything, and the Share dialog asks: *"Use the organisation "<name>" (<short id>) for sharing? Deskwarden did not create it."*
+  - **Yes** pins the org id as adopted. From then on it is treated like a created org, with no further question.
+  - **No** pins nothing. The share goes on in a new org, where the server allows creating one. Otherwise the dialog says it cannot continue.
+  - Until an org is created here or pinned, no whole read holds it and no write files into it.
+  - Access granted through groups (Vaultwarden, official) is not visible on the roster. The question is the backstop for it.
+  - If more than one candidate passes and none is created or pinned, the share is refused with a sentence that says so. It never picks one.
+  - A roster that cannot be read refuses the share and forgets no cached or pinned id.
 
 ### 3.2 Inviting
 
