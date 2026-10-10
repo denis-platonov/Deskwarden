@@ -48,10 +48,15 @@ pub(crate) const SHARE_TOOLTIP: &str = "Share with a person \u{b7} view-only";
 /// card by [`request`]. It no longer ends "This sends a link instead": no
 /// Share-shaped control opens a Send any more (final review, I3), so the
 /// sentence says only what is missing.
-pub(crate) const SHARING_UNAVAILABLE: &str = "Sharing with a person needs a NodeWarden server.";
-/// The greyed Share control's hover on a NodeWarden too old to share
-/// (`server-too-old`, spec 7.1).
-pub(crate) const SHARE_TOO_OLD_TOOLTIP: &str = "Sharing with a person needs a newer NodeWarden server.";
+pub(crate) const SHARING_UNAVAILABLE: &str = "Sharing with a person needs direct sync with a self-hosted server.";
+/// The greyed Share control's hover on a server too old to share
+/// (`server-too-old`, official-path spec §2): a route sharing needs answered
+/// as missing. Any server can be updated, so the sentence names none.
+pub(crate) const SHARE_TOO_OLD_TOOLTIP: &str = "Sharing with a person needs a newer server.";
+/// The Share dialog's warning where people a record is shared with can list
+/// each other (official-path spec §3.4) --
+/// [`SharingView::roster_visible_to_recipients`].
+pub(crate) const ROSTER_VISIBLE_WARNING: &str = "On this server, people you share with can see each other's email addresses.";
 /// A "Share anyway" with no fingerprint behind it -- see
 /// [`SharingPane::share_anyway`]. The card never builds one (it offers the
 /// button only beside a fingerprint it fetched), so this is the sentence a
@@ -91,11 +96,11 @@ pub(crate) fn reinvited_toast(email: &str) -> String {
     format!("Invitation sent to {email}.")
 }
 
-/// A share that left an invitation for an address with no account, said as a
-/// toast when no dialog is open to say it (mock 6e's dialog line, without
-/// the expiry the report does not carry).
-pub(crate) fn waiting_account_toast(email: &str) -> String {
-    format!("Waiting for {email} to create an account.")
+/// A share the server left as a pending invitation, said as a toast when no
+/// dialog is open to say it. It claims nothing about an account
+/// (official-path spec §3.4).
+pub(crate) fn invited_toast(email: &str) -> String {
+    format!("Waiting for {email} to accept.")
 }
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -132,19 +137,19 @@ impl PersonLine {
     pub(crate) fn pill(&self) -> theme::SharePillKind {
         match self.state {
             PersonState::Shared => theme::SharePillKind::Shared,
-            PersonState::WaitingAccept | PersonState::WaitingSignIn => theme::SharePillKind::Invited,
-            PersonState::WaitingAccount => theme::SharePillKind::NoAccount,
-            PersonState::Expired => theme::SharePillKind::Expired,
+            PersonState::WaitingAccept | PersonState::WaitingSignIn | PersonState::Invited => theme::SharePillKind::Invited,
             PersonState::KeyChanged => theme::SharePillKind::KeyChanged,
             PersonState::Gone => theme::SharePillKind::Gone,
         }
     }
 
-    /// Re-invite is offered where a fresh invitation helps (spec 6.1) -- and
-    /// never for an unverified person, whose Re-invite the engine refuses
-    /// anyway (`Sharing::reinvite`): it can wrap the org key to them.
+    /// Re-invite is offered where a fresh invitation helps -- a pending one,
+    /// renewed with `POST …/users/{ouId}/reinvite` on every server, or a
+    /// person who is gone (official-path spec §3.4) -- and never for an
+    /// unverified person, whose Re-invite the engine refuses anyway
+    /// (`Sharing::reinvite`): it can make them a recipient.
     pub(crate) fn reinvite(&self) -> bool {
-        self.authenticated && matches!(self.state, PersonState::WaitingAccount | PersonState::Expired | PersonState::Gone)
+        self.authenticated && matches!(self.state, PersonState::Invited | PersonState::Gone)
     }
 
     /// Show fingerprint only where a key is held (mock 6b: "only for someone
@@ -173,8 +178,16 @@ fn days_left(expires_at: Option<&str>, now_ms: i64) -> Option<i64> {
     Some(((at - now_ms).max(0) + MILLIS_PER_DAY - 1) / MILLIS_PER_DAY)
 }
 
-fn days_words(days: i64) -> String {
-    if days == 1 { "1 day left".to_string() } else { format!("{days} days left") }
+/// "invited 3 days ago" -- how long a person has been waiting to accept
+/// (official-path spec §3.4). From this PC's own record of the share, as
+/// "since" is ([`since`]): no server says when it invited anyone. No expiry
+/// is claimed, because the server's setting is invisible to a client.
+fn invited_ago(at: i64, now_ms: i64) -> String {
+    match (now_ms - at).max(0) / MILLIS_PER_DAY {
+        0 => "invited today".to_string(),
+        1 => "invited 1 day ago".to_string(),
+        days => format!("invited {days} days ago"),
+    }
 }
 
 /// The last time this PC shared `item_id` with `email` -- "since" on the card.
@@ -209,17 +222,12 @@ pub(crate) fn person_lines(
                     Some(at) => format!("Shared \u{b7} since {}", day(at, zone)),
                     None => "Shared".to_string(),
                 },
-                PersonState::WaitingAccept => match since(history, item_id, &person.email) {
-                    Some(at) => format!("Waiting to accept \u{b7} invited {}", day(at, zone)),
+                // Invited and Accepted read alike (official-path spec §3.4):
+                // the accept is the person's, and an Accepted one is
+                // confirmed on the next pass.
+                PersonState::WaitingAccept | PersonState::Invited => match since(history, item_id, &person.email) {
+                    Some(at) => format!("Waiting to accept \u{b7} {}", invited_ago(at, now_ms)),
                     None => "Waiting to accept".to_string(),
-                },
-                PersonState::WaitingAccount => match days_left(person.expires_at.as_deref(), now_ms) {
-                    Some(days) => format!("Waiting to create an account \u{b7} {}", days_words(days)),
-                    None => "Waiting to create an account".to_string(),
-                },
-                PersonState::Expired => match person.expires_at.as_deref().and_then(crate::send::parse_iso_utc_millis) {
-                    Some(at) => format!("The invite ran out on {} \u{b7} they never created an account", day(at, zone)),
-                    None => "The invite ran out \u{b7} they never created an account".to_string(),
                 },
                 PersonState::KeyChanged => "Their key changed. Check the fingerprint before sharing.".to_string(),
                 PersonState::WaitingSignIn => "Waiting for them to sign in once to a Bitwarden app".to_string(),
@@ -233,15 +241,13 @@ pub(crate) fn person_lines(
 
 /// The Sent row's short state (mock 6c: "to anna@example.com · Shared"),
 /// for [`share_rows`].
-pub(crate) fn short_state(state: PersonState, expires_at: Option<&str>, now_ms: i64) -> String {
+pub(crate) fn short_state(state: PersonState) -> &'static str {
     match state {
-        PersonState::Shared => "Shared".to_string(),
-        PersonState::WaitingAccept => "Waiting to accept".to_string(),
-        PersonState::WaitingAccount => days_left(expires_at, now_ms).map_or_else(|| "No account yet".to_string(), days_words),
-        PersonState::Expired => "Invite expired".to_string(),
-        PersonState::KeyChanged => "Key changed".to_string(),
-        PersonState::WaitingSignIn => "Waiting for a first sign-in".to_string(),
-        PersonState::Gone => "Not receiving".to_string(),
+        PersonState::Shared => "Shared",
+        PersonState::WaitingAccept | PersonState::Invited => "Waiting to accept",
+        PersonState::KeyChanged => "Key changed",
+        PersonState::WaitingSignIn => "Waiting for a first sign-in",
+        PersonState::Gone => "Not receiving",
     }
 }
 
@@ -254,11 +260,11 @@ pub(crate) fn short_state(state: PersonState, expires_at: Option<&str>, now_ms: 
 ///   it is that organisation's to share. One with attachments is greyed with
 ///   the engine's own sentence ([`crate::rest::sharing::HAS_ATTACHMENTS`]),
 ///   rather than refused after the user has typed an address.
-/// - `server-too-old`: greyed, with [`SHARE_TOO_OLD_TOOLTIP`] -- NodeWarden,
-///   so sharing is a thing this server will do once updated.
-/// - `bw-serve`, `not-nodewarden`, `not-loaded`, any other reason, no view
-///   yet, no line to the daemon, a received record: **nothing**. It used to
-///   offer a Send on every server but NodeWarden; the controller's call is
+/// - `server-too-old`: greyed, with [`SHARE_TOO_OLD_TOOLTIP`] -- sharing is
+///   a thing this server will do once updated.
+/// - `bw-serve`, `not-loaded`, any other reason, no view yet, no line to the
+///   daemon, a received record: **nothing**. It used to offer a Send where
+///   sharing was not available; the controller's call is
 ///   that the envelope beside it already is that door, so a Share-shaped
 ///   control that opens the Send composer is a duplicate under a wrong name.
 ///
@@ -651,7 +657,7 @@ pub(crate) struct ShareDialog {
     /// The last attempt's sentence.
     pub(crate) error: Option<String>,
     /// A share that left an invitation for an address with no account.
-    pub(crate) waiting_account: Option<String>,
+    pub(crate) invited: Option<String>,
     /// **A share that stopped to ask** whether to use an organisation
     /// Deskwarden did not create (official-path spec §3.1, fix round 1):
     /// the dialog asks it with Yes and No until it is answered or closed.
@@ -690,7 +696,7 @@ impl ShareDialog {
             email: String::new(),
             in_flight: false,
             error: None,
-            waiting_account: None,
+            invited: None,
             adopt: None,
             password: Zeroizing::new(String::new()),
             minting: false,
@@ -1099,12 +1105,12 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                 }
                 // The open dialog says it in its own words (mock 6a); with
                 // the dialog closed before the answer came, a toast does.
-                Ok(ShareResult::WaitingAccount) => match pane.dialog.as_mut().filter(|_| asked) {
+                Ok(ShareResult::Invited) => match pane.dialog.as_mut().filter(|_| asked) {
                     Some(dialog) => {
                         dialog.in_flight = false;
-                        dialog.waiting_account = Some(email);
+                        dialog.invited = Some(email);
                     }
-                    None => toast(pane, waiting_account_toast(&email)),
+                    None => toast(pane, invited_toast(&email)),
                 },
                 // The engine's refusals -- a record with attachments, in the
                 // trash, in another organisation, waiting to come home -- are
@@ -1394,26 +1400,25 @@ fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
     job
 }
 
-/// **The no-account band's two sentences** -- the bold line and the one
-/// under it.
+/// **The invited band's two sentences** -- the bold line and the one under
+/// it -- for a share the server left as a pending invitation.
 ///
-/// **NodeWarden sends no email** (plan decision 4), so this says what really
-/// happens next: the person needs an invite code to sign up, and the band
-/// never says an invitation was emailed, which is mock 6a's wording for the
-/// official server's flow. An administrator is told they can make that code
-/// here; anybody else, who makes it.
-fn no_account_band(email: &str, record: &str, admin: bool) -> (String, String) {
-    let head = format!("Waiting for {email} to create an account \u{b7} the invitation lasts 7 days.");
-    let who = if admin {
-        "They need an invite code to sign up. You are this server's administrator, so you can \
-         create one below and give it to them."
+/// It claims nothing about an account: no server tells a client whether an
+/// address has one (official-path spec §3.4), and no expiry is claimed
+/// either. Nor does it say an invitation was emailed: whether one was is
+/// the server's setting, which a client cannot see. Only NodeWarden's
+/// administrator -- the one account [`SharingView::can_mint_invites`] is
+/// ever true for -- is told about the invite code a newcomer there needs,
+/// and that they can make it here.
+fn invited_band(email: &str, record: &str, admin: bool) -> (String, String) {
+    let head = format!("Waiting for {email} to accept.");
+    let code = if admin {
+        "If they have no account on this server yet, they need an invite code to sign up. You are \
+         this server's administrator, so you can create one below and give it to them. "
     } else {
-        "They need an invite code from your server's administrator to sign up."
+        ""
     };
-    let body = format!(
-        "{who} {record} reaches their vault after they sign up and accept, and you can re-invite \
-         them from the record."
-    );
+    let body = format!("{code}{record} reaches their vault once they accept, and you can re-invite them from the record.");
     (head, body)
 }
 
@@ -1494,7 +1499,7 @@ pub(crate) fn draw_share_modal(
                 // it under the band would make the two disagree.
                 theme::eyebrow(ui, WITH_EYEBROW);
                 ui.add_space(theme::EYEBROW_GAP);
-                let editable = !busy && dialog.waiting_account.is_none() && dialog.adopt.is_none();
+                let editable = !busy && dialog.invited.is_none() && dialog.adopt.is_none();
                 let width = ui.available_width();
                 let field = ui
                     .add_enabled_ui(editable, |ui| theme::inline_field(ui, &mut dialog.email, WITH_HINT, width, false))
@@ -1534,6 +1539,15 @@ pub(crate) fn draw_share_modal(
                     let width = ui.available_width();
                     ui.add(egui::Label::new(access_job(&dialog.item_name, width)).wrap());
                 });
+                // **The roster-visibility warning** (official-path spec §3.4):
+                // where members may read the roster, everyone a record is
+                // shared with can list everyone else, and no request this app
+                // makes can stop it. Decided by the server's own name
+                // (`SharingView::roster_visible_to_recipients`).
+                if view.is_some_and(|v| v.roster_visible_to_recipients) {
+                    ui.add_space(10.0);
+                    ui.add(egui::Label::new(egui::RichText::new(ROSTER_VISIBLE_WARNING).size(12.0).color(theme::TEXT_MUTED)).wrap());
+                }
                 // The last attempt's sentence -- the engine's refusal (a
                 // record with attachments, in the trash, in another
                 // organisation, waiting to come home), a refused request, a
@@ -1543,8 +1557,8 @@ pub(crate) fn draw_share_modal(
                     ui.add(egui::Label::new(egui::RichText::new(error).size(12.0).color(theme::ERROR)).wrap());
                 }
             });
-            if let Some(email) = dialog.waiting_account.clone() {
-                if let Some(asked) = no_account_block(ui, dialog, &email, admin) {
+            if let Some(email) = dialog.invited.clone() {
+                if let Some(asked) = invited_block(ui, dialog, &email, admin) {
                     action = asked;
                 }
             }
@@ -1562,7 +1576,7 @@ pub(crate) fn draw_share_modal(
                     APPEARS_IN_SENT
                 };
                 ui.horizontal(|ui| {
-                    if dialog.waiting_account.is_some() {
+                    if dialog.invited.is_some() {
                         if theme::primary_button_enabled(ui, DONE_BUTTON, None, !busy).clicked() {
                             action = ShareDialogAction::Done;
                         }
@@ -1618,24 +1632,24 @@ pub(crate) fn draw_share_modal(
     action
 }
 
-/// **6a's no-account band**, between the body and the footer: the amber of
-/// `totp_add`'s 6c band rather than `theme::form_card_caution`'s red, and an
-/// info mark rather than a warning, because nothing went wrong -- the share
-/// went through and is waiting for somebody to sign up.
+/// **The invited band** (6a's fourth state), between the body and the footer:
+/// the amber of `totp_add`'s 6c band rather than `theme::form_card_caution`'s
+/// red, and an info mark rather than a warning, because nothing went wrong --
+/// the share went through and is waiting for the person to accept.
 ///
 /// An administrator also gets the invite code here: a master-password box and
 /// Create an invite code, then the code with a Copy. Only an administrator
 /// (`SharingView::can_mint_invites`), and only here -- a code is minted for
 /// the one pending invitation this share left, so there is nothing to mint
 /// for before it exists.
-fn no_account_block(
+fn invited_block(
     ui: &mut egui::Ui,
     dialog: &mut ShareDialog,
     email: &str,
     admin: bool,
 ) -> Option<ShareDialogAction> {
     let mut asked = None;
-    let (head, body) = no_account_band(email, &dialog.item_name, admin);
+    let (head, body) = invited_band(email, &dialog.item_name, admin);
     // 6a's `border-top: 1px solid var(--caution-edge)`.
     let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().rect_filled(rule, egui::CornerRadius::ZERO, theme::CAUTION_EDGE);
@@ -1815,7 +1829,7 @@ pub(crate) fn answer_dialog(
         }
         ShareDialogAction::MintCode if !busy => {
             let password = std::mem::replace(&mut dialog.password, Zeroizing::new(String::new()));
-            match dialog.waiting_account.clone().filter(|_| !password.is_empty()) {
+            match dialog.invited.clone().filter(|_| !password.is_empty()) {
                 Some(email) => {
                     dialog.minting = true;
                     dialog.error = None;
@@ -2587,7 +2601,6 @@ pub(crate) fn share_rows(
     view: Option<&SharingView>,
     sources: &[&[VaultItem]],
     history: &SentHistory,
-    now_ms: i64,
     zone: &dyn LocalOffset,
 ) -> Vec<ShareRow> {
     let Some(view) = view else {
@@ -2615,11 +2628,7 @@ pub(crate) fn share_rows(
                     name: item.name.clone(),
                     email: person.email.clone(),
                     state: person.state,
-                    subtitle: format!(
-                        "to {} \u{b7} {}",
-                        person.email,
-                        short_state(person.state, person.expires_at.as_deref(), now_ms)
-                    ),
+                    subtitle: format!("to {} \u{b7} {}", person.email, short_state(person.state)),
                     since: at.map(|at| day(at, zone)),
                 },
             ));
@@ -3215,20 +3224,19 @@ mod tests {
         Fingerprint { phrase: "cobalt-hinge-lantern-mossy-quill".into(), key_sha256: hash.into() }
     }
 
-    /// **Every status line of mock 6e**, in its words.
+    /// **Every status line**, in its words (mock 6e, and official-path spec
+    /// §3.4 for the waits): Invited and Accepted both "Waiting to accept",
+    /// with how long ago where this PC shared it; nothing about an account
+    /// or an expiry.
     #[test]
     fn each_persons_line_says_where_they_stand_in_the_mocks_words() {
-        let expires = crate::local_time::FixedOffset(0);
-        let in_six = {
-            let parts = crate::local_time::civil_parts(NOW + 6 * DAY - 1);
-            format!("{:04}-{:02}-{:02}T{:02}:{:02}:00Z", parts.year, parts.month, parts.day, parts.hour, parts.minute)
-        };
+        let zone = crate::local_time::FixedOffset(0);
         let v = view(
             vec![
                 ("anna@x.io", PersonState::Shared, None),
                 ("bob@x.io", PersonState::WaitingAccept, None),
-                ("carol@x.io", PersonState::WaitingAccount, Some(in_six.as_str())),
-                ("dan@x.io", PersonState::Expired, Some("2026-09-01T00:00:00Z")),
+                ("carol@x.io", PersonState::Invited, Some("2999-01-01T00:00:00Z")),
+                ("dan@x.io", PersonState::Invited, Some("2000-01-01T00:00:00Z")),
                 ("eve@x.io", PersonState::KeyChanged, None),
                 ("fay@x.io", PersonState::WaitingSignIn, None),
                 ("gus@x.io", PersonState::Gone, None),
@@ -3236,31 +3244,37 @@ mod tests {
             vec![("r1", vec!["anna@x.io", "bob@x.io", "carol@x.io", "dan@x.io", "eve@x.io", "fay@x.io", "gus@x.io"])],
         );
         let mut history = crate::sent_history::SentHistory::default();
-        history.record(crate::sent_history::SentRecord {
-            kind: crate::sent_history::SentKind::Share,
-            item_id: "r1".into(),
-            recipient: "anna@x.io".into(),
-            sent_at_unix_millis: NOW - 7 * DAY,
-            ..Default::default()
-        });
-        let lines = person_lines(Some(&v), "r1", &history, NOW, &expires);
+        for (who, ago) in [("anna@x.io", 7 * DAY), ("carol@x.io", 6 * DAY), ("bob@x.io", DAY)] {
+            history.record(crate::sent_history::SentRecord {
+                kind: crate::sent_history::SentKind::Share,
+                item_id: "r1".into(),
+                recipient: who.into(),
+                sent_at_unix_millis: NOW - ago,
+                ..Default::default()
+            });
+        }
+        let lines = person_lines(Some(&v), "r1", &history, NOW, &zone);
         let line = |email: &str| lines.iter().find(|l| l.email == email).map(|l| l.line.clone()).expect("a line");
         assert_eq!(line("anna@x.io"), "Shared \u{b7} since 14 Sep");
-        assert_eq!(line("bob@x.io"), "Waiting to accept");
-        assert_eq!(line("carol@x.io"), "Waiting to create an account \u{b7} 6 days left");
-        assert_eq!(line("dan@x.io"), "The invite ran out on 1 Sep \u{b7} they never created an account");
+        assert_eq!(line("bob@x.io"), "Waiting to accept \u{b7} invited 1 day ago");
+        assert_eq!(line("carol@x.io"), "Waiting to accept \u{b7} invited 6 days ago");
+        assert_eq!(line("dan@x.io"), "Waiting to accept", "no record of the share here, and no expiry claimed");
         assert_eq!(line("eve@x.io"), "Their key changed. Check the fingerprint before sharing.");
         assert_eq!(line("fay@x.io"), "Waiting for them to sign in once to a Bitwarden app");
         assert_eq!(line("gus@x.io"), "No longer receiving this");
+        for said in lines.iter().map(|l| l.line.to_lowercase()) {
+            assert!(!said.contains("account") && !said.contains("expire") && !said.contains("ran out"), "{said}");
+        }
         let pill = |email: &str| lines.iter().find(|l| l.email == email).map(PersonLine::pill).expect("a pill");
         assert_eq!(pill("anna@x.io"), theme::SharePillKind::Shared);
-        assert_eq!(pill("carol@x.io"), theme::SharePillKind::NoAccount);
+        assert_eq!(pill("carol@x.io"), theme::SharePillKind::Invited);
         assert!(lines.iter().find(|l| l.email == "anna@x.io").is_some_and(PersonLine::fingerprint));
         assert!(lines.iter().find(|l| l.email == "bob@x.io").is_some_and(|l| !l.fingerprint()), "no key held yet (mock 6b)");
         assert!(lines.iter().find(|l| l.email == "dan@x.io").is_some_and(PersonLine::reinvite));
+        assert!(lines.iter().find(|l| l.email == "bob@x.io").is_some_and(|l| !l.reinvite()), "an Accepted person has nothing to re-accept");
         assert!(lines.iter().find(|l| l.email == "eve@x.io").is_some_and(PersonLine::share_anyway));
-        assert_eq!(short_state(PersonState::Shared, None, NOW), "Shared");
-        assert_eq!(short_state(PersonState::WaitingAccount, Some(&in_six), NOW), "6 days left");
+        assert_eq!(short_state(PersonState::Shared), "Shared");
+        assert_eq!(short_state(PersonState::Invited), "Waiting to accept");
     }
 
     /// **The Share control is decided by the view's reason** (final review,
@@ -3648,14 +3662,14 @@ mod tests {
         let shared = |email: &str, result| SharingReport::Shared { email: email.into(), item_name: "Acme VPN".into(), result: Ok(result) };
         apply(&mut pane, shared("bob@x.io", ShareResult::WaitingAccept), 0.0);
         assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("bob@x.io was added. Acme VPN appears in their vault once they accept."));
-        apply(&mut pane, shared("carol@x.io", ShareResult::WaitingAccount), 1.0);
-        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Waiting for carol@x.io to create an account."));
+        apply(&mut pane, shared("carol@x.io", ShareResult::Invited), 1.0);
+        assert_eq!(pane.toast.as_ref().map(|(t, _)| t.as_str()), Some("Waiting for carol@x.io to accept."));
 
         pane.toast = None;
         pane.dialog = Some(ShareDialog { in_flight: true, ..ShareDialog::opening("r1", "Acme VPN") });
-        apply(&mut pane, shared("carol@x.io", ShareResult::WaitingAccount), 2.0);
+        apply(&mut pane, shared("carol@x.io", ShareResult::Invited), 2.0);
         assert!(pane.toast.is_none(), "the open dialog says it instead");
-        assert_eq!(pane.dialog.as_ref().and_then(|d| d.waiting_account.as_deref()), Some("carol@x.io"));
+        assert_eq!(pane.dialog.as_ref().and_then(|d| d.invited.as_deref()), Some("carol@x.io"));
     }
 
     /// **Re-reading the address book keeps what this window could not
@@ -3788,17 +3802,30 @@ mod tests {
     #[test]
     fn a_person_without_an_account_is_said_and_an_admin_can_make_an_invite_code() {
         let mut dialog = ShareDialog::opening("r1", "Acme VPN");
-        dialog.waiting_account = Some("carol@example.com".into());
+        dialog.invited = Some("carol@example.com".into());
         let admin = SharingView { available: true, can_mint_invites: true, ..SharingView::default() };
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
         let has = |needle: &str| texts.iter().any(|(t, _)| t.contains(needle));
-        assert!(has("Waiting for carol@example.com to create an account"), "{texts:?}");
+        assert!(has("Waiting for carol@example.com to accept."), "{texts:?}");
         assert!(has(MAKE_CODE_BUTTON));
         assert!(has(DONE_BUTTON));
         assert!(!has(SHARE_BUTTON) || !texts.iter().any(|(t, _)| t == SHARE_BUTTON), "Done replaces Share and Cancel");
         let plain = SharingView { available: true, ..SharingView::default() };
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&plain), Vec::new());
         assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON), "only an administrator can mint");
+    }
+
+    /// **The Share dialog warns where recipients can see each other**
+    /// (official-path spec §3.4), and only there.
+    #[test]
+    fn the_share_dialog_warns_where_recipients_can_see_each_other() {
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        let official = SharingView { available: true, roster_visible_to_recipients: true, ..SharingView::default() };
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&official), Vec::new());
+        assert!(texts.iter().any(|(t, _)| t == ROSTER_VISIBLE_WARNING), "{texts:?}");
+        let hidden = SharingView { available: true, roster_visible_to_recipients: false, ..SharingView::default() };
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&hidden), Vec::new());
+        assert!(!texts.iter().any(|(t, _)| t == ROSTER_VISIBLE_WARNING), "{texts:?}");
     }
 
     /// **An administrator is offered a code only for somebody with no
@@ -3812,19 +3839,21 @@ mod tests {
         assert!(!texts.iter().any(|(t, _)| t == MAKE_CODE_BUTTON), "{texts:?}");
     }
 
-    /// **NodeWarden sends no email** (plan decision 4), so the band never
-    /// says one was sent -- to an administrator or to anyone else -- and says
-    /// what does happen: an invite code.
+    /// **The invited band claims no account either way** (official-path spec
+    /// §3.4) and never says an email went out: an administrator is told
+    /// about the invite code a newcomer to this server needs; anyone else is
+    /// told only that the person has to accept.
     #[test]
-    fn the_no_account_band_says_an_invite_code_and_never_an_email() {
+    fn the_invited_band_claims_no_account_and_no_email() {
         for admin in [false, true] {
-            let (head, body) = no_account_band("carol@example.com", "Acme VPN", admin);
+            let (head, body) = invited_band("carol@example.com", "Acme VPN", admin);
             let all = format!("{head} {body}").to_lowercase();
             assert!(!all.contains("email") && !all.contains("e-mail"), "{all}");
-            assert!(all.contains("invite code"), "{all}");
-            assert!(body.contains("Acme VPN") && head.contains("carol@example.com"));
+            assert!(!all.contains("create an account") && !all.contains("7 days"), "{all}");
+            assert_eq!(head, "Waiting for carol@example.com to accept.");
+            assert!(body.contains("Acme VPN"), "{body}");
+            assert_eq!(all.contains("invite code"), admin, "{all}");
         }
-        assert!(no_account_band("c@x.io", "R", false).1.contains("administrator"), "a non-admin is told who makes codes");
     }
 
     /// **An invite code, once made, is on the band with a Copy** -- and the
@@ -3833,7 +3862,7 @@ mod tests {
     fn a_made_invite_code_is_shown_with_a_copy() {
         let admin = SharingView { available: true, can_mint_invites: true, ..SharingView::default() };
         let mut dialog = ShareDialog::opening("r1", "Acme VPN");
-        dialog.waiting_account = Some("carol@example.com".into());
+        dialog.invited = Some("carol@example.com".into());
         dialog.invite_code = Some(InviteCode { code: "K7Q2-99XA".into(), link: None, expires_at: None });
         let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), Vec::new());
         assert!(texts.iter().any(|(t, _)| t.contains("K7Q2-99XA")), "{texts:?}");
@@ -3979,7 +4008,7 @@ mod tests {
         assert_eq!(dialog.error.as_deref(), Some(BUSY));
 
         let mut dialog = pane.dialog.take().expect("the dialog");
-        dialog.waiting_account = Some("carol@x.io".into());
+        dialog.invited = Some("carol@x.io".into());
         dialog.password.push_str("hunter2");
         let _ = answer_dialog(&mut pane, dialog, ShareDialogAction::MintCode, Some(&line), &ctx, &tx);
         let dialog = pane.dialog.as_ref().expect("the dialog stays open");
@@ -4024,7 +4053,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut pane = SharingPane::default();
         let mut dialog = ShareDialog::opening("r1", "Acme VPN");
-        dialog.waiting_account = Some("carol@x.io".into());
+        dialog.invited = Some("carol@x.io".into());
         dialog.password.push_str("hunter2");
         let _ = answer_dialog(&mut pane, dialog, ShareDialogAction::MintCode, Some(&dead_line()), &ctx, &tx);
         let dialog = pane.dialog.as_ref().expect("the dialog");
@@ -4114,8 +4143,8 @@ mod tests {
     fn an_answer_does_not_land_in_a_dialog_that_did_not_ask() {
         let mut pane = SharingPane::default();
         pane.dialog = Some(ShareDialog::opening("r2", "Wi-Fi"));
-        apply(&mut pane, SharingReport::Shared { email: "carol@x.io".into(), item_name: "Acme VPN".into(), result: Ok(ShareResult::WaitingAccount) }, 0.0);
-        assert!(pane.dialog.as_ref().is_some_and(|d| d.waiting_account.is_none()));
+        apply(&mut pane, SharingReport::Shared { email: "carol@x.io".into(), item_name: "Acme VPN".into(), result: Ok(ShareResult::Invited) }, 0.0);
+        assert!(pane.dialog.as_ref().is_some_and(|d| d.invited.is_none()));
         assert!(pane.toast.is_some());
         apply(&mut pane, SharingReport::Shared { email: "b@x.io".into(), item_name: "Acme VPN".into(), result: Err("no".into()) }, 1.0);
         assert!(pane.dialog.as_ref().is_some_and(|d| d.error.is_none()));
@@ -4184,7 +4213,7 @@ mod tests {
     fn lines() -> Vec<PersonLine> {
         vec![
             PersonLine { email: "anna@x.io".into(), state: PersonState::Shared, line: "Shared \u{b7} since 14 Sep".into(), authenticated: true },
-            PersonLine { email: "carol@x.io".into(), state: PersonState::WaitingAccount, line: "Waiting to create an account \u{b7} 6 days left".into(), authenticated: true },
+            PersonLine { email: "carol@x.io".into(), state: PersonState::Invited, line: "Waiting to accept \u{b7} invited 6 days ago".into(), authenticated: true },
         ]
     }
 
@@ -4206,7 +4235,7 @@ mod tests {
         assert_eq!(count(REINVITE_LABEL), 1, "only carol's invite can be renewed");
         assert_eq!(count(SHOW_FINGERPRINT), 1, "only anna's key is held");
         assert_eq!(count("Shared"), 1);
-        assert_eq!(count("No account yet"), 1);
+        assert_eq!(count("Invited"), 1, "carol's pill");
         assert_eq!(count(PEOPLE_BLOCK_LABEL), 1, "the stacked label over the entries");
         assert_eq!(count("A"), 1, "anna's avatar carries her initial: {texts:?}");
         assert_eq!(count("C"), 1, "carol's avatar carries hers");
@@ -4343,21 +4372,21 @@ mod tests {
         assert_eq!(block_frame(checked, click(anyway)).0, DetailAction::ShareAnyway("eve@x.io".into()));
     }
 
-    /// **Mock 6b, invite expired**: Re-invite and Stop sharing stay, and
-    /// Re-invite reports the person.
+    /// **An invited person can be re-invited**: Re-invite and Stop sharing
+    /// stay, no fingerprint is offered, and Re-invite reports the person.
     #[test]
-    fn an_expired_invite_can_be_renewed() {
+    fn an_invited_person_can_be_reinvited() {
         use super::super::detail::DetailAction;
         let people_lines = vec![PersonLine {
             email: "carol@x.io".into(),
-            state: PersonState::Expired,
-            line: "The invite ran out on 3 Oct \u{b7} they never created an account".into(),
+            state: PersonState::Invited,
+            line: "Waiting to accept \u{b7} invited 6 days ago".into(),
             authenticated: true,
         }];
         let people = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(people, Vec::new());
-        assert!(texts.iter().any(|(t, _)| t == "Invite expired"));
-        assert!(!texts.iter().any(|(t, _)| t == SHOW_FINGERPRINT), "no key is held for an expired invite");
+        assert!(texts.iter().any(|(t, _)| t == "Invited"));
+        assert!(!texts.iter().any(|(t, _)| t == SHOW_FINGERPRINT), "no key is held for an invitation");
         let reinvite = centre_of(&texts, REINVITE_LABEL);
         assert_eq!(block_frame(people, click(reinvite)).0, DetailAction::Reinvite("carol@x.io".into()));
     }
@@ -4371,7 +4400,7 @@ mod tests {
         let unverified = SharingView {
             available: true,
             people: vec![
-                PersonEntry { email: "mal@x.io".into(), state: PersonState::Expired, expires_at: None, authenticated: false },
+                PersonEntry { email: "mal@x.io".into(), state: PersonState::Invited, expires_at: None, authenticated: false },
                 PersonEntry { email: "eve@x.io".into(), state: PersonState::KeyChanged, expires_at: None, authenticated: false },
             ],
             records: vec![crate::rest::sharing::RecordEntry { item_id: "r1".into(), people: vec!["mal@x.io".into(), "eve@x.io".into()] }],
@@ -4621,7 +4650,7 @@ mod tests {
             sent_at_unix_millis: NOW,
             ..Default::default()
         });
-        let rows = share_rows(Some(&v), &[&items], &history, NOW, &crate::local_time::FixedOffset(0));
+        let rows = share_rows(Some(&v), &[&items], &history, &crate::local_time::FixedOffset(0));
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].item_id, "r2", "the newest share first");
         assert_eq!(rows[0].subtitle, "to anna@x.io \u{b7} Shared");
@@ -4631,7 +4660,7 @@ mod tests {
         assert_eq!(rows[2].since, None, "no local record, so no date and the end of the list");
         assert_eq!(parse_share_key(&rows[0].key), Some(("r2".to_string(), "anna@x.io".to_string())));
         assert_eq!(parse_share_key("send-id"), None, "a Send's id is not a share key");
-        assert_eq!(share_rows(None, &[&items], &history, NOW, &crate::local_time::FixedOffset(0)), Vec::new());
+        assert_eq!(share_rows(None, &[&items], &history, &crate::local_time::FixedOffset(0)), Vec::new());
     }
 
     /// **A record the vault does not hold is not listed**, and a person the
@@ -4643,7 +4672,7 @@ mod tests {
             vec![("r1", vec!["anna@x.io", "Anna@X.io"]), ("gone", vec!["anna@x.io"])],
         );
         let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "r1", "name": "Acme VPN" })).expect("item")];
-        let rows = share_rows(Some(&v), &[&items], &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
+        let rows = share_rows(Some(&v), &[&items], &SentHistory::default(), &crate::local_time::FixedOffset(0));
         assert_eq!(rows.len(), 1, "{rows:?}");
         assert_eq!(rows[0].name, "Acme VPN", "the vault's name");
         assert_eq!(rows[0].pill(), theme::SharePillKind::Shared);
@@ -4651,7 +4680,7 @@ mod tests {
         // An ARCHIVED record's share is still live: found in the archive, it
         // is listed -- the live list is looked in first.
         let archived: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "gone", "name": "Old VPN" })).expect("item")];
-        let rows = share_rows(Some(&v), &[&items, &archived], &SentHistory::default(), NOW, &crate::local_time::FixedOffset(0));
+        let rows = share_rows(Some(&v), &[&items, &archived], &SentHistory::default(), &crate::local_time::FixedOffset(0));
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert!(rows.iter().any(|r| r.item_id == "gone" && r.name == "Old VPN"));
     }

@@ -712,8 +712,8 @@ pub enum DetailAction {
     /// The question's way out, drawn where Stop sharing was -- the Revoke
     /// pattern above, for a person.
     CancelStopSharing,
-    /// A fresh invitation for a person whose invite ran out, or who has no
-    /// account yet (spec 6.1).
+    /// A fresh invitation for a person still invited, or one who is gone
+    /// (official-path spec §3.4).
     Reinvite(String),
     /// Fetch and show a person's fingerprint phrase. A read of a public key's
     /// digest, not a secret of this vault.
@@ -20958,8 +20958,8 @@ mod tests {
         let mut people = anna_shared();
         people.push(crate::vault_window::share_ui::PersonLine {
             email: "carol@x.io".to_string(),
-            state: crate::rest::sharing::PersonState::WaitingAccount,
-            line: "Waiting to create an account \u{b7} 6 days left".to_string(),
+            state: crate::rest::sharing::PersonState::Invited,
+            line: "Waiting to accept \u{b7} invited 6 days ago".to_string(),
             authenticated: true,
         });
         let mut pane = Pane::wide(MIN_PANE).with_people(people);

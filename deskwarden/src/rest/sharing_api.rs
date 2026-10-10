@@ -229,6 +229,14 @@ pub fn user_public_key(
     }
 }
 
+/// `GET /api/config` -- the server's own name, `server.name`. Vaultwarden
+/// and NodeWarden fill it; official Bitwarden sends `null`, which is `None`
+/// (official-path spec §3.4). Read once a session, for one sentence.
+pub fn server_name(client: &RestClient, session: &mut Session) -> Result<Option<String>, RestError> {
+    let answer = send(client, session, &SharingRequest::new(SharingMethod::Get, "/api/config".into(), None))?;
+    Ok(answer.get("server").and_then(|server| text_at(server, "name")))
+}
+
 /// `POST /api/organizations`, the official body. Returns the new org's id.
 pub fn create_organization(
     client: &RestClient,
@@ -663,6 +671,24 @@ mod tests {
         confirm_member(&client, &mut session, ORG, "anna-id", &an_enc()).expect("a race is a success");
         server.mock("DELETE", format!("/api/organizations/{ORG}/users/gone").as_str()).with_status(404).create();
         remove_user(&client, &mut session, ORG, "gone").expect("a 404 on a delete is a success");
+    }
+
+    /// `/config`'s `server.name` -- Vaultwarden's and NodeWarden's own name;
+    /// official Bitwarden sends `null`, which is no name.
+    #[test]
+    fn the_servers_own_name_is_read_from_config() {
+        let mut server = crate::test_http::server();
+        let (client, mut session) = granted(&mut server);
+        server
+            .mock("GET", "/api/config")
+            .with_body(r#"{"object":"config","server":{"name":"Vaultwarden","url":"https://github.com/dani-garcia/vaultwarden"}}"#)
+            .expect(1)
+            .create();
+        assert_eq!(server_name(&client, &mut session).expect("read").as_deref(), Some("Vaultwarden"));
+        let mut official = crate::test_http::server();
+        let (client, mut session) = granted(&mut official);
+        official.mock("GET", "/api/config").with_body(r#"{"object":"config","server":null}"#).create();
+        assert_eq!(server_name(&client, &mut session).expect("read"), None);
     }
 
     /// Any other refusal keeps the server's own sentence, whichever key it

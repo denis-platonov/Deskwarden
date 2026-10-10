@@ -669,12 +669,12 @@ mod tests {
         let shared = server
             .mock("POST", "/sharing/item/p-1")
             .match_body(crate::test_http::Matcher::Json(serde_json::json!({ "email": "anna@example.com", "newOrganization": false })))
-            .with_body(r#"{"success":true,"data":{"result":"waitingAccount"}}"#)
+            .with_body(r#"{"success":true,"data":{"result":"invited"}}"#)
             .expect(1)
             .create();
         assert_eq!(
             client.share("p-1", "anna@example.com", false),
-            Ok(ShareAnswer::Done(crate::rest::sharing::ShareResult::WaitingAccount))
+            Ok(ShareAnswer::Done(crate::rest::sharing::ShareResult::Invited))
         );
         shared.assert();
     }
@@ -791,10 +791,10 @@ mod tests {
         let renewed = server
             .mock("POST", "/sharing/person/reinvite")
             .match_body(body)
-            .with_body(r#"{"success":true,"data":{"result":"waitingAccount"}}"#)
+            .with_body(r#"{"success":true,"data":{"result":"invited"}}"#)
             .expect(1)
             .create();
-        assert_eq!(client.reinvite("anna@example.com"), Ok(crate::rest::sharing::ShareResult::WaitingAccount));
+        assert_eq!(client.reinvite("anna@example.com"), Ok(crate::rest::sharing::ShareResult::Invited));
         renewed.assert();
     }
 

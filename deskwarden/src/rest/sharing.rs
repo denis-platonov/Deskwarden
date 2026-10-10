@@ -69,12 +69,12 @@ pub enum PersonState {
     Shared,
     /// Accepted, confirm not run yet.
     WaitingAccept,
-    /// NodeWarden: a pending invitation, no account for the email.
-    WaitingAccount,
+    /// A pending invitation (official status 0). No server tells a client
+    /// whether the address has an account, so nothing here claims either,
+    /// and no expiry is claimed (official-path spec §3.4).
+    Invited,
     /// Accepted, but the account has no public key yet.
     WaitingSignIn,
-    /// The invitation's expiry has passed.
-    Expired,
     /// Accepted, and the public key differs from the pin: not confirmed.
     KeyChanged,
     /// Their collection exists and no membership reaches it.
@@ -87,7 +87,9 @@ pub enum PersonState {
 pub struct PersonEntry {
     pub email: String,
     pub state: PersonState,
-    /// An invitation's expiry, ISO 8601.
+    /// NodeWarden's invitation expiry, ISO 8601, when the server names one.
+    /// Not drawn: no expiry is claimed (official-path spec §3.4), because
+    /// official servers do not show it. The ten-minute timer still reads it.
     pub expires_at: Option<String>,
     /// **Their collection's name decrypted under the org key** -- rule 2
     /// (see [`PersonCollection`]). `false` for a person known only from a
@@ -151,7 +153,11 @@ pub struct WaitingEntry {
 pub struct SharingView {
     pub available: bool,
     pub reason: Option<String>,
-    /// Always false on NodeWarden (slice 1 makes rosters manager-only).
+    /// People a record is shared with can list each other (official
+    /// Bitwarden's `mini-details` is open to every member). Decided by
+    /// `/config`'s server name (official-path spec §3.4): false only for
+    /// Vaultwarden and NodeWarden, which keep the roster to managers; an
+    /// unnamed server is warned about, the direction that discloses.
     pub roster_visible_to_recipients: bool,
     /// The account is NodeWarden's administrator and may mint invite codes.
     pub can_mint_invites: bool,
@@ -291,6 +297,20 @@ pub fn not_vouched_for(email: &str) -> String {
     )
 }
 
+/// The Share dialog's sentence when the server will not create the sharing
+/// org (official-path spec §3.1) -- an official self-hosted server, where an
+/// organisation comes only from a license. The user makes it in the web
+/// vault under this name, and the next share finds it by name and ownership
+/// and asks before using it ([`SharingError::NeedsAdoption`]): Deskwarden
+/// did not create it.
+#[must_use]
+pub fn needs_org(email: &str) -> String {
+    format!(
+        "Your server needs an organisation for sharing. Create one named \"{}\" in the web vault, then try again.",
+        crate::rest::organizations::sharing_org_name(email)
+    )
+}
+
 /// What a share ended as: the words the dialog chooses between (mock 6a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -299,8 +319,9 @@ pub enum ShareResult {
     Shared,
     /// A member without the key yet: the confirm pass will finish it.
     WaitingAccept,
-    /// No account: a pending invitation.
-    WaitingAccount,
+    /// The server left a pending invitation: the person accepts, then the
+    /// confirm pass finishes it.
+    Invited,
 }
 
 /// **Show fingerprint's answer**: the five words, and the SHA-256 of the key
@@ -869,9 +890,14 @@ impl Sharing {
         if held.capabilities.too_old {
             return SharingView::unavailable(REASON_TOO_OLD);
         }
-        let now = now_millis();
+        let hides_roster = held
+            .capabilities
+            .server_name
+            .as_deref()
+            .is_some_and(|name| name.eq_ignore_ascii_case("vaultwarden") || name.eq_ignore_ascii_case("nodewarden"));
         let mut view = SharingView {
             available: true,
+            roster_visible_to_recipients: !hides_roster,
             can_mint_invites: held.account.as_ref().is_some_and(|a| a.admin),
             ..SharingView::default()
         };
@@ -886,7 +912,7 @@ impl Sharing {
                 let member = org.member(email);
                 view.people.push(PersonEntry {
                     email: email.clone(),
-                    state: person_state(member, collection_id, &held, now),
+                    state: person_state(member, collection_id, &held),
                     expires_at: member.and_then(|m| m.invitation_expires.clone()),
                     authenticated: org.authenticated_collection_for(email).is_some(),
                 });
@@ -935,24 +961,36 @@ impl Sharing {
         view
     }
 
-    /// **The first pass's one question**, once per engine: who the account
-    /// is. Sharing is "not loaded" until it has an answer, and is then
-    /// available on every server -- unless a route it needs answers as
-    /// missing ([`Self::route`], [`Self::fetch_roster`]), which turns it off
-    /// with [`REASON_TOO_OLD`] for the session.
+    /// **The first pass's two questions**, once per engine: who the account
+    /// is, and what the server calls itself. Sharing is "not loaded" until
+    /// the first has an answer, and is then available on every server --
+    /// unless a route it needs answers as missing ([`Self::route`],
+    /// [`Self::fetch_roster`]), which turns it off with [`REASON_TOO_OLD`] for
+    /// the session.
     ///
-    /// This replaces the dialect probe (official-path spec §2). The probe
-    /// asked NodeWarden's `/invitations/mine` to tell the servers apart and
-    /// turned sharing off everywhere else; nothing asks which server this is
-    /// now. The profile is usually already held -- the whole read that called
-    /// [`Self::note_directory`] filed it -- so a first pass costs no request.
-    /// A transport failure is not remembered: the next pass asks again.
+    /// This replaces the dialect probe (official-path spec §2). The profile
+    /// is usually already held -- the whole read that called
+    /// [`Self::note_directory`] filed it -- so the account costs no request.
+    /// The name is `/config`'s `server.name`, read for one sentence -- the
+    /// roster-visibility warning ([`SharingView::roster_visible_to_recipients`])
+    /// -- and nothing else branches on it. A `/config` that does not answer
+    /// leaves the server unnamed, which warns. A failure to read the account
+    /// is not remembered: the next pass asks again.
     pub(crate) fn ensure_loaded(&self) -> Result<(), SharingError> {
         if self.held().capabilities.loaded {
             return Ok(());
         }
         self.account_id()?;
-        self.held().capabilities.loaded = true;
+        let name = match self.call(|client, auth| sharing_api::server_name(client, &mut auth.session)) {
+            Ok(name) => name,
+            Err(e) => {
+                log::info!("the server's /config could not be read for its name: {e}");
+                None
+            }
+        };
+        let mut held = self.held();
+        held.capabilities.server_name = name;
+        held.capabilities.loaded = true;
         Ok(())
     }
 
@@ -1602,8 +1640,10 @@ impl Sharing {
     /// account's own public key -- derived from its own private key, not
     /// asked of the server -- an RSA pair, and the first person's collection
     /// name. Returns the org's id and key. `refused` is the sentence a
-    /// refusal is said with: [`ORG_FAILED`], or [`NO_FRESH_ORG`] when the
-    /// user has just said No to an org they could have used.
+    /// failure is said with: [`ORG_FAILED`], or [`NO_FRESH_ORG`] when the
+    /// user has just said No to an org they could have used. A server that
+    /// answers the create with a refusal is, outside that No, told
+    /// [`needs_org`] instead, and remembered as one that will not create.
     fn create_org(
         &self,
         profile: &Profile,
@@ -1624,9 +1664,25 @@ impl Sharing {
             encrypted_private_key,
             collection_name: crate::rest::crypto::encrypt(&org_key, first_email.as_bytes()).map_err(crypto)?,
         };
+        // **Refused, not unreachable**, is the server saying it will not make
+        // one: an official self-hosted server creates an organisation only
+        // from a license ([SelfHosted(NotSelfHostedOnly = true)], base spec
+        // §4.3). The user makes it in the web vault and the next share offers
+        // it for adoption (official-path spec §3.1); the server's own words
+        // follow. After a No to an org that could have been used, the
+        // sentence stays [`NO_FRESH_ORG`]: making yet another org of the same
+        // name would only be asked about again.
         let id = self
             .call(|client, auth| sharing_api::create_organization(client, &mut auth.session, &body))
-            .map_err(|e| e.or_say(refused))?;
+            .map_err(|e| {
+                if matches!(e, SharingError::Refused(_) | SharingError::Vault(VaultError::Http(_))) {
+                    self.held().capabilities.creates_orgs = Some(false);
+                    if refused == NO_FRESH_ORG { e.or_say(refused) } else { e.or_say(&needs_org(&account.email)) }
+                } else {
+                    e.or_say(refused)
+                }
+            })?;
+        self.held().capabilities.creates_orgs = Some(true);
         Ok((id, org_key))
     }
 
@@ -2688,7 +2744,7 @@ impl Sharing {
                 let ou = member.id.clone();
                 self.route(|client, auth| sharing_api::reinvite(client, &mut auth.session, &ctx.org_id, &ou))
                     .map_err(|e| e.or_say(&refused))?;
-                ShareResult::WaitingAccount
+                ShareResult::Invited
             }
             _ => {
                 let collection = self.ensure_collection(&mut ctx, &email)?;
@@ -3236,21 +3292,19 @@ fn share_result_of(member: &Member) -> ShareResult {
     match member.status {
         MemberStatus::Confirmed => ShareResult::Shared,
         MemberStatus::Accepted => ShareResult::WaitingAccept,
-        MemberStatus::Invited | MemberStatus::Revoked => ShareResult::WaitingAccount,
+        MemberStatus::Invited | MemberStatus::Revoked => ShareResult::Invited,
     }
 }
 
 /// Spec 6.1's table, as a function of the roster row, the collection and
 /// what the confirm pass learned.
-fn person_state(member: Option<&Member>, collection_id: &str, held: &Held, now: i64) -> PersonState {
+fn person_state(member: Option<&Member>, collection_id: &str, held: &Held) -> PersonState {
     let Some(member) = member else {
         return PersonState::Gone;
     };
     let email = normalise_email(&member.email);
     match member.status {
-        MemberStatus::Invited => {
-            if invitation_ran_out(member, now) { PersonState::Expired } else { PersonState::WaitingAccount }
-        }
+        MemberStatus::Invited => PersonState::Invited,
         MemberStatus::Accepted if held.key_changed.contains(&email) => PersonState::KeyChanged,
         MemberStatus::Accepted if held.no_key.contains(&email) => PersonState::WaitingSignIn,
         MemberStatus::Accepted => PersonState::WaitingAccept,
@@ -3261,9 +3315,10 @@ fn person_state(member: Option<&Member>, collection_id: &str, held: &Held, now: 
     }
 }
 
-/// A pending invitation whose expiry has passed -- the card's `Expired`, and
-/// what [`Sharing::wants_timer`] leaves out. A member past the invitation, or
-/// one with no expiry the server named, is not expired.
+/// A pending invitation whose expiry has passed -- what [`Sharing::wants_timer`]
+/// leaves out, since nothing it reads can move it. Not shown on the card (no
+/// expiry is claimed). A member past the invitation, or one with no expiry
+/// the server named, is not expired.
 fn invitation_ran_out(member: &Member, now: i64) -> bool {
     member.status == MemberStatus::Invited
         && member.invitation_expires.as_deref().and_then(crate::send::parse_iso_utc_millis).is_some_and(|at| at < now)
@@ -3351,8 +3406,8 @@ mod tests {
         let state = |email: &str| view.person(email).map(|p| p.state);
         assert_eq!(state("anna@x.io"), Some(PersonState::Shared));
         assert_eq!(state("bob@x.io"), Some(PersonState::WaitingAccept));
-        assert_eq!(state("carol@x.io"), Some(PersonState::WaitingAccount));
-        assert_eq!(state("dan@x.io"), Some(PersonState::Expired));
+        assert_eq!(state("carol@x.io"), Some(PersonState::Invited));
+        assert_eq!(state("dan@x.io"), Some(PersonState::Invited), "no expiry is claimed (official-path spec §3.4)");
         assert_eq!(state("eve@x.io"), Some(PersonState::KeyChanged));
         assert_eq!(state("fay@x.io"), Some(PersonState::WaitingSignIn));
         assert_eq!(state("gus@x.io"), Some(PersonState::Gone), "a collection and no member");
@@ -3455,6 +3510,80 @@ mod tests {
     }
 
     use crate::test_http::{Matcher, MockServer};
+
+    /// **A server that will not create the sharing org** (official
+    /// self-hosted, official-path spec §3.1): the share asks the user to make
+    /// it in the web vault, by its name, keeps the server's own words after
+    /// that, remembers the answer, and writes nothing else.
+    #[test]
+    fn a_server_that_will_not_create_the_org_asks_the_user_to_make_it() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        server
+            .mock("POST", "/api/organizations")
+            .with_status(400)
+            .with_body(r#"{"message":"Only allowed when not self hosted."}"#)
+            .expect(1)
+            .create();
+        let invites = server.mock("POST", Matcher::Regex("/users/invite$".into())).expect(0).create();
+        let moved = server.mock("PUT", Matcher::Any).expect(0).create();
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::Refused(sentence)) => {
+                assert!(sentence.starts_with(&needs_org(FIXTURE_EMAIL)), "{sentence}");
+                assert!(sentence.ends_with("Only allowed when not self hosted."), "{sentence}");
+            }
+            other => panic!("expected the create-it-yourself sentence, got {other:?}"),
+        }
+        invites.assert();
+        moved.assert();
+        assert_eq!(engine.held().capabilities.creates_orgs, Some(false));
+        assert_eq!(
+            needs_org("Denis@Example.com"),
+            "Your server needs an organisation for sharing. Create one named \"Shared by denis@example.com\" in the web vault, then try again."
+        );
+    }
+
+    /// **The roster-visibility warning follows the server's own name**
+    /// (official-path spec §3.4): Vaultwarden and NodeWarden keep the roster
+    /// to managers and get none; official Bitwarden, any other name, and a
+    /// server that names itself nothing are warned about -- the direction
+    /// that discloses rather than hides.
+    #[test]
+    fn the_roster_warning_follows_the_servers_own_name() {
+        let engine = offline();
+        let visible = |name: Option<&str>| {
+            {
+                let mut held = engine.held();
+                held.capabilities.loaded = true;
+                held.capabilities.server_name = name.map(str::to_string);
+            }
+            engine.view(&[]).roster_visible_to_recipients
+        };
+        assert!(!visible(Some("Vaultwarden")));
+        assert!(!visible(Some("NodeWarden")));
+        assert!(!visible(Some("nodewarden")), "case does not matter");
+        assert!(visible(Some("Bitwarden")));
+        assert!(visible(None), "an unnamed server warns");
+    }
+
+    /// **The first pass reads the server's name once**, from `/config`.
+    #[test]
+    fn the_first_pass_reads_the_servers_name_once() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
+        let config = server
+            .mock("GET", "/api/config")
+            .with_body(r#"{"object":"config","server":{"name":"NodeWarden","url":"https://github.com/shuaiplus/NodeWarden"}}"#)
+            .expect(1)
+            .create();
+        engine.refresh(Trigger::WholeRead).expect("a first pass");
+        engine.refresh(Trigger::WholeRead).expect("a second pass");
+        config.assert();
+        assert_eq!(engine.held().capabilities.server_name.as_deref(), Some("NodeWarden"));
+        assert!(!engine.view(&[]).roster_visible_to_recipients);
+    }
 
     /// A loaded engine (its first pass made) on a NodeWarden, over the
     /// fixture account, with its files in a scratch directory -- and, when
@@ -3685,7 +3814,7 @@ mod tests {
         let outcome = engine.share("p1", "carol@example.com").expect("shared");
         invite.assert();
         confirms.assert();
-        assert_eq!(outcome.result, ShareResult::WaitingAccount);
+        assert_eq!(outcome.result, ShareResult::Invited);
         assert_eq!(engine.held().capabilities.accepts_on_invite, Some(false));
     }
 
@@ -4843,7 +4972,7 @@ mod tests {
             &[roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"]), roster_row("inv-gus", None, "gus@example.com", 0, &["c-gus"])],
         );
         let renewed = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/inv-carol/reinvite").as_str()).with_body("").expect(1).create();
-        assert_eq!(engine.reinvite("carol@example.com").expect("renewed"), ShareResult::WaitingAccount);
+        assert_eq!(engine.reinvite("carol@example.com").expect("renewed"), ShareResult::Invited);
         renewed.assert();
 
         let invited = server
@@ -4852,7 +4981,7 @@ mod tests {
             .with_body("")
             .expect(1)
             .create();
-        assert_eq!(engine.reinvite("gus@example.com").expect("invited"), ShareResult::WaitingAccount);
+        assert_eq!(engine.reinvite("gus@example.com").expect("invited"), ShareResult::Invited);
         invited.assert();
     }
 
@@ -5634,7 +5763,7 @@ mod tests {
         let outcome = engine.share("p1", "anna@example.com").expect("shared");
         removed.assert();
         invited.assert();
-        assert_eq!(outcome.result, ShareResult::WaitingAccount);
+        assert_eq!(outcome.result, ShareResult::Invited);
     }
 
     /// **m2: adopt takes only the org the last share asked about, once.** No
@@ -6249,10 +6378,11 @@ mod tests {
         assert_eq!(set_aside_in(&dir).len(), 1);
     }
 
-    /// **A pending invitation's expiry reaches the view** through a real
-    /// roster read, and the day it passes the person reads as expired.
+    /// **A pending invitation is Invited whatever its expiry** (official-path
+    /// spec §3.4): official servers do not show a client the expiry, so no
+    /// card claims one -- and a NodeWarden that does name one is read the same.
     #[test]
-    fn a_pending_invitation_says_when_it_expires_and_then_that_it_has() {
+    fn a_pending_invitation_is_invited_whatever_its_expiry() {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
         engine.held().my_org = Some(MyOrg {
             id: FIXTURE_ORG.into(),
@@ -6266,10 +6396,8 @@ mod tests {
         with_roster(&mut server, &[carol, dan]);
         engine.refresh(Trigger::Timer).expect("a pass");
         let view = engine.view(&[]);
-        let carol = view.person("carol@example.com").expect("carol");
-        assert_eq!(carol.state, PersonState::WaitingAccount);
-        assert_eq!(carol.expires_at.as_deref(), Some("2999-01-01T00:00:00.000Z"));
-        assert_eq!(view.person("dan@example.com").map(|p| p.state), Some(PersonState::Expired));
+        assert_eq!(view.person("carol@example.com").map(|p| p.state), Some(PersonState::Invited));
+        assert_eq!(view.person("dan@example.com").map(|p| p.state), Some(PersonState::Invited));
     }
 
     /// The fixture account on NodeWarden, owning the sharing org, as the

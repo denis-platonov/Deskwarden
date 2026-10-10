@@ -3369,7 +3369,6 @@ pub fn build_frame_with_search(
                 trash_list.items.as_deref().unwrap_or_default(),
             ],
             &sent_history,
-            crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
             &crate::local_time::SystemZone,
         );
         // **Design 6d's FROM PEOPLE**, built beside them for the same reason:
@@ -9320,8 +9319,8 @@ fn permit_share_anyway(
 
 /// **Re-invite (design 6b), behind the re-prompt where it grants access.**
 ///
-/// For a person who never got in -- no account yet, an invite that ran out
-/// -- a fresh invitation hands nothing new over: they were already meant to
+/// For a person who never got in -- an invitation still waiting -- a fresh
+/// invitation hands nothing new over: they were already meant to
 /// have it, behind the share that asked. For a person who is GONE it
 /// re-grants a membership that had ended, and that reaches every record
 /// shared with them -- [`permit_share_anyway`]'s reason, so the same
@@ -41296,7 +41295,7 @@ mod reprompt_gating_tests {
             permit_reinvite(&ctx, "eve@x.io", &[plain()], &gone, &never_asks(), &mut Proof::default()),
             Some(share_ui::SharingCall::Reinvite(_))
         ));
-        for waiting in [PersonState::WaitingAccount, PersonState::Expired] {
+        for waiting in [PersonState::Invited] {
             let pane = eve_on(waiting, "1");
             assert!(
                 matches!(
