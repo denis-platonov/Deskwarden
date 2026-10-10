@@ -476,17 +476,54 @@ static PORT_CLAIMS: Mutex<Vec<crate::vault_service::Held>> = Mutex::new(Vec::new
 /// on the same port is refused here, at startup, with a sentence that says
 /// why and what to do -- rather than starting a `bw serve` that could not
 /// bind, or worse, letting its window read the first profile's. Called by
-/// `main` once the single-instance takeover has settled, so a same-profile
-/// predecessor has already let go. Always `Ok` for the default copy, whose
-/// port is 8087 and outside every profile's range.
+/// `main` once the single-instance takeover has settled. Always `Ok` for the
+/// default copy, whose port is 8087 and outside every profile's range.
+///
+/// **Retried for about two seconds before it refuses.** "The takeover has
+/// settled" means this profile's previous daemon released its MUTEX -- and an
+/// exiting process's handles are closed in no fixed order, so a relaunch can
+/// find the mutex free while the old port claim is still held for a moment.
+/// Refusing on the first look would refuse a same-profile restart over its
+/// own predecessor.
 pub fn claim_bw_serve_port() -> Result<(), String> {
     let Some(profile) = active() else {
         return Ok(());
     };
     let port = crate::bw_serve::port();
-    let held = claim_port_with(profile, port, crate::vault_service::windows_env().hold)?;
+    let held = claim_port_retrying(
+        PORT_CLAIM_ATTEMPTS,
+        PORT_CLAIM_RETRY_EVERY,
+        std::thread::sleep,
+        || claim_port_with(profile, port, crate::vault_service::windows_env().hold),
+    )?;
     PORT_CLAIMS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(held);
     Ok(())
+}
+
+/// How many times [`claim_bw_serve_port`] tries before it refuses.
+pub const PORT_CLAIM_ATTEMPTS: u32 = 21;
+
+/// The pause between two tries: 20 pauses of 100 ms is the two-second bound.
+pub const PORT_CLAIM_RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// `attempt` up to `attempts` times, `sleep`ing `every` between two tries, and
+/// the first success -- or the last refusal once the bound is spent. Never
+/// sleeps after the last try, and never before the first.
+pub fn claim_port_retrying<T>(
+    attempts: u32,
+    every: std::time::Duration,
+    sleep: impl Fn(std::time::Duration),
+    attempt: impl Fn() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut last = attempt();
+    for _ in 1..attempts {
+        if last.is_ok() {
+            break;
+        }
+        sleep(every);
+        last = attempt();
+    }
+    last
 }
 
 /// [`claim_bw_serve_port`] over `hold`, which must be exclusive: `None` when
@@ -522,6 +559,35 @@ pub fn bw_serve_port_is_ours() -> bool {
             profile,
         )),
     }
+}
+
+/// **The refusal a test profile gets when its account list cannot be read**,
+/// or `None`. Pure.
+///
+/// `stored` and `unreadable` are what `settings.json` gave; together they are
+/// exactly the case `accounts::resolve_startup` answers with `NoAccountList`
+/// (no account, because the list could not be read). The default copy runs on
+/// in that state with the Bitwarden CLI on its own default profile -- the
+/// user's real `%APPDATA%\Bitwarden CLI` -- so for a test copy it is a refusal
+/// instead. Always `None` for the default copy.
+#[must_use]
+pub fn no_account_list_refusal(
+    profile: Option<&Profile>,
+    stored: &[crate::accounts::Account],
+    unreadable: bool,
+    settings_path: &std::path::Path,
+) -> Option<String> {
+    let profile = profile?;
+    (stored.is_empty() && unreadable).then(|| {
+        format!(
+            "The Deskwarden test profile {:?} could not read its account list, so it was not \
+             started: running without one would point the Bitwarden CLI at your real profile \
+             in %APPDATA%\\Bitwarden CLI. Nothing was changed. Fix or remove {} and start the \
+             test copy again.",
+            profile.0,
+            settings_path.display()
+        )
+    })
 }
 
 /// What a "`bw serve`'s port is held" refusal adds under a profile: empty for
@@ -1057,6 +1123,106 @@ mod tests {
         assert!(bw_serve_port_is_ours(), "the default copy asks only the port, as before");
         assert_eq!(port_held_hint(), "", "the default copy's refusal sentence changed");
         assert!(!PORT_CLAIM_PREFIX.starts_with(crate::app_mutex::APP_MUTEX_NAME));
+    }
+
+    /// **A same-profile restart is not refused over its own predecessor's
+    /// claim**: the claim is tried again, briefly, and taken once it is let
+    /// go. The pauses are counted, not slept.
+    #[test]
+    fn the_port_claim_is_retried_for_about_two_seconds_before_it_refuses() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        // Free on the fourth try: taken, after three pauses.
+        let tries = Cell::new(0u32);
+        let slept = Cell::new(Duration::ZERO);
+        let taken = claim_port_retrying(
+            PORT_CLAIM_ATTEMPTS,
+            PORT_CLAIM_RETRY_EVERY,
+            |pause| slept.set(slept.get() + pause),
+            || {
+                tries.set(tries.get() + 1);
+                if tries.get() < 4 { Err("held".to_string()) } else { Ok(tries.get()) }
+            },
+        );
+        assert_eq!(taken, Ok(4));
+        assert_eq!(slept.get(), PORT_CLAIM_RETRY_EVERY * 3);
+
+        // Never free: refused, after exactly the bound, about two seconds.
+        tries.set(0);
+        slept.set(Duration::ZERO);
+        let refused: Result<u32, String> = claim_port_retrying(
+            PORT_CLAIM_ATTEMPTS,
+            PORT_CLAIM_RETRY_EVERY,
+            |pause| slept.set(slept.get() + pause),
+            || {
+                tries.set(tries.get() + 1);
+                Err(format!("held {}", tries.get()))
+            },
+        );
+        assert_eq!(refused, Err(format!("held {PORT_CLAIM_ATTEMPTS}")), "not the last refusal");
+        assert_eq!(tries.get(), PORT_CLAIM_ATTEMPTS);
+        assert_eq!(slept.get(), Duration::from_secs(2), "the bound is not about two seconds");
+
+        // Free at once: no pause at all.
+        slept.set(Duration::ZERO);
+        let at_once = claim_port_retrying(
+            PORT_CLAIM_ATTEMPTS,
+            PORT_CLAIM_RETRY_EVERY,
+            |pause| slept.set(slept.get() + pause),
+            || Ok::<_, String>(()),
+        );
+        assert_eq!(at_once, Ok(()));
+        assert_eq!(slept.get(), Duration::ZERO);
+
+        // And production uses the retry, with a real sleep.
+        let code = production_code(include_str!("app_profile.rs"));
+        let body = &code[code.find("pub fn claim_bw_serve_port()").unwrap()..];
+        let body = &body[..body.find("\n}").unwrap()];
+        assert!(body.contains(concat!("claim_port_", "retrying(")), "{body}");
+        assert!(body.contains(concat!("std::thread::", "sleep,")), "{body}");
+    }
+
+    /// **A test profile with an unreadable account list is refused**, in
+    /// exactly the case the default copy runs on account-less
+    /// (`NoAccountList`) -- and before `main` resolves accounts or points
+    /// the CLI anywhere.
+    #[test]
+    fn a_profile_without_its_account_list_is_refused_at_startup() {
+        use crate::accounts::{resolve_startup, Account, AccountId, StartupAccounts};
+        let p = profile("rc");
+        let path = std::path::Path::new(r"C:\cfg\profiles\rc\settings.json");
+        let one = vec![Account {
+            id: AccountId::generate(),
+            email: "a@example.test".into(),
+            server_url: None,
+            use_official_bw_crypto: true,
+        }];
+        for (stored, unreadable) in [(&[][..], true), (&[][..], false), (&one[..], true), (&one[..], false)] {
+            let no_list = matches!(
+                resolve_startup(stored, None, unreadable.then_some("unreadable")),
+                StartupAccounts::NoAccountList { .. }
+            );
+            let refusal = no_account_list_refusal(Some(&p), stored, unreadable, path);
+            assert_eq!(refusal.is_some(), no_list, "not exactly the `NoAccountList` case");
+            assert_eq!(no_account_list_refusal(None, stored, unreadable, path), None, "default changed");
+            if let Some(why) = refusal {
+                assert!(why.contains("settings.json") && why.contains("\"rc\""), "{why}");
+            }
+        }
+
+        let main_rs = production_code(include_str!("main.rs"));
+        let body = &main_rs[main_rs.find("fn main() {").unwrap()..];
+        let loaded = body.find(concat!("settings::Settings::", "load(&settings_path);")).unwrap();
+        let refused = body
+            .find(concat!("deskwarden::app_profile::no_account_list_", "refusal("))
+            .expect("`main` no longer refuses a profile without its account list");
+        let resolved = body.find(concat!("accounts::resolve_", "startup(")).expect("control");
+        let pointed = body.find(concat!("bw_path::set_active_", "data_dir(")).expect("control");
+        assert!(loaded < refused && refused < resolved && refused < pointed, "out of order");
+        let arm = &body[refused..resolved];
+        assert!(arm.contains(concat!("message", "_box(")), "refused without saying so");
+        assert!(arm.contains(concat!("std::process::", "exit(PROFILE_REFUSED)")), "not refused");
     }
 
     /// **Every action on the installed copy asks first** -- before the

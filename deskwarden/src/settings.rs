@@ -2255,12 +2255,6 @@ mod tests {
 
     // -- the shortcuts record ----------------------------------------------
 
-    /// **The five defaults, spelled out rather than derived.**
-    ///
-    /// A test that read them back off `Shortcuts::default()` would pass with
-    /// every one of them changed. These are the combinations the app promises
-    /// out of the box and the ones the justification in that impl's doc is
-    /// about, so they are pinned as text.
     /// What a fill-hotkey pass under a given `settings.json` tries to
     /// register, through the real `register_fill_hotkeys_with` and a fake
     /// `RegisterHotKey` -- no test may take a real global chord.
@@ -2318,6 +2312,12 @@ mod tests {
         assert_eq!(Shortcuts::defaults_for(None), Shortcuts::default());
     }
 
+    /// **The five defaults, spelled out rather than derived.**
+    ///
+    /// A test that read them back off `Shortcuts::default()` would pass with
+    /// every one of them changed. These are the combinations the app promises
+    /// out of the box and the ones the justification in that impl's doc is
+    /// about, so they are pinned as text.
     #[test]
     fn the_five_shipped_shortcuts_are_the_ones_that_were_reasoned_about() {
         let s = Shortcuts::default();

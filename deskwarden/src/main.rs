@@ -394,6 +394,23 @@ fn main() {
     // conditional.
     let settings_path = config_dir.join("settings.json");
     let settings = settings::Settings::load(&settings_path);
+    // **A test profile does not start without its account list.** The
+    // default copy runs on with no account of its own (`NoAccountList`, in
+    // the account block below) and leaves the Bitwarden CLI on its own
+    // default profile -- for a test copy that would be the user's real
+    // `%APPDATA%\Bitwarden CLI`, which a sign-in or sign-out in the test copy
+    // must never touch. So under a profile it is a refusal, here, before
+    // anything has run `bw`. `None` for the default copy. See `app_profile`.
+    if let Some(why) = deskwarden::app_profile::no_account_list_refusal(
+        deskwarden::app_profile::active(),
+        &settings.accounts,
+        settings.accounts_unreadable,
+        &settings_path,
+    ) {
+        log::error!("{why}");
+        message_box("Deskwarden", &why, MB_ICONERROR | MB_OK);
+        std::process::exit(PROFILE_REFUSED);
+    }
     // The active account's server, for `backend_policy::choose` below. A
     // fresh install has no active account and no server, which `choose`
     // reads as not-self-hosted and therefore `BwServe` -- the safe answer,
