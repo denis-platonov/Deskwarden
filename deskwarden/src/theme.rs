@@ -7038,6 +7038,16 @@ pub fn section_password_field_within(
     password_field_shaped(ui, value, revealed, FieldShape { width: room, ..FieldShape::section(ui) })
 }
 
+/// A field box's right inset with nothing in it -- [`FieldShape`]'s plain
+/// one. Public so a caller sizing a box to its contents (the card form's
+/// expiry boxes) reserves the inset the box will really keep.
+pub const FIELD_PAD_RIGHT: f32 = 10.0;
+
+/// A field box's right inset **with the in-field `Show`/`Hide`** -- what
+/// [`password_field`] and its row variant keep clear of the toggle. Public
+/// for the same reason as [`FIELD_PAD_RIGHT`].
+pub const REVEAL_FIELD_PAD_RIGHT: f32 = 52.0;
+
 /// Both password fields, in one body: the box `shape` describes, masked
 /// unless `revealed`, with the in-field toggle on its right.
 fn password_field_shaped(
@@ -7047,8 +7057,11 @@ fn password_field_shaped(
     shape: FieldShape<'_>,
 ) -> Response {
     // The wide right inset keeps typed text from running under the toggle.
-    let (response, box_rect) =
-        field_box(ui, value, FieldShape { password: !*revealed, right_pad: 52.0, ..shape });
+    let (response, box_rect) = field_box(
+        ui,
+        value,
+        FieldShape { password: !*revealed, right_pad: REVEAL_FIELD_PAD_RIGHT, ..shape },
+    );
 
     // 3h's in-field reveal: a click-sensing label, not a Button, so no
     // padding or fill fights the field it sits inside.
@@ -7406,7 +7419,7 @@ impl<'a> FieldShape<'a> {
             password: false,
             width: ui.available_width(),
             height: FIELD_HEIGHT,
-            right_pad: 10.0,
+            right_pad: FIELD_PAD_RIGHT,
             font: FontId::new(14.0, FontFamily::Proportional),
         }
     }

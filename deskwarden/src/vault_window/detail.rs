@@ -8810,29 +8810,110 @@ const CARD_PIN_LABEL: &str = super::detail_edit::CARD_PIN_LABEL;
 ///    public-suffix rules `uri_match` already compares websites with.
 /// 3. **Otherwise the stored value as it is**: an IP address, or something
 ///    that is not a web address at all.
+///
+/// **One bank, one walk.** This scans the vault for the one domain it is
+/// asked about, borrowing every host rather than copying it, which is what the
+/// read pane wants for the one card on screen. A caller naming MANY domains --
+/// the edit form's chooser -- builds a [`BankNames`] once instead, which
+/// answers by the same rules through the same two steps ([`logins_agree`] and
+/// [`bank_name_without_a_login`]).
 pub(crate) fn bank_name(domain: &str, items: &[VaultItem]) -> String {
     let host = domain.trim();
     // 1. The logins whose saved websites have this host. Any of their
     //    websites, not only the first: the picker's own list comes from the
     //    first, but a login saved for two sites of one bank is still that
     //    bank's login.
-    let mut names = items
+    let agreed = items
         .iter()
         .filter(|item| ItemKind::of(item) == ItemKind::Login)
-        .filter(|item| {
-            item.login.as_ref().is_some_and(|login| {
-                login.uris.iter().filter_map(|u| u.uri.as_deref()).any(|uri| {
-                    crate::favicon::domain_from_uri(uri)
-                        .is_some_and(|saved| saved.eq_ignore_ascii_case(host))
-                })
-            })
-        })
-        .map(|item| item.name.trim());
-    if let Some(first) = names.next() {
-        if !first.is_empty() && names.all(|name| name == first) {
-            return first.to_string();
+        .filter(|item| login_hosts(item).any(|saved| saved.eq_ignore_ascii_case(host)))
+        .fold(None, |agreed, item| Some(logins_agree(agreed, &item.name)));
+    match agreed {
+        Some(LoginNames::Agree(name)) => name,
+        Some(LoginNames::Differ) | None => bank_name_without_a_login(domain),
+    }
+}
+
+/// What the logins found so far for one bank call it: one name they all
+/// share, or not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoginNames {
+    Agree(String),
+    Differ,
+}
+
+/// [`bank_name`]'s first rule, one login at a time: the first login's name,
+/// kept while every later one carries the same name. A blank name names
+/// nothing, so it is a disagreement too.
+fn logins_agree(agreed: Option<LoginNames>, name: &str) -> LoginNames {
+    let name = name.trim();
+    match agreed {
+        _ if name.is_empty() => LoginNames::Differ,
+        None => LoginNames::Agree(name.to_string()),
+        Some(LoginNames::Agree(first)) if first == name => LoginNames::Agree(first),
+        Some(_) => LoginNames::Differ,
+    }
+}
+
+/// The hosts of an item's saved websites, borrowed through
+/// `favicon::domain_in_uri` -- every website, not only the first.
+fn login_hosts(item: &VaultItem) -> impl Iterator<Item = &str> {
+    item.login
+        .iter()
+        .flat_map(|login| login.uris.iter())
+        .filter_map(|u| u.uri.as_deref())
+        .filter_map(crate::favicon::domain_in_uri)
+}
+
+/// **[`bank_name`] for many domains at once**: one walk over the vault,
+/// building what every host's logins agree to call it, and then a lookup per
+/// domain.
+///
+/// The bank chooser names every domain the vault offers, and asking
+/// [`bank_name`] once per domain walked every login's websites once per
+/// domain -- quadratic in the vault, millions of string copies on a 1,700-item
+/// vault on the frame the chooser opens. The answers are the same: the same
+/// [`logins_agree`] folds the same logins, and a host no login agrees on goes
+/// to the same [`bank_name_without_a_login`].
+pub(crate) struct BankNames {
+    /// Lowercased host -> what its logins agree to call it.
+    by_host: std::collections::HashMap<String, LoginNames>,
+}
+
+impl BankNames {
+    pub(crate) fn of(items: &[VaultItem]) -> Self {
+        let mut by_host: std::collections::HashMap<String, LoginNames> =
+            std::collections::HashMap::new();
+        for item in items.iter().filter(|item| ItemKind::of(item) == ItemKind::Login) {
+            // Each host ONCE per login: a login saved for two pages of one
+            // bank is one login of that bank, as `bank_name`'s `any` counts it.
+            let mut seen: Vec<String> = Vec::new();
+            for host in login_hosts(item) {
+                let host = host.to_ascii_lowercase();
+                if seen.contains(&host) {
+                    continue;
+                }
+                let agreed = by_host.remove(&host);
+                by_host.insert(host.clone(), logins_agree(agreed, &item.name));
+                seen.push(host);
+            }
+        }
+        Self { by_host }
+    }
+
+    /// What `domain` is called -- exactly [`bank_name`]'s answer.
+    pub(crate) fn name(&self, domain: &str) -> String {
+        match self.by_host.get(&domain.trim().to_ascii_lowercase()) {
+            Some(LoginNames::Agree(name)) => name.clone(),
+            Some(LoginNames::Differ) | None => bank_name_without_a_login(domain),
         }
     }
+}
+
+/// [`bank_name`]'s second and third rules: the registrable domain's first
+/// label, capitalised, or else the stored value as it is.
+fn bank_name_without_a_login(domain: &str) -> String {
+    let host = domain.trim();
     // 2. The registrable domain's first label, capitalised.
     let label = crate::uri_match::registrable_domain(host)
         .and_then(|registrable| registrable.split('.').next().map(str::to_string))
@@ -17577,6 +17658,76 @@ mod tests {
         // 3. The value as it is.
         assert_eq!(bank_name("192.168.1.10", &[]), "192.168.1.10");
         assert_eq!(bank_name("intranet", &[]), "intranet");
+    }
+
+    /// **[`BankNames`] answers exactly as [`bank_name`] does**, on a vault
+    /// with every shape of duplicate the rules distinguish: one login, several
+    /// agreeing, several disagreeing, a blank name, one login listing a host
+    /// twice, a host in another case, a card carrying the bank, and domains no
+    /// login has.
+    #[test]
+    fn the_bank_name_map_answers_as_the_per_domain_scan_does() {
+        let mut twice = bank_login("Monzo", "https://app.monzo.com/");
+        twice.login.as_mut().unwrap().uris.push(crate::vault_bridge::UriEntry {
+            uri: Some("https://APP.monzo.com/login".to_string()),
+            other: serde_json::Map::new(),
+        });
+        let mut card = an_item(Some(3));
+        card.name = "Some card".to_string();
+        let card = crate::vault_bridge::with_custom_field(
+            &card,
+            crate::favicon::BANK_DOMAIN_FIELD,
+            "secure.chase.com",
+        );
+        let items = vec![
+            bank_login("Chase Bank", "https://secure.chase.com/web"),
+            bank_login("Brex", "https://dashboard.brex.com/"),
+            bank_login("Brex", "https://Dashboard.Brex.com/settings"),
+            bank_login("Wise", "https://wise.com/"),
+            bank_login("Wise (old)", "https://wise.com/login"),
+            bank_login("   ", "https://blank.example.com/"),
+            twice,
+            card,
+        ];
+        let names = BankNames::of(&items);
+        let domains = [
+            "secure.chase.com",
+            "SECURE.CHASE.COM",
+            "dashboard.brex.com",
+            "wise.com",
+            "blank.example.com",
+            "app.monzo.com",
+            "online.chase.co.uk",
+            "192.168.1.10",
+            "intranet",
+            " dashboard.brex.com ",
+        ];
+        for domain in domains {
+            assert_eq!(names.name(domain), bank_name(domain, &items), "for {domain:?}");
+        }
+        // CONTROL: the fixture really exercises each rule.
+        assert_eq!(names.name("secure.chase.com"), "Chase Bank");
+        assert_eq!(names.name("dashboard.brex.com"), "Brex");
+        assert_eq!(names.name("wise.com"), "Wise");
+        assert_eq!(names.name("app.monzo.com"), "Monzo");
+        assert_eq!(names.name("blank.example.com"), "Example");
+    }
+
+    /// The bank is shown by name, and **its stored domain is the row's
+    /// tooltip**, so nothing is hidden.
+    #[test]
+    fn a_cards_bank_row_shows_its_domain_as_a_tooltip() {
+        let item = napps_brex();
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        assert!(!laid_out.painted("brex.com"), "the domain is painted before any hover");
+        let at = laid_out.rect_of("Brex").center();
+        let hovered = pane.hover_settled(&item, &TotpState::NoSecret, at);
+        assert!(
+            hovered.painted("brex.com"),
+            "resting on the bank shows no domain: {:?}",
+            hovered.strings()
+        );
     }
 
     /// The reported card with a PIN on it, stored as Bitwarden's standard

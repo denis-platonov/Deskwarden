@@ -90,6 +90,15 @@ fn is_bitwarden_cloud_host(host: &str) -> bool {
 /// login item's stored URI, the same normalization `login_ui::server_host`
 /// already does for the login window's server footer.
 pub fn domain_from_uri(uri: &str) -> Option<String> {
+    domain_in_uri(uri).map(str::to_string)
+}
+
+/// [`domain_from_uri`] **borrowed** -- the same host, as a slice of `uri`
+/// rather than a new `String`. For a caller that only compares hosts across a
+/// whole vault (`detail::bank_name`), where an allocation per website per
+/// frame is the whole cost; [`domain_from_uri`] is this plus the copy, so the
+/// two cannot disagree about what the host is.
+pub fn domain_in_uri(uri: &str) -> Option<&str> {
     let stripped = uri
         .trim()
         .trim_start_matches("https://")
@@ -99,7 +108,7 @@ pub fn domain_from_uri(uri: &str) -> Option<String> {
     if host.is_empty() || !host.contains('.') {
         None
     } else {
-        Some(host.to_string())
+        Some(host)
     }
 }
 

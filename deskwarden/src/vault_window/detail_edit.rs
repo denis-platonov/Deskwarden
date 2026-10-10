@@ -785,6 +785,20 @@ impl FieldDraft {
         self.row_id
     }
 
+    /// Whether this row is one the user has NAMED `PIN` -- typed it into a
+    /// new field, or renamed a field to it -- which on a card would collide
+    /// with the card's own PIN box: `vault_bridge::card_pin_index` reads the
+    /// first field so named as the PIN, and the next save would write the
+    /// PIN box over it. A field that ARRIVED named `PIN` is not this: the
+    /// first is the card's PIN already ([`FieldRole::CardPin`]), and a second
+    /// one is left exactly as it is.
+    fn claims_card_pin(&self) -> bool {
+        let is_pin = |name: &str| name.trim().eq_ignore_ascii_case(crate::vault_bridge::CARD_PIN_FIELD);
+        let arrived_as_pin =
+            self.original.as_ref().and_then(|o| o.name.as_deref()).is_some_and(is_pin);
+        self.is_editable() && is_pin(&self.name) && !arrived_as_pin
+    }
+
     /// Whether this form draws boxes for this field.
     fn is_editable(&self) -> bool {
         matches!(self.role, FieldRole::Text | FieldRole::Hidden)
@@ -2927,7 +2941,17 @@ impl EditDraft {
     /// decision a test can call. See [`template_fault`] for what "won't parse"
     /// means against a parser that is total by design.
     pub fn is_saveable(&self) -> bool {
-        self.is_valid() && self.sequence_fault().is_none()
+        self.is_valid() && self.sequence_fault().is_none() && self.pin_name_fault().is_none()
+    }
+
+    /// The custom-field name refusal on a card, or `None`: a custom field the
+    /// user has named `PIN` ([`FieldDraft::claims_card_pin`]) would be read
+    /// as the card's PIN and overwritten by the PIN box, silently. Refused
+    /// rather than renamed for them, and said both under the field and beside
+    /// Save, the way [`Self::sequence_fault`] is.
+    pub fn pin_name_fault(&self) -> Option<&'static str> {
+        (self.kind == ItemKind::Card && self.fields.iter().any(FieldDraft::claims_card_pin))
+            .then_some(PIN_NAME_REFUSAL)
     }
 
     /// Records this draft's current content as its opening state, so
@@ -3744,6 +3768,7 @@ impl EditDraft {
             None => true,
         };
         if !card.bank_domain.is_empty() && stale {
+            // One domain: one borrowing walk, no map to build.
             let name = detail::bank_name(&card.bank_domain, items);
             card.bank_shown = Some((card.bank_domain.clone(), name));
         }
@@ -3754,7 +3779,10 @@ impl EditDraft {
             items.iter().filter_map(crate::favicon::icon_domain_for).collect();
         domains.sort();
         domains.dedup();
-        card.bank_choice_names = domains.iter().map(|d| detail::bank_name(d, items)).collect();
+        // Every domain: ONE walk to build the names, then a lookup each. Asking
+        // `bank_name` per domain walked the whole vault per domain.
+        let names = detail::BankNames::of(items);
+        card.bank_choice_names = domains.iter().map(|d| names.name(d)).collect();
         card.bank_choices = domains;
     }
 
@@ -5412,7 +5440,14 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
 /// 32 is the height of an inline box in a row this block does not draw, and
 /// a box two points shorter than every other box on the form would read as a
 /// third field size rather than as 8a's second.
-fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating: bool) {
+fn custom_fields_block(
+    ui: &mut egui::Ui,
+    fields: &mut Vec<FieldDraft>,
+    creating: bool,
+    // Whether the item is a CARD, whose PIN has a box of its own -- see
+    // [`FieldDraft::claims_card_pin`].
+    card: bool,
+) {
     // **No rule and no heading here any more.** Design 8a gives this block a
     // card of its own, whose title band already says `Custom fields` in the
     // design's own treatment -- see `Section::title`. A `field_label` under a
@@ -5488,6 +5523,17 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
                         .id(egui::Id::new(("custom-field", field.row_id()))),
                     |ui| {
                         theme::section_text_field(ui, &mut field.name, false);
+                        // A card has its own PIN box; a custom field the
+                        // user names `PIN` would be read back as that box
+                        // and overwritten by it. Said here, under the name
+                        // that causes it, and Save is held until it changes
+                        // -- see `EditDraft::pin_name_fault`.
+                        if card && field.claims_card_pin() {
+                            ui.add_space(4.0);
+                            ui.label(
+                                RichText::new(PIN_NAME_REFUSAL).size(12.0).color(theme::ERROR),
+                            );
+                        }
                         ui.add_space(4.0);
                         theme::field_label(
                             ui,
@@ -7712,19 +7758,22 @@ fn brand_combo(ui: &mut egui::Ui, card: &mut CardDraft) -> f32 {
 /// are centred on the boxes by their ink ([`inline_caption`]).
 fn expires_row(ui: &mut egui::Ui, card: &mut CardDraft, creating: bool, ink: egui::Color32) {
     row_with_buttons(ui, &[], |ui, _room| {
-        let month = digits_box_width(ui, 2, FIELD_INSET_RIGHT);
+        let gap = ui.spacing().item_spacing.x;
+        let month = digits_box_width(ui, 2, theme::FIELD_PAD_RIGHT);
         theme::section_text_field_within(ui, &mut card.exp_month, false, month);
+        // Each caption goes to the next line WITH the box it names: a `Code`
+        // left at the end of one line over a box at the start of the next is
+        // a caption naming nothing.
+        let year = digits_box_width(ui, 4, theme::FIELD_PAD_RIGHT);
+        keep_together(ui, caption_width(ui, EXPIRY_JOIN) + gap + year);
         inline_caption(ui, EXPIRY_JOIN, ink);
-        let year = digits_box_width(ui, 4, FIELD_INSET_RIGHT);
         theme::section_text_field_within(ui, &mut card.exp_year, false, year);
+        let code = digits_box_width(ui, 4, theme::REVEAL_FIELD_PAD_RIGHT);
+        keep_together(ui, caption_width(ui, CARD_CODE_LABEL) + gap + code);
         inline_caption(ui, CARD_CODE_LABEL, ink);
-        let code = digits_box_width(ui, 4, REVEAL_INSET_RIGHT);
         theme::section_password_field_within(ui, &mut card.code, &mut card.reveal_code, code);
 
-        let caption = caption_width(ui, CARD_PIN_LABEL) + ui.spacing().item_spacing.x;
-        if ui.available_size_before_wrap().x < caption + PIN_FLOOR {
-            ui.end_row();
-        }
+        keep_together(ui, caption_width(ui, CARD_PIN_LABEL) + gap + PIN_FLOOR);
         inline_caption(ui, CARD_PIN_LABEL, ink);
         let room = ui.available_size_before_wrap().x.max(PIN_FLOOR);
         if creating {
@@ -7740,11 +7789,15 @@ fn expires_row(ui: &mut egui::Ui, card: &mut CardDraft, creating: bool, ink: egu
 /// The narrowest the PIN box may be before it goes to a line of its own.
 const PIN_FLOOR: f32 = 110.0;
 
-/// A row box's right inset with nothing in it, and with the in-field
-/// `Show`/`Hide` -- `theme`'s `FieldShape` numbers for the two, which a box
-/// sized to its digits has to leave room for.
-const FIELD_INSET_RIGHT: f32 = 10.0;
-const REVEAL_INSET_RIGHT: f32 = 52.0;
+/// Starts a new line of a wrapped row unless `width` more still fits on this
+/// one -- so a caption and the box it names wrap together. Nothing at the
+/// start of a line, where a new line would only be an empty one.
+fn keep_together(ui: &mut egui::Ui, width: f32) {
+    let at_start = ui.cursor().min.x <= ui.max_rect().left() + 0.5;
+    if !at_start && ui.available_size_before_wrap().x < width {
+        ui.end_row();
+    }
+}
 
 /// How wide a row box must be to show `digits` digits -- or as many mask
 /// bullets, whichever is wider -- without scrolling: the run, the box's
@@ -7802,7 +7855,6 @@ fn inline_caption(ui: &mut egui::Ui, text: &str, ink: egui::Color32) {
 fn dropdown_button(
     ui: &mut egui::Ui,
     text: &str,
-    chosen: bool,
     width: f32,
     open: bool,
 ) -> egui::Response {
@@ -7838,9 +7890,10 @@ fn dropdown_button(
             room,
             egui::TextStyle::Button,
         );
-        let ink = if chosen { visuals.text_color() } else { theme::TEXT_FAINT };
+        // The combo's own ink, chosen or not: the brand chooser beside it says
+        // `Not set` in it, and two unset states side by side should match.
         let at = egui::pos2(rect.left() + pad, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(at, galley, ink);
+        ui.painter().galley(at, galley, visuals.text_color());
     }
     response
 }
@@ -7886,7 +7939,6 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
         let picker = dropdown_button(
             ui,
             name.as_deref().unwrap_or(BANK_CHOOSE),
-            name.is_some(),
             room,
             card.bank_picking,
         );
@@ -9176,6 +9228,15 @@ pub(crate) fn apply_chip_edit(sequence: &str, edit: ChipEdit) -> String {
 /// Save's caption while the keystroke template will not parse. Names the thing
 /// to go and fix, the same way "Save (needs a name)" does.
 pub const SAVE_TEMPLATE_BLOCKED: &str = "Save (fix the template)";
+
+/// Save's caption while a card's custom field is named `PIN` -- see
+/// [`EditDraft::pin_name_fault`].
+pub const SAVE_PIN_NAME_BLOCKED: &str = "Save (rename the PIN field)";
+
+/// Why a card's custom field may not be called `PIN`, said under it and
+/// beside Save.
+pub const PIN_NAME_REFUSAL: &str =
+    "This card has its own PIN box, on the Expires row. Give this field another name.";
 
 /// The refusal under the wait box, said as the rule rather than as "invalid".
 const WAIT_REFUSAL: &str = "Type a number of seconds, up to 3600.";
@@ -11121,6 +11182,8 @@ fn save_label(draft: &EditDraft) -> &'static str {
         "Save (needs a name)"
     } else if draft.sequence_fault().is_some() {
         SAVE_TEMPLATE_BLOCKED
+    } else if draft.pin_name_fault().is_some() {
+        SAVE_PIN_NAME_BLOCKED
     } else {
         SAVE_BUTTON
     }
@@ -11502,6 +11565,12 @@ pub fn draw_detail_edit(
             // top of a long form and a Save that is off for no visible reason
             // is the silent no-op this file keeps refusing to ship.
             if let Some(fault) = draft.sequence_fault() {
+                ui.label(RichText::new(fault).size(12.0).color(theme::ERROR));
+                ui.add_space(6.0);
+            }
+            // The same for a custom field named `PIN` on a card, whose
+            // sentence is also under the field itself.
+            if let Some(fault) = draft.pin_name_fault() {
                 ui.label(RichText::new(fault).size(12.0).color(theme::ERROR));
                 ui.add_space(6.0);
             }
@@ -12127,9 +12196,20 @@ pub fn draw_detail_edit(
                         row_with_buttons(ui, buttons, |ui, room| {
                             let brand = brand_combo(ui, card);
                             // The number takes what is LEFT of the row's
-                            // field room once the chooser is on it.
-                            let number_room =
-                                (room - brand - theme::ROW_BUTTON_GAP).max(CARD_NUMBER_FLOOR);
+                            // field room once the chooser is on it -- or,
+                            // when that is too narrow to type a card number
+                            // into, a line of its own under the chooser, at
+                            // the row's FULL field room. Not a floored width
+                            // on the same line: that wrapped the number short
+                            // and left its Remove stopping well inside the
+                            // right edge every other row's button ends at.
+                            let beside = room - brand - theme::ROW_BUTTON_GAP;
+                            let number_room = if beside >= CARD_NUMBER_FLOOR {
+                                beside
+                            } else {
+                                ui.end_row();
+                                room
+                            };
                             theme::section_password_field_within(
                                 ui,
                                 &mut card.number,
@@ -12632,7 +12712,7 @@ pub fn draw_detail_edit(
                 changed(Section::CustomFields),
                 wanted,
                 |ui| {
-                    custom_fields_block(ui, &mut draft.fields, creating);
+                    custom_fields_block(ui, &mut draft.fields, creating, kind == ItemKind::Card);
                 },
             );
 
@@ -22417,6 +22497,16 @@ mod edit_pane_layout_tests {
                 painted.strings()
             );
             assert_eq!(count(BANK_CLEAR), 1, "the {width}pt Bank row has no Clear");
+            // ...and all four end on one right edge, as the login form's
+            // buttons do.
+            let edge = painted.frame_around(painted.rect_of(BANK_CLEAR)).right();
+            for text in painted.rects_of(SLOT_REMOVE_BUTTON) {
+                let right = painted.frame_around(text).right();
+                assert!(
+                    (right - edge).abs() <= 0.5,
+                    "at {width}pt a Remove ends at {right} and Clear at {edge}"
+                );
+            }
         }
     }
 
@@ -22732,6 +22822,241 @@ mod edit_pane_layout_tests {
         assert!(draft.shows(Slot::CardNumber));
         draft.card.set_number("5555555555554444");
         assert_eq!(draft.card.brand, "Mastercard", "a cleared brand is still the user's choice");
+    }
+
+    /// The full card form at `width`, revealed, one settled frame.
+    fn full_card_frame_at(width: f32, draft: &mut EditDraft) -> Painted {
+        let item = full_card_item();
+        let pane = Vec2::new(width, UNCULLED_PANE_HEIGHT);
+        let ctx = styled_context(pane);
+        let _ = frame_for(&ctx, pane, draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+        frame_for(&ctx, pane, draft, false, &[], Some(&item), &detail::TotpState::NoSecret)
+    }
+
+    /// **The Card row's Remove ends where every other row's button ends, at
+    /// every width** -- including the middle widths where the brand chooser
+    /// and the number no longer fit on one line. The number used to wrap at a
+    /// floored width there, and its Remove stopped 70 to 250 points short of
+    /// the others: the misalignment the owner reported. It now takes the whole
+    /// next line.
+    #[test]
+    fn the_card_rows_remove_ends_where_the_other_rows_buttons_do_at_every_width() {
+        for width in [MIN_PANE_WIDTH, 450.0, WIDE_PANE_WIDTH] {
+            let mut draft = revealed_full_card_draft();
+            let painted = full_card_frame_at(width, &mut draft);
+            let pane = Vec2::new(width, UNCULLED_PANE_HEIGHT);
+            let edge = painted.frame_around(painted.rect_of(BANK_CLEAR)).right();
+            let card_row = caption(&painted, CARD_ROW_LABEL).top()
+                ..caption(&painted, EXPIRES_ROW_LABEL).top();
+            let mut on_card_row = 0;
+            for text in painted.rects_of(SLOT_REMOVE_BUTTON) {
+                let button = painted.frame_around(text);
+                assert!(
+                    (button.right() - edge).abs() <= 0.5,
+                    "at {width}pt a Remove ends at {} and Clear at {edge}",
+                    button.right()
+                );
+                assert!(within_pane(button, pane), "at {width}pt a Remove is off the pane");
+                if card_row.contains(&button.center().y) {
+                    on_card_row += 1;
+                }
+            }
+            assert_eq!(on_card_row, 1, "at {width}pt the Card row does not carry its one Remove");
+        }
+    }
+
+    /// **The PIN wraps to its own line on a narrow pane, caption and all, and
+    /// nothing leaves the pane** -- and each inline caption stays on the line
+    /// of the box it names.
+    #[test]
+    fn the_pin_wraps_to_its_own_line_on_a_narrow_pane_without_overflowing() {
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame_at(MIN_PANE_WIDTH, &mut draft);
+        let pane = Vec2::new(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let code = row_box_around(&painted, painted.rect_of("417"));
+        let pin = row_box_around(&painted, painted.rect_of("4321"));
+        assert!(pin.top() >= code.bottom(), "the PIN {pin:?} is not under the code {code:?}");
+        for (label, boxed) in [(CARD_CODE_LABEL, code), (CARD_PIN_LABEL, pin)] {
+            let caption = painted.rect_of(label);
+            assert!(
+                (caption.center().y - boxed.center().y).abs() <= 2.0,
+                "{label:?} at {caption:?} is not on the line of its box {boxed:?}"
+            );
+            assert!(caption.right() <= boxed.left(), "{label:?} is not in front of its box");
+        }
+        for rect in [code, pin] {
+            assert!(within_pane(rect, pane), "{rect:?} leaves the {}pt pane", pane.x);
+        }
+    }
+
+    /// The smallest painted rect round `inner` that is a row box's height --
+    /// the FIELD, not the text area egui paints inside a short one.
+    fn row_box_around(painted: &Painted, inner: Rect) -> Rect {
+        let mut found: Vec<Rect> = painted
+            .rects
+            .iter()
+            .map(|(r, _)| *r)
+            .filter(|f| {
+                f.height() >= theme::SECTION_FIELD_HEIGHT - 1.0
+                    && f.min.x <= inner.min.x + 1.0
+                    && f.max.x >= inner.max.x - 1.0
+                    && f.min.y <= inner.min.y + 1.0
+                    && f.max.y >= inner.max.y - 1.0
+            })
+            .collect();
+        found.sort_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())));
+        *found.first().unwrap_or_else(|| panic!("no box is painted round {inner:?}"))
+    }
+
+    /// **The card form at its fullest -- every row, every secret revealed, the
+    /// bank chooser open -- paints nothing outside the minimum pane.** The
+    /// card's rows wrap at that width (the number under the brand, the PIN
+    /// under the code), and a wrap that missed would push a box sideways.
+    #[test]
+    fn nothing_on_the_fullest_card_form_is_painted_outside_the_minimum_pane() {
+        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
+        let mut login = item_with_history(0);
+        login.name = "Brex corporate".to_string();
+        login.login.as_mut().unwrap().uris = vec![UriEntry {
+            uri: Some("https://dashboard.brex.com/login".to_string()),
+            other: serde_json::Map::new(),
+        }];
+        let mut draft = revealed_full_card_draft();
+        draft.card.bank_picking = true;
+        draft.offer_bank_domains(std::slice::from_ref(&login));
+        let painted = full_card_frame_at(MIN_PANE_WIDTH, &mut draft);
+        assert!(
+            painted.strings().contains(&"Brex corporate \u{2014} dashboard.brex.com"),
+            "the chooser is not open, so this is not the fullest card form"
+        );
+        assert!(!painted.glyphs.is_empty(), "the form painted no glyphs at all");
+        for (text, ink) in &painted.glyphs {
+            assert!(
+                within_pane(*ink, pane),
+                "{text:?} lays glyphs over x = {}..{} on a {}pt-wide pane",
+                ink.left(),
+                ink.right(),
+                pane.x
+            );
+        }
+        assert!(!painted.rect_ink.is_empty(), "the form painted no filled boxes at all");
+        for (ink, fill) in &painted.rect_ink {
+            assert!(
+                within_pane(*ink, pane),
+                "a {fill:?} box lays ink over x = {}..{} on a {}pt-wide pane",
+                ink.left(),
+                ink.right(),
+                pane.x
+            );
+        }
+    }
+
+    /// **The bank picker is drawn as the brand chooser beside it is** -- the
+    /// same fill, border, corner, height, caret and ink -- painted side by
+    /// side, so the hand-drawn one cannot drift from `form_combo`'s. Both are
+    /// asked in their UNSET state, which is the pair the owner sees together.
+    #[test]
+    fn the_bank_picker_is_drawn_as_the_brand_chooser_is() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 400.0);
+        let ctx = styled_context(pane);
+        let mut combo = Rect::NOTHING;
+        let mut picker = Rect::NOTHING;
+        let output = ctx.run_ui(raw_input(pane, &[]), |ui| {
+            ui.horizontal(|ui| {
+                // The row's own height dial, as `row_with_buttons` sets it.
+                ui.spacing_mut().interact_size.y = theme::ROW_BUTTON_HEIGHT_2B;
+                combo = ui
+                    .scope(|ui| {
+                        form_combo(ui, "probe-brand")
+                            .selected_text(BRAND_UNSET)
+                            .width(BRAND_COMBO_WIDTH)
+                            .show_ui(ui, |_ui| {})
+                            .response
+                            .rect
+                    })
+                    .inner;
+                picker = dropdown_button(ui, BANK_CHOOSE, BRAND_COMBO_WIDTH, false).rect;
+            });
+        });
+        let mut boxes: Vec<egui::epaint::RectShape> = Vec::new();
+        let mut carets: Vec<(Rect, egui::Color32)> = Vec::new();
+        let mut inks: Vec<(String, egui::Color32)> = Vec::new();
+        fn collect(
+            shape: &egui::Shape,
+            boxes: &mut Vec<egui::epaint::RectShape>,
+            carets: &mut Vec<(Rect, egui::Color32)>,
+            inks: &mut Vec<(String, egui::Color32)>,
+        ) {
+            match shape {
+                egui::Shape::Rect(r) => boxes.push(r.clone()),
+                egui::Shape::Path(p) => carets.push((shape.visual_bounding_rect(), p.fill)),
+                egui::Shape::Text(t) => inks.push((t.galley.text().to_string(), t.fallback_color)),
+                egui::Shape::Vec(shapes) => {
+                    for s in shapes {
+                        collect(s, boxes, carets, inks);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut boxes, &mut carets, &mut inks);
+        }
+        let frame_of = |button: Rect| -> egui::epaint::RectShape {
+            boxes
+                .iter()
+                .find(|r| (r.rect.min - button.min).length() < 1.5 && (r.rect.max - button.max).length() < 1.5)
+                .cloned()
+                .unwrap_or_else(|| panic!("nothing is painted as the frame of {button:?}"))
+        };
+        let caret_of = |button: Rect| -> (Rect, egui::Color32) {
+            *carets
+                .iter()
+                .find(|(c, _)| button.contains_rect(*c))
+                .unwrap_or_else(|| panic!("no caret is painted in {button:?}"))
+        };
+        let (a, b) = (frame_of(combo), frame_of(picker));
+        assert_eq!(a.fill, b.fill, "the picker's fill is not the chooser's");
+        assert_eq!(a.stroke, b.stroke, "the picker's border is not the chooser's");
+        assert_eq!(a.corner_radius, b.corner_radius, "the picker's corner is not the chooser's");
+        assert!((combo.height() - picker.height()).abs() <= 0.5, "{combo:?} against {picker:?}");
+        let ((ca, ink_a), (cb, ink_b)) = (caret_of(combo), caret_of(picker));
+        assert_eq!(ink_a, ink_b, "the picker's caret is not the chooser's colour");
+        for (what, x, y) in [
+            ("right inset", combo.right() - ca.right(), picker.right() - cb.right()),
+            ("vertical centre", combo.center().y - ca.center().y, picker.center().y - cb.center().y),
+            ("width", ca.width(), cb.width()),
+            ("height", ca.height(), cb.height()),
+        ] {
+            assert!((x - y).abs() <= 0.5, "the caret's {what} differs: {x} against {y}");
+        }
+        let ink = |label: &str| {
+            inks.iter().find(|(t, _)| t == label).map(|(_, c)| *c).expect("the label is painted")
+        };
+        assert_eq!(ink(BANK_CHOOSE), ink(BRAND_UNSET), "the two unset states are in different inks");
+    }
+
+    /// **On a card, a custom field may not be called `PIN`**: it would be read
+    /// back as the card's PIN and overwritten by the PIN box. The refusal is
+    /// said under the field and beside Save, and Save is held until the field
+    /// is renamed.
+    #[test]
+    fn a_custom_field_named_pin_on_a_card_is_refused_where_it_is_typed() {
+        let mut draft = revealed_full_card_draft();
+        let mut field = FieldDraft::new_of(FieldRole::Hidden);
+        field.name = " pin ".to_string();
+        field.value = "1111".to_string();
+        draft.fields.push(field);
+        let painted = full_card_frame(&[], &mut draft);
+        let refusals = painted.rects_of(PIN_NAME_REFUSAL);
+        assert_eq!(refusals.len(), 2, "the refusal is not said under the field and beside Save");
+        assert!(painted.strings().contains(&SAVE_PIN_NAME_BLOCKED), "{:?}", painted.strings());
+        assert!(!draft.is_saveable());
+
+        draft.fields.last_mut().unwrap().name = "PIN hint".to_string();
+        let painted = full_card_frame(&[], &mut draft);
+        assert!(painted.rects_of(PIN_NAME_REFUSAL).is_empty(), "a renamed field is still refused");
+        assert!(draft.is_saveable());
     }
 
     // -----------------------------------------------------------------------
@@ -31631,6 +31956,42 @@ mod card_custom_field_tests {
         // And a discard wipes it with the other secrets.
         draft.zeroize_secrets();
         assert_eq!(draft.card.pin, "", "a discard left the PIN in memory");
+    }
+
+    /// **Which fields the PIN-name refusal is about**: one the user NAMES
+    /// `PIN` on a card -- new, or renamed -- in any case; not a field that
+    /// arrived so named, and not a field on any other kind.
+    #[test]
+    fn only_a_field_the_user_names_pin_on_a_card_is_refused() {
+        let mut draft = EditDraft::from_item(&card_item());
+        assert_eq!(draft.pin_name_fault(), None);
+        assert!(draft.is_saveable());
+
+        draft.fields.push(FieldDraft::new_of(FieldRole::Text));
+        draft.fields.last_mut().unwrap().name = "Pin".into();
+        assert_eq!(draft.pin_name_fault(), Some(PIN_NAME_REFUSAL));
+        assert!(!draft.is_saveable(), "a card saved a custom field named PIN");
+        assert_eq!(save_label(&draft), SAVE_PIN_NAME_BLOCKED);
+
+        // Renaming an existing field to PIN is the same collision.
+        let mut renamed = EditDraft::from_item(&card_item());
+        renamed.fields[0].name = "PIN".into();
+        assert_eq!(renamed.pin_name_fault(), Some(PIN_NAME_REFUSAL));
+
+        // Arrived as two PIN fields: the first is the card's PIN, the second
+        // is left as it is, and neither is refused.
+        let mut twice = card_item();
+        twice.fields.push(typed_field("PIN", "1234", 1));
+        twice.fields.push(typed_field("pin", "5678", 1));
+        assert_eq!(EditDraft::from_item(&twice).pin_name_fault(), None);
+
+        // Not a card: a field called PIN is an ordinary field.
+        let mut login = card_item();
+        login.item_type = Some(1);
+        let mut on_login = EditDraft::from_item(&login);
+        on_login.fields.push(FieldDraft::new_of(FieldRole::Text));
+        on_login.fields.last_mut().unwrap().name = "PIN".into();
+        assert_eq!(on_login.pin_name_fault(), None);
     }
 
     /// **An empty month, year, code, PIN or ZIP saves nothing** for that
