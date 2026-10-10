@@ -3384,8 +3384,8 @@ pub fn build_frame_with_search(
         // too -- the badge = list rule: a dot with no line under it cannot
         // happen. There are no invitation rows: an invitation is accepted
         // from its link (Paste an invite link) or in the web vault.
-        let waiting_from: Vec<String> =
-            sharing.view.as_ref().map(|v| v.waiting.iter().map(share_ui::waiting_from).collect()).unwrap_or_default();
+        let waiting_from: Vec<crate::rest::sharing::WaitingEntry> =
+            sharing.view.as_ref().map(|v| v.waiting.clone()).unwrap_or_default();
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -5338,7 +5338,14 @@ pub fn build_frame_with_search(
                                 // the sharer leaves the vault, so the
                                 // question after the panels asks first.
                                 DetailAction::StopReceiving(org) => {
-                                    let from = sharing.view.as_ref().and_then(|v| v.received_from(&item.id)).unwrap_or_default().to_string();
+                                    // Named as the waiting line names them:
+                                    // "(unverified)" where the sharer is the
+                                    // org's own title (fix round 1, m9).
+                                    let from = sharing
+                                        .view
+                                        .as_ref()
+                                        .and_then(|v| v.received_from(&item.id).map(|from| share_ui::named_sharer(from, v.received_verified(&item.id))))
+                                        .unwrap_or_default();
                                     leave_ask = Some((org, from, item.id.clone()));
                                 }
                                 // **4a.** The draft is built HERE, from the

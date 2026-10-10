@@ -10832,10 +10832,22 @@ const UNFILE_REFUSAL: &str =
 /// only report. See [`OWNER_HINT`], which is the sentence the box carries so
 /// the read-only state has a reason on it rather than being a greyed field
 /// the user pokes at.
-fn owner_field(ui: &mut egui::Ui, owner: &str) {
+fn owner_field(ui: &mut egui::Ui, owner: &str, hint: &str) {
     let rect = theme::section_disabled_text_field(ui, owner);
     ui.interact(rect, ui.id().with("owner"), egui::Sense::hover())
-        .on_hover_text(OWNER_HINT);
+        .on_hover_text(hint);
+}
+
+/// The `Owner` cell's hover: [`OWNER_HINT`], led by the spec's own words
+/// where the cell says "unverified" -- every place the mark is drawn says
+/// why (official-path spec §4.3, fix round 1, m7).
+fn owner_hint(audience: &crate::rest::organizations::Audience) -> String {
+    match audience {
+        crate::rest::organizations::Audience::SharedWithMe { verified: false, .. } => {
+            format!("{}\n\n{OWNER_HINT}", crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP)
+        }
+        _ => OWNER_HINT.to_string(),
+    }
 }
 
 /// 8a's `Copy`, and the read pane's own word for the same act.
@@ -11870,6 +11882,7 @@ pub fn draw_detail_edit(
                 // is the stacked rows this card already shipped.
                 let grid = theme::section_grid_fits_at(ui.available_width());
                 let owner = owner_line(audience);
+                let owner_hint = owner_hint(audience);
                 if grid {
                     ui.scope(|ui| {
                         ui.spacing_mut().item_spacing.x = theme::SECTION_GRID_GAP;
@@ -11878,7 +11891,7 @@ pub fn draw_detail_edit(
                                 folder_combo(ui, draft, folders, may_unfile);
                             });
                             theme::section_grid_cell(&mut cols[1], ITEM_OWNER_LABEL, |ui| {
-                                owner_field(ui, &owner);
+                                owner_field(ui, &owner, &owner_hint);
                             });
                             theme::section_grid_cell(&mut cols[2], ITEM_TYPE_LABEL, |ui| {
                                 theme::section_disabled_text_field(ui, kind_noun(kind));
@@ -11909,7 +11922,7 @@ pub fn draw_detail_edit(
                     }
                 });
                 theme::section_row(ui, ITEM_OWNER_LABEL, |ui| {
-                    owner_field(ui, &owner);
+                    owner_field(ui, &owner, &owner_hint);
                 });
                 theme::section_row(ui, ITEM_TYPE_LABEL, |ui| {
                     theme::section_disabled_text_field(ui, kind_noun(kind));
@@ -28486,6 +28499,23 @@ mod edit_pane_layout_tests {
 
         // A personal item draws no card at all.
         assert_eq!(sharing_line(&Audience::Personal), None);
+    }
+
+    /// **The `Owner` cell says "unverified", and why, where the sharer is
+    /// only the org's own title** (official-path spec §4.3, fix round 1,
+    /// m7): its hover leads with the spec's tooltip. A verified sharer's
+    /// cell, and every other, keeps the plain hint.
+    #[test]
+    fn an_unverified_owner_cell_says_so_and_why() {
+        use crate::rest::organizations::Audience;
+        let claimed = Audience::SharedWithMe { from: "boss@x.io".into(), verified: false };
+        let attested = Audience::SharedWithMe { from: "boss@x.io".into(), verified: true };
+        assert_eq!(owner_line(&claimed), "Shared by boss@x.io \u{b7} unverified");
+        assert_eq!(owner_line(&attested), "Shared by boss@x.io");
+        assert!(owner_hint(&claimed).starts_with(crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP));
+        assert!(owner_hint(&claimed).ends_with(OWNER_HINT));
+        assert_eq!(owner_hint(&attested), OWNER_HINT);
+        assert_eq!(owner_hint(&Audience::Personal), OWNER_HINT);
     }
 
     /// **The section rail is gone, and nothing draws it again by accident.**

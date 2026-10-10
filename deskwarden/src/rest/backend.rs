@@ -607,7 +607,7 @@ impl RestBackend {
 
         // Read before the session lock: the sharing engine's lock is never
         // taken while the session's is held.
-        let ask_received_rosters = self.sharing.roster_readable() != Some(false);
+        let mut received_rosters = self.sharing.received_rosters();
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
         log::info!(
@@ -661,18 +661,28 @@ impl RestBackend {
             &response,
             &keys,
         );
+        drop(state);
+        // **This PC's own sharing org is never received** (fix round 1,
+        // m11): the org it made or the user adopted comes out of the received
+        // set before any roster is asked, so neither the owner line nor
+        // Shared with me says "Shared by" of it. A file read, so with the
+        // session unlocked.
+        let account_email = profile.email.clone().unwrap_or_default();
+        if let Some(own) = self.sharing.own_org_pin(profile) {
+            directory.not_received(&own);
+        }
         // **Who shares each received record, on the server's word where it
         // gives one** (official-path spec §4.3): the received sharing orgs'
-        // `mini-details`, asked until the server says members may not read
-        // them. It never says otherwise this session, so the engine keeps the
-        // answer and later whole reads ask nothing.
-        let roster_readable = if ask_received_rosters {
-            directory.attest_received(&self.client, &mut state.session)
-        } else {
-            None
-        };
-        drop(state);
-        self.sharing.note_roster_readable(roster_readable);
+        // `mini-details`. Each answered org is asked once a session, and a
+        // server that refuses a member before any has answered is asked
+        // nothing more; the engine keeps both between whole reads
+        // (`Directory::attest_received`). The session is locked again for
+        // these requests alone.
+        {
+            let mut state = self.locked();
+            directory.attest_received(&self.client, &mut state.session, &account_email, &mut received_rosters);
+        }
+        self.sharing.note_received_rosters(received_rosters);
         // The sharing engine takes what this read already paid for -- its
         // org's roster and person collections -- so its confirm pass asks the
         // server for no roster of its own (spec 11.5). **After** the session

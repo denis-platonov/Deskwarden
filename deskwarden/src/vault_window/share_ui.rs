@@ -2682,12 +2682,13 @@ pub struct PeopleRows<'a> {
     /// [`draw_paste_and_waiting`] puts it first in Shared with me.
     pub(crate) paste: Option<Zeroizing<String>>,
     /// **The sharers this account accepted and who have not finished yet**
-    /// -- the view's `waiting`, by the sharer's address ([`waiting_from`]:
-    /// with `(unverified)` where it is the org name's claim). Each is one quiet
-    /// [`waiting_line`] under the paste box: an accepted sharing org shows
-    /// its member nothing until the sharer's daemon confirms them, and
-    /// without the line an accept would look like it did nothing.
-    pub(crate) waiting: &'a [String],
+    /// -- the view's `waiting`, each named by [`waiting_from`]: with
+    /// `(unverified)`, and the spec's tooltip, where the sharer is the org
+    /// name's claim. Each is one quiet [`waiting_line`] under the paste box:
+    /// an accepted sharing org shows its member nothing until the sharer's
+    /// daemon confirms them, and without the line an accept would look like
+    /// it did nothing.
+    pub(crate) waiting: &'a [crate::rest::sharing::WaitingEntry],
     /// **A sharing write is out** ([`SharingPane::is_busy`]): Paste's Accept
     /// is drawn greyed and senses nothing, rather than being pressed only for
     /// [`request`] to refuse it with [`BUSY`].
@@ -2766,6 +2767,9 @@ pub(crate) struct ReceivedShareRow {
     /// The sharer is the server's word (official-path spec §4.3); `false`
     /// draws "unverified" in the row's subtitle ([`received_subtitle`]).
     pub(crate) verified: bool,
+    /// The sharing org it is in: [`draw_received_group`] draws a hairline
+    /// where one org's records end and the next's begin (fix round 1, m8).
+    pub(crate) organization_id: String,
 }
 
 /// A received row's subtitle: who shares it and that it is view-only, with
@@ -2813,6 +2817,7 @@ pub(crate) fn received_share_rows(view: Option<&SharingView>, items: &[VaultItem
                 name: item.name.clone(),
                 from: r.from.clone(),
                 verified: r.verified,
+                organization_id: r.organization_id.clone(),
             },
         ));
     }
@@ -2865,7 +2870,19 @@ pub(crate) fn draw_received_group(
     }
     let mut action = None;
     group_eyebrow(ui, width, FROM_PEOPLE_EYEBROW);
+    let mut group: Option<&str> = None;
     for row in people.received {
+        // **One organisation's records end where a hairline is** (fix round
+        // 1, m8): two orgs that claim one sharer read as two groups, not as
+        // one sharer's. Painted in the row gap above the next group's first
+        // row, so it takes no height and `send_ui`'s measured list is
+        // unchanged.
+        if group.is_some_and(|org| org != row.organization_id) {
+            let y = ui.cursor().top() - ui.spacing().item_spacing.y / 2.0;
+            let left = ui.cursor().left() + GROUP_EYEBROW_INSET;
+            ui.painter().hline(left..=left + (width - GROUP_EYEBROW_INSET * 2.0).max(0.0), y, egui::Stroke::new(1.0, theme::HAIRLINE));
+        }
+        group = Some(&row.organization_id);
         let clicked = crate::vault_window::send_ui::draw_person_row(
             ui,
             crate::vault_window::send_ui::PersonRow {
@@ -2874,6 +2891,9 @@ pub(crate) fn draw_received_group(
                 name: &row.name,
                 subtitle: &received_subtitle(row),
                 pill: None,
+                // The spec's words for why, wherever "unverified" is said
+                // (fix round 1, m7).
+                hover: (!row.verified).then_some(crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP),
             },
             width,
             height,
@@ -2926,10 +2946,17 @@ pub(crate) fn waiting_line(from: &str) -> String {
 /// arrived (`received_subtitle`). Parenthesised, not a `·` run, because it
 /// sits inside the line's sentence.
 pub(crate) fn waiting_from(entry: &crate::rest::sharing::WaitingEntry) -> String {
-    if entry.verified {
-        entry.from.clone()
+    named_sharer(&entry.from, entry.verified)
+}
+
+/// A sharer named inside a sentence: `from`, with `(unverified)` after it
+/// where it is only the org name's claim -- the waiting line's form, and
+/// "Stop receiving from X?"'s (fix round 1, m9).
+pub(crate) fn named_sharer(from: &str, verified: bool) -> String {
+    if verified {
+        from.to_string()
     } else {
-        format!("{} (unverified)", entry.from)
+        format!("{from} (unverified)")
     }
 }
 
@@ -2969,18 +2996,23 @@ pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<
             people.asked = Some(PeopleAsk::AcceptLink);
         }
     }
-    for from in people.waiting {
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(width, WAITING_LINE_HEIGHT), egui::Sense::hover());
+    for entry in people.waiting {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(width, WAITING_LINE_HEIGHT), egui::Sense::hover());
         let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
         let galley = one_line(
             &painter,
-            &waiting_line(from),
+            &waiting_line(&waiting_from(entry)),
             egui::FontId::new(WAITING_LINE_SIZE, egui::FontFamily::Proportional),
             theme::TEXT_FAINT,
             width - GROUP_EYEBROW_INSET * 2.0,
         );
         let y = rect.center().y - galley.size().y / 2.0;
         painter.galley(egui::pos2(rect.left() + GROUP_EYEBROW_INSET, y), galley, theme::TEXT_FAINT);
+        // The spec's own words for why, wherever "unverified" is said (fix
+        // round 1, m7).
+        if !entry.verified {
+            let _ = response.on_hover_text(crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP);
+        }
     }
 }
 
@@ -4650,7 +4682,7 @@ mod tests {
     #[test]
     fn shared_with_me_lists_received_records_from_people_and_opens_them() {
         use crate::vault_window::send_ui::{RecordTiles, SendUiAction};
-        let received = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }];
+        let received = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
         let mut people = PeopleRows { received: &received, ..PeopleRows::none() };
         let mut selected = None;
         let texts = ui_frame(400.0, Vec::new(), |ui| {
@@ -4693,7 +4725,7 @@ mod tests {
         let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "r9", "name": "Acme VPN" })).expect("item")];
         assert_eq!(
             received_share_rows(Some(&v), &items),
-            vec![ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }]
+            vec![ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }]
         );
         assert!(received_share_rows(None, &items).is_empty());
     }
@@ -4722,7 +4754,7 @@ mod tests {
     /// with no box and nobody waited on, nothing is drawn at all.
     #[test]
     fn a_sharer_being_waited_on_is_one_line_and_nothing_is_drawn_without_one() {
-        let waiting = ["denis@x.io".to_string()];
+        let waiting = [crate::rest::sharing::WaitingEntry { organization_id: "org-x".into(), from: "denis@x.io".into(), verified: true }];
         let mut people = PeopleRows { waiting: &waiting, ..PeopleRows::none() };
         let texts = ui_frame(400.0, Vec::new(), |ui| draw_paste_and_waiting(ui, &mut people, 376.0));
         assert_eq!(texts.iter().map(|(t, _)| t.as_str()).collect::<Vec<_>>(), ["Waiting for denis@x.io to finish sharing"]);
@@ -4765,6 +4797,51 @@ mod tests {
         };
         assert_eq!(waiting_line(&waiting_from(&entry(true))), "Waiting for boss@x.io to finish sharing");
         assert_eq!(waiting_line(&waiting_from(&entry(false))), "Waiting for boss@x.io (unverified) to finish sharing");
+        // "Stop receiving from X?" names them the same way (fix round 1, m9).
+        assert_eq!(stop_receiving_title(&named_sharer("boss@x.io", false)), "Stop receiving from boss@x.io (unverified)?");
+        assert_eq!(stop_receiving_title(&named_sharer("boss@x.io", true)), "Stop receiving from boss@x.io?");
+    }
+
+    /// **Each organisation's received records end at a hairline** (fix round
+    /// 1, m8): two orgs that claim one sharer are told apart on screen, and
+    /// one org's records are not split. Drawn in the row gap, so it adds no
+    /// height.
+    #[test]
+    fn a_hairline_parts_one_organisations_received_records_from_the_next() {
+        use crate::vault_window::send_ui::RecordTiles;
+        fn hairlines(shape: &egui::Shape) -> usize {
+            match shape {
+                egui::Shape::Vec(shapes) => shapes.iter().map(hairlines).sum(),
+                egui::Shape::LineSegment { stroke, .. } if stroke.color == theme::HAIRLINE => 1,
+                _ => 0,
+            }
+        }
+        let row = |id: &str, org: &str| ReceivedShareRow {
+            key: format!("recv:{id}"),
+            item_id: id.into(),
+            name: id.into(),
+            from: "boss@x.io".into(),
+            verified: false,
+            organization_id: org.into(),
+        };
+        let drawn = |rows: &[ReceivedShareRow]| {
+            let ctx = egui::Context::default();
+            let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+            theme::apply(&ctx);
+            let mut height = 0.0;
+            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                let top = ui.cursor().top();
+                let mut people = PeopleRows { received: rows, ..PeopleRows::none() };
+                let _ = draw_received_group(ui, &mut people, 376.0, 62.0, &mut None, RecordTiles::default());
+                height = ui.cursor().top() - top;
+            });
+            (output.shapes.iter().map(|c| hairlines(&c.shape)).sum::<usize>(), height)
+        };
+        let (one_org, one_height) = drawn(&[row("a", "org-1"), row("b", "org-1")]);
+        let (two_orgs, two_height) = drawn(&[row("a", "org-1"), row("b", "org-2")]);
+        assert_eq!(two_orgs, one_org + 1, "one hairline between the two orgs");
+        assert!((two_height - one_height).abs() < f32::EPSILON, "it takes no height");
     }
 
     /// **"Stop receiving from X?"** names the sharer and what goes, and
@@ -4909,7 +4986,7 @@ mod tests {
     /// is the list's to add.
     #[test]
     fn the_paste_and_waiting_height_counts_the_gaps_between_its_rows() {
-        let waiting = ["e@x.io".to_string()];
+        let waiting = [crate::rest::sharing::WaitingEntry { organization_id: "org-x".into(), from: "e@x.io".into(), verified: true }];
         let one = PeopleRows { paste: Some(Zeroizing::new(String::new())), ..PeopleRows::none() };
         assert!((paste_and_waiting_height(&one, 6.0) - PASTE_ROW_HEIGHT).abs() < f32::EPSILON);
         let two = PeopleRows { paste: Some(Zeroizing::new(String::new())), waiting: &waiting, ..PeopleRows::none() };

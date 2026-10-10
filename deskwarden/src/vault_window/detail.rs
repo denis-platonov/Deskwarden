@@ -1031,9 +1031,22 @@ pub enum DetailAction {
 /// place of the entries a view-only record does not have. It names the
 /// sharer as the view names them, which is display and nothing more (see
 /// `share_ui::ReceivedShareRow::from`).
+///
+/// **`unverified` says nothing it cannot back** (official-path spec §4.3,
+/// fix round 1, I1): where the sharer is only the organisation name's claim,
+/// "Shared by X ... Only they can edit" would assert an owner the server
+/// never named -- false outright for a planted org. So the line says it was
+/// shared with you, and whose title the name is.
 #[must_use]
-pub fn view_only_footer(from: &str) -> String {
-    format!("Shared by {from}, view-only. Only they can edit or delete it.")
+pub fn view_only_footer(from: &str, unverified: bool) -> String {
+    if unverified {
+        format!(
+            "Shared with you, view-only. The server does not say who owns it; the name \u{201c}{from}\u{201d} comes from \
+             the organisation's own title."
+        )
+    } else {
+        format!("Shared by {from}, view-only. Only they can edit or delete it.")
+    }
 }
 
 /// **The received record's subtitle run** (mock 6d): who shares it and that
@@ -1053,10 +1066,16 @@ pub fn shared_by_line(from: &str, unverified: bool) -> String {
 pub const UNVERIFIED_SHARER_TOOLTIP: &str =
     "This server does not say who owns the organisation. The name comes from the organisation's own title.";
 
-/// The received record's kebab entry that leaves its sharer's org.
+/// The received record's kebab entry that leaves its sharer's org --
+/// `(unverified)` after the name where it is only the org's own title, as
+/// the waiting line says it (`share_ui::waiting_from`; fix round 1, m9).
 #[must_use]
-pub fn stop_receiving_label(from: &str) -> String {
-    format!("Stop receiving from {from}")
+pub fn stop_receiving_label(from: &str, unverified: bool) -> String {
+    if unverified {
+        format!("Stop receiving from {from} (unverified)")
+    } else {
+        format!("Stop receiving from {from}")
+    }
 }
 
 /// [`view_only_footer`] where no sharer is known: an `edit: false` item the
@@ -4013,7 +4032,9 @@ pub fn draw_detail_read(
                     // view-only, and says so without a name
                     // ([`VIEW_ONLY_FOOTER`]).
                     if !writable {
-                        let footer = people.view_only_from.map_or_else(|| VIEW_ONLY_FOOTER.to_string(), view_only_footer);
+                        let footer = people
+                            .view_only_from
+                            .map_or_else(|| VIEW_ONLY_FOOTER.to_string(), |from| view_only_footer(from, people.view_only_unverified));
                         ui.set_width(VIEW_ONLY_MENU_WIDTH);
                         // **Stop receiving (spec 6.9), the one entry**, and
                         // only on a record the view names a sharer for and
@@ -4024,7 +4045,7 @@ pub fn draw_detail_read(
                         if let (Some(from), Some(org)) =
                             (people.view_only_from, crate::rest::organizations::organization_of(item))
                         {
-                            if ui.button(stop_receiving_label(from)).clicked() {
+                            if ui.button(stop_receiving_label(from, people.view_only_unverified)).clicked() {
                                 action = DetailAction::StopReceiving(org.to_string());
                                 ui.close();
                             }
@@ -18837,6 +18858,32 @@ mod tests {
         );
     }
 
+    /// **An unverified sharer's kebab claims no owner** (fix round 1, I1 and
+    /// m9): the footer says it was shared with you and whose title the name
+    /// is -- not "Only they can edit", false for a planted org -- and Stop
+    /// receiving says "(unverified)". A verified sharer's read as before.
+    #[test]
+    fn an_unverified_sharers_kebab_claims_no_owner() {
+        let mut item = a_login();
+        item.other.insert("organizationId".into(), serde_json::json!("org-boss"));
+        let mut pane = Pane::new().view_only("boss@corp.example").unverified();
+        let open = pane.open_kebab(&item, &TotpState::NoSecret);
+        let painted = open.strings();
+        let footer = view_only_footer("boss@corp.example", true);
+        assert_eq!(
+            footer,
+            "Shared with you, view-only. The server does not say who owns it; the name \u{201c}boss@corp.example\u{201d} \
+             comes from the organisation's own title."
+        );
+        assert!(painted.iter().any(|s| *s == footer), "{painted:?}");
+        assert!(!painted.iter().any(|s| s.contains("Only they")), "{painted:?}");
+        let stop = stop_receiving_label("boss@corp.example", true);
+        assert_eq!(stop, "Stop receiving from boss@corp.example (unverified)");
+        assert!(painted.iter().any(|s| *s == stop), "{painted:?}");
+        assert_eq!(view_only_footer("d@x.io", false), "Shared by d@x.io, view-only. Only they can edit or delete it.");
+        assert_eq!(stop_receiving_label("d@x.io", false), "Stop receiving from d@x.io");
+    }
+
     /// **Mock 6d's ⋮, open**: the one line saying why, and not one entry
     /// that writes -- no Edit, no Clone, no Delete, and (the owner's call,
     /// since NodeWarden refuses every write on a view-only collection) no
@@ -18848,10 +18895,10 @@ mod tests {
         let open = pane.open_kebab(&item, &TotpState::NoSecret);
         let painted = open.strings();
         assert!(
-            painted.iter().any(|s| *s == view_only_footer("denis@x.io")),
+            painted.iter().any(|s| *s == view_only_footer("denis@x.io", false)),
             "the view-only kebab does not say why it is empty: {painted:?}"
         );
-        assert_eq!(view_only_footer("denis@x.io"), "Shared by denis@x.io, view-only. Only they can edit or delete it.");
+        assert_eq!(view_only_footer("denis@x.io", false), "Shared by denis@x.io, view-only. Only they can edit or delete it.");
         for writer in ["Edit", "Clone", crate::vault_window::item_list::DELETE_LABEL, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
             assert!(!painted.iter().any(|s| *s == writer), "a received record's kebab offers {writer:?}: {painted:?}");
         }
@@ -18867,8 +18914,8 @@ mod tests {
         item.other.insert("organizationId".into(), serde_json::json!("org-denis"));
         let mut pane = Pane::new().view_only("denis@x.io");
         let open = pane.open_kebab(&item, &TotpState::NoSecret);
-        let entry = open.rect_of(&stop_receiving_label("denis@x.io"));
-        assert_eq!(stop_receiving_label("denis@x.io"), "Stop receiving from denis@x.io");
+        let entry = open.rect_of(&stop_receiving_label("denis@x.io", false));
+        assert_eq!(stop_receiving_label("denis@x.io", false), "Stop receiving from denis@x.io");
         let pressed = pane.click(&item, &TotpState::NoSecret, entry.center());
         assert_eq!(pressed.action, DetailAction::StopReceiving("org-denis".into()));
         assert_eq!(view_only(DetailAction::StopReceiving("org-denis".into())), DetailAction::StopReceiving("org-denis".into()));

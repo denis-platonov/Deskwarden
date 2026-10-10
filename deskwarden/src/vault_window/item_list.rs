@@ -2169,13 +2169,7 @@ impl RowPeople {
                 .filter(|r| view.shared_with_someone(&r.item_id))
                 .map(|r| r.item_id.clone())
                 .collect(),
-            // An unverified sharer says so here too (official-path spec
-            // §4.3): the row's "from" is the org name's claim alone.
-            received: view
-                .received
-                .iter()
-                .map(|r| (r.item_id.clone(), if r.verified { r.from.clone() } else { format!("{} \u{b7} unverified", r.from) }))
-                .collect(),
+            received: view.received.iter().map(|r| (r.item_id.clone(), r.from.clone())).collect(),
         }
     }
 

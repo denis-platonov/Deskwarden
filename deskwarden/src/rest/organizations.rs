@@ -794,48 +794,130 @@ impl Directory {
     /// (`[Authorize<MemberOrProviderRequirement>]`). There the sharer is the
     /// org's one confirmed owner -- whatever the name claims, so a forged
     /// "Shared by boss@" says who really owns it -- and the org is marked
-    /// verified. Two owners, or none, leave the name's claim, unverified.
+    /// verified. Anything else leaves the name's claim, unverified:
     ///
-    /// Vaultwarden and NodeWarden answer a plain member 404 (or 403). The
-    /// first such answer ends the asking: no other org on that server will
-    /// answer differently, and each would cost a request on every whole
-    /// read. Their orgs keep the name's claim, unverified.
+    /// - two confirmed owners, or none -- counted BEFORE an email is looked
+    ///   at, so a blank-email second owner cannot make the other "the one"
+    ///   (fix round 1, m4);
+    /// - an owner row with no `status` at all: only an explicit 2 is
+    ///   confirmed here ([`confirmed_owner_emails`]);
+    /// - the one owner being this account itself: an org it owns is not one
+    ///   someone else shares with it (fix round 1, m5).
     ///
-    /// Returns what was learned for the session: `Some(true)` a roster was
-    /// read, `Some(false)` members may not read one here, `None` nothing to
-    /// ask or every ask failed some other way (a transport error says
-    /// nothing about the server's rule).
-    /// `a_received_orgs_sharer_is_read_off_a_roster_a_member_may_read` holds
-    /// this.
-    pub fn attest_received(&mut self, client: &RestClient, session: &mut Session) -> Option<bool> {
+    /// Vaultwarden and NodeWarden answer a plain member 404 (or 403). That
+    /// answer, before any roster has answered this session, ends the asking:
+    /// no other org on that server will answer differently, and each would
+    /// cost a request on every whole read. **After** a roster has answered,
+    /// a 404 or 403 is about that one org -- deleted, or this account no
+    /// longer in it -- which stays unverified while the rest are still asked
+    /// (fix round 1, m3).
+    ///
+    /// **Each answered roster is asked once a session** (fix round 1, m12):
+    /// `rosters.owners` keeps its answer by org id, and a later read applies
+    /// it without a request. An org that has left the received set is
+    /// dropped from it, so one that comes back is asked again. A request
+    /// that failed any other way is not kept and is asked again next read.
+    ///
+    /// `a_received_orgs_sharer_is_read_off_a_roster_a_member_may_read` and
+    /// its neighbours hold this.
+    pub fn attest_received(&mut self, client: &RestClient, session: &mut Session, account_email: &str, rosters: &mut ReceivedRosters) {
         let received: Vec<String> = self
             .organisations
             .iter()
             .filter(|o| o.sharing.as_ref().is_some_and(|s| !s.mine))
             .map(|o| o.id.clone())
             .collect();
-        let mut learned = None;
+        rosters.owners.retain(|id, _| received.contains(id));
+        let account = normalise_email(account_email);
         for id in received {
-            match client.fetch_organization_mini_details(session, &id) {
-                Ok(answer) => {
-                    learned = Some(true);
-                    let Some(members) = map_members(&answer) else {
-                        continue;
-                    };
-                    let owners: Vec<&Member> = members
-                        .iter()
-                        .filter(|m| m.role == "owner" && m.status == MemberStatus::Confirmed && !m.email.trim().is_empty())
-                        .collect();
-                    if let ([owner], Some(org)) = (owners.as_slice(), self.organisations.iter_mut().find(|o| o.id == id)) {
-                        org.sharing = Some(SharingOrg { sharer: normalise_email(&owner.email), mine: false, verified: true });
+            let owner = match rosters.owners.get(&id) {
+                Some(answered) => answered.clone(),
+                None if rosters.readable == Some(false) => None,
+                None => match client.fetch_organization_mini_details(session, &id) {
+                    Ok(answer) => match confirmed_owner_emails(&answer) {
+                        Some(owners) => {
+                            rosters.readable = Some(true);
+                            let owner = the_one_owner(&owners, &account);
+                            rosters.owners.insert(id.clone(), owner.clone());
+                            owner
+                        }
+                        None => None,
+                    },
+                    Err(RestError::Status(403 | 404)) if rosters.readable != Some(true) => {
+                        rosters.readable = Some(false);
+                        None
                     }
-                }
-                Err(RestError::Status(403 | 404)) => return Some(false),
-                Err(_) => {}
+                    Err(_) => None,
+                },
+            };
+            if let (Some(owner), Some(org)) = (owner, self.organisations.iter_mut().find(|o| o.id == id)) {
+                org.sharing = Some(SharingOrg { sharer: owner, mine: false, verified: true });
             }
         }
-        learned
     }
+
+    /// **This account's own sharing org is never received from anyone**
+    /// (DW1 review, M3; fix round 1, m11). `organization_id` is the org this
+    /// PC made or the user adopted (`Sharing::own_org_pin`): if the profile
+    /// now lists it in a received org's shape -- renamed for someone else,
+    /// this account no longer its owner -- it is drawn as the ordinary
+    /// organisation it is, so [`Self::audience_of`] never says "Shared by"
+    /// of it, and it is never waited on. Its own mark is left alone.
+    pub fn not_received(&mut self, organization_id: &str) {
+        for org in self.organisations.iter_mut().filter(|o| o.id == organization_id) {
+            if org.sharing.as_ref().is_some_and(|s| !s.mine) {
+                org.sharing = None;
+            }
+        }
+        self.waiting.retain(|o| o.id != organization_id);
+    }
+}
+
+/// **What this session has learned about received orgs' rosters**
+/// ([`Directory::attest_received`]), kept by the sharing engine between whole
+/// reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReceivedRosters {
+    /// `Some(true)`: a member-readable roster has answered here.
+    /// `Some(false)`: a member was refused before any answered, so this
+    /// server keeps rosters to managers and nothing more is asked. `None`:
+    /// nothing learned yet.
+    pub readable: Option<bool>,
+    /// By org id, an answered roster's word: its one confirmed owner, or
+    /// `None` where it named no single owner (left unverified).
+    pub owners: std::collections::BTreeMap<String, Option<String>>,
+}
+
+/// The emails of a roster answer's **confirmed** owners, blank ones
+/// included so they are counted. `None` for an answer that is not a roster.
+///
+/// Only a row that says `status: 2` is confirmed here. [`map_member`] reads
+/// a missing status as confirmed, which is right for counting who can see an
+/// item and wrong for naming who owns an organisation: an owner row with no
+/// status is not the server saying it holds the org key (fix round 1, m4).
+fn confirmed_owner_emails(answer: &Value) -> Option<Vec<String>> {
+    let rows = match answer.get("data") {
+        Some(Value::Array(rows)) => rows,
+        _ => answer.as_array()?,
+    };
+    Some(
+        rows.iter()
+            .filter(|row| row.get("status").and_then(Value::as_i64) == Some(2))
+            .filter_map(map_member)
+            .filter(|m| m.role == "owner")
+            .map(|m| m.email)
+            .collect(),
+    )
+}
+
+/// The sharer a roster names: its one confirmed owner, when there is exactly
+/// one, with an email, and it is not this account.
+fn the_one_owner(owners: &[String], account: &str) -> Option<String> {
+    let [owner] = owners else {
+        return None;
+    };
+    let owner = normalise_email(owner);
+    (!owner.is_empty() && owner != account).then_some(owner)
 }
 
 /// The organisation that owns this item, or `None` for a personal one.
@@ -1908,59 +1990,240 @@ mod tests {
         );
     }
 
-    /// **A received sharing org's sharer is the server's word where it gives
-    /// one** (official-path spec §4.3). Official Bitwarden lets a member read
-    /// `mini-details`, and the sharer becomes the org's one confirmed owner --
-    /// a forged "Shared by boss@" says who really owns it -- marked verified;
-    /// two owners leave the name's claim. A server that answers a member 404
-    /// ends the asking, and its orgs keep the claim, unverified.
-    #[test]
-    fn a_received_orgs_sharer_is_read_off_a_roster_a_member_may_read() {
+    /// A signed-in client on a server of its own, for the received-roster
+    /// tests: a fresh server per half, so an `expect(0)` is never satisfied
+    /// by a mock an earlier half left behind.
+    fn received_client() -> (crate::test_http::MockServer, RestClient, crate::rest::api::Session) {
         let mut server = crate::test_http::server();
         server.mock("POST", "/identity/connect/token")
             .with_body(r#"{"access_token":"AT-1","expires_in":3600,"refresh_token":"RT-1","token_type":"Bearer"}"#)
             .create();
         let client = RestClient::new(server.url());
         let device = Device::windows_desktop("11111111-2222-3333-4444-555555555555", "TEST-PC");
-        let mut session = client.password_grant("a@b.c", "HASH", &device).expect("grant");
+        let session = client.password_grant("a@b.c", "HASH", &device).expect("grant");
+        (server, client, session)
+    }
+
+    /// The account the received-roster tests read as.
+    const ME: &str = "denis@example.com";
+
+    /// A whole read listing `ids` as received sharing orgs, each named
+    /// "Shared by boss@corp.example".
+    fn received_directory(ids: &[&str]) -> Directory {
+        let orgs: Vec<Value> =
+            ids.iter().map(|id| json!({ "id": id, "name": "Shared by boss@corp.example", "type": 2, "key": "4.zzz" })).collect();
         let response: SyncResponse = serde_json::from_value(json!({
-            "profile": { "key": "2.aaa|bbb|ccc", "email": "denis@example.com", "organizations": [
-                { "id": "forged", "name": "Shared by boss@corp.example", "type": 2, "key": "4.zzz" },
-                { "id": "shared", "name": "Shared by anna@example.com", "type": 2, "key": "4.zzz" }
-            ]},
+            "profile": { "key": "2.aaa|bbb|ccc", "email": ME, "organizations": orgs },
             "ciphers": [], "folders": [], "collections": []
-        })).expect("parses");
-        let row = |id: &str, email: &str, kind: i64| json!({ "id": id, "userId": id, "email": email, "type": kind, "status": 2 });
+        }))
+        .expect("parses");
+        Directory::from_sync(&response, &keys())
+    }
+
+    /// One `mini-details` row: `kind` 0 is owner, 2 member; `status` `None`
+    /// leaves the key out.
+    fn mini_row(id: &str, email: &str, kind: i64, status: Option<i64>) -> Value {
+        let mut row = json!({ "id": id, "userId": id, "email": email, "type": kind });
+        if let Some(status) = status {
+            row["status"] = json!(status);
+        }
+        row
+    }
+
+    /// `org`'s `mini-details`, answered with `rows`, asked exactly once.
+    fn mini_details(server: &mut crate::test_http::MockServer, org: &str, rows: &[Value]) -> crate::test_http::Mock {
         server
-            .mock("GET", "/api/organizations/forged/users/mini-details")
-            .with_body(json!({ "data": [row("m", "Mallory@Evil.example", 0), row("d", "denis@example.com", 2)] }).to_string())
+            .mock("GET", format!("/api/organizations/{org}/users/mini-details").as_str())
+            .with_body(json!({ "data": rows }).to_string())
             .expect(1)
-            .create();
-        server
-            .mock("GET", "/api/organizations/shared/users/mini-details")
-            .with_body(json!({ "data": [row("a", "anna@example.com", 0), row("o", "other@example.com", 0)] }).to_string())
-            .expect(1)
-            .create();
-        let mut directory = Directory::from_sync(&response, &keys());
-        assert_eq!(directory.attest_received(&client, &mut session), Some(true));
-        let sharing = |directory: &Directory, id: &str| directory.organisations().iter().find(|o| o.id == id).and_then(|o| o.sharing.clone());
+            .create()
+    }
+
+    fn sharing_of(directory: &Directory, id: &str) -> Option<SharingOrg> {
+        directory.organisations().iter().find(|o| o.id == id).and_then(|o| o.sharing.clone())
+    }
+
+    /// The name's claim, unverified -- what a roster that settles nothing
+    /// leaves.
+    fn claimed() -> Option<SharingOrg> {
+        Some(SharingOrg { sharer: "boss@corp.example".into(), mine: false, verified: false })
+    }
+
+    /// **A received sharing org's sharer is the server's word where it gives
+    /// one** (official-path spec §4.3). Official Bitwarden lets a member read
+    /// `mini-details`, and the sharer becomes the org's one confirmed owner --
+    /// a forged "Shared by boss@" says who really owns it -- marked verified;
+    /// two owners leave the name's claim. A server that answers a member 404
+    /// before any roster has answered ends the asking, and its orgs keep the
+    /// claim, unverified.
+    #[test]
+    fn a_received_orgs_sharer_is_read_off_a_roster_a_member_may_read() {
+        let (mut server, client, mut session) = received_client();
+        let forged = mini_details(&mut server, "forged", &[
+            mini_row("m", "Mallory@Evil.example", 0, Some(2)),
+            mini_row("d", ME, 2, Some(2)),
+        ]);
+        let shared = mini_details(&mut server, "shared", &[
+            mini_row("a", "boss@corp.example", 0, Some(2)),
+            mini_row("o", "other@example.com", 0, Some(2)),
+        ]);
+        let mut directory = received_directory(&["forged", "shared"]);
+        let mut rosters = ReceivedRosters::default();
+        directory.attest_received(&client, &mut session, ME, &mut rosters);
+        forged.assert();
+        shared.assert();
+        assert_eq!(rosters.readable, Some(true));
         assert_eq!(
-            sharing(&directory, "forged"),
+            sharing_of(&directory, "forged"),
             Some(SharingOrg { sharer: "mallory@evil.example".into(), mine: false, verified: true }),
             "the real owner, on the server's word"
         );
-        assert_eq!(
-            sharing(&directory, "shared"),
-            Some(SharingOrg { sharer: "anna@example.com".into(), mine: false, verified: false }),
-            "two owners: still only the name's claim"
-        );
+        assert_eq!(sharing_of(&directory, "shared"), claimed(), "two owners: still only the name's claim");
 
-        let mut hidden = Directory::from_sync(&response, &keys());
-        server.mock("GET", "/api/organizations/forged/users/mini-details").with_status(404).expect(1).create();
+        let (mut server, client, mut session) = received_client();
+        let refused = server.mock("GET", "/api/organizations/forged/users/mini-details").with_status(404).expect(1).create();
         let asked_again = server.mock("GET", "/api/organizations/shared/users/mini-details").expect(0).create();
-        assert_eq!(hidden.attest_received(&client, &mut session), Some(false));
+        let mut hidden = received_directory(&["forged", "shared"]);
+        let mut rosters = ReceivedRosters::default();
+        hidden.attest_received(&client, &mut session, ME, &mut rosters);
+        refused.assert();
         asked_again.assert();
-        assert_eq!(sharing(&hidden, "forged").map(|s| s.verified), Some(false));
+        assert_eq!(rosters.readable, Some(false));
+        assert_eq!(sharing_of(&hidden, "forged"), claimed());
+    }
+
+    /// **Only one confirmed owner, not this account, with an address, names
+    /// the sharer** (fix round 1, m4 and m5). No owner, an invited owner, a
+    /// revoked one, one whose row says no status, one this account is, and a
+    /// real owner beside a blank-email second one -- each leaves the claim.
+    #[test]
+    fn a_roster_that_names_no_single_confirmed_owner_leaves_the_claim() {
+        let member = mini_row("d", ME, 2, Some(2));
+        let cases: [(&str, Vec<Value>); 6] = [
+            ("no owner", vec![member.clone()]),
+            ("an invited owner", vec![mini_row("b", "boss@corp.example", 0, Some(0)), member.clone()]),
+            ("a revoked owner", vec![mini_row("b", "boss@corp.example", 0, Some(-1)), member.clone()]),
+            ("an owner with no status", vec![mini_row("b", "boss@corp.example", 0, None), member.clone()]),
+            ("this account the owner", vec![mini_row("d", " Denis@Example.com ", 0, Some(2))]),
+            ("a blank second owner", vec![mini_row("b", "boss@corp.example", 0, Some(2)), mini_row("x", "  ", 0, Some(2))]),
+        ];
+        for (case, rows) in cases {
+            let (mut server, client, mut session) = received_client();
+            let asked = mini_details(&mut server, "claimed", &rows);
+            let mut directory = received_directory(&["claimed"]);
+            let mut rosters = ReceivedRosters::default();
+            directory.attest_received(&client, &mut session, ME, &mut rosters);
+            asked.assert();
+            assert_eq!(sharing_of(&directory, "claimed"), claimed(), "{case}");
+            assert_eq!(rosters.readable, Some(true), "{case}: a roster answered");
+        }
+
+        // Control: the one confirmed owner, named, is the sharer.
+        let (mut server, client, mut session) = received_client();
+        let asked = mini_details(&mut server, "claimed", &[mini_row("b", "Boss@Corp.example", 0, Some(2)), member]);
+        let mut directory = received_directory(&["claimed"]);
+        directory.attest_received(&client, &mut session, ME, &mut ReceivedRosters::default());
+        asked.assert();
+        assert_eq!(sharing_of(&directory, "claimed").map(|s| s.verified), Some(true));
+    }
+
+    /// **A 403 before any roster has answered ends the asking, as a 404
+    /// does; after one has, it is about that org alone** (fix round 1, m3):
+    /// the org stays unverified and the others are still asked -- within a
+    /// read, and in a later read of a session that already learned rosters
+    /// are readable.
+    #[test]
+    fn a_refusal_ends_the_asking_only_before_any_roster_has_answered() {
+        let (mut server, client, mut session) = received_client();
+        let refused = server.mock("GET", "/api/organizations/a/users/mini-details").with_status(403).expect(1).create();
+        let not_asked = server.mock("GET", "/api/organizations/b/users/mini-details").expect(0).create();
+        let mut directory = received_directory(&["a", "b"]);
+        let mut rosters = ReceivedRosters::default();
+        directory.attest_received(&client, &mut session, ME, &mut rosters);
+        refused.assert();
+        not_asked.assert();
+        assert_eq!(rosters.readable, Some(false));
+
+        let owner = [mini_row("b", "boss@corp.example", 0, Some(2))];
+        let (mut server, client, mut session) = received_client();
+        let first = mini_details(&mut server, "a", &owner);
+        let gone = server.mock("GET", "/api/organizations/b/users/mini-details").with_status(404).expect(1).create();
+        let third = mini_details(&mut server, "c", &owner);
+        let mut directory = received_directory(&["a", "b", "c"]);
+        let mut rosters = ReceivedRosters::default();
+        directory.attest_received(&client, &mut session, ME, &mut rosters);
+        first.assert();
+        gone.assert();
+        third.assert();
+        assert_eq!(rosters.readable, Some(true), "one org's 404 after a roster answered turns nothing off");
+        assert_eq!(sharing_of(&directory, "b"), claimed());
+        assert_eq!(sharing_of(&directory, "c").map(|s| s.verified), Some(true), "the next org is still asked");
+
+        // A later read of the same session: its first org's 404 is that org's.
+        let (mut server, client, mut session) = received_client();
+        let gone = server.mock("GET", "/api/organizations/x/users/mini-details").with_status(404).expect(1).create();
+        let next = mini_details(&mut server, "y", &owner);
+        let mut directory = received_directory(&["x", "y"]);
+        let mut rosters = ReceivedRosters { readable: Some(true), ..ReceivedRosters::default() };
+        directory.attest_received(&client, &mut session, ME, &mut rosters);
+        gone.assert();
+        next.assert();
+        assert_eq!(rosters.readable, Some(true));
+    }
+
+    /// **An answered roster is asked once a session** (fix round 1, m12): a
+    /// second read applies the kept answer without a request; an org that
+    /// leaves the received set is forgotten, and asked again if it returns.
+    #[test]
+    fn an_answered_roster_is_asked_once_and_forgotten_when_its_org_leaves() {
+        let (mut server, client, mut session) = received_client();
+        let owner = [mini_row("b", "boss@corp.example", 0, Some(2))];
+        let once = mini_details(&mut server, "kept", &owner);
+        let mut rosters = ReceivedRosters::default();
+        for _ in 0..2 {
+            let mut directory = received_directory(&["kept"]);
+            directory.attest_received(&client, &mut session, ME, &mut rosters);
+            assert_eq!(sharing_of(&directory, "kept").map(|s| s.verified), Some(true));
+        }
+        once.assert();
+
+        let mut without = received_directory(&[]);
+        without.attest_received(&client, &mut session, ME, &mut rosters);
+        assert!(rosters.owners.is_empty(), "an org that left is forgotten: {rosters:?}");
+        let again = mini_details(&mut server, "kept", &owner);
+        received_directory(&["kept"]).attest_received(&client, &mut session, ME, &mut rosters);
+        again.assert();
+    }
+
+    /// **This account's own sharing org is never "Shared by" anyone**, even
+    /// when the profile lists it in a received org's shape (fix round 1,
+    /// m11): the org the engine pins is drawn as the organisation it is, in
+    /// the owner line and the rail, and is not waited on.
+    #[test]
+    fn the_pinned_org_is_never_received_in_the_directory() {
+        let response: SyncResponse = serde_json::from_value(json!({
+            "profile": {
+                "key": "2.aaa|bbb|ccc",
+                "email": ME,
+                "organizations": [ { "id": "pinned", "name": "Shared by boss@corp.example", "type": 2, "key": "4.zzz" } ],
+                "organizationsNew": [
+                    { "id": "pinned", "name": "Shared by boss@corp.example", "type": 2, "status": 2 },
+                    { "id": "pinned-waiting", "name": "Shared by boss@corp.example", "type": 2, "status": 1 }
+                ]
+            },
+            "ciphers": [], "folders": [], "collections": []
+        }))
+        .expect("parses");
+        let mut directory = Directory::from_sync(&response, &keys());
+        assert!(matches!(directory.audience_of(&item(Some("pinned"), &[])), Audience::SharedWithMe { .. }), "control");
+        directory.not_received("pinned");
+        directory.not_received("pinned-waiting");
+        assert_eq!(
+            directory.audience_of(&item(Some("pinned"), &[])),
+            Audience::Shared { organisation: "Shared by boss@corp.example".into(), collections: Vec::new(), others: None }
+        );
+        assert!(directory.visible_organisations().iter().any(|o| o.id == "pinned"));
+        assert!(directory.waiting().is_empty(), "{:?}", directory.waiting());
     }
 
     /// **The roster route is `/users` and nothing else**: NodeWarden's older

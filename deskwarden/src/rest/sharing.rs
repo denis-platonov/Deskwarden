@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::rest::api::{Authenticated, RestClient, RestError};
 use crate::rest::crypto::{CryptoError, EncString, SymmetricKey};
 use crate::rest::organizations::{
-    Directory, Member, MemberStatus, Roster, collection_ids_of, normalise_email, organization_of, sharer_of,
+    Directory, Member, MemberStatus, ReceivedRosters, Roster, collection_ids_of, normalise_email, organization_of, sharer_of,
 };
 use crate::rest::sharing_api;
 use crate::rest::sync::{Profile, VaultKeys};
@@ -544,9 +544,11 @@ pub(crate) struct Capabilities {
     /// ([`Sharing::fetch_roster`]). Sharing is off with [`REASON_TOO_OLD`]
     /// until the next sign-in.
     pub(crate) too_old: bool,
-    /// A recipient's `GET …/users/mini-details` answered 200 (`Some(true)`) or
-    /// 403/404 (`Some(false)`). Whether "Shared by" can be verified.
-    pub(crate) roster_readable: Option<bool>,
+    /// What received orgs' `GET …/users/mini-details` have said this session:
+    /// whether a member may read them here, and each answered org's one
+    /// owner -- so "Shared by" is verified, and each org asked once
+    /// (`organizations::Directory::attest_received`).
+    pub(crate) received_rosters: ReceivedRosters,
     /// The roster read after the last invite showed the person Accepted
     /// (`Some(true)`, Vaultwarden and NodeWarden with mail off) or Invited
     /// (`Some(false)`). A share then goes straight to confirm, or waits.
@@ -913,21 +915,29 @@ impl Sharing {
         me.sharing_org_id.filter(|_| me.sharing_org_created || me.sharing_org_adopted)
     }
 
-    /// Whether members may read an organisation's roster on this server, as
-    /// far as this session has learned ([`Capabilities::roster_readable`]).
-    /// `RestBackend::synced` asks it before asking the received rosters.
+    /// [`Self::pinned_org`] for the account `profile` names -- what
+    /// `RestBackend::synced` reads, before the directory is filed, so the
+    /// directory itself never draws this account's own org as received
+    /// (`organizations::Directory::not_received`, fix round 1, m11). It
+    /// reads a file: never call it with the session locked.
     #[must_use]
-    pub fn roster_readable(&self) -> Option<bool> {
-        self.held().capabilities.roster_readable
+    pub fn own_org_pin(&self, profile: &Profile) -> Option<String> {
+        self.pinned_org(profile.id.as_deref()?)
     }
 
-    /// What a whole read learned about it
-    /// (`organizations::Directory::attest_received`). `None` learned nothing
-    /// and changes nothing.
-    pub fn note_roster_readable(&self, learned: Option<bool>) {
-        if learned.is_some() {
-            self.held().capabilities.roster_readable = learned;
-        }
+    /// What this session has learned about received orgs' rosters
+    /// ([`Capabilities::received_rosters`]). `RestBackend::synced` takes a
+    /// copy before the session lock, hands it to
+    /// `organizations::Directory::attest_received`, and gives it back with
+    /// [`Self::note_received_rosters`].
+    #[must_use]
+    pub fn received_rosters(&self) -> ReceivedRosters {
+        self.held().capabilities.received_rosters.clone()
+    }
+
+    /// What a whole read learned, kept for the session.
+    pub fn note_received_rosters(&self, rosters: ReceivedRosters) {
+        self.held().capabilities.received_rosters = rosters;
     }
 
     /// The view -- pure over what is held and the daemon's items.
@@ -3176,6 +3186,7 @@ impl Sharing {
             held.others.retain(|(id, _)| id != organization_id);
             held.waiting.retain(|(id, _)| id != organization_id);
             held.unverified.remove(organization_id);
+            held.capabilities.received_rosters.owners.remove(organization_id);
         }
         Ok(SharingOutcome {
             upserted: Vec::new(),
@@ -6656,17 +6667,94 @@ mod tests {
         assert!(held.waiting.is_empty(), "{:?}", held.waiting);
     }
 
-    /// **What a whole read learns about rosters is kept for the session**:
-    /// a read that learned nothing changes nothing.
+    /// **What a whole read learns about rosters is kept for the session.**
     #[test]
     fn what_a_whole_read_learns_about_rosters_is_kept_for_the_session() {
         let engine = offline();
-        assert_eq!(engine.roster_readable(), None);
-        engine.note_roster_readable(None);
-        assert_eq!(engine.roster_readable(), None, "nothing learned changes nothing");
-        engine.note_roster_readable(Some(false));
-        engine.note_roster_readable(None);
-        assert_eq!(engine.roster_readable(), Some(false));
+        assert_eq!(engine.received_rosters(), ReceivedRosters::default());
+        let learned = ReceivedRosters {
+            readable: Some(true),
+            owners: [("org-boss".to_string(), Some("boss@x.io".to_string()))].into_iter().collect(),
+        };
+        engine.note_received_rosters(learned.clone());
+        assert_eq!(engine.received_rosters(), learned);
+    }
+
+    /// A whole sync on [`on_nodewarden`]'s server, its profile listing
+    /// `organizations` -- what `RestBackend::synced` reads. Asked `reads`
+    /// times exactly: no revision route is mocked, so every list is a whole
+    /// read.
+    fn whole_reads(server: &mut MockServer, organizations: serde_json::Value, reads: usize) -> crate::test_http::Mock {
+        let body = serde_json::json!({
+            "object": "sync",
+            "profile": sharing_profile(organizations),
+            "folders": [], "ciphers": [], "collections": []
+        });
+        server.mock("GET", "/api/sync?excludeDomains=true").with_body(body.to_string()).expect(reads).create()
+    }
+
+    fn boss_org() -> serde_json::Value {
+        serde_json::json!([{ "id": "org-boss", "name": "Shared by boss@x.io", "type": 2, "status": 2, "enabled": true }])
+    }
+
+    /// **A member refused once is asked nothing more that session** (fix
+    /// round 1, I2): NodeWarden answers a member's `mini-details` 404, and
+    /// the second whole read makes no request for it at all.
+    #[test]
+    fn a_refused_roster_is_not_asked_again_on_a_later_whole_read() {
+        let (mut server, backend, engine, _dir) = on_nodewarden(boss_org());
+        let syncs = whole_reads(&mut server, boss_org(), 2);
+        let asked = server.mock("GET", Matcher::Regex("/users/mini-details$".into())).with_status(404).expect(1).create();
+        crate::vault_backend::VaultBackend::list_items(&backend).expect("first read");
+        crate::vault_backend::VaultBackend::list_items(&backend).expect("second read");
+        syncs.assert();
+        asked.assert();
+        assert_eq!(engine.received_rosters().readable, Some(false));
+        assert!(engine.held().unverified.contains("org-boss"));
+    }
+
+    /// **An answered roster costs one request a session** (fix round 1, m12):
+    /// on a server that lets a member read it, the second whole read applies
+    /// the kept owner -- verified -- without asking again.
+    #[test]
+    fn an_answered_roster_is_asked_once_across_whole_reads() {
+        let (mut server, backend, engine, _dir) = on_nodewarden(boss_org());
+        let syncs = whole_reads(&mut server, boss_org(), 2);
+        let rows = serde_json::json!({ "data": [
+            { "id": "ou-b", "userId": "u-b", "email": "Boss@X.io", "type": 0, "status": 2 },
+            { "id": "ou-me", "userId": FIXTURE_USER_ID, "email": FIXTURE_EMAIL, "type": 2, "status": 2 }
+        ]});
+        let asked = server
+            .mock("GET", "/api/organizations/org-boss/users/mini-details")
+            .with_body(rows.to_string())
+            .expect(1)
+            .create();
+        for read in ["first", "second"] {
+            crate::vault_backend::VaultBackend::list_items(&backend).expect("a read");
+            let held = engine.held();
+            assert_eq!(held.others, vec![("org-boss".to_string(), "boss@x.io".to_string())], "{read}");
+            assert!(!held.unverified.contains("org-boss"), "{read} read: the kept owner is applied");
+        }
+        syncs.assert();
+        asked.assert();
+    }
+
+    /// **This PC's own org, listed in a received org's shape, is asked
+    /// about by nobody** (fix round 1, m11): the backend takes it out of the
+    /// directory before any roster is asked, so no `mini-details` goes out
+    /// and nothing names a sharer for it.
+    #[test]
+    fn a_whole_read_asks_no_roster_of_this_pcs_own_org() {
+        let renamed = serde_json::json!([
+            { "id": FIXTURE_ORG, "name": "Shared by boss@x.io", "type": 2, "status": 2, "enabled": true }
+        ]);
+        let (mut server, backend, engine, _dir) = on_nodewarden(renamed.clone());
+        let syncs = whole_reads(&mut server, renamed, 1);
+        let asked = server.mock("GET", Matcher::Regex("/users/mini-details$".into())).expect(0).create();
+        crate::vault_backend::VaultBackend::list_items(&backend).expect("a read");
+        syncs.assert();
+        asked.assert();
+        assert!(engine.held().others.is_empty());
     }
 
     /// **Stop receiving from X** (spec 6.9): leave the sharer's org, and every

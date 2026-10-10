@@ -2549,6 +2549,7 @@ fn draw_share_row(
             name: &share.name,
             subtitle: &share.subtitle,
             pill: Some(share.pill()),
+            hover: None,
         },
         width,
         ROW_HEIGHT,
@@ -2571,6 +2572,9 @@ pub(crate) struct PersonRow<'a> {
     /// The share pill at the right edge -- a share's state. `None` for a
     /// received record, whose one state the subtitle already says.
     pub(crate) pill: Option<theme::SharePillKind>,
+    /// The row's hover words, if any: a received record whose sharer is
+    /// unverified carries the spec's tooltip (fix round 1, m7).
+    pub(crate) hover: Option<&'a str>,
 }
 
 /// **One row about a record and a person** -- [`draw_share_row`]'s whole
@@ -2671,7 +2675,11 @@ pub(crate) fn draw_person_row(
         subtitle_font,
         theme::TEXT_FAINT,
     );
-    response.clicked()
+    let clicked = response.clicked();
+    if let Some(tip) = row.hover {
+        let _ = response.on_hover_text(tip);
+    }
+    clicked
 }
 
 /// 6c's `ic('person', 10, ..)` before a share row's subtitle, and its
@@ -9236,7 +9244,7 @@ mod paint_tests {
             entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
         };
         let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
-        let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }];
+        let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
         let painted = paint_received_with(&rows, &people, None);
         let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
         assert!(top(FROM_PEOPLE_EYEBROW) < top("Acme VPN"));
@@ -9273,7 +9281,7 @@ mod paint_tests {
             entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
         };
         let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
-        let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }];
+        let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
         let mut people = PeopleRows { received: &from_people, paste: Some(zeroize::Zeroizing::new(String::new())), ..PeopleRows::none() };
         let (painted, selected) = paint_received_people(&rows, &mut people, None);
         assert_eq!(selected, None, "nothing is picked for the user");
@@ -9286,7 +9294,7 @@ mod paint_tests {
         assert!(alone.has(sharing::PASTE_ACCEPT_LABEL), "{:?}", alone.text);
         assert!(alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
 
-        let waiting = ["denis@x.io".to_string()];
+        let waiting = [crate::rest::sharing::WaitingEntry { organization_id: "org-x".into(), from: "denis@x.io".into(), verified: true }];
         let mut only_waiting = PeopleRows { waiting: &waiting, ..PeopleRows::none() };
         let (painted, _) = paint_received_people(&[], &mut only_waiting, None);
         assert!(painted.has(&sharing::waiting_line("denis@x.io")), "{:?}", painted.text);
