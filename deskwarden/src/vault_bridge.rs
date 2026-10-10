@@ -603,6 +603,107 @@ pub fn with_custom_field(item: &VaultItem, name: &str, value: &str) -> VaultItem
     updated
 }
 
+/// The custom field a card's PIN is stored on.
+///
+/// **Not namespaced, unlike [`BILLING_ZIP_FIELD`], and that is the point.**
+/// Bitwarden's card object has no PIN, and the owner's decision is to keep it
+/// where every Bitwarden client already shows one: a standard **hidden**
+/// custom field (`type: 1`) named exactly `PIN`. The official apps draw it as
+/// a masked custom field called "PIN" with their own reveal button, so a PIN
+/// typed here is readable everywhere and a PIN typed there is picked up here
+/// as it is.
+pub const CARD_PIN_FIELD: &str = "PIN";
+
+/// Where a card's PIN sits in `item.fields`, or `None`.
+///
+/// **The first custom field whose name is `PIN`**, compared after trimming
+/// and in any case, so a card that already carries a `pin` or a ` PIN ` from
+/// another client is read as it is. Only a text or hidden field qualifies (a
+/// `type` of `0` or `1`, or none at all): a boolean or a linked field named
+/// `PIN` has no value of its own to show, and reading one as an empty PIN
+/// would let the next save delete it.
+///
+/// **A card's only.** A login or an identity may carry a field called `PIN`
+/// too, and it stays the ordinary custom field it always was.
+pub fn card_pin_index(item: &VaultItem) -> Option<usize> {
+    if ItemKind::of(item) != ItemKind::Card {
+        return None;
+    }
+    item.fields.iter().position(|f| {
+        let named = f
+            .name
+            .as_deref()
+            .is_some_and(|name| name.trim().eq_ignore_ascii_case(CARD_PIN_FIELD));
+        let has_a_value = match f.other.get("type") {
+            None => true,
+            Some(kind) => matches!(kind.as_i64(), Some(0 | 1)),
+        };
+        named && has_a_value
+    })
+}
+
+/// A card's PIN as it is stored, untrimmed, or `None` when it has none. See
+/// [`card_pin_index`] for which field that is.
+pub fn card_pin(item: &VaultItem) -> Option<&str> {
+    let index = card_pin_index(item)?;
+    Some(item.fields[index].value.as_deref().map(|v| v.as_str()).unwrap_or_default())
+}
+
+/// Pure helper: a copy of the card `item` with its PIN set to `pin`.
+///
+/// * The existing PIN field (see [`card_pin_index`]) is **replaced in place**,
+///   keeping its slot and the server's extra keys, as
+///   [`with_custom_field`] does -- and rewritten as `{name: "PIN", value,
+///   type: 1}`, the standard hidden field.
+/// * **A PIN equal to the stored one leaves the field exactly as it was**, so
+///   an untouched save of a card whose field is spelled `pin`, or is a text
+///   field, is byte for byte what was read.
+/// * A blank `pin` **removes** the field; with none to remove it changes
+///   nothing.
+/// * With no PIN field yet, a new hidden one is appended.
+/// * Every other field is untouched, and an item that is not a card is
+///   returned unchanged.
+pub fn with_card_pin(item: &VaultItem, pin: &str) -> VaultItem {
+    let mut updated = item.clone();
+    if ItemKind::of(item) != ItemKind::Card {
+        return updated;
+    }
+    let existing = card_pin_index(item);
+    if let Some(i) = existing {
+        let stored = item.fields[i].value.as_deref().map(|v| v.as_str()).unwrap_or_default();
+        if stored == pin {
+            return updated;
+        }
+    }
+    let pin = pin.trim();
+    match existing {
+        Some(i) if pin.is_empty() => {
+            updated.fields.remove(i);
+        }
+        None if pin.is_empty() => {}
+        _ => {
+            // The server's extra keys on the field being replaced are its to
+            // keep, exactly as `with_custom_field` keeps them; `type` is the
+            // one this write decides, because a PIN is a hidden field.
+            let mut other = match existing {
+                Some(i) => item.fields[i].other.clone(),
+                None => serde_json::Map::new(),
+            };
+            other.insert("type".to_string(), serde_json::json!(1));
+            let rebuilt = VaultField {
+                name: Some(CARD_PIN_FIELD.to_string()),
+                value: Some(Zeroizing::new(pin.to_string())),
+                other,
+            };
+            match existing {
+                Some(i) => updated.fields[i] = rebuilt,
+                None => updated.fields.push(rebuilt),
+            }
+        }
+    }
+    updated
+}
+
 /// Pure helper: returns a copy of `item` filed under `folder_id` (or filed
 /// nowhere, when that is `None`). Everything else -- including anything
 /// unmodelled riding [`VaultItem::other`] -- is cloned untouched, exactly as
@@ -3567,6 +3668,97 @@ mod tests {
             serde_json::to_value(&updated).unwrap(),
             serde_json::to_value(&item).unwrap(),
             "clearing an absent field rewrote the item"
+        );
+    }
+
+    /// The fixture's PIN field, then the same card read back through
+    /// [`card_pin`]: the first text or hidden field named `PIN`, in any case,
+    /// trimmed -- on a card only.
+    #[test]
+    fn a_cards_pin_is_its_first_text_or_hidden_field_named_pin_in_any_case() {
+        let item = a_card_with_custom_fields();
+        assert_eq!(card_pin_index(&item), Some(0));
+        assert_eq!(card_pin(&item), Some("1234"));
+
+        let spelled = |name: &str, kind: serde_json::Value| -> VaultItem {
+            let mut item = a_card_with_custom_fields();
+            item.fields[0].name = Some(name.to_string());
+            item.fields[0].other.insert("type".to_string(), kind);
+            item
+        };
+        assert_eq!(card_pin_index(&spelled(" pin ", serde_json::json!(0))), Some(0));
+        assert_eq!(card_pin_index(&spelled("Pin", serde_json::json!(1))), Some(0));
+        // A boolean or linked field called PIN has no value of its own: it is
+        // not the PIN, and reading it as an empty one would delete it on save.
+        assert_eq!(card_pin_index(&spelled("PIN", serde_json::json!(2))), None);
+        assert_eq!(card_pin_index(&spelled("PIN", serde_json::json!(3))), None);
+        // Not a card: the field is an ordinary custom field.
+        let mut login = a_card_with_custom_fields();
+        login.item_type = Some(1);
+        assert_eq!(card_pin_index(&login), None);
+    }
+
+    #[test]
+    fn a_changed_pin_replaces_its_field_in_place_as_a_hidden_field_named_pin() {
+        let mut item = a_card_with_custom_fields();
+        // Arrived as a TEXT field spelled `pin`, which a change rewrites as
+        // the standard hidden one.
+        item.fields[0].name = Some("pin".to_string());
+        item.fields[0].other.insert("type".to_string(), serde_json::json!(0));
+        let before = field_objects(&item);
+
+        let updated = with_card_pin(&item, "9876");
+        let after = field_objects(&updated);
+        assert_eq!(after.len(), 3, "the field count changed");
+        assert_eq!(after[0]["name"], serde_json::json!("PIN"));
+        assert_eq!(after[0]["value"], serde_json::json!("9876"));
+        assert_eq!(after[0]["type"], serde_json::json!(1), "the PIN is not a hidden field");
+        assert_eq!(after[0]["linkedId"], serde_json::Value::Null, "its extra keys were dropped");
+        assert_eq!(after[1..], before[1..], "the other fields were disturbed");
+    }
+
+    #[test]
+    fn an_unchanged_pin_leaves_its_field_byte_for_byte() {
+        let mut item = a_card_with_custom_fields();
+        item.fields[0].name = Some(" pin".to_string());
+        item.fields[0].other.insert("type".to_string(), serde_json::json!(0));
+        assert_eq!(
+            serde_json::to_value(with_card_pin(&item, "1234")).unwrap(),
+            serde_json::to_value(&item).unwrap(),
+            "saving the PIN it already had rewrote the field"
+        );
+    }
+
+    #[test]
+    fn a_blank_pin_removes_the_field_and_a_new_one_is_appended_hidden() {
+        let item = a_card_with_custom_fields();
+        let cleared = with_card_pin(&item, "  ");
+        let names: Vec<&str> = cleared.fields.iter().filter_map(|f| f.name.as_deref()).collect();
+        assert_eq!(names, vec![crate::favicon::BANK_DOMAIN_FIELD, "Branch"]);
+        assert_eq!(card_pin(&cleared), None);
+        // Nothing to remove: nothing changes.
+        assert_eq!(
+            serde_json::to_value(with_card_pin(&cleared, "")).unwrap(),
+            serde_json::to_value(&cleared).unwrap()
+        );
+
+        let added = field_objects(&with_card_pin(&cleared, "4321"));
+        assert_eq!(added.len(), 3);
+        assert_eq!(added[..2], field_objects(&cleared)[..], "adding a PIN moved the other fields");
+        assert_eq!(
+            added[2],
+            serde_json::json!({"name": "PIN", "value": "4321", "type": 1}),
+            "a new PIN is not Bitwarden's standard hidden field"
+        );
+    }
+
+    #[test]
+    fn a_pin_is_never_written_onto_anything_but_a_card() {
+        let mut login = a_card_with_custom_fields();
+        login.item_type = Some(1);
+        assert_eq!(
+            serde_json::to_value(with_card_pin(&login, "9999")).unwrap(),
+            serde_json::to_value(&login).unwrap()
         );
     }
 

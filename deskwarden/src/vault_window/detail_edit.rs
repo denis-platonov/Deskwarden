@@ -44,6 +44,19 @@ pub struct CardDraft {
     /// sharing one, so revealing the number cannot reveal the security code.
     pub reveal_number: bool,
     pub reveal_code: bool,
+    /// The card's PIN -- `vault_bridge::CARD_PIN_FIELD`, Bitwarden's standard
+    /// **hidden** custom field named `PIN`, on the item.
+    ///
+    /// Bitwarden's card object has no PIN, so it lives where every Bitwarden
+    /// client already shows one; see that constant. Drafted **here**, beside
+    /// the security code, because that is where the form draws it -- on the
+    /// `Expires` row -- and the field's own row in [`EditDraft::fields`] is
+    /// [`FieldRole::CardPin`], which the custom-fields card does not draw. A
+    /// plain `String`, like [`Self::code`] and for the same recorded reason.
+    pub pin: String,
+    /// Persistent reveal state for [`Self::pin`]: its own flag, for the reason
+    /// [`Self::reveal_number`] and [`Self::reveal_code`] are separate.
+    pub reveal_pin: bool,
     /// Whether the brand on this draft is the user's own choice rather than
     /// something this form suggested.
     ///
@@ -112,6 +125,20 @@ pub struct CardDraft {
     /// it is not saved, and a form that became dirty because a list was
     /// filled in behind it would ask about a change that is not one.
     pub bank_choices: Vec<String>,
+    /// What each of [`Self::bank_choices`] is called, index for index -- the
+    /// picker lists every entry as `Name \u{2014} domain`, so two logins for
+    /// one bank can be told apart. Filled with the list by
+    /// [`EditDraft::offer_bank_domains`], through `detail::bank_name`. View
+    /// state, like the list it names; a row with no name here is named
+    /// without the vault (see [`bank_choice_text`]).
+    pub bank_choice_names: Vec<String>,
+    /// The chosen bank's name, and the domain it was resolved for -- what the
+    /// picker button shows instead of the stored domain. Resolved against the
+    /// vault's items by [`EditDraft::offer_bank_domains`] and kept until the
+    /// domain changes, so a frame walks the vault only when the bank does.
+    /// View state: the stored value is [`Self::bank_domain`], and a name is
+    /// only how it is drawn.
+    bank_shown: Option<(String, String)>,
 }
 
 impl CardDraft {
@@ -129,6 +156,35 @@ impl CardDraft {
     pub fn clear_bank(&mut self) {
         self.bank_domain.clear();
         self.bank_picking = false;
+    }
+
+    /// What the bank picker's button says: the chosen bank's **name**, never
+    /// the stored domain -- `detail::bank_name`, resolved against the vault
+    /// by [`EditDraft::offer_bank_domains`] when it has been, and from the
+    /// domain alone until then -- or `None` when no bank is chosen.
+    pub fn bank_label(&self) -> Option<String> {
+        if self.bank_domain.is_empty() {
+            return None;
+        }
+        Some(match &self.bank_shown {
+            Some((domain, name)) if *domain == self.bank_domain => name.clone(),
+            _ => detail::bank_name(&self.bank_domain, &[]),
+        })
+    }
+
+    /// The Card row's Remove: **the number and the brand**, the two things on
+    /// that row, as the two separate rows' boxes held them between them.
+    ///
+    /// The row itself stays -- a card's number is the floor of the form (see
+    /// [`Slot::always_shown`]) -- and the brand goes back to being a
+    /// suggestion: a brand nobody has chosen any more is not a choice the
+    /// next number should be kept from overriding. The number is
+    /// [`zeroize::Zeroize`]d, for [`Self::set_number`]'s reason.
+    pub fn clear_card(&mut self) {
+        use zeroize::Zeroize as _;
+        self.number.zeroize();
+        self.brand.clear();
+        self.brand_touched = false;
     }
 
     /// Replaces the number, then re-runs the brand suggestion.
@@ -575,6 +631,16 @@ pub enum FieldRole {
     /// fields, and a draft that dropped the slot would move it to the end on
     /// the next save.
     Internal,
+    /// **A card's PIN** -- the field `vault_bridge::card_pin_index` names, on
+    /// a card only.
+    ///
+    /// Not drawn by the custom-fields card, for `Internal`'s reason: it has a
+    /// dedicated box already, on the card's `Expires` row
+    /// ([`CardDraft::pin`]), and a second, raw one would let the two disagree.
+    /// It keeps its slot here for the same reason too, and is written back
+    /// from what arrived; `EditDraft::apply_card_fields_to` then replaces its
+    /// value in place through `vault_bridge::with_card_pin`.
+    CardPin,
 }
 
 /// One element of [`VaultItem::fields`], as the edit form holds it.
@@ -2453,6 +2519,12 @@ impl EditDraft {
                     code: drafted(card.and_then(|c| c.code.as_deref()).map(|c| c.as_str())),
                     reveal_number: false,
                     reveal_code: false,
+                    // Through the SAME reader the read pane draws it with and
+                    // `with_card_pin` writes it back through, untrimmed, so an
+                    // untouched save compares equal and leaves the field alone.
+                    // `card_pin` answers for a card only.
+                    pin: crate::vault_bridge::card_pin(item).unwrap_or_default().to_string(),
+                    reveal_pin: false,
                     // Read through the SAME reader the icon loader uses, so
                     // the form and the tile can never disagree about which
                     // domain this card's icon comes from. `icon_domain_for`
@@ -2480,6 +2552,8 @@ impl EditDraft {
                     bank_picking: false,
                     bank_filter: String::new(),
                     bank_choices: Vec::new(),
+                    bank_choice_names: Vec::new(),
+                    bank_shown: None,
                 }
             },
             identity: IdentityDraft {
@@ -2520,7 +2594,17 @@ impl EditDraft {
             // One walk, in the item's order, keeping every element --
             // including the ones this form will not draw. See
             // [`Self::fields`].
-            fields: item.fields.iter().map(FieldDraft::from_field).collect(),
+            fields: {
+                let mut fields: Vec<FieldDraft> =
+                    item.fields.iter().map(FieldDraft::from_field).collect();
+                // A card's PIN has its own box on the card's `Expires` row,
+                // so its row here keeps its slot and is drawn by nothing --
+                // see `FieldRole::CardPin`.
+                if let Some(index) = crate::vault_bridge::card_pin_index(item) {
+                    fields[index].role = FieldRole::CardPin;
+                }
+                fields
+            },
             opened_digest: 0,
             opened_units: [0; ChangeUnit::COUNT],
             discard_prompt: false,
@@ -2976,6 +3060,9 @@ impl EditDraft {
             code,
             reveal_number: _,
             reveal_code: _,
+            // Content: a PIN typed or emptied is written back on Save.
+            pin,
+            reveal_pin: _,
             // Not content: `brand` above IS the content, and whether the
             // string got there by a suggestion or by a click is a fact about
             // how the form behaves from here on rather than about the item.
@@ -2997,6 +3084,10 @@ impl EditDraft {
             bank_picking: _,
             bank_filter: _,
             bank_choices: _,
+            // View state too: what the list and the button call a domain is
+            // how it is drawn, not what is saved.
+            bank_choice_names: _,
+            bank_shown: _,
         } = card;
         let SshKeyDraft { private_key, public_key, key_fingerprint, reveal_private_key: _ } =
             ssh_key;
@@ -3039,7 +3130,7 @@ impl EditDraft {
         let _ = write!(
             sketch,
             "{cardholder_name}\u{0}{brand}\u{0}{number}\u{0}{exp_month}\u{0}{exp_year}\u{0}\
-             {code}\u{0}{bank_domain}\u{0}{billing_zip}\u{0}"
+             {code}\u{0}{pin}\u{0}{bank_domain}\u{0}{billing_zip}\u{0}"
         );
         close(ChangeUnit::Card, &mut sketch);
         let _ = write!(sketch, "{identity:?}\u{0}");
@@ -3165,6 +3256,7 @@ impl EditDraft {
         self.totp.zeroize();
         self.card.number.zeroize();
         self.card.code.zeroize();
+        self.card.pin.zeroize();
         self.ssh_key.private_key.zeroize();
         // A secure note's entire body is the secret.
         self.note_body.zeroize();
@@ -3176,7 +3268,8 @@ impl EditDraft {
         // life of the form. See `GeneratorDraft::preview`.
         self.generator.preview.zeroize();
         for field in &mut self.fields {
-            if field.role == FieldRole::Hidden {
+            // The card PIN's own row holds the copy of it that arrived.
+            if matches!(field.role, FieldRole::Hidden | FieldRole::CardPin) {
                 field.value.zeroize();
             }
         }
@@ -3379,10 +3472,10 @@ impl EditDraft {
             Slot::Totp => self.totp.clear(),
             Slot::Websites => self.uris.clear(),
             Slot::CardholderName => self.card.cardholder_name.clear(),
-            Slot::CardExpMonth => self.card.exp_month.clear(),
-            Slot::CardExpYear => self.card.exp_year.clear(),
-            Slot::CardCode => self.card.code.clear(),
-            Slot::CardBank => self.card.bank_domain.clear(),
+            // Through `clear_bank`, which also shuts the picker: the row's
+            // Clear is this, and a list left open under a row that is gone
+            // would come back open the next time the row is added.
+            Slot::CardBank => self.card.clear_bank(),
             Slot::CardBillingZip => self.card.billing_zip.clear(),
             // Through the form's OWN row list rather than a third match over
             // the eighteen fields: `identity_rows` is the one place that
@@ -3402,6 +3495,9 @@ impl EditDraft {
             | Slot::Password
             | Slot::CardBrand
             | Slot::CardNumber
+            | Slot::CardExpMonth
+            | Slot::CardExpYear
+            | Slot::CardCode
             | Slot::Note
             | Slot::SshPrivateKey
             | Slot::SshPublicKey
@@ -3566,8 +3662,9 @@ impl EditDraft {
         self.apply_app_match_to(item, updated)
     }
 
-    /// The card's two namespaced custom fields -- the bank domain and the
-    /// billing postcode -- written back into `updated`.
+    /// The card's custom fields -- the bank domain and the billing postcode,
+    /// both namespaced, and the PIN, which is Bitwarden's standard hidden
+    /// `PIN` field -- written back into `updated`.
     ///
     /// **After the fields walk above, never instead of it.** The walk carries
     /// these two elements through in the item's own order along with
@@ -3593,11 +3690,27 @@ impl EditDraft {
             crate::favicon::BANK_DOMAIN_FIELD,
             &self.card.bank_domain,
         );
-        crate::vault_bridge::with_custom_field(
+        let updated = crate::vault_bridge::with_custom_field(
             &updated,
             crate::vault_bridge::BILLING_ZIP_FIELD,
             &self.card.billing_zip,
-        )
+        );
+        // **The PIN, the same way: in place, after the walk.** Its row rode
+        // the walk untouched (`FieldRole::CardPin`), and `with_card_pin` is
+        // the one producer of Bitwarden's standard hidden `PIN` field -- it
+        // leaves an unchanged PIN byte for byte, removes an emptied one, and
+        // appends a new one.
+        //
+        // **Not called for an empty box on a card that arrived with no PIN.**
+        // There is nothing to remove then, and the field `with_card_pin`
+        // would find is one the user has just added on the custom-fields card
+        // and named `PIN` -- which an empty box here must not delete.
+        let had_pin = self.fields.iter().any(|f| f.role == FieldRole::CardPin);
+        if had_pin || !self.card.pin.trim().is_empty() {
+            crate::vault_bridge::with_card_pin(&updated, &self.card.pin)
+        } else {
+            updated
+        }
     }
 
     /// Hands the bank picker the domains it may offer: every domain the
@@ -3617,15 +3730,32 @@ impl EditDraft {
     ///
     /// Sorted and de-duplicated: several logins share a domain, and a list
     /// with `chase.com` in it three times is a list that looks broken.
+    ///
+    /// **And it names them** -- the list's entries and the chosen bank alike,
+    /// through `detail::bank_name`, whose first rule is the name of the vault
+    /// login a domain came from and therefore needs the items this is the one
+    /// holder of. The chosen bank's name is resolved once per domain (see
+    /// `CardDraft::bank_shown`), so the frame that walks the vault is the one
+    /// after the bank changed, and the frames after it walk nothing again.
     pub fn offer_bank_domains(&mut self, items: &[VaultItem]) {
-        if !self.card.bank_picking || !self.card.bank_choices.is_empty() {
+        let card = &mut self.card;
+        let stale = match &card.bank_shown {
+            Some((domain, _)) => *domain != card.bank_domain,
+            None => true,
+        };
+        if !card.bank_domain.is_empty() && stale {
+            let name = detail::bank_name(&card.bank_domain, items);
+            card.bank_shown = Some((card.bank_domain.clone(), name));
+        }
+        if !card.bank_picking || !card.bank_choices.is_empty() {
             return;
         }
         let mut domains: Vec<String> =
             items.iter().filter_map(crate::favicon::icon_domain_for).collect();
         domains.sort();
         domains.dedup();
-        self.card.bank_choices = domains;
+        card.bank_choice_names = domains.iter().map(|d| detail::bank_name(d, items)).collect();
+        card.bank_choices = domains;
     }
 
     /// Hands the window picker the executables **other items already bind
@@ -4149,6 +4279,12 @@ impl Slot {
     ///    with taste: `CardDraft::suggest_brand` runs beside the number box
     ///    and fills the brand in from the digits, so a hidden brand would be a
     ///    value this form sets and the user cannot see.
+    ///  * **A card's expiry month and year and its security code.** They share
+    ///    the `Expires` row with the PIN (spec 2026-10-09), and the owner's
+    ///    decision is that the row carries **no Remove**: an empty box there is
+    ///    simply not saved. A row of four boxes that appeared only when one of
+    ///    three slots was filled, or an Add menu offering a box already on
+    ///    screen, would be the two halves of one row disagreeing.
     ///  * **An identity's first and last name.** An identity is a person, the
     ///    read pane's headline is their name, and this is the kind with
     ///    eighteen rows -- the one the feature is for -- so its floor is the
@@ -4164,6 +4300,9 @@ impl Slot {
             | Slot::Password
             | Slot::CardNumber
             | Slot::CardBrand
+            | Slot::CardExpMonth
+            | Slot::CardExpYear
+            | Slot::CardCode
             | Slot::Note
             | Slot::SshPrivateKey
             | Slot::SshPublicKey
@@ -4174,9 +4313,6 @@ impl Slot {
             Slot::Totp
             | Slot::Websites
             | Slot::CardholderName
-            | Slot::CardExpMonth
-            | Slot::CardExpYear
-            | Slot::CardCode
             | Slot::CardBank
             | Slot::CardBillingZip => false,
         }
@@ -4538,14 +4674,33 @@ pub const BRAND_UNSET: &str = "Not set";
 /// string exactly would leave no room for a brand Bitwarden adds later.
 const BRAND_COMBO_WIDTH: f32 = 160.0;
 
+/// The caption of the card's **number row**, which carries the brand chooser
+/// in front of the number box -- the owner's "brand with number" on one line.
+/// `Card`, because the row is the card itself: which network, which digits.
+pub const CARD_ROW_LABEL: &str = "Card";
+
+/// The caption of the row that carries the expiry, the security code and the
+/// PIN. `Expires`, the read pane's own word for the same date.
+pub const EXPIRES_ROW_LABEL: &str = "Expires";
+
+/// What joins the month box to the year box: a card prints `10/29`.
+pub const EXPIRY_JOIN: &str = "/";
+
+/// The inline caption in front of the security-code box on the `Expires` row.
+/// `Code`, as the read pane says it, for the reason given there: the long
+/// form does not fit beside its neighbours.
+pub const CARD_CODE_LABEL: &str = "Code";
+
+/// The inline caption in front of the PIN box -- and the name of the custom
+/// field the PIN is stored on (`vault_bridge::CARD_PIN_FIELD`), so the form,
+/// the read pane and every other Bitwarden client call it one thing.
+pub const CARD_PIN_LABEL: &str = crate::vault_bridge::CARD_PIN_FIELD;
+
 /// The label above the card's bank row.
 ///
 /// It says **bank**, not "domain": the user is choosing an institution, and
 /// the domain is how this app happens to find its icon.
 pub const BANK_LABEL: &str = "Bank";
-
-/// What the bank row says when no bank has been chosen.
-pub const BANK_UNSET: &str = "No bank chosen";
 
 /// Why the row is a picker and not a box the user can type in.
 pub const BANK_HINT: &str =
@@ -4678,6 +4833,12 @@ pub const SLOT_ADD_HINT: &str =
 /// **Drawn only on a row [`Slot::always_shown`] is false for.** A login with
 /// a Remove beside its password would be one click from a wiped credential,
 /// and [`EditDraft::hide_slot`] refuses that independently of the drawing.
+///
+/// **A card's rows are the exception on both counts** (spec 2026-10-09): their
+/// Remove is inline at the END of the row, as the login form's buttons are
+/// (see [`field_with_remove`]), and the Card row -- brand and number, both
+/// floor -- carries one that clears the two (see [`CardDraft::clear_card`])
+/// and leaves the row where it is.
 pub const SLOT_REMOVE_BUTTON: &str = "Remove";
 
 /// **One row on a per-kind card: §8a's label column, the row's control, and
@@ -5264,10 +5425,10 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
         return;
     }
 
-    // `FieldRole::Internal` rows are drawn by nothing -- see that variant --
-    // so "has no fields" is about the rows the user can see, not about the
-    // vector's length.
-    if !fields.iter().any(|f| f.role != FieldRole::Internal) {
+    // `FieldRole::Internal` and `FieldRole::CardPin` rows are drawn by nothing
+    // here -- see those variants -- so "has no fields" is about the rows the
+    // user can see, not about the vector's length.
+    if !fields.iter().any(|f| !matches!(f.role, FieldRole::Internal | FieldRole::CardPin)) {
         ui.label(RichText::new(FIELDS_NONE_NOTICE).size(11.0).color(theme::TEXT_FAINT));
         ui.add_space(6.0);
     }
@@ -5285,7 +5446,7 @@ fn custom_fields_block(ui: &mut egui::Ui, fields: &mut Vec<FieldDraft>, creating
     let mut remove: Option<usize> = None;
     for (i, field) in fields.iter_mut().enumerate() {
         match field.role {
-            FieldRole::Internal => continue,
+            FieldRole::Internal | FieldRole::CardPin => continue,
             FieldRole::Preserved => {
                 // Named by whatever the field calls itself, so the row is
                 // identifiable; a nameless one says so rather than drawing a
@@ -7466,38 +7627,282 @@ fn picker_footer(ui: &mut egui::Ui, staged: bool, count: usize) -> (bool, bool, 
     pressed
 }
 
-/// The card's bank row: what is chosen, the button that opens the picker, and
-/// the picker itself.
+/// **A §8a row's field and its Remove at the end of the line**, built the way
+/// the credentials card builds its rows: [`row_with_buttons`] measures the
+/// button first, `field` takes exactly what is left, and the Remove is
+/// [`theme::row_button_danger`] -- the one-time code's own Remove. Answers
+/// whether it was clicked.
+///
+/// The card's Cardholder and Billing ZIP rows. Their Remove used to be a chip
+/// under the caption (`slot_row`), which is the owner's report this replaces:
+/// "Remove buttons sit under the label instead of inline at the end of the
+/// row, as on the login form".
+fn field_with_remove(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui, f32)) -> bool {
+    let mut clicked = false;
+    row_with_buttons(ui, &[SLOT_REMOVE_BUTTON], |ui, room| {
+        field(ui, room);
+        clicked = theme::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked();
+    });
+    clicked
+}
+
+/// The narrowest the card number's box may be before the row wraps it under
+/// the brand chooser instead of squeezing it: sixteen digits and the in-field
+/// `Show`, at the row's own type size.
+const CARD_NUMBER_FLOOR: f32 = 180.0;
+
+/// The card's brand chooser, at its own width, **in front of the number** on
+/// the Card row. Answers with the width it took, so the number box can take
+/// the rest.
+///
+/// A dropdown over `CARD_BRANDS` rather than a text box, and the rows are
+/// derived from the enumeration rather than written out here: a second
+/// hand-written list is the "two enumerations that must agree" defect, and the
+/// one that drifts would offer a spelling no other Bitwarden client draws card
+/// art for.
+///
+/// `selected_text` is the draft's own string, not a resolved `CardBrand`, so a
+/// brand this build does not know -- one a newer client wrote -- is still
+/// SHOWN rather than silently reading as blank.
+///
+/// In a scope, because [`form_combo`] sets the `Ui`'s `interact_size` and the
+/// row's other widgets are not its to resize.
+fn brand_combo(ui: &mut egui::Ui, card: &mut CardDraft) -> f32 {
+    ui.scope(|ui| {
+        form_combo(ui, "card-brand")
+            .selected_text(if card.brand.is_empty() { BRAND_UNSET } else { card.brand.as_str() })
+            .width(BRAND_COMBO_WIDTH)
+            .show_ui(ui, |ui| {
+                for brand in CARD_BRANDS {
+                    let canonical = brand.canonical();
+                    let chosen = card.brand == canonical;
+                    if ui.selectable_label(chosen, canonical).clicked() {
+                        // Through `pick_brand`, never by assigning `brand`:
+                        // this is the click that makes the choice permanent.
+                        card.pick_brand(canonical);
+                    }
+                }
+            })
+            .response
+            .rect
+            .width()
+    })
+    .inner
+}
+
+/// The card's `Expires` row: **month `/` year, then `Code` and its box, then
+/// `PIN` and its box taking the rest of the line.**
+///
+/// No Remove on this row -- the owner's decision; an empty box is simply not
+/// saved (see `EditDraft::apply_to`, and `vault_bridge::with_card_pin` for the
+/// PIN). The three expiry and code slots are floor rows for that reason.
+///
+/// * The month box is sized for two digits. **The year box is sized for four**:
+///   Bitwarden's clients store `2029`, not `29`, and a box sized for two would
+///   scroll the year out of sight in every card this vault holds.
+/// * The code box is sized for four digits and its in-field `Show`.
+/// * The PIN is masked, with its own `Show` ([`CardDraft::reveal_pin`]), and
+///   takes what is left -- or, on a pane too narrow for it, the next line,
+///   caption and all, rather than a box too small to type in.
+/// * On a CREATE the PIN box is greyed and says why, for
+///   [`CARD_FIELD_CREATE_NOTICE`]'s reason: `NewItem` carries no custom fields.
+///
+/// Laid through [`row_with_buttons`] with no buttons, so every box sits on the
+/// row height the rest of the form's rows share, and the captions between them
+/// are centred on the boxes by their ink ([`inline_caption`]).
+fn expires_row(ui: &mut egui::Ui, card: &mut CardDraft, creating: bool, ink: egui::Color32) {
+    row_with_buttons(ui, &[], |ui, _room| {
+        let month = digits_box_width(ui, 2, FIELD_INSET_RIGHT);
+        theme::section_text_field_within(ui, &mut card.exp_month, false, month);
+        inline_caption(ui, EXPIRY_JOIN, ink);
+        let year = digits_box_width(ui, 4, FIELD_INSET_RIGHT);
+        theme::section_text_field_within(ui, &mut card.exp_year, false, year);
+        inline_caption(ui, CARD_CODE_LABEL, ink);
+        let code = digits_box_width(ui, 4, REVEAL_INSET_RIGHT);
+        theme::section_password_field_within(ui, &mut card.code, &mut card.reveal_code, code);
+
+        let caption = caption_width(ui, CARD_PIN_LABEL) + ui.spacing().item_spacing.x;
+        if ui.available_size_before_wrap().x < caption + PIN_FLOOR {
+            ui.end_row();
+        }
+        inline_caption(ui, CARD_PIN_LABEL, ink);
+        let room = ui.available_size_before_wrap().x.max(PIN_FLOOR);
+        if creating {
+            let rect = theme::section_disabled_text_field_within(ui, CARD_FIELD_CREATE_NOTICE, room);
+            ui.interact(rect, ui.id().with("card-pin-create"), egui::Sense::hover())
+                .on_hover_text(CARD_FIELD_CREATE_NOTICE);
+        } else {
+            theme::section_password_field_within(ui, &mut card.pin, &mut card.reveal_pin, room);
+        }
+    });
+}
+
+/// The narrowest the PIN box may be before it goes to a line of its own.
+const PIN_FLOOR: f32 = 110.0;
+
+/// A row box's right inset with nothing in it, and with the in-field
+/// `Show`/`Hide` -- `theme`'s `FieldShape` numbers for the two, which a box
+/// sized to its digits has to leave room for.
+const FIELD_INSET_RIGHT: f32 = 10.0;
+const REVEAL_INSET_RIGHT: f32 = 52.0;
+
+/// How wide a row box must be to show `digits` digits -- or as many mask
+/// bullets, whichever is wider -- without scrolling: the run, the box's
+/// 10-point left inset, its right inset, and two points for the caret egui
+/// draws at the end of the run.
+fn digits_box_width(ui: &egui::Ui, digits: usize, inset_right: f32) -> f32 {
+    let font = egui::FontId::new(theme::SECTION_FIELD_PX, egui::FontFamily::Proportional);
+    let run = |text: String| {
+        ui.painter().layout_no_wrap(text, font.clone(), egui::Color32::PLACEHOLDER).size().x
+    };
+    let ink = run("0".repeat(digits)).max(run("\u{2022}".repeat(digits)));
+    ink + 10.0 + inset_right + 2.0
+}
+
+/// The type an inline caption on the `Expires` row is set in: the label
+/// column's own 12 points.
+fn inline_caption_font() -> egui::FontId {
+    egui::FontId::new(12.0, egui::FontFamily::Proportional)
+}
+
+fn caption_width(ui: &egui::Ui, text: &str) -> f32 {
+    ui.painter()
+        .layout_no_wrap(text.to_string(), inline_caption_font(), egui::Color32::PLACEHOLDER)
+        .size()
+        .x
+}
+
+/// **A caption between two boxes on one row**, in the form's field-label
+/// type and `ink`, **centred on the boxes by its ink** --
+/// `theme::centred_galley_top`, because a box-centred run reads high.
+///
+/// It takes the row's whole box height, so the run is centred on the same
+/// line the boxes beside it are.
+fn inline_caption(ui: &mut egui::Ui, text: &str, ink: egui::Color32) {
+    let font = inline_caption_font();
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font.clone(), ink);
+    let (cell, _) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x, theme::SECTION_FIELD_HEIGHT),
+        egui::Sense::hover(),
+    );
+    let at = theme::centred_galley_top(ui.ctx(), cell, &galley, &font, cell.left());
+    ui.painter().galley(at, galley, ink);
+}
+
+/// **A button drawn as a closed drop-down**: `form_combo`'s box -- the same
+/// widget visuals, corner, fill and border, `button_padding`, and egui's own
+/// downward caret on the right -- at the row's [`theme::SECTION_FIELD_HEIGHT`],
+/// `width` wide, showing `text`. Painted in the `open` state while what it
+/// opens is open, as a combo's button is.
+///
+/// The bank's picker. **Not a `ComboBox`**, because what it opens is not a
+/// popup list: it is the bank chooser that already lives under the row -- a
+/// search box over the vault's own sites -- which a popup in its own layer
+/// could neither hold nor be put in front of a test.
+fn dropdown_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    chosen: bool,
+    width: f32,
+    open: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, theme::SECTION_FIELD_HEIGHT),
+        egui::Sense::click(),
+    );
+    if ui.is_rect_visible(rect) {
+        let visuals =
+            if open { ui.visuals().widgets.open } else { *ui.style().interact(&response) };
+        ui.painter().rect(
+            rect.expand(visuals.expansion),
+            visuals.corner_radius,
+            visuals.weak_bg_fill,
+            visuals.bg_stroke,
+            egui::StrokeKind::Inside,
+        );
+        let pad = ui.spacing().button_padding.x;
+        let icon = ui.spacing().icon_width;
+        let caret = egui::Rect::from_center_size(
+            egui::pos2(rect.right() - pad - icon / 2.0, rect.center().y),
+            egui::vec2(icon * 0.7, icon * 0.45),
+        );
+        ui.painter().add(egui::Shape::convex_polygon(
+            vec![caret.left_top(), caret.right_top(), caret.center_bottom()],
+            visuals.fg_stroke.color,
+            Stroke::NONE,
+        ));
+        let room = (rect.width() - 2.0 * pad - icon - ui.spacing().icon_spacing).max(0.0);
+        let galley = egui::WidgetText::from(text).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Truncate),
+            room,
+            egui::TextStyle::Button,
+        );
+        let ink = if chosen { visuals.text_color() } else { theme::TEXT_FAINT };
+        let at = egui::pos2(rect.left() + pad, rect.center().y - galley.size().y / 2.0);
+        ui.painter().galley(at, galley, ink);
+    }
+    response
+}
+
+/// What the bank picker's list says for its `index`th entry:
+/// `Name \u{2014} domain`, so two logins for one bank can be told apart. The
+/// name is the one [`EditDraft::offer_bank_domains`] resolved against the
+/// vault, or -- for a list filled some other way -- the domain's own.
+fn bank_choice_text(card: &CardDraft, index: usize) -> String {
+    let domain = &card.bank_choices[index];
+    let name = card
+        .bank_choice_names
+        .get(index)
+        .cloned()
+        .unwrap_or_else(|| detail::bank_name(domain, &[]));
+    format!("{name} \u{2014} {domain}")
+}
+
+/// The card's bank row: **the picker, showing the bank by name, and Clear at
+/// the end of the line**, both centred on the row at its standard height --
+/// then the chooser itself under them while it is open. Answers whether Clear
+/// was clicked, which the caller treats as the row's Remove.
 ///
 /// **There is no text box here, and that is the whole design.** The domain is
 /// what `favicon::icon_domain_for` hands the fetcher, and a typo in it
 /// produces a silent fetch failure and an unexplained blank tile with nothing
 /// on screen to explain why. Every writer of `CardDraft::bank_domain` in this
-/// function is [`CardDraft::choose_bank`] on a row the vault itself supplied,
-/// or [`CardDraft::clear_bank`].
+/// function is [`CardDraft::choose_bank`] on a row the vault itself supplied;
+/// Clear goes through `EditDraft::hide_slot`, which is
+/// [`CardDraft::clear_bank`].
+///
+/// **By name, never by the stored domain** (spec 2026-10-09): the domain is
+/// what finds the icon, so it is what is saved, and it is the button's
+/// tooltip, so nothing is hidden.
 ///
 /// The choices come from [`EditDraft::offer_bank_domains`], which the vault
 /// window fills in; an empty list is drawn as a sentence naming its cause
 /// rather than as a picker with nothing in it.
-fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) {
-    ui.horizontal(|ui| {
-        ui.label(if card.bank_domain.is_empty() {
-            RichText::new(BANK_UNSET).color(theme::TEXT_FAINT)
+fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) -> bool {
+    let mut cleared = false;
+    row_with_buttons(ui, &[BANK_CLEAR], |ui, room| {
+        let name = card.bank_label();
+        let picker = dropdown_button(
+            ui,
+            name.as_deref().unwrap_or(BANK_CHOOSE),
+            name.is_some(),
+            room,
+            card.bank_picking,
+        );
+        let picker = if card.bank_domain.is_empty() {
+            picker
         } else {
-            RichText::new(card.bank_domain.as_str()).color(theme::INK)
-        });
-        if theme::secondary_button(ui, BANK_CHOOSE).clicked() {
+            picker.on_hover_text(card.bank_domain.as_str())
+        };
+        if picker.clicked() {
             card.bank_picking = !card.bank_picking;
         }
-        // Only when there is something to clear: a Clear beside "No bank
-        // chosen" is a control whose only outcome is nothing happening.
-        if !card.bank_domain.is_empty() && theme::secondary_button(ui, BANK_CLEAR).clicked() {
-            card.clear_bank();
-        }
+        cleared = theme::row_button_danger(ui, BANK_CLEAR).clicked();
     });
 
     if !card.bank_picking {
-        return;
+        return cleared;
     }
     ui.add_space(6.0);
     if theme::secondary_button(ui, BANK_CLOSE_LIST).clicked() {
@@ -7515,11 +7920,13 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             for index in 0..card.bank_choices.len() {
-                let domain = &card.bank_choices[index];
-                if !filter.is_empty() && !domain.to_lowercase().contains(&filter) {
+                // The name and the domain, matched and shown together: a
+                // user looking for their bank types its name.
+                let text = bank_choice_text(card, index);
+                if !filter.is_empty() && !text.to_lowercase().contains(&filter) {
                     continue;
                 }
-                if ui.add(egui::Button::new(domain.as_str()).wrap()).clicked() {
+                if ui.add(egui::Button::new(text).wrap()).clicked() {
                     chosen = Some(index);
                 }
             }
@@ -7534,6 +7941,7 @@ fn bank_domain_row(ui: &mut egui::Ui, card: &mut CardDraft) {
         let domain = card.bank_choices[index].clone();
         card.choose_bank(&domain);
     }
+    cleared
 }
 
 /// One chip: the step, and the three controls that move and remove it.
@@ -11663,171 +12071,137 @@ pub fn draw_detail_edit(
                     // cards, from the same slots and with the same Removes.
                 }
                 FormBody::Card => {
+                    // **Spec 2026-10-09: three rows plus ZIP plus Bank, with
+                    // every row's buttons inline at its end** -- §8a's row,
+                    // `field(flex: 1)` and then the buttons, built exactly as
+                    // the credentials card builds one: `theme::section_row`
+                    // for the caption, `row_with_buttons` for the line, the
+                    // `_within` boxes for the field and `theme::row_button_danger`
+                    // for its Remove, so a card reads as the same form as a
+                    // login. The Removes used to be chips under the caption.
+                    //
+                    // The inline captions on the `Expires` row are painted in
+                    // the grey this card's own captions wear in the arm it is
+                    // drawn in -- §8a's label column, or the stacked
+                    // `theme::field_label` below it.
+                    let caption_ink = if theme::section_rows_fit(ui) {
+                        theme::TEXT_FAINT
+                    } else {
+                        theme::TEXT_MUTED
+                    };
                     let card = &mut draft.card;
-                    // **Every row on this card is a `slot_row`**, optional or
-                    // not, and the gap between them is `theme::BLOCK_GAP` --
-                    // the same one the `Item` card above uses. What was here
-                    // was `slot_label` + control + a local `10.0`, which is
-                    // the other half of why the two cards did not read as one
-                    // form: not only a different row shape but a different
-                    // rhythm between the rows, two points apart, which is
-                    // exactly far enough to notice and not far enough to
-                    // explain.
-                    if showing(Slot::CardholderName) {
-                        if slot_row(
-                            ui,
-                            Slot::CardholderName.label(),
-                            removable(Slot::CardholderName),
-                            |ui| {
-                                theme::section_text_field(ui, &mut card.cardholder_name, false);
-                            },
-                        ) {
-                            hide = Some(Slot::CardholderName);
-                        }
-                            }
 
-                    // **The brand is floor** -- never hidden, never
-                    // removable -- and not because a card needs one on the
-                    // wire. `suggest_brand` below fills it in from the
-                    // number's own digits, so a hidden brand would be a value
-                    // this form sets and the user cannot see. See
-                    // [`Slot::always_shown`].
-                    theme::section_row(ui, Slot::CardBrand.label(), |ui| {
-                        // A dropdown over `CARD_BRANDS` rather than a text box,
-                        // and the rows are derived from the enumeration rather
-                        // than written out here: a second hand-written list is
-                        // the "two enumerations that must agree" defect, and
-                        // the one that drifts would offer a spelling no other
-                        // Bitwarden client draws card art for.
-                        //
-                        // `selected_text` is the draft's own string, not a
-                        // resolved `CardBrand`, so a brand this build does not
-                        // know -- one a newer client wrote -- is still SHOWN
-                        // rather than silently reading as blank.
-                        form_combo(ui, "card-brand")
-                            .selected_text(if card.brand.is_empty() {
-                                BRAND_UNSET
-                            } else {
-                                card.brand.as_str()
-                            })
-                            .width(BRAND_COMBO_WIDTH)
-                            .show_ui(ui, |ui| {
-                                for brand in CARD_BRANDS {
-                                    let canonical = brand.canonical();
-                                    let chosen = card.brand == canonical;
-                                    if ui.selectable_label(chosen, canonical).clicked() {
-                                        // Through `pick_brand`, never by
-                                        // assigning `brand`: this is the click
-                                        // that makes the choice permanent.
-                                        card.pick_brand(canonical);
-                                    }
+                    // 1. Cardholder: one field, its Remove at the end.
+                    if showing(Slot::CardholderName) {
+                        theme::section_row(ui, Slot::CardholderName.label(), |ui| {
+                            if removable(Slot::CardholderName) {
+                                if field_with_remove(ui, |ui, room| {
+                                    theme::section_text_field_within(
+                                        ui,
+                                        &mut card.cardholder_name,
+                                        false,
+                                        room,
+                                    );
+                                }) {
+                                    hide = Some(Slot::CardholderName);
                                 }
-                            });
+                            } else {
+                                theme::section_text_field(ui, &mut card.cardholder_name, false);
+                            }
+                        });
+                    }
+
+                    // 2. Card: the brand chooser in front of the number, and
+                    // ONE Remove for the row that clears both -- see
+                    // `CardDraft::clear_card`. **The brand is floor** and so
+                    // is the number (see [`Slot::always_shown`]), so the row
+                    // itself never goes; and the Remove is drawn only when
+                    // there is something on the row to clear, and never on a
+                    // create, which hides nothing.
+                    let offers_clear =
+                        !creating && !(card.number.is_empty() && card.brand.is_empty());
+                    let mut clear_card = false;
+                    theme::section_row(ui, CARD_ROW_LABEL, |ui| {
+                        let buttons: &[&str] =
+                            if offers_clear { &[SLOT_REMOVE_BUTTON] } else { &[] };
+                        row_with_buttons(ui, buttons, |ui, room| {
+                            let brand = brand_combo(ui, card);
+                            // The number takes what is LEFT of the row's
+                            // field room once the chooser is on it.
+                            let number_room =
+                                (room - brand - theme::ROW_BUTTON_GAP).max(CARD_NUMBER_FLOOR);
+                            theme::section_password_field_within(
+                                ui,
+                                &mut card.number,
+                                &mut card.reveal_number,
+                                number_room,
+                            );
+                            if offers_clear
+                                && theme::row_button_danger(ui, SLOT_REMOVE_BUTTON).clicked()
+                            {
+                                clear_card = true;
+                            }
+                        });
                     });
-    
-                    theme::section_row(ui, Slot::CardNumber.label(), |ui| {
-                        theme::section_password_field(ui, &mut card.number, &mut card.reveal_number);
-                    });
+                    if clear_card {
+                        card.clear_card();
+                    }
                     // Every frame, unconditionally. `suggest_brand` is
                     // idempotent and returns immediately once the user has
                     // picked, so there is nothing to gate it on -- and gating
                     // it on "the number changed" would mean keeping a second
                     // plaintext copy of the number to compare against.
                     card.suggest_brand();
-    
-                    if showing(Slot::CardExpMonth) {
-                        if slot_row(
-                            ui,
-                            Slot::CardExpMonth.label(),
-                            removable(Slot::CardExpMonth),
-                            |ui| {
-                                theme::section_text_field(ui, &mut card.exp_month, false);
-                            },
-                        ) {
-                            hide = Some(Slot::CardExpMonth);
-                        }
-                            }
 
-                    if showing(Slot::CardExpYear) {
-                        if slot_row(
-                            ui,
-                            Slot::CardExpYear.label(),
-                            removable(Slot::CardExpYear),
-                            |ui| {
-                                theme::section_text_field(ui, &mut card.exp_year, false);
-                            },
-                        ) {
-                            hide = Some(Slot::CardExpYear);
-                        }
-                            }
+                    // 3. Expires: month / year, Code, PIN -- one line, no
+                    // Remove (owner's decision: an empty box is not saved).
+                    theme::section_row(ui, EXPIRES_ROW_LABEL, |ui| {
+                        expires_row(ui, card, creating, caption_ink);
+                    });
 
-                    if showing(Slot::CardCode) {
-                        if slot_row(
-                            ui,
-                            Slot::CardCode.label(),
-                            removable(Slot::CardCode),
-                            |ui| {
-                                theme::section_password_field(ui, &mut card.code, &mut card.reveal_code);
-                            },
-                        ) {
-                            hide = Some(Slot::CardCode);
-                        }
-                            }
-
-                    // The two namespaced custom fields. Withheld on a CREATE
-                    // for the same reason the TOTP seed is (see
-                    // `TOTP_CREATE_NOTICE`): `NewItem` carries no `fields`,
-                    // so anything typed here would be silently discarded on
-                    // Save. A disabled box that says so beats a live box that
-                    // lies.
-                    if showing(Slot::CardBank) {
-                        // The hint goes INSIDE the control column, under the
-                        // box it is about -- the same place the `Item` card
-                        // puts its un-file explanation. Left outside the row it
-                        // would start at the card's left edge, level with the
-                        // captions, and read as a sentence about the card
-                        // rather than about this field.
-                        if slot_row(
-                            ui,
-                            Slot::CardBank.label(),
-                            removable(Slot::CardBank),
-                            |ui| {
-                                if creating {
-                                    theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
-                                } else {
-                                    bank_domain_row(ui, card);
-                                }
-                                ui.add_space(4.0);
-                                ui.label(
-                                    RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT),
-                                );
-                            },
-                        ) {
-                            hide = Some(Slot::CardBank);
-                        }
-                            }
-
+                    // 4. Billing ZIP, as Cardholder. Withheld on a CREATE for
+                    // the same reason the TOTP seed is (see
+                    // `TOTP_CREATE_NOTICE`): `NewItem` carries no `fields`, so
+                    // anything typed here would be silently discarded on Save.
+                    // A disabled box that says so beats a live box that lies.
                     if showing(Slot::CardBillingZip) {
-                        if slot_row(
-                            ui,
-                            Slot::CardBillingZip.label(),
-                            removable(Slot::CardBillingZip),
-                            |ui| {
-                                if creating {
-                                    theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
-                                } else {
-                                    // Free text, unlike the bank: a postcode
-                                    // has no closed set to pick from, and a
-                                    // wrong one fails in front of the user on
-                                    // the payment form rather than silently
-                                    // here.
-                                    theme::section_text_field(ui, &mut card.billing_zip, false);
-                                }
-                            },
-                        ) {
-                            hide = Some(Slot::CardBillingZip);
-                        }
+                        theme::section_row(ui, Slot::CardBillingZip.label(), |ui| {
+                            if creating {
+                                theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                            } else if field_with_remove(ui, |ui, room| {
+                                // Free text, unlike the bank: a postcode has
+                                // no closed set to pick from, and a wrong one
+                                // fails in front of the user on the payment
+                                // form rather than silently here.
+                                theme::section_text_field_within(
+                                    ui,
+                                    &mut card.billing_zip,
+                                    false,
+                                    room,
+                                );
+                            }) {
+                                hide = Some(Slot::CardBillingZip);
                             }
+                        });
+                    }
+
+                    // 5. Bank: the picker and its Clear, centred on the row,
+                    // with the hint under them INSIDE the control column --
+                    // the place the `Item` card puts its un-file explanation.
+                    // Left outside the row it would start at the card's left
+                    // edge, level with the captions, and read as a sentence
+                    // about the card rather than about this field.
+                    if showing(Slot::CardBank) {
+                        theme::section_row(ui, Slot::CardBank.label(), |ui| {
+                            if creating {
+                                theme::section_disabled_text_field(ui, CARD_FIELD_CREATE_NOTICE);
+                            } else if bank_domain_row(ui, card) {
+                                hide = Some(Slot::CardBank);
+                            }
+                            ui.add_space(4.0);
+                            ui.label(RichText::new(BANK_HINT).size(11.0).color(theme::TEXT_FAINT));
+                        });
+                    }
                 }
                 FormBody::Identity => {
                     // **The kind this feature earns its keep on.** Eighteen
@@ -21936,13 +22310,14 @@ mod edit_pane_layout_tests {
             theme::TEXT_FAINT,
             "the Item card's caption is no longer §8a's label-column grey"
         );
+        // The card's row captions, and the inline captions on its `Expires`
+        // row, which are set to match them (spec 2026-10-09).
         for caption in [
             Slot::CardholderName.label(),
-            Slot::CardBrand.label(),
-            Slot::CardNumber.label(),
-            Slot::CardExpMonth.label(),
-            Slot::CardExpYear.label(),
-            Slot::CardCode.label(),
+            EXPIRES_ROW_LABEL,
+            EXPIRY_JOIN,
+            CARD_CODE_LABEL,
+            CARD_PIN_LABEL,
         ] {
             assert_eq!(
                 ink_of_run(&painted, caption),
@@ -21951,6 +22326,13 @@ mod edit_pane_layout_tests {
                  what a row that went back to the stacked shape looks like"
             );
         }
+        // `Card` is painted twice -- the row's caption, and the `Item` card's
+        // `Type` value -- so it is asked whether one of them is the caption's
+        // grey rather than whether there is exactly one.
+        assert!(
+            painted.inks.iter().any(|(t, ink)| t == CARD_ROW_LABEL && *ink == reference),
+            "the Card row's caption is drawn in a different grey from the Item card above it"
+        );
     }
 
     /// **And the same thing at the window floor, the other way round.**
@@ -21980,7 +22362,9 @@ mod edit_pane_layout_tests {
             theme::TEXT_MUTED,
             "the stacked arm's caption is no longer `theme::field_label`'s grey"
         );
-        for caption in [Slot::CardholderName.label(), Slot::CardExpMonth.label()] {
+        for caption in
+            [Slot::CardholderName.label(), EXPIRES_ROW_LABEL, CARD_CODE_LABEL, CARD_PIN_LABEL]
+        {
             assert_eq!(
                 ink_of_run(&painted, caption),
                 reference,
@@ -21990,21 +22374,27 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// The Remove chip survives the move into the label cell, at both widths.
+    /// Every optional row of a card still offers its way off the form, at both
+    /// widths -- **now inline at the end of the row** (spec 2026-10-09), where
+    /// it used to be a chip in the label cell.
     ///
-    /// It moved from beside the caption to under it (wide) and stayed beside
-    /// it (stacked), and "the chip is still on the form" is exactly the thing
-    /// a layout change like that can quietly lose: the cell is a fixed 130
-    /// points and a widget that did not fit would simply be clipped.
+    /// "The Remove is still on the form" is exactly the thing a layout change
+    /// like that can quietly lose. The Cardholder and ZIP rows carry a Remove,
+    /// the Card row carries the one that clears its number and brand, and the
+    /// Bank row's is its Clear.
     #[test]
     fn every_optional_row_still_offers_its_remove_at_both_widths() {
-        let item = filled_card_item();
-        let expected = EditDraft::from_item(&item)
+        let item = full_card_item();
+        let optional: Vec<Slot> = EditDraft::from_item(&item)
             .shown_slots(false)
-            .iter()
+            .into_iter()
             .filter(|slot| !slot.always_shown())
-            .count();
-        assert!(expected >= 4, "the card fixture has no optional rows, so this test is vacuous");
+            .collect();
+        assert_eq!(
+            optional,
+            vec![Slot::CardholderName, Slot::CardBank, Slot::CardBillingZip],
+            "the card fixture does not show every optional row, so this test is vacuous"
+        );
         for width in [WIDE_PANE_WIDTH, MIN_PANE_WIDTH] {
             let mut draft = EditDraft::from_item(&item);
             let pane = Vec2::new(width, 2400.0);
@@ -22018,13 +22408,330 @@ mod edit_pane_layout_tests {
                 Some(&item),
                 &detail::TotpState::NoSecret,
             );
-            let drawn =
-                painted.strings().iter().filter(|s| **s == SLOT_REMOVE_BUTTON).count();
+            let count = |label: &str| painted.strings().iter().filter(|s| **s == label).count();
             assert_eq!(
-                drawn, expected,
-                "{drawn} Remove chips on a {width}pt form that shows {expected} optional rows"
+                count(SLOT_REMOVE_BUTTON),
+                3,
+                "a {width}pt card form does not draw one Remove each on Cardholder, Card and ZIP: \
+                 {:?}",
+                painted.strings()
+            );
+            assert_eq!(count(BANK_CLEAR), 1, "the {width}pt Bank row has no Clear");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // The card's rows: three rows plus ZIP plus Bank, buttons inline
+    // (spec 2026-10-09-card-edit-layout-design)
+    // -----------------------------------------------------------------------
+
+    /// [`filled_card_item`] with everything the card form can show: its PIN
+    /// as Bitwarden's standard hidden custom field named `PIN`, a billing ZIP,
+    /// and a bank -- stored the way the form stores each of them.
+    fn full_card_item() -> VaultItem {
+        let mut item = filled_card_item();
+        item.fields = vec![serde_json::from_value(serde_json::json!(
+            {"name": "PIN", "value": "4321", "type": 1, "linkedId": null}
+        ))
+        .expect("a valid field")];
+        let item = crate::vault_bridge::with_custom_field(
+            &item,
+            crate::vault_bridge::BILLING_ZIP_FIELD,
+            "91307",
+        );
+        crate::vault_bridge::with_custom_field(
+            &item,
+            crate::favicon::BANK_DOMAIN_FIELD,
+            "dashboard.brex.com",
+        )
+    }
+
+    /// The card form at the wide width, with every secret on it revealed so
+    /// each box can be found by the value painted inside it.
+    fn full_card_frame(events: &[egui::Event], draft: &mut EditDraft) -> Painted {
+        let item = full_card_item();
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let ctx = styled_context(pane);
+        let _ = frame_for(&ctx, pane, draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
+        frame_for(&ctx, pane, draft, false, events, Some(&item), &detail::TotpState::NoSecret)
+    }
+
+    fn revealed_full_card_draft() -> EditDraft {
+        let mut draft = EditDraft::from_item(&full_card_item());
+        draft.card.reveal_number = true;
+        draft.card.reveal_code = true;
+        draft.card.reveal_pin = true;
+        draft
+    }
+
+    /// A row CAPTION: the leftmost run painting `label`, which is the label
+    /// column's. `Card` is also the `Item` card's `Type` value, painted in a
+    /// box further right, and that one is not a caption.
+    fn caption(painted: &Painted, label: &str) -> Rect {
+        painted
+            .rects_of(label)
+            .into_iter()
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .unwrap_or_else(|| panic!("no {label:?} caption on the form: {:?}", painted.strings()))
+    }
+
+    /// **The layout, top to bottom:** Cardholder, Card, Expires, Billing ZIP,
+    /// Bank -- and none of the old one-field-per-row captions.
+    #[test]
+    fn a_card_draws_its_four_field_rows_and_then_its_bank_in_the_designs_order() {
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame(&[], &mut draft);
+        let order = [
+            Slot::CardholderName.label(),
+            CARD_ROW_LABEL,
+            EXPIRES_ROW_LABEL,
+            BILLING_ZIP_LABEL,
+            BANK_LABEL,
+        ];
+        let tops: Vec<f32> = order.iter().map(|label| caption(&painted, label).top()).collect();
+        for pair in 0..order.len() - 1 {
+            assert!(
+                tops[pair] < tops[pair + 1],
+                "{:?} is not above {:?}: {tops:?}",
+                order[pair],
+                order[pair + 1]
             );
         }
+        for gone in [
+            Slot::CardBrand.label(),
+            Slot::CardNumber.label(),
+            Slot::CardExpMonth.label(),
+            Slot::CardExpYear.label(),
+            Slot::CardCode.label(),
+        ] {
+            assert!(
+                !painted.strings().contains(&gone),
+                "the card still draws a row of its own for {gone:?}: {:?}",
+                painted.strings()
+            );
+        }
+    }
+
+    /// **Brand with number**: the chooser, then the number box, on one line.
+    #[test]
+    fn the_brand_sits_left_of_the_number_on_the_same_line() {
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame(&[], &mut draft);
+        let brand = painted.frame_around(painted.rect_of("Visa"));
+        let number = painted.frame_around(painted.rect_of("4111111111111111"));
+        assert!(brand.right() < number.left(), "the brand {brand:?} is not left of {number:?}");
+        assert!(
+            (brand.center().y - number.center().y).abs() <= 0.5,
+            "the brand {brand:?} and the number {number:?} are not on one line"
+        );
+        assert!(
+            (caption(&painted, CARD_ROW_LABEL).top() - number.top()).abs() < theme::SECTION_FIELD_HEIGHT,
+            "the number is not on the Card row"
+        );
+    }
+
+    /// **Month, year, code and PIN share one line**, their boxes centred
+    /// within half a point of each other, with the inline captions centred on
+    /// them too -- and the PIN is drawn there once, not again among the custom
+    /// fields.
+    #[test]
+    fn month_year_code_and_pin_share_one_line_with_their_centres_aligned() {
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame(&[], &mut draft);
+        // The BOX round each value: the smallest painted rect enclosing it
+        // that is a row box's height. `frame_around` alone finds the text
+        // area egui paints inside a short box, which is not what the eye
+        // reads as the field.
+        let box_around = |inner: Rect| -> Rect {
+            let mut found: Vec<Rect> = painted
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|f| {
+                    f.height() >= theme::SECTION_FIELD_HEIGHT - 1.0
+                        && f.min.x <= inner.min.x + 1.0
+                        && f.max.x >= inner.max.x - 1.0
+                        && f.min.y <= inner.min.y + 1.0
+                        && f.max.y >= inner.max.y - 1.0
+                })
+                .collect();
+            found.sort_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())));
+            *found.first().unwrap_or_else(|| panic!("no box is painted round {inner:?}"))
+        };
+        let boxes: Vec<(&str, Rect)> = ["11", "2029", "417", "4321"]
+            .into_iter()
+            .map(|value| (value, box_around(painted.rect_of(value))))
+            .collect();
+        let line = boxes[0].1.center().y;
+        for (value, rect) in &boxes {
+            assert!(
+                (rect.center().y - line).abs() <= 0.5,
+                "the {value:?} box is centred at {} against the line's {line}",
+                rect.center().y
+            );
+            assert!(
+                (rect.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5,
+                "the {value:?} box is not a row box: {rect:?}"
+            );
+        }
+        for pair in boxes.windows(2) {
+            assert!(pair[0].1.right() < pair[1].1.left(), "{:?} is not left of {:?}", pair[0], pair[1]);
+        }
+        // The inline captions, centred on the boxes by their ink.
+        for label in [EXPIRY_JOIN, CARD_CODE_LABEL, CARD_PIN_LABEL] {
+            let middles: Vec<f32> = painted
+                .ink_middles
+                .iter()
+                .filter(|(text, _, _)| text == label)
+                .map(|(_, _, middle)| *middle)
+                .collect();
+            assert_eq!(middles.len(), 1, "expected one {label:?} on the form: {:?}", painted.strings());
+            assert!(
+                (middles[0] - line).abs() <= 1.0,
+                "{label:?} is centred at {} against the boxes' {line}",
+                middles[0]
+            );
+        }
+        // Drawn ONCE (`rect_of` asserts the count): the custom-fields card
+        // does not offer the field a second box, with its name in it.
+        let _ = painted.rect_of(CARD_PIN_LABEL);
+    }
+
+    /// **Every trailing button ends where the login form's do**: one right
+    /// edge for the whole form.
+    #[test]
+    fn every_trailing_button_lines_up_with_the_login_forms() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
+        let login = item_with_history(0);
+        let mut login_draft = EditDraft::from_item(&login);
+        let ctx = styled_context(pane);
+        let _ = frame_for(&ctx, pane, &mut login_draft, false, &[], Some(&login), &detail::TotpState::NoSecret);
+        let login_painted =
+            frame_for(&ctx, pane, &mut login_draft, false, &[], Some(&login), &detail::TotpState::NoSecret);
+        let copies = login_painted.rects_of(COPY_LABEL);
+        assert!(!copies.is_empty(), "the login form drew no Copy: {:?}", login_painted.strings());
+        let edge = login_painted.frame_around(copies[0]).right();
+
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame(&[], &mut draft);
+        let mut buttons = painted.rects_of(SLOT_REMOVE_BUTTON);
+        assert_eq!(buttons.len(), 3, "Cardholder, Card and ZIP each carry one Remove");
+        buttons.push(painted.rect_of(BANK_CLEAR));
+        for text in buttons {
+            let button = painted.frame_around(text);
+            assert!(
+                (button.right() - edge).abs() <= 0.5,
+                "a trailing button ends at {} where the login form's end at {edge}",
+                button.right()
+            );
+        }
+    }
+
+    /// **The Bank row**: a drop-down-style picker naming the bank, and Clear in
+    /// the form's button style, both centred on one row at the row's height.
+    #[test]
+    fn the_bank_rows_picker_and_clear_are_centred_on_the_row() {
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame(&[], &mut draft);
+        let picker = painted.frame_around(painted.rect_of("Brex"));
+        let clear = painted.frame_around(painted.rect_of(BANK_CLEAR));
+        assert!(
+            (picker.center().y - clear.center().y).abs() <= 0.5,
+            "the picker {picker:?} and Clear {clear:?} are not centred on one line"
+        );
+        assert!((picker.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5, "picker {picker:?}");
+        assert!((clear.height() - theme::ROW_BUTTON_HEIGHT_2B).abs() <= 0.5, "Clear {clear:?}");
+        assert!(picker.right() < clear.left(), "Clear is not after the picker");
+        // Clear is the Remove buttons' own control, in their own ink.
+        assert_eq!(ink_of_run(&painted, BANK_CLEAR), ink_of_run_first(&painted, SLOT_REMOVE_BUTTON));
+        // By name, never by the stored address.
+        assert!(
+            !painted.strings().iter().any(|s| s.contains("brex.com")),
+            "the bank's domain is painted: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// The first run painting `label`'s ink -- for a label drawn more than
+    /// once in one ink, such as the card's three Removes.
+    fn ink_of_run_first(painted: &Painted, label: &str) -> egui::Color32 {
+        painted
+            .inks
+            .iter()
+            .find(|(t, _)| t == label)
+            .map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("no {label:?} on the form: {:?}", painted.strings()))
+    }
+
+    /// The picker names the bank after the vault login it came from, and its
+    /// list shows each entry as `Name \u{2014} domain`.
+    #[test]
+    fn the_bank_picker_names_the_bank_after_its_login_and_lists_name_and_domain() {
+        let mut login = item_with_history(0);
+        login.name = "Brex corporate".to_string();
+        login.login.as_mut().unwrap().uris = vec![UriEntry {
+            uri: Some("https://dashboard.brex.com/login".to_string()),
+            other: serde_json::Map::new(),
+        }];
+        let mut draft = revealed_full_card_draft();
+        draft.card.bank_picking = true;
+        draft.offer_bank_domains(std::slice::from_ref(&login));
+        let painted = full_card_frame(&[], &mut draft);
+        assert!(
+            painted.strings().contains(&"Brex corporate"),
+            "the picker does not name the bank after its login: {:?}",
+            painted.strings()
+        );
+        assert!(
+            painted.strings().contains(&"Brex corporate \u{2014} dashboard.brex.com"),
+            "the list does not show the entry as name and domain: {:?}",
+            painted.strings()
+        );
+    }
+
+    /// **No Remove on the Expires row** (owner's decision): an empty box there
+    /// is simply not saved.
+    #[test]
+    fn no_remove_is_drawn_on_the_expires_row() {
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame(&[], &mut draft);
+        // The row, from its caption to the bottom of its boxes -- the label
+        // cell included, which is where the old rows' chips sat.
+        let caption = caption(&painted, EXPIRES_ROW_LABEL);
+        let boxes = painted.frame_around(painted.rect_of("2029"));
+        let row = Rect::from_x_y_ranges(
+            caption.left()..=f32::INFINITY,
+            caption.top().min(boxes.top())..=boxes.bottom(),
+        );
+        let removes = painted.rects_of(SLOT_REMOVE_BUTTON);
+        assert_eq!(removes.len(), 3, "the card does not draw its three other Removes");
+        for remove in removes {
+            assert!(
+                remove.bottom() < row.top() || remove.top() > row.bottom(),
+                "a Remove at {remove:?} is on the Expires row {row:?}"
+            );
+        }
+    }
+
+    /// **The Card row's one Remove clears the number and the brand**, the two
+    /// things on that row -- and the brand becomes a suggestion again.
+    #[test]
+    fn remove_on_the_card_row_clears_the_number_and_the_brand() {
+        let mut draft = revealed_full_card_draft();
+        let painted = full_card_frame(&[], &mut draft);
+        let number = painted.frame_around(painted.rect_of("4111111111111111"));
+        let remove = painted
+            .rects_of(SLOT_REMOVE_BUTTON)
+            .into_iter()
+            .find(|r| (r.center().y - number.center().y).abs() < theme::SECTION_FIELD_HEIGHT / 2.0)
+            .unwrap_or_else(|| panic!("no Remove on the Card row: {:?}", painted.strings()));
+        let _ = full_card_frame(&click(remove.center()), &mut draft);
+        assert_eq!(draft.card.number, "", "Remove left the number");
+        assert_eq!(draft.card.brand, "", "Remove left the brand");
+        // ...and the row stays, empty: the number is the floor of a card.
+        assert!(draft.shows(Slot::CardNumber));
+        draft.card.set_number("5555555555554444");
+        assert_eq!(draft.card.brand, "Mastercard", "a cleared brand is still the user's choice");
     }
 
     // -----------------------------------------------------------------------
@@ -24877,9 +25584,15 @@ mod edit_pane_layout_tests {
         // this list cannot drift from it.
         let body = form_body(kind, creating);
         if body != FormBody::UneditableNotice {
-            expected.extend(
-                EditDraft::empty_of(kind).shown_slots(creating).into_iter().map(Slot::label),
-            );
+            let mut captions: Vec<&'static str> = EditDraft::empty_of(kind)
+                .shown_slots(creating)
+                .into_iter()
+                .map(drawn_caption)
+                .collect();
+            // A card's rows hold more than one slot each, so one caption can
+            // stand for two of them -- consecutively, in `all_for`'s order.
+            captions.dedup();
+            expected.extend(captions);
         }
         match body {
             // The generator row belongs to the password box and is not a slot
@@ -24910,6 +25623,21 @@ mod edit_pane_layout_tests {
             expected.push(SLOT_ADD_BUTTON);
         }
         expected
+    }
+
+    /// **The caption a slot's box is drawn beside**, which on a card is no
+    /// longer always the slot's own label: the card's rows hold several slots
+    /// each (spec 2026-10-09) -- the brand and the number on the `Card` row;
+    /// the month and the year on the `Expires` row, with the security code
+    /// behind its own inline `Code` on the same line. Every other slot is its
+    /// own row, under its own label.
+    fn drawn_caption(slot: Slot) -> &'static str {
+        match slot {
+            Slot::CardBrand | Slot::CardNumber => CARD_ROW_LABEL,
+            Slot::CardExpMonth | Slot::CardExpYear => EXPIRES_ROW_LABEL,
+            Slot::CardCode => CARD_CODE_LABEL,
+            other => other.label(),
+        }
     }
 
     /// The rows an empty draft of `kind` must NOT be showing on an edit, by
@@ -30851,6 +31579,101 @@ mod card_custom_field_tests {
         zip.card.billing_zip.push('X');
         assert!(zip.is_dirty(), "editing the billing postcode did not register as a change");
     }
+
+    /// A field of `type`, built from JSON with the extra keys `bw` normalises
+    /// onto one -- see [`field`].
+    fn typed_field(name: &str, value: &str, kind: i64) -> VaultField {
+        serde_json::from_value(serde_json::json!(
+            {"name": name, "value": value, "type": kind, "linkedId": null}
+        ))
+        .expect("the fixture is valid field JSON")
+    }
+
+    /// **The PIN round-trips as Bitwarden's standard hidden custom field
+    /// named `PIN`**, and a changed one replaces the field it came from IN
+    /// PLACE, with every other field left exactly as it was.
+    #[test]
+    fn the_pin_round_trips_as_a_hidden_field_named_pin_replaced_in_place() {
+        let mut item = card_item();
+        // Arrived spelled the way another client might spell it, between two
+        // of the user's own fields.
+        item.fields.insert(1, typed_field("pin", "1234", 0));
+        let before = serde_json::to_value(&item).unwrap()["fields"].clone();
+
+        let mut draft = EditDraft::from_item(&item);
+        assert_eq!(draft.card.pin, "1234", "the card's PIN did not arrive in the form");
+        // The custom-fields card does not draw it: the PIN has one box, on
+        // the card.
+        assert_eq!(draft.fields[1].role(), FieldRole::CardPin);
+        // Untouched, the save is byte for byte what was read.
+        assert_eq!(serde_json::to_value(draft.apply_to(&item)).unwrap()["fields"], before);
+
+        draft.card.pin = "9876".into();
+        assert!(draft.is_dirty(), "editing the PIN did not register as a change");
+        let saved = serde_json::to_value(draft.apply_to(&item)).unwrap();
+        let fields = saved["fields"].as_array().unwrap();
+        assert_eq!(fields.len(), 4, "the field count changed");
+        assert_eq!(fields[1]["name"], serde_json::json!("PIN"));
+        assert_eq!(fields[1]["value"], serde_json::json!("9876"));
+        assert_eq!(fields[1]["type"], serde_json::json!(1), "the PIN is not a hidden field");
+        for i in [0, 2, 3] {
+            assert_eq!(fields[i], before[i], "field {i} was rewritten by a PIN change");
+        }
+
+        // A card with no PIN gains one at the end, as the standard field.
+        let mut fresh = EditDraft::from_item(&card_item());
+        assert_eq!(fresh.card.pin, "");
+        fresh.card.pin = "2468".into();
+        let saved = fresh.apply_to(&card_item());
+        let last = serde_json::to_value(saved.fields.last().unwrap()).unwrap();
+        assert_eq!(last, serde_json::json!({"name": "PIN", "value": "2468", "type": 1}));
+
+        // And a discard wipes it with the other secrets.
+        draft.zeroize_secrets();
+        assert_eq!(draft.card.pin, "", "a discard left the PIN in memory");
+    }
+
+    /// **An empty month, year, code, PIN or ZIP saves nothing** for that
+    /// field -- neither on a card that never had one, nor (as an absent value)
+    /// on one that did.
+    #[test]
+    fn an_empty_month_year_code_pin_or_zip_saves_nothing() {
+        // Never had them: an untouched save adds none of the five.
+        let bare = card_item();
+        let mut bare_no_extras = bare.clone();
+        bare_no_extras.fields.retain(|f| f.name.as_deref() == Some("Branch"));
+        let draft = EditDraft::from_item(&bare_no_extras);
+        assert_eq!(
+            serde_json::to_value(draft.apply_to(&bare_no_extras)).unwrap(),
+            serde_json::to_value(&bare_no_extras).unwrap(),
+            "empty boxes wrote something onto a card that had none of them"
+        );
+
+        // Had all five: emptied, each one is gone.
+        let mut full = bare.clone();
+        full.fields.push(typed_field("PIN", "1234", 1));
+        let card = full.card.as_mut().unwrap();
+        card.exp_month = Some("10".into());
+        card.exp_year = Some("2029".into());
+        card.code = Some(Zeroizing::new("321".into()));
+        let mut draft = EditDraft::from_item(&full);
+        draft.card.exp_month.clear();
+        draft.card.exp_year.clear();
+        draft.card.code.clear();
+        draft.card.pin.clear();
+        draft.card.billing_zip.clear();
+        let saved = serde_json::to_value(draft.apply_to(&full)).unwrap();
+        for key in ["expMonth", "expYear", "code"] {
+            assert!(saved["card"].get(key).is_none(), "an emptied {key} was saved: {saved}");
+        }
+        let names: Vec<&str> = saved["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["Branch", BANK_DOMAIN_FIELD], "an emptied PIN or ZIP was saved");
+    }
 }
 
 /// **The login's websites**: how they are read, how they are written, and what
@@ -31381,7 +32204,12 @@ mod sparse_form_tests {
             Slot::all_for(kind).into_iter().filter(|s| s.always_shown()).map(Slot::label).collect()
         };
         assert_eq!(floor(ItemKind::Login), vec!["Username", "Password"]);
-        assert_eq!(floor(ItemKind::Card), vec!["Brand", "Number"]);
+        // The expiry and the code are floor since they share the `Expires`
+        // row with the PIN, which carries no Remove (spec 2026-10-09).
+        assert_eq!(
+            floor(ItemKind::Card),
+            vec!["Brand", "Number", "Expiry month", "Expiry year", "Security code"]
+        );
         assert_eq!(floor(ItemKind::Identity), vec!["First name", "Last name"]);
         assert_eq!(floor(ItemKind::SecureNote), vec!["Note"]);
         assert_eq!(
@@ -31518,7 +32346,9 @@ mod sparse_form_tests {
                 }
             }
         }
-        assert_eq!(cases, 2 + 6 + 16, "the slot walk covered {cases} rows");
+        // A card's optional rows are its cardholder, bank and ZIP: the expiry
+        // and the code became floor with the `Expires` row (spec 2026-10-09).
+        assert_eq!(cases, 2 + 3 + 16, "the slot walk covered {cases} rows");
     }
 
     /// [`edit_pane_layout_tests::fill`]'s twin, kept here so this module does

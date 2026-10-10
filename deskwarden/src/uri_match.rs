@@ -329,9 +329,40 @@ fn base_domain(url: &Url) -> Option<String> {
     }
 }
 
+/// The registrable domain of a host or a saved website, by the same
+/// public-suffix rules [`base_domain`] compares with: `dashboard.brex.com` is
+/// `brex.com`, and `chase.co.uk` is itself.
+///
+/// **`None` for an IP address, `localhost`, or a value that is not a web
+/// address.** None of them has a registrable domain; [`base_domain`]'s answer
+/// for the first two is the host itself, which is a comparison key and not a
+/// name. The card form's bank label asks this to name a bank, and a bank
+/// named `192` is worse than the address it came from.
+pub fn registrable_domain(saved: &str) -> Option<String> {
+    let url = saved_url(saved)?;
+    match url.host()? {
+        Host::Domain(domain) if !domain.trim_end_matches('.').eq_ignore_ascii_case("localhost") => {
+            base_domain(&url)
+        }
+        Host::Domain(_) | Host::Ipv4(_) | Host::Ipv6(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_registrable_domain_is_the_public_suffix_lists_and_nothing_for_an_address() {
+        assert_eq!(registrable_domain("dashboard.brex.com").as_deref(), Some("brex.com"));
+        assert_eq!(registrable_domain("https://www.Chase.co.uk/login").as_deref(), Some("chase.co.uk"));
+        assert_eq!(registrable_domain("brex.com").as_deref(), Some("brex.com"));
+        assert_eq!(registrable_domain("192.168.1.10"), None);
+        assert_eq!(registrable_domain("http://[::1]:8080/"), None);
+        assert_eq!(registrable_domain("localhost"), None);
+        assert_eq!(registrable_domain("not a url"), None);
+        assert_eq!(registrable_domain(""), None);
+    }
 
     fn page(text: &str) -> Url {
         Url::parse(text).expect("the fixture page is a URL")

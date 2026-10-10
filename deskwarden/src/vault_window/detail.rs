@@ -1365,6 +1365,29 @@ pub struct CardFields {
     /// `vault_bridge::BILLING_ZIP_FIELD` custom field, for the same reason
     /// and filled by the same function as [`Self::bank`].
     pub billing_zip: Option<String>,
+    /// The card's PIN: Bitwarden's standard hidden custom field named `PIN`
+    /// (`vault_bridge::card_pin_index`), drawn here -- masked, after the
+    /// security code -- rather than on CUSTOM FIELDS. Filled by
+    /// [`card_pane_fields`] alone, like [`Self::bank`].
+    pub pin: Option<CardPin>,
+}
+
+/// A card's PIN as CARD DETAILS draws it: **which field it is**, because the
+/// row's eye and its copy are the hidden custom field's own -- keyed by its
+/// index into `item.fields`, exactly as a CUSTOM FIELDS row is (see
+/// [`DetailAction::CopyField`]) -- and the trimmed value it paints.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CardPin {
+    pub index: usize,
+    pub value: String,
+}
+
+/// Hand-written so the PIN never reaches a formatter -- the rule
+/// [`CustomFieldFace`]'s `Debug` keeps for every hidden field.
+impl std::fmt::Debug for CardPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CardPin").field("index", &self.index).field("value", &"<elided>").finish()
+    }
 }
 
 impl CardFields {
@@ -1380,6 +1403,7 @@ impl CardFields {
             code,
             bank,
             billing_zip,
+            pin,
         } = self;
         cardholder.is_none()
             && brand.is_none()
@@ -1388,6 +1412,7 @@ impl CardFields {
             && code.is_none()
             && bank.is_none()
             && billing_zip.is_none()
+            && pin.is_none()
     }
 }
 
@@ -1404,6 +1429,7 @@ pub fn card_fields(data: &CardData) -> CardFields {
         code: non_empty(data.code.as_deref().map(|c| c.as_str())).map(str::to_string),
         bank: None,
         billing_zip: None,
+        pin: None,
     }
 }
 
@@ -1431,12 +1457,20 @@ fn card_pane_fields(item: &VaultItem) -> Option<CardFields> {
         .find(|f| f.name.as_deref() == Some(crate::vault_bridge::BILLING_ZIP_FIELD))
         .and_then(|f| non_empty(f.value.as_deref().map(|v| v.as_str())))
         .map(str::to_string);
-    if item.card.is_none() && bank.is_none() && billing_zip.is_none() {
+    // The PIN, through the one reader the edit form and the CUSTOM FIELDS
+    // card's exclusion also use, trimmed and blank meaning absent -- the
+    // custom-field rows' own rule.
+    let pin = crate::vault_bridge::card_pin_index(item).and_then(|index| {
+        non_empty(item.fields[index].value.as_deref().map(|v| v.as_str()))
+            .map(|value| CardPin { index, value: value.to_string() })
+    });
+    if item.card.is_none() && bank.is_none() && billing_zip.is_none() && pin.is_none() {
         return None;
     }
     let mut fields = item.card.as_ref().map(card_fields).unwrap_or_default();
     fields.bank = bank;
     fields.billing_zip = billing_zip;
+    fields.pin = pin;
     Some(fields)
 }
 
@@ -8527,6 +8561,7 @@ fn card_rows(
         code,
         bank,
         billing_zip,
+        pin,
     } = fields;
 
     // Whether the card's FACE -- the number line and the expiry/code line --
@@ -8637,6 +8672,30 @@ fn card_rows(
         }
     }
 
+    // **The PIN, after the security code** -- masked, with its own eye, and
+    // copied the way a hidden custom field is: it IS one (Bitwarden's
+    // standard hidden field named `PIN`), so its reveal flag and its copy are
+    // that field's, keyed by its index. `CopyField` is on the exposing side
+    // of the window's re-prompt gate exactly as `CopyCardCode` is, so a
+    // protected card asks for the master password before either. Left off
+    // CUSTOM FIELDS by [`custom_field_rows`], so it is drawn once.
+    if let Some(CardPin { index, value }) = &pin {
+        face = true;
+        // A field past `MAX_FIELD_ROWS` has no flag to keep; see
+        // `custom_fields_card_rows`, which runs out the same safe way.
+        let mut unkept = false;
+        let revealed = reveal.custom_fields.get_mut(*index).unwrap_or(&mut unkept);
+        masked_row(
+            ui,
+            CARD_PIN_LABEL,
+            value,
+            revealed,
+            action,
+            DetailAction::CopyField(*index),
+            MaskedFace::default(),
+        );
+    }
+
     // **The cardholder last, under the card's one rule.** The design's reason
     // is that it is the least-consulted field and that this slot is where a
     // linked identity will render when the vault grows one; the rule is what
@@ -8663,13 +8722,37 @@ fn card_rows(
     // rows, as on the LOGIN CREDENTIALS card, and never above the first thing
     // the card draws -- the heading's own rule is already there.
     let mut above = face || cardholder.is_some();
-    for (label, value) in [(CARD_BANK_LABEL, &bank), (CARD_BILLING_ZIP_LABEL, &billing_zip)] {
-        let Some(v) = value else { continue };
+    // **The bank by NAME** (see [`bank_name`]): the stored domain is how its
+    // icon is found, and stays visible as the row's tooltip; the name is what
+    // is drawn and what a click copies. This pane is not handed the vault's
+    // items, so the name is the domain's own (`Brex` for
+    // `dashboard.brex.com`) rather than the login's.
+    if let Some(domain) = &bank {
         if above {
             theme::row_rule(ui);
         }
         above = true;
-        credential_row(ui, label, v, None, action, DetailAction::CopyValue(v.clone()));
+        let name = bank_name(domain, &[]);
+        copy_row(
+            ui,
+            CARD_BANK_LABEL,
+            |ui| {
+                ui.label(RichText::new(name.as_str()).size(ROW_VALUE_SIZE).color(theme::INK))
+                    .on_hover_text(domain.as_str());
+            },
+            |_ui| {},
+            DetailAction::CopyValue(name.clone()),
+            None,
+            row_offers_copy(&name),
+            action,
+            RowShape::Columns,
+        );
+    }
+    if let Some(v) = &billing_zip {
+        if above {
+            theme::row_rule(ui);
+        }
+        credential_row(ui, CARD_BILLING_ZIP_LABEL, v, None, action, DetailAction::CopyValue(v.clone()));
     }
 }
 
@@ -8698,6 +8781,62 @@ const CARD_BANK_LABEL: &str = super::detail_edit::BANK_LABEL;
 /// The edit form's own words for the billing postcode row
 /// (`detail_edit::BILLING_ZIP_LABEL`), for the same reason.
 const CARD_BILLING_ZIP_LABEL: &str = super::detail_edit::BILLING_ZIP_LABEL;
+/// The card's PIN row, in the edit form's word for it
+/// (`detail_edit::CARD_PIN_LABEL`) -- which is also the custom field's own
+/// name, so every Bitwarden client calls it the same thing.
+const CARD_PIN_LABEL: &str = super::detail_edit::CARD_PIN_LABEL;
+
+/// **What a card's bank is called on screen**, given the domain it is stored
+/// as and the vault's items.
+///
+/// The stored value stays the domain, because the domain is what finds the
+/// icon; only what is drawn is a name. Resolved in the owner's order:
+///
+/// 1. **The name of the vault login the domain was chosen from.** The bank
+///    picker offers the vault's own logins' domains, so the logins whose saved
+///    websites have this host are where it came from: exactly one, or several
+///    all carrying the same name, and that name is the bank's.
+/// 2. **Otherwise the registrable domain's first label, capitalised** --
+///    `dashboard.brex.com` is `Brex`, `chase.co.uk` is `Chase` -- by the
+///    public-suffix rules `uri_match` already compares websites with.
+/// 3. **Otherwise the stored value as it is**: an IP address, or something
+///    that is not a web address at all.
+pub(crate) fn bank_name(domain: &str, items: &[VaultItem]) -> String {
+    let host = domain.trim();
+    // 1. The logins whose saved websites have this host. Any of their
+    //    websites, not only the first: the picker's own list comes from the
+    //    first, but a login saved for two sites of one bank is still that
+    //    bank's login.
+    let mut names = items
+        .iter()
+        .filter(|item| ItemKind::of(item) == ItemKind::Login)
+        .filter(|item| {
+            item.login.as_ref().is_some_and(|login| {
+                login.uris.iter().filter_map(|u| u.uri.as_deref()).any(|uri| {
+                    crate::favicon::domain_from_uri(uri)
+                        .is_some_and(|saved| saved.eq_ignore_ascii_case(host))
+                })
+            })
+        })
+        .map(|item| item.name.trim());
+    if let Some(first) = names.next() {
+        if !first.is_empty() && names.all(|name| name == first) {
+            return first.to_string();
+        }
+    }
+    // 2. The registrable domain's first label, capitalised.
+    let label = crate::uri_match::registrable_domain(host)
+        .and_then(|registrable| registrable.split('.').next().map(str::to_string))
+        .filter(|label| !label.is_empty());
+    if let Some(label) = label {
+        let mut chars = label.chars();
+        if let Some(first) = chars.next() {
+            return first.to_uppercase().chain(chars).collect();
+        }
+    }
+    // 3. As it is.
+    domain.to_string()
+}
 
 /// How wide a digits run wants to be, unwrapped -- the question
 /// [`digits_fit`] asks, asked from outside a row.
@@ -9339,7 +9478,21 @@ struct CustomFieldRow<'a> {
 ///   trimmed, as the identity's are.
 /// * Booleans and linked fields are always drawn: `false` and "linked to the
 ///   password" are both something to say.
+///
+/// **A card's PIN is not drawn here either**: it is a row of CARD DETAILS
+/// ([`card_pane_fields`]), after the security code, and on a card only -- a
+/// field called `PIN` on any other kind is an ordinary custom field. See
+/// `vault_bridge::card_pin_index`, the one reader of which field that is.
 fn custom_field_rows(item: &VaultItem) -> Vec<CustomFieldRow<'_>> {
+    let pin = crate::vault_bridge::card_pin_index(item);
+    every_custom_field_row(item).into_iter().filter(|row| Some(row.index) != pin).collect()
+}
+
+/// [`custom_field_rows`] **with a card's PIN still in it** -- what a copy is
+/// resolved against, because the PIN's row on CARD DETAILS copies through
+/// [`DetailAction::CopyField`] like any hidden field. See
+/// [`custom_field_copy_text`].
+fn every_custom_field_row(item: &VaultItem) -> Vec<CustomFieldRow<'_>> {
     item.fields
         .iter()
         .enumerate()
@@ -9381,8 +9534,11 @@ fn custom_field_rows(item: &VaultItem) -> Vec<CustomFieldRow<'_>> {
 ///
 /// The one producer `vault_window::mod`'s [`DetailAction::CopyField`] arm
 /// reads, so a copy and the row it came from cannot disagree about trimming.
+///
+/// Over [`every_custom_field_row`], so a card's PIN -- painted on CARD
+/// DETAILS by the same trimmed rule -- copies as well.
 pub fn custom_field_copy_text(item: &VaultItem, index: usize) -> Option<&str> {
-    custom_field_rows(item)
+    every_custom_field_row(item)
         .into_iter()
         .find(|row| row.index == index)
         .and_then(|row| match row.face {
@@ -17232,7 +17388,9 @@ mod tests {
         let heading = frame.rect_of("CARD DETAILS");
         let holder = frame.rect_of("Denis Platonov");
         let bank_label = frame.rect_of(CARD_BANK_LABEL);
-        let bank = frame.rect_of("brex.com");
+        // By NAME: the stored `brex.com` is how the icon is found, and `Brex`
+        // is what the bank is called. See [`bank_name`].
+        let bank = frame.rect_of("Brex");
         let zip_label = frame.rect_of(CARD_BILLING_ZIP_LABEL);
         let zip = frame.rect_of("94107");
         assert!(heading.bottom() < holder.top(), "the cardholder is not under the heading");
@@ -17248,11 +17406,12 @@ mod tests {
         assert!(!frame.painted(CUSTOM_FIELDS_CARD_HEADING), "{:?}", frame.strings());
     }
 
-    /// Copy-on-click, as the Cardholder row above them does.
+    /// Copy-on-click, as the Cardholder row above them does -- and the bank
+    /// copies the NAME it shows, not the domain behind it.
     #[test]
     fn clicking_a_cards_bank_or_billing_zip_copies_it() {
         let item = napps_brex();
-        for value in ["brex.com", "94107"] {
+        for value in ["Brex", "94107"] {
             let mut pane = Pane::new();
             let laid_out = pane.idle(&item, &TotpState::NoSecret);
             let clicked = pane.click(&item, &TotpState::NoSecret, laid_out.rect_of(value).center());
@@ -17286,12 +17445,12 @@ mod tests {
         item.card = Some(crate::vault_bridge::CardData::default());
         let texts = painted(&item, &TotpState::NoSecret);
         assert!(!contains(&texts, "No card details on this item."), "{texts:?}");
-        assert!(contains(&texts, "brex.com") && contains(&texts, "94107"), "{texts:?}");
+        assert!(contains(&texts, "Brex") && contains(&texts, "94107"), "{texts:?}");
 
         item.card = None;
         let texts = painted(&item, &TotpState::NoSecret);
         assert!(!contains(&texts, "No card details on this item."), "{texts:?}");
-        assert!(contains(&texts, "brex.com") && contains(&texts, "94107"), "{texts:?}");
+        assert!(contains(&texts, "Brex") && contains(&texts, "94107"), "{texts:?}");
 
         // Blank values: no rows, and the note is back.
         for field in &mut item.fields {
@@ -17312,6 +17471,141 @@ mod tests {
         let fields = card_pane_fields(&item).expect("the card has fields");
         assert_eq!(fields.bank, crate::favicon::icon_domain_for(&item));
         assert_eq!(fields.billing_zip.as_deref(), Some("94107"));
+    }
+
+    /// The bank is drawn by NAME, with the stored domain nowhere on the row.
+    #[test]
+    fn a_cards_bank_is_shown_by_name_and_not_by_its_address() {
+        let item = crate::vault_bridge::with_custom_field(
+            &napps_brex(),
+            crate::favicon::BANK_DOMAIN_FIELD,
+            "dashboard.brex.com",
+        );
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(texts.iter().any(|t| t == "Brex"), "the bank is not drawn by its name: {texts:?}");
+        assert!(!contains(&texts, "brex.com"), "the bank's address is still painted: {texts:?}");
+    }
+
+    /// A login as the bank picker sees one: a name and one saved website.
+    fn bank_login(name: &str, uri: &str) -> VaultItem {
+        let mut item = an_item(Some(1));
+        item.name = name.to_string();
+        item.login = Some(crate::vault_bridge::LoginData {
+            uris: vec![crate::vault_bridge::UriEntry {
+                uri: Some(uri.to_string()),
+                other: serde_json::Map::new(),
+            }],
+            ..Default::default()
+        });
+        item
+    }
+
+    /// [`bank_name`]'s three steps, in the owner's order.
+    #[test]
+    fn a_banks_name_is_its_logins_then_its_domains_first_label_then_the_value() {
+        let brex = "dashboard.brex.com";
+        // 1. The one login the domain came from.
+        let one = [bank_login("Brex corporate", "https://dashboard.brex.com/login")];
+        assert_eq!(bank_name(brex, &one), "Brex corporate");
+        // ...or several, all carrying the same name; any of their websites
+        // counts, not only the first.
+        let mut second = bank_login("Brex corporate", "https://example.com/");
+        second.login.as_mut().unwrap().uris.push(crate::vault_bridge::UriEntry {
+            uri: Some("https://DASHBOARD.brex.com".to_string()),
+            other: serde_json::Map::new(),
+        });
+        let same = [one[0].clone(), second];
+        assert_eq!(bank_name(brex, &same), "Brex corporate");
+        // Several with different names: no login decides, so the domain does.
+        let split = [one[0].clone(), bank_login("Brex (old)", "https://dashboard.brex.com/")];
+        assert_eq!(bank_name(brex, &split), "Brex");
+        // A card carrying the same bank is not a login the bank was chosen
+        // from.
+        let mut card = an_item(Some(3));
+        card.name = "Some card".to_string();
+        let card = crate::vault_bridge::with_custom_field(&card, crate::favicon::BANK_DOMAIN_FIELD, brex);
+        assert_eq!(bank_name(brex, &[card]), "Brex");
+        // 2. The registrable domain's first label, capitalised.
+        assert_eq!(bank_name(brex, &[]), "Brex");
+        assert_eq!(bank_name("online.chase.co.uk", &[]), "Chase");
+        // 3. The value as it is.
+        assert_eq!(bank_name("192.168.1.10", &[]), "192.168.1.10");
+        assert_eq!(bank_name("intranet", &[]), "intranet");
+    }
+
+    /// The reported card with a PIN on it, stored as Bitwarden's standard
+    /// hidden custom field named `PIN`, and one field of the user's own after
+    /// it so the CUSTOM FIELDS card is drawn and can be looked inside.
+    fn napps_brex_with_pin() -> VaultItem {
+        let mut item = napps_brex();
+        item.fields.push(custom_field("PIN", Some("4321"), Some(1)));
+        item.fields.push(custom_field("Branch", Some("north"), Some(0)));
+        item
+    }
+
+    /// **The PIN is drawn once, on CARD DETAILS, masked, after the code** --
+    /// and not again in CUSTOM FIELDS.
+    #[test]
+    fn a_cards_pin_is_masked_after_its_code_and_not_in_custom_fields() {
+        let item = napps_brex_with_pin();
+        let pin_index = crate::vault_bridge::card_pin_index(&item).expect("the fixture has a PIN");
+        let mut pane = Pane::new();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        // CONTROL: CUSTOM FIELDS is drawn, with the user's other field in it.
+        assert!(frame.painted(CUSTOM_FIELDS_CARD_HEADING), "{:?}", frame.strings());
+        assert!(frame.painted("north"), "{:?}", frame.strings());
+        // Exactly one PIN row (`rect_of` asserts the count), on CARD DETAILS:
+        // under the code, and above the CUSTOM FIELDS card.
+        let pin = frame.rect_of(CARD_PIN_LABEL);
+        let code = frame.rect_of(CODE_LABEL);
+        assert!(code.bottom() <= pin.top(), "the PIN is not after the security code");
+        assert!(
+            pin.bottom() < frame.rect_of(CUSTOM_FIELDS_CARD_HEADING).top(),
+            "the PIN is not on CARD DETAILS"
+        );
+        assert!(
+            !frame.strings().iter().any(|s| s.contains("4321")),
+            "the PIN was painted in the clear: {:?}",
+            frame.strings()
+        );
+        assert!(
+            !custom_field_rows(&item).iter().any(|row| row.index == pin_index),
+            "the PIN is still one of the CUSTOM FIELDS rows"
+        );
+
+        // Its own eye: the hidden field's flag, keyed by its index.
+        let mut reveal = RevealState::default();
+        reveal.custom_fields[pin_index] = true;
+        let revealed = painted_with_reveal(&item, &TotpState::NoSecret, reveal);
+        assert!(contains(&revealed, "4321"), "the PIN's reveal flag did nothing: {revealed:?}");
+    }
+
+    /// The PIN copies the way a hidden custom field does -- by index, through
+    /// `CopyField`, which the window gates behind the master-password
+    /// re-prompt exactly as it gates the security code.
+    #[test]
+    fn clicking_a_cards_pin_copies_it_by_index() {
+        let item = napps_brex_with_pin();
+        let pin_index = crate::vault_bridge::card_pin_index(&item).expect("the fixture has a PIN");
+        let mut pane = Pane::new();
+        let laid_out = pane.idle(&item, &TotpState::NoSecret);
+        let clicked =
+            pane.click(&item, &TotpState::NoSecret, laid_out.rect_of(CARD_PIN_LABEL).center());
+        assert_eq!(clicked.action, DetailAction::CopyField(pin_index));
+        // What the window then puts on the clipboard is the PIN itself.
+        assert_eq!(custom_field_copy_text(&item, pin_index), Some("4321"));
+    }
+
+    /// **A card's only.** A field called `PIN` on any other kind is an
+    /// ordinary custom field and stays on CUSTOM FIELDS.
+    #[test]
+    fn a_pin_field_on_anything_but_a_card_stays_in_custom_fields() {
+        let mut item = an_item(Some(4));
+        item.fields = vec![custom_field("PIN", Some("4321"), Some(1))];
+        let rows = custom_field_rows(&item);
+        assert_eq!(rows.len(), 1, "a non-card's PIN field left CUSTOM FIELDS");
+        let texts = painted(&item, &TotpState::NoSecret);
+        assert!(contains(&texts, CUSTOM_FIELDS_CARD_HEADING), "{texts:?}");
     }
 
     /// How many `theme::hairline` rules -- the heavier, `HAIRLINE`-coloured
