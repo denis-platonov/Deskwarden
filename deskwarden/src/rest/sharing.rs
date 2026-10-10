@@ -552,6 +552,12 @@ pub(crate) struct Capabilities {
     /// `GET /config`'s `server.name`, read once. Decides the
     /// roster-visibility warning.
     pub(crate) server_name: Option<String>,
+    /// `/config` has answered, so [`Self::server_name`] is the server's own
+    /// word -- a name, or none. Kept apart from [`Self::loaded`] (DW2 fix
+    /// round 1): a `/config` that was unreachable for one pass must not
+    /// leave the server unnamed for the whole session, so it is asked again
+    /// on every later pass until it answers. Unknown warns, as unnamed does.
+    pub(crate) name_known: bool,
 }
 
 /// The signed-in account, as the profile says.
@@ -973,24 +979,40 @@ impl Sharing {
     /// [`Self::note_directory`] filed it -- so the account costs no request.
     /// The name is `/config`'s `server.name`, read for one sentence -- the
     /// roster-visibility warning ([`SharingView::roster_visible_to_recipients`])
-    /// -- and nothing else branches on it. A `/config` that does not answer
-    /// leaves the server unnamed, which warns. A failure to read the account
-    /// is not remembered: the next pass asks again.
+    /// -- and nothing else branches on it. A failure to read the account is
+    /// not remembered: the next pass asks again.
+    ///
+    /// **The name is asked until `/config` answers** (fix round 1), apart
+    /// from `loaded`: an unreachable server, a 5xx or an ended session
+    /// leaves it unknown, which warns, and every later pass asks again. Any
+    /// answer -- a name, `null`, or a 4xx -- is the server's word and is
+    /// kept: a server with no `/config` route would otherwise be asked on
+    /// every write for the rest of the session, for a sentence that cannot
+    /// change.
     pub(crate) fn ensure_loaded(&self) -> Result<(), SharingError> {
-        if self.held().capabilities.loaded {
+        if !self.held().capabilities.loaded {
+            self.account_id()?;
+            self.held().capabilities.loaded = true;
+        }
+        if self.held().capabilities.name_known {
             return Ok(());
         }
-        self.account_id()?;
         let name = match self.call(|client, auth| sharing_api::server_name(client, &mut auth.session)) {
-            Ok(name) => name,
-            Err(e) => {
-                log::info!("the server's /config could not be read for its name: {e}");
+            Ok(name) => Some(name),
+            Err(SharingError::Vault(VaultError::Unreachable(_) | VaultError::Unauthorized)) => {
+                log::info!("the server's /config could not be reached for its name; the next pass asks again");
                 None
             }
+            Err(e) => {
+                log::info!("the server's /config gave no name: {e}");
+                Some(None)
+            }
         };
-        let mut held = self.held();
-        held.capabilities.server_name = name;
-        held.capabilities.loaded = true;
+        if let Some(name) = name {
+            let mut held = self.held();
+            held.capabilities.server_name = name;
+            held.capabilities.name_known = true;
+        }
         Ok(())
     }
 
@@ -1672,16 +1694,25 @@ impl Sharing {
         // follow. After a No to an org that could have been used, the
         // sentence stays [`NO_FRESH_ORG`]: making yet another org of the same
         // name would only be asked about again.
-        let id = self
-            .call(|client, auth| sharing_api::create_organization(client, &mut auth.session, &body))
-            .map_err(|e| {
-                if matches!(e, SharingError::Refused(_) | SharingError::Vault(VaultError::Http(_))) {
-                    self.held().capabilities.creates_orgs = Some(false);
-                    if refused == NO_FRESH_ORG { e.or_say(refused) } else { e.or_say(&needs_org(&account.email)) }
-                } else {
-                    e.or_say(refused)
-                }
-            })?;
+        //
+        // **Only a 400 is that answer** (fix round 1): the attribute throws
+        // `BadRequestException`, which `sharing_answer` reads as
+        // `RestError::Rejected`. The raw answer is kept here, before
+        // [`Self::call`] folds it into `SharingError`, because there a 400
+        // with no sentence and a 403 or a 429 are the same
+        // `VaultError::Http`. Any other status is no verdict on making
+        // organisations -- a rate limit passes -- so it says `refused` and
+        // learns nothing.
+        let answer = self.call(|client, auth| Ok(sharing_api::create_organization(client, &mut auth.session, &body)))?;
+        let id = match answer {
+            Ok(id) => id,
+            Err(RestError::Rejected { description, .. }) => {
+                self.held().capabilities.creates_orgs = Some(false);
+                let sentence = if refused == NO_FRESH_ORG { refused.to_string() } else { needs_org(&account.email) };
+                return Err(SharingError::Refused(description).or_say(&sentence));
+            }
+            Err(other) => return Err(SharingError::Vault(crate::rest::backend::rest_error(other)).or_say(refused)),
+        };
         self.held().capabilities.creates_orgs = Some(true);
         Ok((id, org_key))
     }
@@ -3583,6 +3614,52 @@ mod tests {
         config.assert();
         assert_eq!(engine.held().capabilities.server_name.as_deref(), Some("NodeWarden"));
         assert!(!engine.view(&[]).roster_visible_to_recipients);
+    }
+
+    /// **A `/config` that fails for one pass is asked again** (fix round 1):
+    /// a 500 leaves the name unknown -- warned about, as an unnamed server
+    /// is -- without costing the session its answer, and the next pass that
+    /// reaches it learns the name and stops asking.
+    #[test]
+    fn a_config_that_failed_is_asked_again_until_it_answers() {
+        let (mut server, backend) = signed_in_with_no_sync_route();
+        let engine = backend.sharing_engine();
+        engine.set_up(SharingSetup::none());
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
+        let failing = server.mock("GET", "/api/config").with_status(500).expect(1).create();
+        engine.ensure_loaded().expect("loaded, whatever /config said");
+        failing.assert();
+        failing.remove();
+        assert!(engine.view(&[]).available);
+        assert!(engine.view(&[]).roster_visible_to_recipients, "an unknown name warns");
+        assert!(!engine.held().capabilities.name_known);
+        let config = server
+            .mock("GET", "/api/config")
+            .with_body(r#"{"object":"config","server":{"name":"Vaultwarden","url":"https://github.com/dani-garcia/vaultwarden"}}"#)
+            .expect(1)
+            .create();
+        engine.ensure_loaded().expect("a second pass");
+        engine.ensure_loaded().expect("a third pass, which does not ask");
+        config.assert();
+        assert!(engine.held().capabilities.name_known);
+        assert!(!engine.view(&[]).roster_visible_to_recipients, "Vaultwarden keeps the roster to managers");
+    }
+
+    /// **Only a 400 says the server will not make the org** (fix round 1): a
+    /// rate limit or a 403 is no verdict on creating organisations, so it is
+    /// the plain failure, and nothing is learned about the server.
+    #[test]
+    fn a_create_refused_with_another_status_is_the_plain_failure() {
+        for status in [429, 403] {
+            let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+            server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+            server.mock("POST", "/api/organizations").with_status(status).expect(1).create();
+            match engine.share("p1", "anna@example.com") {
+                Err(SharingError::Refused(sentence)) => assert_eq!(sentence, ORG_FAILED, "{status}"),
+                other => panic!("{status}: expected the plain failure, got {other:?}"),
+            }
+            assert_eq!(engine.held().capabilities.creates_orgs, None, "{status}");
+        }
     }
 
     /// A loaded engine (its first pass made) on a NodeWarden, over the

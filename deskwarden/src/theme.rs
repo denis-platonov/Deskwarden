@@ -8172,18 +8172,21 @@ pub fn paint_info_mark(painter: &egui::Painter, rect: Rect, color: Color32) {
 /// Where one person stands, as a pill says it. Short words; the status line
 /// beside the pill carries the long form (mock 6e, SHARE PILLS).
 ///
-/// Four of the six are the mock's. [`Self::KeyChanged`] and [`Self::Gone`]
+/// Two of the four are the mock's. [`Self::KeyChanged`] and [`Self::Gone`]
 /// are the engine's own states (`rest::sharing::PersonState`) that the mock's
 /// strip does not draw: a changed key is the danger wash, because nothing is
 /// sent to that person until it is looked at, and a person no membership
-/// reaches any more is the expired grey, because both mean "not receiving
-/// this" and neither asks for anything.
+/// reaches any more is the mock's expired grey, because it means "not
+/// receiving this" and asks for nothing.
+///
+/// The mock's "No account yet" and "Invite expired" are gone (DW2 fix round
+/// 1): no server tells a client whether an invited address has an account,
+/// and no expiry is claimed (official-path spec §3.4), so a pending
+/// invitation is [`Self::Invited`] whatever it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharePillKind {
     Shared,
     Invited,
-    NoAccount,
-    Expired,
     KeyChanged,
     Gone,
 }
@@ -8194,8 +8197,6 @@ impl SharePillKind {
         match self {
             Self::Shared => "Shared",
             Self::Invited => "Invited",
-            Self::NoAccount => "No account yet",
-            Self::Expired => "Invite expired",
             Self::KeyChanged => "Key changed",
             Self::Gone => "Not receiving",
         }
@@ -8212,23 +8213,21 @@ impl SharePillKind {
         match self {
             Self::Shared => tone(BLUE, BLUE, CARD),
             Self::Invited => tone(BLUE_WASH, BLUE_EDGE, BLUE_DEEP),
-            Self::NoAccount => tone(CAUTION_WASH, CAUTION_EDGE, CAUTION_INK),
-            Self::Expired | Self::Gone => tone(CANVAS, BORDER, TEXT_FAINT),
+            Self::Gone => tone(CANVAS, BORDER, TEXT_FAINT),
             Self::KeyChanged => tone(DANGER_WASH, DANGER_EDGE, DANGER_INK),
         }
     }
 
     /// **The person mark's colour, which is not always the word's.** The
     /// mock's `sp()` strokes Invited's person in `#1b3fa0` beside a
-    /// `#14307a` word, and No account yet's in `#8a5a06` beside `#7a4f05` --
-    /// the same mark-a-shade-brighter-than-its-word pairing the Send pills'
-    /// dots use (`p-waiting .dot` is [`BLUE`] on [`BLUE_DEEP`] text). Shared
-    /// and the greys stroke it in the word's own colour.
+    /// `#14307a` word -- the same mark-a-shade-brighter-than-its-word pairing
+    /// the Send pills' dots use (`p-waiting .dot` is [`BLUE`] on
+    /// [`BLUE_DEEP`] text). Shared and the greys stroke it in the word's own
+    /// colour.
     #[must_use]
     pub fn mark_ink(self) -> Color32 {
         match self {
             Self::Invited => BLUE,
-            Self::NoAccount => CAUTION_MARK,
             _ => self.tone().ink,
         }
     }
@@ -12411,15 +12410,14 @@ mod tests {
         let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
         apply(&ctx);
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            for kind in [SharePillKind::Shared, SharePillKind::Invited, SharePillKind::NoAccount, SharePillKind::Expired, SharePillKind::KeyChanged, SharePillKind::Gone] {
+            for kind in [SharePillKind::Shared, SharePillKind::Invited, SharePillKind::KeyChanged, SharePillKind::Gone] {
                 let rect = share_pill(ui.painter(), egui::pos2(10.0, 20.0), kind);
                 assert_eq!(rect.height(), PILL_HEIGHT);
                 assert!(rect.width() > share_pill_width(ui.painter(), kind) - 0.5 && rect.width() > 30.0);
             }
         });
         assert_eq!(SharePillKind::Shared.label(), "Shared");
-        assert_eq!(SharePillKind::NoAccount.label(), "No account yet");
-        assert_eq!(SharePillKind::Expired.label(), "Invite expired");
+        assert_eq!(SharePillKind::Invited.label(), "Invited");
         assert_eq!(SharePillKind::Shared.tone().fill, BLUE, "Shared is the filled blue of the list's `shared` chip");
     }
 

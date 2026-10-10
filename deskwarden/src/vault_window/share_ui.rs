@@ -656,7 +656,10 @@ pub(crate) struct ShareDialog {
     pub(crate) in_flight: bool,
     /// The last attempt's sentence.
     pub(crate) error: Option<String>,
-    /// A share that left an invitation for an address with no account.
+    /// A share that left the person invited, not yet accepted: on official
+    /// Bitwarden and with invitation email on, they accept from the email's
+    /// link; with no account yet, after they register (official-path spec
+    /// §4.1).
     pub(crate) invited: Option<String>,
     /// **A share that stopped to ask** whether to use an organisation
     /// Deskwarden did not create (official-path spec §3.1, fix round 1):
@@ -1084,7 +1087,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
         // **An answer lands only in the dialog that asked** -- the one with a
         // share out (`in_flight`). A dialog closed before its answer came and
         // a fresh one opened since, on this record or another, did not ask:
-        // painting the old share's "no account yet" or failure into it would
+        // painting the old share's "waiting to accept" or failure into it would
         // put one record's outcome on another's dialog. Those answers are
         // said the way a closed dialog's are, as a toast or a notice
         // (`an_answer_does_not_land_in_a_dialog_that_did_not_ask`).
@@ -1459,8 +1462,8 @@ pub(crate) enum ShareDialogAction {
 
 /// **Draws the Share dialog** over the window: scrim, card, the record,
 /// the WITH field with suggestions from the one address book (Sends and
-/// shares), what view-only means, and Share/Cancel -- or, after a share to an
-/// address with no account, the band that says so and Done.
+/// shares), what view-only means, and Share/Cancel -- or, after a share the
+/// server left as a pending invitation, the band that says so and Done.
 ///
 /// **It decides nothing it draws.** What a press does is [`answer_dialog`]'s;
 /// this only reports which press it was. Share, Cancel, Done, the corner ✕
@@ -3654,7 +3657,7 @@ mod tests {
     }
 
     /// **A share's answer says where it stands even with the dialog closed**:
-    /// the record's name travels with the call, and "no account yet" -- which
+    /// the record's name travels with the call, and "waiting to accept" -- which
     /// the open dialog says in its own words -- becomes a toast.
     #[test]
     fn a_share_answer_with_the_dialog_closed_still_says_where_it_stands() {
@@ -3797,10 +3800,11 @@ mod tests {
         assert_eq!(action, ShareDialogAction::Submit, "the box opens focused, and Enter in it shares");
     }
 
-    /// **No account** (mock 6a, fourth state): the dialog stays open to say
-    /// so, and an administrator is offered an invite code.
+    /// **Invited** (mock 6a, fourth state): the dialog stays open to say the
+    /// share is waiting for the person to accept, and an administrator is
+    /// offered an invite code.
     #[test]
-    fn a_person_without_an_account_is_said_and_an_admin_can_make_an_invite_code() {
+    fn an_invited_person_is_said_and_an_admin_can_make_an_invite_code() {
         let mut dialog = ShareDialog::opening("r1", "Acme VPN");
         dialog.invited = Some("carol@example.com".into());
         let admin = SharingView { available: true, can_mint_invites: true, ..SharingView::default() };
@@ -4137,7 +4141,7 @@ mod tests {
 
     /// **An answer lands only in the dialog that asked.** A share closed with
     /// Cancel and then a fresh dialog opened -- on this record or another --
-    /// must not have the old share's "no account yet" or failure painted into
+    /// must not have the old share's "waiting to accept" or failure painted into
     /// it; the answer is said as a toast or a notice instead.
     #[test]
     fn an_answer_does_not_land_in_a_dialog_that_did_not_ask() {

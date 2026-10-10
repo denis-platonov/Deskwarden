@@ -41295,16 +41295,14 @@ mod reprompt_gating_tests {
             permit_reinvite(&ctx, "eve@x.io", &[plain()], &gone, &never_asks(), &mut Proof::default()),
             Some(share_ui::SharingCall::Reinvite(_))
         ));
-        for waiting in [PersonState::Invited] {
-            let pane = eve_on(waiting, "1");
-            assert!(
-                matches!(
-                    permit_reinvite(&ctx, "eve@x.io", &protected_items, &pane, &never_asks(), &mut Proof::default()),
-                    Some(share_ui::SharingCall::Reinvite(_))
-                ),
-                "{waiting:?}: a fresh invitation was asked about"
-            );
-        }
+        let invited = eve_on(PersonState::Invited, "1");
+        assert!(
+            matches!(
+                permit_reinvite(&ctx, "eve@x.io", &protected_items, &invited, &never_asks(), &mut Proof::default()),
+                Some(share_ui::SharingCall::Reinvite(_))
+            ),
+            "Invited: a fresh invitation was asked about"
+        );
     }
 }
 
