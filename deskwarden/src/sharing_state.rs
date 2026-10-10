@@ -88,11 +88,14 @@ pub struct AccountSharing {
     pub sharing_org_id: Option<String>,
     /// **This client CREATED `sharing_org_id`** -- set by the share that made
     /// it, kept while the id stays the same, cleared when another is chosen.
-    /// On a server that does not attest an org's owner (no `ownerEmail`) it
-    /// is the only thing that lets the cached id be used: an org merely OWNED
-    /// and NAMED for this account may be one someone else made and added it
-    /// to as owner (`Sharing::my_org_id`). `serde(default)`: a file from
-    /// before it reads as "not created here", the safe side.
+    /// Such an id -- or one the user adopted, below -- is this account's
+    /// without a roster read (`Sharing::my_org_id`). An org merely OWNED and
+    /// NAMED for this account may be one someone else made and added it to
+    /// as an owner: it is only a candidate, offered to the user when its
+    /// roster passes `roster_says_mine`'s three rules. No server's word on
+    /// the owner stands in for this flag (NodeWarden's `ownerEmail` is not
+    /// read). `serde(default)`: a file from before it reads as "not created
+    /// here", the safe side.
     pub sharing_org_created: bool,
     /// **The user said to use `sharing_org_id`, which this client did not
     /// create** -- the answer Yes to "Use the organisation ... for sharing?

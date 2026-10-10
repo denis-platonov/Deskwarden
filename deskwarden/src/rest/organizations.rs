@@ -86,7 +86,7 @@ use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-use crate::rest::api::{RestClient, Session};
+use crate::rest::api::{RestClient, RestError, Session};
 use crate::rest::crypto::{EncString, SymmetricKey, decrypt};
 use crate::rest::sync::{SyncResponse, VaultKeys};
 use crate::vault_bridge::VaultItem;
@@ -168,54 +168,52 @@ pub fn sharer_is(claimed: &str, email: &str) -> bool {
 }
 
 /// **Whether an organisation is a sharing org, and whose** -- the name's
-/// claim checked against the server's attestation (controller decision,
-/// final review).
+/// claim, before any roster has spoken (official-path spec §4.3).
 ///
-/// Anyone can create an organisation named "Shared by boss@..." and add
-/// anyone to it; read by name alone, its records showed "Shared by boss@...
-/// · view-only". So a name-only claim is never shown as "Shared by":
+/// - **This account's own candidate**: it owns the org and the name is its
+///   own address. Whether it is really this account's -- not one someone
+///   else made and added it to as an owner -- is the sharing engine's roster
+///   check (`Sharing::my_org_id`); the directory only marks the candidate.
+/// - **One this account owns, named for someone else**: no sharing org.
+///   Nobody shares it with this account; it is drawn as the organisation it
+///   is.
+/// - **Named for this account and not owned by it**: no sharing org either.
+///   A "share from me" that I do not own is the planted shape, and it is
+///   drawn as the ordinary organisation it provably is.
+/// - **Anyone else's "Shared by X"**: a sharing org received from X,
+///   **unverified** -- the name is plaintext anyone can set.
+///   [`Directory::attest_received`] puts the org's one owner in X's place,
+///   verified, where the server lets a member read the roster.
 ///
-/// - **This account's own**: it owns the org and the name is its own
-///   address -- nothing to attest, the account made it. Only refused when
-///   the server attests a DIFFERENT owner.
-/// - **Someone else's**, where `owner_email` (NodeWarden's `ownerEmail`)
-///   matches the name: the sharer is the name's, as before.
-/// - `owner_email` present and NOT the name: a forged name. The org is a
-///   sharing org received from its REAL owner -- they are sharing with this
-///   account, whatever they called it -- and the sharer shown is theirs.
-///   One whose attested owner is this account itself is not a sharing org
-///   at all (its name claims someone else; it is shown as the org it is).
-/// - No `owner_email` (a server that does not attest): not a sharing org.
-///   It is drawn as the ordinary organisation it provably is.
-///
-/// `claimed` is [`sharer_of`] of the name; `None` is no sharing name at all.
+/// This replaces NodeWarden's `ownerEmail` attestation, which no other
+/// server sends. `claimed` is [`sharer_of`] of the name; `None` is no sharing
+/// name at all.
 #[must_use]
-pub fn sharing_mark(claimed: Option<&str>, owner_email: Option<&str>, is_owner: bool, account_email: &str) -> Option<SharingOrg> {
+pub fn sharing_mark(claimed: Option<&str>, is_owner: bool, account_email: &str) -> Option<SharingOrg> {
     let claimed = claimed?;
-    let owner = owner_email.map(normalise_email).filter(|o| !o.is_empty());
     let account = normalise_email(account_email);
     let names_me = !account.is_empty() && sharer_is(claimed, &account);
-    // **The attested owner is the sharer shown** wherever there is one
-    // (final re-review, Minor 3): the name is cut to fit the org name's 50
-    // characters (`sharing_org_name`), the attestation is the whole address.
-    if is_owner && names_me && owner.as_deref().is_none_or(|o| o == account) {
-        return Some(SharingOrg { sharer: owner.unwrap_or_else(|| claimed.to_string()), mine: true });
-    }
-    match owner {
-        Some(owner) if sharer_is(claimed, &owner) => Some(SharingOrg { sharer: owner, mine: false }),
-        Some(owner) if owner == account => None,
-        Some(owner) => Some(SharingOrg { sharer: owner, mine: false }),
-        None => None,
+    match (is_owner, names_me) {
+        (true, true) => Some(SharingOrg { sharer: account, mine: true, verified: true }),
+        (false, false) => Some(SharingOrg { sharer: normalise_email(claimed), mine: false, verified: false }),
+        _ => None,
     }
 }
 
 /// A sharing organisation, as the directory marks one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharingOrg {
-    /// The sharer's email as the name carries it (possibly cut with `…`).
+    /// The sharer's email: the org's one owner where a roster said so, else
+    /// the name's claim (possibly cut with `…`). This account's own, for its
+    /// own org.
     pub sharer: String,
     /// This account owns it and is the sharer it names.
     pub mine: bool,
+    /// **The sharer is the server's word** -- the one confirmed owner on a
+    /// roster a member may read -- and not only the name's claim. Always
+    /// true for this account's own. `false` is drawn "Shared by X ·
+    /// unverified" (official-path spec §4.3).
+    pub verified: bool,
 }
 
 /// One organisation this account is a member of.
@@ -427,8 +425,9 @@ pub enum Audience {
     /// In this account's own sharing org: the people it is shared with, by
     /// their person collections' names. Never names the organisation.
     SharedWithPeople { people: Vec<String> },
-    /// In someone else's sharing org: who shared it.
-    SharedWithMe { from: String },
+    /// In someone else's sharing org: who shared it, and whether that is the
+    /// server's word or only the org name's claim ([`SharingOrg::verified`]).
+    SharedWithMe { from: String, verified: bool },
 }
 
 impl Audience {
@@ -624,7 +623,7 @@ impl Directory {
                         .collect(),
                 }
             } else {
-                Audience::SharedWithMe { from: sharing.sharer.clone() }
+                Audience::SharedWithMe { from: sharing.sharer.clone(), verified: sharing.verified }
             };
         }
         let collections = filed_in
@@ -664,11 +663,11 @@ impl Directory {
     pub fn from_sync(response: &SyncResponse, keys: &VaultKeys) -> Self {
         let account_email = response.profile.as_ref().and_then(|p| p.email.clone()).unwrap_or_default();
         // Whether `org` is a sharing organisation, and whose: its name's
-        // claim checked against the server's `ownerEmail` (`sharing_mark`).
-        // Shared between the confirmed organisations below and
-        // `organizationsNew`'s not-yet-confirmed ones, since both carry both.
+        // claim (`sharing_mark`), which `attest_received` may replace with
+        // the roster's word. Shared between the confirmed organisations below
+        // and `organizationsNew`'s not-yet-confirmed ones.
         let mark = |org: &crate::rest::sync::Organization| {
-            sharing_mark(org.name.as_deref().and_then(sharer_of), org.owner_email.as_deref(), org.is_owner(), &account_email)
+            sharing_mark(org.name.as_deref().and_then(sharer_of), org.is_owner(), &account_email)
         };
 
         let organisations: Vec<Organisation> = response
@@ -771,9 +770,9 @@ impl Directory {
     ) -> Self {
         let mut directory = Self::from_sync(response, keys);
         // **Not other people's sharing orgs.** A recipient is a plain member,
-        // and NodeWarden answers a plain member's roster request with 404 on
-        // both routes -- two requests per org per sync for nothing. Their
-        // rosters are also none of this account's business (spec 10.2).
+        // who may not read `/users` on any server -- a request per org per
+        // sync for nothing. Who shares them is asked of `mini-details`
+        // instead, where the server allows it (`Self::attest_received`).
         let wanted: Vec<String> = directory
             .organisations
             .iter()
@@ -786,6 +785,56 @@ impl Directory {
             }
         }
         directory
+    }
+
+    /// **Who shares each received sharing org, on the server's word where it
+    /// gives one** (official-path spec §4.3).
+    ///
+    /// Official Bitwarden lets every member read `GET …/users/mini-details`
+    /// (`[Authorize<MemberOrProviderRequirement>]`). There the sharer is the
+    /// org's one confirmed owner -- whatever the name claims, so a forged
+    /// "Shared by boss@" says who really owns it -- and the org is marked
+    /// verified. Two owners, or none, leave the name's claim, unverified.
+    ///
+    /// Vaultwarden and NodeWarden answer a plain member 404 (or 403). The
+    /// first such answer ends the asking: no other org on that server will
+    /// answer differently, and each would cost a request on every whole
+    /// read. Their orgs keep the name's claim, unverified.
+    ///
+    /// Returns what was learned for the session: `Some(true)` a roster was
+    /// read, `Some(false)` members may not read one here, `None` nothing to
+    /// ask or every ask failed some other way (a transport error says
+    /// nothing about the server's rule).
+    /// `a_received_orgs_sharer_is_read_off_a_roster_a_member_may_read` holds
+    /// this.
+    pub fn attest_received(&mut self, client: &RestClient, session: &mut Session) -> Option<bool> {
+        let received: Vec<String> = self
+            .organisations
+            .iter()
+            .filter(|o| o.sharing.as_ref().is_some_and(|s| !s.mine))
+            .map(|o| o.id.clone())
+            .collect();
+        let mut learned = None;
+        for id in received {
+            match client.fetch_organization_mini_details(session, &id) {
+                Ok(answer) => {
+                    learned = Some(true);
+                    let Some(members) = map_members(&answer) else {
+                        continue;
+                    };
+                    let owners: Vec<&Member> = members
+                        .iter()
+                        .filter(|m| m.role == "owner" && m.status == MemberStatus::Confirmed && !m.email.trim().is_empty())
+                        .collect();
+                    if let ([owner], Some(org)) = (owners.as_slice(), self.organisations.iter_mut().find(|o| o.id == id)) {
+                        org.sharing = Some(SharingOrg { sharer: normalise_email(&owner.email), mine: false, verified: true });
+                    }
+                }
+                Err(RestError::Status(403 | 404)) => return Some(false),
+                Err(_) => {}
+            }
+        }
+        learned
     }
 }
 
@@ -1021,6 +1070,10 @@ struct WireOrganisation {
     sharer: Option<String>,
     #[serde(default)]
     mine: bool,
+    /// [`SharingOrg::verified`]. Absent in a body from before it existed, and
+    /// read as `false`: unverified is the safe default.
+    #[serde(default)]
+    verified: bool,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1081,6 +1134,7 @@ fn organisation_to_wire(o: &Organisation) -> WireOrganisation {
         enabled: o.enabled,
         sharer: o.sharing.as_ref().map(|s| s.sharer.clone()),
         mine: o.sharing.as_ref().is_some_and(|s| s.mine),
+        verified: o.sharing.as_ref().is_some_and(|s| s.verified),
     }
 }
 
@@ -1090,7 +1144,7 @@ fn organisation_from_wire(o: WireOrganisation) -> Organisation {
         id: o.id,
         name: o.name,
         enabled: o.enabled,
-        sharing: o.sharer.map(|sharer| SharingOrg { sharer, mine: o.mine }),
+        sharing: o.sharer.map(|sharer| SharingOrg { sharer, mine: o.mine, verified: o.verified }),
     }
 }
 
@@ -1768,10 +1822,10 @@ mod tests {
                 "organizations": [
                     { "id": ORG, "name": "Engineering", "enabled": true, "key": "4.zzz" },
                     { "id": "mine", "name": "Shared by denis@example.com", "role": "owner", "key": "4.zzz" },
-                    { "id": "theirs", "name": "Shared by anna@example.com", "role": "member", "key": "4.zzz", "ownerEmail": "anna@example.com" }
+                    { "id": "theirs", "name": "Shared by anna@example.com", "role": "member", "key": "4.zzz" }
                 ],
                 "organizationsNew": [
-                    { "id": "pending", "name": "Shared by carol@example.com", "role": "member", "status": 1, "ownerEmail": "carol@example.com" }
+                    { "id": "pending", "name": "Shared by carol@example.com", "role": "member", "status": 1 }
                 ]
             },
             "ciphers": [], "folders": [],
@@ -1790,7 +1844,7 @@ mod tests {
         );
         assert_eq!(
             directory.audience_of(&item(Some("theirs"), &[])),
-            Audience::SharedWithMe { from: "anna@example.com".to_string() }
+            Audience::SharedWithMe { from: "anna@example.com".to_string(), verified: false }
         );
         assert!(directory.audience_of(&item(Some("theirs"), &[])).is_shared());
 
@@ -1799,70 +1853,114 @@ mod tests {
         assert_eq!(round, directory);
     }
 
-    /// **A "Shared by" name is believed only when the server attests it**
-    /// (controller decision, final review): anyone can create an org named
-    /// "Shared by boss@..." and add anyone. A forged name is shown as its
-    /// REAL owner's share; a name with no attestation is no sharing org at
-    /// all; a name matching the attested owner is a share as before; and
-    /// this account's own org needs no attestation, unless it names another
-    /// owner.
+    /// **A "Shared by" name is a claim** (official-path spec §4.3): anyone can
+    /// create an org named "Shared by boss@..." and add anyone. Received, it
+    /// is a sharing org from the name's sharer, marked unverified; owned and
+    /// named for this account, it is this account's candidate; named for this
+    /// account and not owned by it, or owned and named for someone else, it
+    /// is no sharing org at all.
     #[test]
-    fn a_shared_by_name_is_believed_only_when_the_server_attests_its_owner() {
+    fn a_shared_by_name_is_a_claim_until_a_roster_says_otherwise() {
         let me = "denis@example.com";
-        let mark = |name: &str, owner: Option<&str>, is_owner: bool| sharing_mark(sharer_of(name), owner, is_owner, me);
+        let mark = |name: &str, is_owner: bool| sharing_mark(sharer_of(name), is_owner, me);
         assert_eq!(
-            mark("Shared by boss@corp.example", Some("mallory@evil.example"), false),
-            Some(SharingOrg { sharer: "mallory@evil.example".into(), mine: false }),
-            "a forged name: received from the attested owner"
+            mark("Shared by Boss@Corp.example", false),
+            Some(SharingOrg { sharer: "boss@corp.example".into(), mine: false, verified: false }),
+            "received: the name's claim, unverified"
         );
-        assert_eq!(mark("Shared by boss@corp.example", None, false), None, "a name-only claim is no sharing org");
-        assert_eq!(
-            mark("Shared by boss@corp.example", Some(" Boss@Corp.example "), false),
-            Some(SharingOrg { sharer: "boss@corp.example".into(), mine: false }),
-            "attested: a share from the name's sharer"
-        );
-        assert_eq!(mark("Shared by denis@example.com", None, true), Some(SharingOrg { sharer: me.into(), mine: true }), "my own");
-        assert_eq!(mark("Shared by denis@example.com", Some(me), true), Some(SharingOrg { sharer: me.into(), mine: true }));
-        assert_eq!(
-            mark("Shared by denis@example.com", Some("mallory@evil.example"), false),
-            Some(SharingOrg { sharer: "mallory@evil.example".into(), mine: false }),
-            "someone else's org named for me is theirs"
-        );
-        assert_eq!(mark("Shared by anna@example.com", Some(me), true), None, "my org named for someone else is no share");
-        assert_eq!(mark("Engineering", Some("boss@corp.example"), false), None, "no sharing name, no sharing org");
-        // A long address is cut in the name; the attested owner is whole.
+        assert_eq!(mark("Shared by denis@example.com", true), Some(SharingOrg { sharer: me.into(), mine: true, verified: true }), "my own");
+        assert_eq!(mark("Shared by denis@example.com", false), None, "named for me and owned by someone else: planted, not a share");
+        assert_eq!(mark("Shared by anna@example.com", true), None, "my org named for someone else is no share");
+        assert_eq!(mark("Engineering", false), None, "no sharing name, no sharing org");
         let long = "denis.platonov@a-very-long-domain-name-for-testing.example";
         let cut = sharing_org_name(long);
         assert!(cut.ends_with('\u{2026}'), "{cut}");
-        assert_eq!(mark(&cut, Some(long), false).map(|s| s.sharer), Some(long.to_string()), "the whole address, not the cut name");
+        assert_eq!(sharing_mark(sharer_of(&cut), true, long).map(|s| s.sharer), Some(long.to_string()), "mine: the whole address, not the cut name");
+        assert_eq!(sharer_of("Engineering"), None);
+        assert_eq!(sharer_of("Shared by nobody"), None, "no `@`, not an email");
 
-        // Through a whole read: the forged org's records say who really
-        // owns it, and a name-only org is an ordinary organisation.
+        // Through a whole read: a received name-only org is a sharing org,
+        // unverified; one named for me that I do not own is an ordinary org.
         let response: SyncResponse = serde_json::from_value(json!({
             "profile": {
                 "key": "2.aaa|bbb|ccc",
                 "email": me,
                 "organizations": [
-                    { "id": "forged", "name": "Shared by boss@corp.example", "role": "member", "key": "4.zzz", "ownerEmail": "mallory@evil.example" },
-                    { "id": "bare", "name": "Shared by boss@corp.example", "role": "member", "key": "4.zzz" }
+                    { "id": "claimed", "name": "Shared by boss@corp.example", "type": 2, "key": "4.zzz" },
+                    { "id": "planted", "name": "Shared by denis@example.com", "type": 2, "key": "4.zzz" }
                 ],
                 "organizationsNew": [
-                    { "id": "waiting-forged", "name": "Shared by boss@corp.example", "role": "member", "status": 1, "ownerEmail": "mallory@evil.example" }
+                    { "id": "waiting", "name": "Shared by boss@corp.example", "type": 2, "status": 1 }
                 ]
             },
             "ciphers": [], "folders": [], "collections": []
         })).expect("parses");
         let directory = Directory::from_sync(&response, &keys());
         assert_eq!(
-            directory.audience_of(&item(Some("forged"), &[])),
-            Audience::SharedWithMe { from: "mallory@evil.example".to_string() }
+            directory.audience_of(&item(Some("claimed"), &[])),
+            Audience::SharedWithMe { from: "boss@corp.example".to_string(), verified: false }
         );
-        assert!(directory.sharing_orgs().iter().all(|o| o.id != "bare"), "a name-only claim is not a sharing org");
-        assert!(directory.visible_organisations().iter().any(|o| o.id == "bare"), "it is shown as the organisation it is");
+        assert!(directory.sharing_orgs().iter().all(|o| o.id != "planted"), "a planted org is not a sharing org");
+        assert!(directory.visible_organisations().iter().any(|o| o.id == "planted"), "it is shown as the organisation it is");
         assert_eq!(
-            directory.waiting().iter().map(|o| o.sharing.as_ref().map(|s| s.sharer.as_str())).collect::<Vec<_>>(),
-            [Some("mallory@evil.example")]
+            directory.waiting().iter().map(|o| o.sharing.clone()).collect::<Vec<_>>(),
+            [Some(SharingOrg { sharer: "boss@corp.example".into(), mine: false, verified: false })]
         );
+    }
+
+    /// **A received sharing org's sharer is the server's word where it gives
+    /// one** (official-path spec §4.3). Official Bitwarden lets a member read
+    /// `mini-details`, and the sharer becomes the org's one confirmed owner --
+    /// a forged "Shared by boss@" says who really owns it -- marked verified;
+    /// two owners leave the name's claim. A server that answers a member 404
+    /// ends the asking, and its orgs keep the claim, unverified.
+    #[test]
+    fn a_received_orgs_sharer_is_read_off_a_roster_a_member_may_read() {
+        let mut server = crate::test_http::server();
+        server.mock("POST", "/identity/connect/token")
+            .with_body(r#"{"access_token":"AT-1","expires_in":3600,"refresh_token":"RT-1","token_type":"Bearer"}"#)
+            .create();
+        let client = RestClient::new(server.url());
+        let device = Device::windows_desktop("11111111-2222-3333-4444-555555555555", "TEST-PC");
+        let mut session = client.password_grant("a@b.c", "HASH", &device).expect("grant");
+        let response: SyncResponse = serde_json::from_value(json!({
+            "profile": { "key": "2.aaa|bbb|ccc", "email": "denis@example.com", "organizations": [
+                { "id": "forged", "name": "Shared by boss@corp.example", "type": 2, "key": "4.zzz" },
+                { "id": "shared", "name": "Shared by anna@example.com", "type": 2, "key": "4.zzz" }
+            ]},
+            "ciphers": [], "folders": [], "collections": []
+        })).expect("parses");
+        let row = |id: &str, email: &str, kind: i64| json!({ "id": id, "userId": id, "email": email, "type": kind, "status": 2 });
+        server
+            .mock("GET", "/api/organizations/forged/users/mini-details")
+            .with_body(json!({ "data": [row("m", "Mallory@Evil.example", 0), row("d", "denis@example.com", 2)] }).to_string())
+            .expect(1)
+            .create();
+        server
+            .mock("GET", "/api/organizations/shared/users/mini-details")
+            .with_body(json!({ "data": [row("a", "anna@example.com", 0), row("o", "other@example.com", 0)] }).to_string())
+            .expect(1)
+            .create();
+        let mut directory = Directory::from_sync(&response, &keys());
+        assert_eq!(directory.attest_received(&client, &mut session), Some(true));
+        let sharing = |directory: &Directory, id: &str| directory.organisations().iter().find(|o| o.id == id).and_then(|o| o.sharing.clone());
+        assert_eq!(
+            sharing(&directory, "forged"),
+            Some(SharingOrg { sharer: "mallory@evil.example".into(), mine: false, verified: true }),
+            "the real owner, on the server's word"
+        );
+        assert_eq!(
+            sharing(&directory, "shared"),
+            Some(SharingOrg { sharer: "anna@example.com".into(), mine: false, verified: false }),
+            "two owners: still only the name's claim"
+        );
+
+        let mut hidden = Directory::from_sync(&response, &keys());
+        server.mock("GET", "/api/organizations/forged/users/mini-details").with_status(404).expect(1).create();
+        let asked_again = server.mock("GET", "/api/organizations/shared/users/mini-details").expect(0).create();
+        assert_eq!(hidden.attest_received(&client, &mut session), Some(false));
+        asked_again.assert();
+        assert_eq!(sharing(&hidden, "forged").map(|s| s.verified), Some(false));
     }
 
     /// **The roster route is `/users` and nothing else**: NodeWarden's older

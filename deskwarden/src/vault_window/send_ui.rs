@@ -9236,7 +9236,7 @@ mod paint_tests {
             entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
         };
         let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
-        let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }];
+        let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }];
         let painted = paint_received_with(&rows, &people, None);
         let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
         assert!(top(FROM_PEOPLE_EYEBROW) < top("Acme VPN"));
@@ -9273,7 +9273,7 @@ mod paint_tests {
             entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
         };
         let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
-        let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }];
+        let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }];
         let mut people = PeopleRows { received: &from_people, paste: Some(zeroize::Zeroizing::new(String::new())), ..PeopleRows::none() };
         let (painted, selected) = paint_received_people(&rows, &mut people, None);
         assert_eq!(selected, None, "nothing is picked for the user");

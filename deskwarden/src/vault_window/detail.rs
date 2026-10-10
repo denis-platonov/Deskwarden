@@ -1036,6 +1036,23 @@ pub fn view_only_footer(from: &str) -> String {
     format!("Shared by {from}, view-only. Only they can edit or delete it.")
 }
 
+/// **The received record's subtitle run** (mock 6d): who shares it and that
+/// it is view-only -- with `unverified` between where the sharer is only the
+/// organisation name's claim (official-path spec §4.3).
+#[must_use]
+pub fn shared_by_line(from: &str, unverified: bool) -> String {
+    if unverified {
+        format!("Shared by {from} \u{b7} unverified \u{b7} view-only")
+    } else {
+        format!("Shared by {from} \u{b7} view-only")
+    }
+}
+
+/// The hover on an unverified "Shared by" -- the official-path spec §4.3's
+/// own words: the planted-organisation risk is shown, not silently trusted.
+pub const UNVERIFIED_SHARER_TOOLTIP: &str =
+    "This server does not say who owns the organisation. The name comes from the organisation's own title.";
+
 /// The received record's kebab entry that leaves its sharer's org.
 #[must_use]
 pub fn stop_receiving_label(from: &str) -> String {
@@ -3836,7 +3853,7 @@ pub fn draw_detail_read(
                         // the ⋮ says it is view-only, and a "Shared by" with
                         // no one after it would be a claim with a hole in it.
                         if let Some(from) = people.view_only_from {
-                            ui.horizontal(|ui| {
+                            let line = ui.horizontal(|ui| {
                                 ui.spacing_mut().item_spacing.x = 0.0;
                                 subtitle_text(ui, subtitle_kind_id(&item.id), &kind.label());
                                 ui.add_space(VIEW_ONLY_KIND_GAP);
@@ -3857,10 +3874,13 @@ pub fn draw_detail_read(
                                 subtitle_text_in(
                                     ui,
                                     subtitle_folder_id(&item.id),
-                                    &format!("Shared by {from} \u{b7} view-only"),
+                                    &shared_by_line(from, people.view_only_unverified),
                                     theme::TEXT_MUTED,
                                 );
                             });
+                            if people.view_only_unverified {
+                                let _ = line.response.on_hover_text(UNVERIFIED_SHARER_TOOLTIP);
+                            }
                             return;
                         }
                         let (lead, name) = header_subtitle_parts(kind, folder);
@@ -6423,6 +6443,9 @@ pub struct PeopleSharing<'a> {
     /// only -- see `share_ui::ReceivedShareRow::from`). The pane is
     /// view-only.
     pub view_only_from: Option<&'a str>,
+    /// That sharer is only the organisation name's claim (official-path spec
+    /// §4.3): the subtitle says `unverified`, with [`UNVERIFIED_SHARER_TOOLTIP`].
+    pub view_only_unverified: bool,
 }
 
 /// **Design 5d's card body.**
@@ -10983,6 +11006,8 @@ mod tests {
         /// one (mock 6d) -- `None` unless a test sets it (see
         /// [`Pane::view_only`]), which is every record the user owns.
         view_only_from: Option<String>,
+        /// That sharer is unverified ([`Pane::unverified`]).
+        view_only_unverified: bool,
         /// The vault's items, as the window hands them -- what names a card's
         /// bank. Empty unless a test sets it (see [`Pane::in_vault`]).
         vault: Vec<VaultItem>,
@@ -11428,6 +11453,7 @@ mod tests {
                 people: Vec::new(),
                 sharing_notice: None,
                 view_only_from: None,
+                view_only_unverified: false,
                 vault: Vec::new(),
             }
         }
@@ -11455,6 +11481,12 @@ mod tests {
         /// view-only pane of mock 6d.
         fn view_only(mut self, from: &str) -> Self {
             self.view_only_from = Some(from.to_string());
+            self
+        }
+
+        /// The same pane, with that sharer only the org name's claim.
+        fn unverified(mut self) -> Self {
+            self.view_only_unverified = true;
             self
         }
 
@@ -11551,6 +11583,7 @@ mod tests {
                             people: &self.people,
                             notice: self.sharing_notice.as_deref(),
                             view_only_from: self.view_only_from.as_deref(),
+                            view_only_unverified: self.view_only_unverified,
                             ..PeopleSharing::default()
                         },
                         &self.vault);
@@ -18783,6 +18816,25 @@ mod tests {
         assert_eq!(view_only(DetailAction::Delete), DetailAction::None);
         assert_eq!(view_only(DetailAction::ToggleFavorite(true)), DetailAction::None);
         assert_eq!(view_only(DetailAction::CopyPassword), DetailAction::CopyPassword, "copy still works");
+    }
+
+    /// **An unverified sharer is said in the subtitle** (official-path spec
+    /// §4.3), with the spec's tooltip words for why; a verified one is not.
+    #[test]
+    fn an_unverified_sharer_is_marked_in_the_subtitle() {
+        let item = a_login();
+        let mut pane = Pane::new().view_only("boss@corp.example").unverified();
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(
+            frame.texts.iter().any(|(t, _)| t.contains("Shared by boss@corp.example \u{b7} unverified \u{b7} view-only")),
+            "{:?}",
+            frame.texts
+        );
+        assert_eq!(shared_by_line("d@x.io", false), "Shared by d@x.io \u{b7} view-only");
+        assert_eq!(
+            UNVERIFIED_SHARER_TOOLTIP,
+            "This server does not say who owns the organisation. The name comes from the organisation's own title."
+        );
     }
 
     /// **Mock 6d's ⋮, open**: the one line saying why, and not one entry

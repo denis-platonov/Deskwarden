@@ -1504,6 +1504,20 @@ impl RestClient {
         })
     }
 
+    /// `GET /api/organizations/{id}/users/mini-details` -- every member's id,
+    /// account, type, status, name and email.
+    ///
+    /// Official Bitwarden answers any member
+    /// (`[Authorize<MemberOrProviderRequirement>]`). Vaultwarden and
+    /// NodeWarden answer managers only, and a plain member gets 404 (or 403).
+    /// Read only for a received sharing org's sharer
+    /// ([`crate::rest::organizations::Directory::attest_received`]), on
+    /// `sync_agent` for [`Self::fetch_organization_members`]' reason.
+    pub fn fetch_organization_mini_details(&self, session: &mut Session, id: &str) -> Result<serde_json::Value, RestError> {
+        let url = self.organization_url(id, "/users/mini-details")?;
+        self.refreshing(session, |session| self.value_from(self.bearer(self.sync_agent.get(&url), session).call()))
+    }
+
     /// **The one door every sharing route goes through.**
     ///
     /// `request` is a [`crate::rest::sharing_api::SharingRequest`], which only

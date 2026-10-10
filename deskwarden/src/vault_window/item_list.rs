@@ -2169,7 +2169,13 @@ impl RowPeople {
                 .filter(|r| view.shared_with_someone(&r.item_id))
                 .map(|r| r.item_id.clone())
                 .collect(),
-            received: view.received.iter().map(|r| (r.item_id.clone(), r.from.clone())).collect(),
+            // An unverified sharer says so here too (official-path spec
+            // §4.3): the row's "from" is the org name's claim alone.
+            received: view
+                .received
+                .iter()
+                .map(|r| (r.item_id.clone(), if r.verified { r.from.clone() } else { format!("{} \u{b7} unverified", r.from) }))
+                .collect(),
         }
     }
 
@@ -4395,7 +4401,7 @@ mod row_tile_tests {
             available: true,
             people: vec![crate::rest::sharing::PersonEntry { email: "anna@x.io".into(), state: crate::rest::sharing::PersonState::Shared, expires_at: None, authenticated: true }],
             records: vec![crate::rest::sharing::RecordEntry { item_id: "mine".into(), people: vec!["anna@x.io".into()] }],
-            received: vec![crate::rest::sharing::ReceivedEntry { item_id: "theirs".into(), from: "denis@x.io".into() }],
+            received: vec![crate::rest::sharing::ReceivedEntry { item_id: "theirs".into(), from: "denis@x.io".into(), organization_id: "org-x".into(), verified: true }],
             ..Default::default()
         };
         let people = RowPeople::from_view(Some(&view));

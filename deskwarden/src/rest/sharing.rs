@@ -121,6 +121,16 @@ pub struct RecordEntry {
 pub struct ReceivedEntry {
     pub item_id: String,
     pub from: String,
+    /// The sharing org the record is in -- what Shared with me groups by,
+    /// so two orgs that claim one sharer are never merged (official-path
+    /// spec §4.3).
+    #[serde(default)]
+    pub organization_id: String,
+    /// The sharer is the server's word, not only the org name's claim
+    /// ([`crate::rest::organizations::SharingOrg::verified`]).
+    /// `serde(default)` reads an answer without it as unverified.
+    #[serde(default)]
+    pub verified: bool,
 }
 
 /// A sharing org this account accepted and its sharer has not confirmed.
@@ -129,6 +139,9 @@ pub struct ReceivedEntry {
 pub struct WaitingEntry {
     pub organization_id: String,
     pub from: String,
+    /// As [`ReceivedEntry::verified`].
+    #[serde(default)]
+    pub verified: bool,
 }
 
 /// **Everything the window draws about sharing**, answered by `GET /sharing`
@@ -187,6 +200,13 @@ impl SharingView {
     #[must_use]
     pub fn received_from(&self, item_id: &str) -> Option<&str> {
         self.received.iter().find(|r| r.item_id == item_id).map(|r| r.from.as_str())
+    }
+
+    /// Whether a received record's sharer is the server's word -- `false`
+    /// for the org name's claim alone, and for a record not received at all.
+    #[must_use]
+    pub fn received_verified(&self, item_id: &str) -> bool {
+        self.received.iter().any(|r| r.item_id == item_id && r.verified)
     }
 }
 
@@ -645,6 +665,9 @@ pub(crate) struct Held {
     pub(crate) others: Vec<(String, String)>,
     /// Accepted, unconfirmed: `(org id, sharer)`.
     pub(crate) waiting: Vec<(String, String)>,
+    /// The ids of `others` and `waiting` whose sharer is only the org name's
+    /// claim (official-path spec §4.3).
+    pub(crate) unverified: BTreeSet<String>,
     /// Emails whose key differs from the pin.
     pub(crate) key_changed: BTreeSet<String>,
     /// Emails whose account has no public key yet.
@@ -666,6 +689,7 @@ impl std::fmt::Debug for Held {
             .field("my_org", &self.my_org)
             .field("others", &self.others)
             .field("waiting", &self.waiting)
+            .field("unverified", &self.unverified)
             .field("key_changed", &self.key_changed)
             .field("no_key", &self.no_key)
             .field("asked_adoption", &self.asked_adoption)
@@ -822,6 +846,10 @@ impl Sharing {
         // could not fetch changes nothing; and this is a READ, so it forgets
         // no cached id and writes no state (I2). No profile: nothing is held.
         let account = self.held().account.clone();
+        // The id this PC made or the user adopted, whatever the profile now
+        // says of it: never received from anyone (DW1 review, M3). Read here,
+        // before `held` is locked, as `trusted_org` reads the same file.
+        let pinned = account.as_ref().and_then(|account| self.pinned_org(&account.id));
         let chosen = profile.zip(account).and_then(|(profile, account)| self.trusted_org(profile, &account, false));
         let mine = chosen.and_then(|id| directory.sharing_orgs().into_iter().find(|o| o.id == id));
         let mut held = self.held();
@@ -846,16 +874,60 @@ impl Sharing {
                 Roster::Unknown => previous.as_ref().filter(|o| o.id == org.id).map(|o| o.roster.clone()).unwrap_or_default(),
             },
         });
+        // **Received: someone else's sharing orgs, and never this account's
+        // own.** The directory marks an org this account owns and is named
+        // for as its own; the pin covers the one it made or adopted even if
+        // the profile now lists it otherwise -- renamed, or this account no
+        // longer its owner -- so that org is never "Shared by" anyone
+        // (`a_made_or_adopted_org_is_never_received_from_anyone`).
+        let received = |o: &&crate::rest::organizations::Organisation| pinned.as_deref() != Some(o.id.as_str());
         held.others = directory
             .sharing_orgs()
             .into_iter()
+            .filter(received)
             .filter_map(|o| o.sharing.as_ref().filter(|s| !s.mine).map(|s| (o.id.clone(), s.sharer.clone())))
             .collect();
         held.waiting = directory
             .waiting()
             .iter()
+            .filter(received)
             .filter_map(|o| o.sharing.as_ref().map(|s| (o.id.clone(), s.sharer.clone())))
             .collect();
+        // **Which of them name a sharer only by the org's own title**
+        // (official-path spec §4.3): the view says "unverified" for these.
+        held.unverified = directory
+            .sharing_orgs()
+            .into_iter()
+            .chain(directory.waiting().iter())
+            .filter(|o| o.sharing.as_ref().is_some_and(|s| !s.mine && !s.verified))
+            .map(|o| o.id.clone())
+            .collect();
+    }
+
+    /// The org id `sharing_state.json` pins as this account's own -- made
+    /// here or adopted -- with no word from the profile on it. `None` with no
+    /// file, no id, or an id cached by a build before either flag existed.
+    fn pinned_org(&self, account_id: &str) -> Option<String> {
+        let path = self.setup().state_path?;
+        let me = crate::sharing_state::SharingState::load(&path).account(account_id);
+        me.sharing_org_id.filter(|_| me.sharing_org_created || me.sharing_org_adopted)
+    }
+
+    /// Whether members may read an organisation's roster on this server, as
+    /// far as this session has learned ([`Capabilities::roster_readable`]).
+    /// `RestBackend::synced` asks it before asking the received rosters.
+    #[must_use]
+    pub fn roster_readable(&self) -> Option<bool> {
+        self.held().capabilities.roster_readable
+    }
+
+    /// What a whole read learned about it
+    /// (`organizations::Directory::attest_received`). `None` learned nothing
+    /// and changes nothing.
+    pub fn note_roster_readable(&self, learned: Option<bool>) {
+        if learned.is_some() {
+            self.held().capabilities.roster_readable = learned;
+        }
     }
 
     /// The view -- pure over what is held and the daemon's items.
@@ -917,14 +989,23 @@ impl Sharing {
         for item in items {
             if let Some(org) = organization_of(item) {
                 if let Some((_, sharer)) = held.others.iter().find(|(id, _)| id == org) {
-                    view.received.push(ReceivedEntry { item_id: item.id.clone(), from: sharer.clone() });
+                    view.received.push(ReceivedEntry {
+                        item_id: item.id.clone(),
+                        from: sharer.clone(),
+                        organization_id: org.to_string(),
+                        verified: !held.unverified.contains(org),
+                    });
                 }
             }
         }
         view.waiting = held
             .waiting
             .iter()
-            .map(|(organization_id, from)| WaitingEntry { organization_id: organization_id.clone(), from: from.clone() })
+            .map(|(organization_id, from)| WaitingEntry {
+                organization_id: organization_id.clone(),
+                from: from.clone(),
+                verified: !held.unverified.contains(organization_id),
+            })
             .collect();
         view
     }
@@ -1216,7 +1297,7 @@ fn keyed_account(account: Option<Account>) -> Result<Account, SharingError> {
 /// own: another account can create "Shared by <me>" and make this account an
 /// owner of it. [`roster_says_mine`] and the user's own Yes decide.
 fn owned_and_named(org: &crate::rest::sync::Organization, account_email: &str) -> bool {
-    crate::rest::organizations::sharing_mark(org.name.as_deref().and_then(sharer_of), None, org.is_owner(), account_email)
+    crate::rest::organizations::sharing_mark(org.name.as_deref().and_then(sharer_of), org.is_owner(), account_email)
         .is_some_and(|mark| mark.mine)
 }
 
@@ -3034,9 +3115,11 @@ impl Sharing {
     /// place that needs an attested owner keeps needing one). The link's
     /// `organizationName` is plaintext anyone can write -- "Shared by
     /// boss@corp" names nobody -- so the org is not put in [`Held::waiting`]
-    /// or [`Held::others`] here. It reaches Shared with me when a whole read's
-    /// directory attests its sharer, as every other sharing org does; until
-    /// then the window's toast (`share_ui::LINK_ACCEPTED`) is the answer.
+    /// or [`Held::others`] here. It reaches Shared with me when a whole read
+    /// lists it, as every other sharing org does -- its sharer the roster's
+    /// one owner where a member may read it, else the name's claim marked
+    /// unverified ([`Held::unverified`]); until then the window's toast
+    /// (`share_ui::LINK_ACCEPTED`) is the answer.
     /// `a_links_org_name_files_no_sharer_until_the_server_attests_one` holds
     /// this.
     ///
@@ -3092,6 +3175,7 @@ impl Sharing {
             let mut held = self.held();
             held.others.retain(|(id, _)| id != organization_id);
             held.waiting.retain(|(id, _)| id != organization_id);
+            held.unverified.remove(organization_id);
         }
         Ok(SharingOutcome {
             upserted: Vec::new(),
@@ -6446,7 +6530,9 @@ mod tests {
     /// anyone can write: a "Shared by boss@corp.example" link, accepted, puts
     /// nothing in waiting and nothing in Shared with me -- not even a record
     /// of that org the vault already holds -- and a later pass whose
-    /// directory does not list the org adds nothing either.
+    /// directory does not list the org adds nothing either. Only the server's
+    /// own listing of the org files it, and then marked unverified unless a
+    /// roster names its owner (`a_whole_read_files_the_unverified_sharers`).
     #[test]
     fn a_links_org_name_files_no_sharer_until_the_server_attests_one() {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
@@ -6498,6 +6584,89 @@ mod tests {
             Err(SharingError::Refused(sentence)) => assert_eq!(sentence, format!("{LINK_ACCEPT_FAILED} The server said: Invalid token.")),
             other => panic!("a refused accept succeeded: {other:?}"),
         }
+    }
+
+    /// **A received record says whether its sharer is the server's word**
+    /// (official-path spec §4.3), and carries its organisation, which Shared
+    /// with me groups by; a sharer being waited on is marked the same way.
+    #[test]
+    fn received_records_and_waiting_sharers_say_whether_the_sharer_is_verified() {
+        let engine = offline();
+        {
+            let mut held = engine.held();
+            held.capabilities.loaded = true;
+            held.others = vec![("org-anna".into(), "anna@x.io".into()), ("org-boss".into(), "boss@x.io".into())];
+            held.waiting = vec![("org-carol".into(), "carol@x.io".into())];
+            held.unverified = ["org-boss".to_string(), "org-carol".to_string()].into_iter().collect();
+        }
+        let items = [an_item("r1", "org-anna", &[]), an_item("r2", "org-boss", &[])];
+        let view = engine.view(&items);
+        assert_eq!(
+            view.received,
+            vec![
+                ReceivedEntry { item_id: "r1".into(), from: "anna@x.io".into(), organization_id: "org-anna".into(), verified: true },
+                ReceivedEntry { item_id: "r2".into(), from: "boss@x.io".into(), organization_id: "org-boss".into(), verified: false },
+            ]
+        );
+        assert!(view.received_verified("r1"));
+        assert!(!view.received_verified("r2"));
+        assert!(!view.received_verified("nothing"));
+        assert_eq!(view.waiting, vec![WaitingEntry { organization_id: "org-carol".into(), from: "carol@x.io".into(), verified: false }]);
+    }
+
+    /// **A whole read files which received orgs are unverified** -- the
+    /// directory's own mark -- for the view to say so.
+    #[test]
+    fn a_whole_read_files_the_unverified_sharers() {
+        let (_server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        // `sharing_profile` (backend.rs's fixture) lists it in both
+        // `organizations` and `organizationsNew`, as a confirmed member.
+        let body = sharing_profile(serde_json::json!([
+            { "id": "org-boss", "name": "Shared by boss@x.io", "type": 2, "status": 2, "enabled": true }
+        ]));
+        let profile: Profile = serde_json::from_value(body.clone()).expect("profile");
+        let response: crate::rest::sync::SyncResponse =
+            serde_json::from_value(serde_json::json!({ "profile": body, "ciphers": [], "folders": [], "collections": [] })).expect("sync");
+        let directory = crate::rest::organizations::Directory::from_sync(&response, &engine.keys_from(&profile).expect("keys"));
+        engine.note_directory(&directory, Some(&profile));
+        let held = engine.held();
+        assert_eq!(held.others, vec![("org-boss".to_string(), "boss@x.io".to_string())]);
+        assert!(held.unverified.contains("org-boss"));
+    }
+
+    /// **This account's own sharing org is never received from anyone**
+    /// (DW1 review, M3): an org this client made, or the user adopted, is
+    /// not listed in Shared with me whatever the profile now says of it --
+    /// here, no longer owned and renamed for someone else.
+    #[test]
+    fn a_made_or_adopted_org_is_never_received_from_anyone() {
+        let renamed = serde_json::json!([
+            { "id": FIXTURE_ORG, "name": "Shared by boss@x.io", "type": 2, "status": 2, "enabled": true }
+        ]);
+        let (_server, _backend, engine, _dir) = on_nodewarden(renamed.clone());
+        let body = sharing_profile(renamed);
+        let profile: Profile = serde_json::from_value(body.clone()).expect("profile");
+        let response: crate::rest::sync::SyncResponse =
+            serde_json::from_value(serde_json::json!({ "profile": body, "ciphers": [], "folders": [], "collections": [] })).expect("sync");
+        let directory = crate::rest::organizations::Directory::from_sync(&response, &engine.keys_from(&profile).expect("keys"));
+        assert!(directory.sharing_orgs().iter().any(|o| o.id == FIXTURE_ORG), "the directory alone reads it as received");
+        engine.note_directory(&directory, Some(&profile));
+        let held = engine.held();
+        assert!(held.others.is_empty(), "{:?}", held.others);
+        assert!(held.waiting.is_empty(), "{:?}", held.waiting);
+    }
+
+    /// **What a whole read learns about rosters is kept for the session**:
+    /// a read that learned nothing changes nothing.
+    #[test]
+    fn what_a_whole_read_learns_about_rosters_is_kept_for_the_session() {
+        let engine = offline();
+        assert_eq!(engine.roster_readable(), None);
+        engine.note_roster_readable(None);
+        assert_eq!(engine.roster_readable(), None, "nothing learned changes nothing");
+        engine.note_roster_readable(Some(false));
+        engine.note_roster_readable(None);
+        assert_eq!(engine.roster_readable(), Some(false));
     }
 
     /// **Stop receiving from X** (spec 6.9): leave the sharer's org, and every

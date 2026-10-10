@@ -3385,7 +3385,7 @@ pub fn build_frame_with_search(
         // happen. There are no invitation rows: an invitation is accepted
         // from its link (Paste an invite link) or in the web vault.
         let waiting_from: Vec<String> =
-            sharing.view.as_ref().map(|v| v.waiting.iter().map(|w| w.from.clone()).collect()).unwrap_or_default();
+            sharing.view.as_ref().map(|v| v.waiting.iter().map(share_ui::waiting_from).collect()).unwrap_or_default();
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)

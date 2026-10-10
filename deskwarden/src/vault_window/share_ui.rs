@@ -1311,6 +1311,7 @@ pub(crate) fn people_sharing<'a>(
         fingerprinting: pane.fingerprinting.as_deref(),
         notice: pane.notice_for(&item.id),
         view_only_from: pane.view.as_ref().and_then(|v| v.received_from(&item.id)),
+        view_only_unverified: pane.view.as_ref().is_some_and(|v| v.received_from(&item.id).is_some() && !v.received_verified(&item.id)),
     }
 }
 
@@ -2681,7 +2682,8 @@ pub struct PeopleRows<'a> {
     /// [`draw_paste_and_waiting`] puts it first in Shared with me.
     pub(crate) paste: Option<Zeroizing<String>>,
     /// **The sharers this account accepted and who have not finished yet**
-    /// -- the view's `waiting`, by the sharer's address. Each is one quiet
+    /// -- the view's `waiting`, by the sharer's address ([`waiting_from`]:
+    /// with `(unverified)` where it is the org name's claim). Each is one quiet
     /// [`waiting_line`] under the paste box: an accepted sharing org shows
     /// its member nothing until the sharer's daemon confirms them, and
     /// without the line an accept would look like it did nothing.
@@ -2756,16 +2758,29 @@ pub(crate) struct ReceivedShareRow {
     /// decrypted and authenticated the record, and the view only says which
     /// item it is.
     pub(crate) name: String,
-    /// Who shares it, as the view names them. **For display only**: the
-    /// view's sharer is read off the sharing org's name, which its owner
-    /// wrote in plaintext and could have spelled as anybody. The view offers
-    /// no authenticated alternative for a record received (the collection
-    /// under it is the SHARER's, keyed by an org key only they vouch for), so
-    /// this is shown as the claim it is and decides nothing.
+    /// Who shares it, as the view names them. **For display only**: the org's
+    /// one owner where the server let a member read the roster, else the org
+    /// name's claim, which anyone could have spelled as anybody -- and then
+    /// [`Self::verified`] is false and the row says so. It decides nothing.
     pub(crate) from: String,
+    /// The sharer is the server's word (official-path spec §4.3); `false`
+    /// draws "unverified" in the row's subtitle ([`received_subtitle`]).
+    pub(crate) verified: bool,
 }
 
-/// **The received records the window holds, in the view's order.** An entry
+/// A received row's subtitle: who shares it and that it is view-only, with
+/// `unverified` between where the sharer is only the organisation name's
+/// claim (official-path spec §4.3).
+pub(crate) fn received_subtitle(row: &ReceivedShareRow) -> String {
+    if row.verified {
+        format!("from {} \u{b7} view-only", row.from)
+    } else {
+        format!("from {} \u{b7} unverified \u{b7} view-only", row.from)
+    }
+}
+
+/// **The received records the window holds, grouped by organisation, in the
+/// view's order within each.** An entry
 /// whose item the vault does not hold -- a view a frame older than a sync --
 /// is left out, for [`share_rows`]' reason: the vault is where a name comes
 /// from, and a nameless row is not one to show.
@@ -2773,18 +2788,36 @@ pub(crate) fn received_share_rows(view: Option<&SharingView>, items: &[VaultItem
     let Some(view) = view else {
         return Vec::new();
     };
-    view.received
-        .iter()
-        .filter_map(|r| {
-            let item = items.iter().find(|i| i.id == r.item_id)?;
-            Some(ReceivedShareRow {
+    // **Grouped by organisation** (official-path spec §4.3), in the order each
+    // first appears: two orgs that claim one sharer are two groups, never
+    // merged under a name neither has proved. The sort is stable, so the
+    // view's order holds within a group.
+    let mut groups: Vec<&str> = Vec::new();
+    let mut rows: Vec<(usize, ReceivedShareRow)> = Vec::new();
+    for r in &view.received {
+        let Some(item) = items.iter().find(|i| i.id == r.item_id) else {
+            continue;
+        };
+        let group = match groups.iter().position(|g| *g == r.organization_id) {
+            Some(at) => at,
+            None => {
+                groups.push(&r.organization_id);
+                groups.len() - 1
+            }
+        };
+        rows.push((
+            group,
+            ReceivedShareRow {
                 key: format!("{RECEIVED_KEY_PREFIX}{}", item.id),
                 item_id: item.id.clone(),
                 name: item.name.clone(),
                 from: r.from.clone(),
-            })
-        })
-        .collect()
+                verified: r.verified,
+            },
+        ));
+    }
+    rows.sort_by_key(|(group, _)| *group);
+    rows.into_iter().map(|(_, row)| row).collect()
 }
 
 /// The height [`group_eyebrow`] takes, measured -- what `send_ui` adds to its
@@ -2839,7 +2872,7 @@ pub(crate) fn draw_received_group(
                 key: &row.key,
                 item_id: &row.item_id,
                 name: &row.name,
-                subtitle: &format!("from {} \u{b7} view-only", row.from),
+                subtitle: &received_subtitle(row),
                 pill: None,
             },
             width,
@@ -2867,8 +2900,9 @@ pub(crate) fn draw_received_group(
 pub(crate) const PASTE_HINT: &str = "Paste an invite link";
 pub(crate) const PASTE_ACCEPT_LABEL: &str = "Accept";
 /// A pasted link was accepted. The records arrive once the sharer's daemon
-/// confirms. Nothing names the sharer until a whole read attests them --
-/// the link's org name is a claim (`Sharing::accept_link`) -- so this toast is
+/// confirms. Nothing names the sharer until a whole read lists the org --
+/// the link's org name is a claim (`Sharing::accept_link`), and the listing
+/// marks it unverified unless a roster names the owner -- so this toast is
 /// the whole answer until then.
 pub(crate) const LINK_ACCEPTED: &str = "Invitation accepted. The records arrive once the person sharing them finishes.";
 /// The paste row: one `theme::inline_field` high.
@@ -2884,6 +2918,19 @@ const WAITING_LINE_SIZE: f32 = 12.0;
 /// org shows this account nothing, and this line is why.
 pub(crate) fn waiting_line(from: &str) -> String {
     format!("Waiting for {from} to finish sharing")
+}
+
+/// **Who a [`waiting_line`] names**: the sharer, and `(unverified)` after
+/// them where that is only the org name's claim (official-path spec §4.3) --
+/// a sharer being waited on is no more proved than one whose records have
+/// arrived (`received_subtitle`). Parenthesised, not a `·` run, because it
+/// sits inside the line's sentence.
+pub(crate) fn waiting_from(entry: &crate::rest::sharing::WaitingEntry) -> String {
+    if entry.verified {
+        entry.from.clone()
+    } else {
+        format!("{} (unverified)", entry.from)
+    }
 }
 
 /// One line of `text`, ended with an ellipsis where it would pass `width` --
@@ -3194,7 +3241,7 @@ mod tests {
         assert_eq!(share_control(None, false, &item("mine")), None, "no line to the daemon: the envelope is the Send");
         assert_eq!(share_control(None, true, &item("mine")), None, "not known yet");
         let mut received = on.clone();
-        received.received.push(crate::rest::sharing::ReceivedEntry { item_id: "theirs".into(), from: "d@x.io".into() });
+        received.received.push(crate::rest::sharing::ReceivedEntry { item_id: "theirs".into(), from: "d@x.io".into(), organization_id: "org-x".into(), verified: true });
         assert_eq!(share_control(Some(&received), true, &item("theirs")), None);
     }
 
@@ -3457,7 +3504,7 @@ mod tests {
             vec![("anna@x.io", PersonState::Shared, None), ("bob@x.io", PersonState::WaitingAccept, None)],
             vec![("r1", vec!["anna@x.io", "bob@x.io"]), ("r2", vec!["anna@x.io"])],
         );
-        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "t1".into(), from: "d@x.io".into() });
+        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "t1".into(), from: "d@x.io".into(), organization_id: "org-x".into(), verified: true });
         pane.view = Some(v);
         assert_eq!(received(&pane), 1);
         pane.stop_confirming = Some(("r1".into(), "bob@x.io".into()));
@@ -4603,7 +4650,7 @@ mod tests {
     #[test]
     fn shared_with_me_lists_received_records_from_people_and_opens_them() {
         use crate::vault_window::send_ui::{RecordTiles, SendUiAction};
-        let received = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }];
+        let received = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }];
         let mut people = PeopleRows { received: &received, ..PeopleRows::none() };
         let mut selected = None;
         let texts = ui_frame(400.0, Vec::new(), |ui| {
@@ -4641,12 +4688,12 @@ mod tests {
     #[test]
     fn received_rows_are_named_by_the_vault_and_need_their_record() {
         let mut v = SharingView { available: true, ..SharingView::default() };
-        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "r9".into(), from: "denis@x.io".into() });
-        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "gone".into(), from: "denis@x.io".into() });
+        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "r9".into(), from: "denis@x.io".into(), organization_id: "org-x".into(), verified: true });
+        v.received.push(crate::rest::sharing::ReceivedEntry { item_id: "gone".into(), from: "denis@x.io".into(), organization_id: "org-x".into(), verified: true });
         let items: Vec<VaultItem> = vec![serde_json::from_value(serde_json::json!({ "id": "r9", "name": "Acme VPN" })).expect("item")];
         assert_eq!(
             received_share_rows(Some(&v), &items),
-            vec![ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into() }]
+            vec![ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true }]
         );
         assert!(received_share_rows(None, &items).is_empty());
     }
@@ -4683,6 +4730,41 @@ mod tests {
         let texts = ui_frame(400.0, Vec::new(), |ui| draw_paste_and_waiting(ui, &mut people, 376.0));
         assert!(texts.is_empty(), "{texts:?}");
         assert!(paste_and_waiting_height(&PeopleRows::none(), 6.0).abs() < f32::EPSILON);
+    }
+
+    /// **An unverified sharer says so, and is grouped by organisation**
+    /// (official-path spec §4.3): two orgs that claim one sharer stay two
+    /// groups, in the order each first appears, never merged under a name
+    /// neither has proved.
+    #[test]
+    fn received_rows_are_grouped_by_organisation_and_say_when_the_sharer_is_unverified() {
+        let mut v = SharingView { available: true, ..SharingView::default() };
+        let entry = |item: &str, org: &str, verified: bool| crate::rest::sharing::ReceivedEntry {
+            item_id: item.into(),
+            from: "boss@x.io".into(),
+            organization_id: org.into(),
+            verified,
+        };
+        v.received = vec![entry("a", "org-1", false), entry("b", "org-2", true), entry("c", "org-1", false)];
+        let items: Vec<VaultItem> =
+            ["a", "b", "c"].iter().map(|id| serde_json::from_value(serde_json::json!({ "id": id, "name": id })).expect("item")).collect();
+        let rows = received_share_rows(Some(&v), &items);
+        assert_eq!(rows.iter().map(|r| r.item_id.as_str()).collect::<Vec<_>>(), ["a", "c", "b"]);
+        assert_eq!(received_subtitle(&rows[0]), "from boss@x.io \u{b7} unverified \u{b7} view-only");
+        assert_eq!(received_subtitle(&rows[2]), "from boss@x.io \u{b7} view-only");
+    }
+
+    /// **A sharer being waited on says unverified too** (official-path spec
+    /// §4.3): the line names the org's claim, and says it is one.
+    #[test]
+    fn a_waiting_line_says_when_the_sharer_is_unverified() {
+        let entry = |verified: bool| crate::rest::sharing::WaitingEntry {
+            organization_id: "org-1".into(),
+            from: "boss@x.io".into(),
+            verified,
+        };
+        assert_eq!(waiting_line(&waiting_from(&entry(true))), "Waiting for boss@x.io to finish sharing");
+        assert_eq!(waiting_line(&waiting_from(&entry(false))), "Waiting for boss@x.io (unverified) to finish sharing");
     }
 
     /// **"Stop receiving from X?"** names the sharer and what goes, and

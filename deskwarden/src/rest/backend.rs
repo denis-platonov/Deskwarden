@@ -605,6 +605,9 @@ impl RestBackend {
             because = "the server did not say what revision it is at";
         }
 
+        // Read before the session lock: the sharing engine's lock is never
+        // taken while the session's is held.
+        let ask_received_rosters = self.sharing.roster_readable() != Some(false);
         let mut state = self.locked();
         let response = self.client.sync_refreshing(&mut state.session).map_err(rest_error)?;
         log::info!(
@@ -652,13 +655,24 @@ impl RestBackend {
         // that trait would oblige four impls with nothing to say about
         // organisations each to say something. See that module's docs, which
         // argue the trade against this file's own rule about second caches.
-        let directory = crate::rest::organizations::Directory::load(
+        let mut directory = crate::rest::organizations::Directory::load(
             &self.client,
             &mut state.session,
             &response,
             &keys,
         );
+        // **Who shares each received record, on the server's word where it
+        // gives one** (official-path spec §4.3): the received sharing orgs'
+        // `mini-details`, asked until the server says members may not read
+        // them. It never says otherwise this session, so the engine keeps the
+        // answer and later whole reads ask nothing.
+        let roster_readable = if ask_received_rosters {
+            directory.attest_received(&self.client, &mut state.session)
+        } else {
+            None
+        };
         drop(state);
+        self.sharing.note_roster_readable(roster_readable);
         // The sharing engine takes what this read already paid for -- its
         // org's roster and person collections -- so its confirm pass asks the
         // server for no roster of its own (spec 11.5). **After** the session
@@ -4170,8 +4184,6 @@ pub mod tests {
         serde_json::json!({
             "id": FIXTURE_ORG,
             "name": format!("Shared by {EMAIL}"),
-            // A NodeWarden that attests the owner -- this account.
-            "ownerEmail": EMAIL,
             "role": "owner",
             "type": 0,
             "status": 2,

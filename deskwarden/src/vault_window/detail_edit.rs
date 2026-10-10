@@ -10742,7 +10742,8 @@ fn owner_line(audience: &crate::rest::organizations::Audience) -> String {
             1 => format!("{OWNER_PERSONAL} \u{b7} shared with {}", people[0]),
             n => format!("{OWNER_PERSONAL} \u{b7} shared with {n} people"),
         },
-        Audience::SharedWithMe { from } => format!("Shared by {from}"),
+        Audience::SharedWithMe { from, verified: true } => format!("Shared by {from}"),
+        Audience::SharedWithMe { from, verified: false } => format!("Shared by {from} \u{b7} unverified"),
     }
 }
 
