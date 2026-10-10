@@ -113,8 +113,12 @@ as the same form as a login.
 
 - the Autofill card stays on card records (owner's decision);
 - which fields exist and how they are saved;
-- validation;
-- the read pane.
+- validation.
+
+**The read pane changes only as the owner's sections above say:** CARD
+DETAILS gains the masked PIN row after the security code (the PIN leaves
+CUSTOM FIELDS on a card), and the Bank row shows the bank by name, resolved
+against the vault's logins exactly as the edit form's picker does.
 
 ## Testing
 

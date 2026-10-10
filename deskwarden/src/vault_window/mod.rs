@@ -5170,6 +5170,7 @@ pub fn build_frame_with_search(
                                 reveal_totp_seed,
                                 &mut breaches,
                                 people,
+                                &items,
                             );
                             // **The share toast, over the pane just drawn**
                             // (mock 6a): how a share or a stop ended, said in
@@ -6313,6 +6314,7 @@ pub fn build_frame_with_search(
                                     reveal_totp_seed,
                                     &mut breaches,
                                     share_ui::people_sharing(&sharing, sharing_client.is_some(), item, &person_lines),
+                                    &items,
                                 );
                             }
                             (None, None) => {}
@@ -13435,6 +13437,10 @@ fn draw_read_arm(
     // (`share_ui::people_sharing`), and this arm only carries it so the pane
     // can be driven headlessly with it under a test's control.
     people: detail::PeopleSharing<'_>,
+    // The window's items, forwarded for the one question the read pane asks
+    // of them: what a card's bank is called (`detail::bank_name`), the same
+    // answer the edit form's picker gives.
+    vault: &[VaultItem],
 ) -> DetailAction {
     let action = draw_detail_read(
         ui,
@@ -13452,6 +13458,7 @@ fn draw_read_arm(
         reveal_totp_seed,
         breaches,
         people,
+        vault,
     );
     // **CTRL+SHIFT+F used to be read here, and is gone with the button it
     // was the keyboard equivalent of.** Its whole identity was "clicking
@@ -23424,6 +23431,8 @@ mod draw_read_arm_tests {
                 // Nothing about sharing: the Share control has its own tests
                 // in `detail`, and this harness has no daemon behind it.
                 crate::vault_window::detail::PeopleSharing::default(),
+                // No vault: a card's bank is named from its domain alone.
+                &[],
             );
         });
 

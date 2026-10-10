@@ -3554,6 +3554,13 @@ pub fn draw_detail_read(
     // daemon's view (`share_ui::people_sharing`). `PeopleSharing::default()`
     // from every caller that is not about sharing.
     people: PeopleSharing<'_>,
+    // The vault's items, for ONE question: what a card's bank is called.
+    // [`bank_name`]'s first rule is the name of the vault login the bank's
+    // domain was chosen from, and only the window holds the logins -- the
+    // edit form gets the same list through `EditDraft::offer_bank_domains`,
+    // so the two panes name a bank the same way. `&[]` from a caller with no
+    // vault, which names the bank from its domain alone.
+    vault: &[VaultItem],
 ) -> DetailAction {
     let mut action = DetailAction::None;
     // **First, before anything is drawn or any chord is resolved.** A copy
@@ -4659,7 +4666,7 @@ pub fn draw_detail_read(
         DetailBody::NotesOnly => {}
         DetailBody::Card => {
             card(ui, "CARD DETAILS", |ui| {
-                card_rows(ui, card_pane_fields(item), reveal, &mut action);
+                card_rows(ui, card_pane_fields(item), reveal, &mut action, vault);
             });
             ui.add_space(CARD_GAP);
         }
@@ -8535,6 +8542,8 @@ fn card_rows(
     fields: Option<CardFields>,
     reveal: &mut RevealState,
     action: &mut DetailAction,
+    // The vault's items, which name the bank -- see [`bank_name`].
+    vault: &[VaultItem],
 ) {
     let Some(fields) = fields else {
         empty_pane_note(ui, "No card details on this item.");
@@ -8724,15 +8733,15 @@ fn card_rows(
     let mut above = face || cardholder.is_some();
     // **The bank by NAME** (see [`bank_name`]): the stored domain is how its
     // icon is found, and stays visible as the row's tooltip; the name is what
-    // is drawn and what a click copies. This pane is not handed the vault's
-    // items, so the name is the domain's own (`Brex` for
-    // `dashboard.brex.com`) rather than the login's.
+    // is drawn and what a click copies. Named against the vault the window
+    // hands this pane, so the read pane and the edit form agree: the login
+    // the bank was chosen from, then the domain's own label.
     if let Some(domain) = &bank {
         if above {
             theme::row_rule(ui);
         }
         above = true;
-        let name = bank_name(domain, &[]);
+        let name = bank_name(domain, vault);
         copy_row(
             ui,
             CARD_BANK_LABEL,
@@ -10122,7 +10131,7 @@ mod tests {
                 false,
                 false,
                 &mut inert_breach_cache(),
-                PeopleSharing::default());
+                PeopleSharing::default(), &[]);
         });
 
         let mut texts = Vec::new();
@@ -10791,7 +10800,7 @@ mod tests {
                 false,
                 false,
                 &mut inert_breach_cache(),
-                PeopleSharing::default());
+                PeopleSharing::default(), &[]);
         })
         .shapes
     }
@@ -10893,6 +10902,9 @@ mod tests {
         /// one (mock 6d) -- `None` unless a test sets it (see
         /// [`Pane::view_only`]), which is every record the user owns.
         view_only_from: Option<String>,
+        /// The vault's items, as the window hands them -- what names a card's
+        /// bank. Empty unless a test sets it (see [`Pane::in_vault`]).
+        vault: Vec<VaultItem>,
     }
 
     /// One frame's output: what it returned, every string it painted with
@@ -11335,7 +11347,14 @@ mod tests {
                 people: Vec::new(),
                 sharing_notice: None,
                 view_only_from: None,
+                vault: Vec::new(),
             }
+        }
+
+        /// The same pane, in a vault holding these items.
+        fn in_vault(mut self, items: Vec<VaultItem>) -> Self {
+            self.vault = items;
+            self
         }
 
         /// The same pane, with the header's Share control drawn as
@@ -11452,7 +11471,8 @@ mod tests {
                             notice: self.sharing_notice.as_deref(),
                             view_only_from: self.view_only_from.as_deref(),
                             ..PeopleSharing::default()
-                        });
+                        },
+                        &self.vault);
                 },
             );
             let mut frame = Frame {
@@ -17484,6 +17504,32 @@ mod tests {
         let texts = painted(&item, &TotpState::NoSecret);
         assert!(texts.iter().any(|t| t == "Brex"), "the bank is not drawn by its name: {texts:?}");
         assert!(!contains(&texts, "brex.com"), "the bank's address is still painted: {texts:?}");
+    }
+
+    /// **The read pane names the bank after the vault login it came from**,
+    /// exactly as the edit form's picker does: a login called `Chase Bank`
+    /// with a website on the bank's host is what the row says -- not the
+    /// domain's own `Chase`, and not the domain. Clicking it copies that name.
+    #[test]
+    fn a_cards_bank_is_named_after_the_vault_login_it_came_from() {
+        let item = crate::vault_bridge::with_custom_field(
+            &napps_brex(),
+            crate::favicon::BANK_DOMAIN_FIELD,
+            "secure.chase.com",
+        );
+        let login = bank_login("Chase Bank", "https://secure.chase.com/web/auth");
+        let mut pane = Pane::new().in_vault(vec![login, item.clone()]);
+        let frame = pane.idle(&item, &TotpState::NoSecret);
+        assert!(frame.painted("Chase Bank"), "the bank is not named after its login: {:?}", frame.strings());
+        assert!(!frame.painted("Chase"), "the bank is named after its domain: {:?}", frame.strings());
+        assert!(
+            !frame.strings().iter().any(|s| s.contains("chase.com")),
+            "the bank's domain is painted: {:?}",
+            frame.strings()
+        );
+        let clicked =
+            pane.click(&item, &TotpState::NoSecret, frame.rect_of("Chase Bank").center());
+        assert_eq!(clicked.action, DetailAction::CopyValue("Chase Bank".to_string()));
     }
 
     /// A login as the bank picker sees one: a name and one saved website.
@@ -25932,7 +25978,7 @@ mod read_pane_scroll_tests {
                         false,
                         false,
                         &mut super::tests::inert_breach_cache(),
-                        PeopleSharing::default());
+                        PeopleSharing::default(), &[]);
                 },
             );
             let mut shot = Shot::default();
@@ -27983,7 +28029,7 @@ mod breach_badge_tests {
                     enabled,
                     false,
                     &mut cache,
-                    PeopleSharing::default());
+                    PeopleSharing::default(), &[]);
             });
             painted.runs.clear();
             painted.fills.clear();

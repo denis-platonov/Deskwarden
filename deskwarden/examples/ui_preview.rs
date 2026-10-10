@@ -2793,6 +2793,9 @@ impl Preview {
                         // Design 6: nothing about sharing -- a preview has no
                         // daemon to ask whether a Share control belongs here.
                         detail::PeopleSharing::default(),
+                        // No vault behind the preview either: a card's bank
+                        // is named from its domain alone.
+                        &[],
                     );
                 }
                 PaneKind::Discard => {
