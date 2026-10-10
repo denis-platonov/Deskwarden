@@ -4773,9 +4773,13 @@ pub const FIELDS_BLOCK_HEADING: &str = "Custom fields";
 /// "no custom fields **of its own**", because an item can be carrying a
 /// `deskwarden:app-match` and still show this line -- ours are not the
 /// user's, and the app block above is where that one is edited.
+///
+/// **It does not suggest a PIN**: a card has a PIN box of its own, and a
+/// custom field named `PIN` on a card is refused (`PIN_NAME_REFUSAL`), so a
+/// sentence offering one would advise the user into that refusal.
 pub const FIELDS_NONE_NOTICE: &str =
     "This item has no custom fields of its own yet. Add one to store anything Bitwarden has no \
-     box for \u{2014} a PIN, a recovery code, an account number.";
+     box for \u{2014} a recovery code, an account number.";
 
 /// The two Add buttons. Two, rather than one button and a type combo box,
 /// because the choice is what the field IS and the user makes it once: a
