@@ -39,6 +39,26 @@
 //! runs under SOME profile" and one that says which. A takeover only ends a
 //! process whose markers show it is in the same profile as the one ending it
 //! ([`may_force_end`]); a profiled process that cannot show that ends nothing.
+//!
+//! # Footguns
+//!
+//! * **A build older than `06dd6e8` ignores `DESKWARDEN_PROFILE`** and runs as
+//!   the owner's copy -- same lock, same folders, same vault -- and stands the
+//!   owner's copy down. Only use the variable with builds from `06dd6e8` on.
+//! * **Set it per shell, never for the user.** `setx DESKWARDEN_PROFILE ...`
+//!   (or the System Properties dialog) writes it into the user's environment,
+//!   and the owner's own copy, started at sign-in, would then come up as the
+//!   test profile -- with empty settings and no vault. Use `set` in `cmd` or
+//!   `$env:DESKWARDEN_PROFILE = '...'` in PowerShell, in the shell that starts
+//!   the test copy.
+//! * **Give the test copy its own executable name** (for example
+//!   `deskwarden-test.exe`). Builds older than the profile markers end every
+//!   same-named process in a forced takeover; a different name is invisible
+//!   to them.
+//! * **No global shortcuts, Windows Hello or updates.** A profile registers
+//!   only the chords written into its own `settings.json`, never touches the
+//!   shared Hello credential, and never checks for, downloads or installs an
+//!   update.
 
 use std::ffi::OsStr;
 use std::os::windows::io::OwnedHandle;
@@ -96,6 +116,9 @@ pub enum ProfileRefusal {
     /// The value is well formed, but one of its names would spell an object
     /// the default copy owns -- see [`parse`].
     Reserved(String),
+    /// The value is a Windows device name (`con`, `nul`, `com1`...), which no
+    /// folder can have.
+    DeviceName(String),
 }
 
 impl ProfileRefusal {
@@ -118,6 +141,10 @@ impl ProfileRefusal {
                 "{PROFILE_ENV} is set to {value:?}. Names that are \"quit\" or start with \
                  \"quit-\" are reserved, because the app's lock under that profile would share a \
                  name with another copy's stand-down signal. {shape}"
+            ),
+            Self::DeviceName(value) => format!(
+                "{PROFILE_ENV} is set to {value:?}, which Windows keeps for a device, so no folder \
+                 can be named after it. {shape}"
             ),
         }
     }
@@ -146,7 +173,21 @@ pub fn parse(raw: Option<&OsStr>) -> Result<Option<Profile>, ProfileRefusal> {
     if value == "quit" || value.starts_with("quit-") {
         return Err(ProfileRefusal::Reserved(value.to_string()));
     }
+    if is_device_name(value) {
+        return Err(ProfileRefusal::DeviceName(value.to_string()));
+    }
     Ok(Some(Profile(value.to_string())))
+}
+
+/// Whether `name` is one Windows keeps for a device -- `con`, `prn`, `aux`,
+/// `nul`, `com0`-`com9`, `lpt0`-`lpt9` -- and so can never be a folder: the
+/// profile's folders are named after it. Pure; `name` is already lowercase.
+fn is_device_name(name: &str) -> bool {
+    if matches!(name, "con" | "prn" | "aux" | "nul") {
+        return true;
+    }
+    let numbered = name.strip_prefix("com").or_else(|| name.strip_prefix("lpt"));
+    matches!(numbered, Some(digit) if digit.len() == 1 && digit.as_bytes()[0].is_ascii_digit())
 }
 
 /// This process's profile, once it has been read.
@@ -217,17 +258,41 @@ static MARKERS: Mutex<Vec<OwnedHandle>> = Mutex::new(Vec::new());
 /// Called by `main` straight after [`init_from_env`], above the mutex and above
 /// the `--ui` branch, so that every profiled process -- daemon, window or
 /// service -- is marked before any other Deskwarden could look for it.
-pub fn hold_markers() {
+///
+/// **`Err` when a profiled process could not take both**, and `main` then
+/// refuses to start it. Unmarked, it would read to the owner's copy as a
+/// default copy -- one the owner's forced takeover may end, and one whose own
+/// takeover the owner's copy could be mistaken for. Always `Ok` for the
+/// default copy.
+pub fn hold_markers() -> Result<(), String> {
     let Some(profile) = active() else {
-        return;
+        return Ok(());
     };
-    let pid = std::process::id();
-    let mut held = MARKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    for name in [any_profile_marker(pid), profile_marker(pid, profile)] {
-        if let Some(handle) = crate::app_mutex::hold_claim(&name) {
-            held.push(handle);
-        }
-    }
+    let handles = hold_markers_with(profile, std::process::id(), crate::app_mutex::hold_claim)?;
+    MARKERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(handles);
+    Ok(())
+}
+
+/// [`hold_markers`] over `hold`, for `pid` under `profile`: both handles, or
+/// the sentence that refuses the launch.
+pub fn hold_markers_with<H>(
+    profile: &Profile,
+    pid: u32,
+    hold: impl Fn(&str) -> Option<H>,
+) -> Result<Vec<H>, String> {
+    [any_profile_marker(pid), profile_marker(pid, profile)]
+        .iter()
+        .map(|name| {
+            hold(name).ok_or_else(|| {
+                format!(
+                    "Deskwarden could not mark this process as running under the test profile \
+                     {:?} (it could not create {name:?}). Without that mark the installed copy \
+                     could mistake it for itself, so it was not started. Nothing was changed.",
+                    profile.0
+                )
+            })
+        })
+        .collect()
 }
 
 /// What asking whether a name exists found.
@@ -330,6 +395,25 @@ pub fn app_dirs() -> Option<AppDirs> {
     ))
 }
 
+/// Where the Bitwarden CLI keeps its data when no account directory is
+/// chosen: `None` for the default copy -- the CLI's own default,
+/// `%APPDATA%\Bitwarden CLI`, as always -- and `<profile config>\bw-cli`
+/// under a profile, so a test copy never signs the user's real CLI profile in
+/// or out. Pure.
+#[must_use]
+pub fn bw_cli_fallback_for(config_dir: Option<PathBuf>, profile: Option<&Profile>) -> Option<PathBuf> {
+    profile?;
+    config_dir.map(|dir| dir.join("bw-cli"))
+}
+
+/// [`bw_cli_fallback_for`] for this process, created if it is used.
+#[must_use]
+pub fn bw_cli_fallback_dir() -> Option<PathBuf> {
+    let dir = bw_cli_fallback_for(app_dirs().map(|dirs| dirs.config_dir), active())?;
+    let _ = std::fs::create_dir_all(&dir);
+    Some(dir)
+}
+
 /// The cache folder `bw_acquire` downloads the Bitwarden CLI into, with the
 /// profile applied.
 #[must_use]
@@ -363,6 +447,95 @@ pub fn bw_serve_port_for(default: u16, profile: Option<&Profile>) -> u16 {
     }
     // `% 1000` is below 1000, so the sum is at most 19086 and fits.
     18_087 + u16::try_from(hash % 1000).unwrap_or(0)
+}
+
+/// The prefix of the names that say which test profile owns a `bw serve`
+/// port. Its own prefix, like [`MARKER_PREFIX`], so no profile can spell one.
+const PORT_CLAIM_PREFIX: &str = "Local\\Deskwarden-BwServePort-63CBCB72-5383-4AE7-AFB7-5EE0530E4630";
+
+/// The name only ONE test profile's daemon may hold for `port`.
+#[must_use]
+pub fn port_claim(port: u16) -> String {
+    format!("{PORT_CLAIM_PREFIX}-{port}")
+}
+
+/// The name the daemon of `profile` holds beside [`port_claim`], so its own
+/// windows can tell the `bw serve` on that port is their daemon's.
+#[must_use]
+pub fn port_owner(port: u16, profile: &Profile) -> String {
+    format!("{PORT_CLAIM_PREFIX}-{port}-{}", profile.0)
+}
+
+/// The port claims, held for the life of the daemon.
+static PORT_CLAIMS: Mutex<Vec<crate::vault_service::Held>> = Mutex::new(Vec::new());
+
+/// **Claims this profile's `bw serve` port for this daemon, or refuses.**
+///
+/// Two names can hash to one port ([`bw_serve_port_for`]). The first daemon
+/// to start holds [`port_claim`] exclusively, and a second profile's daemon
+/// on the same port is refused here, at startup, with a sentence that says
+/// why and what to do -- rather than starting a `bw serve` that could not
+/// bind, or worse, letting its window read the first profile's. Called by
+/// `main` once the single-instance takeover has settled, so a same-profile
+/// predecessor has already let go. Always `Ok` for the default copy, whose
+/// port is 8087 and outside every profile's range.
+pub fn claim_bw_serve_port() -> Result<(), String> {
+    let Some(profile) = active() else {
+        return Ok(());
+    };
+    let port = crate::bw_serve::port();
+    let held = claim_port_with(profile, port, crate::vault_service::windows_env().hold)?;
+    PORT_CLAIMS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(held);
+    Ok(())
+}
+
+/// [`claim_bw_serve_port`] over `hold`, which must be exclusive: `None` when
+/// the name already exists.
+pub fn claim_port_with<H>(
+    profile: &Profile,
+    port: u16,
+    hold: impl Fn(&str) -> Option<H>,
+) -> Result<Vec<H>, String> {
+    let refused = || {
+        format!(
+            "The Deskwarden test profile {:?} runs `bw serve` on port {port}, and another test \
+             profile's Deskwarden already holds that port -- two profile names can land on the \
+             same one. A profile never reads another profile's vault, so this one was not \
+             started. Close the other test copy, or pick a different {PROFILE_ENV} name.",
+            profile.0
+        )
+    };
+    let exclusive = hold(&port_claim(port)).ok_or_else(refused)?;
+    let owner = hold(&port_owner(port, profile)).ok_or_else(refused)?;
+    Ok(vec![exclusive, owner])
+}
+
+/// **Whether the `bw serve` on this process's port is its own daemon's.**
+/// Always `true` for the default copy, which asks only the port, as before.
+/// Under a profile, only when this profile's daemon holds [`port_owner`].
+#[must_use]
+pub fn bw_serve_port_is_ours() -> bool {
+    match active() {
+        None => true,
+        Some(profile) => (crate::vault_service::windows_env().is_held)(&port_owner(
+            crate::bw_serve::port(),
+            profile,
+        )),
+    }
+}
+
+/// What a "`bw serve`'s port is held" refusal adds under a profile: empty for
+/// the default copy, whose sentence is unchanged.
+#[must_use]
+pub fn port_held_hint() -> String {
+    match active() {
+        None => String::new(),
+        Some(profile) => format!(
+            " This is the Deskwarden test profile {:?}, whose port is derived from its name; if \
+             another program uses that port, pick a different {PROFILE_ENV} name.",
+            profile.0
+        ),
+    }
 }
 
 /// `false` under a profile: a test copy never writes the logon entry, never
@@ -681,9 +854,9 @@ mod tests {
     /// owner's copy -- one of them could hold, signal or wait on the other's.
     /// Read over every file's production code, a line at a time: a line that
     /// spells a `Local\` literal must also call `kernel_name(`, except the
-    /// three constants it is applied to (the app mutex, the stand-down event)
-    /// or deliberately not (this module's markers, which carry the name
-    /// themselves). And the two constants are used, outside their own
+    /// four constants it is applied to (the app mutex, the stand-down event)
+    /// or deliberately not (this module's markers and port claims, which carry
+    /// the name themselves or arbitrate between profiles). And the two constants are used, outside their own
     /// declarations, only where `kernel_name` wraps them.
     #[test]
     fn every_named_kernel_object_goes_through_kernel_name() {
@@ -692,6 +865,7 @@ mod tests {
             concat!("pub const APP_MUTEX", "_NAME: &str = "),
             concat!("pub const QUIT_EVENT", "_NAME: &str = "),
             concat!("const MARKER", "_PREFIX: &str = "),
+            concat!("const PORT_CLAIM", "_PREFIX: &str = "),
         ];
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut stack = vec![src.clone()];
@@ -765,11 +939,14 @@ mod tests {
             .find(concat!("if let Err(refusal) = deskwarden::app_profile::init_", "from_env() {"))
             .expect("`main` no longer reads DESKWARDEN_PROFILE, or no longer refuses a bad one");
         let refused = body
-            .find(concat!("std::process::exit(refuse_the_", "profile(&refusal));"))
+            .find(concat!("std::process::exit(refuse_the_", "profile(&refusal.message()));"))
             .expect("a bad DESKWARDEN_PROFILE no longer ends the process");
         let marked = body
-            .find(concat!("app_profile::hold_", "markers();"))
-            .expect("`main` no longer marks a profiled process");
+            .find(concat!("if let Err(why) = deskwarden::app_profile::hold_", "markers() {"))
+            .expect("`main` no longer marks a profiled process, or runs one it could not mark");
+        let unmarked = body
+            .find(concat!("std::process::exit(refuse_the_", "profile(&why));"))
+            .expect("a profiled process that could not mark itself is no longer refused");
         for later in [
             concat!("launch_intent(std::env::", "args()"),
             concat!("app_mutex::", "acquire()"),
@@ -777,14 +954,130 @@ mod tests {
             concat!("logging::", "init("),
         ] {
             let at = body.find(later).unwrap_or_else(|| panic!("control: no {later:?} in main"));
-            assert!(read < refused && refused < marked && marked < at, "{later:?} comes first");
+            assert!(
+                read < refused && refused < marked && marked < unmarked && unmarked < at,
+                "{later:?} comes first"
+            );
         }
+        // The port is claimed once the takeover has settled -- so this
+        // profile's own predecessor has let go -- and before this process
+        // answers anyone or starts anything.
+        let settled = body.find(concat!("single_instance::", "resolve(")).expect("control");
+        let claimed = body
+            .find(concat!("if let Err(why) = deskwarden::app_profile::claim_bw_serve_", "port() {"))
+            .expect("`main` no longer claims the profile's bw serve port");
+        let listening = body.find(concat!("single_instance::", "listen_for_takeover()")).unwrap();
+        assert!(settled < claimed && claimed < listening, "the port claim is out of place");
+        let exits = &body[claimed..listening];
+        assert!(exits.contains(concat!("std::process::", "exit(PROFILE_REFUSED)")), "{exits}");
         // The refusal writes nothing: no log file, whose folder is the very
         // thing the refused value would have chosen.
         let refusal = &main_rs[main_rs.find("fn refuse_the_profile(").expect("control")..];
         let refusal = &refusal[..refusal.find("\n}").unwrap()];
         assert!(refusal.contains("message_box("), "a bad profile is refused without saying so");
         assert!(!refusal.contains("logging::"), "the refusal opens a log file");
+    }
+
+    #[test]
+    fn windows_device_names_are_refused() {
+        let mut devices = vec!["con".to_string(), "prn".into(), "aux".into(), "nul".into()];
+        for n in 0..=9 {
+            devices.push(format!("com{n}"));
+            devices.push(format!("lpt{n}"));
+        }
+        for device in &devices {
+            assert_eq!(
+                parse(Some(OsStr::new(device))),
+                Err(ProfileRefusal::DeviceName(device.clone())),
+                "{device} was not refused"
+            );
+        }
+        for fine in ["com", "lpt", "com10", "lpt1-x", "console", "conx", "nul-x", "auxiliary"] {
+            assert!(parse(Some(OsStr::new(fine))).is_ok(), "{fine} was refused");
+        }
+        let message = ProfileRefusal::DeviceName("nul".into()).message();
+        assert!(message.contains("device") && message.contains(PROFILE_ENV), "{message}");
+    }
+
+    /// **A profiled process that cannot mark itself is not started** -- each
+    /// marker on its own, and the sentence names the profile.
+    #[test]
+    fn a_process_that_cannot_hold_both_markers_is_refused() {
+        let p = profile("rc");
+        let both = hold_markers_with(&p, 42, |name: &str| Some(name.to_string())).unwrap();
+        assert_eq!(both, vec![any_profile_marker(42), profile_marker(42, &p)]);
+        for missing in [any_profile_marker(42), profile_marker(42, &p)] {
+            let refused = hold_markers_with(&p, 42, |name: &str| {
+                (name != missing).then(|| name.to_string())
+            })
+            .expect_err("a process missing a marker was let run");
+            assert!(refused.contains("\"rc\"") && refused.contains("not started"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_cli_falls_back_to_the_profile_s_own_folder_never_the_user_s() {
+        let config = PathBuf::from(r"C:\cfg\profiles\rc");
+        assert_eq!(bw_cli_fallback_for(Some(config.clone()), None), None, "the default changed");
+        assert_eq!(
+            bw_cli_fallback_for(Some(config.clone()), Some(&profile("rc"))),
+            Some(config.join("bw-cli"))
+        );
+        assert_eq!(bw_cli_fallback_for(None, None), None);
+        assert_eq!(bw_cli_fallback_dir(), None, "the unit tests run as the default copy");
+        // And `main` points the CLI there when it has no account directory.
+        assert!(
+            production_code(include_str!("main.rs")).contains(concat!(
+                "None => (config_dir.join(\"session.bin\"), ",
+                "deskwarden::app_profile::bw_cli_fallback_dir()),"
+            )),
+            "`main`'s no-account arm no longer uses the profile's own CLI folder"
+        );
+    }
+
+    /// **Two profiles on one `bw serve` port: the second is refused**, over
+    /// the real kernel, and gets the port once the first has gone. Port 1 is
+    /// outside every profile's range, so no real daemon holds these names.
+    #[test]
+    fn a_second_profile_on_a_claimed_port_is_refused_until_the_first_goes() {
+        let hold = crate::vault_service::windows_env().hold;
+        let first = claim_port_with(&profile("claim-test-a"), 1, hold).expect("control: first");
+        let Err(refused) = claim_port_with(&profile("claim-test-b"), 1, hold) else {
+            panic!("two profiles were let share a bw serve port");
+        };
+        assert!(refused.contains("port 1") && refused.contains(PROFILE_ENV), "{refused}");
+        assert!(
+            (crate::vault_service::windows_env().is_held)(&port_owner(1, &profile("claim-test-a"))),
+            "the first profile's windows could not tell the port is theirs"
+        );
+        assert!(!(crate::vault_service::windows_env().is_held)(&port_owner(1, &profile("claim-test-b"))));
+        drop(first);
+        let second = claim_port_with(&profile("claim-test-b"), 1, hold);
+        assert!(second.is_ok(), "the port stayed claimed after its holder let go");
+        assert!(bw_serve_port_is_ours(), "the default copy asks only the port, as before");
+        assert_eq!(port_held_hint(), "", "the default copy's refusal sentence changed");
+        assert!(!PORT_CLAIM_PREFIX.starts_with(crate::app_mutex::APP_MUTEX_NAME));
+    }
+
+    /// **Every action on the installed copy asks first** -- before the
+    /// network, the registry or the disk is touched.
+    #[test]
+    fn every_installed_copy_action_asks_the_profile_first() {
+        let gate = concat!("app_profile::touches_the_installed_", "copy()");
+        for (file, source, function, first_act) in [
+            ("updater.rs", include_str!("updater.rs"), "pub fn check_for_update(", ".get(&url)"),
+            ("updater.rs", include_str!("updater.rs"), "pub fn download_and_verify(", "create_dir_all("),
+            ("updater.rs", include_str!("updater.rs"), "pub fn apply_update(", "apply_update_with("),
+            ("autostart_repair.rs", include_str!("autostart_repair.rs"), "pub fn repair_logon_entry(", "RegOpenKeyExW("),
+            ("bw_acquire.rs", include_str!("bw_acquire.rs"), "fn add_to_user_path(", "RegOpenKeyExW("),
+        ] {
+            let code = production_code(source);
+            let body = &code[code.find(function).unwrap_or_else(|| panic!("{file}: no {function}"))..];
+            let body = &body[..body.find("\n}").unwrap()];
+            let asked = body.find(gate).unwrap_or_else(|| panic!("{file} `{function}` never asks"));
+            let acted = body.find(first_act).unwrap_or_else(|| panic!("control: {first_act}"));
+            assert!(asked < acted, "{file} `{function}` acts before it asks");
+        }
     }
 
     /// A source file with comment lines and `cfg(test)` modules removed.

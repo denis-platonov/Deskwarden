@@ -811,6 +811,13 @@ pub fn check_for_update(
     current_version: &Version,
     agent: &crate::http_agent::TotalBounded,
 ) -> Result<Option<ReleaseInfo>, String> {
+    // **A test copy never looks for an update** (`crate::app_profile`): an
+    // update is for the installed copy, which a test copy must never replace,
+    // so there is nothing to offer and no reason to ask GitHub.
+    if !crate::app_profile::touches_the_installed_copy() {
+        log::debug!("update check skipped: this is a test profile");
+        return Ok(None);
+    }
     let url = format!(
         "{base_url}/repos/denis-platonov/deskwarden/releases?per_page={RELEASES_PER_PAGE}"
     );
@@ -1236,6 +1243,11 @@ pub fn download_and_verify(
     agent: &crate::http_agent::StallBounded,
     on_progress: &dyn Fn(u64, Option<u64>),
 ) -> Result<PathBuf, String> {
+    // A test copy downloads no installer: it would never run one. See
+    // `check_for_update`, which already offers it none.
+    if !crate::app_profile::touches_the_installed_copy() {
+        return Err(crate::app_profile::installed_copy_refusal("downloads an update"));
+    }
     // Created here rather than assumed to exist: this is a dedicated cache
     // subdirectory (see `main.rs`), not the config directory the rest of the
     // app already creates at startup.

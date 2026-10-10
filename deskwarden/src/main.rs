@@ -126,12 +126,16 @@ fn main() {
     // environment, and must land in the daemon's profile. Unset, it changes
     // nothing. See `app_profile`.
     if let Err(refusal) = deskwarden::app_profile::init_from_env() {
-        std::process::exit(refuse_the_profile(&refusal));
+        std::process::exit(refuse_the_profile(&refusal.message()));
     }
     // A profiled process marks itself before any other Deskwarden could look
     // for it, so a forced takeover in another profile -- or in the default
-    // copy -- can tell it is not theirs to end. No-op for the default copy.
-    deskwarden::app_profile::hold_markers();
+    // copy -- can tell it is not theirs to end. One that cannot is refused
+    // rather than run unmarked: unmarked, the owner's copy would read it as a
+    // default copy it may end. Always `Ok` for the default copy.
+    if let Err(why) = deskwarden::app_profile::hold_markers() {
+        std::process::exit(refuse_the_profile(&why));
+    }
 
     // **Which of the two processes this is, answered before anything else.**
     //
@@ -353,6 +357,17 @@ fn main() {
             message_box("Deskwarden", gave_up.message(), MB_ICONWARNING | MB_OK);
             std::process::exit(1);
         }
+    }
+
+    // **A test profile's `bw serve` port is its own, or this launch stops.**
+    // Two profile names can derive one port; the second daemon is refused
+    // here, saying so, rather than ever reading the first one's vault. Taken
+    // after the takeover above, so this profile's previous daemon has gone.
+    // Always `Ok` for the default copy. See `app_profile::claim_bw_serve_port`.
+    if let Err(why) = deskwarden::app_profile::claim_bw_serve_port() {
+        log::error!("{why}");
+        message_box("Deskwarden", &why, MB_ICONERROR | MB_OK);
+        std::process::exit(PROFILE_REFUSED);
     }
 
     // **The other side of the same handover.** From here on this process is
@@ -718,7 +733,11 @@ fn main() {
                 Some(accounts::data_dir_for(&config_dir, &a.id)),
             )
         }
-        None => (config_dir.join("session.bin"), None),
+        // No account: the CLI's own default profile, `%APPDATA%\Bitwarden
+        // CLI` -- the user's real one -- for the default copy, as always. A
+        // test profile gets `<its config>\bw-cli` instead, so it can never
+        // sign the user's real CLI in or out. See `app_profile`.
+        None => (config_dir.join("session.bin"), deskwarden::app_profile::bw_cli_fallback_dir()),
     };
     bw_path::set_active_data_dir(active_dir);
     // `mut` for the same reason: `switch_to_account` re-points this at the
@@ -11410,6 +11429,23 @@ fn launch_intent<S: AsRef<str>>(
     })
 }
 
+/// What a launch refused over its `DESKWARDEN_PROFILE` exits with: the same
+/// code a refused launch gets.
+const PROFILE_REFUSED: i32 = 2;
+
+/// **Refuses a launch over its test profile** -- a `DESKWARDEN_PROFILE` that
+/// is not a valid name, or a profiled process that could not mark itself --
+/// with a message box and nothing else.
+///
+/// Unlike [`refuse_a_ui_launch`], this opens no log file: which folder the
+/// log lives in is the very thing the profile decides, and the default copy's
+/// log is not this process's to write into.
+fn refuse_the_profile(message: &str) -> i32 {
+    eprintln!("deskwarden: {message}");
+    message_box("Deskwarden", message, MB_ICONERROR | MB_OK);
+    PROFILE_REFUSED
+}
+
 /// A `--ui` command line this app will not act on, said out loud and then
 /// ended.
 ///
@@ -11421,23 +11457,6 @@ fn launch_intent<S: AsRef<str>>(
 /// Exit 2, matching the identical refusal the daemon's own `launch_intent`
 /// read makes further down: from the caller's side both are the same failure
 /// and giving them two codes would only invite someone to tell them apart.
-/// What a launch with an invalid `DESKWARDEN_PROFILE` exits with: the same
-/// code a refused launch gets.
-const PROFILE_REFUSED: i32 = 2;
-
-/// **Refuses a launch whose `DESKWARDEN_PROFILE` is not a valid name**, with
-/// a message box and nothing else.
-///
-/// Unlike [`refuse_a_ui_launch`], this opens no log file: which folder the
-/// log lives in is the very thing the refused value would have decided, and
-/// the default copy's log is not this process's to write into.
-fn refuse_the_profile(refusal: &deskwarden::app_profile::ProfileRefusal) -> i32 {
-    let message = refusal.message();
-    eprintln!("deskwarden: {message}");
-    message_box("Deskwarden", &message, MB_ICONERROR | MB_OK);
-    PROFILE_REFUSED
-}
-
 fn refuse_a_ui_launch(refusal: &UiLaunchRefusal) -> i32 {
     // The refusal happens above `logging::init`, so it opens the log itself.
     // Silently, and best-effort: a refusal that could not be logged is still
@@ -12914,10 +12933,15 @@ fn the_daemon_let_this_window_go() {
 /// process does not have. A connect-and-drop rather than an HTTP request: the
 /// only question is whether the daemon's backend is up, and a TCP handshake
 /// answers it without a round trip through a vault.
+///
+/// Under a test profile the port is only half of it: the listener must be
+/// this profile's daemon's, which `app_profile::bw_serve_port_is_ours` asks
+/// of the name that daemon holds. Always `true` for the default copy.
 fn backend_is_listening() -> bool {
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, bw_serve::port()));
-    TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+    deskwarden::app_profile::bw_serve_port_is_ours()
+        && TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
 }
 
 /// **Whether this launch puts a window on screen at all.**
@@ -14518,8 +14542,9 @@ impl std::fmt::Display for BackendStartError {
                 "something is still listening on localhost:{} after waiting {waited:?} -- most \
                  likely an orphaned `bw serve` (or a grandchild of one we killed) that has not \
                  released the socket yet. Refusing to start rather than talking to an unknown \
-                 process holding an unknown session.",
-                bw_serve::port()
+                 process holding an unknown session.{}",
+                bw_serve::port(),
+                deskwarden::app_profile::port_held_hint()
             ),
             Self::NoVerifiedCli(e) => write!(f, "cannot start `bw serve`: {e}"),
             Self::CliMissing(path) => write!(

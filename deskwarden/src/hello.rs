@@ -119,10 +119,25 @@ fn state_from(available: bool, blob_exists: bool) -> HelloState {
     }
 }
 
+/// **Whether this copy may use Windows Hello at all.** Pure.
+///
+/// Not under a test profile (`crate::app_profile`). [`CREDENTIAL_NAME`] is one
+/// key credential per Windows user, shared with the owner's copy and kept
+/// outside every folder a profile owns: a test copy enrolling would open --
+/// or, on a machine where the owner has not enrolled, create -- a credential
+/// that outlives the test. Off is the simpler of the two safe answers; a
+/// suffixed credential would leave one behind per profile name.
+fn hello_permitted(profile: Option<&crate::app_profile::Profile>) -> bool {
+    profile.is_none()
+}
+
 /// Probes Hello support and `account`'s enrollment. Called once when the login
 /// window opens — `IsSupportedAsync` is quick but not free, and the answer
 /// doesn't change mid-dialog.
 pub fn state_for(config_dir: &Path, id: &AccountId) -> HelloState {
+    if !hello_permitted(crate::app_profile::active()) {
+        return HelloState::unavailable();
+    }
     let available = KeyCredentialManager::IsSupportedAsync()
         .and_then(|op| op.get())
         .unwrap_or(false);
@@ -153,6 +168,9 @@ pub fn state_for(config_dir: &Path, id: &AccountId) -> HelloState {
 /// every later enrolment, and falls through to opening the credential that is
 /// already there.
 fn hello_derived_key(create: bool, account_suffix: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
+    if !hello_permitted(crate::app_profile::active()) {
+        return Err("Windows Hello is off in a Deskwarden test profile".to_string());
+    }
     let name = HSTRING::from(CREDENTIAL_NAME);
 
     // Both calls below can put the OS's Hello prompt on screen, and
@@ -364,6 +382,30 @@ pub fn unenroll_for(config_dir: &Path, id: &AccountId) {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// **A test profile never touches the shared Hello credential**: Hello
+    /// is off there, and both doors to the credential -- the state the login
+    /// window draws from and the key derivation every enrol and unlock runs
+    /// through -- ask before anything reaches `KeyCredentialManager`.
+    #[test]
+    fn windows_hello_is_off_under_a_test_profile_and_unchanged_without_one() {
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("rc")))
+            .unwrap()
+            .unwrap();
+        assert!(hello_permitted(None), "the default copy lost Windows Hello");
+        assert!(!hello_permitted(Some(&profile)));
+
+        let source = include_str!("hello.rs").replace("\r\n", "\n");
+        for door in ["pub fn state_for(", "fn hello_derived_key("] {
+            let body = &source[source.find(door).expect("control: renamed")..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            let gate = body
+                .find(concat!("if !hello_permitted(crate::app_profile::", "active()) {"))
+                .unwrap_or_else(|| panic!("`{door}` no longer asks whether Hello is permitted"));
+            let reach = body.find("KeyCredentialManager::").expect("control: no Hello call");
+            assert!(gate < reach, "`{door}` reaches the credential before asking");
+        }
+    }
 
     const A: &str = "0123456789abcdef0123456789abcdef";
     const B: &str = "fedcba9876543210fedcba9876543210";

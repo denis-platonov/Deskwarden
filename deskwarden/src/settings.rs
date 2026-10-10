@@ -879,8 +879,27 @@ pub struct Shortcuts {
 /// a different family for four rows and leave the fifth behind.
 impl Default for Shortcuts {
     fn default() -> Self {
+        Self::defaults_for(crate::app_profile::active())
+    }
+}
+
+impl Shortcuts {
+    /// **The defaults for the copy running under `profile`.** Pure.
+    ///
+    /// The default copy gets the five above. **A test profile
+    /// (`crate::app_profile`) gets none at all**: `RegisterHotKey` is
+    /// first-come-first-served across the logon session, so a test copy
+    /// holding `CTRL+ALT+B` would take the owner's fill shortcut the next time
+    /// the owner's copy restarts. Under a profile, only a chord written
+    /// explicitly into the profile's own `settings.json` is registered -- an
+    /// absent row, and an unreadable one, fall back to this, which is
+    /// unbound, so there is nothing to register and nothing to retry.
+    pub fn defaults_for(profile: Option<&crate::app_profile::Profile>) -> Self {
         use crate::hotkey::Chord;
         use global_hotkey::hotkey::{Code, Modifiers};
+        if profile.is_some() {
+            return Self { picker: None, username: None, password: None, totp: None, sequence: None };
+        }
         let ctrl_alt = Modifiers::CONTROL | Modifiers::ALT;
         Self {
             picker: Some(Chord::new(ctrl_alt, Code::KeyB)),
@@ -890,9 +909,7 @@ impl Default for Shortcuts {
             sequence: Some(Chord::new(ctrl_alt, Code::KeyS)),
         }
     }
-}
 
-impl Shortcuts {
     /// One row's chord, by the shortcut it belongs to.
     pub fn chord(&self, which: FillShortcut) -> Option<Chord> {
         match which {
@@ -987,7 +1004,14 @@ struct RawShortcuts {
 /// remembering.
 impl From<RawShortcuts> for Shortcuts {
     fn from(raw: RawShortcuts) -> Self {
-        let default = Shortcuts::default();
+        Shortcuts::from_raw_with(raw, Shortcuts::default())
+    }
+}
+
+impl Shortcuts {
+    /// The lenient read, with `default` standing in for every absent or
+    /// unreadable row -- [`Shortcuts::defaults_for`] this copy's profile.
+    fn from_raw_with(raw: RawShortcuts, default: Shortcuts) -> Self {
         let read = |text: Option<String>, fallback: Option<Chord>| match text {
             None => fallback,
             // The cleared marker. Whitespace counts as cleared too: a hand
@@ -2237,6 +2261,63 @@ mod tests {
     /// every one of them changed. These are the combinations the app promises
     /// out of the box and the ones the justification in that impl's doc is
     /// about, so they are pinned as text.
+    /// What a fill-hotkey pass under a given `settings.json` tries to
+    /// register, through the real `register_fill_hotkeys_with` and a fake
+    /// `RegisterHotKey` -- no test may take a real global chord.
+    fn registered_by(json: &str, profile: Option<&str>) -> Vec<u32> {
+        use std::sync::Mutex;
+        static ATTEMPTED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        static SERIAL: Mutex<()> = Mutex::new(());
+        fn attempt(
+            held: Option<global_hotkey::GlobalHotKeyManager>,
+            hotkey: global_hotkey::hotkey::HotKey,
+        ) -> (Option<global_hotkey::GlobalHotKeyManager>, Result<(), global_hotkey::Error>) {
+            ATTEMPTED.lock().unwrap().push(hotkey.id());
+            (held, Ok(()))
+        }
+        fn publish(_: FillShortcut, _: Option<Chord>, _: crate::hotkey::HotkeyStatus) {}
+
+        let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        ATTEMPTED.lock().unwrap().clear();
+        let profile = profile.map(|name| {
+            crate::app_profile::parse(Some(std::ffi::OsStr::new(name))).unwrap().unwrap()
+        });
+        let raw: RawShortcuts = serde_json::from_str(json).unwrap();
+        let shortcuts = Shortcuts::from_raw_with(raw, Shortcuts::defaults_for(profile.as_ref()));
+        let fh = crate::hotkey::register_fill_hotkeys_with(
+            shortcuts.as_chords(),
+            attempt,
+            publish,
+            std::time::Instant::now(),
+        );
+        // A row with no chord is `Unbound`, which is never retried.
+        let an_hour = std::time::Duration::from_secs(3600);
+        for which in FillShortcut::ALL {
+            if fh.chord(which).is_none() {
+                assert!(!crate::hotkey::should_retry(fh.availability(which), an_hour));
+                assert_eq!(fh.availability(which), crate::hotkey::HotkeyStatus::Unbound);
+            }
+        }
+        std::mem::take(&mut *ATTEMPTED.lock().unwrap())
+    }
+
+    /// **A test copy takes no global chord it was not explicitly given.**
+    /// With the profile's settings saying nothing, nothing is registered --
+    /// so the owner's `CTRL+ALT+B` is never taken -- and with one chord
+    /// written in, exactly that one is.
+    #[test]
+    fn a_profiled_copy_registers_only_the_chords_its_own_settings_name() {
+        assert_eq!(registered_by("{}", Some("rc")), Vec::<u32>::new());
+        let q = Chord::parse("CTRL+ALT+Q").unwrap();
+        assert_eq!(registered_by(r#"{"picker": "CTRL+ALT+Q"}"#, Some("rc")), vec![q.id()]);
+        // An unreadable row falls back to the profile's default, which is
+        // nothing -- not to the owner's chord.
+        assert_eq!(registered_by(r#"{"picker": "nonsense"}"#, Some("rc")), Vec::<u32>::new());
+        // The default copy is unchanged: all five, as shipped.
+        assert_eq!(registered_by("{}", None).len(), FillShortcut::COUNT);
+        assert_eq!(Shortcuts::defaults_for(None), Shortcuts::default());
+    }
+
     #[test]
     fn the_five_shipped_shortcuts_are_the_ones_that_were_reasoned_about() {
         let s = Shortcuts::default();

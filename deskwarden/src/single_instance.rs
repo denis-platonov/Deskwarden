@@ -153,9 +153,11 @@ use windows::Win32::System::Diagnostics::ToolHelp::{
 };
 use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcessId, OpenEventW, OpenProcess, SetEvent, TerminateProcess,
-    WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE, PROCESS_TERMINATE,
+    CreateEventW, GetCurrentProcessId, OpenEventW, OpenProcess, QueryFullProcessImageNameW,
+    SetEvent, TerminateProcess, WaitForSingleObject, EVENT_MODIFY_STATE, INFINITE,
+    PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
 };
+use windows::Win32::Foundation::MAX_PATH;
 
 use crate::app_mutex::{self, Acquired};
 
@@ -745,15 +747,18 @@ fn image_name_of(path: &str) -> String {
 ///    a relaunch -- the exact harm the `Local\` scope was chosen to prevent.
 /// 4. **Its image path still resolves, to the same file name.** The snapshot's
 ///    `szExeFile` is a stale copy taken at enumeration time; re-reading the
-///    path through `QueryFullProcessImageNameW` on a freshly opened handle
-///    re-establishes the name against the process that pid means *now*, which
-///    is what closes the window in which a pid is recycled between the
-///    snapshot and the kill.
+///    path through `QueryFullProcessImageNameW` re-establishes the name
+///    against the process that pid means *now*.
 /// 5. **It runs under the same test profile as this one, or both under
 ///    none** ([`crate::app_profile::may_force_end`]). A test copy may share
 ///    this executable's name; it is told apart by the marker names every
 ///    profiled process holds. The default copy never ends a profiled one, and
 ///    a profiled one ends nothing whose profile it cannot read.
+///
+/// **One handle, opened first, carries checks 3 to 5 and the kill.** A pid
+/// is not reused while a handle to its process is open, so every check is
+/// about the very process `TerminateProcess` then ends -- there is no second
+/// `OpenProcess` by pid for a recycled id to slip between.
 ///
 /// # What is deliberately NOT checked
 ///
@@ -763,8 +768,8 @@ fn image_name_of(path: &str) -> String {
 /// version check would refuse the only case that matters, and a mutex has no
 /// owner to ask. What the five checks above establish is the honest claim --
 /// *a process running this same executable name, in this same logon session,
-/// under this same test profile or none* -- and that is the population the single-instance rule is defined over in
-/// the first place.
+/// under this same test profile or none* -- and that is the population the
+/// single-instance rule is defined over in the first place.
 ///
 /// # The log
 ///
@@ -780,7 +785,10 @@ fn end_other_deskwardens() -> usize {
 /// so the DECISION -- which of the processes it found it ends -- can be run
 /// over invented processes. No test in this crate may enumerate real
 /// processes or end one; see [`TakeoverEnv::end_by_force`].
-struct ForceEnv {
+///
+/// `H` is an opened process: [`ProcessHandle`] in production, a number in the
+/// tests.
+struct ForceEnv<H> {
     /// This executable's file name, lowercased.
     my_image_name: fn() -> Option<String>,
     /// This process's id.
@@ -790,15 +798,17 @@ struct ForceEnv {
     /// Every pid whose snapshot image name equals the first argument, except
     /// the second.
     same_named_processes: fn(&str, u32) -> Vec<u32>,
-    /// A pid's image path, re-read now.
-    image_path_of: fn(u32) -> Option<String>,
+    /// Opens a pid for querying and ending, once. `None` when it cannot be.
+    open: fn(u32) -> Option<H>,
+    /// An opened process's image path, read now.
+    image_path_of: fn(&H) -> Option<String>,
     /// Which test profile a pid runs under, given this process's.
     profile_of: fn(u32, Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile,
-    /// `TerminateProcess`, reporting whether it worked.
-    terminate: fn(u32) -> bool,
+    /// `TerminateProcess` on the opened process, reporting whether it worked.
+    terminate: fn(&H) -> bool,
 }
 
-impl ForceEnv {
+impl ForceEnv<ProcessHandle> {
     /// The real one.
     fn production() -> Self {
         ForceEnv {
@@ -806,16 +816,17 @@ impl ForceEnv {
             my_pid: || unsafe { GetCurrentProcessId() },
             session_of,
             same_named_processes,
-            image_path_of: crate::window_watch::process_image_path_for_pid,
+            open: ProcessHandle::open,
+            image_path_of: ProcessHandle::image_path,
             profile_of,
-            terminate,
+            terminate: ProcessHandle::terminate,
         }
     }
 }
 
 /// [`end_other_deskwardens`] over `env`, as the process running under
 /// `my_profile`.
-fn end_others_with(env: &ForceEnv, my_profile: Option<&crate::app_profile::Profile>) -> usize {
+fn end_others_with<H>(env: &ForceEnv<H>, my_profile: Option<&crate::app_profile::Profile>) -> usize {
     let Some(mine) = (env.my_image_name)() else {
         log::warn!(
             "cannot end the running Deskwarden: this process's own executable name could not \
@@ -836,6 +847,16 @@ fn end_others_with(env: &ForceEnv, my_profile: Option<&crate::app_profile::Profi
     let mut ended = 0usize;
     for pid in (env.same_named_processes)(&mine, me) {
         seen += 1;
+        // Opened FIRST, and held until the end of this pass: while it is
+        // open the pid cannot be handed to another process, so the checks
+        // below and the kill are all about one process.
+        let Some(process) = (env.open)(pid) else {
+            log::debug!(
+                "pid {pid} is named {mine} but could not be opened (it may be another user's, \
+                 at a higher integrity level, or already gone); leaving it alone"
+            );
+            continue;
+        };
         match (env.session_of)(pid) {
             Some(session) if session == my_session => {}
             other => {
@@ -847,7 +868,7 @@ fn end_others_with(env: &ForceEnv, my_profile: Option<&crate::app_profile::Profi
                 continue;
             }
         }
-        let Some(path) = (env.image_path_of)(pid) else {
+        let Some(path) = (env.image_path_of)(&process) else {
             log::debug!(
                 "pid {pid} is named {mine} but its image path could not be re-read (it may \
                  have exited already); leaving it alone"
@@ -881,7 +902,7 @@ fn end_others_with(env: &ForceEnv, my_profile: Option<&crate::app_profile::Profi
              on the clipboard until that copy's own clipboard timer clears it -- and this \
              process cannot clear a clipboard it cannot show is its own"
         );
-        if (env.terminate)(pid) {
+        if (env.terminate)(&process) {
             ended += 1;
         }
     }
@@ -960,37 +981,67 @@ fn same_named_processes(mine: &str, me: u32) -> Vec<u32> {
     found
 }
 
-/// `TerminateProcess` on one pid, reporting whether it worked.
+/// A process opened once for the forced path, closed on drop.
 ///
-/// **Failure is expected and survivable**, which is why it is reported rather
-/// than asserted: `OpenProcess` is refused for a process in another security
-/// context or at a higher integrity level, and both calls fail for a process
-/// that has exited since it was enumerated. The caller counts what actually
-/// happened, and a count of zero becomes [`GaveUp::CouldNotEnd`] -- a launch
-/// that says why it will not start, never a second Deskwarden.
-///
-/// Exit code 1: this is a kill, not a clean exit, and it should not be
-/// mistaken for one by anything reading the outgoing process's exit code.
-fn terminate(pid: u32) -> bool {
-    unsafe {
-        let handle = match OpenProcess(PROCESS_TERMINATE, false, pid) {
-            Ok(handle) => handle,
-            Err(e) => {
-                log::warn!(
-                    "could not open Deskwarden pid {pid} to end it ({e}); it may be running as \
-                     another user or at a higher integrity level, or it may have exited already"
-                );
-                return false;
-            }
-        };
-        let killed = TerminateProcess(handle, 1);
-        let _ = CloseHandle(handle);
-        match killed {
+/// `PROCESS_TERMINATE` for the kill and `PROCESS_QUERY_LIMITED_INFORMATION`
+/// for the image path, on ONE handle: see [`end_other_deskwardens`] for why
+/// the checks and the kill must not open the pid twice.
+struct ProcessHandle {
+    pid: u32,
+    handle: HANDLE,
+}
+
+impl ProcessHandle {
+    /// Opens `pid`, or `None` when that is refused -- another security
+    /// context, a higher integrity level, or a process that has exited.
+    fn open(pid: u32) -> Option<Self> {
+        unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
+            .ok()
+            .map(|handle| ProcessHandle { pid, handle })
+    }
+
+    /// The image path of the process this handle holds.
+    fn image_path(&self) -> Option<String> {
+        let mut buffer = [0u16; MAX_PATH as usize];
+        let mut size = buffer.len() as u32;
+        unsafe {
+            QueryFullProcessImageNameW(
+                self.handle,
+                PROCESS_NAME_WIN32,
+                windows::core::PWSTR(buffer.as_mut_ptr()),
+                &mut size,
+            )
+        }
+        .ok()?;
+        let path = String::from_utf16_lossy(&buffer[..size as usize]);
+        (!path.is_empty()).then_some(path)
+    }
+
+    /// `TerminateProcess` through this handle, reporting whether it worked.
+    ///
+    /// **Failure is expected and survivable**, which is why it is reported
+    /// rather than asserted: the process may have exited since it was opened.
+    /// The caller counts what actually happened, and a count of zero becomes
+    /// [`GaveUp::CouldNotEnd`] -- a launch that says why it will not start,
+    /// never a second Deskwarden.
+    ///
+    /// Exit code 1: this is a kill, not a clean exit, and it should not be
+    /// mistaken for one by anything reading the outgoing process's exit code.
+    fn terminate(&self) -> bool {
+        match unsafe { TerminateProcess(self.handle, 1) } {
             Ok(()) => true,
             Err(e) => {
-                log::warn!("could not end Deskwarden pid {pid} ({e})");
+                log::warn!("could not end Deskwarden pid {} ({e})", self.pid);
                 false
             }
+        }
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
         }
     }
 }
@@ -1652,8 +1703,10 @@ mod tests {
 
     /// The invented processes the forced-end tests run over, all named like
     /// this executable and all in this logon session: `10` is a default copy,
-    /// `11` runs under profile `rc`, `12` under profile `other`, and `13`'s
-    /// markers cannot be read.
+    /// `11` runs under profile `rc`, `12` under profile `other`, `13`'s
+    /// markers cannot be read, and `14` is in profile `rc` but cannot be
+    /// opened. An opened process is the number `1000 + pid`, so what reaches
+    /// `end` shows which handle the kill went through.
     mod invented {
         use crate::app_profile::{classify, CandidateProfile, Probe, Profile};
         use std::sync::Mutex;
@@ -1671,9 +1724,12 @@ mod tests {
             Some(1)
         }
         pub fn listed(_: &str, _: u32) -> Vec<u32> {
-            vec![10, 11, 12, 13]
+            vec![10, 11, 12, 13, 14]
         }
-        pub fn path(_: u32) -> Option<String> {
+        pub fn open(pid: u32) -> Option<u32> {
+            (pid != 14).then_some(1000 + pid)
+        }
+        pub fn path(_: &u32) -> Option<String> {
             Some(r"C:\Test\deskwarden.exe".into())
         }
         /// The real classification, over invented markers.
@@ -1684,7 +1740,7 @@ mod tests {
                 _ => Probe::Present,
             };
             let same = mine.map(|p| match (pid, p.name()) {
-                (11, "rc") | (12, "other") => Probe::Present,
+                (11 | 14, "rc") | (12, "other") => Probe::Present,
                 (13, _) => Probe::Unknown,
                 _ => Probe::Absent,
             });
@@ -1693,26 +1749,30 @@ mod tests {
         pub fn unreadable(_: u32, _: Option<&Profile>) -> CandidateProfile {
             CandidateProfile::Unknown
         }
-        pub fn end(pid: u32) -> bool {
-            ENDED.lock().unwrap().push(pid);
+        pub fn end(handle: &u32) -> bool {
+            ENDED.lock().unwrap().push(*handle);
             true
         }
     }
 
-    fn invented_env(profile_of: fn(u32, Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile) -> ForceEnv {
+    type ProfileOf = fn(u32, Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile;
+
+    fn invented_env(profile_of: ProfileOf) -> ForceEnv<u32> {
         ForceEnv {
             my_image_name: invented::image,
             my_pid: invented::me,
             session_of: invented::session,
             same_named_processes: invented::listed,
+            open: invented::open,
             image_path_of: invented::path,
             profile_of,
             terminate: invented::end,
         }
     }
 
-    /// What ending by force ends, as the process running under `profile`.
-    fn ended_as(profile: Option<&str>, profile_of: fn(u32, Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile) -> Vec<u32> {
+    /// The handles ending by force ended through, as the process running
+    /// under `profile`.
+    fn ended_as(profile: Option<&str>, profile_of: ProfileOf) -> Vec<u32> {
         let _serial = invented::SERIALISE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         invented::ENDED.lock().unwrap().clear();
         let profile = profile.map(|name| {
@@ -1725,18 +1785,19 @@ mod tests {
     }
 
     /// **A test copy never ends the owner's copy**, nor another profile's,
-    /// nor anything whose profile it cannot read -- only its own profile's.
+    /// nor anything whose profile it cannot read -- only its own profile's,
+    /// through the handle it opened to check it.
     #[test]
     fn a_profiled_copy_ends_only_its_own_profile() {
-        assert_eq!(ended_as(Some("rc"), invented::profile), vec![11]);
-        assert_eq!(ended_as(Some("other"), invented::profile), vec![12]);
+        assert_eq!(ended_as(Some("rc"), invented::profile), vec![1011]);
+        assert_eq!(ended_as(Some("other"), invented::profile), vec![1012]);
     }
 
     /// **The owner's copy never ends a test copy**, and still ends a default
     /// copy that will not stand down -- what it always did.
     #[test]
     fn the_default_copy_ends_only_default_copies() {
-        assert_eq!(ended_as(None, invented::profile), vec![10]);
+        assert_eq!(ended_as(None, invented::profile), vec![1010]);
     }
 
     /// When no process's profile can be read, a test copy ends nothing.
@@ -1747,24 +1808,77 @@ mod tests {
     }
 
     /// The production seam is the real one, and the real entry point runs it
-    /// as THIS process's profile.
+    /// as THIS process's profile. Sliced by `find`, never by a byte count, so
+    /// no edit to the text can put the cut inside a character.
     #[test]
     fn ending_by_force_runs_as_this_process_s_profile() {
-        let source = include_str!("single_instance.rs");
+        let source = include_str!("single_instance.rs").replace("\r\n", "\n");
         let at = source.find("fn end_other_deskwardens() -> usize {").expect("control: renamed");
-        let body = &source[at..at + 200];
+        let body = &source[at..];
+        let body = &body[..body.find("\n}\n").expect("control: the function never closes")];
         assert!(
             body.contains(concat!("end_others_with(&ForceEnv::production(), ", "crate::app_profile::active())")),
             "ending by force is no longer run over the real system as this process's profile"
         );
-        let production = &source[source.find("    fn production() -> Self {\r\n        ForceEnv {")
-            .or_else(|| source.find("    fn production() -> Self {\n        ForceEnv {"))
+        let production = &source[source
+            .find("    fn production() -> Self {\n        ForceEnv {")
             .expect("control: no production `ForceEnv`")..];
-        let production = &production[..production.find("    }").unwrap()];
-        assert!(
-            production.contains("            profile_of,") && production.contains("            terminate,"),
-            "the real seam does not read the real markers or end through the real call"
+        let production = &production[..production.find("\n        }").unwrap()];
+        for field in [
+            "            open: ProcessHandle::open,",
+            "            image_path_of: ProcessHandle::image_path,",
+            "            profile_of,",
+            "            terminate: ProcessHandle::terminate,",
+        ] {
+            assert!(production.contains(field), "the real seam lost {field:?}");
+        }
+    }
+
+    /// A pid no process can have: real pids are multiples of four.
+    fn fake_pid(offset: u32) -> u32 {
+        u32::MAX - 1 - 4 * offset
+    }
+
+    /// **The probe, over the real kernel: a held marker is `Present`.**
+    #[test]
+    fn a_held_marker_probes_present() {
+        let name = crate::app_profile::any_profile_marker(fake_pid(0));
+        let held = crate::app_mutex::hold_claim(&name).expect("control: could not create the marker");
+        assert_eq!(probe_name(&name), crate::app_profile::Probe::Present);
+        drop(held);
+    }
+
+    /// **...and once its last handle is gone, `Absent`** -- the kernel's "no
+    /// such name", the only failure read as an answer.
+    #[test]
+    fn a_dropped_marker_probes_absent() {
+        let name = crate::app_profile::any_profile_marker(fake_pid(1));
+        assert_eq!(probe_name(&name), crate::app_profile::Probe::Absent, "control: already held");
+        let held = crate::app_mutex::hold_claim(&name).expect("control: could not create the marker");
+        assert_eq!(probe_name(&name), crate::app_profile::Probe::Present, "control");
+        drop(held);
+        assert_eq!(
+            probe_name(&name),
+            crate::app_profile::Probe::Absent,
+            "the probe kept the name alive, or misread a missing name"
         );
+    }
+
+    /// **A name that exists as something other than a mutex is `Unknown`**,
+    /// never `Absent`: the default copy would otherwise read it as "no profile
+    /// here" and could end the process.
+    #[test]
+    fn a_marker_name_held_by_an_event_probes_unknown() {
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("probe-test")))
+            .unwrap()
+            .unwrap();
+        let name = crate::app_profile::profile_marker(fake_pid(2), &profile);
+        let event = unsafe { CreateEventW(None, true, false, &HSTRING::from(name.as_str())) }
+            .expect("control: could not create the event");
+        assert_eq!(probe_name(&name), crate::app_profile::Probe::Unknown);
+        unsafe {
+            let _ = CloseHandle(event);
+        }
     }
 
     /// The timeout is a bound with a shape, not a number someone typed: it has

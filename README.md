@@ -476,6 +476,28 @@ errors — this has cost real debugging time more than once. If a batch of
 unrelated pins goes red after a scripted edit, check the line endings before
 you check the logic.
 
+### Running a test copy beside your own
+
+Set `DESKWARDEN_PROFILE=<name>` (1–32 of `a-z`, `0-9`, `-`) in the shell that
+starts the test copy. That copy then uses its own lock and window names, keeps
+everything under `…\profiles\<name>\` in Deskwarden's folders, runs `bw serve`
+on its own port, and changes nothing outside those folders. It does not touch
+the logon entry, your `PATH`, Windows Hello, updates, or global shortcuts it
+was not explicitly given. Its title bar and tray tooltip end with
+"— profile <name>".
+
+Three footguns:
+
+- **Builds older than `06dd6e8` ignore the variable.** They run as your own
+  copy and stand it down. Use the variable only with builds from `06dd6e8` on.
+- **Set it per shell, never with `setx`.** `setx` saves it to your user
+  environment, so your own copy, started at sign-in, would come up as the
+  test profile with empty settings. Use `set` in `cmd` or
+  `$env:DESKWARDEN_PROFILE = 'name'` in PowerShell.
+- **Give the test copy its own `.exe` name**, for example
+  `deskwarden-test.exe`. An older installed build that force-ends a copy that
+  will not stand down matches on the `.exe` name alone.
+
 ## Privacy
 
 Deskwarden has no servers, no accounts, no analytics and no telemetry.
