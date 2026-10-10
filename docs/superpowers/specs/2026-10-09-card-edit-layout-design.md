@@ -22,9 +22,11 @@ Cardholder   [Denis Platonov                      ] [Remove]
 ------------------------------------------------------------
 Card         [Mastercard v] [****************  Show] [Remove]
 ------------------------------------------------------------
-Expires      [10] / [29]   Code [***  Show]   ZIP [91307   ]
+Expires      [10] / [29]   Code [***  Show]   PIN [****  Show]
 ------------------------------------------------------------
-Bank         [dashboard.brex.com      v]           [Clear ]
+Billing ZIP  [91307                               ] [Remove]
+------------------------------------------------------------
+Bank         [Brex                    v]           [Clear ]
              Chosen from the sites already in your vault...
 ```
 
@@ -34,16 +36,16 @@ Bank         [dashboard.brex.com      v]           [Clear ]
    of the row and keeps its in-field Show. There is one Remove inline at the
    end. It clears the number and the brand, as the separate rows' Remove
    buttons did between them.
-3. **Expires, Code, ZIP.**
-   - Month and year are two short boxes, sized for two digits, joined by `/`.
+3. **Expires, Code, PIN.**
+   - Month and year: two short boxes sized for two digits, joined by `/`.
    - Then the label `Code` and the security-code box, with its in-field Show.
-   - Then the label `ZIP` and the billing ZIP box, which takes the remaining
-     width.
-   - **No Remove on this row** (owner's decision). An empty box is not saved,
-     exactly as an empty box is not saved today.
-   - The inline labels use the form's field-label style. They are vertically
+   - Then the label `PIN` and the PIN box (masked, with in-field Show), taking
+     the remaining width.
+   - **No Remove on this row** (owner's decision). An empty box is not saved.
+   - The inline labels use the form's field-label style and are vertically
      centred on the boxes.
-4. **Bank.**
+4. **Billing ZIP.** One field, with its Remove inline at the end, as Cardholder.
+5. **Bank.**
    - The picker is a drop-down-style button showing the chosen domain, or
      `Choose a bank…` when there is none. It opens the existing chooser.
    - Clear is inline at the end, in the same button style as Remove on the
@@ -51,6 +53,31 @@ Bank         [dashboard.brex.com      v]           [Clear ]
    - Both are vertically centred on the row, in the form's standard row
      height.
    - The help sentence stays under the row, as it is.
+
+### The card PIN (owner, 2026-10-09)
+
+Bitwarden's card object has no PIN. The PIN is stored as a **standard
+Bitwarden hidden custom field** (`type: 1`) named exactly `PIN`. That keeps it
+100% compatible: official Bitwarden apps show it as a masked custom field
+called "PIN", with their own reveal button.
+
+- **Reading.** A Card item's PIN is the value of its first custom field whose
+  name is `PIN`, compared case-insensitively after trimming. An existing card
+  with such a field is picked up as is.
+- **Writing.** The edit form writes `{name: "PIN", value, type: 1}`.
+  - It replaces an existing `PIN` field in place, keeping its position.
+  - An empty box removes that field.
+  - Other custom fields are untouched.
+- **Shown once.** The PIN is drawn on the card:
+  - in the edit form's Expires row;
+  - in the read pane's CARD DETAILS, as a masked row with its own eye, after
+    the security code.
+
+  It is therefore left out of the CUSTOM FIELDS card.
+- **Copying.** It copies like the security code, with the master-password
+  re-prompt on protected items.
+- **Never exposed.** The PIN is never written to logs, and it is never added
+  to the picker's `ItemFacts` (no secrets there).
 
 ### The bank is shown by name, not by its address (owner, 2026-10-09)
 
@@ -93,13 +120,17 @@ as the same form as a login.
 
 Use the existing edit-form layout harness (`edit_pane_layout_tests`):
 
-- A Card draft draws three field rows plus Bank, in the order above.
+- A Card draft draws four field rows plus Bank, in the order above.
 - Brand sits left of the number on the same line.
-- Month, year, code and ZIP share one line, with their centres aligned
+- Month, year, code and PIN share one line, with their centres aligned
   within 0.5 pt.
 - Every trailing button's right edge lines up with the login form's trailing
   buttons.
 - The Bank row's picker and Clear are vertically centred on the row.
 - No Remove is drawn on the Expires row.
 - Remove on the Card row clears the number and the brand.
-- Empty month, year, code or ZIP saves nothing for that field.
+- Empty month, year, code, PIN or ZIP saves nothing for that field.
+- The PIN round-trips as a hidden custom field named `PIN` and replaces an
+  existing one in place.
+- The read pane shows the PIN masked, after the code, and not in CUSTOM
+  FIELDS.
