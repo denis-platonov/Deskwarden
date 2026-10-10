@@ -10523,6 +10523,28 @@ const FORM_COMBO_HEIGHT: f32 = 420.0;
 /// here". The bar is floating, so it takes no room; with every opacity at
 /// zero it takes no ink either. The wheel still scrolls the rare list that
 /// truly outruns [`FORM_COMBO_HEIGHT`], whose cut-off last row says so.
+///
+/// **And a row is one size whatever state it is in.** The owner, with the
+/// card-brand list open: "this list shaking on hover". egui 0.35's `Button`
+/// takes its frame's stroke width out of the inner margin, so a framed row
+/// is `button_padding` all round -- but a selectable row that is NOT framed
+/// (inactive and unselected) reuses that reduced margin with no stroke to
+/// give it back. With this theme's 1-point strokes a plain row was 24 points
+/// and a framed one 26, so the selected row stood two points taller than the
+/// rest and hovering a row grew it and pushed every row below it down.
+///
+/// Two settings, both popup-only, close the gap without changing a pixel of
+/// what a row looks like:
+///
+/// - every state's `expansion` equals its `bg_stroke` width. egui lays a
+///   framed button out with `-expansion` of outer margin and paints the box
+///   that much outside it, so the stroke now costs no layout room in ANY
+///   state, the unframed one included. The outline is still drawn: it just
+///   sits on the row's edge instead of inside a taller row.
+/// - `button_padding` comes down by the inactive stroke's width, so the
+///   rows keep the 24-point height (and the list its pitch) they had while
+///   no pointer was on them -- and a highlighted row's box is the 26 points,
+///   text inset included, that it already was.
 fn form_popup_style() -> egui::style::StyleModifier {
     egui::style::StyleModifier::new(|style| {
         style.spacing.scroll = egui::style::ScrollStyle {
@@ -10534,6 +10556,18 @@ fn form_popup_style() -> egui::style::StyleModifier {
             interact_handle_opacity: 0.0,
             ..egui::style::ScrollStyle::default()
         };
+        let widgets = &mut style.visuals.widgets;
+        let plain_stroke = widgets.inactive.bg_stroke.width;
+        for state in [
+            &mut widgets.noninteractive,
+            &mut widgets.inactive,
+            &mut widgets.hovered,
+            &mut widgets.active,
+            &mut widgets.open,
+        ] {
+            state.expansion = state.bg_stroke.width;
+        }
+        style.spacing.button_padding -= egui::Vec2::splat(plain_stroke);
     })
 }
 
@@ -29485,6 +29519,153 @@ mod edit_pane_layout_tests {
             "the folder button draws {:?} corners while its list is open",
             frame.corner_radius
         );
+    }
+
+    /// **Hovering a row of an open drop-down moves no row, and the selected
+    /// row is as tall as the rest.**
+    ///
+    /// The owner, with the card-brand list open: "this list shaking on
+    /// hover". egui 0.35's `Button` takes its frame's stroke width OUT of the
+    /// inner margin, then -- for a selectable row drawn with no frame -- reuses
+    /// that reduced margin with no stroke to make it back. With this theme's
+    /// 1-point strokes a plain row was 24 points and a framed one (hovered, or
+    /// the selected row) 26: hovering a row grew it and pushed every row below
+    /// it down two points, and back up when the pointer left.
+    ///
+    /// Measured on the folder list, which is built by the same `form_combo` as
+    /// the brand list: each row's label is where its row put it, so a row that
+    /// grows or moves moves its label.
+    #[test]
+    fn hovering_a_row_of_an_open_drop_down_moves_no_row() {
+        let pane = Vec2::new(WIDE_PANE_WIDTH, 900.0);
+        let ctx = styled_context(pane);
+        let names = ["VirtualZones", "Napps", "OMF", "TVT", "Test Pro", "F7", "F8"];
+        let folders: Vec<Folder> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Folder { id: format!("f{i}"), name: n.to_string(), other: serde_json::Map::new() })
+            .collect();
+        let item = login_with_websites(1);
+        let mut draft = EditDraft::from_item(&item);
+        draft.folder_id = Some("f1".into());
+        #[derive(Default)]
+        struct Seen {
+            texts: Vec<(String, Rect)>,
+            /// Every painted rect, with the clip it was painted under.
+            rects: Vec<(egui::epaint::RectShape, Rect)>,
+        }
+        fn collect(shape: &egui::Shape, clip: Rect, seen: &mut Seen) {
+            match shape {
+                egui::Shape::Text(t) => {
+                    seen.texts.push((t.galley.text().to_string(), Rect::from_min_size(t.pos, t.galley.size())))
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, clip, seen)),
+                egui::Shape::Rect(r) if r.fill.a() > 0 || r.stroke.color.a() > 0 => {
+                    seen.rects.push((r.clone(), clip))
+                }
+                _ => {}
+            }
+        }
+        // The small painted box round a point: a row's highlight, never the
+        // popup's own frame or the form's cards.
+        fn highlight_at(seen: &Seen, p: Pos2) -> Option<&(egui::epaint::RectShape, Rect)> {
+            seen.rects.iter().filter(|(r, _)| r.rect.contains(p) && r.rect.height() < 60.0).last()
+        }
+        let mut run = |events: &[egui::Event]| {
+            let mut apps = AppIdentityCache::default();
+            let out = ctx.run_ui(raw_input(pane, events), |ui| {
+                let _ = draw_detail_edit(
+                    ui,
+                    &mut draft,
+                    &folders,
+                    false,
+                    &mut apps,
+                    Some(&item),
+                    0,
+                    &crate::rest::organizations::Audience::Personal,
+                    &detail::TotpState::NoSecret,
+                    None,
+                );
+            });
+            let mut seen = Seen::default();
+            out.shapes.iter().for_each(|c| collect(&c.shape, c.clip_rect, &mut seen));
+            seen
+        };
+        let mut button = None;
+        for _ in 0..3 {
+            button = run(&[]).texts.into_iter().find(|(s, _)| s == "Napps").map(|(_, r)| r);
+        }
+        let at = button.expect("the folder button shows the item's folder").center();
+        let _ = run(&[
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
+        ]);
+        let _ = run(&[egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
+        // Every row's label, by name, sorted top to bottom. The button's own
+        // "Napps" is the one under the point that opened the list.
+        let rows_of = |seen: &Seen| -> Vec<(String, Rect)> {
+            let mut rows: Vec<(String, Rect)> = std::iter::once(&NO_FOLDER_LABEL)
+                .chain(names.iter())
+                .map(|n| {
+                    let r = seen
+                        .texts
+                        .iter()
+                        .find(|(s, r)| s == n && !r.contains(at))
+                        .map(|(_, r)| *r)
+                        .unwrap_or_else(|| panic!("the open list paints no {n:?} row"));
+                    (n.to_string(), r)
+                })
+                .collect();
+            rows.sort_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y));
+            rows
+        };
+        // The pointer parked on the button, away from every row.
+        let mut away = Seen::default();
+        for _ in 0..4 {
+            away = run(&[egui::Event::PointerMoved(at)]);
+        }
+        let still = rows_of(&away);
+        let pitches: Vec<f32> = still.windows(2).map(|w| w[1].1.min.y - w[0].1.min.y).collect();
+        assert!(
+            pitches.iter().all(|p| (p - pitches[0]).abs() < 0.01),
+            "the rows of the open list are not one height -- label-to-label pitches {pitches:?} \
+             for rows {:?} (the selected row is \"Napps\")",
+            still.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+        );
+
+        // Now on a row that is not the selected one.
+        let target = still.iter().find(|(n, _)| n == "TVT").expect("TVT is a row").1.center();
+        let mut over = Seen::default();
+        for _ in 0..4 {
+            over = run(&[egui::Event::PointerMoved(target)]);
+        }
+        let hovered = rows_of(&over);
+        let (hover, clip) = highlight_at(&over, target).unwrap_or_else(|| {
+            panic!(
+                "the premise failed: the row under the pointer paints no hover highlight, so the \
+                 pointer is not on it and nothing below is measured"
+            )
+        });
+        assert!(highlight_at(&away, target).is_none(), "the premise failed: \"TVT\" is lit with the pointer away");
+        // The look the fix must keep: the hovered row is still an outlined,
+        // rounded box, drawn whole, and the selected row is still filled.
+        assert!(
+            hover.stroke.width > 0.0 && hover.corner_radius.nw > 0,
+            "the hovered row lost its rounded outline: {hover:?}"
+        );
+        assert!(clip.contains_rect(hover.rect), "the hovered row's box {:?} is clipped by {clip:?}", hover.rect);
+        let napps = still.iter().find(|(n, _)| n == "Napps").expect("Napps is a row").1.center();
+        assert!(
+            highlight_at(&away, napps).is_some_and(|(r, _)| r.fill.a() > 0),
+            "the selected row is no longer filled"
+        );
+        let moved: Vec<String> = still
+            .iter()
+            .zip(&hovered)
+            .filter(|(a, b)| a != b)
+            .map(|(a, b)| format!("{} {:?} -> {:?}", a.0, a.1, b.1))
+            .collect();
+        assert!(moved.is_empty(), "hovering \"TVT\" moved rows of the open list: {moved:#?}");
     }
 
     #[test]
