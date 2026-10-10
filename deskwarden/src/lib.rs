@@ -77,6 +77,9 @@ pub mod hotkey;
 pub mod http_agent;
 pub mod icon;
 pub mod injector;
+/// A pasted organisation invite link -- Bitwarden's, Vaultwarden's or
+/// NodeWarden's -- read into the ids and token Bitwarden's accept route takes.
+pub mod invite_link;
 /// The icon the owner CHOSE for one vault item, stored on the item itself so
 /// it syncs. Read before anything in [`favicon`] routes a request: when it
 /// answers, no origin is fetched, no proxy is asked and no third party sees

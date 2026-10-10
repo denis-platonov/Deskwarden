@@ -1,9 +1,9 @@
 //! **The sharing routes**, one typed function each -- Bitwarden's own, the
 //! official column of spec §7.3, which every server answers
 //! (`docs/superpowers/specs/2026-10-08-official-path-sharing-design.md`).
-//! Two NodeWarden routes remain, each said where it is: the recipient's
-//! invitation list (until the paste-a-link accept replaces it) and the
-//! administrator's registration code.
+//! One NodeWarden route remains, and says so: the administrator's
+//! registration code. There is no invitation list -- no official server has
+//! one -- and an invitation is accepted from its link ([`accept_invite`]).
 //!
 //! No policy lives here. Which route to call, in what order, and what a
 //! refusal means for the user is `rest::sharing`'s. What lives here is the
@@ -17,7 +17,6 @@
 //! nowhere but this file.
 
 use serde_json::{Value, json};
-use zeroize::Zeroizing;
 
 use crate::rest::api::{RestClient, RestError, Session, is_url_path_safe};
 use crate::rest::crypto::{EncString, spki_from_base64};
@@ -65,11 +64,6 @@ fn safe(id: &str) -> Result<&str, RestError> {
     if is_url_path_safe(id) { Ok(id) } else { Err(RestError::UnsafeId) }
 }
 
-/// A server without this route: its whole answer is "not here".
-fn route_absent(error: &RestError) -> bool {
-    matches!(error, RestError::Status(404 | 405 | 501))
-}
-
 /// The server's sentence, lower-cased, when it refused.
 fn refusal(error: &RestError) -> Option<String> {
     match error {
@@ -96,30 +90,6 @@ fn send(client: &RestClient, session: &mut Session, request: &SharingRequest) ->
 }
 
 // ---- answers ----------------------------------------------------------------
-
-/// An invitation addressed to this account (`GET /invitations/mine`).
-///
-/// **No `Debug`**, because the token is what accepts it.
-#[derive(Clone)]
-pub struct IncomingInvitation {
-    pub id: String,
-    pub organization_id: String,
-    /// Plaintext on every server; for a sharing org, `Shared by <email>`.
-    /// Anyone can set it, so it says only THAT an invitation is a personal
-    /// share, never WHOSE -- see [`Self::owner_email`].
-    pub organization_name: Option<String>,
-    /// **The inviting organisation's owner, as the server attests it** --
-    /// NodeWarden's `ownerEmail`, normalised. The one thing an invitation's
-    /// "from" is read off (`Sharing::view`); `None` from a server that does
-    /// not send it, and the window then names nobody.
-    pub owner_email: Option<String>,
-    /// The role the invitation grants, as NodeWarden words it (`member`,
-    /// `manager`, `admin`, `owner`). Only a `member` invitation is a personal
-    /// share (`Sharing::view`); `None` from a server that did not say.
-    pub role: Option<String>,
-    pub token: Zeroizing<String>,
-    pub expires_at: Option<String>,
-}
 
 /// An account's id and public key: what a confirm wraps the org key to, and
 /// what a pin records.
@@ -180,39 +150,9 @@ pub struct NewOrganization {
 
 // ---- the routes ---------------------------------------------------------------
 
-/// `GET /api/organizations/invitations/mine` -- NodeWarden's, and the dialect
-/// probe's question. `None` is a server without the route (official,
-/// Vaultwarden), which is an answer and not an error.
-pub fn my_invitations(
-    client: &RestClient,
-    session: &mut Session,
-) -> Result<Option<Vec<IncomingInvitation>>, RestError> {
-    let request = SharingRequest::new(SharingMethod::Get, "/api/organizations/invitations/mine".into(), None);
-    match send(client, session, &request) {
-        Ok(answer) => Ok(Some(
-            rows(&answer)
-                .iter()
-                .filter_map(|row| {
-                    Some(IncomingInvitation {
-                        id: text_at(row, "id")?,
-                        organization_id: text_at(row, "organizationId")?,
-                        organization_name: text_at(row, "organizationName"),
-                        owner_email: text_at(row, "ownerEmail").map(|e| crate::rest::organizations::normalise_email(&e)),
-                        role: text_at(row, "role").map(|r| r.trim().to_lowercase()),
-                        token: Zeroizing::new(text_at(row, "token")?),
-                        expires_at: text_at(row, "expirationDate"),
-                    })
-                })
-                .collect(),
-        )),
-        Err(e) if route_absent(&e) || matches!(e, RestError::Rejected { .. }) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
-/// `GET /api/users/{userId}/public-key` -- slice 1's second probe, and the
-/// key every confirm wraps to. `None`: no such route, no such user, or a user
-/// who has never opened an app that made keys.
+/// `GET /api/users/{userId}/public-key` -- the key every confirm wraps to.
+/// `None`: no such user, or a user who has never opened an app that made
+/// keys.
 pub fn user_public_key(
     client: &RestClient,
     session: &mut Session,
@@ -447,24 +387,15 @@ pub fn set_cipher_collections(
     send(client, session, &SharingRequest::new(SharingMethod::Put, path, Some(json!({ "collectionIds": collection_ids }))))
 }
 
-/// `POST /api/organizations/invitations/accept {token}`.
-pub fn accept_invitation(client: &RestClient, session: &mut Session, token: &str) -> Result<(), RestError> {
-    let request = SharingRequest::new(
-        SharingMethod::Post,
-        "/api/organizations/invitations/accept".into(),
-        Some(json!({ "token": token })),
-    );
-    send(client, session, &request).map(|_| ())
-}
-
-/// `POST /api/organizations/invitations/decline {token}`.
-pub fn decline_invitation(client: &RestClient, session: &mut Session, token: &str) -> Result<(), RestError> {
-    let request = SharingRequest::new(
-        SharingMethod::Post,
-        "/api/organizations/invitations/decline".into(),
-        Some(json!({ "token": token })),
-    );
-    send(client, session, &request).map(|_| ())
+/// `POST /api/organizations/{orgId}/users/{ouId}/accept {token}` -- Bitwarden's
+/// accept, with the token an invitation link carries (official-path spec
+/// §4.1). The server checks the token, and that the invitation's email is
+/// the signed-in account's. `resetPasswordKey` is not sent: a sharing org has
+/// no account-recovery policy that would ask for one. There is no decline --
+/// Bitwarden has none; an invitation nobody answers expires.
+pub fn accept_invite(client: &RestClient, session: &mut Session, org: &str, ou_id: &str, token: &str) -> Result<(), RestError> {
+    let path = format!("/api/organizations/{}/users/{}/accept", safe(org)?, safe(ou_id)?);
+    send(client, session, &SharingRequest::new(SharingMethod::Post, path, Some(json!({ "token": token })))).map(|_| ())
 }
 
 /// `POST /api/organizations/{id}/leave` -- the recipient's "stop receiving".
@@ -527,36 +458,24 @@ mod tests {
         "4.AAAA".parse().expect("a type-4 string")
     }
 
-    /// **The invitation list, and what its absence means.** A 200 list is
-    /// NodeWarden; a 404 is a server without the route -- the dialect probe's
-    /// whole question -- and is `None`, not an error.
+    /// **The accept is Bitwarden's**: the link's org and org-user ids in the
+    /// path, the token in the body and nowhere else; an id that is not
+    /// path-safe never reaches the wire.
     #[test]
-    fn my_invitations_are_read_and_a_missing_route_is_none() {
+    fn an_accept_posts_the_links_token_to_the_official_route() {
         let mut server = crate::test_http::server();
         let (client, mut session) = granted(&mut server);
-        let listed = server
-            .mock("GET", "/api/organizations/invitations/mine")
-            .match_header("Authorization", "Bearer AT-1")
-            .with_body(serde_json::json!({ "object": "list", "data": [{
-                "id": "inv-1", "organizationId": ORG, "organizationName": "Shared by denis@example.com",
-                "token": "tok-1", "expirationDate": "2026-10-04T00:00:00.000Z", "object": "organizationInvitation",
-                "ownerEmail": " Denis@Example.com ", "role": "Member"
-            }]}).to_string())
+        let accepted = server
+            .mock("POST", format!("/api/organizations/{ORG}/users/ou-9/accept").as_str())
+            .match_body(Matcher::Json(serde_json::json!({ "token": "tok-1" })))
+            .with_body("")
             .expect(1)
             .create();
-        let got = my_invitations(&client, &mut session).expect("a list").expect("NodeWarden");
-        listed.assert();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].organization_name.as_deref(), Some("Shared by denis@example.com"));
-        assert_eq!(got[0].owner_email.as_deref(), Some("denis@example.com"), "read and normalised");
-        assert_eq!(got[0].role.as_deref(), Some("member"), "the role, lower-cased");
-        assert_eq!(got[0].token.as_str(), "tok-1");
-        assert_eq!(got[0].expires_at.as_deref(), Some("2026-10-04T00:00:00.000Z"));
-
-        let mut official = crate::test_http::server();
-        let (client, mut session) = granted(&mut official);
-        official.mock("GET", "/api/organizations/invitations/mine").with_status(404).create();
-        assert!(my_invitations(&client, &mut session).expect("not an error").is_none());
+        accept_invite(&client, &mut session, ORG, "ou-9", "tok-1").expect("accepted");
+        accepted.assert();
+        let any = server.mock("POST", Matcher::Any).expect(0).create();
+        assert_eq!(accept_invite(&client, &mut session, ORG, "../x", "t"), Err(RestError::UnsafeId));
+        any.assert();
     }
 
     /// **The organisation create body is the official one** (spec 9.5),

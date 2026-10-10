@@ -19,9 +19,9 @@
 //!
 //! It holds only what the last whole read already paid for (the sharing
 //! org's roster and person collections, handed over by `synced` through
-//! [`Sharing::note_directory`]), the [`Capabilities`] it has learned, the recipient's
-//! incoming invitations, and two sets the confirm pass learns (keys that
-//! changed, accounts with no key yet). Every WRITE reads current server
+//! [`Sharing::note_directory`]), the [`Capabilities`] it has learned, the
+//! sharers this account accepted and is waiting on, and two sets the confirm
+//! pass learns (keys that changed, accounts with no key yet). Every WRITE reads current server
 //! state first and does only the missing steps (spec 13), so a Retry is the
 //! same call and two PCs converge.
 //!
@@ -34,8 +34,9 @@
 //! [`Capabilities`], each from an official route sharing needs anyway: a
 //! route answering as missing turns sharing off (`server-too-old`), and a
 //! roster read after an invite says whether the server accepted at once.
-//! The recipient's invitation list is the one NodeWarden route left, until
-//! the paste-a-link accept replaces it.
+//! There is no invitation list -- no official server lets an invitee list
+//! one -- and an invitation is accepted from its pasted link
+//! ([`Sharing::accept_link`]) or in the web vault.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -48,7 +49,7 @@ use crate::rest::crypto::{CryptoError, EncString, SymmetricKey};
 use crate::rest::organizations::{
     Directory, Member, MemberStatus, Roster, collection_ids_of, normalise_email, organization_of, sharer_of,
 };
-use crate::rest::sharing_api::{self, IncomingInvitation};
+use crate::rest::sharing_api;
 use crate::rest::sync::{Profile, VaultKeys};
 use crate::vault_bridge::{VaultError, VaultItem};
 
@@ -122,21 +123,6 @@ pub struct ReceivedEntry {
     pub from: String,
 }
 
-/// An invitation addressed to this account, from a sharer.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IncomingEntry {
-    pub id: String,
-    /// **Who sent it, as the SERVER attests** -- the inviting org's
-    /// `ownerEmail`, and never its plaintext "Shared by" name, which anyone
-    /// can set (final review, concern 1). `None` when the server does not
-    /// say: the window then shows a neutral "Someone on this server", not a
-    /// name-only claim.
-    #[serde(default)]
-    pub from: Option<String>,
-    pub expires_at: Option<String>,
-}
-
 /// A sharing org this account accepted and its sharer has not confirmed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -164,7 +150,6 @@ pub struct SharingView {
     pub people: Vec<PersonEntry>,
     pub records: Vec<RecordEntry>,
     pub received: Vec<ReceivedEntry>,
-    pub incoming: Vec<IncomingEntry>,
     pub waiting: Vec<WaitingEntry>,
 }
 
@@ -647,16 +632,10 @@ impl MyOrg {
 
 /// What the engine holds between passes. See the module docs.
 ///
-/// **A hand-written `Debug`, and it must have one** -- not for a caller, but
-/// as `crate::debug_leak_guard`'s barrier. `incoming` holds invitation tokens
-/// (`Zeroizing`), so to the guard `Held` reaches a secret; with no `Debug` of
-/// its own it would pass that on to [`Sharing`]. The guard matches types by
-/// bare name, so without this impl it flagged types that merely NAME a
-/// `Sharing` as deriving `Debug` over a secret: the detail pane's `Section`
-/// (its `Section::Sharing` variant) and, by further name matches,
-/// `change_feed`'s `Change` and `FeedPage`. Refusing here, at the one type
-/// that holds the tokens, un-flags all three in the right place; the impl
-/// prints the invitations as a count and never a token.
+/// **A hand-written `Debug`.** It was `crate::debug_leak_guard`'s barrier
+/// while `Held` kept invitation tokens; it holds no secret now (there is no
+/// invitation list), and the impl stays so that a field added later is
+/// printed on purpose or not at all.
 #[derive(Clone, Default)]
 pub(crate) struct Held {
     pub(crate) capabilities: Capabilities,
@@ -666,7 +645,6 @@ pub(crate) struct Held {
     pub(crate) others: Vec<(String, String)>,
     /// Accepted, unconfirmed: `(org id, sharer)`.
     pub(crate) waiting: Vec<(String, String)>,
-    pub(crate) incoming: Vec<IncomingInvitation>,
     /// Emails whose key differs from the pin.
     pub(crate) key_changed: BTreeSet<String>,
     /// Emails whose account has no public key yet.
@@ -688,7 +666,6 @@ impl std::fmt::Debug for Held {
             .field("my_org", &self.my_org)
             .field("others", &self.others)
             .field("waiting", &self.waiting)
-            .field("incoming", &format_args!("<{} invitations>", self.incoming.len()))
             .field("key_changed", &self.key_changed)
             .field("no_key", &self.no_key)
             .field("asked_adoption", &self.asked_adoption)
@@ -883,10 +860,9 @@ impl Sharing {
 
     /// The view -- pure over what is held and the daemon's items.
     ///
-    /// Built under the `held` lock rather than from a clone of [`Held`]: a
-    /// clone would copy every incoming invitation's `Zeroizing` token only to
-    /// read its id and drop it, and nothing here takes another lock or makes
-    /// a request, so the guard is short.
+    /// Built under the `held` lock rather than from a clone of [`Held`]:
+    /// nothing here takes another lock or makes a request, so the guard is
+    /// short, and a clone would copy the roster to read it once.
     #[must_use]
     pub fn view(&self, items: &[VaultItem]) -> SharingView {
         let held = self.held();
@@ -945,20 +921,6 @@ impl Sharing {
                 }
             }
         }
-        view.incoming = held
-            .incoming
-            .iter()
-            // The NAME says only that this is a personal-sharing invitation
-            // (a "Shared by" org); WHO sent it is the server's attested
-            // owner, whatever the name claims -- a forged "Shared by boss@"
-            // is shown as its real owner's -- or nobody when it does not say.
-            .filter(|invitation| is_personal_share(invitation))
-            .map(|invitation| IncomingEntry {
-                id: invitation.id.clone(),
-                from: invitation.owner_email.clone(),
-                expires_at: invitation.expires_at.clone(),
-            })
-            .collect();
         view.waiting = held
             .waiting
             .iter()
@@ -1039,20 +1001,16 @@ impl Sharing {
             .ok_or_else(|| SharingError::Refused("The server did not say which account this is.".to_string()))
     }
 
-    /// **One pass** (spec 11.5): the account, then the incoming invitations on a
-    /// whole read or the timer, then every move back whose delete failed
-    /// ([`Self::finish_unfinished`]) -- on every trigger, since each is one
-    /// file read when nothing is pending -- and last the confirm pass
-    /// ([`Self::confirm_pass`]), whose failure is logged like the
-    /// invitations' and for their reason.
+    /// **One pass** (spec 11.5): the account, then every move back whose
+    /// delete failed ([`Self::finish_unfinished`]) -- on every trigger, since
+    /// each is one file read when nothing is pending -- and last the confirm
+    /// pass ([`Self::confirm_pass`]), whose failure is logged: the finished
+    /// moves above must still reach the daemon.
     ///
-    /// **A failed invitations read does not end the pass.** It used to, with
-    /// `?`, and so a transient error there skipped the unfinished moves too:
-    /// an org copy nobody was retrying, one pass at a time. It is logged, the
-    /// incoming list keeps what it held, and the rest of the pass runs. It
-    /// cannot run FIRST instead: a pass that finished a move and then failed
-    /// on the invitations would return the error and drop the outcome, and
-    /// the daemon would never be told the org copy is gone.
+    /// There is no invitation list to read (official-path spec §4.1): no
+    /// official server lets an invitee list their invitations, and
+    /// NodeWarden's `/invitations/mine` is not called. An invitation is
+    /// accepted from its link ([`Self::accept_link`]) or in the web vault.
     ///
     /// # Errors
     ///
@@ -1064,18 +1022,6 @@ impl Sharing {
         let mut pass = SharingPass { changed: !was_loaded, ..SharingPass::default() };
         if self.held().capabilities.too_old {
             return Ok(pass);
-        }
-        if matches!(trigger, Trigger::WholeRead | Trigger::Timer) {
-            match self.call(|client, auth| sharing_api::my_invitations(client, &mut auth.session)) {
-                Ok(Some(list)) => {
-                    let mut held = self.held();
-                    let before: Vec<String> = held.incoming.iter().map(|i| i.id.clone()).collect();
-                    pass.changed |= before != list.iter().map(|i| i.id.clone()).collect::<Vec<_>>();
-                    held.incoming = list;
-                }
-                Ok(None) => {}
-                Err(e) => log::info!("the incoming invitations could not be read this pass: {e}"),
-            }
         }
         pass.outcome = self.finish_unfinished();
         pass.changed |= !pass.outcome.is_empty();
@@ -1264,21 +1210,6 @@ fn keyed_account(account: Option<Account>) -> Result<Account, SharingError> {
 }
 
 // ---- the owner's writes -----------------------------------------------------------
-
-/// **Whether an invitation is a personal share** -- what Shared with me lists
-/// and Accept takes (final re-review, minor 1): a "Shared by" org name AND a
-/// plain `member` role. An owner, admin or manager invitation -- which
-/// NodeWarden now sends instead of making an existing account one directly
-/// (`47869c4`) -- is not "wants to share with you": accepting it would make
-/// this account run someone's organisation. It is not listed at all, rather
-/// than listed with its role spelled out: Shared with me is about records
-/// people share, and one line that asks something else of the user there
-/// would be the easier one to accept without reading. The web vault lists it,
-/// in its own words. A role the server did not name is not assumed to be
-/// `member` (NodeWarden has always named it).
-fn is_personal_share(invitation: &IncomingInvitation) -> bool {
-    invitation.organization_name.as_deref().and_then(sharer_of).is_some() && invitation.role.as_deref() == Some("member")
-}
 
 /// **Owned by this account and named for it** -- what makes an org a
 /// CANDIDATE for this account's own sharing org (spec 5.1). Not enough on its
@@ -3076,88 +3007,62 @@ impl Sharing {
 
 // ---- the recipient -----------------------------------------------------------------
 
-/// An invitation id this account no longer holds: answered already (here or
-/// on another PC), expired and dropped by the last read, or never one.
-pub const INVITATION_GONE: &str = "This invitation is no longer waiting.";
 /// A leave asked of an organisation that is not someone else's sharing org --
 /// this account's own (whose owner NodeWarden will not let leave anyway), a
 /// real organisation, or one this account has already left.
 pub const NOT_A_SHARER: &str = "That is not someone sharing with you.";
+/// A pasted invite link the server would not accept; its own words follow
+/// (`SharingError::or_say`).
+pub const LINK_ACCEPT_FAILED: &str = "Couldn't accept the invitation.";
+
+/// A pasted invite link addressed to another account (official-path spec
+/// §4.1). The server would refuse it too; this says so in words, before a
+/// request is made.
+#[must_use]
+pub fn link_for_someone_else(link_email: &str, account_email: &str) -> String {
+    format!("This invite link is for {link_email}. You're signed in as {account_email}.")
+}
 
 impl Sharing {
-    /// **The token of an invitation this account still holds**, by the id the
-    /// view listed it under.
+    /// **Accept a pasted invite link** (official-path spec §4.1): read it
+    /// ([`crate::invite_link::parse`]), refuse it in words when its email is
+    /// not this account's, and otherwise send its token to Bitwarden's own
+    /// accept route. The sharer's daemon confirms, and the records arrive on
+    /// the push or the poll that confirm produces.
     ///
-    /// The token is what accepts the invitation, so it never leaves the
-    /// daemon: `invitations/mine` put it in [`Held::incoming`] as a
-    /// `Zeroizing`, the view carries only the id ([`IncomingEntry`]), and the
-    /// window's accept names that id. This clone is wiped when the write that
-    /// asked for it returns.
+    /// **The org is filed as waiting at once**, under the name's claim, so
+    /// Shared with me says "Waiting for X to finish sharing" the moment the
+    /// accept lands rather than after the next whole read -- which replaces
+    /// this entry with the directory's own word when it comes. A name that
+    /// claims no sharer files nothing.
     ///
-    /// Only an invitation the view lists ([`is_personal_share`]): an elevated
-    /// role is not accepted from here even by an id the window was never
-    /// shown.
-    fn token_of(&self, id: &str) -> Result<zeroize::Zeroizing<String>, SharingError> {
-        self.held()
-            .incoming
-            .iter()
-            .find(|i| i.id == id && is_personal_share(i))
-            .map(|i| i.token.clone())
-            .ok_or_else(|| SharingError::Refused(INVITATION_GONE.to_string()))
-    }
-
-    /// **Accept an invitation** (spec 6.9): NodeWarden's
-    /// `POST /invitations/accept {token}`. The sharer's daemon confirms, and
-    /// the records arrive on the push that confirm produces.
-    ///
-    /// **The org is filed as waiting at once**, from the invitation's own
-    /// org id and name, so Shared with me says "Waiting for X to finish
-    /// sharing" the moment the row goes rather than after the next whole
-    /// read -- which is what fills [`Held::waiting`] otherwise, and which
-    /// replaces this entry with the server's own answer when it comes. The
-    /// sharer is the invitation's attested owner, as the view's `incoming`
-    /// reads it; with none, no waiting line is filed -- the whole read's
-    /// directory, which holds the same rule (`organizations::sharing_mark`),
-    /// would not file one either.
-    ///
-    /// Accepting records no SSO consent and asks nothing more of the server:
-    /// the token is the whole of it (NodeWarden's own decision).
+    /// The link is the caller's; nothing here logs it or keeps it, and the
+    /// token leaves this process only in the accept's body.
     ///
     /// # Errors
     ///
-    /// The invitation is gone ([`INVITATION_GONE`]), or the server refused --
-    /// its sentence after "Couldn't accept the invitation."
-    pub fn accept(&self, id: &str) -> Result<(), SharingError> {
+    /// The link is not one ([`crate::invite_link::LinkError::sentence`]), it
+    /// is for someone else ([`link_for_someone_else`]), or the server refused
+    /// -- its sentence after [`LINK_ACCEPT_FAILED`].
+    pub fn accept_link(&self, link: &str) -> Result<(), SharingError> {
         let _one = self.one_at_a_time();
         self.require_available()?;
-        let token = self.token_of(id)?;
-        self.call(|client, auth| sharing_api::accept_invitation(client, &mut auth.session, &token))
-            .map_err(|e| e.or_say("Couldn't accept the invitation."))?;
-        let mut held = self.held();
-        let accepted = held.incoming.iter().position(|i| i.id == id).map(|at| held.incoming.remove(at));
-        if let Some(invitation) = accepted {
-            if let Some(from) = invitation.owner_email.clone() {
-                if !held.waiting.iter().any(|(org, _)| *org == invitation.organization_id) {
-                    held.waiting.push((invitation.organization_id.clone(), from));
-                }
+        let invite = crate::invite_link::parse(link).map_err(|e| SharingError::Refused(e.sentence().to_string()))?;
+        let account = self.held().account.clone().ok_or_else(|| SharingError::Refused(LINK_ACCEPT_FAILED.to_string()))?;
+        let mine = normalise_email(&account.email);
+        if invite.email != mine {
+            return Err(SharingError::Refused(link_for_someone_else(&invite.email, &mine)));
+        }
+        self.call(|client, auth| {
+            sharing_api::accept_invite(client, &mut auth.session, &invite.organization_id, &invite.organization_user_id, &invite.token)
+        })
+        .map_err(|e| e.or_say(LINK_ACCEPT_FAILED))?;
+        if let Some(from) = invite.organization_name.as_deref().and_then(sharer_of) {
+            let mut held = self.held();
+            if !held.waiting.iter().any(|(org, _)| *org == invite.organization_id) {
+                held.waiting.push((invite.organization_id.clone(), from.to_string()));
             }
         }
-        Ok(())
-    }
-
-    /// **Decline an invitation**: `POST /invitations/decline {token}`.
-    /// Nothing is added to this vault; the sharer can invite again later.
-    ///
-    /// # Errors
-    ///
-    /// The invitation is gone ([`INVITATION_GONE`]), or the server refused.
-    pub fn decline(&self, id: &str) -> Result<(), SharingError> {
-        let _one = self.one_at_a_time();
-        self.require_available()?;
-        let token = self.token_of(id)?;
-        self.call(|client, auth| sharing_api::decline_invitation(client, &mut auth.session, &token))
-            .map_err(|e| e.or_say("Couldn't decline the invitation."))?;
-        self.held().incoming.retain(|i| i.id != id);
         Ok(())
     }
 
@@ -3467,7 +3372,6 @@ mod tests {
         let engine = backend.sharing_engine();
         engine.set_up(SharingSetup { make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         let profile = server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect(1).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_status(404).expect_at_least(0).create();
         let key = server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str()).expect(0).create();
         engine.refresh(Trigger::WholeRead).expect("a first pass");
         engine.refresh(Trigger::WholeRead).expect("a second pass");
@@ -3496,27 +3400,6 @@ mod tests {
         }
     }
 
-    /// **`Held`'s `Debug` never prints an invitation token** -- the reason it
-    /// is hand-written (see its doc).
-    #[test]
-    fn held_debug_never_prints_an_invitation_token() {
-        let held = Held {
-            incoming: vec![IncomingInvitation {
-                id: "inv-1".into(),
-                organization_id: "org-anna".into(),
-                organization_name: Some("Shared by anna@x.io".into()),
-                owner_email: Some("anna@x.io".into()),
-                role: Some("member".into()),
-                token: zeroize::Zeroizing::new("TOKEN-NEEDLE-7f3a".into()),
-                expires_at: None,
-            }],
-            ..Held::default()
-        };
-        let printed = format!("{held:?}");
-        assert!(!printed.contains("TOKEN-NEEDLE-7f3a"), "{printed}");
-        assert!(printed.contains("<1 invitations>"), "{printed}");
-    }
-
     /// The fixture profile with no key pair: `privateKey` null.
     fn keyless_profile() -> serde_json::Value {
         let mut profile = sharing_profile(serde_json::json!([]));
@@ -3533,7 +3416,6 @@ mod tests {
         let engine = backend.sharing_engine();
         engine.set_up(SharingSetup::none());
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_status(404).create();
         engine.refresh(Trigger::WholeRead).expect("a pass");
         let view = engine.view(&[]);
         assert!(view.available, "{view:?}");
@@ -3701,7 +3583,6 @@ mod tests {
             eff_wordlist: vec![PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/eff_large_wordlist.txt"))],
         });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(organizations).to_string()).expect_at_least(0).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
         server
             .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
@@ -3905,7 +3786,6 @@ mod tests {
         let dir = pinned_dir("sharing-move-fails-daemon");
         engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server
             .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
@@ -3945,7 +3825,6 @@ mod tests {
         let dir = crate::test_scratch::ScratchDir::new("sharing-adopt-daemon");
         engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         with_collections(&mut server, &[]);
         with_roster(&mut server, &[me_row()]);
         let writes = server.mock("POST", Matcher::Regex("^/api/".into())).expect(0).create();
@@ -4016,7 +3895,6 @@ mod tests {
         let engine = backend.sharing_engine();
         engine.set_up(SharingSetup { make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(keyless_profile().to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str()).with_status(404).create();
         let record = server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).expect(0).create();
         let writes = server.mock("POST", Matcher::Any).expect(0).create();
@@ -4795,25 +4673,6 @@ mod tests {
         assert!(collection_ids_of(org_copy).is_empty());
     }
 
-    /// **A failed invitations read does not skip a half-finished move**: the
-    /// pass logs it and runs on.
-    #[test]
-    fn a_failed_invitations_read_does_not_skip_a_half_finished_move() {
-        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
-        crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
-            state.account_mut(FIXTURE_USER_ID).unfinished.push(crate::sharing_state::Unfinished::PurgeOrgCopy {
-                org_cipher_id: "s1".into(),
-                personal_id: "p1".into(),
-            });
-        }).expect("seeded");
-        server.mock("GET", "/api/organizations/invitations/mine").with_status(500).create();
-        server.mock("PUT", "/api/ciphers/s1/collections").with_body(shared_cipher("s1", "Acme VPN", &[]).to_string()).create();
-        let deleted = server.mock("DELETE", "/api/ciphers/s1").with_status(204).expect(1).create();
-        let pass = engine.refresh(Trigger::WholeRead).expect("the pass runs on");
-        deleted.assert();
-        assert_eq!(pass.outcome.removed, ["s1"]);
-    }
-
     // ---- follow-up: a pending move back, from every side -------------------------
 
     /// `s1`'s move back is pending: its personal copy is `p-new`.
@@ -4966,7 +4825,6 @@ mod tests {
         let dir = pinned_dir("sharing-move-back-daemon");
         engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server
             .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
@@ -5206,7 +5064,6 @@ mod tests {
         let dir = pinned_dir("sharing-forget-daemon");
         engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server
             .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
@@ -5353,7 +5210,6 @@ mod tests {
         let engine = backend.sharing_engine();
         engine.set_up(SharingSetup::none());
         official.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
-        official.mock("GET", "/api/organizations/invitations/mine").with_status(404).create();
         let deletes = official.mock("DELETE", Matcher::Any).expect(0).create();
         let outcome = engine.forget("anna@example.com", &[]).expect("nothing to forget off NodeWarden");
         deletes.assert();
@@ -6114,47 +5970,6 @@ mod tests {
         assert!(!engine.held().capabilities.too_old, "a candidate org's roster");
     }
 
-    /// **An owner, admin or manager invitation is not a personal share**
-    /// (final re-review, minor 1): Shared with me does not list it -- a
-    /// "Shared by" name notwithstanding -- and Accept will not take it by
-    /// id. A member invitation beside it is listed as before; one whose role
-    /// the server did not name is not assumed to be one.
-    #[test]
-    fn an_elevated_role_invitation_is_not_listed_or_accepted_as_a_share() {
-        let (mut server, backend) = signed_in_with_no_sync_route();
-        let engine = backend.sharing_engine();
-        engine.set_up(SharingSetup::none());
-        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
-        let row = |id: &str, role: Option<&str>| {
-            let mut row = serde_json::json!({ "id": id, "organizationId": format!("o-{id}"), "organizationName": "Shared by denis@example.com",
-                "token": format!("t-{id}"), "ownerEmail": "denis@example.com" });
-            if let Some(role) = role {
-                row["role"] = serde_json::json!(role);
-            }
-            row
-        };
-        server
-            .mock("GET", "/api/organizations/invitations/mine")
-            .with_body(serde_json::json!({ "data": [
-                row("share", Some("member")), row("own", Some("owner")), row("adm", Some("Admin")), row("mgr", Some("manager")), row("unsaid", None)
-            ]}).to_string())
-            .create();
-        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
-            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
-            .create();
-        engine.refresh(Trigger::WholeRead).expect("probed");
-        let listed: Vec<String> = engine.view(&[]).incoming.into_iter().map(|i| i.id).collect();
-        assert_eq!(listed, ["share"], "only the member invitation is a share");
-        let accepted = server.mock("POST", "/api/organizations/invitations/accept").expect(0).create();
-        for id in ["own", "adm", "mgr", "unsaid"] {
-            match engine.accept(id) {
-                Err(SharingError::Refused(sentence)) => assert_eq!(sentence, INVITATION_GONE, "{id}"),
-                other => panic!("{id} was accepted as a share: {other:?}"),
-            }
-        }
-        accepted.assert();
-    }
-
     /// **A cached id the profile does not list YET is kept** (final
     /// re-review, minor 2): a whole read that began before a share's
     /// `create_org` and ended after its state write carries a profile
@@ -6491,7 +6306,6 @@ mod tests {
             profile["role"] = serde_json::json!("admin");
         }
         server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
         server
             .mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
@@ -6601,112 +6415,72 @@ mod tests {
         assert_eq!(refused(&engine, "carol@example.com"), format!("{INVITE_CODE_FAILED} The server said: Something else"));
     }
 
-    fn invited(server: &mut MockServer) {
-        server
-            .mock("GET", "/api/organizations/invitations/mine")
-            .with_body(serde_json::json!({ "data": [{
-                "id": "inv-1", "organizationId": "org-denis", "organizationName": "Shared by denis@example.com",
-                "token": "tok-1", "expirationDate": "2999-01-01T00:00:00.000Z", "ownerEmail": "denis@example.com",
-                "role": "member"
-            }]}).to_string())
-            .expect_at_least(0)
-            .create();
+    /// A Bitwarden invite link for `email`, to the fixture-free org `org-guid`.
+    fn invite_link_for(email: &str) -> String {
+        format!(
+            "https://vault.example/#/accept-organization?organizationId=0f0e0d0c-0b0a-4009-8807-060504030201\
+             &organizationUserId=a1b2c3d4-e5f6-4789-8abc-def012345678&email={}\
+             &organizationName=Shared+by+denis%40example.com&token=tok-1&initOrganization=False&orgUserHasExistingUser=True",
+            email.replace('@', "%40")
+        )
     }
 
-    /// **"denis@… wants to share with you"** (spec 6.9): the invitation is in
-    /// the view, Accept posts its token, and it leaves the view.
+    /// **A pasted link is accepted on Bitwarden's own route** (official-path
+    /// spec §4.1), and the sharer is waited on at once -- under the name's
+    /// claim, until a whole read says more.
     #[test]
-    fn a_recipient_accepts_an_invitation_by_its_token() {
-        let (mut server, backend) = signed_in_with_no_sync_route();
-        let engine = backend.sharing_engine();
-        engine.set_up(SharingSetup::none());
-        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
-        invited(&mut server);
-        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
-            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
-            .create();
-        engine.refresh(Trigger::WholeRead).expect("probed");
-        let view = engine.view(&[]);
-        assert_eq!(view.incoming, vec![IncomingEntry { id: "inv-1".into(), from: Some("denis@example.com".into()), expires_at: Some("2999-01-01T00:00:00.000Z".into()) }]);
-        // The token is the daemon's alone: what the window is sent has none.
-        let sent = serde_json::to_string(&view).expect("json");
-        assert!(!sent.contains("tok-1"), "{sent}");
+    fn a_pasted_link_is_accepted_on_the_official_route() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
         let accepted = server
-            .mock("POST", "/api/organizations/invitations/accept")
+            .mock("POST", "/api/organizations/0f0e0d0c-0b0a-4009-8807-060504030201/users/a1b2c3d4-e5f6-4789-8abc-def012345678/accept")
             .match_body(Matcher::Json(serde_json::json!({ "token": "tok-1" })))
             .with_body("")
             .expect(1)
             .create();
-        engine.accept("inv-1").expect("accepted");
+        let listed = server.mock("GET", Matcher::Regex("invitations".into())).expect(0).create();
+        engine.accept_link(&invite_link_for(FIXTURE_EMAIL)).expect("accepted");
         accepted.assert();
-        assert!(engine.view(&[]).incoming.is_empty());
-        // Waiting at once, not after the next whole read: the row that went
-        // is replaced by "Waiting for denis@… to finish sharing".
+        listed.assert();
         assert_eq!(
             engine.view(&[]).waiting,
-            vec![WaitingEntry { organization_id: "org-denis".into(), from: "denis@example.com".into() }]
+            vec![WaitingEntry { organization_id: "0f0e0d0c-0b0a-4009-8807-060504030201".into(), from: "denis@example.com".into() }]
         );
-        assert!(matches!(engine.accept("inv-1"), Err(SharingError::Refused(_))), "an invitation already answered is gone");
     }
 
-    /// **An invitation's "from" is the server's attested owner, never the
-    /// name** (final review, concern 1). A forged "Shared by boss@" from
-    /// mallory's org says mallory; a matching name says its sharer; with no
-    /// `ownerEmail` it names nobody, and accepting it files no waiting line.
-    /// An invitation to an org with no sharing name is not a personal share.
+    /// **A link for another account is refused in words, before any
+    /// request** -- the server would refuse it too, in its own.
     #[test]
-    fn an_invitation_is_attributed_to_its_attested_owner_and_never_to_the_name() {
-        let (mut server, backend) = signed_in_with_no_sync_route();
-        let engine = backend.sharing_engine();
-        engine.set_up(SharingSetup::none());
-        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
+    fn a_link_for_someone_else_is_refused_before_any_request() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        let posts = server.mock("POST", Matcher::Any).expect(0).create();
+        match engine.accept_link(&invite_link_for("someone@else.example")) {
+            Err(SharingError::Refused(sentence)) => {
+                assert_eq!(sentence, link_for_someone_else("someone@else.example", &FIXTURE_EMAIL.to_lowercase()));
+            }
+            other => panic!("a link for someone else was accepted: {other:?}"),
+        }
+        posts.assert();
+        assert!(engine.view(&[]).waiting.is_empty());
+    }
+
+    /// **What is not a link is refused with the parser's sentence**, and a
+    /// server's refusal keeps its own words after the engine's.
+    #[test]
+    fn a_bad_link_and_a_refused_accept_say_why() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        match engine.accept_link("https://vault.example/#/vault") {
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, crate::invite_link::LinkError::NotAnInviteLink.sentence()),
+            other => panic!("not a link was accepted: {other:?}"),
+        }
         server
-            .mock("GET", "/api/organizations/invitations/mine")
-            .with_body(serde_json::json!({ "data": [
-                { "id": "forged", "organizationId": "o-mal", "organizationName": "Shared by boss@corp.example", "token": "t1", "ownerEmail": "mallory@evil.example", "role": "member" },
-                { "id": "real", "organizationId": "o-boss", "organizationName": "Shared by boss@corp.example", "token": "t2", "ownerEmail": "Boss@Corp.example", "role": "member" },
-                { "id": "bare", "organizationId": "o-old", "organizationName": "Shared by boss@corp.example", "token": "t3", "role": "member" },
-                { "id": "work", "organizationId": "o-work", "organizationName": "Engineering", "token": "t4", "ownerEmail": "cto@corp.example", "role": "member" }
-            ]}).to_string())
+            .mock("POST", Matcher::Regex("/accept$".into()))
+            .with_status(400)
+            .with_body(r#"{"message":"Invalid token."}"#)
             .create();
-        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
-            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
-            .create();
-        engine.refresh(Trigger::WholeRead).expect("probed");
-        let from = |view: &SharingView, id: &str| view.incoming.iter().find(|i| i.id == id).map(|i| i.from.clone());
-        let view = engine.view(&[]);
-        assert_eq!(from(&view, "forged"), Some(Some("mallory@evil.example".into())), "a forged name: the real owner");
-        assert_eq!(from(&view, "real"), Some(Some("boss@corp.example".into())), "a matching name: its sharer");
-        assert_eq!(from(&view, "bare"), Some(None), "no attestation: nobody named");
-        assert_eq!(from(&view, "work"), None, "not a personal share");
-
-        server.mock("POST", "/api/organizations/invitations/accept").with_body("").expect(2).create();
-        engine.accept("bare").expect("accepted");
-        assert!(engine.view(&[]).waiting.is_empty(), "no attested sharer, no waiting line naming one");
-        engine.accept("forged").expect("accepted");
-        assert_eq!(
-            engine.view(&[]).waiting,
-            vec![WaitingEntry { organization_id: "o-mal".into(), from: "mallory@evil.example".into() }]
-        );
-    }
-
-    #[test]
-    fn a_recipient_declines_an_invitation_by_its_token() {
-        let (mut server, backend) = signed_in_with_no_sync_route();
-        let engine = backend.sharing_engine();
-        engine.set_up(SharingSetup::none());
-        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
-        invited(&mut server);
-        server.mock("GET", format!("/api/users/{FIXTURE_USER_ID}/public-key").as_str())
-            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
-            .create();
-        engine.refresh(Trigger::WholeRead).expect("probed");
-        let declined = server.mock("POST", "/api/organizations/invitations/decline")
-            .match_body(Matcher::Json(serde_json::json!({ "token": "tok-1" }))).with_body("").expect(1).create();
-        engine.decline("inv-1").expect("declined");
-        declined.assert();
-        let view = engine.view(&[]);
-        assert!(view.incoming.is_empty() && view.waiting.is_empty(), "a decline leaves nothing waiting: {view:?}");
+        match engine.accept_link(&invite_link_for(FIXTURE_EMAIL)) {
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, format!("{LINK_ACCEPT_FAILED} The server said: Invalid token.")),
+            other => panic!("a refused accept succeeded: {other:?}"),
+        }
     }
 
     /// **Stop receiving from X** (spec 6.9): leave the sharer's org, and every

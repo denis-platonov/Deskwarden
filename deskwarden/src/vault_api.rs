@@ -336,8 +336,7 @@ impl VaultApi {
             ("POST", ["sharing", "person", "confirm"]) => self.confirm_person(request.body),
             ("POST", ["sharing", "person", "fingerprint"]) => self.person_fingerprint(request.body),
             ("POST", ["sharing", "invite-code"]) => self.invite_code(request.body),
-            ("POST", ["sharing", "incoming", id, "accept"]) => self.incoming(id, true),
-            ("POST", ["sharing", "incoming", id, "decline"]) => self.incoming(id, false),
+            ("POST", ["sharing", "incoming", "paste"]) => self.accept_link(request.body),
             ("POST", ["sharing", "from", org, "leave"]) => self.leave_sharer(org),
             (_, ["status" | "sync" | "changes" | "organizations"])
             | (_, ["list", "object", "items" | "folders"])
@@ -680,19 +679,24 @@ impl VaultApi {
         }
     }
 
-    /// `POST /sharing/incoming/{id}/accept|decline` (spec 11.3) -- the
-    /// recipient's answer to an invitation, by the id `GET /sharing` listed it
-    /// under. **The token that answers it is the engine's** (`Sharing::
-    /// accept`): the window never held it, so no body carries one. Nothing in
-    /// the vault moves yet -- an accept's records arrive once the sharer's
-    /// daemon confirms -- so only `sharing` is announced.
-    fn incoming(&self, id: &str, accept: bool) -> ApiResponse {
+    /// `POST /sharing/incoming/paste {link}` (spec 11.3; official-path spec
+    /// §4.1) -- Paste an invite link. The link's token accepts the
+    /// invitation, so it is read straight into [`PasteBody`]'s `Zeroizing`
+    /// -- not through a `serde_json::Value`, whose own `String` copy would be
+    /// dropped unwiped -- and wiped when this returns; the host's buffer it
+    /// came from is a `Zeroizing` too (`vault_host::serve`). Nothing here
+    /// logs it. Nothing in the vault moves yet -- the records arrive once the
+    /// sharer's daemon confirms -- so only `sharing` is announced.
+    fn accept_link(&self, body: &[u8]) -> ApiResponse {
         let engine = match self.engine() {
             Ok(engine) => engine,
             Err(answer) => return answer,
         };
-        let done = if accept { engine.accept(id) } else { engine.decline(id) };
-        match done {
+        let asked: Option<PasteBody> = serde_json::from_slice(body).ok();
+        let Some(asked) = asked.filter(|asked| !asked.link.trim().is_empty()) else {
+            return ApiResponse::refused(400, "Paste the invite link first.");
+        };
+        match engine.accept_link(&asked.link) {
             Ok(()) => {
                 self.feed.publish([Change::Sharing]);
                 ApiResponse::done()
@@ -881,6 +885,14 @@ struct InviteCodeBody {
     email: String,
     #[serde(default)]
     password: zeroize::Zeroizing<String>,
+}
+
+/// `POST /sharing/incoming/paste`'s body: the pasted link, wiped on drop. A
+/// missing `link` reads as empty, which the route refuses in words.
+#[derive(serde::Deserialize)]
+struct PasteBody {
+    #[serde(default)]
+    link: zeroize::Zeroizing<String>,
 }
 
 /// A body's `keySha256`: exactly 64 hex digits, the form
@@ -1130,7 +1142,6 @@ pub(crate) mod tests {
         assert_eq!(body["data"]["reason"], crate::rest::sharing::REASON_NOT_LOADED);
 
         server.mock("GET", "/api/accounts/profile").with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server.mock("GET", "/api/users/user-1/public-key")
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
             .create();
@@ -1193,7 +1204,8 @@ pub(crate) mod tests {
     fn a_confirm_without_the_checked_key_is_refused_and_asks_nothing() {
         let (mut server, cache, api, token) = a_daemon();
         cache.bridge().sharing().expect("a REST daemon has an engine").set_up(crate::rest::sharing::SharingSetup::none());
-        let probe = server.mock("GET", "/api/organizations/invitations/mine").expect(0).create();
+        // The dialect probe's place is the first pass's `/config` question.
+        let probe = server.mock("GET", "/api/config").expect(0).create();
         let profile = server.mock("GET", "/api/accounts/profile").expect(0).create();
         let writes = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
         for body in [
@@ -1258,7 +1270,6 @@ pub(crate) mod tests {
         let mut profile = crate::rest::backend::tests::sharing_profile(serde_json::json!([crate::rest::backend::tests::sharing_org_row()]));
         profile["role"] = serde_json::json!("admin");
         server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
         server
             .mock("GET", "/api/users/user-1/public-key")
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
@@ -1296,8 +1307,8 @@ pub(crate) mod tests {
         assert_eq!(sent.as_object().map(serde_json::Map::len), Some(1), "only the hash is sent: {sent}");
     }
 
-    /// **The recipient's three routes** (spec 11.3): an answer to an
-    /// invitation this daemon does not hold is the engine's sentence, never a
+    /// **The recipient's routes** (spec 11.3): the listed-invitation answers
+    /// are gone, a pasted link for someone else is refused before any
     /// request; and Stop receiving leaves the sharer's org, takes every
     /// record from them out of the daemon's copy, and announces each gone
     /// with `sharing` -- the window re-reads nothing from the server.
@@ -1307,22 +1318,24 @@ pub(crate) mod tests {
         let engine = cache.bridge().sharing().expect("a REST daemon has an engine");
         engine.set_up(crate::rest::sharing::SharingSetup::none());
         server.mock("GET", "/api/accounts/profile").with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string()).expect_at_least(0).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
-        server
-            .mock("GET", "/api/users/user-1/public-key")
-            .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
-            .expect_at_least(0)
-            .create();
         api.sharing_pass(crate::rest::sharing::Trigger::WholeRead);
 
-        let answers = server.mock("POST", "/api/organizations/invitations/accept").expect(0).create();
+        // The listed-invitation routes are gone: an invitation is accepted
+        // from its link, and there is no decline (official-path spec §4.1).
         for route in ["/sharing/incoming/inv-9/accept", "/sharing/incoming/inv-9/decline"] {
             let answer = ask(&api, "POST", route, Some(&token), "{}");
-            assert_eq!(answer.status, 400, "{route}");
-            let said: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
-            assert_eq!(said["message"], crate::rest::sharing::INVITATION_GONE, "{route}");
+            assert_eq!(answer.status, 405, "{route}: {}", answer.body);
         }
-        answers.assert();
+        // A pasted link for another account is refused in words, before any
+        // request reaches the server.
+        let accepts = server.mock("POST", crate::test_http::Matcher::Regex("/accept$".into())).expect(0).create();
+        let link = "https://vault.example/#/accept-organization?organizationId=11111111-1111-4111-8111-111111111111\
+                    &organizationUserId=22222222-2222-4222-8222-222222222222&email=someone%40else.example&token=t-1";
+        let answer = ask(&api, "POST", "/sharing/incoming/paste", Some(&token), &serde_json::json!({ "link": link }).to_string());
+        assert_eq!(answer.status, 400, "{}", answer.body);
+        accepts.assert();
+        let empty = ask(&api, "POST", "/sharing/incoming/paste", Some(&token), "{}");
+        assert_eq!(empty.status, 400, "{}", empty.body);
 
         engine.held().others = vec![("org-denis".into(), "denis@example.com".into())];
         let theirs: VaultItem =

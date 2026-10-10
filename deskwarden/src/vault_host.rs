@@ -720,7 +720,6 @@ mod tests {
             .mock("GET", "/api/accounts/profile")
             .with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string())
             .create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server
             .mock("GET", "/api/users/user-1/public-key")
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
@@ -767,7 +766,6 @@ mod tests {
         server.mock("GET", "/api/accounts/revision-date").with_body("1700000000000").expect_at_least(0).create();
         server.mock("GET", "/api/sync?excludeDomains=true").with_body(sync_payload()).expect_at_least(0).create();
         server.mock("GET", "/api/accounts/profile").with_body(crate::rest::backend::tests::sharing_profile(serde_json::json!([])).to_string()).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server.mock("GET", "/api/users/user-1/public-key")
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
             .create();
@@ -831,7 +829,6 @@ mod tests {
             .expect(1)
             .create();
         server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
         let key = serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string();
         server.mock("GET", "/api/users/user-1/public-key").with_body(key.clone()).expect_at_least(0).create();
         server.mock("GET", "/api/users/anna-id/public-key").with_body(key).expect(1).create();
@@ -881,7 +878,6 @@ mod tests {
             .expect_at_least(0)
             .create();
         server.mock("GET", "/api/accounts/profile").with_body(profile.to_string()).expect_at_least(0).create();
-        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).expect_at_least(0).create();
         let key = serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string();
         server.mock("GET", "/api/users/user-1/public-key").with_body(key.clone()).expect_at_least(0).create();
         let mallorys_key = server.mock("GET", "/api/users/mal-id/public-key").with_body(key).expect(0).create();

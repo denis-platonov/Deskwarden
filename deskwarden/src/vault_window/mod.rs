@@ -3379,14 +3379,11 @@ pub fn build_frame_with_search(
         // sharer has trashed is in neither list and is not a row here. Unlike
         // `share_rows` there is no archive or trash to search.
         let received_share_rows = share_ui::received_share_rows(sharing.view.as_ref(), &items);
-        // **Design 6d's invitations, and the sharers being waited on**, built
-        // beside them for the same reason. The rail's dot on Shared with me
-        // is read off `incoming_rows` too -- the badge = list rule: a dot
-        // with no invitation row under it cannot happen.
-        let incoming_rows = share_ui::incoming_rows(
-            sharing.view.as_ref(),
-            crate::send::SendClock::now_unix_millis(&crate::send::SystemClock),
-        );
+        // **The sharers being waited on** (spec 6.9), built beside them for
+        // the same reason. The rail's dot on Shared with me is read off them
+        // too -- the badge = list rule: a dot with no line under it cannot
+        // happen. There are no invitation rows: an invitation is accepted
+        // from its link (Paste an invite link) or in the web vault.
         let waiting_from: Vec<String> =
             sharing.view.as_ref().map(|v| v.waiting.iter().map(|w| w.from.clone()).collect()).unwrap_or_default();
         egui::Panel::left("vault-sidebar")
@@ -3450,7 +3447,7 @@ pub fn build_frame_with_search(
                     // the badge and the column say one number even while
                     // the view names an item this vault does not hold yet.
                     received_records: received_share_rows.len(),
-                    invitation_waiting: !incoming_rows.is_empty(),
+                    invitation_waiting: !waiting_from.is_empty(),
                 };
                 match draw_sidebar(
                     ui,
@@ -4498,15 +4495,11 @@ pub fn build_frame_with_search(
         // is said as a toast, as the read pane does; one about this record is
         // said at the foot of its detail.
         //
-        // **On Shared with me the same rule holds for an invitation**, by its
-        // key: an Accept or a Decline is asked as a write about the
-        // invitation on screen (`request_on` below), so its failure stands at
-        // the foot of that invitation's pane, and one about anything else --
-        // a record, another invitation -- goes to a toast.
+        // **On Shared with me nothing on screen is a record a write was
+        // about** -- Paste an invite link names none -- so every sentence
+        // there is a toast.
         let sent_share_record = selected_send.as_deref().and_then(share_ui::parse_share_key).map(|(item_id, _)| item_id);
-        let shown_invitation =
-            selected_send.as_deref().filter(|key| key.starts_with(share_ui::INVITE_KEY_PREFIX)).map(str::to_string);
-        let notice_about = if on_received { shown_invitation } else { sent_share_record };
+        let notice_about = if on_received { None } else { sent_share_record };
         if show_sends {
             share_ui::route_stray_notice(&mut sharing, notice_about.as_deref().unwrap_or_default(), ui.input(|i| i.time));
         }
@@ -4517,7 +4510,10 @@ pub fn build_frame_with_search(
             notice: notice_about.as_deref().and_then(|id| sharing.notice_for(id)).map(str::to_string),
             asked: None,
             received: &received_share_rows,
-            incoming: &incoming_rows,
+            // The box's text is the pane's between frames; the list borrows
+            // it for this one and hands it back below. Offered only where
+            // sharing is available: a link accepted elsewhere is refused.
+            paste: sharing.view.as_ref().is_some_and(|view| view.available).then(|| std::mem::take(&mut sharing.paste)),
             waiting: &waiting_from,
             busy: sharing.is_busy(),
         };
@@ -6670,6 +6666,10 @@ pub fn build_frame_with_search(
             spawn_send_delete,
             copy_send_url,
         );
+        // The paste box's text goes back to the pane, whatever was pressed.
+        if let Some(text) = people_rows.paste.take() {
+            sharing.paste = text;
+        }
         // **What the Sent detail asked of sharing** (design 6c): the same
         // `stop_confirming` the SHARING card arms, and the same
         // `SharingCall::Stop` it sends -- one stop, whichever screen asked.
@@ -6690,28 +6690,13 @@ pub fn build_frame_with_search(
                     );
                 }
             }
-            // **An invitation's answer** (6d), from its row or its pane: one
-            // press, by the view's id -- the token is the daemon's. Asked
-            // about the invitation's own key, so a refusal stands on its pane
-            // (`notice_about` above) and not on whatever record is shown next.
-            //
-            // A request that is REFUSED -- no line to the daemon, a write
-            // already out -- has its sentence pinned to the invitation too
-            // (`pin_notice_to`): said on its pane when that is on screen, and
-            // as a toast when the press came from a row beside another pick.
-            Some(share_ui::PeopleAsk::Accept(id)) => {
-                let key = format!("{}{id}", share_ui::INVITE_KEY_PREFIX);
-                let call = share_ui::SharingCall::Accept(id);
-                if !share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call) {
-                    sharing.pin_notice_to(&key);
-                }
-            }
-            Some(share_ui::PeopleAsk::Decline(id)) => {
-                let key = format!("{}{id}", share_ui::INVITE_KEY_PREFIX);
-                let call = share_ui::SharingCall::Decline(id);
-                if !share_ui::request_on(&mut sharing, &key, sharing_client.as_ref(), ui.ctx(), &sharing_tx, call) {
-                    sharing.pin_notice_to(&key);
-                }
+            // **Paste an invite link's Accept** (official-path spec §4.1): the
+            // box's text, taken whole -- the box empties as the link goes, and
+            // the token is wiped when the call ends. A refused request (a
+            // write already out) has said why, as a toast on this screen.
+            Some(share_ui::PeopleAsk::AcceptLink) => {
+                let link = std::mem::take(&mut sharing.paste);
+                let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, share_ui::SharingCall::AcceptLink(link));
             }
             None => {}
         }
