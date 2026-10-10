@@ -94,6 +94,14 @@ pub struct AccountSharing {
     /// to as owner (`Sharing::my_org_id`). `serde(default)`: a file from
     /// before it reads as "not created here", the safe side.
     pub sharing_org_created: bool,
+    /// **The user said to use `sharing_org_id`, which this client did not
+    /// create** -- the answer Yes to "Use the organisation ... for sharing?
+    /// Deskwarden did not create it." (official-path spec §3.1, owner's fix
+    /// round 1). From then on the id is used as a created one is: no roster
+    /// question, no second ask. Set only by `Sharing::adopt`, kept while the
+    /// id stays the same, cleared with it. `serde(default)`: a file from
+    /// before it reads as "not adopted", so such an org is asked about once.
+    pub sharing_org_adopted: bool,
     /// Public-key pins, by normalised email.
     pub pins: BTreeMap<String, Pin>,
     /// Where a shared record was, by its organisation cipher id.

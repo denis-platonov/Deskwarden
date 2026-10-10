@@ -260,6 +260,15 @@ pub fn sharing_client() -> Option<SharingClient> {
 /// behind the daemon.
 const SHARING_DEADLINE: Duration = Duration::from_secs(60);
 
+/// What a share answered: how it ended, or the question it stopped on
+/// (official-path spec §3.1, fix round 1) -- an organisation Deskwarden did
+/// not create, which the user is asked about before anything is written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShareAnswer {
+    Done(crate::rest::sharing::ShareResult),
+    Adopt(crate::rest::sharing::AdoptionQuestion),
+}
+
 /// **The window's line to the daemon's sharing engine.** Typed calls to the
 /// `/sharing` routes; nothing personal in a query string (spec 11.3).
 #[derive(Clone)]
@@ -293,7 +302,9 @@ impl SharingClient {
         sharing_answer(self.agent.post(&format!("{}{}", self.base_url, path)).send_json(body))
     }
 
-    /// `POST /sharing/item/{id}` -- share a record with a person.
+    /// `POST /sharing/item/{id}` -- share a record with a person, or, with
+    /// `new_organization`, the share after No to the organisation question:
+    /// one that makes a new org rather than ask again.
     ///
     /// # Errors
     ///
@@ -301,13 +312,30 @@ impl SharingClient {
     /// path segment is refused here, before any request: the daemon routes
     /// by `/`-separated segment, and `rest::api`'s one rule for ids in paths
     /// is the one applied.
-    pub fn share(&self, item_id: &str, email: &str) -> Result<crate::rest::sharing::ShareResult, String> {
+    pub fn share(&self, item_id: &str, email: &str, new_organization: bool) -> Result<ShareAnswer, String> {
         if !crate::rest::api::is_url_path_safe(item_id) {
             return Err("That record can't be shared.".to_string());
         }
-        let data = self.post(&format!("/sharing/item/{item_id}"), serde_json::json!({ "email": email }))?;
-        serde_json::from_value(data.get("result").cloned().unwrap_or_default())
-            .map_err(|_| "The vault service answered something unreadable.".to_string())
+        let data = self.post(
+            &format!("/sharing/item/{item_id}"),
+            serde_json::json!({ "email": email, "newOrganization": new_organization }),
+        )?;
+        let unreadable = |_| "The vault service answered something unreadable.".to_string();
+        match data.get("adopt") {
+            Some(question) => serde_json::from_value(question.clone()).map(ShareAnswer::Adopt).map_err(unreadable),
+            None => serde_json::from_value(data.get("result").cloned().unwrap_or_default()).map(ShareAnswer::Done).map_err(unreadable),
+        }
+    }
+
+    /// `POST /sharing/adopt` -- Yes to the organisation question: the daemon
+    /// pins the org as this account's sharing org.
+    ///
+    /// # Errors
+    ///
+    /// The engine's sentence (the org no longer passes, the choice could not
+    /// be saved), or the daemon's.
+    pub fn adopt(&self, organization_id: &str) -> Result<(), String> {
+        self.post("/sharing/adopt", serde_json::json!({ "organizationId": organization_id })).map(|_| ())
     }
 
     /// `POST /sharing/item/{id}/stop`. `Some(new id)` when the record came
@@ -635,16 +663,57 @@ mod tests {
         let any = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
         let client = SharingClient::new(&server.url(), &Zeroizing::new(GRANT.to_string()));
         for unsafe_id in ["../x", "a/b", "", "a?b=c", "a%2Fb"] {
-            assert!(client.share(unsafe_id, "anna@example.com").is_err(), "{unsafe_id:?}");
+            assert!(client.share(unsafe_id, "anna@example.com", false).is_err(), "{unsafe_id:?}");
         }
         any.assert();
         let shared = server
             .mock("POST", "/sharing/item/p-1")
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({ "email": "anna@example.com", "newOrganization": false })))
             .with_body(r#"{"success":true,"data":{"result":"waitingAccount"}}"#)
             .expect(1)
             .create();
-        assert_eq!(client.share("p-1", "anna@example.com"), Ok(crate::rest::sharing::ShareResult::WaitingAccount));
+        assert_eq!(
+            client.share("p-1", "anna@example.com", false),
+            Ok(ShareAnswer::Done(crate::rest::sharing::ShareResult::WaitingAccount))
+        );
         shared.assert();
+    }
+
+    /// **The share's question comes back as a question** (fix round 1): an
+    /// `adopt` answer is [`ShareAnswer::Adopt`], not a result and not an
+    /// error. No is the share again with `newOrganization: true`, and Yes is
+    /// `POST /sharing/adopt` with the org's id in the body.
+    #[test]
+    fn a_shares_question_its_no_and_its_yes_go_over_the_line() {
+        let mut server = crate::test_http::server();
+        let client = SharingClient::new(&server.url(), &Zeroizing::new(GRANT.to_string()));
+        server
+            .mock("POST", "/sharing/item/p-1")
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({ "newOrganization": false })))
+            .with_body(r#"{"success":true,"data":{"adopt":{"organizationId":"org-1","name":"Shared by me@x.io"}}}"#)
+            .create();
+        let question = crate::rest::sharing::AdoptionQuestion { organization_id: "org-1".into(), name: "Shared by me@x.io".into() };
+        assert_eq!(client.share("p-1", "anna@example.com", false), Ok(ShareAnswer::Adopt(question)));
+
+        let fresh = server
+            .mock("POST", "/sharing/item/p-1")
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({ "newOrganization": true })))
+            .with_body(r#"{"success":true,"data":{"result":"shared"}}"#)
+            .expect(1)
+            .create();
+        assert_eq!(client.share("p-1", "anna@example.com", true), Ok(ShareAnswer::Done(crate::rest::sharing::ShareResult::Shared)));
+        fresh.assert();
+
+        let adopted = server
+            .mock("POST", "/sharing/adopt")
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({ "organizationId": "org-1" })))
+            .with_body(r#"{"success":true}"#)
+            .expect(1)
+            .create();
+        assert_eq!(client.adopt("org-1"), Ok(()));
+        adopted.assert();
+        server.mock("POST", "/sharing/adopt").with_status(400).with_body(r#"{"success":false,"message":"No."}"#).create();
+        assert_eq!(client.adopt("org-2"), Err("No.".to_string()));
     }
 
     /// **`stop` refuses an unsafe id before any request too**, and reads the

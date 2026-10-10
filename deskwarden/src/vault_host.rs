@@ -798,9 +798,23 @@ mod tests {
     /// daemon's own thread, with no client connected.
     #[test]
     fn an_accepted_person_is_confirmed_by_the_daemon_with_no_window() {
-        use crate::rest::backend::tests::{FIXTURE_ORG, person_collection, roster_row, sharing_org_row, sharing_profile};
+        use crate::rest::backend::tests::{FIXTURE_ORG, FIXTURE_USER_ID, person_collection, roster_row, sharing_org_row, sharing_profile};
         let (mut server, backend) = signed_in_with_no_sync_route();
-        backend.sharing_engine().set_up(crate::rest::sharing::SharingSetup::none());
+        // The org cached as made here, as on the PC that shares from it: a
+        // whole read holds only an org made here or adopted by the user
+        // (official-path spec §3.1, fix round 1), and the pass confirms only
+        // in a held org.
+        let dir = crate::test_scratch::ScratchDir::new("vault-host-confirm");
+        let state = dir.path().join("sharing_state.json");
+        crate::sharing_state::update(&state, |s| {
+            let me = s.account_mut(FIXTURE_USER_ID);
+            me.sharing_org_id = Some(FIXTURE_ORG.into());
+            me.sharing_org_created = true;
+        })
+        .expect("seeded");
+        backend
+            .sharing_engine()
+            .set_up(crate::rest::sharing::SharingSetup { state_path: Some(state), ..crate::rest::sharing::SharingSetup::none() });
         server.mock("GET", "/api/accounts/revision-date").with_body("1700000000000").expect_at_least(0).create();
         let profile = sharing_profile(serde_json::json!([sharing_org_row()]));
         server

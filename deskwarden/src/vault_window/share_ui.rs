@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use eframe::egui;
 use zeroize::Zeroizing;
 
-use crate::daemon_link::SharingClient;
+use crate::daemon_link::{ShareAnswer, SharingClient};
 use crate::local_time::LocalOffset;
 use crate::rest::organizations::normalise_email;
 use crate::rest::sharing::{Fingerprint, PersonState, ShareResult, SharingView};
@@ -652,6 +652,11 @@ pub(crate) struct ShareDialog {
     pub(crate) error: Option<String>,
     /// A share that left an invitation for an address with no account.
     pub(crate) waiting_account: Option<String>,
+    /// **A share that stopped to ask** whether to use an organisation
+    /// Deskwarden did not create (official-path spec §3.1, fix round 1):
+    /// the dialog asks it with Yes and No until it is answered or closed.
+    /// Closing answers nothing, and nothing is chosen for the user.
+    pub(crate) adopt: Option<crate::rest::sharing::AdoptionQuestion>,
     /// The master password, typed to mint an invite code. Wiped on drop, and
     /// taken out -- leaving an empty one -- the moment Create is pressed,
     /// whatever the mint answers. Never logged, never in a `Debug`.
@@ -686,6 +691,7 @@ impl ShareDialog {
             in_flight: false,
             error: None,
             waiting_account: None,
+            adopt: None,
             password: Zeroizing::new(String::new()),
             minting: false,
             invite_code: None,
@@ -696,6 +702,19 @@ impl ShareDialog {
 }
 
 // ---- the calls, on one worker thread each --------------------------------------------
+
+/// **How a share treats the organisation question** (official-path spec
+/// §3.1, fix round 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrgAnswer {
+    /// A share as the user typed it: the daemon may stop and ask.
+    Ask,
+    /// Yes: the org is adopted, then the share runs again -- one worker,
+    /// two requests, so nothing can come between them.
+    Adopt(String),
+    /// No: the share runs in a new org of its own.
+    New,
+}
 
 /// **One request to the daemon's sharing routes.**
 ///
@@ -711,7 +730,9 @@ impl ShareDialog {
 /// record's Stop receiving.
 pub(crate) enum SharingCall {
     View,
-    Share { item_id: String, item_name: String, email: String },
+    /// `org` is the answer to the organisation question, when the dialog
+    /// asked one ([`OrgAnswer`]).
+    Share { item_id: String, item_name: String, email: String, org: OrgAnswer },
     Stop { item_id: String, email: String },
     Reinvite(String),
     Forget(String),
@@ -773,6 +794,9 @@ pub(crate) enum SharingReport {
     /// `item_name` is the call's own, so a toast can name the record
     /// whether or not the dialog is still open when the answer comes.
     Shared { email: String, item_name: String, result: Result<ShareResult, String> },
+    /// The share stopped to ask about an organisation Deskwarden did not
+    /// create; nothing was written.
+    AdoptionAsked { email: String, item_name: String, question: crate::rest::sharing::AdoptionQuestion },
     Stopped { email: String, result: Result<Option<String>, String> },
     /// A Re-invite's answer, with the person it names in its toast.
     Reinvited { email: String, result: Result<(), String> },
@@ -802,6 +826,7 @@ impl std::fmt::Debug for SharingReport {
         let (kind, result) = match self {
             Self::View(r) => ("View", outcome(r)),
             Self::Shared { result, .. } => ("Shared", outcome(result)),
+            Self::AdoptionAsked { .. } => ("AdoptionAsked", "Ok(..)"),
             Self::Stopped { result, .. } => ("Stopped", outcome(result)),
             Self::Reinvited { result, .. } => ("Reinvited", outcome(result)),
             Self::Confirmed { result, .. } => ("Confirmed", outcome(result)),
@@ -820,9 +845,17 @@ impl std::fmt::Debug for SharingReport {
 pub(crate) fn run(client: &SharingClient, call: SharingCall) -> SharingReport {
     match call {
         SharingCall::View => SharingReport::View(client.view()),
-        SharingCall::Share { item_id, item_name, email } => {
-            let result = client.share(&item_id, &email);
-            SharingReport::Shared { email, item_name, result }
+        SharingCall::Share { item_id, item_name, email, org } => {
+            let answer = match &org {
+                OrgAnswer::Ask => client.share(&item_id, &email, false),
+                OrgAnswer::Adopt(organization) => client.adopt(organization).and_then(|()| client.share(&item_id, &email, false)),
+                OrgAnswer::New => client.share(&item_id, &email, true),
+            };
+            match answer {
+                Ok(ShareAnswer::Done(result)) => SharingReport::Shared { email, item_name, result: Ok(result) },
+                Ok(ShareAnswer::Adopt(question)) => SharingReport::AdoptionAsked { email, item_name, question },
+                Err(sentence) => SharingReport::Shared { email, item_name, result: Err(sentence) },
+            }
         }
         SharingCall::Stop { item_id, email } => {
             let result = client.stop(&item_id, &email);
@@ -1085,6 +1118,19 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                 },
             }
         }
+        // **The organisation question, in the dialog that asked** (fix
+        // round 1). Nothing was written, so a dialog closed before it came
+        // gets a sentence on the record, never a guess: the next Share asks
+        // again.
+        SharingReport::AdoptionAsked { email, item_name, question } => {
+            match pane.dialog.as_mut().filter(|d| d.in_flight) {
+                Some(dialog) => {
+                    dialog.in_flight = false;
+                    dialog.adopt = Some(question);
+                }
+                None => fail(pane, format!("{item_name} wasn't shared with {email}: Deskwarden needs you to choose an organisation. Share it again to choose.")),
+            }
+        }
         SharingReport::Stopped { email, result } => {
             // Which record the stop was on: `stopping` names it, and there
             // is one write at a time (`request`), so it is this answer's.
@@ -1267,6 +1313,17 @@ pub(crate) fn people_sharing<'a>(
 pub(crate) const SHARE_BUTTON: &str = "Share";
 pub(crate) const CANCEL_BUTTON: &str = "Cancel";
 pub(crate) const DONE_BUTTON: &str = "Done";
+/// The organisation question's answers (official-path spec §3.1, fix round
+/// 1): the owner's plain Yes and No, under a question that says what each
+/// does.
+pub(crate) const ADOPT_YES: &str = "Yes";
+pub(crate) const ADOPT_NO: &str = "No";
+/// The line under the question: what Deskwarden checked, what it cannot,
+/// and what each answer does. Group access is the part a roster does not
+/// show (`rest::sharing::roster_says_mine`), so the user's Yes is the check.
+const ADOPT_BODY: &str = "Only you can see everything in it, but Deskwarden can't tell who made it, and access given \
+     through a group doesn't show here. Say Yes only if you made it yourself, in the web vault or on another PC. \
+     No shares from a new organisation instead.";
 /// The administrator's button on the no-account band. An invite code is
 /// NodeWarden's way in for a new account (plan decision 4: no email is sent),
 /// minted for the one pending invitation the share just left.
@@ -1389,6 +1446,10 @@ pub(crate) enum ShareDialogAction {
     /// every credential (`clipboard::copy_secret`), which this file does not
     /// reach.
     CopyCode,
+    /// Yes to the organisation question.
+    Adopt,
+    /// No to it: share in a new organisation.
+    NewOrganization,
 }
 
 /// **Draws the Share dialog** over the window: scrim, card, the record,
@@ -1433,7 +1494,7 @@ pub(crate) fn draw_share_modal(
                 // it under the band would make the two disagree.
                 theme::eyebrow(ui, WITH_EYEBROW);
                 ui.add_space(theme::EYEBROW_GAP);
-                let editable = !busy && dialog.waiting_account.is_none();
+                let editable = !busy && dialog.waiting_account.is_none() && dialog.adopt.is_none();
                 let width = ui.available_width();
                 let field = ui
                     .add_enabled_ui(editable, |ui| theme::inline_field(ui, &mut dialog.email, WITH_HINT, width, false))
@@ -1487,6 +1548,9 @@ pub(crate) fn draw_share_modal(
                     action = asked;
                 }
             }
+            if let Some(question) = &dialog.adopt {
+                question_band(ui, &question.sentence(), ADOPT_BODY);
+            }
             // **5a's footer, answers left and a standing note right** --
             // and the note says what is running while something is.
             theme::form_card_footer(ui, |ui| {
@@ -1501,6 +1565,17 @@ pub(crate) fn draw_share_modal(
                     if dialog.waiting_account.is_some() {
                         if theme::primary_button_enabled(ui, DONE_BUTTON, None, !busy).clicked() {
                             action = ShareDialogAction::Done;
+                        }
+                    } else if dialog.adopt.is_some() {
+                        // The question's answers stand where Share and Cancel
+                        // stood; the ✕ and Escape still close the dialog,
+                        // answering nothing.
+                        if theme::primary_button_enabled(ui, ADOPT_YES, None, !busy).clicked() {
+                            action = ShareDialogAction::Adopt;
+                        }
+                        ui.add_space(theme::FORM_FOOTER_GAP);
+                        if ui.add_enabled_ui(!busy, |ui| theme::secondary_button(ui, ADOPT_NO)).inner.clicked() {
+                            action = ShareDialogAction::NewOrganization;
                         }
                     } else {
                         let ready = !busy && !dialog.email.trim().is_empty();
@@ -1628,6 +1703,29 @@ fn no_account_block(
     asked
 }
 
+/// **The organisation question's band** (fix round 1), between the body and
+/// the footer: the no-account band's amber, rule and info mark, because it
+/// too is a pause and not a failure -- nothing was written, and the share
+/// goes on whichever way it is answered.
+fn question_band(ui: &mut egui::Ui, head: &str, body: &str) {
+    let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().rect_filled(rule, egui::CornerRadius::ZERO, theme::CAUTION_EDGE);
+    egui::Frame::new()
+        .fill(theme::CAUTION_WASH)
+        .inner_margin(egui::Margin::symmetric(theme::form_card_pad_x(ui.available_width()), BAND_PAD_Y))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(BAND_MARK), egui::Sense::hover());
+                theme::paint_info_mark(ui.painter(), mark.translate(egui::vec2(0.0, 1.0)), theme::CAUTION_MARK);
+                ui.add_space(BAND_MARK_GAP);
+                let width = ui.available_width();
+                ui.add(egui::Label::new(band_job(head, body, width)).wrap());
+            });
+        });
+}
+
 /// The band's paragraph: the bold line, a break, the plain one -- 6a's
 /// `<b>…</b><br>…` at 12px and a 1.5 line height, in the caution ink.
 fn band_job(head: &str, body: &str, width: f32) -> egui::text::LayoutJob {
@@ -1686,6 +1784,28 @@ pub(crate) fn answer_dialog(
                 item_id: dialog.item_id.clone(),
                 item_name: dialog.item_name.clone(),
                 email: dialog.email.trim().to_string(),
+                org: OrgAnswer::Ask,
+            };
+            pane.dialog = Some(dialog);
+            if !request(pane, client, ctx, tx, call) {
+                say_refusal_in_dialog(pane);
+            }
+            ShareDialogAction::None
+        }
+        // **The organisation question's answers** (fix round 1): the question
+        // leaves the dialog as the call that answers it goes, so a second
+        // press has nothing to answer. A refused request keeps the dialog
+        // open with its sentence and the question gone: Share asks again.
+        ShareDialogAction::Adopt | ShareDialogAction::NewOrganization if !busy && dialog.adopt.is_some() => {
+            let question = dialog.adopt.take().expect("checked just above");
+            let org = if action == ShareDialogAction::Adopt { OrgAnswer::Adopt(question.organization_id) } else { OrgAnswer::New };
+            dialog.in_flight = true;
+            dialog.error = None;
+            let call = SharingCall::Share {
+                item_id: dialog.item_id.clone(),
+                item_name: dialog.item_name.clone(),
+                email: dialog.email.trim().to_string(),
+                org,
             };
             pane.dialog = Some(dialog);
             if !request(pane, client, ctx, tx, call) {
@@ -1716,7 +1836,11 @@ pub(crate) fn answer_dialog(
             pane.dialog = Some(dialog);
             ShareDialogAction::CopyCode
         }
-        ShareDialogAction::None | ShareDialogAction::Submit | ShareDialogAction::MintCode => {
+        ShareDialogAction::None
+        | ShareDialogAction::Submit
+        | ShareDialogAction::MintCode
+        | ShareDialogAction::Adopt
+        | ShareDialogAction::NewOrganization => {
             pane.dialog = Some(dialog);
             ShareDialogAction::None
         }
@@ -3719,6 +3843,102 @@ mod tests {
         let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), Some(&admin), click(at));
         assert_eq!(action, ShareDialogAction::CopyCode);
         assert_eq!(dialog.invite_code.as_ref().map(invite_text), Some("K7Q2-99XA"));
+    }
+
+    fn a_question() -> crate::rest::sharing::AdoptionQuestion {
+        crate::rest::sharing::AdoptionQuestion { organization_id: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0".into(), name: "Shared by me@x.io".into() }
+    }
+
+    /// **The organisation question is asked in the Share dialog** (fix
+    /// round 1): the owner's sentence naming the org and its short id, Yes
+    /// and No in place of Share and Cancel, and the address box no longer
+    /// editable -- the answer is about the share that asked.
+    #[test]
+    fn the_organisation_question_is_asked_in_the_dialog_with_yes_and_no() {
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.email = "anna@x.io".into();
+        dialog.adopt = Some(a_question());
+        let (_, texts) = modal_frame(&mut dialog, &SentHistory::default(), None, Vec::new());
+        let has = |needle: &str| texts.iter().any(|(t, _)| t.contains(needle));
+        assert!(has("Use the organisation \u{201c}Shared by me@x.io\u{201d} (0f1e2d3c) for sharing? Deskwarden did not create it."), "{texts:?}");
+        assert!(texts.iter().any(|(t, _)| t == ADOPT_YES) && texts.iter().any(|(t, _)| t == ADOPT_NO), "{texts:?}");
+        assert!(!texts.iter().any(|(t, _)| t == SHARE_BUTTON), "Yes and No replace Share: {texts:?}");
+        let at = |label: &str| texts.iter().find(|(t, _)| t == label).map(|(_, r)| r.center()).expect("the button");
+        let (yes, no) = (at(ADOPT_YES), at(ADOPT_NO));
+        let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, click(yes));
+        assert_eq!(action, ShareDialogAction::Adopt);
+        let (action, _) = modal_frame(&mut dialog, &SentHistory::default(), None, click(no));
+        assert_eq!(action, ShareDialogAction::NewOrganization);
+    }
+
+    /// **The question lands in the dialog that asked**, its spinner down and
+    /// the write slot free; a dialog closed meanwhile gets a sentence on the
+    /// record instead, and nothing is chosen for the user.
+    #[test]
+    fn the_organisation_question_lands_in_the_dialog_that_asked() {
+        let asked = || SharingReport::AdoptionAsked { email: "anna@x.io".into(), item_name: "Acme VPN".into(), question: a_question() };
+        let mut pane = SharingPane::default();
+        let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+        dialog.in_flight = true;
+        pane.dialog = Some(dialog);
+        pane.busy = true;
+        apply(&mut pane, asked(), 1.0);
+        let dialog = pane.dialog.as_ref().expect("the dialog stays open to ask");
+        assert!(!dialog.in_flight);
+        assert_eq!(dialog.adopt, Some(a_question()));
+        assert!(!pane.busy, "the write slot is free while the user answers");
+
+        let mut pane = SharingPane::default();
+        pane.busy = true;
+        apply(&mut pane, asked(), 1.0);
+        assert!(pane.notice.as_deref().is_some_and(|n| n.contains("Acme VPN")), "{:?}", pane.notice);
+    }
+
+    /// **Yes adopts and then shares; No shares in a new organisation**, each
+    /// one call from the window's worker -- and pressing either sends the
+    /// question away and raises the spinner.
+    #[test]
+    fn yes_adopts_then_shares_and_no_shares_in_a_new_organisation() {
+        let mut server = crate::test_http::server();
+        let line = SharingClient::new(&server.url(), &Zeroizing::new("grant".to_string()));
+        let adopted = server
+            .mock("POST", "/sharing/adopt")
+            .match_body(crate::test_http::Matcher::Json(serde_json::json!({ "organizationId": a_question().organization_id })))
+            .with_body(r#"{"success":true}"#)
+            .expect(1)
+            .create();
+        let shared = server
+            .mock("POST", "/sharing/item/r1")
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({ "newOrganization": false })))
+            .with_body(r#"{"success":true,"data":{"result":"shared"}}"#)
+            .expect(1)
+            .create();
+        let call = |org| SharingCall::Share { item_id: "r1".into(), item_name: "Acme VPN".into(), email: "anna@x.io".into(), org };
+        let report = run(&line, call(OrgAnswer::Adopt(a_question().organization_id)));
+        assert!(matches!(report, SharingReport::Shared { result: Ok(ShareResult::Shared), .. }), "{report:?}");
+        adopted.assert();
+        shared.assert();
+        let fresh = server
+            .mock("POST", "/sharing/item/r1")
+            .match_body(crate::test_http::Matcher::PartialJson(serde_json::json!({ "newOrganization": true })))
+            .with_body(r#"{"success":true,"data":{"result":"waitingAccept"}}"#)
+            .expect(1)
+            .create();
+        let report = run(&line, call(OrgAnswer::New));
+        assert!(matches!(report, SharingReport::Shared { result: Ok(ShareResult::WaitingAccept), .. }), "{report:?}");
+        fresh.assert();
+
+        let (tx, _rx) = mpsc::channel();
+        let ctx = egui::Context::default();
+        for action in [ShareDialogAction::Adopt, ShareDialogAction::NewOrganization] {
+            let mut pane = SharingPane::default();
+            let mut dialog = ShareDialog::opening("r1", "Acme VPN");
+            dialog.email = "anna@x.io".into();
+            dialog.adopt = Some(a_question());
+            let _ = answer_dialog(&mut pane, dialog, action.clone(), Some(&dead_line()), &ctx, &tx);
+            let dialog = pane.dialog.as_ref().expect("the dialog stays open while the share runs");
+            assert!(dialog.in_flight && dialog.adopt.is_none(), "{action:?}");
+        }
     }
 
     /// The suggestion's count says which kinds a person has had: shares,

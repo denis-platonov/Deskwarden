@@ -213,6 +213,26 @@ pub const SHARE_FAILED: &str = "Couldn't share the record. It's still in your va
 pub const ORG_FAILED: &str = "Deskwarden couldn't start sharing on this server.";
 /// The server's list of the people in the sharing org was not one.
 pub const ROSTER_UNREADABLE: &str = "Deskwarden couldn't read who you share with. Try again.";
+/// More than one organisation passes every test for this account's own
+/// sharing org, and Deskwarden made none of them (plan fix round 1, I1).
+/// Picking one would be a guess about which the user meant -- and a planted
+/// one among them would win half the time -- so nothing is chosen.
+pub const SEVERAL_ORGS: &str = "You own more than one organisation named for you, and Deskwarden didn't create any of them. \
+     Delete or rename the extra ones in the web vault, then try again.";
+/// The sharing org's roster answered 404 and the profile no longer lists it
+/// as this account's to own: deleted, or this account was moved out of the
+/// owner role. Its id is dropped, so the next share makes a new one.
+pub const ORG_GONE: &str = "Your sharing organisation is no longer on this server. Share again to start a new one.";
+/// The user said No to an organisation Deskwarden did not create, and the
+/// server would not let a new one be made.
+pub const NO_FRESH_ORG: &str = "This server won't let Deskwarden create a sharing organisation, so it can't share \
+     without the one you didn't choose.";
+/// Yes to an organisation that no longer passes the roster rule, or is no
+/// longer listed, by the time the answer came.
+pub const ADOPT_REFUSED: &str = "Deskwarden can't use that organisation for sharing any more. Try sharing again.";
+/// Yes was said, but the choice could not be saved, so it would be asked
+/// again: said rather than pretended.
+pub const ADOPT_NOT_SAVED: &str = "Deskwarden couldn't save that choice. Try again.";
 /// A stop's refusal opens with this; the person who can still see the record
 /// follows it.
 pub const STOP_FAILED_PREFIX: &str = "Couldn't stop sharing.";
@@ -340,6 +360,36 @@ pub enum SharingError {
     Refused(String),
     /// The vault backend's own failure (session gone, server unreachable).
     Vault(VaultError),
+    /// **A share stopped to ask the user** (official-path spec §3.1, owner's
+    /// fix round 1): one organisation on the server passes every roster test
+    /// for this account's own sharing org, but this client did not create
+    /// it and the user has not said to use it. Nothing was written. The
+    /// window asks [`AdoptionQuestion::sentence`]; Yes is [`Sharing::adopt`]
+    /// and the share again, No is [`Sharing::share_in_a_new_org`].
+    NeedsAdoption(AdoptionQuestion),
+}
+
+/// **The organisation a share asks the user about** -- its id, and its name
+/// as the server lists it. Plaintext on every server, and anyone who made the
+/// org chose it, so it is shown in quotes beside a short id rather than
+/// trusted as a description.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdoptionQuestion {
+    pub organization_id: String,
+    pub name: String,
+}
+
+impl AdoptionQuestion {
+    /// The owner's wording: `Use the organisation "<name>" (<short id>) for
+    /// sharing? Deskwarden did not create it.` The short id is the first
+    /// eight characters, which tell two orgs of one name apart in the web
+    /// vault's address bar.
+    #[must_use]
+    pub fn sentence(&self) -> String {
+        let short: String = self.organization_id.chars().take(8).collect();
+        format!("Use the organisation \u{201c}{}\u{201d} ({short}) for sharing? Deskwarden did not create it.", self.name)
+    }
 }
 
 impl std::fmt::Display for SharingError {
@@ -348,6 +398,7 @@ impl std::fmt::Display for SharingError {
             Self::Unavailable(reason) => write!(f, "sharing is not available here ({reason})"),
             Self::Refused(sentence) => f.write_str(sentence),
             Self::Vault(e) => write!(f, "{e:?}"),
+            Self::NeedsAdoption(_) => f.write_str("the share needs the user to choose an organisation"),
         }
     }
 }
@@ -360,7 +411,7 @@ impl SharingError {
     #[must_use]
     pub(crate) fn or_say(self, sentence: &str) -> Self {
         match self {
-            Self::Vault(VaultError::Unauthorized) | Self::Unavailable(_) => self,
+            Self::Vault(VaultError::Unauthorized) | Self::Unavailable(_) | Self::NeedsAdoption(_) => self,
             Self::Refused(server) if !server.is_empty() && server != sentence => {
                 Self::Refused(format!("{sentence} The server said: {server}"))
             }
@@ -740,24 +791,14 @@ impl Sharing {
             self.note_account(profile);
         }
         // **The writes' own rule** ([`Self::my_org_id`]), so the confirm pass
-        // never works on an org the writes would refuse: a planted org owned
-        // and named for this account, whose roster names another owner, is
-        // not held as ours. No profile, nothing to check: nothing is held.
+        // never works on an org the writes would refuse: only an org this
+        // client made or the user adopted is held, whatever its roster says
+        // -- an org that merely passes the roster rule is not ours until the
+        // user says so (fix round 1, C1). No roster is asked, so one this read
+        // could not fetch changes nothing; and this is a READ, so it forgets
+        // no cached id and writes no state (I2). No profile: nothing is held.
         let account = self.held().account.clone();
-        let previous_id = self.held().my_org.as_ref().map(|o| o.id.clone());
-        // The roster this whole read already fetched is the attestation
-        // ([`Self::choose_org`]); an org whose roster it could not fetch keeps
-        // the word it had when it was last held. No request is made here.
-        let chosen = profile.zip(account).and_then(|(profile, account)| {
-            self.choose_org(profile, &account, &mut |id| {
-                Ok(match directory.roster_of(id) {
-                    Roster::Known(members) => roster_says_mine(members, &account.id),
-                    Roster::Unknown => previous_id.as_deref() == Some(id),
-                })
-            })
-            .ok()
-            .flatten()
-        });
+        let chosen = profile.zip(account).and_then(|(profile, account)| self.trusted_org(profile, &account, false));
         let mine = chosen.and_then(|id| directory.sharing_orgs().into_iter().find(|o| o.id == id));
         let mut held = self.held();
         // The previous roster, kept for an org whose roster this read could
@@ -1161,21 +1202,47 @@ fn is_personal_share(invitation: &IncomingInvitation) -> bool {
 /// **Owned by this account and named for it** -- what makes an org a
 /// CANDIDATE for this account's own sharing org (spec 5.1). Not enough on its
 /// own: another account can create "Shared by <me>" and make this account an
-/// owner of it. [`Sharing::my_org_id`] asks the roster too.
+/// owner of it. [`roster_says_mine`] and the user's own Yes decide.
 fn owned_and_named(org: &crate::rest::sync::Organization, account_email: &str) -> bool {
     crate::rest::organizations::sharing_mark(org.name.as_deref().and_then(sharer_of), None, org.is_owner(), account_email)
         .is_some_and(|mark| mark.mine)
 }
 
-/// **The roster's word that a candidate org is this account's own**
-/// (official-path spec §3.1): no OTHER account holds the owner role there.
+/// **The roster's word that a candidate org could be this account's own**
+/// (official-path spec §3.1, owner's fix round 1, C1). All three must hold:
+///
+/// 1. This account's own row is an OWNER, and CONFIRMED.
+/// 2. Every other row is a plain `member` -- in any status. An owner, admin,
+///    manager or custom row reads every collection, so an attacker who made
+///    "Shared by <me>", made this account an owner and then stepped down to
+///    any of them could still read every share. An INVITED or revoked row in
+///    such a role counts: accepted or restored later, it reads the same.
+/// 3. Every collection a member is listed on is the ONE authenticated
+///    collection named for that member's own email, held read-only. A member
+///    seat on anybody else's collection -- the attacker's other way to keep
+///    reading -- fails, as does one on a plaintext-named collection, which the
+///    server can write.
+///
+/// **This is not the whole answer, and cannot be.** Bitwarden and Vaultwarden
+/// also grant collections through GROUPS, which `/users?includeCollections`
+/// does not list per member: an attacker's group on a person collection is
+/// invisible here. So passing makes an org only a candidate; it is used after
+/// the user says Yes to "Use the organisation ... ? Deskwarden did not create
+/// it." ([`Sharing::adopt`]), and that question is the backstop.
+///
 /// It replaces NodeWarden's `ownerEmail` attestation, which no other server
-/// sends. A planted org -- someone else's "Shared by <me>" that made this
-/// account an owner -- still lists its maker as an owner, and fails here. A
-/// pending invitation in the owner role counts as another owner too: it has
-/// no account behind it yet, so it cannot be this one.
-fn roster_says_mine(roster: &[Member], account_id: &str) -> bool {
-    !roster.iter().any(|m| m.role == "owner" && m.user_id.as_deref() != Some(account_id))
+/// sends, and DW1's "no other owner", which an attacker satisfied by stepping
+/// down.
+fn roster_says_mine(roster: &[Member], collections: &[PersonCollection], account_id: &str) -> bool {
+    let is_me = |m: &Member| m.user_id.as_deref() == Some(account_id);
+    let confirmed_owner = roster.iter().any(|m| is_me(m) && m.role == "owner" && m.status == MemberStatus::Confirmed);
+    confirmed_owner
+        && roster.iter().filter(|m| !is_me(m)).all(|m| {
+            let email = normalise_email(&m.email);
+            let own: Vec<&str> = collections.iter().filter(|c| c.authenticated && c.email == email).map(|c| c.id.as_str()).collect();
+            m.role == "member"
+                && m.collections.iter().all(|c| own.as_slice() == [c.as_str()] && m.read_only.iter().any(|r| r == c))
+        })
 }
 
 /// This account's own row in a roster -- see [`Ctx::own_ou_id`].
@@ -1183,17 +1250,40 @@ fn own_row<'a>(roster: &'a [Member], account_id: &str) -> Option<&'a Member> {
     roster.iter().find(|m| m.user_id.as_deref() == Some(account_id))
 }
 
+/// What one candidate org's roster said (fix round 1, I2): three answers, so
+/// a roster that could not be READ is never taken for one that said no --
+/// "no" drops a cached id, and "could not read" must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Attestation {
+    /// Passes [`roster_says_mine`].
+    Mine,
+    /// Fails it, or the server would not show this account the roster (403
+    /// or 404: no ManageUsers there, or no such org).
+    NotMine,
+    /// An answer that was not a roster.
+    Unknown,
+}
+
+/// Which org a share files into ([`Sharing::org_for_a_share`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum OrgChoice {
+    /// Made by this client or adopted by the user: written to without asking.
+    Ours(String),
+    /// The one candidate that passes the roster rule, which the user has not
+    /// chosen yet: the share stops and asks.
+    Adoptable(AdoptionQuestion),
+    /// No org of this account's: the share makes one.
+    Nothing,
+}
+
 impl Sharing {
-    /// **This account's own sharing org among the profile's** -- the cached
-    /// id while it still passes, else the first candidate that passes
-    /// (official-path spec §3.1). A candidate is owned and named for this
-    /// account ([`owned_and_named`]); it passes when this client CREATED it
-    /// (the cached `sharing_org_created` id) or when its roster names no
-    /// other owner ([`roster_says_mine`]), read fresh.
-    ///
-    /// **A roster that cannot be read is a refusal, not a "no"**
-    /// ([`ROSTER_UNREADABLE`]): read as "not mine", a share would create a
-    /// second sharing org beside the real one.
+    /// **This account's own sharing org, for every write but a share's first
+    /// step** -- the cached id, and only while this client MADE it or the
+    /// user ADOPTED it, and the profile still lists it owned and named for
+    /// this account (official-path spec §3.1, fix round 1). No roster is read
+    /// and nothing is guessed: an org that is neither is not this account's
+    /// to write to until the user says so, through a share
+    /// ([`Self::org_for_a_share`]).
     ///
     /// **A cached id that fails is dropped** from `sharing_state.json`, with
     /// a plain warning naming nothing. **Only an id the profile LISTS can
@@ -1202,54 +1292,154 @@ impl Sharing {
     ///
     /// # Errors
     ///
-    /// The roster of a candidate could not be read.
+    /// None today; `Result` so a write's callers keep one shape with
+    /// [`Self::org_for_a_share`].
     pub(crate) fn my_org_id(&self, profile: &Profile, account: &Account) -> Result<Option<String>, SharingError> {
-        self.choose_org(profile, account, &mut |id| self.attested_mine(id, &account.id))
+        Ok(self.trusted_org(profile, account, true))
     }
 
-    /// [`Self::my_org_id`] with the roster question asked by `attest` -- a
-    /// fresh read for a write, the whole read's own rosters for
-    /// [`Self::note_directory`].
-    fn choose_org(
-        &self,
-        profile: &Profile,
-        account: &Account,
-        attest: &mut dyn FnMut(&str) -> Result<bool, SharingError>,
-    ) -> Result<Option<String>, SharingError> {
-        let (cached, created) = self.setup().state_path.map_or((None, false), |path| {
-            let me = crate::sharing_state::SharingState::load(&path).account(&account.id);
-            (me.sharing_org_id, me.sharing_org_created)
+    /// [`Self::my_org_id`]'s rule. `may_forget` is false on a READ path
+    /// ([`Self::note_directory`]), which writes no state (fix round 1, I2).
+    fn trusted_org(&self, profile: &Profile, account: &Account, may_forget: bool) -> Option<String> {
+        let path = self.setup().state_path?;
+        let me = crate::sharing_state::SharingState::load(&path).account(&account.id);
+        let cached = me.sharing_org_id?;
+        if !(me.sharing_org_created || me.sharing_org_adopted) {
+            return None;
+        }
+        let listed = profile.organizations.iter().find(|o| o.id == cached)?;
+        if owned_and_named(listed, &account.email) {
+            return Some(cached);
+        }
+        if may_forget {
+            self.forget_cached_org(&account.id, &cached);
+        }
+        None
+    }
+
+    /// **The org a share files into** (official-path spec §3.1, fix round
+    /// 1): [`Self::my_org_id`]'s when there is one; otherwise every candidate
+    /// ([`owned_and_named`]) has its roster read and judged
+    /// ([`roster_says_mine`]), and
+    ///
+    /// - none passes: [`OrgChoice::Nothing`], and the share makes a new org;
+    /// - one passes: [`OrgChoice::Adoptable`], and the share asks the user;
+    /// - more than one: refused with [`SEVERAL_ORGS`] (I1) -- picking the
+    ///   first was a guess, and a planted org among them would be it half the
+    ///   time.
+    ///
+    /// A cached id that is neither made here nor adopted (a file from before
+    /// adoption existed) is judged like any candidate, and dropped when its
+    /// roster says no.
+    ///
+    /// # Errors
+    ///
+    /// **A roster that cannot be read is a refusal** ([`ROSTER_UNREADABLE`]),
+    /// never a "no": read as no, a share would make a second org beside the
+    /// real one, and drop its cached id. A failed request is the backend's.
+    pub(crate) fn org_for_a_share(&self, profile: &Profile, account: &Account, keys: &VaultKeys) -> Result<OrgChoice, SharingError> {
+        if let Some(id) = self.trusted_org(profile, account, true) {
+            return Ok(OrgChoice::Ours(id));
+        }
+        let cached = self
+            .setup()
+            .state_path
+            .and_then(|path| crate::sharing_state::SharingState::load(&path).account(&account.id).sharing_org_id);
+        let mut passing = Vec::new();
+        for org in profile.organizations.iter().filter(|o| owned_and_named(o, &account.email)) {
+            match self.vouched(&org.id, &account.id, keys)? {
+                Attestation::Mine => passing.push(org),
+                Attestation::NotMine if cached.as_deref() == Some(org.id.as_str()) => self.forget_cached_org(&account.id, &org.id),
+                Attestation::NotMine => {}
+                Attestation::Unknown => return Err(SharingError::Refused(ROSTER_UNREADABLE.to_string())),
+            }
+        }
+        match passing.as_slice() {
+            [] => Ok(OrgChoice::Nothing),
+            [org] => Ok(OrgChoice::Adoptable(AdoptionQuestion {
+                organization_id: org.id.clone(),
+                name: org.name.clone().unwrap_or_default(),
+            })),
+            _ => Err(SharingError::Refused(SEVERAL_ORGS.to_string())),
+        }
+    }
+
+    /// One candidate's roster and person collections, read now, and their
+    /// word ([`roster_says_mine`]). Through [`Self::call`], not
+    /// [`Self::route`]: this is a question about an org this account may not
+    /// even be the sharer of, so a 404 or 403 says nothing about the
+    /// server's routes (I3) -- it is a no.
+    fn vouched(&self, org: &str, account_id: &str, keys: &VaultKeys) -> Result<Attestation, SharingError> {
+        let answer = self.call(|client, auth| match client.fetch_organization_members(&mut auth.session, org) {
+            Err(RestError::Status(403 | 404)) => Ok(None),
+            other => other.map(Some),
+        })?;
+        let Some(answer) = answer else {
+            return Ok(Attestation::NotMine);
+        };
+        let Some(roster) = crate::rest::organizations::map_members(&answer) else {
+            return Ok(Attestation::Unknown);
+        };
+        // No org key, no authenticated collection name: rule 3 cannot hold
+        // for anybody with a seat, and the org could not be shared into.
+        let Some(org_key) = keys.organization(org).cloned() else {
+            return Ok(Attestation::NotMine);
+        };
+        let collections = self.collections_of(org, &org_key)?;
+        Ok(if roster_says_mine(&roster, &collections, account_id) { Attestation::Mine } else { Attestation::NotMine })
+    }
+
+    /// **Yes to "Use the organisation ... for sharing?"** -- the user's own
+    /// choice, pinned as `sharing_org_adopted` beside the id, after which the
+    /// org is used as one made here is (official-path spec §3.1, fix round
+    /// 1, C1 rule 4).
+    ///
+    /// The org is judged again first, as a share would judge it: the answer
+    /// may come minutes after the question, and a roster that changed in
+    /// between -- an admin added -- is refused ([`ADOPT_REFUSED`]) rather than
+    /// pinned on the strength of what it said before.
+    ///
+    /// # Errors
+    ///
+    /// The org is no longer a candidate or no longer passes; its roster
+    /// could not be read; or the choice could not be saved
+    /// ([`ADOPT_NOT_SAVED`]) -- said, since unsaved it would be asked again.
+    pub fn adopt(&self, organization_id: &str) -> Result<(), SharingError> {
+        let _one = self.one_at_a_time();
+        self.require_available()?;
+        let profile = self.profile()?;
+        let account = keyed_account(self.held().account.clone())?;
+        if !profile.organizations.iter().any(|o| o.id == organization_id && owned_and_named(o, &account.email)) {
+            return Err(SharingError::Refused(ADOPT_REFUSED.to_string()));
+        }
+        let keys = self.keys_from(&profile)?;
+        match self.vouched(organization_id, &account.id, &keys)? {
+            Attestation::Mine => {}
+            Attestation::NotMine => return Err(SharingError::Refused(ADOPT_REFUSED.to_string())),
+            Attestation::Unknown => return Err(SharingError::Refused(ROSTER_UNREADABLE.to_string())),
+        }
+        let Some(path) = self.setup().state_path else {
+            return Err(SharingError::Refused(ADOPT_NOT_SAVED.to_string()));
+        };
+        let written = crate::sharing_state::update(&path, |state| {
+            let me = state.account_mut(&account.id);
+            me.sharing_org_id = Some(organization_id.to_string());
+            me.sharing_org_created = false;
+            me.sharing_org_adopted = true;
         });
-        if let Some(cached) = cached.as_deref() {
-            if let Some(listed) = profile.organizations.iter().find(|o| o.id == cached) {
-                if owned_and_named(listed, &account.email) && (created || attest(cached)?) {
-                    return Ok(Some(cached.to_string()));
-                }
-                self.forget_cached_org(&account.id, cached);
+        match written {
+            Ok(_) => Ok(()),
+            Err(e) if crate::sharing_state::unreadable(&e).is_some() => Err(state_refused(&e)),
+            Err(e) => {
+                log::warn!("an adopted sharing organisation could not be saved: {e}");
+                Err(SharingError::Refused(ADOPT_NOT_SAVED.to_string()))
             }
         }
-        for org in profile.organizations.iter().filter(|o| Some(o.id.as_str()) != cached.as_deref()) {
-            if owned_and_named(org, &account.email) && attest(&org.id)? {
-                return Ok(Some(org.id.clone()));
-            }
-        }
-        Ok(None)
-    }
-
-    /// One candidate's roster, read now, and its word ([`roster_says_mine`]).
-    /// Through [`Self::call`], not [`Self::route`]: this is a question about
-    /// an org this account may not even be the sharer of, and its failure
-    /// says nothing about the server's routes.
-    fn attested_mine(&self, org: &str, account_id: &str) -> Result<bool, SharingError> {
-        let answer = self.call(|client, auth| client.fetch_organization_members(&mut auth.session, org))?;
-        let roster = crate::rest::organizations::map_members(&answer)
-            .ok_or_else(|| SharingError::Refused(ROSTER_UNREADABLE.to_string()))?;
-        Ok(roster_says_mine(&roster, account_id))
     }
 
     /// Drops a cached sharing org id that failed [`Self::my_org_id`] -- only
     /// if the file still holds that id, so a share that chose another in the
-    /// meantime is not undone.
+    /// meantime is not undone. Its made-here and adopted marks go with it.
     fn forget_cached_org(&self, account: &str, id: &str) {
         let Some(path) = self.setup().state_path else {
             return;
@@ -1260,6 +1450,7 @@ impl Sharing {
             if me.sharing_org_id.as_deref() == Some(id) {
                 me.sharing_org_id = None;
                 me.sharing_org_created = false;
+                me.sharing_org_adopted = false;
             }
         });
         if let Err(e) = dropped {
@@ -1283,16 +1474,51 @@ impl Sharing {
     /// nobody, it would have a share invite people who are already members,
     /// and [`Self::reload_org`] hold a roster that shows everyone as `Gone`.
     ///
-    /// **The sharer's own org only**, so a 404 is the route missing, not a
-    /// member refused: every server gives the owner ManageUsers. It turns
-    /// sharing off as [`Self::route`]'s 405 and 501 do (official-path spec
-    /// §2) -- an older NodeWarden had no `/users`.
+    /// **The sharer's own org only.** A 404 is read with the profile's help
+    /// ([`Self::own_roster_missing`]): an org the profile still lists as this
+    /// account's to own is a server without the route -- sharing goes off as
+    /// [`Self::route`]'s 405 and 501 turn it off (official-path spec §2; an
+    /// older NodeWarden had no `/users`) -- and any other is an org that has
+    /// gone.
     pub(crate) fn fetch_roster(&self, org: &str) -> Result<Vec<Member>, SharingError> {
         let answer = self.route(|client, auth| match client.fetch_organization_members(&mut auth.session, org) {
-            Err(RestError::Status(404)) => Err(RestError::Status(501)),
-            other => other,
+            Err(RestError::Status(404)) => Ok(None),
+            other => other.map(Some),
         })?;
+        let Some(answer) = answer else {
+            return Err(self.own_roster_missing(org));
+        };
         crate::rest::organizations::map_members(&answer).ok_or_else(|| SharingError::Refused(ROSTER_UNREADABLE.to_string()))
+    }
+
+    /// **The sharer's own roster answered 404** (fix round 1, I3). Official
+    /// Bitwarden answers 404 for an org that was deleted and for one this
+    /// account may no longer manage -- neither is an old server. So the
+    /// profile is read again: still listed with the owner role, it is the
+    /// route that is missing, and sharing goes off ([`REASON_TOO_OLD`]).
+    /// Otherwise the org is dropped -- from `held` and from the cached id,
+    /// made-here or adopted -- so the next share makes a new one, and the
+    /// write that asked is told so ([`ORG_GONE`]).
+    fn own_roster_missing(&self, org: &str) -> SharingError {
+        let profile = match self.profile() {
+            Ok(profile) => profile,
+            Err(e) => return e,
+        };
+        if profile.organizations.iter().any(|o| o.id == org && o.is_owner()) {
+            self.held().capabilities.too_old = true;
+            return SharingError::Unavailable(REASON_TOO_OLD);
+        }
+        let account = {
+            let mut held = self.held();
+            if held.my_org.as_ref().is_some_and(|mine| mine.id == org) {
+                held.my_org = None;
+            }
+            held.account.clone()
+        };
+        if let Some(account) = account {
+            self.forget_cached_org(&account.id, org);
+        }
+        SharingError::Refused(ORG_GONE.to_string())
     }
 
     /// One record, fresh from the server, decrypted with `keys`.
@@ -1340,13 +1566,16 @@ impl Sharing {
     /// **Creates the sharing org** (spec 9.1): a fresh org key wrapped to the
     /// account's own public key -- derived from its own private key, not
     /// asked of the server -- an RSA pair, and the first person's collection
-    /// name. Returns the org's id and key.
+    /// name. Returns the org's id and key. `refused` is the sentence a
+    /// refusal is said with: [`ORG_FAILED`], or [`NO_FRESH_ORG`] when the
+    /// user has just said No to an org they could have used.
     fn create_org(
         &self,
         profile: &Profile,
         account: &Account,
         keys: &VaultKeys,
         first_email: &str,
+        refused: &str,
     ) -> Result<(String, SymmetricKey), SharingError> {
         let org_key = crate::rest::crypto::generate_symmetric_key().map_err(crypto)?;
         let private = crate::rest::sync::private_key_der(keys.user(), profile).map_err(crypto)?;
@@ -1362,7 +1591,7 @@ impl Sharing {
         };
         let id = self
             .call(|client, auth| sharing_api::create_organization(client, &mut auth.session, &body))
-            .map_err(|e| e.or_say(ORG_FAILED))?;
+            .map_err(|e| e.or_say(refused))?;
         Ok((id, org_key))
     }
 
@@ -1590,11 +1819,34 @@ impl Sharing {
     /// never be asked anything. A server that leaves an invitation waits for
     /// the person to accept, and the daemon confirms on a later pass.
     ///
+    /// **An org this client did not make is never written to unasked**
+    /// (official-path spec §3.1, fix round 1). When the only org that could
+    /// be this account's is one the user has not chosen, the share stops
+    /// before writing anything and answers [`SharingError::NeedsAdoption`].
+    ///
     /// # Errors
     ///
-    /// [`SharingError::Refused`] with the sentence to show, or the backend's
-    /// own failure.
+    /// [`SharingError::Refused`] with the sentence to show,
+    /// [`SharingError::NeedsAdoption`] with the question to ask, or the
+    /// backend's own failure.
     pub fn share(&self, item_id: &str, email: &str) -> Result<ShareOutcome, SharingError> {
+        self.share_with(item_id, email, false)
+    }
+
+    /// **The share after No** to "Use the organisation ... ?": the org that
+    /// was offered is left alone and pinned as nothing, and this share makes
+    /// a new org of its own -- or, on a server that will not let it, says so
+    /// ([`NO_FRESH_ORG`]). An org this client made or the user adopted
+    /// meanwhile is still used, rather than made twice.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::share`], never [`SharingError::NeedsAdoption`].
+    pub fn share_in_a_new_org(&self, item_id: &str, email: &str) -> Result<ShareOutcome, SharingError> {
+        self.share_with(item_id, email, true)
+    }
+
+    fn share_with(&self, item_id: &str, email: &str, new_org: bool) -> Result<ShareOutcome, SharingError> {
         let _one = self.one_at_a_time();
         self.require_available()?;
         let email = normalise_email(email);
@@ -1629,7 +1881,15 @@ impl Sharing {
         // that cannot move is refused before the sharing org is looked for
         // (which reads a roster). The org check follows, against ours.
         refuse_unmovable(&record, &failures, organization_of(&record.item))?;
-        let existing = self.my_org_id(&profile, &account)?;
+        let existing = if new_org {
+            self.my_org_id(&profile, &account)?
+        } else {
+            match self.org_for_a_share(&profile, &account, &keys)? {
+                OrgChoice::Ours(id) => Some(id),
+                OrgChoice::Adoptable(question) => return Err(SharingError::NeedsAdoption(question)),
+                OrgChoice::Nothing => None,
+            }
+        };
         refuse_unmovable(&record, &failures, existing.as_deref())?;
 
         let (org_id, org_key, collections, created) = match existing {
@@ -1639,7 +1899,8 @@ impl Sharing {
                 (org_id, org_key, collections, false)
             }
             None => {
-                let (org_id, org_key) = self.create_org(&profile, &account, &keys, &email)?;
+                let refused = if new_org { NO_FRESH_ORG } else { ORG_FAILED };
+                let (org_id, org_key) = self.create_org(&profile, &account, &keys, &email, refused)?;
                 keys = Arc::new(keys.with_organization(&org_id, org_key.clone()));
                 // Into the backend's key cache too, which `keys_from` filled:
                 // the moved record comes back under this org, and a read the
@@ -1659,10 +1920,12 @@ impl Sharing {
             let moved = crate::sharing_state::Move { folder_id: record.item.folder_id.clone(), favorite: record.item.favorite };
             let written = crate::sharing_state::update(&path, |state| {
                 let me = state.account_mut(&account_id);
-                // Made here now, or made here before under this same id: such
-                // an id is this account's without a roster read
-                // (`Sharing::choose_org`).
-                me.sharing_org_created = created || (me.sharing_org_created && me.sharing_org_id.as_deref() == Some(org.as_str()));
+                // Made here now, or made here or adopted before under this
+                // same id: such an id is this account's without asking again
+                // (`Sharing::my_org_id`). Another id carries neither mark.
+                let same = me.sharing_org_id.as_deref() == Some(org.as_str());
+                me.sharing_org_created = created || (me.sharing_org_created && same);
+                me.sharing_org_adopted = !created && me.sharing_org_adopted && same;
                 me.sharing_org_id = Some(org);
                 if was_personal {
                     me.moves.insert(record.item.id.clone(), moved);
@@ -3143,8 +3406,33 @@ mod tests {
     use crate::test_http::{Matcher, MockServer};
 
     /// A loaded engine (its first pass made) on a NodeWarden, over the
-    /// fixture account, with its files in a scratch directory.
+    /// fixture account, with its files in a scratch directory -- and, when
+    /// the profile lists the fixture's own sharing org, that org cached as
+    /// MADE HERE: the state of the PC that shares from it. Only such an org
+    /// (or one the user adopted) is ever written to (official-path spec
+    /// §3.1, fix round 1); [`on_nodewarden_unpinned`] is the PC that has not
+    /// chosen it.
     fn on_nodewarden(organizations: serde_json::Value) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>, crate::test_scratch::ScratchDir) {
+        let pinned = organizations.as_array().is_some_and(|orgs| orgs.iter().any(|org| org["id"] == FIXTURE_ORG));
+        let (server, backend, engine, dir) = on_nodewarden_unpinned(organizations);
+        if pinned {
+            cache_org(&dir, true);
+        }
+        (server, backend, engine, dir)
+    }
+
+    /// A scratch directory whose `sharing_state.json` caches the fixture's
+    /// own sharing org as made here, for an engine set up by hand: only a
+    /// made or adopted org is written to (fix round 1).
+    fn pinned_dir(tag: &str) -> crate::test_scratch::ScratchDir {
+        let dir = crate::test_scratch::ScratchDir::new(tag);
+        cache_org(&dir, true);
+        dir
+    }
+
+    /// [`on_nodewarden`] with nothing cached: a second PC, a fresh install,
+    /// or an org this client did not make.
+    fn on_nodewarden_unpinned(organizations: serde_json::Value) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>, crate::test_scratch::ScratchDir) {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let dir = crate::test_scratch::ScratchDir::new("sharing-flow");
         let engine = backend.sharing_engine();
@@ -3331,7 +3619,7 @@ mod tests {
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
-            .expect(2)
+            .expect(1)
             .create();
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
@@ -3357,7 +3645,8 @@ mod tests {
     fn a_share_that_fails_at_the_move_leaves_the_record_personal() {
         let (mut server, cache, api, token) = crate::vault_api::tests::a_daemon();
         let engine = cache.bridge().sharing().expect("an engine");
-        engine.set_up(SharingSetup { make_key_pair: fixture_key_pair, ..SharingSetup::none() });
+        let dir = pinned_dir("sharing-move-fails-daemon");
+        engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
         server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server
@@ -3384,6 +3673,46 @@ mod tests {
         let after = serde_json::to_value(cache.get_by_id("live-1").expect("still in the daemon's vault")).expect("json");
         assert_eq!(after, before, "a failed move changed the daemon's copy");
         assert!(api.feed().wait_after(Some(0), false, std::time::Duration::ZERO).changes.is_empty(), "a failed move was announced");
+    }
+
+    /// **Through the daemon, the question is an answer, No is the share
+    /// again, and Yes is its own route** (fix round 1): `POST
+    /// /sharing/item/{id}` answers `{adopt: {organizationId, name}}` with
+    /// nothing written or announced; `newOrganization: true` makes a new org
+    /// (here refused by the server, which is said); `POST /sharing/adopt`
+    /// pins the org.
+    #[test]
+    fn the_adoption_question_goes_over_the_daemons_api() {
+        let (mut server, cache, api, token) = crate::vault_api::tests::a_daemon();
+        let engine = cache.bridge().sharing().expect("an engine");
+        let dir = crate::test_scratch::ScratchDir::new("sharing-adopt-daemon");
+        engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
+        server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
+        with_collections(&mut server, &[]);
+        with_roster(&mut server, &[me_row()]);
+        let writes = server.mock("POST", Matcher::Regex("^/api/".into())).expect(0).create();
+        let answer = crate::vault_api::tests::ask(&api, "POST", "/sharing/item/live-1", Some(&token), r#"{"email":"anna@example.com"}"#);
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        let body: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
+        assert_eq!(body["data"]["adopt"]["organizationId"], FIXTURE_ORG);
+        assert_eq!(body["data"]["adopt"]["name"], format!("Shared by {FIXTURE_EMAIL}"));
+        assert!(body["data"].get("result").is_none(), "a question is not a result: {body}");
+        writes.assert();
+        assert!(api.feed().wait_after(Some(0), false, std::time::Duration::ZERO).changes.is_empty(), "a question was announced");
+
+        server.mock("POST", "/api/organizations").with_status(400).with_body(r#"{"message":"You cannot create an organization."}"#).create();
+        let answer = crate::vault_api::tests::ask(&api, "POST", "/sharing/item/live-1", Some(&token), r#"{"email":"anna@example.com","newOrganization":true}"#);
+        assert_eq!(answer.status, 400, "{}", answer.body);
+        let body: serde_json::Value = serde_json::from_str(&answer.body).expect("json");
+        assert!(body["message"].as_str().is_some_and(|m| m.starts_with(NO_FRESH_ORG)), "{body}");
+        assert_eq!(cached(&dir), (None, false), "No pinned nothing");
+
+        let answer = crate::vault_api::tests::ask(&api, "POST", "/sharing/adopt", Some(&token), &serde_json::json!({ "organizationId": FIXTURE_ORG }).to_string());
+        assert_eq!(answer.status, 200, "{}", answer.body);
+        assert_eq!(cached(&dir).0.as_deref(), Some(FIXTURE_ORG));
+        assert!(adopted(&dir), "Yes pinned the org as adopted");
+        assert_eq!(crate::vault_api::tests::ask(&api, "POST", "/sharing/adopt", Some(&token), "{}").status, 400, "no organisation named");
     }
 
     /// **What cannot move is refused before anything is sent** (spec 9.3,
@@ -3635,7 +3964,7 @@ mod tests {
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
-            .expect(2)
+            .expect(1)
             .create();
         with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
         let invite = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").expect(1).create();
@@ -4365,7 +4694,8 @@ mod tests {
     fn a_move_back_through_the_daemon_is_announced_gone_then_new_in_one_batch() {
         let (mut server, cache, api, token) = crate::vault_api::tests::a_daemon();
         let engine = cache.bridge().sharing().expect("an engine");
-        engine.set_up(SharingSetup { make_key_pair: fixture_key_pair, ..SharingSetup::none() });
+        let dir = pinned_dir("sharing-move-back-daemon");
+        engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
         server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
         server
@@ -4443,7 +4773,7 @@ mod tests {
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"])]))
-            .expect(5)
+            .expect(3)
             .create();
         with_roster(
             &mut server,
@@ -4604,7 +4934,7 @@ mod tests {
     fn a_refused_forget_through_the_daemon_still_announces_what_it_stopped() {
         let (mut server, cache, api, token) = crate::vault_api::tests::a_daemon();
         let engine = cache.bridge().sharing().expect("an engine");
-        let dir = crate::test_scratch::ScratchDir::new("sharing-forget-daemon");
+        let dir = pinned_dir("sharing-forget-daemon");
         engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), make_key_pair: fixture_key_pair, ..SharingSetup::none() });
         server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([sharing_org_row()])).to_string()).create();
         server.mock("GET", "/api/organizations/invitations/mine").with_body(r#"{"data":[]}"#).create();
@@ -5001,7 +5331,7 @@ mod tests {
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
-            .expect(2)
+            .expect(1)
             .create();
         with_roster(&mut server, &[roster_row("anna-id", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
         let short = {
@@ -5053,7 +5383,7 @@ mod tests {
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
-            .expect(2)
+            .expect(1)
             .create();
         with_roster(&mut server, &[roster_row("kim-ou", Some("kim-id"), "kim@example.com", 1, &["c-kim"])]);
         server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").expect(1).create();
@@ -5064,23 +5394,20 @@ mod tests {
         assert_eq!(engine.view(&[]).person("kim@example.com").map(|p| p.state), Some(PersonState::WaitingSignIn));
     }
 
-    // ---- an org is mine only on the roster's word (official-path spec §3.1) ----
+    // ---- an org is mine only when made here or adopted (official-path spec §3.1, fix round 1) ----
 
-    /// A roster row of another account in the OWNER role -- the planted
-    /// shape: Mallory made "Shared by <me>" and added me as an owner.
-    fn other_owner() -> serde_json::Value {
-        let mut row = roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", 2, &[]);
-        row["type"] = serde_json::json!(0);
-        row
-    }
-
-    fn cache_org(dir: &crate::test_scratch::ScratchDir, created: bool) {
+    fn seed_org(dir: &crate::test_scratch::ScratchDir, created: bool, adopted: bool) {
         crate::sharing_state::update(&dir.join("sharing_state.json"), |state| {
             let me = state.account_mut(FIXTURE_USER_ID);
             me.sharing_org_id = Some(FIXTURE_ORG.into());
             me.sharing_org_created = created;
+            me.sharing_org_adopted = adopted;
         })
         .expect("seeded");
+    }
+
+    fn cache_org(dir: &crate::test_scratch::ScratchDir, created: bool) {
+        seed_org(dir, created, false);
     }
 
     fn cached(dir: &crate::test_scratch::ScratchDir) -> (Option<String>, bool) {
@@ -5088,92 +5415,347 @@ mod tests {
         (me.sharing_org_id, me.sharing_org_created)
     }
 
-    /// **A planted org -- owned by this account and named for it, but with
-    /// another owner on its roster -- is never this account's sharing org**
-    /// (final re-review, CRITICAL, now on the roster's word). The share does
-    /// not file into it, and a fresh org of my own is created instead.
-    /// Nothing is written to the planted org.
-    #[test]
-    fn a_planted_org_with_another_owner_is_not_used_and_a_fresh_one_is_made() {
-        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
-        server
-            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
-            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), other_owner()]))
-            .create();
-        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
-        let account = engine.held().account.clone().expect("an account");
-        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer"), None);
+    fn adopted(dir: &crate::test_scratch::ScratchDir) -> bool {
+        crate::sharing_state::SharingState::load(&dir.join("sharing_state.json")).account(FIXTURE_USER_ID).sharing_org_adopted
+    }
 
+    /// The fixture account's own row: owner, confirmed.
+    fn me_row() -> serde_json::Value {
+        roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])
+    }
+
+    /// `row` in another role, as an official server writes it: `type` 0
+    /// owner, 1 admin, 3 manager, 4 custom.
+    fn in_role(mut row: serde_json::Value, kind: i64) -> serde_json::Value {
+        row["type"] = serde_json::json!(kind);
+        row
+    }
+
+    /// An org named for and owned by the fixture account that this client
+    /// did NOT make, with `rows` on its roster and `collections` in it -- and
+    /// a personal record `p1` to share.
+    fn unpinned_org(rows: &[serde_json::Value], collections: &[serde_json::Value]) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>, crate::test_scratch::ScratchDir) {
+        let (mut server, backend, engine, dir) = on_nodewarden_unpinned(serde_json::json!([sharing_org_row()]));
         server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
-        let planted_collections = server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/collections").as_str()).expect(0).create();
+        with_collections(&mut server, collections);
+        with_roster(&mut server, rows);
+        (server, backend, engine, dir)
+    }
+
+    /// **The share goes to a fresh org of its own**: the unpinned org is not
+    /// offered, nothing is written to it, and nothing is filed into it.
+    fn shares_into_a_fresh_org(server: &mut MockServer, engine: &Sharing, dir: &crate::test_scratch::ScratchDir, case: &str) {
         let planted_writes = server.mock("POST", Matcher::Regex(format!("^/api/organizations/{FIXTURE_ORG}/"))).expect(0).create();
         let filed = server.mock("PUT", "/api/ciphers/p1/share").match_request(|r| r.utf8_lossy_body().contains(FIXTURE_ORG)).expect(0).create();
         let fresh = server.mock("POST", "/api/organizations").with_body(r#"{"id":"org-new","object":"organization"}"#).expect(1).create();
         server.mock("GET", "/api/organizations/org-new/collections").with_body(r#"{"data":[]}"#).create();
         // What follows the create is not this test's business; the create is.
-        let _ = engine.share("p1", "anna@example.com");
+        let answer = engine.share("p1", "anna@example.com");
+        assert!(!matches!(answer, Err(SharingError::NeedsAdoption(_))), "{case}: the user was offered an org that fails the roster rule");
         fresh.assert();
-        planted_collections.assert();
         planted_writes.assert();
         filed.assert();
-        assert_eq!(cached(&dir), (Some("org-new".into()), true), "the fresh org is remembered as made here");
+        assert_eq!(cached(dir), (Some("org-new".into()), true), "{case}: the fresh org is remembered as made here");
     }
 
-    /// **A whole read holds no planted org for the confirm pass** -- the
-    /// roster that read fetched names another owner.
+    /// **C1: another account in the owner, admin, manager or custom role
+    /// makes an org not this account's** -- whoever holds one of those reads
+    /// every collection, and an attacker who made "Shared by <me>" can step
+    /// down from owner to any of them and still read every share.
     #[test]
-    fn a_whole_read_does_not_hold_a_planted_org() {
-        let (_server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+    fn an_unpinned_org_with_another_privileged_member_is_refused() {
+        for kind in [0, 1, 3, 4] {
+            let mallory = in_role(roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", 2, &[]), kind);
+            let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), mallory], &[]);
+            shares_into_a_fresh_org(&mut server, &engine, &dir, &format!("type {kind}"));
+        }
+    }
+
+    /// **C1: a member who reaches any collection but their own** -- the
+    /// attacker kept a plain member seat on a person collection they made --
+    /// is refused; so is a member with edit rights on their own, and one on
+    /// a collection whose name did not decrypt under the org key.
+    #[test]
+    fn an_unpinned_org_with_a_member_beyond_their_own_read_only_collection_is_refused() {
+        let anna = person_collection("c-anna", "anna@example.com");
+        let on_annas = roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", 2, &["c-anna"]);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), on_annas], std::slice::from_ref(&anna));
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "a member on someone else's collection");
+
+        let mut writable = roster_row("anna-ou", Some("anna-id"), "anna@example.com", 2, &["c-anna"]);
+        writable["collections"][0]["readOnly"] = serde_json::json!(false);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), writable], &[anna]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "a member who can edit their own collection");
+
+        let plain = roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", 2, &["c-mal"]);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), plain], &[plaintext_collection("c-mal", "mallory@evil.example")]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "a member on a collection named in plaintext");
+    }
+
+    /// **C1: an invitation in the admin role is an admin** -- accepted
+    /// later, it reads everything -- and so is one revoked or in any status.
+    /// And an org where this account is not itself a confirmed owner on the
+    /// roster is not its own, whatever the profile says.
+    #[test]
+    fn an_unpinned_org_with_an_invited_admin_or_an_unconfirmed_me_is_refused() {
+        let invited = in_role(roster_row("inv-x", None, "mallory@evil.example", 0, &[]), 1);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), invited], &[]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "an invited admin");
+
+        let accepted_me = roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 1, &[]);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[accepted_me], &[]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "this account only accepted");
+
+        let admin_me = in_role(me_row(), 1);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[admin_me], &[]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "this account an admin");
+    }
+
+    /// **A second PC's roster -- only members, each on their own read-only
+    /// collection, in any status -- asks the user, writes nothing, and Yes
+    /// pins the org** (fix round 1, C1 rule 4).
+    #[test]
+    fn a_second_pcs_org_is_asked_about_and_yes_pins_it() {
+        let rows = [
+            me_row(),
+            roster_row("anna-ou", Some("anna-id"), "anna@example.com", 2, &["c-anna"]),
+            roster_row("inv-carol", None, "carol@example.com", 0, &["c-carol"]),
+            roster_row("bob-ou", Some("bob-id"), "bob@example.com", 1, &[]),
+        ];
+        let collections = [person_collection("c-anna", "anna@example.com"), person_collection("c-carol", "carol@example.com")];
+        let (mut server, _backend, engine, dir) = unpinned_org(&rows, &collections);
+        let writes = server.mock("POST", Matcher::Any).expect(0).create();
+        let puts = server.mock("PUT", Matcher::Any).expect(0).create();
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::NeedsAdoption(question)) => {
+                assert_eq!(question.organization_id, FIXTURE_ORG);
+                assert_eq!(question.name, format!("Shared by {FIXTURE_EMAIL}"));
+                let sentence = question.sentence();
+                assert!(sentence.contains(FIXTURE_ORG) && sentence.contains(&question.name), "{sentence}");
+                assert!(sentence.ends_with("Deskwarden did not create it."), "{sentence}");
+            }
+            other => panic!("expected the question, got {other:?}"),
+        }
+        writes.assert();
+        puts.assert();
+        assert_eq!(cached(&dir), (None, false), "asking pins nothing");
+        assert!(engine.held().my_org.is_none(), "an org the user has not chosen is not held");
+
+        engine.adopt(FIXTURE_ORG).expect("adopted");
+        assert_eq!(cached(&dir), (Some(FIXTURE_ORG.into()), false), "pinned, and not as made here");
+        assert!(adopted(&dir), "pinned as adopted");
+    }
+
+    /// **An org made in the web vault -- only this account on it -- is asked
+    /// about too**: nothing on the roster says who made it.
+    #[test]
+    fn an_org_made_in_the_web_vault_is_asked_about() {
+        let (_server, _backend, engine, dir) = unpinned_org(&[me_row()], &[]);
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::NeedsAdoption(question)) => assert_eq!(question.organization_id, FIXTURE_ORG),
+            other => panic!("expected the question, got {other:?}"),
+        }
+        assert_eq!(cached(&dir), (None, false));
+    }
+
+    /// **Once adopted, an org is used as a made one is**: no question, no
+    /// roster test, and a whole read holds it for the confirm pass.
+    #[test]
+    fn an_adopted_org_is_used_without_asking_again() {
+        let (mut server, _backend, engine, dir) = on_nodewarden_unpinned(serde_json::json!([sharing_org_row()]));
+        seed_org(&dir, false, true);
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        anna_is_confirmed(&mut server);
+        let (_, shared) = share_captured(&mut server, "p1");
+        let outcome = engine.share("p1", "anna@example.com").expect("shared, not asked");
+        shared.assert();
+        assert_eq!(outcome.result, ShareResult::Shared);
+
+        engine.held().my_org = None;
         let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
-        let mut directory = crate::rest::organizations::Directory::from_sync(
+        let directory = crate::rest::organizations::Directory::from_sync(
             &serde_json::from_value(serde_json::json!({ "profile": sharing_profile(serde_json::json!([sharing_org_row()])), "ciphers": [], "folders": [], "collections": [] })).expect("sync"),
             &engine.keys_from(&profile).expect("keys"),
         );
-        directory.set_roster(FIXTURE_ORG, &serde_json::json!({ "data": [roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), other_owner()] }));
         engine.note_directory(&directory, Some(&profile));
-        assert!(engine.held().my_org.is_none(), "a planted org is not held as ours");
-        directory.set_roster(FIXTURE_ORG, &serde_json::json!({ "data": [roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])] }));
-        engine.note_directory(&directory, Some(&profile));
-        assert_eq!(engine.held().my_org.as_ref().map(|o| o.id.as_str()), Some(FIXTURE_ORG), "control: alone as owner, it is ours");
+        assert_eq!(engine.held().my_org.as_ref().map(|o| o.id.as_str()), Some(FIXTURE_ORG));
     }
 
-    /// **A cached id the roster disowns is dropped** -- unless this client
-    /// made it: an org this client created cannot have been planted.
+    /// **No pins nothing, and the share goes on in a new org**; on a server
+    /// that will not make one, the refusal says so and still pins nothing.
     #[test]
-    fn a_cached_id_the_roster_disowns_is_dropped_unless_made_here() {
-        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
+    fn no_pins_nothing_and_shares_in_a_new_org() {
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row()], &[]);
+        assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::NeedsAdoption(_))));
+        let planted_writes = server.mock("POST", Matcher::Regex(format!("^/api/organizations/{FIXTURE_ORG}/"))).expect(0).create();
+        let fresh = server.mock("POST", "/api/organizations").with_body(r#"{"id":"org-new","object":"organization"}"#).expect(1).create();
+        server.mock("GET", "/api/organizations/org-new/collections").with_body(r#"{"data":[]}"#).create();
+        // What follows the create is not this test's business; the create is.
+        let _ = engine.share_in_a_new_org("p1", "anna@example.com");
+        fresh.assert();
+        planted_writes.assert();
+        assert_eq!(cached(&dir), (Some("org-new".into()), true));
+        assert!(!adopted(&dir), "No adopted nothing");
+
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row()], &[]);
+        server
+            .mock("POST", "/api/organizations")
+            .with_status(400)
+            .with_body(r#"{"message":"You cannot create an organization."}"#)
+            .create();
+        match engine.share_in_a_new_org("p1", "anna@example.com") {
+            Err(SharingError::Refused(sentence)) => assert!(sentence.starts_with(NO_FRESH_ORG), "{sentence}"),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert_eq!(cached(&dir), (None, false), "nothing pinned");
+    }
+
+    /// **I1: two orgs that both pass are refused, not guessed between** --
+    /// unless one of them is pinned, which is then the answer.
+    #[test]
+    fn two_orgs_that_both_pass_are_refused_not_guessed_between() {
+        let mut two = sharing_org_row();
+        two["id"] = serde_json::json!("org-two");
+        let orgs = serde_json::json!([sharing_org_row(), two]);
+        let (mut server, _backend, engine, dir) = on_nodewarden_unpinned(orgs.clone());
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[]);
+        with_roster(&mut server, &[me_row()]);
+        server.mock("GET", "/api/organizations/org-two/collections").with_body(r#"{"data":[]}"#).create();
+        server.mock("GET", "/api/organizations/org-two/users?includeCollections=true").with_body(roster(&[me_row()])).create();
+        let writes = server.mock("POST", Matcher::Any).expect(0).create();
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, SEVERAL_ORGS),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        writes.assert();
+        assert_eq!(cached(&dir), (None, false));
+
+        seed_org(&dir, false, true);
+        let profile: Profile = serde_json::from_value(sharing_profile(orgs)).expect("profile");
+        let account = engine.held().account.clone().expect("an account");
+        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG), "the pinned one");
+    }
+
+    /// **I2: a roster that cannot be read forgets nothing.** A pinned org is
+    /// used and held whatever its roster read did, and a whole read writes no
+    /// state; a cached id that is not pinned, whose roster is unreadable, is
+    /// kept and the share refuses rather than choosing.
+    #[test]
+    fn a_failed_roster_read_keeps_the_pinned_org() {
+        let (mut server, _backend, engine, dir) = on_nodewarden_unpinned(serde_json::json!([sharing_org_row()]));
+        seed_org(&dir, false, true);
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
-            .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), other_owner()]))
+            .with_body(r#"{"message":"Not found"}"#)
             .create();
         let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
         let account = engine.held().account.clone().expect("an account");
+        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG));
+
+        let before = std::fs::read(dir.join("sharing_state.json")).expect("the state");
+        let directory = crate::rest::organizations::Directory::from_sync(
+            &serde_json::from_value(serde_json::json!({ "profile": sharing_profile(serde_json::json!([sharing_org_row()])), "ciphers": [], "folders": [], "collections": [] })).expect("sync"),
+            &engine.keys_from(&profile).expect("keys"),
+        );
+        assert_eq!(directory.roster_of(FIXTURE_ORG), &Roster::Unknown, "control: this read has no roster");
+        engine.note_directory(&directory, Some(&profile));
+        assert_eq!(engine.held().my_org.as_ref().map(|o| o.id.as_str()), Some(FIXTURE_ORG), "held");
+        assert_eq!(std::fs::read(dir.join("sharing_state.json")).expect("the state"), before, "a whole read wrote the sharing state");
+
         cache_org(&dir, false);
-        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer"), None);
-        assert_eq!(cached(&dir), (None, false), "the cached id is gone");
+        engine.held().my_org = None;
+        engine.note_directory(&directory, Some(&profile));
+        assert!(engine.held().my_org.is_none(), "an unpinned cached id is not held");
+        assert_eq!(cached(&dir), (Some(FIXTURE_ORG.into()), false), "and a whole read does not forget it");
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[]);
+        match engine.share("p1", "anna@example.com") {
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, ROSTER_UNREADABLE),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert_eq!(cached(&dir), (Some(FIXTURE_ORG.into()), false), "an unreadable roster drops nothing");
+    }
+
+    /// **A cached id that is neither made here nor adopted, whose roster
+    /// fails the rule, is dropped by a write** -- and one made here is used
+    /// without asking the roster at all.
+    #[test]
+    fn a_cached_id_the_roster_disowns_is_dropped_unless_made_here() {
+        let mallory = in_role(roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", 2, &[]), 0);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), mallory], &[]);
+        cache_org(&dir, false);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "a cached id another owner holds");
+
+        let (_server, _backend, engine, dir) = on_nodewarden_unpinned(serde_json::json!([sharing_org_row()]));
         cache_org(&dir, true);
+        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
+        let account = engine.held().account.clone().expect("an account");
         assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG), "the id this client made");
     }
 
-    /// **A genuine org is used** -- owned, named for this account, and alone
-    /// as owner on its roster -- found with or without a cache; and **a
-    /// roster that cannot be read refuses rather than answering "not mine"**,
-    /// which would have a share make a second org beside the real one.
+    /// **I3: a 404 from the sharer's own roster is not "too old" when the
+    /// org has gone** -- deleted, or this account no longer its owner. The
+    /// profile is asked; the org and its cached id are dropped, and sharing
+    /// stays on so the next share makes a new one.
     #[test]
-    fn a_genuine_org_is_adopted_on_the_roster_and_an_unreadable_roster_refuses() {
-        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([]));
-        let account = engine.held().account.clone().expect("an account");
-        let profile: Profile = serde_json::from_value(sharing_profile(serde_json::json!([sharing_org_row()]))).expect("profile");
-        let path = format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true");
-        server.mock("GET", path.as_str()).with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])])).expect(2).create();
-        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG), "adopted on the roster's word");
-        cache_org(&dir, false);
-        assert_eq!(engine.my_org_id(&profile, &account).expect("an answer").as_deref(), Some(FIXTURE_ORG), "a cached id the roster owns");
-        assert_eq!(cached(&dir).0.as_deref(), Some(FIXTURE_ORG), "kept");
+    fn a_deleted_org_is_dropped_and_sharing_stays_on() {
+        let (mut server, _backend, engine, dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        engine.held().my_org = Some(MyOrg { id: FIXTURE_ORG.into(), collections: Vec::new(), roster: Vec::new() });
+        server.mock("GET", "/api/accounts/profile").with_body(sharing_profile(serde_json::json!([])).to_string()).create();
+        server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).with_status(404).create();
+        match engine.fetch_roster(FIXTURE_ORG) {
+            Err(SharingError::Refused(sentence)) => assert_eq!(sentence, ORG_GONE),
+            other => panic!("expected the org to be gone, got {other:?}"),
+        }
+        assert!(!engine.held().capabilities.too_old, "a deleted org is not an old server");
+        assert!(engine.view(&[]).available);
+        assert!(engine.held().my_org.is_none(), "the gone org is not held");
+        assert_eq!(cached(&dir), (None, false), "and not cached: the next share makes a new one");
+    }
 
-        server.mock("GET", path.as_str()).with_body(r#"{"message":"Not found"}"#).create();
-        assert!(matches!(engine.my_org_id(&profile, &account), Err(SharingError::Refused(s)) if s == ROSTER_UNREADABLE));
-        assert_eq!(cached(&dir).0.as_deref(), Some(FIXTURE_ORG), "an unreadable roster drops nothing");
+    /// **I3: a 404 from anything but the sharer's own roster leaves sharing
+    /// on** -- from `/share` (a record gone), the invite, a confirm (a person
+    /// gone), or a candidate org's roster (no ManageUsers there).
+    #[test]
+    fn a_404_from_any_other_route_leaves_sharing_on() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        anna_is_confirmed(&mut server);
+        server.mock("PUT", "/api/ciphers/p1/share").with_status(404).create();
+        assert!(engine.share("p1", "anna@example.com").is_err());
+        assert!(!engine.held().capabilities.too_old, "/share");
+
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[person_collection("c-kim", "kim@example.com")]);
+        with_roster(&mut server, &[me_row()]);
+        server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_status(404).create();
+        assert!(engine.share("p1", "kim@example.com").is_err());
+        assert!(!engine.held().capabilities.too_old, "the invite");
+
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[me_row()]))
+            .expect(1)
+            .create();
+        with_roster(&mut server, &[me_row(), roster_row("anna-ou", Some("anna-id"), "anna@example.com", 1, &["c-anna"])]);
+        server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").create();
+        server.mock("GET", "/api/users/anna-id/public-key").with_body(anna_key()).create();
+        server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/anna-ou/confirm").as_str()).with_status(404).create();
+        server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-anna"])).create();
+        let outcome = engine.share("p1", "anna@example.com").expect("shared; the confirm did not land");
+        assert_eq!(outcome.result, ShareResult::WaitingAccept);
+        assert!(!engine.held().capabilities.too_old, "/confirm");
+
+        let (mut server, _backend, engine, _dir) = unpinned_org(&[], &[]);
+        server.mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str()).with_status(404).create();
+        server.mock("POST", "/api/organizations").with_status(400).with_body(r#"{"message":"No."}"#).create();
+        assert!(engine.share("p1", "anna@example.com").is_err());
+        assert!(!engine.held().capabilities.too_old, "a candidate org's roster");
     }
 
     /// **An owner, admin or manager invitation is not a personal share**
@@ -5285,7 +5867,7 @@ mod tests {
         server
             .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
             .with_body(roster(&[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[])]))
-            .expect(2)
+            .expect(1)
             .create();
         with_roster(
             &mut server,
@@ -5541,12 +6123,14 @@ mod tests {
     }
 
     /// The fixture account on NodeWarden, owning the sharing org, as the
-    /// server's administrator or not. No files (`SharingSetup::none`), and
-    /// not loaded yet: the mint loads, as every write does.
-    fn on_nodewarden_as(admin: bool) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>) {
+    /// server's administrator or not. One file, the sharing state, with the
+    /// org cached as made here ([`pinned_dir`]), and not loaded yet: the
+    /// mint loads, as every write does.
+    fn on_nodewarden_as(admin: bool) -> (MockServer, crate::rest::backend::RestBackend, Arc<Sharing>, crate::test_scratch::ScratchDir) {
         let (mut server, backend) = signed_in_with_no_sync_route();
         let engine = backend.sharing_engine();
-        engine.set_up(SharingSetup::none());
+        let dir = pinned_dir("sharing-mint");
+        engine.set_up(SharingSetup { state_path: Some(dir.join("sharing_state.json")), ..SharingSetup::none() });
         let mut profile = sharing_profile(serde_json::json!([sharing_org_row()]));
         if admin {
             profile["role"] = serde_json::json!("admin");
@@ -5558,7 +6142,7 @@ mod tests {
             .with_body(serde_json::json!({ "publicKey": crate::rest::crypto::tests::base64(&crate::rest::crypto::tests::fixture_public_spki()) }).to_string())
             .expect_at_least(0)
             .create();
-        (server, backend, engine)
+        (server, backend, engine, dir)
     }
 
     /// Carol's pending invitation, expiring far in the future.
@@ -5580,7 +6164,7 @@ mod tests {
     /// before any write.
     #[test]
     fn an_admin_mints_an_invite_code_with_the_password_hash_and_nobody_else_can() {
-        let (mut server, _backend, engine) = on_nodewarden_as(true);
+        let (mut server, _backend, engine, _dir) = on_nodewarden_as(true);
         with_roster(&mut server, &[roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, 2, &[]), carol_invited()]);
         // The fixture account's master key is PBKDF2 of "master" with one
         // iteration; its server hash is one more PBKDF2 round keyed by it.
@@ -5601,7 +6185,7 @@ mod tests {
         assert_eq!(code.expires_at.as_deref(), Some("2999-01-01T00:00:00.000Z"));
         assert!(engine.view(&[]).can_mint_invites);
 
-        let (mut other, _backend, engine) = on_nodewarden_as(false);
+        let (mut other, _backend, engine, _dir) = on_nodewarden_as(false);
         with_roster(&mut other, &[carol_invited()]);
         let never = other.mock("POST", Matcher::Any).expect(0).create();
         assert!(matches!(engine.mint_invite_code("carol@example.com", b"master"), Err(SharingError::Refused(s)) if s == NOT_ADMIN));
@@ -5616,7 +6200,7 @@ mod tests {
     /// role and anything else the route answers each say what happened.
     #[test]
     fn only_a_pending_invitation_gets_a_code_and_the_servers_refusals_are_plain() {
-        let (mut server, _backend, engine) = on_nodewarden_as(true);
+        let (mut server, _backend, engine, _dir) = on_nodewarden_as(true);
         let mut dan = roster_row("inv-dan", None, "dan@example.com", 0, &["c-dan"]);
         dan["invitationExpirationDate"] = serde_json::json!("2001-01-01T00:00:00.000Z");
         with_roster(

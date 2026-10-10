@@ -7150,6 +7150,8 @@ pub fn build_frame_with_search(
                 | share_ui::ShareDialogAction::Submit
                 | share_ui::ShareDialogAction::Cancel
                 | share_ui::ShareDialogAction::MintCode
+                | share_ui::ShareDialogAction::Adopt
+                | share_ui::ShareDialogAction::NewOrganization
                 | share_ui::ShareDialogAction::Done => {}
             }
         }

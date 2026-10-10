@@ -125,6 +125,9 @@ fn sharing_failed(error: &SharingError) -> ApiResponse {
         SharingError::Unavailable(reason) => ApiResponse::refused(501, reason),
         SharingError::Refused(sentence) => ApiResponse::refused(400, sentence),
         SharingError::Vault(e) => failed(e),
+        // Only a share asks, and `share_item` answers the question itself; a
+        // route that met one anyway says what it is rather than a 500.
+        SharingError::NeedsAdoption(question) => ApiResponse::refused(409, &question.sentence()),
     }
 }
 
@@ -326,6 +329,7 @@ impl VaultApi {
             }
             ("GET", ["sharing"]) => self.sharing_view(),
             ("POST", ["sharing", "item", id]) => self.share_item(id, request.body),
+            ("POST", ["sharing", "adopt"]) => self.adopt_org(request.body),
             ("POST", ["sharing", "item", id, "stop"]) => self.stop_sharing(id, request.body),
             ("POST", ["sharing", "person", "forget"]) => self.forget_person(request.body),
             ("POST", ["sharing", "person", "reinvite"]) => self.reinvite_person(request.body),
@@ -495,10 +499,17 @@ impl VaultApi {
         }
     }
 
-    /// `POST /sharing/item/{id} {email}` (spec 11.3). What moved is applied
-    /// to the daemon's copy and announced; the answer says which of the
-    /// dialog's three results it was. The era is read before the engine's
-    /// first round trip -- see [`Self::publish_outcome`].
+    /// `POST /sharing/item/{id} {email, newOrganization?}` (spec 11.3). What
+    /// moved is applied to the daemon's copy and announced; the answer says
+    /// which of the dialog's three results it was.
+    ///
+    /// **Or the question** (official-path spec §3.1, fix round 1): when the
+    /// engine stops to ask about an organisation it did not create, the
+    /// answer is `{adopt: {organizationId, name}}` -- a 200, because nothing
+    /// failed and nothing was written; the dialog asks. `newOrganization:
+    /// true` is the share after No ([`Sharing::share_in_a_new_org`]). The era
+    /// is read before the engine's first round trip -- see
+    /// [`Self::publish_outcome`].
     fn share_item(&self, id: &str, body: &[u8]) -> ApiResponse {
         let era = self.cache.epoch().era();
         let engine = match self.engine() {
@@ -508,11 +519,40 @@ impl VaultApi {
         let Some(email) = email_in(body) else {
             return ApiResponse::refused(400, "Say who to share with.");
         };
-        match engine.share(id, &email) {
+        let new_org = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| body.get("newOrganization").and_then(serde_json::Value::as_bool))
+            .unwrap_or(false);
+        let shared = if new_org { engine.share_in_a_new_org(id, &email) } else { engine.share(id, &email) };
+        match shared {
             Ok(outcome) => {
                 self.publish_outcome(&outcome.changed, era);
                 ApiResponse::ok(serde_json::json!({ "result": outcome.result }))
             }
+            Err(SharingError::NeedsAdoption(question)) => ApiResponse::ok(serde_json::json!({ "adopt": question })),
+            Err(e) => sharing_failed(&e),
+        }
+    }
+
+    /// `POST /sharing/adopt {organizationId}` -- Yes to "Use the organisation
+    /// ... for sharing? Deskwarden did not create it." ([`Sharing::adopt`]).
+    /// Nothing in the vault or the sharing view moves until the share that
+    /// follows it, which announces what it changed; so nothing is announced
+    /// here.
+    fn adopt_org(&self, body: &[u8]) -> ApiResponse {
+        let engine = match self.engine() {
+            Ok(engine) => engine,
+            Err(answer) => return answer,
+        };
+        let organization = serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|body| body.get("organizationId").and_then(serde_json::Value::as_str).map(str::to_string))
+            .filter(|id| !id.trim().is_empty());
+        let Some(organization) = organization else {
+            return ApiResponse::refused(400, "Say which organisation to use.");
+        };
+        match engine.adopt(&organization) {
+            Ok(()) => ApiResponse::done(),
             Err(e) => sharing_failed(&e),
         }
     }
@@ -1186,7 +1226,21 @@ pub(crate) mod tests {
     #[test]
     fn an_invite_code_route_sends_only_the_hash_and_answers_the_code() {
         let (mut server, cache, api, token) = a_daemon();
-        cache.bridge().sharing().expect("a REST daemon has an engine").set_up(crate::rest::sharing::SharingSetup::none());
+        // The fixture org cached as made here: only a made or adopted org is
+        // this account's to act in (official-path spec §3.1, fix round 1).
+        let dir = crate::test_scratch::ScratchDir::new("vault-api-invite-code");
+        let state = dir.path().join("sharing_state.json");
+        crate::sharing_state::update(&state, |s| {
+            let me = s.account_mut(crate::rest::backend::tests::FIXTURE_USER_ID);
+            me.sharing_org_id = Some(crate::rest::backend::tests::FIXTURE_ORG.into());
+            me.sharing_org_created = true;
+        })
+        .expect("seeded");
+        cache
+            .bridge()
+            .sharing()
+            .expect("a REST daemon has an engine")
+            .set_up(crate::rest::sharing::SharingSetup { state_path: Some(state), ..crate::rest::sharing::SharingSetup::none() });
         let nothing = server.mock("POST", crate::test_http::Matcher::Any).expect(0).create();
         for (body, sentence) in [
             (r#"{"email":"carol@example.com"}"#, "Type your master password."),
