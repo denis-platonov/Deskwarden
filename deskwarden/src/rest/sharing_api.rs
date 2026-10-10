@@ -33,10 +33,36 @@ pub enum SharingMethod {
 
 /// One sharing request. **No `Debug`**: a body can hold a member's email and
 /// an invitation token, and nothing needs to print one.
+///
+/// **Its body's strings are wiped when it is dropped** (fix round 1, M3).
+/// Two bodies carry a secret in the clear -- an invitation's token
+/// ([`accept_invite`]) and the administrator's master password hash
+/// ([`registration_invite`]) -- and a `serde_json::Value` frees its strings
+/// unwiped. Every body is wiped rather than those two, so a third cannot be
+/// added that forgets to. What `ureq`'s `send_json` serialises the body into
+/// on the way to the socket this crate does not own and cannot wipe -- the
+/// limit `http_agent::bounded_total_with_bearer` states for the grant.
 pub struct SharingRequest {
     method: SharingMethod,
     path: String,
     body: Option<Value>,
+}
+
+impl Drop for SharingRequest {
+    fn drop(&mut self) {
+        fn wipe(value: &mut Value) {
+            use zeroize::Zeroize;
+            match value {
+                Value::String(text) => text.zeroize(),
+                Value::Array(items) => items.iter_mut().for_each(wipe),
+                Value::Object(fields) => fields.values_mut().for_each(wipe),
+                Value::Null | Value::Bool(_) | Value::Number(_) => {}
+            }
+        }
+        if let Some(body) = self.body.as_mut() {
+            wipe(body);
+        }
+    }
 }
 
 impl SharingRequest {
@@ -392,7 +418,9 @@ pub fn set_cipher_collections(
 /// §4.1). The server checks the token, and that the invitation's email is
 /// the signed-in account's. `resetPasswordKey` is not sent: a sharing org has
 /// no account-recovery policy that would ask for one. There is no decline --
-/// Bitwarden has none; an invitation nobody answers expires.
+/// Bitwarden has none; an invitation nobody answers expires. The body's copy
+/// of the token is wiped when the request drops, at the end of the send
+/// ([`SharingRequest`]'s `Drop`).
 pub fn accept_invite(client: &RestClient, session: &mut Session, org: &str, ou_id: &str, token: &str) -> Result<(), RestError> {
     let path = format!("/api/organizations/{}/users/{}/accept", safe(org)?, safe(ou_id)?);
     send(client, session, &SharingRequest::new(SharingMethod::Post, path, Some(json!({ "token": token })))).map(|_| ())

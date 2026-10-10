@@ -12,24 +12,32 @@
 //! `{vault}/#/accept-organization?organizationId=…&organizationUserId=…&email=…&organizationName=…&token=…&initOrganization=True|False&orgUserHasExistingUser=True|False`
 //!
 //! -- the query inside the FRAGMENT; `email`, `organizationName` and `token`
-//! through .NET's `WebUtility.UrlEncode`, where a space is `+`. NodeWarden
-//! writes the same. Vaultwarden writes `…/#/accept-organization/?…` with
-//! `email` first and `%20` for a space. So this reads the query wherever it
-//! stands -- the fragment's, or the URL's own -- under a path that names
-//! `accept-organization`, with keys in any case and values form-decoded.
-//! Both ids must be GUIDs, as the official web vault's
-//! `DirectOrganizationInvite.fromUrlParams` requires, which also keeps any
-//! other text out of a route's path.
+//! through .NET's `WebUtility.UrlEncode`, where a space is `+` and the hex is
+//! upper-case; the booleans as C# prints them. NodeWarden writes the same.
+//! Vaultwarden (`mail.rs`, `send_invite`) writes `…/#/accept-organization/?…`
+//! with `email` first, then `organizationName`, `organizationId`,
+//! `organizationUserId`, `token`, `initOrganization=false` and
+//! `orgUserHasExistingUser`, through the `url` crate's `query_pairs_mut` --
+//! a space is `+` there too. So this reads the query wherever it stands --
+//! the fragment's, or the URL's own -- under a path that names
+//! `accept-organization`, with keys in any case and values form-decoded. A
+//! key read as `amp;…` is the same key: a link copied out of a plain-text
+//! email that escaped its `&` as `&amp;`. Both ids must be GUIDs, as the
+//! official web vault's `DirectOrganizationInvite.fromUrlParams` requires,
+//! which also keeps any other text out of a route's path.
 //!
 //! # The token
 //!
-//! It is what accepts the invitation, so it is held in a `Zeroizing<String>`,
-//! and [`InviteLink`]'s `Debug` prints no part of it -- nor the email or the
-//! ids, which nothing that debugs a link needs. Nothing here logs.
+//! It is what accepts the invitation, so it is held in a `Zeroizing<String>`
+//! -- decoded straight into one ([`form_decode`]), never through a decoder
+//! that hands back a plain `String` nobody wipes -- and [`InviteLink`]'s
+//! `Debug` prints no part of it, nor the email or the ids, which nothing
+//! that debugs a link needs. Nothing here logs
+//! (`nothing_that_reads_or_sends_a_link_logs_it`).
 //!
 //! Pure: no I/O, no clock, no window.
 
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// One invite link, read. See the module docs.
 pub struct InviteLink {
@@ -93,6 +101,51 @@ fn is_guid(text: &str) -> bool {
         })
 }
 
+/// One hex digit's value.
+fn hex(digit: u8) -> Option<u8> {
+    char::from(digit).to_digit(16).and_then(|value| u8::try_from(value).ok())
+}
+
+/// **`application/x-www-form-urlencoded` decoding, into a `Zeroizing`
+/// buffer**: `+` is a space and `%XX` a byte, in either case of hex; a `%`
+/// not followed by two hex digits stays as written, as `url::form_urlencoded`
+/// leaves it. `None` when the bytes are not UTF-8.
+///
+/// Written here rather than taken from `url::form_urlencoded::parse`, whose
+/// decoded `Cow` is a plain `String` whenever there was anything to decode --
+/// for the token, a copy of it dropped unwiped. The buffer is sized up front
+/// (decoding only shortens), so it never grows and leaves an earlier
+/// allocation behind, and it becomes the `String` without a copy.
+fn form_decode(raw: &str) -> Option<Zeroizing<String>> {
+    let bytes = raw.as_bytes();
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == b'+' {
+            out.push(b' ');
+            at += 1;
+            continue;
+        }
+        if byte == b'%' {
+            if let (Some(high), Some(low)) = (bytes.get(at + 1).and_then(|d| hex(*d)), bytes.get(at + 2).and_then(|d| hex(*d))) {
+                out.push((high << 4) | low);
+                at += 3;
+                continue;
+            }
+        }
+        out.push(byte);
+        at += 1;
+    }
+    match String::from_utf8(std::mem::take(&mut *out)) {
+        Ok(text) => Some(Zeroizing::new(text)),
+        Err(not_text) => {
+            not_text.into_bytes().zeroize();
+            None
+        }
+    }
+}
+
 /// **Reads a pasted invite link.** See the module docs for the formats.
 ///
 /// # Errors
@@ -115,9 +168,17 @@ pub fn parse(text: &str) -> Result<InviteLink, LinkError> {
         return Err(LinkError::NotAnInviteLink);
     }
     let (mut organization_id, mut organization_user_id, mut email, mut organization_name, mut token) = (None, None, None, None, None);
-    for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        let value = value.trim();
-        match key.to_ascii_lowercase().as_str() {
+    for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+        let (raw_key, raw_value) = pair.split_once('=').unwrap_or((pair, ""));
+        let Some(key) = form_decode(raw_key) else { continue };
+        let key = key.to_ascii_lowercase();
+        // `&amp;organizationUserId=…`: an `&` a plain-text email escaped.
+        let key = key.trim_start_matches("amp;");
+        // A value that is not UTF-8 is read as absent: the link is then
+        // refused as missing it.
+        let Some(decoded) = form_decode(raw_value) else { continue };
+        let value = decoded.trim();
+        match key {
             "organizationid" => organization_id = Some(value.to_ascii_lowercase()),
             "organizationuserid" => organization_user_id = Some(value.to_ascii_lowercase()),
             "email" => email = Some(value.to_lowercase()),
@@ -149,22 +210,27 @@ mod tests {
 
     /// **A link exactly as Bitwarden's server writes it**
     /// (`HandlebarsMailService.BuildInvitationUrl`): the query in the
-    /// fragment, `email` and `organizationName` through .NET's
-    /// `WebUtility.UrlEncode` (a space is `+`), a DataProtector token, the
-    /// booleans as C# prints them.
+    /// fragment, its keys in that method's order -- `organizationId`,
+    /// `organizationUserId`, `email`, `organizationName`, `token`,
+    /// `initOrganization`, `orgUserHasExistingUser` -- the GUIDs plain and
+    /// lower-case, `email`, `organizationName` and `token` through .NET's
+    /// `WebUtility.UrlEncode` (a space is `+`, the hex upper-case, so the `+`
+    /// in an address is `%2B` and a `Ü` is `%C3%9C`), and the booleans as C#
+    /// prints them. The ids and the DataProtector token are synthetic; the
+    /// format is exact.
     #[test]
     fn a_link_from_a_bitwarden_email_is_read() {
         let link = format!(
             "https://vault.bitwarden.com/#/accept-organization?organizationId={ORG}&organizationUserId={OU}\
-             &email=Anna%40Example.com&organizationName=Shared+by+denis%40example.com\
+             &email=Anna%2Bvault%40Example.com&organizationName=%C3%9Cbersicht+Team\
              &token=BwOrgUserInviteToken_CfDJ8Kx-Q9vR3pZ_e2A7hT0wLmN1yF4uB6cD8gH0jK2lM4nP6qS8tU0vW2xY4zA6bC8dE0fG2hI4\
              &initOrganization=False&orgUserHasExistingUser=True"
         );
         let read = parse(&link).expect("a Bitwarden link");
         assert_eq!(read.organization_id, ORG);
         assert_eq!(read.organization_user_id, OU);
-        assert_eq!(read.email, "anna@example.com", "lower-cased");
-        assert_eq!(read.organization_name.as_deref(), Some("Shared by denis@example.com"));
+        assert_eq!(read.email, "anna+vault@example.com", "lower-cased, and `%2B` a plus, not a space");
+        assert_eq!(read.organization_name.as_deref(), Some("\u{dc}bersicht Team"), "two bytes, one letter");
         assert_eq!(
             read.token.as_str(),
             "BwOrgUserInviteToken_CfDJ8Kx-Q9vR3pZ_e2A7hT0wLmN1yF4uB6cD8gH0jK2lM4nP6qS8tU0vW2xY4zA6bC8dE0fG2hI4"
@@ -172,16 +238,22 @@ mod tests {
     }
 
     /// **Vaultwarden's link** (`mail.rs` `send_invite`): a `/` before the `?`,
-    /// `email` first, `%20` rather than `+`, a JWT token, and the extra keys
-    /// it adds.
+    /// and the query built by the `url` crate's `query_pairs_mut` on a
+    /// placeholder URL -- `email`, `organizationName`, `organizationId`,
+    /// `organizationUserId`, `token`, then `initOrganization=false`, always,
+    /// and `orgUserHasExistingUser`. That serialiser writes a space as `+`
+    /// and its hex upper-case, as .NET's does. The ids and the JWT are
+    /// synthetic; the format is exact.
     #[test]
     fn a_link_from_a_vaultwarden_email_is_read() {
         let link = format!(
-            "https://vw.example.org/#/accept-organization/?email=anna%40example.com&organizationName=Shared%20by%20denis%40example.com\
+            "https://vw.example.org/#/accept-organization/?email=anna%40example.com&organizationName=Shared+by+denis%40example.com\
              &organizationId={ORG}&organizationUserId={OU}&token=eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln\
              &initOrganization=false&orgUserHasExistingUser=true"
         );
         let read = parse(&link).expect("a Vaultwarden link");
+        assert_eq!(read.organization_id, ORG);
+        assert_eq!(read.organization_user_id, OU);
         assert_eq!(read.organization_name.as_deref(), Some("Shared by denis@example.com"));
         assert_eq!(read.token.as_str(), "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.c2ln");
         assert_eq!(read.email, "anna@example.com");
@@ -201,16 +273,34 @@ mod tests {
 
     /// **Keys in any case, and a query outside the fragment**: a link a mail
     /// client rewrote, or one copied from a web vault that routes by path.
+    /// Hex in either case decodes alike: `%2b` is the `%2B` .NET writes.
     #[test]
     fn keys_in_any_case_and_a_query_outside_the_fragment_are_read() {
         let link = format!(
-            "https://vault.example.com/accept-organization?ORGANIZATIONID={}&OrganizationUserId={OU}&EMAIL=anna%40example.com&TOKEN=t-1",
+            "https://vault.example.com/accept-organization?ORGANIZATIONID={}&OrganizationUserId={OU}&EMAIL=anna%2bvault%40example.com&TOKEN=t-1",
             ORG.to_uppercase()
         );
         let read = parse(&link).expect("read");
         assert_eq!(read.organization_id, ORG, "a GUID is compared lower-cased");
+        assert_eq!(read.email, "anna+vault@example.com", "lower-case hex");
         assert_eq!(read.organization_name, None, "the name is not required");
         assert_eq!(read.token.as_str(), "t-1");
+    }
+
+    /// **A link copied out of a plain-text email that escaped its `&`s** as
+    /// `&amp;` is the same link: each key after the first reads `amp;…`.
+    #[test]
+    fn a_link_with_escaped_ampersands_is_read() {
+        let link = format!(
+            "https://vault.bitwarden.com/#/accept-organization?organizationId={ORG}&amp;organizationUserId={OU}\
+             &amp;email=anna%40example.com&amp;organizationName=Shared+by+denis%40example.com&amp;token=tok%2B1\
+             &amp;initOrganization=False&amp;orgUserHasExistingUser=True"
+        );
+        let read = parse(&link).expect("an escaped link");
+        assert_eq!(read.organization_user_id, OU);
+        assert_eq!(read.email, "anna@example.com");
+        assert_eq!(read.organization_name.as_deref(), Some("Shared by denis@example.com"));
+        assert_eq!(read.token.as_str(), "tok+1");
     }
 
     /// **What a paste carries around the link** -- spaces, a newline, angle
@@ -270,6 +360,46 @@ mod tests {
         let printed = format!("{:?}", parse(&link).expect("read"));
         for secret in ["TOKEN-NEEDLE-31b", "anna@example.com", ORG, OU] {
             assert!(!printed.contains(secret), "{printed}");
+        }
+    }
+
+    /// The text of the function whose signature line contains `signature`,
+    /// up to the first line that is exactly `close` -- its closing brace at
+    /// its own indent. Panics when it is not found, so a renamed function
+    /// fails here rather than leaving nothing scanned.
+    fn body_of(source: &str, signature: &str, close: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let start = source.find(signature).unwrap_or_else(|| panic!("no `{signature}`"));
+        let lines: Vec<&str> = source[start..].lines().collect();
+        let end = lines.iter().position(|line| *line == close).unwrap_or_else(|| panic!("no end to `{signature}`"));
+        lines[..end].join("\n")
+    }
+
+    /// **Nothing that reads or sends a link logs it** (global constraint:
+    /// never log an invite token, an invite link, or a link's query). Every
+    /// `log::` line in this module's code, and in each function a pasted
+    /// link passes through -- the window's client, the daemon's route, the
+    /// engine and the request -- is read, and none may name the link or the
+    /// token. A scan of the source rather than of a captured log, because a
+    /// log line is written only on the path that runs; this holds the paths
+    /// no test drives too.
+    #[test]
+    fn nothing_that_reads_or_sends_a_link_logs_it() {
+        let this = include_str!("invite_link.rs").replace("\r\n", "\n");
+        let code = this.split("#[cfg(test)]").next().unwrap_or_default().to_string();
+        let scanned = [
+            ("invite_link.rs", code),
+            ("Sharing::accept_link", body_of(include_str!("rest/sharing.rs"), "    pub fn accept_link(", "    }")),
+            ("sharing_api::accept_invite", body_of(include_str!("rest/sharing_api.rs"), "pub fn accept_invite(", "}")),
+            ("VaultApi::accept_link", body_of(include_str!("vault_api.rs"), "    fn accept_link(", "    }")),
+            ("SharingClient::accept_link", body_of(include_str!("daemon_link.rs"), "    pub fn accept_link(", "    }")),
+        ];
+        for (name, text) in &scanned {
+            assert!(text.lines().count() > 1, "{name}: nothing past the signature was scanned");
+            for line in text.lines().filter(|line| line.contains("log::")) {
+                let lower = line.to_lowercase();
+                assert!(!lower.contains("link") && !lower.contains("token"), "{name} logs a link or a token: {line}");
+            }
         }
     }
 }

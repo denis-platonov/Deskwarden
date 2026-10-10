@@ -6690,14 +6690,12 @@ pub fn build_frame_with_search(
                     );
                 }
             }
-            // **Paste an invite link's Accept** (official-path spec §4.1): the
-            // box's text, taken whole -- the box empties as the link goes, and
-            // the token is wiped when the call ends. A refused request (a
-            // write already out) has said why, as a toast on this screen.
-            Some(share_ui::PeopleAsk::AcceptLink) => {
-                let link = std::mem::take(&mut sharing.paste);
-                let _ = share_ui::request(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx, share_ui::SharingCall::AcceptLink(link));
-            }
+            // **Paste an invite link's Accept** (official-path spec §4.1):
+            // nothing is sent yet. A link that reads puts `Join "X"?` up --
+            // answered below, over its own scrim -- and one that does not is
+            // refused in the parser's words, as a toast on this screen. The
+            // box keeps its text either way (`SharingPane::paste`).
+            Some(share_ui::PeopleAsk::AcceptLink) => share_ui::ask_to_join(&mut sharing),
             None => {}
         }
         // **`Open record`**: leave the Sent screen and show the item the Send
@@ -7392,6 +7390,19 @@ pub fn build_frame_with_search(
                     leave_ask = None;
                 }
                 Some(false) => leave_ask = None,
+                None => {}
+            }
+        }
+        // **`Join "X"?`** (fix round 1, M2), over its own scrim: Paste an
+        // invite link's Accept asked it, because a link does not say what
+        // access it grants. Yes sends a clone of the box's text; the box
+        // empties only when the accept comes back `Ok`. No sends nothing.
+        if let Some(title) = sharing.join_asking.clone() {
+            match share_ui::draw_join_confirm(ui.ctx(), &title) {
+                Some(true) => {
+                    let _ = share_ui::send_pasted_link(&mut sharing, sharing_client.as_ref(), ui.ctx(), &sharing_tx);
+                }
+                Some(false) => sharing.join_asking = None,
                 None => {}
             }
         }

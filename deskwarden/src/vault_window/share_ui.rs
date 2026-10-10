@@ -329,9 +329,20 @@ pub(crate) struct SharingPane {
     /// The Share dialog, while it is open.
     pub(crate) dialog: Option<ShareDialog>,
     /// **Paste an invite link's text**, between frames: lent to the list as
-    /// [`PeopleRows::paste`] while it is drawn, and taken whole when Accept is
-    /// pressed. Wiped on drop -- its token accepts the invitation.
+    /// [`PeopleRows::paste`] while it is drawn. A `Yes` to the join question
+    /// sends a `Zeroizing` CLONE of it ([`send_pasted_link`]) and the box is
+    /// emptied only by an accept that came back `Ok` ([`apply`]), so a
+    /// refusal -- someone else's link, the server's no, no daemon -- leaves
+    /// the link where the user can fix it or try again (fix round 1, M5).
+    /// Wiped on drop -- its token accepts the invitation. egui's text edit
+    /// keeps copies of its own while the box is edited (its layout and undo
+    /// state) that this cannot reach: the exposure the master-password field
+    /// already has, and no wider.
     pub(crate) paste: Zeroizing<String>,
+    /// **The join question is up**, with its title (fix round 1, M2): Accept
+    /// was pressed on a link that reads, and nothing is sent until the user
+    /// answers [`draw_join_confirm`].
+    pub(crate) join_asking: Option<String>,
     /// Stop sharing's step two is up for `(item id, email)`.
     pub(crate) stop_confirming: Option<(String, String)>,
     /// A stop is running for `(item id, email)`.
@@ -1164,8 +1175,13 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
         // finishes, and Shared with me's waiting line says so; the toast says
         // it now. A refusal is the engine's sentence -- not a link, someone
         // else's, the server's no -- said where the user is.
+        // The box empties here, on an accept that landed, and only here: a
+        // refusal leaves the pasted link in it (`SharingPane::paste`).
         SharingReport::LinkAccepted(result) => match result {
-            Ok(()) => toast(pane, LINK_ACCEPTED.to_string()),
+            Ok(()) => {
+                pane.paste = Zeroizing::default();
+                toast(pane, LINK_ACCEPTED.to_string());
+            }
             Err(sentence) => fail(pane, sentence),
         },
         // **The daemon's forget came back.** Its outcome is recorded for the
@@ -2851,7 +2867,9 @@ pub(crate) fn draw_received_group(
 pub(crate) const PASTE_HINT: &str = "Paste an invite link";
 pub(crate) const PASTE_ACCEPT_LABEL: &str = "Accept";
 /// A pasted link was accepted. The records arrive once the sharer's daemon
-/// confirms; the waiting line under the box says so meanwhile.
+/// confirms. Nothing names the sharer until a whole read attests them --
+/// the link's org name is a claim (`Sharing::accept_link`) -- so this toast is
+/// the whole answer until then.
 pub(crate) const LINK_ACCEPTED: &str = "Invitation accepted. The records arrive once the person sharing them finishes.";
 /// The paste row: one `theme::inline_field` high.
 pub(crate) const PASTE_ROW_HEIGHT: f32 = theme::BUTTON_HEIGHT;
@@ -2927,6 +2945,92 @@ pub(crate) fn paste_and_waiting_height(people: &PeopleRows<'_>, row_gap: f32) ->
     let paste = usize::from(people.paste.is_some());
     let rows = paste + people.waiting.len();
     paste as f32 * PASTE_ROW_HEIGHT + people.waiting.len() as f32 * WAITING_LINE_HEIGHT + rows.saturating_sub(1) as f32 * row_gap
+}
+
+/// The join question's body, and its two answers (fix round 1, M2).
+pub(crate) const JOIN_BODY: &str = "The link doesn't say what access you'll have.";
+pub(crate) const JOIN_YES_LABEL: &str = "Yes";
+pub(crate) const JOIN_NO_LABEL: &str = "No";
+
+/// `Join "Shared by denis@example.com"?` -- the organisation's name as the
+/// link carries it, quoted because it is the link's claim and not the
+/// server's word; "this organisation" for a link that carries none.
+pub(crate) fn join_title(name: Option<&str>) -> String {
+    match name {
+        Some(name) => format!("Join \"{name}\"?"),
+        None => "Join this organisation?".to_string(),
+    }
+}
+
+/// **Paste an invite link's Accept, pressed** (fix round 1, M2): a link that
+/// reads puts the join question up, and nothing is sent until it is
+/// answered -- an invite link does not say what access it grants, and the
+/// server may make this account an owner or an admin of somebody's
+/// organisation as readily as a reader of their records. A text that does
+/// not read is refused here in the parser's words
+/// ([`crate::invite_link::LinkError::sentence`]), with nothing sent and the
+/// text left in the box. The daemon reads the link again before it accepts:
+/// this read only words the question.
+pub(crate) fn ask_to_join(pane: &mut SharingPane) {
+    match crate::invite_link::parse(&pane.paste) {
+        Ok(link) => pane.join_asking = Some(join_title(link.organization_name.as_deref())),
+        Err(not_a_link) => pane.say(not_a_link.sentence().to_string(), None),
+    }
+}
+
+/// **The join question's Yes**: a `Zeroizing` clone of the box's text, sent
+/// as [`SharingCall::AcceptLink`] -- the box keeps the link until the accept
+/// comes back `Ok` ([`apply`]). The question goes either way. `false` when
+/// [`request`] refused, having said why.
+pub(crate) fn send_pasted_link(
+    pane: &mut SharingPane,
+    client: Option<&SharingClient>,
+    ctx: &egui::Context,
+    tx: &mpsc::Sender<SharingReport>,
+) -> bool {
+    pane.join_asking = None;
+    let link = pane.paste.clone();
+    request(pane, client, ctx, tx, SharingCall::AcceptLink(link))
+}
+
+/// **`Join "X"?`** over its own scrim, in [`draw_leave_confirm`]'s shape.
+/// `Some(true)` to join, `Some(false)` not to -- Escape included -- and
+/// `None` while undecided. No is the end of it: nothing was sent, so there
+/// is nothing to leave.
+///
+/// The scrim's id is a literal, spelled in the declaration, for
+/// `item_list::MODAL_SCRIM_AREAS`'s census.
+pub(crate) fn draw_join_confirm(ctx: &egui::Context, title: &str) -> Option<bool> {
+    let mut answer = None;
+    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-join-scrim")));
+    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-join-modal"))).show(ctx, |ui| {
+        theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
+        egui::Frame::new()
+            .fill(theme::CARD)
+            .corner_radius(egui::CornerRadius::same(10))
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .inner_margin(egui::Margin::same(20))
+            .show(ui, |ui| {
+                ui.set_width(380.0);
+                ui.label(theme::bold(title, 15.0).color(theme::INK));
+                ui.add_space(10.0);
+                ui.label(egui::RichText::new(JOIN_BODY).size(12.0).color(theme::TEXT_SECONDARY));
+                ui.add_space(18.0);
+                ui.horizontal(|ui| {
+                    if theme::primary_button(ui, JOIN_YES_LABEL, None).clicked() {
+                        answer = Some(true);
+                    }
+                    ui.add_space(theme::FORM_FOOTER_GAP);
+                    if theme::secondary_button(ui, JOIN_NO_LABEL).clicked() {
+                        answer = Some(false);
+                    }
+                });
+            });
+    });
+    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        answer = Some(false);
+    }
+    answer
 }
 
 /// The leave question's two answers.
@@ -4615,6 +4719,77 @@ mod tests {
         }];
         let _ = ctx.run_ui(input(escape), |ui| answer = draw_leave_confirm(ui.ctx(), "denis@x.io"));
         assert_eq!(answer, Some(false));
+    }
+
+    /// **Accept asks before it joins** (fix round 1, M2): a link that reads
+    /// puts `Join "X"?` up, naming the link's org, and sends nothing; text
+    /// that is not a link is refused in the parser's words, sends nothing
+    /// and stays in the box. The question says what the link cannot, and
+    /// Escape is No.
+    #[test]
+    fn accept_asks_before_joining_and_escape_says_no() {
+        let mut pane = SharingPane::default();
+        pane.paste = Zeroizing::new("hello".into());
+        ask_to_join(&mut pane);
+        assert_eq!(pane.join_asking, None);
+        assert_eq!(pane.notice.as_deref(), Some(crate::invite_link::LinkError::NotAnInviteLink.sentence()));
+        assert_eq!(pane.paste.as_str(), "hello", "a refusal keeps the text");
+
+        pane.paste = Zeroizing::new(
+            "https://vault.example/#/accept-organization?organizationId=0f0e0d0c-0b0a-4009-8807-060504030201\
+             &organizationUserId=a1b2c3d4-e5f6-4789-8abc-def012345678&email=a%40b.c&organizationName=Shared+by+denis%40x.io&token=t"
+                .into(),
+        );
+        ask_to_join(&mut pane);
+        assert_eq!(pane.join_asking.as_deref(), Some("Join \"Shared by denis@x.io\"?"));
+        assert!(!pane.is_busy(), "nothing was sent before the answer");
+        assert_eq!(join_title(None), "Join this organisation?");
+
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(900.0, 700.0))),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let title = pane.join_asking.clone().unwrap_or_default();
+        let mut answer = None;
+        // An area is sized, unseen, on the frame it first appears.
+        let _ = ctx.run_ui(input(Vec::new()), |ui| answer = draw_join_confirm(ui.ctx(), &title));
+        let output = ctx.run_ui(input(Vec::new()), |ui| answer = draw_join_confirm(ui.ctx(), &title));
+        assert_eq!(answer, None, "undecided until a press");
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_texts(&clipped.shape, &mut texts);
+        }
+        for said in [title.as_str(), JOIN_BODY, JOIN_YES_LABEL, JOIN_NO_LABEL] {
+            assert!(texts.iter().any(|(t, _)| t == said), "{said:?} is not on the question: {texts:?}");
+        }
+        let escape = vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: Default::default() }];
+        let _ = ctx.run_ui(input(escape), |ui| answer = draw_join_confirm(ui.ctx(), &title));
+        assert_eq!(answer, Some(false));
+    }
+
+    /// **The box keeps a link the accept did not take** (fix round 1, M5):
+    /// Yes sends a clone, so a request refused for want of a daemon, or an
+    /// accept the engine or the server refused, leaves the link in the box;
+    /// only an accept that came back `Ok` empties it.
+    #[test]
+    fn a_refused_paste_keeps_the_link_and_an_accepted_one_empties_the_box() {
+        let link = "https://vault.example/#/accept-organization?token=t";
+        let mut pane = SharingPane { paste: Zeroizing::new(link.into()), join_asking: Some("Join?".into()), ..SharingPane::default() };
+        let (tx, _rx) = mpsc::channel();
+        assert!(!send_pasted_link(&mut pane, None, &egui::Context::default(), &tx), "no line to the daemon");
+        assert_eq!(pane.notice.as_deref(), Some(SHARING_UNAVAILABLE));
+        assert_eq!(pane.join_asking, None, "the question goes either way");
+        assert_eq!(pane.paste.as_str(), link);
+        pane.busy = true;
+        apply(&mut pane, SharingReport::LinkAccepted(Err("This invite link is for x@y.z.".into())), 0.0);
+        assert_eq!(pane.paste.as_str(), link, "a refused accept keeps the link");
+        pane.busy = true;
+        apply(&mut pane, SharingReport::LinkAccepted(Ok(())), 1.0);
+        assert!(pane.paste.is_empty(), "an accepted link leaves the box");
     }
 
     /// **A pasted link's answer**: accepted, a toast saying the records are on

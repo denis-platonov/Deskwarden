@@ -2908,8 +2908,9 @@ pub fn action_button_enabled(ui: &mut Ui, rect: Rect, label: &str, tone: ActionT
 }
 
 /// The design's small button, `.btn.sm { height: 28px; padding: 0 11px;
-/// font-size: 12px; border-radius: 7px }` -- 6d's invitation row's Accept and
-/// Decline. The same placed control as [`action_button`], one size down.
+/// font-size: 12px; border-radius: 7px }` -- Shared with me's Paste an invite
+/// link Accept, beside its box. The same placed control as
+/// [`action_button`], one size down.
 pub const SMALL_BUTTON_HEIGHT: f32 = 28.0;
 pub const SMALL_BUTTON_PAD_X: f32 = 11.0;
 pub const SMALL_BUTTON_TEXT_PX: f32 = 12.0;

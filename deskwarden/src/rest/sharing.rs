@@ -3030,11 +3030,15 @@ impl Sharing {
     /// accept route. The sharer's daemon confirms, and the records arrive on
     /// the push or the poll that confirm produces.
     ///
-    /// **The org is filed as waiting at once**, under the name's claim, so
-    /// Shared with me says "Waiting for X to finish sharing" the moment the
-    /// accept lands rather than after the next whole read -- which replaces
-    /// this entry with the directory's own word when it comes. A name that
-    /// claims no sharer files nothing.
+    /// **Nothing is filed from the link** (official-path spec §4.3: every
+    /// place that needs an attested owner keeps needing one). The link's
+    /// `organizationName` is plaintext anyone can write -- "Shared by
+    /// boss@corp" names nobody -- so the org is not put in [`Held::waiting`]
+    /// or [`Held::others`] here. It reaches Shared with me when a whole read's
+    /// directory attests its sharer, as every other sharing org does; until
+    /// then the window's toast (`share_ui::LINK_ACCEPTED`) is the answer.
+    /// `a_links_org_name_files_no_sharer_until_the_server_attests_one` holds
+    /// this.
     ///
     /// The link is the caller's; nothing here logs it or keeps it, and the
     /// token leaves this process only in the accept's body.
@@ -3057,12 +3061,6 @@ impl Sharing {
             sharing_api::accept_invite(client, &mut auth.session, &invite.organization_id, &invite.organization_user_id, &invite.token)
         })
         .map_err(|e| e.or_say(LINK_ACCEPT_FAILED))?;
-        if let Some(from) = invite.organization_name.as_deref().and_then(sharer_of) {
-            let mut held = self.held();
-            if !held.waiting.iter().any(|(org, _)| *org == invite.organization_id) {
-                held.waiting.push((invite.organization_id.clone(), from.to_string()));
-            }
-        }
         Ok(())
     }
 
@@ -6426,8 +6424,8 @@ mod tests {
     }
 
     /// **A pasted link is accepted on Bitwarden's own route** (official-path
-    /// spec §4.1), and the sharer is waited on at once -- under the name's
-    /// claim, until a whole read says more.
+    /// spec §4.1): the link's ids in the path, its token in the body, and no
+    /// invitation list read.
     #[test]
     fn a_pasted_link_is_accepted_on_the_official_route() {
         let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
@@ -6441,10 +6439,29 @@ mod tests {
         engine.accept_link(&invite_link_for(FIXTURE_EMAIL)).expect("accepted");
         accepted.assert();
         listed.assert();
-        assert_eq!(
-            engine.view(&[]).waiting,
-            vec![WaitingEntry { organization_id: "0f0e0d0c-0b0a-4009-8807-060504030201".into(), from: "denis@example.com".into() }]
-        );
+    }
+
+    /// **A link's org name files no sharer until the server attests one**
+    /// (official-path spec §4.3, fix round 1 I1). The name is plaintext
+    /// anyone can write: a "Shared by boss@corp.example" link, accepted, puts
+    /// nothing in waiting and nothing in Shared with me -- not even a record
+    /// of that org the vault already holds -- and a later pass whose
+    /// directory does not list the org adds nothing either.
+    #[test]
+    fn a_links_org_name_files_no_sharer_until_the_server_attests_one() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([]));
+        server.mock("POST", Matcher::Regex("/accept$".into())).with_body("").expect(1).create();
+        let org = "0f0e0d0c-0b0a-4009-8807-060504030201";
+        let link = invite_link_for(FIXTURE_EMAIL).replace("Shared+by+denis%40example.com", "Shared+by+boss%40corp.example");
+        engine.accept_link(&link).expect("accepted");
+        let theirs: VaultItem =
+            serde_json::from_value(serde_json::json!({ "id": "theirs-1", "name": "Payroll", "organizationId": org })).expect("item");
+        let view = engine.view(std::slice::from_ref(&theirs));
+        assert!(view.waiting.is_empty(), "a sharer named by the link alone: {view:?}");
+        assert!(view.received.is_empty(), "a record filed under the link's claim: {view:?}");
+        engine.refresh(Trigger::Timer).expect("a pass");
+        let view = engine.view(std::slice::from_ref(&theirs));
+        assert!(view.waiting.is_empty() && view.received.is_empty(), "{view:?}");
     }
 
     /// **A link for another account is refused in words, before any

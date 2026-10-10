@@ -1510,15 +1510,22 @@ impl RestClient {
     /// that module can build -- the same argument [`MappedCipher`] makes for
     /// the cipher endpoints, applied to a family of routes. What its body can
     /// carry is therefore enumerable from one file: emails and ids in the
-    /// clear (they are what these routes are about), and everything else as
-    /// ciphertext -- an org key wrapped to a public key, a collection name
-    /// under the org key, and, for `/share`, a [`MappedCipher`]'s own body.
+    /// clear (they are what these routes are about); two secrets in the
+    /// clear, each the route's whole point -- an invitation's token, pasted
+    /// in its link (`sharing_api::accept_invite`), and the administrator's
+    /// master password hash (`sharing_api::registration_invite`) -- whose
+    /// copies in the body the request wipes when it drops; and everything
+    /// else as ciphertext -- an org key wrapped to a public key, a collection
+    /// name under the org key, and, for `/share`, a [`MappedCipher`]'s own
+    /// body.
     /// `the_only_json_bodies_this_module_sends_are_mapped_ciphers_and_the_prelogin`
     /// names this door's one `send_json` so a second cannot hide behind it.
     ///
     /// Reads on the sync agent, writes on the write agent, both with the
-    /// vault's session: every sharing route is the account acting on its own
-    /// organisation, never a link a stranger pasted.
+    /// vault's session, and always to this server: the path is one
+    /// `sharing_api` wrote. A pasted invite link supplies only two of its ids
+    /// -- GUIDs, checked path-safe as every id is (`crate::invite_link`) --
+    /// and the token for the body; never a host, a path or a URL.
     pub(crate) fn send_sharing(
         &self,
         session: &mut Session,
