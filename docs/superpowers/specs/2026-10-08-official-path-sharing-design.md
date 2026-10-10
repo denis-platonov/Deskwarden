@@ -63,7 +63,7 @@ If one of them answers 404, sharing is off with the reason `server-too-old` (unc
 - **Creatable** (NodeWarden, Vaultwarden):
   - created on the first share with the official body (base spec §9.5);
   - named `Shared by <email>` (base spec §5.1).
-- **Not creatable** (official self-hosted). The Share dialog says *"Your server needs an organisation for sharing. Create one named "Shared by <your email>" in the web vault, then try again."* Deskwarden adopts it by name and ownership (base spec §5.1). Seat limits are the licence's. When an invite fails for lack of seats, the dialog shows the server's own error text.
+- **Not creatable** (official self-hosted). The Share dialog says *"Your server needs an organisation for sharing. Create one named "Shared by <your email>" in the web vault, then try again."* Deskwarden adopts it by name and ownership (base spec §5.1), and only after the user confirms it: the roster rules and the question under "Adopting an org Deskwarden did not create" below apply to it as to any org Deskwarden did not create. Seat limits are the licence's. When an invite fails for lack of seats, the dialog shows the server's own error text.
 - **Recognising the sharer's own org** (amended after DW1's review, owner-approved). An org is written to only when the account owns it, it is named for the account, and one of these holds:
   - this client created it (the cached `sharing_org_created` id); or
   - the user adopted it (the cached `sharing_org_adopted` id, set by the question below).

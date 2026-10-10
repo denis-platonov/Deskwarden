@@ -214,11 +214,19 @@ pub const ORG_FAILED: &str = "Deskwarden couldn't start sharing on this server."
 /// The server's list of the people in the sharing org was not one.
 pub const ROSTER_UNREADABLE: &str = "Deskwarden couldn't read who you share with. Try again.";
 /// More than one organisation passes every test for this account's own
-/// sharing org, and Deskwarden made none of them (plan fix round 1, I1).
-/// Picking one would be a guess about which the user meant -- and a planted
-/// one among them would win half the time -- so nothing is chosen.
-pub const SEVERAL_ORGS: &str = "You own more than one organisation named for you, and Deskwarden didn't create any of them. \
-     Delete or rename the extra ones in the web vault, then try again.";
+/// sharing org, and Deskwarden made none of them on this PC (plan fix round
+/// 1, I1). Picking one would be a guess about which the user meant -- and a
+/// planted one among them would win half the time -- so nothing is chosen.
+///
+/// **It says what is true and advises nothing** (fix round 2, m4). The
+/// earlier "Delete or rename the extra ones" could have the user delete the
+/// org their own shares live in. Offering a choice between them was weighed
+/// and not built: every candidate carries the same "Shared by <you>" name, so
+/// the only thing a picker could show to tell them apart is an id, and the
+/// user's pick between a real org and a planted twin would be the same guess
+/// this sentence refuses to make.
+pub const SEVERAL_ORGS: &str = "You own more than one organisation named for you on this server, and Deskwarden can't tell \
+     which of them is yours on this PC, so it hasn't shared anything.";
 /// The sharing org's roster answered 404 and the profile no longer lists it
 /// as this account's to own: deleted, or this account was moved out of the
 /// owner role. Its id is dropped, so the next share makes a new one.
@@ -230,6 +238,10 @@ pub const NO_FRESH_ORG: &str = "This server won't let Deskwarden create a sharin
 /// Yes to an organisation that no longer passes the roster rule, or is no
 /// longer listed, by the time the answer came.
 pub const ADOPT_REFUSED: &str = "Deskwarden can't use that organisation for sharing any more. Try sharing again.";
+/// An adopt with no question pending, or for an org other than the one the
+/// last share asked about (fix round 2, m2): only the user's answer to the
+/// question Deskwarden asked can pin an org it did not create.
+pub const ADOPT_NOT_ASKED: &str = "Deskwarden didn't ask about that organisation. Share again to choose.";
 /// Yes was said, but the choice could not be saved, so it would be asked
 /// again: said rather than pretended.
 pub const ADOPT_NOT_SAVED: &str = "Deskwarden couldn't save that choice. Try again.";
@@ -632,6 +644,13 @@ pub(crate) struct Held {
     pub(crate) key_changed: BTreeSet<String>,
     /// Emails whose account has no public key yet.
     pub(crate) no_key: BTreeSet<String>,
+    /// **The org the last share asked about** ([`SharingError::NeedsAdoption`])
+    /// and the user has not answered yet (fix round 2, m2). [`Sharing::adopt`]
+    /// takes only this id, once; No ([`Sharing::share_in_a_new_org`]) spends
+    /// it too. So nothing but the user's own answer to the question
+    /// Deskwarden asked -- not a caller of `POST /sharing/adopt` naming any
+    /// org it likes -- can pin an org Deskwarden did not create.
+    pub(crate) asked_adoption: Option<String>,
 }
 
 impl std::fmt::Debug for Held {
@@ -645,6 +664,7 @@ impl std::fmt::Debug for Held {
             .field("incoming", &format_args!("<{} invitations>", self.incoming.len()))
             .field("key_changed", &self.key_changed)
             .field("no_key", &self.no_key)
+            .field("asked_adoption", &self.asked_adoption)
             .finish()
     }
 }
@@ -1021,8 +1041,9 @@ impl Sharing {
         let held = self.held();
         let now = now_millis();
         held.my_org.as_ref().is_some_and(|org| {
+            // Revoked waits for an admin, not for anything the timer reads.
             org.roster.iter().any(|m| {
-                m.status != MemberStatus::Confirmed
+                !matches!(m.status, MemberStatus::Confirmed | MemberStatus::Revoked)
                     && !invitation_ran_out(m, now)
                     && org.authenticated_collection_for(&m.email).is_some()
             })
@@ -1211,14 +1232,16 @@ fn owned_and_named(org: &crate::rest::sync::Organization, account_email: &str) -
 /// **The roster's word that a candidate org could be this account's own**
 /// (official-path spec §3.1, owner's fix round 1, C1). All three must hold:
 ///
-/// 1. This account's own row is an OWNER, and CONFIRMED.
+/// 1. This account's own row is an OWNER, and CONFIRMED -- status 2, not
+///    official Bitwarden's revoked -1 (`MemberStatus::Revoked`, fix round 2).
 /// 2. Every other row is a plain `member` -- in any status. An owner, admin,
 ///    manager or custom row reads every collection, so an attacker who made
 ///    "Shared by <me>", made this account an owner and then stepped down to
 ///    any of them could still read every share. An INVITED or revoked row in
 ///    such a role counts: accepted or restored later, it reads the same.
 /// 3. Every collection a member is listed on is the ONE authenticated
-///    collection named for that member's own email, held read-only. A member
+///    collection named for that member's own email, held read-only and NOT
+///    managed (a manager edits who reaches it; fix round 2, m3). A member
 ///    seat on anybody else's collection -- the attacker's other way to keep
 ///    reading -- fails, as does one on a plaintext-named collection, which the
 ///    server can write.
@@ -1241,7 +1264,9 @@ fn roster_says_mine(roster: &[Member], collections: &[PersonCollection], account
             let email = normalise_email(&m.email);
             let own: Vec<&str> = collections.iter().filter(|c| c.authenticated && c.email == email).map(|c| c.id.as_str()).collect();
             m.role == "member"
-                && m.collections.iter().all(|c| own.as_slice() == [c.as_str()] && m.read_only.iter().any(|r| r == c))
+                && m.collections.iter().all(|c| {
+                    own.as_slice() == [c.as_str()] && m.read_only.iter().any(|r| r == c) && !m.manage.iter().any(|x| x == c)
+                })
         })
 }
 
@@ -1401,11 +1426,21 @@ impl Sharing {
     ///
     /// # Errors
     ///
-    /// The org is no longer a candidate or no longer passes; its roster
-    /// could not be read; or the choice could not be saved
-    /// ([`ADOPT_NOT_SAVED`]) -- said, since unsaved it would be asked again.
+    /// It is not the org the last share asked about, or that question was
+    /// already answered ([`ADOPT_NOT_ASKED`]); the org is no longer a
+    /// candidate or no longer passes; its roster could not be read; or the
+    /// choice could not be saved ([`ADOPT_NOT_SAVED`]) -- said, since unsaved
+    /// it would be asked again.
     pub fn adopt(&self, organization_id: &str) -> Result<(), SharingError> {
         let _one = self.one_at_a_time();
+        // **Only the org the last share asked about, and only once** (fix
+        // round 2, m2): any adopt spends the question, whatever it named and
+        // however it ends, so a second Yes -- or a call naming another org --
+        // needs a share to ask again.
+        let asked = self.held().asked_adoption.take();
+        if asked.as_deref() != Some(organization_id) {
+            return Err(SharingError::Refused(ADOPT_NOT_ASKED.to_string()));
+        }
         self.require_available()?;
         let profile = self.profile()?;
         let account = keyed_account(self.held().account.clone())?;
@@ -1661,7 +1696,9 @@ impl Sharing {
     pub(crate) fn ensure_member(&self, ctx: &mut Ctx, email: &str, collection: &str) -> Result<ShareResult, SharingError> {
         let refused = format!("Couldn't invite {email}.");
         if let Some(member) = ctx.member(email).cloned() {
-            if member.has_access(collection) {
+            // A revoked member is listed on the collection and reaches none
+            // of it (fix round 2, m1): invited again like one without access.
+            if member.has_access(collection) && member.status != MemberStatus::Revoked {
                 return Ok(share_result_of(&member));
             }
             let ou = member.id.clone();
@@ -1848,6 +1885,10 @@ impl Sharing {
 
     fn share_with(&self, item_id: &str, email: &str, new_org: bool) -> Result<ShareOutcome, SharingError> {
         let _one = self.one_at_a_time();
+        if new_org {
+            // No is an answer: the question is spent (m2).
+            self.held().asked_adoption = None;
+        }
         self.require_available()?;
         let email = normalise_email(email);
         if !plausible_email(&email) {
@@ -1886,7 +1927,11 @@ impl Sharing {
         } else {
             match self.org_for_a_share(&profile, &account, &keys)? {
                 OrgChoice::Ours(id) => Some(id),
-                OrgChoice::Adoptable(question) => return Err(SharingError::NeedsAdoption(question)),
+                OrgChoice::Adoptable(question) => {
+                    // Recorded, so only this answer can pin it (m2).
+                    self.held().asked_adoption = Some(question.organization_id.clone());
+                    return Err(SharingError::NeedsAdoption(question));
+                }
                 OrgChoice::Nothing => None,
             }
         };
@@ -3184,11 +3229,14 @@ fn invite_code_refused(error: SharingError, email: &str) -> SharingError {
 }
 
 /// What a share or a re-invite ends as, read off the person's roster row.
+/// A revoked row never gets here from [`Sharing::ensure_member`], which
+/// invites such a person again; read anyway, it is not "Shared" -- they wait
+/// for an admin, as an invitation waits for its person.
 fn share_result_of(member: &Member) -> ShareResult {
     match member.status {
         MemberStatus::Confirmed => ShareResult::Shared,
         MemberStatus::Accepted => ShareResult::WaitingAccept,
-        MemberStatus::Invited => ShareResult::WaitingAccount,
+        MemberStatus::Invited | MemberStatus::Revoked => ShareResult::WaitingAccount,
     }
 }
 
@@ -3207,7 +3255,9 @@ fn person_state(member: Option<&Member>, collection_id: &str, held: &Held, now: 
         MemberStatus::Accepted if held.no_key.contains(&email) => PersonState::WaitingSignIn,
         MemberStatus::Accepted => PersonState::WaitingAccept,
         MemberStatus::Confirmed if member.has_access(collection_id) => PersonState::Shared,
-        MemberStatus::Confirmed => PersonState::Gone,
+        // Revoked reaches nothing until restored: not Shared, and a share or
+        // Re-invite brings them back as for any member who lost access.
+        MemberStatus::Confirmed | MemberStatus::Revoked => PersonState::Gone,
     }
 }
 
@@ -3254,6 +3304,7 @@ mod tests {
             status,
             collections: collections.iter().map(|c| (*c).to_string()).collect(),
             read_only: collections.iter().map(|c| (*c).to_string()).collect(),
+            manage: Vec::new(),
             invitation_expires: expires.map(str::to_string),
         }
     }
@@ -3708,7 +3759,19 @@ mod tests {
         assert!(body["message"].as_str().is_some_and(|m| m.starts_with(NO_FRESH_ORG)), "{body}");
         assert_eq!(cached(&dir), (None, false), "No pinned nothing");
 
-        let answer = crate::vault_api::tests::ask(&api, "POST", "/sharing/adopt", Some(&token), &serde_json::json!({ "organizationId": FIXTURE_ORG }).to_string());
+        // No spent the question (m2): Yes needs the share to ask again, and
+        // then takes only the org it asked about.
+        let adopt = |org: &str| {
+            crate::vault_api::tests::ask(&api, "POST", "/sharing/adopt", Some(&token), &serde_json::json!({ "organizationId": org }).to_string())
+        };
+        assert_eq!(adopt(FIXTURE_ORG).status, 400, "an answer to a question already answered");
+        let asked = crate::vault_api::tests::ask(&api, "POST", "/sharing/item/live-1", Some(&token), r#"{"email":"anna@example.com"}"#);
+        assert!(asked.body.contains("\"adopt\""), "{}", asked.body);
+        let wrong = adopt("org-other");
+        assert_eq!(wrong.status, 400, "{}", wrong.body);
+        assert!(wrong.body.contains(ADOPT_NOT_ASKED), "{}", wrong.body);
+        crate::vault_api::tests::ask(&api, "POST", "/sharing/item/live-1", Some(&token), r#"{"email":"anna@example.com"}"#);
+        let answer = adopt(FIXTURE_ORG);
         assert_eq!(answer.status, 200, "{}", answer.body);
         assert_eq!(cached(&dir).0.as_deref(), Some(FIXTURE_ORG));
         assert!(adopted(&dir), "Yes pinned the org as adopted");
@@ -5490,6 +5553,13 @@ mod tests {
         let plain = roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", 2, &["c-mal"]);
         let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), plain], &[plaintext_collection("c-mal", "mallory@evil.example")]);
         shares_into_a_fresh_org(&mut server, &engine, &dir, "a member on a collection named in plaintext");
+
+        // Fix round 2, m3: read-only but MANAGE is not "held read-only" -- a
+        // manager of a collection edits who reaches it.
+        let mut managing = roster_row("anna-ou", Some("anna-id"), "anna@example.com", 2, &["c-anna"]);
+        managing["collections"][0]["manage"] = serde_json::json!(true);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), managing], &[person_collection("c-anna", "anna@example.com")]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "a member who manages their own collection");
     }
 
     /// **C1: an invitation in the admin role is an admin** -- accepted
@@ -5509,6 +5579,86 @@ mod tests {
         let admin_me = in_role(me_row(), 1);
         let (mut server, _backend, engine, dir) = unpinned_org(&[admin_me], &[]);
         shares_into_a_fresh_org(&mut server, &engine, &dir, "this account an admin");
+
+        // Fix round 2, m1: official Bitwarden's revoked is status -1, which
+        // is not "confirmed" -- for this account's own row, and an admin row
+        // stays an admin row revoked or not.
+        let revoked_me = roster_row(FIXTURE_USER_ID, Some(FIXTURE_USER_ID), FIXTURE_EMAIL, -1, &[]);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[revoked_me], &[]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "this account revoked");
+
+        let revoked_admin = in_role(roster_row("mal-ou", Some("mal-id"), "mallory@evil.example", -1, &[]), 1);
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row(), revoked_admin], &[]);
+        shares_into_a_fresh_org(&mut server, &engine, &dir, "a revoked admin");
+    }
+
+    /// **m1: a revoked recipient is not Shared on the card**: revoked, they
+    /// reach nothing until restored, so the card says Gone, and they do not
+    /// keep the ten-minute timer reading the roster.
+    #[test]
+    fn a_revoked_recipient_is_not_shown_as_shared() {
+        let engine = offline();
+        let ivy = |status: i64| {
+            crate::rest::organizations::map_members(&serde_json::json!({ "data": [roster_row("ivy-ou", Some("ivy-id"), "ivy@x.io", status, &["c-ivy"])] }))
+                .expect("a roster")
+        };
+        {
+            let mut held = engine.held();
+            held.capabilities.loaded = true;
+            held.account = Some(Account { id: "me".into(), email: "me@x.io".into(), admin: false, keyed: true });
+            held.my_org = Some(MyOrg { id: "org1".into(), collections: vec![authentic("c-ivy", "ivy@x.io")], roster: ivy(-1) });
+        }
+        assert_eq!(engine.view(&[]).person("ivy@x.io").map(|p| p.state), Some(PersonState::Gone));
+        assert!(!engine.wants_timer(), "a revoked member kept the timer running");
+        engine.held().my_org.as_mut().expect("held").roster = ivy(2);
+        assert_eq!(engine.view(&[]).person("ivy@x.io").map(|p| p.state), Some(PersonState::Shared), "control");
+    }
+
+    /// **m1: a share to a revoked person invites them again** -- as for a
+    /// member without access to their collection (decision 11): removed,
+    /// then Bitwarden's invite, never "already shared".
+    #[test]
+    fn a_share_to_a_revoked_person_removes_and_invites_them_again() {
+        let (mut server, _backend, engine, _dir) = on_nodewarden(serde_json::json!([sharing_org_row()]));
+        server.mock("GET", "/api/ciphers/p1").with_body(personal_cipher("p1", "Acme VPN").to_string()).create();
+        with_collections(&mut server, &[person_collection("c-anna", "anna@example.com")]);
+        server
+            .mock("GET", format!("/api/organizations/{FIXTURE_ORG}/users?includeCollections=true").as_str())
+            .with_body(roster(&[me_row(), roster_row("anna-ou", Some("anna-id"), "anna@example.com", -1, &["c-anna"])]))
+            .expect(1)
+            .create();
+        with_roster(&mut server, &[me_row(), roster_row("inv-anna", None, "anna@example.com", 0, &["c-anna"])]);
+        let removed = server.mock("DELETE", format!("/api/organizations/{FIXTURE_ORG}/users/anna-ou").as_str()).with_body("").expect(1).create();
+        let invited = server.mock("POST", format!("/api/organizations/{FIXTURE_ORG}/users/invite").as_str()).with_body("").expect(1).create();
+        server.mock("PUT", "/api/ciphers/p1/share").with_body_from_request(echo("p1", Some(FIXTURE_ORG), &["c-anna"])).create();
+        let outcome = engine.share("p1", "anna@example.com").expect("shared");
+        removed.assert();
+        invited.assert();
+        assert_eq!(outcome.result, ShareResult::WaitingAccount);
+    }
+
+    /// **m2: adopt takes only the org the last share asked about, once.** No
+    /// question pending, or another id, is refused and pins nothing; Yes
+    /// spends the question; No spends it too.
+    #[test]
+    fn adopt_takes_only_the_org_the_share_asked_about_and_only_once() {
+        let not_asked = |answer: Result<(), SharingError>| matches!(answer, Err(SharingError::Refused(s)) if s == ADOPT_NOT_ASKED);
+        let (_server, _backend, engine, dir) = unpinned_org(&[me_row()], &[]);
+        assert!(not_asked(engine.adopt(FIXTURE_ORG)), "no question pending");
+        assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::NeedsAdoption(_))));
+        assert!(not_asked(engine.adopt("org-other")), "an org that was not asked about");
+        assert_eq!(cached(&dir), (None, false));
+        assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::NeedsAdoption(_))));
+        engine.adopt(FIXTURE_ORG).expect("the org asked about");
+        assert!(adopted(&dir));
+        assert!(not_asked(engine.adopt(FIXTURE_ORG)), "the question is spent");
+
+        let (mut server, _backend, engine, dir) = unpinned_org(&[me_row()], &[]);
+        assert!(matches!(engine.share("p1", "anna@example.com"), Err(SharingError::NeedsAdoption(_))));
+        server.mock("POST", "/api/organizations").with_status(400).with_body(r#"{"message":"No."}"#).create();
+        let _ = engine.share_in_a_new_org("p1", "anna@example.com");
+        assert!(not_asked(engine.adopt(FIXTURE_ORG)), "No answered the question");
+        assert_eq!(cached(&dir), (None, false));
     }
 
     /// **A second PC's roster -- only members, each on their own read-only

@@ -304,6 +304,11 @@ pub enum MemberStatus {
     Invited,
     Accepted,
     Confirmed,
+    /// Official Bitwarden's status -1: access taken away until an admin
+    /// restores it. It reaches nothing, so it is not a viewer, not Shared
+    /// on the card, and not "a confirmed owner" (DW1 fix round 2, m1). It was
+    /// read as Confirmed, the catch-all for a status the reader did not name.
+    Revoked,
 }
 
 /// One member of one organisation. See the module docs for what it carries
@@ -331,6 +336,10 @@ pub struct Member {
     pub collections: Vec<String>,
     /// The subset of `collections` held read-only.
     pub read_only: Vec<String>,
+    /// The subset of `collections` this member MANAGES -- edits who reaches
+    /// it. Read-only on the items is not "held read-only" when this is set
+    /// (DW1 fix round 2, m3; `rest::sharing::roster_says_mine`).
+    pub manage: Vec<String>,
     /// NodeWarden's `invitationExpirationDate`, for an invitation.
     pub invitation_expires: Option<String>,
 }
@@ -627,11 +636,12 @@ impl Directory {
             Roster::Unknown => None,
             // Anyone past the invitation counts as a viewer -- the rule this
             // count always had (status "not zero"); a member still waiting
-            // for the key is about to see it.
+            // for the key is about to see it. A revoked member sees nothing
+            // until restored, and is not counted (fix round 2, m1).
             Roster::Known(members) => Some(
                 members
                     .iter()
-                    .filter(|m| m.status != MemberStatus::Invited && m.reaches(&filed_in))
+                    .filter(|m| !matches!(m.status, MemberStatus::Invited | MemberStatus::Revoked) && m.reaches(&filed_in))
                     .count()
                     // The viewer. See `Audience::Shared::others`.
                     .saturating_sub(1),
@@ -920,6 +930,7 @@ fn map_member(raw: &Value) -> Option<Member> {
             }
         }
         Some(1) => MemberStatus::Accepted,
+        Some(status) if status < 0 => MemberStatus::Revoked,
         Some(_) => MemberStatus::Confirmed,
     };
     let user_id = match object.get("userId") {
@@ -942,14 +953,18 @@ fn map_member(raw: &Value) -> Option<Member> {
     };
     let mut collections = Vec::new();
     let mut read_only = Vec::new();
+    let mut manage = Vec::new();
     for entry in object.get("collections").and_then(Value::as_array).into_iter().flatten() {
-        // Bare id strings (NodeWarden's older rows) or `{id, readOnly, ..}`.
+        // Bare id strings (NodeWarden's older rows) or `{id, readOnly, manage, ..}`.
         let Some(cid) = entry.as_str().or_else(|| entry.get("id").and_then(Value::as_str)).filter(|id| !id.is_empty())
         else {
             continue;
         };
         if entry.get("readOnly").and_then(Value::as_bool) == Some(true) {
             read_only.push(cid.to_string());
+        }
+        if entry.get("manage").and_then(Value::as_bool) == Some(true) {
+            manage.push(cid.to_string());
         }
         collections.push(cid.to_string());
     }
@@ -962,6 +977,7 @@ fn map_member(raw: &Value) -> Option<Member> {
         status,
         collections,
         read_only,
+        manage,
         invitation_expires: object
             .get("invitationExpirationDate")
             .and_then(Value::as_str)
@@ -1043,6 +1059,8 @@ struct WireMember {
     #[serde(default)]
     read_only: Vec<String>,
     #[serde(default)]
+    manage: Vec<String>,
+    #[serde(default)]
     invitation_expires: Option<String>,
 }
 
@@ -1111,6 +1129,7 @@ impl Directory {
                                     status: m.status,
                                     collections: m.collections.clone(),
                                     read_only: m.read_only.clone(),
+                                    manage: m.manage.clone(),
                                     invitation_expires: m.invitation_expires.clone(),
                                 })
                                 .collect(),
@@ -1156,6 +1175,7 @@ impl Directory {
                                     status: m.status,
                                     collections: m.collections,
                                     read_only: m.read_only,
+                                    manage: m.manage,
                                     invitation_expires: m.invitation_expires,
                                 })
                                 .collect(),
@@ -1702,6 +1722,22 @@ mod tests {
         assert_eq!(members[0].role, "member", "NodeWarden's constant `type: 0` is not an owner");
         assert_eq!(members[1].status, MemberStatus::Confirmed);
         assert_eq!(members[1].role, "owner");
+    }
+
+    /// **A revoked row is not confirmed** (DW1 fix round 2, m1): official
+    /// Bitwarden says revoked as status -1, and such a member reaches nothing
+    /// until restored. Read as confirmed it counted as a viewer, showed as
+    /// Shared on the card, and passed "this account is a confirmed owner".
+    #[test]
+    fn a_revoked_row_is_neither_confirmed_nor_a_viewer() {
+        let users = json!({ "data": [
+            { "object": "organizationUserUserDetails", "id": "ou-1", "userId": "u-1", "email": "a@x.io",
+              "type": 2, "status": -1, "collections": [{ "id": "c1", "readOnly": true, "hidePasswords": false, "manage": false }] }
+        ]});
+        let members = map_members(&users).expect("a roster");
+        assert!(!members[0].confirmed(), "a revoked member was read as confirmed");
+        assert_ne!(members[0].status, MemberStatus::Accepted, "nor as waiting for the key");
+        assert_ne!(members[0].status, MemberStatus::Invited);
     }
 
     #[test]
