@@ -1342,10 +1342,10 @@ fn install_destination(exe_dir: &Path) -> PathBuf {
 /// Beside the updater's own download directory, under the OS cache location,
 /// so nothing here is ever written into the install tree until it has passed.
 fn scratch_dir() -> Result<PathBuf, AcquireRefusal> {
-    let dirs = directories::ProjectDirs::from("", "", "deskwarden").ok_or_else(|| {
+    let cache = crate::app_profile::bw_cli_cache_dir().ok_or_else(|| {
         AcquireRefusal::CouldNotInstall("could not locate a cache directory".to_string())
     })?;
-    let dir = dirs.cache_dir().join("bw-cli");
+    let dir = cache.join("bw-cli");
     std::fs::create_dir_all(&dir).map_err(|e| {
         AcquireRefusal::CouldNotInstall(format!("could not create {}: {e}", dir.display()))
     })?;
@@ -1405,6 +1405,13 @@ fn add_to_user_path(dir: &Path) -> Result<(), String> {
     use windows::Win32::UI::WindowsAndMessaging::{
         SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
     };
+
+    // A test copy (`crate::app_profile`) changes nothing outside its own
+    // folders, and the user's `PATH` is the user's, shared with the installed
+    // copy. The caller logs this and carries on, as for any failed write.
+    if !crate::app_profile::touches_the_installed_copy() {
+        return Err(crate::app_profile::installed_copy_refusal("changes the user's PATH"));
+    }
 
     let wanted = dir.to_string_lossy().to_string();
     let mut key = HKEY::default();

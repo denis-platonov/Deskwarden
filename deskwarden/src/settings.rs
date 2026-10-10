@@ -745,18 +745,17 @@ pub fn clamp_window_geometry(saved: WindowGeometry, work_areas: &[WorkArea]) -> 
     WindowPlacement { width, height, position: Some((x, y)) }
 }
 
-/// The `directories` triple `main.rs` resolves its config directory from, and
-/// the file name it joins onto it.
+/// The file name `main.rs` joins onto its config directory.
 ///
-/// Duplicated here rather than threaded in because `vault_window::run` -- the
-/// only writer of [`Settings::vault_window`] -- is handed an `auto_lock:
-/// Duration`, not a settings path, and widening its signature means editing
-/// `main.rs`. `the_config_path_still_matches_the_one_main_resolves` is a
-/// source-text guard over `main.rs` so this duplication cannot silently drift
-/// into writing a second settings file nothing reads.
-const PROJECT_QUALIFIER: &str = "dev";
-const PROJECT_ORGANIZATION: &str = "Deskwarden";
-const PROJECT_APPLICATION: &str = "Deskwarden";
+/// That directory comes from [`crate::app_profile::app_dirs`] here and in
+/// `main.rs` alike -- the one place the crate asks the OS for its folders, and
+/// the one place a test profile is applied. It used to be a `directories`
+/// triple spelled twice, once here and once in `main.rs`, because
+/// `vault_window::run` -- the only writer of [`Settings::vault_window`] -- is
+/// handed an `auto_lock: Duration`, not a settings path.
+/// `the_config_path_still_matches_the_one_main_resolves` is a source-text
+/// guard over `main.rs` so the two cannot drift into writing a second settings
+/// file nothing reads.
 pub const SETTINGS_FILE_NAME: &str = "settings.json";
 
 /// Where `settings.json` lives, or `None` if the platform has no resolvable
@@ -769,20 +768,19 @@ pub fn default_path() -> Option<std::path::PathBuf> {
 /// The directory `settings.json` lives in, for the other file this app keeps
 /// beside it.
 ///
-/// **Extracted so the triple is spelled once inside this crate**, not so that
-/// anything may write anywhere. The only other file in that directory is
+/// **Extracted so the folder is resolved once inside this crate**, not so
+/// that anything may write anywhere. The only other file in that directory is
 /// [`crate::scan_history`]'s, which is deliberately a separate file rather
 /// than more fields on [`Settings`] -- see that module for why a record is
-/// not a preference. A second copy of `ProjectDirs::from(..)` is exactly how
-/// one of the two would come to be written into a directory the other does
-/// not read.
+/// not a preference. A second way of resolving it is exactly how one of the
+/// two would come to be written into a directory the other does not read --
+/// or, under a test profile, into the owner's.
 ///
 /// `None` where the platform has no resolvable config directory, in which
 /// case nothing is persisted -- the same silent fall-back every other read
 /// here makes.
 pub fn config_dir() -> Option<std::path::PathBuf> {
-    directories::ProjectDirs::from(PROJECT_QUALIFIER, PROJECT_ORGANIZATION, PROJECT_APPLICATION)
-        .map(|dirs| dirs.config_dir().to_path_buf())
+    crate::app_profile::app_dirs().map(|dirs| dirs.config_dir)
 }
 
 /// `true`, for `serde(default)` on a field whose absence must not read as
@@ -3826,7 +3824,8 @@ mod tests {
     ///
     /// The reason the guard below reads this rather than the raw
     /// `include_str!` bytes. That guard is a **presence** pin -- `main.rs`
-    /// must spell the `ProjectDirs` triple that `default_path` duplicates --
+    /// must resolve its folder the way `default_path` does (it was the
+    /// `ProjectDirs` triple, and is `app_profile::app_dirs` now) --
     /// and for a presence pin the whole file is the LOOSE side, not the
     /// strict one: a fixture in one of `main.rs`'s own test modules spelling
     /// the triple would satisfy it after production had stopped spelling it,
@@ -3946,14 +3945,24 @@ mod tests {
              split at the first `cfg(test)` gate would have done to `main.rs`"
         );
 
-        let triple = format!(
-            "ProjectDirs::from({PROJECT_QUALIFIER:?}, {PROJECT_ORGANIZATION:?}, {PROJECT_APPLICATION:?})"
+        // The folder: both sides ask `app_profile::app_dirs`, and `main.rs`
+        // asks nothing else. A `ProjectDirs::from(` left in `main.rs` would
+        // be a folder no test profile is applied to.
+        let resolved = concat!("app_profile::", "app_dirs()");
+        assert!(
+            main_rs.contains(resolved),
+            "main.rs no longer resolves its config directory with {resolved} -- \
+             `settings::config_dir` does, and would now point at a different directory than \
+             the file main.rs actually loads"
         );
         assert!(
-            main_rs.contains(&triple),
-            "main.rs no longer resolves its config directory with {triple} -- `settings::default_path` \
-             duplicates that triple and would now point at a different directory than the file \
-             main.rs actually loads"
+            !main_rs.contains(concat!("ProjectDirs::", "from(")),
+            "main.rs resolves a folder from the OS itself again, beside {resolved}"
+        );
+        let ours = production_half(include_str!("settings.rs")).0;
+        assert!(
+            ours.contains(concat!("crate::app_profile::", "app_dirs().map(|dirs| dirs.config_dir)")),
+            "`settings::config_dir` no longer comes from {resolved}"
         );
         let join = format!("config_dir.join({SETTINGS_FILE_NAME:?})");
         assert!(

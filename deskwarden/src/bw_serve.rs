@@ -19,6 +19,28 @@ pub const BW_SERVE_PORT: u16 = 8087;
 /// Base URL of the local `bw serve` bridge.
 pub const BW_SERVE_URL: &str = "http://localhost:8087";
 
+/// The port THIS process starts `bw serve` on and talks to it at:
+/// [`BW_SERVE_PORT`] for the default copy, and a port of the profile's own
+/// under a test profile ([`crate::app_profile::bw_serve_port_for`]). `bw
+/// serve` answers anyone on loopback with no credential, so a test copy that
+/// shared the owner's port would be reading the owner's unlocked vault.
+#[must_use]
+pub fn port() -> u16 {
+    crate::app_profile::bw_serve_port_for(BW_SERVE_PORT, crate::app_profile::active())
+}
+
+/// The base URL for [`port`]: exactly [`BW_SERVE_URL`] for the default copy.
+#[must_use]
+pub fn url() -> String {
+    url_for(port())
+}
+
+/// The base URL `bw serve` answers at on `port`. Pure.
+#[must_use]
+pub fn url_for(port: u16) -> String {
+    format!("http://localhost:{port}")
+}
+
 /// Builds the retry schedule for waiting on `bw serve` readiness: the delays
 /// to sleep *between* attempts, exponentially backing off from 250ms and
 /// capped at 4s per wait, stopping once the accumulated wait would exceed
@@ -123,7 +145,8 @@ pub fn stop_bw_serve(child: &mut Child) {
 }
 
 /// Builds (but does not spawn) the `bw serve` command, bound to
-/// [`BW_SERVE_PORT`] with `BW_SESSION` set.
+/// [`port`] -- [`BW_SERVE_PORT`] for the default copy -- with `BW_SESSION`
+/// set.
 ///
 /// Returned unspawned so the caller can decide *how* to start it --
 /// `job_object::spawn_in_job` needs to add `CREATE_SUSPENDED` before spawning
@@ -135,7 +158,7 @@ pub fn stop_bw_serve(child: &mut Child) {
 /// refusal, not a resolve-and-hope.
 pub fn bw_serve_command(session_token: &str) -> Result<crate::bw_path::BareCommand, String> {
     let mut cmd = bw_command()?;
-    cmd.args(["serve", "--port", &BW_SERVE_PORT.to_string()])
+    cmd.args(["serve", "--port", &port().to_string()])
         .env("BW_SESSION", session_token)
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -273,6 +296,22 @@ pub fn run_bw_sync(session_token: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **The default copy's `bw serve` is exactly where it always was**, and
+    /// a test profile's is elsewhere, so a test window can never read the
+    /// owner's unlocked vault off 8087.
+    #[test]
+    fn the_default_port_and_url_are_unchanged_and_a_profile_moves_them() {
+        assert_eq!(port(), 8087);
+        assert_eq!(url(), BW_SERVE_URL);
+        assert_eq!(url_for(BW_SERVE_PORT), "http://localhost:8087");
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("rc")))
+            .unwrap()
+            .unwrap();
+        let profiled = crate::app_profile::bw_serve_port_for(BW_SERVE_PORT, Some(&profile));
+        assert_ne!(profiled, BW_SERVE_PORT);
+        assert_ne!(url_for(profiled), BW_SERVE_URL);
+    }
 
     /// **`bw sync` is started INSIDE a job object, with the session in its
     /// environment and nowhere else.**

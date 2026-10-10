@@ -91,6 +91,13 @@ pub fn repair_logon_entry() {
         KEY_READ, KEY_SET_VALUE, REG_SZ,
     };
 
+    // **A test copy never touches the logon entry.** It is the installed
+    // copy's, and a profiled copy (`crate::app_profile`) would "repair" it to
+    // point at itself.
+    if !crate::app_profile::touches_the_installed_copy() {
+        log::info!("{}", crate::app_profile::installed_copy_refusal("changes the logon entry"));
+        return;
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };

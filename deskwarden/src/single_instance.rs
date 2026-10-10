@@ -88,7 +88,7 @@
 //!
 //! A mutex has no readable owner in Win32, so the running instance has to be
 //! found by enumerating processes -- and ending the wrong one is far worse
-//! than the bug being fixed. [`end_other_deskwardens`] documents the four
+//! than the bug being fixed. [`end_other_deskwardens`] documents the five
 //! checks a candidate has to pass before `TerminateProcess` is called on it.
 //!
 //! # Why a thread of its own, and why the hook is published
@@ -171,6 +171,15 @@ use crate::app_mutex::{self, Acquired};
 /// [`the_quit_event_is_scoped_and_named_like_the_mutex`] pins both against the
 /// one place the GUID is authored.
 pub const QUIT_EVENT_NAME: &str = "Local\\Deskwarden-63CBCB72-5383-4AE7-AFB7-5EE0530E4630-quit";
+
+/// The event this process waits on and signals: [`QUIT_EVENT_NAME`] for the
+/// default copy, plus `-<profile>` under a test profile (see
+/// [`crate::app_profile`]), so a test copy and the owner's copy can never ask
+/// each other to stand down.
+#[must_use]
+pub fn quit_event_name() -> String {
+    crate::app_profile::kernel_name(QUIT_EVENT_NAME)
+}
 
 /// How long the incoming instance waits for the outgoing one to be gone.
 ///
@@ -563,7 +572,7 @@ pub fn listen_for_takeover() -> bool {
 /// this process, not a token to be consumed. An auto-reset event would let a
 /// second asker find it clear again and conclude nothing had happened.
 fn create_quit_event() -> windows::core::Result<HANDLE> {
-    unsafe { CreateEventW(None, true, false, &HSTRING::from(QUIT_EVENT_NAME)) }
+    unsafe { CreateEventW(None, true, false, &HSTRING::from(quit_event_name())) }
 }
 
 /// Signals a running instance's quit event. `false` means there was none to
@@ -578,7 +587,7 @@ fn create_quit_event() -> windows::core::Result<HANDLE> {
 /// business ending the app.
 pub(crate) fn signal_quit() -> bool {
     unsafe {
-        let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(QUIT_EVENT_NAME))
+        let Ok(handle) = OpenEventW(EVENT_MODIFY_STATE, false, &HSTRING::from(quit_event_name()))
         else {
             return false;
         };
@@ -720,7 +729,7 @@ fn image_name_of(path: &str) -> String {
 ///
 /// Win32 offers no way to read a mutex's owner, so the process holding the app
 /// mutex has to be *found*. Ending the wrong process is far worse than the bug
-/// this fixes, so a candidate has to pass all four of these before
+/// this fixes, so a candidate has to pass all five of these before
 /// `TerminateProcess` is called on it:
 ///
 /// 1. **Its image file name equals this executable's**, case-insensitively --
@@ -740,6 +749,11 @@ fn image_name_of(path: &str) -> String {
 ///    re-establishes the name against the process that pid means *now*, which
 ///    is what closes the window in which a pid is recycled between the
 ///    snapshot and the kill.
+/// 5. **It runs under the same test profile as this one, or both under
+///    none** ([`crate::app_profile::may_force_end`]). A test copy may share
+///    this executable's name; it is told apart by the marker names every
+///    profiled process holds. The default copy never ends a profiled one, and
+///    a profiled one ends nothing whose profile it cannot read.
 ///
 /// # What is deliberately NOT checked
 ///
@@ -747,9 +761,9 @@ fn image_name_of(path: &str) -> String {
 /// process holding the mutex rather than a second one that lost the race. Both
 /// are unavailable: an old build is precisely what this path exists for, so a
 /// version check would refuse the only case that matters, and a mutex has no
-/// owner to ask. What the four checks above establish is the honest claim --
-/// *a process running this same executable name, in this same logon session*
-/// -- and that is the population the single-instance rule is defined over in
+/// owner to ask. What the five checks above establish is the honest claim --
+/// *a process running this same executable name, in this same logon session,
+/// under this same test profile or none* -- and that is the population the single-instance rule is defined over in
 /// the first place.
 ///
 /// # The log
@@ -759,15 +773,58 @@ fn image_name_of(path: &str) -> String {
 /// showed up later only as a process that was no longer there is the kind of
 /// thing that costs somebody an afternoon.
 fn end_other_deskwardens() -> usize {
-    let Some(mine) = my_image_name() else {
+    end_others_with(&ForceEnv::production(), crate::app_profile::active())
+}
+
+/// Everything [`end_other_deskwardens`] asks of the system, as `fn` pointers,
+/// so the DECISION -- which of the processes it found it ends -- can be run
+/// over invented processes. No test in this crate may enumerate real
+/// processes or end one; see [`TakeoverEnv::end_by_force`].
+struct ForceEnv {
+    /// This executable's file name, lowercased.
+    my_image_name: fn() -> Option<String>,
+    /// This process's id.
+    my_pid: fn() -> u32,
+    /// The logon session a pid is in.
+    session_of: fn(u32) -> Option<u32>,
+    /// Every pid whose snapshot image name equals the first argument, except
+    /// the second.
+    same_named_processes: fn(&str, u32) -> Vec<u32>,
+    /// A pid's image path, re-read now.
+    image_path_of: fn(u32) -> Option<String>,
+    /// Which test profile a pid runs under, given this process's.
+    profile_of: fn(u32, Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile,
+    /// `TerminateProcess`, reporting whether it worked.
+    terminate: fn(u32) -> bool,
+}
+
+impl ForceEnv {
+    /// The real one.
+    fn production() -> Self {
+        ForceEnv {
+            my_image_name,
+            my_pid: || unsafe { GetCurrentProcessId() },
+            session_of,
+            same_named_processes,
+            image_path_of: crate::window_watch::process_image_path_for_pid,
+            profile_of,
+            terminate,
+        }
+    }
+}
+
+/// [`end_other_deskwardens`] over `env`, as the process running under
+/// `my_profile`.
+fn end_others_with(env: &ForceEnv, my_profile: Option<&crate::app_profile::Profile>) -> usize {
+    let Some(mine) = (env.my_image_name)() else {
         log::warn!(
             "cannot end the running Deskwarden: this process's own executable name could not \
              be read, and it is the name every candidate is matched against"
         );
         return 0;
     };
-    let me = unsafe { GetCurrentProcessId() };
-    let Some(my_session) = session_of(me) else {
+    let me = (env.my_pid)();
+    let Some(my_session) = (env.session_of)(me) else {
         log::warn!(
             "cannot end the running Deskwarden: this process's logon session could not be \
              read, and no process is ended without matching it"
@@ -777,9 +834,9 @@ fn end_other_deskwardens() -> usize {
 
     let mut seen = 0usize;
     let mut ended = 0usize;
-    for pid in same_named_processes(&mine, me) {
+    for pid in (env.same_named_processes)(&mine, me) {
         seen += 1;
-        match session_of(pid) {
+        match (env.session_of)(pid) {
             Some(session) if session == my_session => {}
             other => {
                 log::debug!(
@@ -790,7 +847,7 @@ fn end_other_deskwardens() -> usize {
                 continue;
             }
         }
-        let Some(path) = crate::window_watch::process_image_path_for_pid(pid) else {
+        let Some(path) = (env.image_path_of)(pid) else {
             log::debug!(
                 "pid {pid} is named {mine} but its image path could not be re-read (it may \
                  have exited already); leaving it alone"
@@ -804,6 +861,18 @@ fn end_other_deskwardens() -> usize {
             );
             continue;
         }
+        // The fifth check: the same test profile, or both none. A test copy
+        // may share this executable's name, and it is not this one's to end
+        // -- nor is the owner's copy a test copy's. See `app_profile`.
+        let theirs = (env.profile_of)(pid, my_profile);
+        if !crate::app_profile::may_force_end(my_profile, theirs) {
+            log::debug!(
+                "pid {pid} is named {mine} but runs under another Deskwarden profile ({theirs:?}; \
+                 this one runs under {:?}); leaving it alone",
+                my_profile.map(crate::app_profile::Profile::name)
+            );
+            continue;
+        }
         log::warn!(
             "ending Deskwarden pid {pid} ({path}) with TerminateProcess, because it could not \
              be asked to stand down and this launch is the one the user just started. It runs \
@@ -812,7 +881,7 @@ fn end_other_deskwardens() -> usize {
              on the clipboard until that copy's own clipboard timer clears it -- and this \
              process cannot clear a clipboard it cannot show is its own"
         );
-        if terminate(pid) {
+        if (env.terminate)(pid) {
             ended += 1;
         }
     }
@@ -826,6 +895,36 @@ fn end_other_deskwardens() -> usize {
         log::warn!("ended {ended} of {seen} running Deskwarden process(es) by force");
     }
     ended
+}
+
+/// Which Deskwarden profile `pid` runs under, read off the marker names every
+/// profiled process holds ([`crate::app_profile::hold_markers`]).
+///
+/// `mine` decides what is asked: the default copy only asks whether `pid`
+/// holds ANY profile marker; a profiled copy also asks for its own.
+fn profile_of(pid: u32, mine: Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile {
+    let any = probe_name(&crate::app_profile::any_profile_marker(pid));
+    let same = mine.map(|profile| probe_name(&crate::app_profile::profile_marker(pid, profile)));
+    crate::app_profile::classify(any, same)
+}
+
+/// Whether a named mutex exists, without creating it and without keeping a
+/// handle to it -- `vault_service::win_is_held`'s ask, with "no such name"
+/// told apart from every other failure, because only the first is an answer.
+fn probe_name(name: &str) -> crate::app_profile::Probe {
+    use crate::app_profile::Probe;
+    use windows::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows::Win32::System::Threading::{OpenMutexW, SYNCHRONIZATION_SYNCHRONIZE};
+    unsafe {
+        match OpenMutexW(SYNCHRONIZATION_SYNCHRONIZE, false, &HSTRING::from(name)) {
+            Ok(handle) => {
+                let _ = CloseHandle(handle);
+                Probe::Present
+            }
+            Err(e) if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Probe::Absent,
+            Err(_) => Probe::Unknown,
+        }
+    }
 }
 
 /// Every process id in the system whose snapshot image name equals `mine`,
@@ -1532,6 +1631,139 @@ mod tests {
             app_mutex::APP_MUTEX_NAME,
             "the event and the mutex are the same name, which is two different kernel objects \
              fighting over one string"
+        );
+    }
+
+    /// **The default copy waits on exactly [`QUIT_EVENT_NAME`]; a test
+    /// profile on a name of its own** -- so neither can stand the other down.
+    #[test]
+    fn the_quit_event_is_the_default_s_and_a_profile_has_its_own() {
+        assert_eq!(quit_event_name(), QUIT_EVENT_NAME, "the unit tests run as the default copy");
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("rc")))
+            .unwrap()
+            .unwrap();
+        let quit = crate::app_profile::suffixed(QUIT_EVENT_NAME, Some(&profile));
+        let mutex = crate::app_profile::suffixed(app_mutex::APP_MUTEX_NAME, Some(&profile));
+        assert_eq!(quit, "Local\\Deskwarden-63CBCB72-5383-4AE7-AFB7-5EE0530E4630-quit-rc");
+        assert_ne!(quit, QUIT_EVENT_NAME, "a test copy would stand the owner's copy down");
+        assert_ne!(quit, mutex, "the profile's event and mutex share a name");
+        assert!(quit.starts_with(app_mutex::APP_MUTEX_NAME) && quit.starts_with("Local\\"));
+    }
+
+    /// The invented processes the forced-end tests run over, all named like
+    /// this executable and all in this logon session: `10` is a default copy,
+    /// `11` runs under profile `rc`, `12` under profile `other`, and `13`'s
+    /// markers cannot be read.
+    mod invented {
+        use crate::app_profile::{classify, CandidateProfile, Probe, Profile};
+        use std::sync::Mutex;
+
+        pub static ENDED: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+        pub static SERIALISE: Mutex<()> = Mutex::new(());
+
+        pub fn image() -> Option<String> {
+            Some("deskwarden.exe".into())
+        }
+        pub fn me() -> u32 {
+            1
+        }
+        pub fn session(_: u32) -> Option<u32> {
+            Some(1)
+        }
+        pub fn listed(_: &str, _: u32) -> Vec<u32> {
+            vec![10, 11, 12, 13]
+        }
+        pub fn path(_: u32) -> Option<String> {
+            Some(r"C:\Test\deskwarden.exe".into())
+        }
+        /// The real classification, over invented markers.
+        pub fn profile(pid: u32, mine: Option<&Profile>) -> CandidateProfile {
+            let any = match pid {
+                10 => Probe::Absent,
+                13 => Probe::Unknown,
+                _ => Probe::Present,
+            };
+            let same = mine.map(|p| match (pid, p.name()) {
+                (11, "rc") | (12, "other") => Probe::Present,
+                (13, _) => Probe::Unknown,
+                _ => Probe::Absent,
+            });
+            classify(any, same)
+        }
+        pub fn unreadable(_: u32, _: Option<&Profile>) -> CandidateProfile {
+            CandidateProfile::Unknown
+        }
+        pub fn end(pid: u32) -> bool {
+            ENDED.lock().unwrap().push(pid);
+            true
+        }
+    }
+
+    fn invented_env(profile_of: fn(u32, Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile) -> ForceEnv {
+        ForceEnv {
+            my_image_name: invented::image,
+            my_pid: invented::me,
+            session_of: invented::session,
+            same_named_processes: invented::listed,
+            image_path_of: invented::path,
+            profile_of,
+            terminate: invented::end,
+        }
+    }
+
+    /// What ending by force ends, as the process running under `profile`.
+    fn ended_as(profile: Option<&str>, profile_of: fn(u32, Option<&crate::app_profile::Profile>) -> crate::app_profile::CandidateProfile) -> Vec<u32> {
+        let _serial = invented::SERIALISE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        invented::ENDED.lock().unwrap().clear();
+        let profile = profile.map(|name| {
+            crate::app_profile::parse(Some(std::ffi::OsStr::new(name))).unwrap().unwrap()
+        });
+        let count = end_others_with(&invented_env(profile_of), profile.as_ref());
+        let ended = std::mem::take(&mut *invented::ENDED.lock().unwrap());
+        assert_eq!(count, ended.len(), "the count does not match what was ended");
+        ended
+    }
+
+    /// **A test copy never ends the owner's copy**, nor another profile's,
+    /// nor anything whose profile it cannot read -- only its own profile's.
+    #[test]
+    fn a_profiled_copy_ends_only_its_own_profile() {
+        assert_eq!(ended_as(Some("rc"), invented::profile), vec![11]);
+        assert_eq!(ended_as(Some("other"), invented::profile), vec![12]);
+    }
+
+    /// **The owner's copy never ends a test copy**, and still ends a default
+    /// copy that will not stand down -- what it always did.
+    #[test]
+    fn the_default_copy_ends_only_default_copies() {
+        assert_eq!(ended_as(None, invented::profile), vec![10]);
+    }
+
+    /// When no process's profile can be read, a test copy ends nothing.
+    #[test]
+    fn a_profiled_copy_that_cannot_read_profiles_ends_nothing() {
+        assert_eq!(ended_as(Some("rc"), invented::unreadable), Vec::<u32>::new());
+        assert_eq!(ended_as(None, invented::unreadable), Vec::<u32>::new());
+    }
+
+    /// The production seam is the real one, and the real entry point runs it
+    /// as THIS process's profile.
+    #[test]
+    fn ending_by_force_runs_as_this_process_s_profile() {
+        let source = include_str!("single_instance.rs");
+        let at = source.find("fn end_other_deskwardens() -> usize {").expect("control: renamed");
+        let body = &source[at..at + 200];
+        assert!(
+            body.contains(concat!("end_others_with(&ForceEnv::production(), ", "crate::app_profile::active())")),
+            "ending by force is no longer run over the real system as this process's profile"
+        );
+        let production = &source[source.find("    fn production() -> Self {\r\n        ForceEnv {")
+            .or_else(|| source.find("    fn production() -> Self {\n        ForceEnv {"))
+            .expect("control: no production `ForceEnv`")..];
+        let production = &production[..production.find("    }").unwrap()];
+        assert!(
+            production.contains("            profile_of,") && production.contains("            terminate,"),
+            "the real seam does not read the real markers or end through the real call"
         );
     }
 

@@ -19,6 +19,11 @@ pub mod app_match;
 /// app's files. Held for the life of the process; see its own docs for why
 /// setup asks the user to close Deskwarden rather than force-closing it.
 pub mod app_mutex;
+/// `DESKWARDEN_PROFILE`: a test copy that runs beside the owner's without
+/// touching it -- its own kernel object names, its own folders, its own
+/// `bw serve` port, and nothing written outside them. Unset, it changes
+/// nothing at all.
+pub mod app_profile;
 pub mod app_window;
 /// Locking the vault when Windows says the user walked away -- Win+L, a
 /// session switch, or a suspend. It creates NO window: the notifications are

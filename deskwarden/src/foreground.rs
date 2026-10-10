@@ -355,7 +355,12 @@ mod win32 {
             return CONTINUE;
         }
 
+        // Under a test profile every window's caption carries the profile's
+        // mark (`window_host::run_ui_native`); it comes back off here, so the
+        // titles every lookup compares against stay the plain ones they were
+        // written with. A no-op for the default copy.
         let title = window_title(hwnd);
+        let title = crate::app_profile::unmarked_title(title, crate::app_profile::active());
 
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
 
@@ -1420,7 +1425,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 90] = [
+        const OPENS_NO_WINDOW: [&str; 91] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1443,6 +1448,10 @@ mod tests {
             // process, and is the whole point -- see `app_mutex`'s own docs
             // for why setup asks rather than force-closing.
             "app_mutex",
+            // Names, folders and a title suffix for a test profile, plus two
+            // marker mutexes it holds. Opens no window; the windows it marks
+            // are opened at their own `run_ui_native(TITLE,` as before.
+            "app_profile",
             // **Registers on a window; creates none.** Its whole design is
             // that a second hidden window would have been the wrong answer:
             // `WM_POWERBROADCAST` is broadcast only to top-level windows, so a

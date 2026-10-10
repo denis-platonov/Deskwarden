@@ -136,7 +136,7 @@ pub const SLOTS: usize = 16;
 /// The name of one attachment slot, per logon session.
 #[must_use]
 pub fn attach_slot_name(slot: usize) -> String {
-    format!("Local\\Deskwarden-Attach-{slot}")
+    crate::app_profile::kernel_name(&format!("Local\\Deskwarden-Attach-{slot}"))
 }
 
 /// Claims the first free slot, or `None` if all of them are taken.
@@ -273,7 +273,7 @@ pub fn release(env: &ServiceEnv, attachment: Attachment, port: u16) {
 /// different user, and its service is not ours to adopt.
 #[must_use]
 pub fn service_object_name(account_fingerprint: &str) -> String {
-    format!("Local\\Deskwarden-Vault-{account_fingerprint}")
+    crate::app_profile::kernel_name(&format!("Local\\Deskwarden-Vault-{account_fingerprint}"))
 }
 
 /// What to do about a service that is already listening.
@@ -849,6 +849,27 @@ mod tests {
         assert!(
             service_object_name(OURS).starts_with("Local\\"),
             "the service object must be logon-session scoped, as app_mutex is"
+        );
+    }
+
+    /// **The default copy's slot and service names are the ones it always
+    /// used; a test profile's are its own**, so a test copy can neither hold
+    /// one of the owner's slots nor adopt the owner's service.
+    #[test]
+    fn the_default_names_are_unchanged_and_a_profile_has_its_own() {
+        assert_eq!(attach_slot_name(3), "Local\\Deskwarden-Attach-3");
+        assert_eq!(service_object_name("ab12"), "Local\\Deskwarden-Vault-ab12");
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("rc")))
+            .unwrap()
+            .unwrap();
+        for slot in 0..SLOTS {
+            let profiled = crate::app_profile::suffixed(&attach_slot_name(slot), Some(&profile));
+            assert_eq!(profiled, format!("Local\\Deskwarden-Attach-{slot}-rc"));
+            assert!((0..SLOTS).all(|s| attach_slot_name(s) != profiled));
+        }
+        assert_eq!(
+            crate::app_profile::suffixed(&service_object_name("ab12"), Some(&profile)),
+            "Local\\Deskwarden-Vault-ab12-rc"
         );
     }
     // ---- Task 3: start, reconnect, exit -------------------------------

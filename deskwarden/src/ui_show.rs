@@ -41,7 +41,7 @@ use windows::Win32::System::Threading::{
 /// user's daemon signal another user's window.
 #[must_use]
 pub fn signal_name(pid: u32) -> String {
-    format!(r"Local\Deskwarden-UI-Show-{pid}")
+    crate::app_profile::kernel_name(&format!(r"Local\Deskwarden-UI-Show-{pid}"))
 }
 
 /// **The name a UI process holds while its window is ON SCREEN**, and drops
@@ -67,7 +67,7 @@ pub fn signal_name(pid: u32) -> String {
 /// right was wrong once already.
 #[must_use]
 pub fn visible_name(pid: u32) -> String {
-    format!(r"Local\Deskwarden-UI-Visible-{pid}")
+    crate::app_profile::kernel_name(&format!(r"Local\Deskwarden-UI-Visible-{pid}"))
 }
 
 /// **The name a UI process presses to say "I have edited settings for
@@ -88,7 +88,7 @@ pub fn visible_name(pid: u32) -> String {
 /// means *there is something to read now*, which is a token to be consumed.
 #[must_use]
 pub fn settings_name(pid: u32) -> String {
-    format!(r"Local\Deskwarden-UI-Settings-{pid}")
+    crate::app_profile::kernel_name(&format!(r"Local\Deskwarden-UI-Settings-{pid}"))
 }
 
 /// **The name a UI process presses to say "I have signed in; start
@@ -124,7 +124,7 @@ pub fn settings_name(pid: u32) -> String {
 /// something to read now*, which is a token to be consumed.
 #[must_use]
 pub fn signin_name(pid: u32) -> String {
-    format!(r"Local\Deskwarden-UI-SignIn-{pid}")
+    crate::app_profile::kernel_name(&format!(r"Local\Deskwarden-UI-SignIn-{pid}"))
 }
 
 /// **The name the daemon presses to say "`bw serve` is up on the token you
@@ -157,7 +157,7 @@ pub fn signin_name(pid: u32) -> String {
 /// it first makes the ordering impossible to get wrong.
 #[must_use]
 pub fn backend_ready_name(pid: u32) -> String {
-    format!(r"Local\Deskwarden-UI-Backend-Ready-{pid}")
+    crate::app_profile::kernel_name(&format!(r"Local\Deskwarden-UI-Backend-Ready-{pid}"))
 }
 
 /// A live handle to the event, closed when this is dropped.
@@ -413,6 +413,40 @@ mod tests {
                 assert_ne!(a, b, "`{a_name}` and `{b_name}` share the name {a}");
             }
         }
+    }
+
+    /// **The default copy's five names are exactly the ones it always used,
+    /// and a test profile's are its own** -- a profiled daemon can never ring
+    /// or wake the owner's window, nor the owner's daemon a profiled one.
+    #[test]
+    fn the_default_names_are_unchanged_and_a_profile_suffixes_every_one() {
+        assert_eq!(signal_name(7), r"Local\Deskwarden-UI-Show-7");
+        assert_eq!(visible_name(7), r"Local\Deskwarden-UI-Visible-7");
+        assert_eq!(settings_name(7), r"Local\Deskwarden-UI-Settings-7");
+        assert_eq!(signin_name(7), r"Local\Deskwarden-UI-SignIn-7");
+        assert_eq!(backend_ready_name(7), r"Local\Deskwarden-UI-Backend-Ready-7");
+
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("rc")))
+            .unwrap()
+            .unwrap();
+        let default = [signal_name(7), visible_name(7), settings_name(7), signin_name(7), backend_ready_name(7)];
+        for name in &default {
+            let profiled = crate::app_profile::suffixed(name, Some(&profile));
+            assert_eq!(profiled, format!("{name}-rc"));
+            assert!(!default.contains(&profiled), "{profiled} is one of the default's names");
+        }
+
+        // Every builder goes through the one function a profile is applied
+        // in -- counted over the production half, so a sixth name added
+        // without it is caught.
+        let source = include_str!("ui_show.rs");
+        let production = source.split(concat!("mod ", "tests")).next().unwrap();
+        let built = production.matches(concat!("format!(r\"Local", "\\")).count();
+        let routed = production
+            .matches(concat!("app_profile::kernel_name(&format!(r\"Local", "\\"))
+            .count();
+        assert_eq!(built, 5, "control: this module no longer builds its five names");
+        assert_eq!(routed, built, "a name here is built without the test profile applied");
     }
 
     /// **The whole handshake, over the real kernel, in the direction

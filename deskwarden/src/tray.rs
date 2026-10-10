@@ -332,7 +332,7 @@ pub fn build_tray() -> AppTray {
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(IDLE_TOOLTIP)
+        .with_tooltip(crate::app_profile::window_title(IDLE_TOOLTIP))
         // Left click opens the vault directly (see `next_tray_icon_event`'s
         // caller in `main.rs`) instead of showing the same menu right-click
         // already shows -- this crate's default is to show the menu on
@@ -612,7 +612,12 @@ fn sync_item_to_failed(item: &MenuItem) {
 
 /// Best-effort tooltip update: a tooltip that won't set is a cosmetic
 /// problem, never a reason to fail the operation it was describing.
+///
+/// Every tooltip carries the test profile's mark, if there is one
+/// (`crate::app_profile::window_title`), so a test copy's icon is never
+/// mistaken for the owner's -- unchanged for the default copy.
 fn set_tooltip(tray: &AppTray, text: String) {
+    let text = crate::app_profile::window_title(&text);
     if let Err(e) = tray.icon.set_tooltip(Some(&text)) {
         log::debug!("could not set tray tooltip: {e}");
     }

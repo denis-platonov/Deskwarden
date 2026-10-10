@@ -190,9 +190,18 @@ impl<U: FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static> eframe::App
 /// counts.
 pub fn run_ui_native(
     app_name: &str,
-    native_options: eframe::NativeOptions,
+    mut native_options: eframe::NativeOptions,
     ui_fun: impl FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static,
 ) -> eframe::Result {
+    // **A test profile's windows say so in their title bar.** `eframe` titles
+    // a window `app_name` unless the viewport names one, so naming one here
+    // marks every window this crate opens -- and only under a profile: the
+    // default copy's viewport title stays unset and `eframe` does what it
+    // always did. `foreground` takes the mark back off every caption it reads,
+    // so a raise by `app_name` still finds the window. See `app_profile`.
+    if crate::app_profile::active().is_some() && native_options.viewport.title.is_none() {
+        native_options.viewport.title = Some(crate::app_profile::window_title(app_name));
+    }
     eframe::run_native(
         app_name,
         native_options,

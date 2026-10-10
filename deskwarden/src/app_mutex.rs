@@ -60,6 +60,18 @@ use windows::Win32::System::Threading::CreateMutexW;
 /// this string literally.
 pub const APP_MUTEX_NAME: &str = "Local\\Deskwarden-63CBCB72-5383-4AE7-AFB7-5EE0530E4630";
 
+/// The name this process creates and asks about: [`APP_MUTEX_NAME`] for the
+/// default copy, and that name plus `-<profile>` under a test profile (see
+/// [`crate::app_profile`]).
+///
+/// **The installer only ever opens [`APP_MUTEX_NAME`].** That is right: a test
+/// copy is not the installed copy, so setup has no business waiting for it,
+/// and a test copy's lock must not be able to stand in for the owner's.
+#[must_use]
+pub fn app_mutex_name() -> String {
+    crate::app_profile::kernel_name(APP_MUTEX_NAME)
+}
+
 /// The handle, held for the life of the process.
 ///
 /// Owning it in a `static` rather than in a `main` local is deliberate: the
@@ -129,7 +141,7 @@ fn create_named(name: &str) -> windows::core::Result<(OwnedHandle, Acquired)> {
 /// on rather than refusing to run the user's password manager over a
 /// housekeeping handle.
 pub fn acquire() -> windows::core::Result<Acquired> {
-    let (handle, acquired) = create_named(APP_MUTEX_NAME)?;
+    let (handle, acquired) = create_named(&app_mutex_name())?;
     if let Ok(mut held) = HELD.lock() {
         *held = Some(handle);
     }
@@ -152,7 +164,7 @@ pub fn acquire() -> windows::core::Result<Acquired> {
 /// timeout then decides, which is the right answer: an unexplained refusal to
 /// create the name is not evidence that the other instance has gone.
 pub fn take_if_free() -> bool {
-    match create_named(APP_MUTEX_NAME) {
+    match create_named(&app_mutex_name()) {
         Ok((handle, Acquired::First)) => {
             if let Ok(mut held) = HELD.lock() {
                 *held = Some(handle);
@@ -390,6 +402,26 @@ mod tests {
         );
     }
 
+    /// **The default copy creates exactly the name the installer opens**, and
+    /// a test profile creates a different one in the same scope.
+    #[test]
+    fn the_default_copy_creates_the_installer_s_name_and_a_profile_its_own() {
+        assert_eq!(app_mutex_name(), APP_MUTEX_NAME, "the unit tests run as the default copy");
+        assert_eq!(
+            iss_directive("AppMutex").as_deref(),
+            Some(app_mutex_name().as_str()),
+            "the default copy's mutex is not the one setup looks for"
+        );
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("rc")))
+            .unwrap()
+            .unwrap();
+        let profiled = crate::app_profile::suffixed(APP_MUTEX_NAME, Some(&profile));
+        assert_eq!(profiled, "Local\\Deskwarden-63CBCB72-5383-4AE7-AFB7-5EE0530E4630-rc");
+        assert_ne!(profiled, APP_MUTEX_NAME, "a test copy would hold the owner's mutex");
+        assert!(profiled.starts_with("Local\\"), "a profile left the logon-session scope");
+        assert!(!profiled.contains('{') && !profiled.contains('}'));
+    }
+
     /// The scope decision, pinned rather than left to whoever edits the
     /// constant next.
     #[test]
@@ -450,7 +482,10 @@ mod tests {
         );
         // Three things `main` does that can end the process, each of them
         // after the app is unmistakably alive. None may come first.
-        for later in ["ProjectDirs::from(", "logging::init(", "resolve_bw_exe()"] {
+        // `app_profile::app_dirs(` is where `main` resolves its folders; it
+        // was `ProjectDirs::from(` until every folder moved behind the one
+        // function a test profile is applied in.
+        for later in ["app_profile::app_dirs(", "logging::init(", "resolve_bw_exe()"] {
             let at = body
                 .find(later)
                 .unwrap_or_else(|| panic!("control: `fn main` no longer contains {later:?}"));

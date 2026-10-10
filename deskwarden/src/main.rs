@@ -38,7 +38,7 @@ use deskwarden::bw_path;
 // its own doc for review 11's Important 2) -- defined in `bw_serve`, not
 // here, so both sides share the exact same number rather than disagreeing.
 use deskwarden::bw_serve::{
-    self, readiness_schedule, wait_for_vault_ready, BACKEND_OP_TIMEOUT, BW_SERVE_URL,
+    self, readiness_schedule, wait_for_vault_ready, BACKEND_OP_TIMEOUT,
     READINESS_DEADLINE,
 };
 use deskwarden::dispatch;
@@ -117,6 +117,22 @@ use deskwarden::signature::TRUSTED_BW_SIGNER_ORGANIZATIONS;
 
 
 fn main() {
+    // **Which test profile this is, before ANYTHING else -- even the launch
+    // kind.** `DESKWARDEN_PROFILE` decides every kernel object name and every
+    // folder below, so it is read before the first of either; an invalid value
+    // is refused here, before this process has created, opened or written
+    // anything, and is never read as "no profile". Every kind of launch reads
+    // it: a `--ui` window and the vault service inherit the daemon's
+    // environment, and must land in the daemon's profile. Unset, it changes
+    // nothing. See `app_profile`.
+    if let Err(refusal) = deskwarden::app_profile::init_from_env() {
+        std::process::exit(refuse_the_profile(&refusal));
+    }
+    // A profiled process marks itself before any other Deskwarden could look
+    // for it, so a forced takeover in another profile -- or in the default
+    // copy -- can tell it is not theirs to end. No-op for the default copy.
+    deskwarden::app_profile::hold_markers();
+
     // **Which of the two processes this is, answered before anything else.**
     //
     // It is above the app mutex -- above the line whose own comment says it is
@@ -224,9 +240,13 @@ fn main() {
         ),
     }
 
-    let project_dirs = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
-        .expect("could not resolve config directory");
-    let config_dir = project_dirs.config_dir().to_path_buf();
+    // Through `app_profile`, the one place the crate asks the OS for its
+    // folders: under a test profile both of them move to
+    // `<folder>\profiles\<name>`, and for the default copy they are exactly
+    // the ones this line always resolved.
+    let project_dirs =
+        deskwarden::app_profile::app_dirs().expect("could not resolve config directory");
+    let config_dir = project_dirs.config_dir.clone();
     std::fs::create_dir_all(&config_dir).expect("failed to create config directory");
 
     // Downloaded installers go under the *cache* directory, not next to
@@ -235,7 +255,7 @@ fn main() {
     // for -- and keeping multi-megabyte attacker-supplied-until-verified
     // downloads out of the directory holding the encrypted session token is
     // worth the one extra path. Created lazily by `download_and_verify`.
-    let update_download_dir = project_dirs.cache_dir().join("updates");
+    let update_download_dir = project_dirs.cache_dir.join("updates");
 
     // On-disk favicon cache, keyed by domain (see `favicon::write_cached_icon`).
     // Also a cache directory, for the same reason `update_download_dir` is:
@@ -243,7 +263,7 @@ fn main() {
     // `config_dir`. Not created here -- `favicon::write_cached_icon` creates
     // it lazily on first write, same as `update_download_dir`'s directory is
     // created lazily by `download_and_verify`.
-    let icon_cache_dir = project_dirs.cache_dir().join("icons");
+    let icon_cache_dir = project_dirs.cache_dir.join("icons");
     // The account picker's rows draw the same cached icons the vault window
     // does, and its card is opened from `app::handle_no_match` -- behind an
     // `fn` pointer with a pinned shape, so there is no argument to pass it
@@ -852,7 +872,7 @@ fn main() {
             // asserted: being wrong here is a launch with `bw serve` gated off
             // and nothing in its place.
             log::error!("the backend environment was refused; staying on `bw serve`");
-            vault_slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+            vault_slot.adopt(Box::new(VaultBridge::new(bw_serve::url())));
             let _ = backend_policy::install_env(bw_serve_env());
             backend_policy::VaultBackendChoice::BwServe
         });
@@ -11401,6 +11421,23 @@ fn launch_intent<S: AsRef<str>>(
 /// Exit 2, matching the identical refusal the daemon's own `launch_intent`
 /// read makes further down: from the caller's side both are the same failure
 /// and giving them two codes would only invite someone to tell them apart.
+/// What a launch with an invalid `DESKWARDEN_PROFILE` exits with: the same
+/// code a refused launch gets.
+const PROFILE_REFUSED: i32 = 2;
+
+/// **Refuses a launch whose `DESKWARDEN_PROFILE` is not a valid name**, with
+/// a message box and nothing else.
+///
+/// Unlike [`refuse_a_ui_launch`], this opens no log file: which folder the
+/// log lives in is the very thing the refused value would have decided, and
+/// the default copy's log is not this process's to write into.
+fn refuse_the_profile(refusal: &deskwarden::app_profile::ProfileRefusal) -> i32 {
+    let message = refusal.message();
+    eprintln!("deskwarden: {message}");
+    message_box("Deskwarden", &message, MB_ICONERROR | MB_OK);
+    PROFILE_REFUSED
+}
+
 fn refuse_a_ui_launch(refusal: &UiLaunchRefusal) -> i32 {
     // The refusal happens above `logging::init`, so it opens the log itself.
     // Silently, and best-effort: a refusal that could not be logged is still
@@ -11576,10 +11613,11 @@ fn run_as_the_vault_service(mode: deskwarden::service_host::Mode) -> i32 {
                 // owner on the same port, which is the state
                 // `backend_policy`'s twelve entry points exist to prevent.
                 log::info!(
-                    "serving the vault over bw serve at {BW_SERVE_URL}; this service does \
-                     not start or stop it"
+                    "serving the vault over bw serve at {}; this service does \
+                     not start or stop it",
+                    bw_serve::url()
                 );
-                std::sync::Arc::new(VaultBridge::new(BW_SERVE_URL))
+                std::sync::Arc::new(VaultBridge::new(bw_serve::url()))
             }
         };
 
@@ -11711,15 +11749,16 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // `deskwarden::ui_process::UiStartFailure`: the daemon reads the code back
     // and puts the matching sentence on the screen, because one code for five
     // causes was one message the daemon could not write.
-    let Some(project_dirs) = directories::ProjectDirs::from("dev", "Deskwarden", "Deskwarden")
-    else {
+    // The daemon's folders, test profile and all: this process inherited the
+    // daemon's environment, and `main` read it before branching here.
+    let Some(project_dirs) = deskwarden::app_profile::app_dirs() else {
         return deskwarden::ui_process::UiStartFailure::NoConfigDirectory.exit_code();
     };
-    let config_dir = project_dirs.config_dir().to_path_buf();
+    let config_dir = project_dirs.config_dir.clone();
     if std::fs::create_dir_all(&config_dir).is_err() {
         return deskwarden::ui_process::UiStartFailure::NoConfigDirectory.exit_code();
     }
-    let icon_cache_dir = project_dirs.cache_dir().join("icons");
+    let icon_cache_dir = project_dirs.cache_dir.join("icons");
     deskwarden::app::set_icon_cache_dir(icon_cache_dir.clone());
 
     // The same log file the daemon writes, which the spec already names as an
@@ -12095,7 +12134,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             // changes is that a sign-in can now replace it. This is what the
             // daemon has always done with its own slot.
             backend_policy::VaultBackendChoice::BwServe => {
-                vault_slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+                vault_slot.adopt(Box::new(VaultBridge::new(bw_serve::url())));
                 VaultCache::with_disk_cache(
                     Arc::clone(&vault_slot),
                     disk,
@@ -12221,7 +12260,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             current_version: Version::parse(env!("CARGO_PKG_VERSION"))
                 .expect("CARGO_PKG_VERSION is not valid semver"),
             api_base: GITHUB_API_BASE.to_string(),
-            download_dir: project_dirs.cache_dir().join("updates"),
+            download_dir: project_dirs.cache_dir.join("updates"),
             before_install: std::sync::Arc::new(move || {
                 cache_for_install.clear();
                 deskwarden::clipboard::clear_if_still_ours_for(
@@ -12877,7 +12916,7 @@ fn the_daemon_let_this_window_go() {
 /// answers it without a round trip through a vault.
 fn backend_is_listening() -> bool {
     use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, bw_serve::BW_SERVE_PORT));
+    let address = SocketAddr::from((Ipv4Addr::LOCALHOST, bw_serve::port()));
     TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
 }
 
@@ -13910,7 +13949,7 @@ fn settle_the_vault_backend_when(
                 );
             }
         }
-        slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+        slot.adopt(Box::new(VaultBridge::new(bw_serve::url())));
         return bw_serve_env();
     };
 
@@ -14311,7 +14350,7 @@ fn install_backend_env(
         return choice;
     }
     log::error!("the backend environment was refused; staying on `bw serve`");
-    slot.adopt(Box::new(VaultBridge::new(BW_SERVE_URL)));
+    slot.adopt(Box::new(VaultBridge::new(bw_serve::url())));
     let _ = backend_policy::install_env(bw_serve_env());
     backend_policy::VaultBackendChoice::BwServe
 }
@@ -14480,7 +14519,7 @@ impl std::fmt::Display for BackendStartError {
                  likely an orphaned `bw serve` (or a grandchild of one we killed) that has not \
                  released the socket yet. Refusing to start rather than talking to an unknown \
                  process holding an unknown session.",
-                bw_serve::BW_SERVE_PORT
+                bw_serve::port()
             ),
             Self::NoVerifiedCli(e) => write!(f, "cannot start `bw serve`: {e}"),
             Self::CliMissing(path) => write!(
@@ -14830,7 +14869,7 @@ fn try_start_backend(
     if let Some(missing) = the_cli_is_missing() {
         return BackendStart::Failed(BackendStartError::CliMissing(missing));
     }
-    if !bw_serve::wait_for_port_free(bw_serve::BW_SERVE_PORT, port_grace) {
+    if !bw_serve::wait_for_port_free(bw_serve::port(), port_grace) {
         return BackendStart::Failed(BackendStartError::PortHeld(port_grace));
     }
 
@@ -14864,7 +14903,7 @@ fn try_start_backend(
         log::warn!(
             "spawning `bw serve` with no kill-on-close job object: if this process loses track \
              of the child, nothing will stop it and it will hold localhost:{} after we exit",
-            bw_serve::BW_SERVE_PORT
+            bw_serve::port()
         );
     }
     // Taken out of `bw_path::BareCommand` here rather than in
@@ -22976,7 +23015,7 @@ mod tests {
              nothing about what it talks to"
         );
         assert!(
-            child.contains(concat!("VaultBridge::", "new(BW_SERVE_URL)")),
+            child.contains(concat!("VaultBridge::", "new(bw_serve::url())")),
             "control: the `bw serve` arm is gone too, so the assertions above would pass on \
              a window that can no longer reach the default backend either"
         );

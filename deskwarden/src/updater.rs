@@ -1021,7 +1021,10 @@ fn installer_file_name(version: &Version) -> String {
 /// unrelated program that happened to pick the word "Deskwarden" from being
 /// read as one of ours.
 fn installer_claim_name(file_name: &str) -> String {
-    format!("{}-update-claim-{file_name}", crate::app_mutex::APP_MUTEX_NAME)
+    crate::app_profile::kernel_name(&format!(
+        "{}-update-claim-{file_name}",
+        crate::app_mutex::APP_MUTEX_NAME
+    ))
 }
 
 /// Claims the installer for `version`, for as long as the returned handle
@@ -1602,7 +1605,7 @@ fn apply_update_with(dest_dir: &Path, release: &ReleaseInfo, env: &UpdaterEnv) -
              use and give up without showing anything. Quit every Deskwarden window and \
              try again. (It still holds {mutex}; the verified installer is at {path}.)",
             path = installer_path.display(),
-            mutex = crate::app_mutex::APP_MUTEX_NAME,
+            mutex = crate::app_mutex::app_mutex_name(),
         ));
     }
     (env.launch)(&installer_path)
@@ -1655,6 +1658,13 @@ fn apply_update_with(dest_dir: &Path, release: &ReleaseInfo, env: &UpdaterEnv) -
 /// the_predicate(&thing);` was measured surviving the entire suite at zero
 /// warnings. The routing tests behind the seam are what fail on that now.
 pub fn apply_update(dest_dir: &Path, release: &ReleaseInfo) -> Result<(), String> {
+    // **A test copy never runs the installer.** Setup installs into the
+    // installed copy's folder and stands ITS daemon down, so under a test
+    // profile (`crate::app_profile`) this would replace the owner's app from
+    // a copy that is not it. Refused before anything is hashed or asked.
+    if !crate::app_profile::touches_the_installed_copy() {
+        return Err(crate::app_profile::installed_copy_refusal("runs the installer"));
+    }
     apply_update_with(dest_dir, release, &UpdaterEnv::production())
 }
 
