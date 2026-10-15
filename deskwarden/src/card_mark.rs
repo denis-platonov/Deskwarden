@@ -282,7 +282,7 @@ fn cache_id() -> egui::Id {
 /// **The seam, and the only one.** Production calls it with the user's setting
 /// and [`brand_mark::search_dirs`]; a test calls it with a temp directory it
 /// filled itself, which is what keeps the suite off the real
-/// `%APPDATA%\Deskwarden`. It is an ordinary function rather than a
+/// `%APPDATA%\Deskwarden` folders. It is an ordinary function rather than a
 /// `cfg(test)` branch precisely so that the path the tests exercise is the
 /// path that ships.
 ///
@@ -553,7 +553,8 @@ mod tests {
     ///
     /// **Its logo policy is installed off, and that is not incidental.** With
     /// none installed, [`policy`] resolves the user's real `settings.json`
-    /// and, if they have turned the preference on, their real
+    /// and, if they have turned the preference on, their real `brand-marks`
+    /// folders -- beside `settings.json`, beside the executable, then
     /// `%APPDATA%\\Deskwarden\\brand-marks` -- so the suite would pass or fail
     /// depending on what the developer happens to have in a folder. Every
     /// context in this module's tests is told what to think first, and the
@@ -723,11 +724,12 @@ mod tests {
     // ---- brand logos ---------------------------------------------------
     //
     // Every test below writes its own fixture images into its own temp
-    // directory and points the context at it. **None of them can reach
-    // `%APPDATA%\Deskwarden\brand-marks`**, which is the directory the real
-    // marks would live in and the one a test must never read: the policy is
-    // installed before a mark is drawn, and an installed policy is the only
-    // thing `logo` consults.
+    // directory and points the context at it. **None of them can reach the
+    // real `brand-marks` folders** -- beside `settings.json`, beside the
+    // executable, and `%APPDATA%\Deskwarden\brand-marks`, in that order
+    // -- which are where the real marks live and what a test must never
+    // read: the policy is installed before a mark is drawn, and an installed
+    // policy is the only thing `logo` consults.
 
     use crate::brand_mark::tests::{isolated_png, on_ground_png, tempdir};
 

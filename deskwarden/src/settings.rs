@@ -1293,7 +1293,9 @@ pub struct Settings {
     /// is lost on a downgrade either.
     ///
     /// `true` asks [`crate::card_mark`] to look for a logo file for each brand
-    /// it draws, in [`crate::brand_mark::search_dirs`]' two directories, and
+    /// it draws, in [`crate::brand_mark::search_dirs`]' directories -- beside
+    /// `settings.json`, beside the executable, then
+    /// `%APPDATA%\Deskwarden\brand-marks` for the default copy -- and
     /// to draw the image where it finds a usable one. The wordmark remains the
     /// mark everywhere else -- for a brand with no file, and for a file that
     /// was refused -- so turning this on can never leave a row with no mark

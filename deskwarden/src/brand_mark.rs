@@ -13,7 +13,7 @@
 //! Nothing is compiled in. Marks are read at runtime from
 //! [`search_dirs`], and that is three decisions at once:
 //!
-//! * **The user's directory outranks the shipped one**, so a user can replace
+//! * **The user's settings directory outranks the shipped one**, so a user can replace
 //!   a mark this app ships, or supply one for a brand it ships nothing for,
 //!   without a build.
 //! * **The images and the code ship separately.** This code lands and is
@@ -36,7 +36,8 @@
 use crate::card_brand::CardBrand;
 use std::path::{Path, PathBuf};
 
-/// The directory name, under both roots, that marks are read from.
+/// The directory name, under each of the [`search_dirs`] roots, that marks
+/// are read from.
 pub const MARK_DIR_NAME: &str = "brand-marks";
 
 /// The largest mark file this app will read off disk, in bytes.
@@ -183,32 +184,51 @@ impl Mark {
 /// The directories a mark is looked for in, **in the order they are
 /// searched**.
 ///
-/// 1. **The user's own** -- `%APPDATA%\Deskwarden\brand-marks\`, beside
-///    `settings.json` and the icon cache, resolved through
-///    [`crate::settings::config_dir`] so the triple is not spelled a second
-///    time. First, so that a file the user put there replaces one this app
-///    shipped rather than being shadowed by it. That ordering is the whole
-///    reason there are two directories: the shipped set is a default, and a
-///    default a user cannot override is not a default.
-/// 2. **Beside the executable** -- the installer's, populated at install
-///    time. Empty, and quite possibly absent, in a development build and in
-///    every build until the images are supplied; a missing directory is
-///    indistinguishable here from an empty one, by design.
+/// 1. **Beside `settings.json`** -- `<config dir>\brand-marks\`, which for
+///    the default copy is `%APPDATA%\Deskwarden\Deskwarden\config\brand-marks\`
+///    and under a profile is that profile's own config folder's. Resolved
+///    through [`crate::app_profile::app_dirs`], the one place this crate asks
+///    the OS for a folder, so the triple is not spelled a second time. First,
+///    so that a file the user put there replaces one this app shipped rather
+///    than being shadowed by it: the shipped set is a default, and a default a
+///    user cannot override is not a default.
+/// 2. **Beside the executable** -- `<exe dir>\brand-marks\`, the installer's,
+///    populated at install time. Empty, and quite possibly absent, in a
+///    development build and in every build until the images are supplied; a
+///    missing directory is indistinguishable here from an empty one, by
+///    design.
+/// 3. **`%APPDATA%\Deskwarden\brand-marks\`** -- the Deskwarden folder
+///    itself, one level above the app's own, which is where the owner keeps
+///    their logos and the folder a person browsing `%APPDATA%` finds first.
+///    **The default copy only**:
+///    [`crate::app_profile::AppDirs::organization_dir`] is `None` under a
+///    `DESKWARDEN_PROFILE`, because that folder is not the profile's own and a
+///    test copy reads nothing outside its own folders.
 ///
-/// Either may be absent from the returned list, when the platform has no
-/// resolvable config directory or the running executable's path cannot be
-/// read. An empty list is a valid answer and means every brand falls back to
-/// its word.
+/// Any of them may be absent from the returned list, when the platform has no
+/// resolvable folder or the running executable's path cannot be read. An
+/// empty list is a valid answer and means every brand falls back to its word.
 pub fn search_dirs() -> Vec<PathBuf> {
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    search_dirs_in(crate::app_profile::app_dirs().as_ref(), exe_dir)
+}
+
+/// [`search_dirs`] from its two inputs, as a pure function so the order is a
+/// thing with tests of its own -- for the default copy and for a profile --
+/// rather than an answer that depends on the machine running the suite.
+pub fn search_dirs_in(
+    app_dirs: Option<&crate::app_profile::AppDirs>,
+    exe_dir: Option<PathBuf>,
+) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(config) = crate::settings::config_dir() {
-        dirs.push(config.join(MARK_DIR_NAME));
+    if let Some(app_dirs) = app_dirs {
+        dirs.push(app_dirs.config_dir.join(MARK_DIR_NAME));
     }
-    if let Some(beside) = std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(MARK_DIR_NAME)))
-    {
-        dirs.push(beside);
+    if let Some(exe_dir) = exe_dir {
+        dirs.push(exe_dir.join(MARK_DIR_NAME));
+    }
+    if let Some(organization) = app_dirs.and_then(|dirs| dirs.organization_dir.as_ref()) {
+        dirs.push(organization.join(MARK_DIR_NAME));
     }
     dirs
 }
@@ -506,6 +526,59 @@ pub(crate) mod tests {
             found,
             user.join(&name),
             "the shipped mark won over the user's -- a default a user cannot override"
+        );
+    }
+
+    /// **The real search order, for the default copy**: beside the settings,
+    /// beside the executable, then `%APPDATA%\Deskwarden\brand-marks` -- the
+    /// folder the owner's logos are actually in.
+    #[test]
+    fn the_default_copy_searches_its_config_then_the_exe_then_the_deskwarden_folder() {
+        let roaming = PathBuf::from(r"C:\Users\u\AppData\Roaming");
+        let config = roaming.join(r"Deskwarden\Deskwarden\config");
+        let cache = PathBuf::from(r"C:\Users\u\AppData\Local\Deskwarden\Deskwarden\cache");
+        let exe = PathBuf::from(r"C:\Program Files\Deskwarden");
+        let app_dirs = crate::app_profile::AppDirs::under(config.clone(), cache, None);
+
+        assert_eq!(
+            search_dirs_in(Some(&app_dirs), Some(exe.clone())),
+            vec![
+                config.join("brand-marks"),
+                exe.join("brand-marks"),
+                roaming.join(r"Deskwarden\brand-marks"),
+            ]
+        );
+        // Each root is optional on its own; the order of what is left holds.
+        assert_eq!(
+            search_dirs_in(Some(&app_dirs), None),
+            vec![config.join("brand-marks"), roaming.join(r"Deskwarden\brand-marks")]
+        );
+        assert_eq!(search_dirs_in(None, Some(exe.clone())), vec![exe.join("brand-marks")]);
+    }
+
+    /// **Under a profile only the profile's own folders are read**: its config
+    /// folder and its own executable's, and never the shared
+    /// `%APPDATA%\Deskwarden\brand-marks` the default copy reads.
+    #[test]
+    fn a_profile_searches_only_its_own_folders() {
+        let roaming = PathBuf::from(r"C:\Users\u\AppData\Roaming");
+        let config = roaming.join(r"Deskwarden\Deskwarden\config");
+        let cache = PathBuf::from(r"C:\Users\u\AppData\Local\Deskwarden\Deskwarden\cache");
+        let exe = PathBuf::from(r"D:\builds\rc");
+        let profile = crate::app_profile::parse(Some(std::ffi::OsStr::new("rc")))
+            .expect("a valid name")
+            .expect("a profile");
+        let app_dirs = crate::app_profile::AppDirs::under(config.clone(), cache, Some(&profile));
+
+        let dirs = search_dirs_in(Some(&app_dirs), Some(exe.clone()));
+        assert_eq!(
+            dirs,
+            vec![config.join(r"profiles\rc\brand-marks"), exe.join("brand-marks")],
+            "a profiled copy read logos from outside its own folders"
+        );
+        assert!(
+            !dirs.contains(&roaming.join(r"Deskwarden\brand-marks")),
+            "a profiled copy reads the default copy's shared logo folder"
         );
     }
 

@@ -4709,7 +4709,7 @@ mod row_tile_tests {
     /// that is switched OFF and has nowhere to look, and that is not
     /// tidiness.** With no policy installed at all, `card_mark` resolves the
     /// real `settings.json` and, if the developer running the suite has turned
-    /// the preference on, their real Deskwarden `brand-marks` folder: the
+    /// the preference on, their real Deskwarden `brand-marks` folders: the
     /// row tests below assert on painted WORDS, so the suite would pass or
     /// fail depending on what is in a folder on one machine. Every context
     /// here is told what to think.
