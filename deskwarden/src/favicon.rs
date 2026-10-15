@@ -572,7 +572,12 @@ pub fn icon_domain_for(item: &crate::vault_bridge::VaultItem) -> Option<String> 
 /// -- for the one kind of item that can carry a port.
 ///
 /// This is what the icon loader keys its cache on and hands to
-/// [`icon_source_for`]; [`icon_domain_for`] remains the answer for everything
+/// [`icon_source_for`], and **the one key every reader of that cache uses**:
+/// the vault window's list and read pane, and the account picker -- in the
+/// daemon and in the window alike -- through `app::ItemFacts::icon_domain`.
+/// The picker once asked with [`icon_domain_for`] instead, and so looked for
+/// `www.testpro.io.png` beside the `www.testpro.io_2087.png` this key had
+/// saved. [`icon_domain_for`] remains the answer for everything
 /// that wants a domain, and the proxy URL that `icon_source_for` builds drops
 /// the port back off through [`host_of_authority`]. Two answers to two
 /// questions, from one place, rather than a port that survives to one caller

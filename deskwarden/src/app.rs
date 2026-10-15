@@ -3150,7 +3150,9 @@ pub fn set_icon_cache_dir(dir: std::path::PathBuf) {
 /// The derived values are computed once here, under the cache's lock, rather
 /// than by the card: `palette` is `key_sequence::field_palette`, which tests
 /// only whether a field is non-empty and returns `FieldRef`s -- names, never
-/// values -- and `icon_domain` is the host the favicon cache is keyed by.
+/// values -- and `icon_domain` is the authority (host, and port when the URL
+/// has one) the favicon cache is keyed by: [`crate::favicon::icon_authority_for`],
+/// the same answer the vault window saves and reads its icons under.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ItemFacts {
     pub id: String,
@@ -3169,7 +3171,10 @@ pub struct ItemFacts {
     /// [`crate::key_sequence::field_palette`].
     pub palette: Vec<crate::key_sequence::FieldRef>,
     pub has_sequence: bool,
-    /// The favicon cache's key, resolved once.
+    /// The favicon cache's key, resolved once:
+    /// [`crate::favicon::icon_authority_for`], so `www.testpro.io:2087` and
+    /// not a bare host. The name is kept for the wire, which carries these
+    /// from the daemon to the window.
     pub icon_domain: Option<String>,
 }
 
@@ -3206,7 +3211,12 @@ impl ItemFacts {
                 .unwrap_or_default(),
             palette: key_sequence::field_palette(item),
             has_sequence: !sequence_for(item).is_empty(),
-            icon_domain: crate::favicon::icon_domain_for(item),
+            // `icon_authority_for`, the key the vault window SAVES icons
+            // under -- not `icon_domain_for`, which drops a port and so looked
+            // for `www.testpro.io.png` beside the `www.testpro.io_2087.png`
+            // the vault window had written. One function for both, so the
+            // picker and the read pane cannot disagree about a file name.
+            icon_domain: crate::favicon::icon_authority_for(item),
         }
     }
 }
@@ -10959,6 +10969,50 @@ mod picker_wiring_tests {
         // always finds something.
         let without = picker_offers_in(None, &candidates, &facts_of(std::slice::from_ref(&item)));
         assert!(without[0].icon.is_none());
+    }
+
+    /// **A site with a port finds the icon the vault window saved for it.**
+    ///
+    /// The vault window keys its icon cache on `favicon::icon_authority_for`,
+    /// so `https://www.testpro.io:2087/` is saved as
+    /// `www.testpro.io_2087.png`. The picker used to ask with the bare host
+    /// and so looked for `www.testpro.io.png`, a file nothing writes, and
+    /// every row for such a site drew a monogram. The icon is written here
+    /// exactly as the vault window writes it -- under the item's own
+    /// authority -- and the picker has to find it.
+    #[test]
+    fn an_offer_for_a_site_with_a_port_carries_the_icon_the_vault_window_saved() {
+        let dir = unique_icon_dir("port");
+        let png = vec![137u8, 80, 78, 71, 13, 10, 26, 10];
+        let item = login_at("www.testpro.io:2087");
+        let saved_under =
+            crate::favicon::icon_authority_for(&item).expect("a login with a URL has an authority");
+        assert_eq!(saved_under, "www.testpro.io:2087", "control: the vault window's key has the port");
+        crate::favicon::write_cached_icon(&dir, &saved_under, &png);
+        assert!(
+            dir.join("www.testpro.io_2087.png").is_file(),
+            "control: the file is the one found on the owner's disk"
+        );
+
+        let facts = facts_of(std::slice::from_ref(&item));
+        assert_eq!(
+            facts[0].icon_domain.as_deref(),
+            Some(saved_under.as_str()),
+            "the picker's icon key is not the one the vault window saves under"
+        );
+        let candidates = vec![crate::app_candidates::Candidate {
+            id: item.id.clone(),
+            name: item.name.clone(),
+            username: "ada".to_string(),
+        }];
+        let offers = picker_offers_in(Some(&dir), &candidates, &facts);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            offers[0].icon.as_deref(),
+            Some(png.as_slice()),
+            "the picker drew a monogram for a site with a port whose icon is on disk"
+        );
     }
 
     /// **The icon log line tells the three reasons apart, and names nothing.**
