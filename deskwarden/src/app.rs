@@ -3238,6 +3238,44 @@ pub fn picker_offers_in(
         .collect()
 }
 
+/// **Why the account picker's rows do or do not carry icons**, as one log
+/// sentence of counts.
+///
+/// Written for "CTRL+ALT+B - no icons now shown", which the log could not
+/// answer: an offer's icon is `None` for three different reasons -- no icon
+/// cache folder, an item with no website, or a website whose icon was never
+/// cached -- and nothing said which. Counts only, never a name or a website:
+/// the log is not a place for what the user is signed in to.
+///
+/// `corpus` is the whole vault's facts, where each offer's website is looked
+/// up by id.
+pub fn describe_picker_icons(
+    dir: Option<&std::path::Path>,
+    offers: &[crate::picker_prompt::Offer],
+    corpus: &[ItemFacts],
+) -> String {
+    let rows = offers.len();
+    if dir.is_none() {
+        return format!("no icon cache folder is set, so none of its {rows} row(s) has an icon");
+    }
+    let with_icon = offers.iter().filter(|offer| offer.icon.is_some()).count();
+    let no_website = offers
+        .iter()
+        .filter(|offer| offer.icon.is_none())
+        .filter(|offer| {
+            corpus
+                .iter()
+                .find(|facts| facts.id == offer.candidate.id)
+                .is_none_or(|facts| facts.icon_domain.is_none())
+        })
+        .count();
+    let not_cached = rows - with_icon - no_website;
+    format!(
+        "{with_icon} of its {rows} row(s) have a cached icon; {not_cached} have a website with \
+         no cached icon, and {no_website} have no website"
+    )
+}
+
 /// **The account picker's outcome as something `main` can carry out**, as a
 /// pure function.
 ///
@@ -3493,6 +3531,16 @@ pub fn handle_no_match(
     // is never logged: it is the website the user is on.
     let page = page_address(window);
     let PickerCard { offers, corpus } = picker_offers_for(cache, window, page.as_ref());
+    if !offers.is_empty() {
+        log::info!(
+            "the account picker's icons: {}",
+            describe_picker_icons(
+                ICON_CACHE_DIR.get().map(std::path::PathBuf::as_path),
+                &offers,
+                &corpus
+            )
+        );
+    }
     // **Parked for the card's search seam, and cleared when it comes down.**
     // See `SEARCH_CORPUS`: no secret is in it, and a `fn` pointer cannot close
     // over the cache it came from.
@@ -10683,6 +10731,49 @@ mod picker_wiring_tests {
         // always finds something.
         let without = picker_offers_in(None, &candidates, &facts_of(std::slice::from_ref(&item)));
         assert!(without[0].icon.is_none());
+    }
+
+    /// **The icon log line tells the three reasons apart, and names nothing.**
+    ///
+    /// One row with a cached icon, one whose website has none cached, and one
+    /// with no website at all -- through the production `picker_offers_in`,
+    /// so the counts are about real offers.
+    #[test]
+    fn the_picker_icon_line_counts_each_reason_and_names_no_item_or_website() {
+        let dir = unique_icon_dir("coverage");
+        crate::favicon::write_cached_icon(&dir, "slack.com", &[137u8, 80, 78, 71]);
+        let mut cached = login_at("slack.com");
+        cached.id = "id-cached".to_string();
+        let mut uncached = login_at("uncached.example");
+        uncached.id = "id-uncached".to_string();
+        let mut bare = login("ada", "hunter2");
+        bare.id = "id-bare".to_string();
+        let facts = facts_of(&[cached, uncached, bare]);
+        let candidates: Vec<_> = facts
+            .iter()
+            .map(|f| crate::app_candidates::Candidate {
+                id: f.id.clone(),
+                name: f.name.clone(),
+                username: f.username.clone(),
+            })
+            .collect();
+
+        let offers = picker_offers_in(Some(&dir), &candidates, &facts);
+        let line = describe_picker_icons(Some(&dir), &offers, &facts);
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            line,
+            "1 of its 3 row(s) have a cached icon; 1 have a website with no cached icon, and 1 \
+             have no website"
+        );
+        for secret in ["slack", "uncached", "Slack", "ada"] {
+            assert!(!line.contains(secret), "the line names {secret:?}: {line}");
+        }
+        assert_eq!(
+            describe_picker_icons(None, &offers, &facts),
+            "no icon cache folder is set, so none of its 3 row(s) has an icon"
+        );
     }
 
     /// **The empty card is told the window label, not the exe name**, pinned

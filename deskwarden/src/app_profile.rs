@@ -833,6 +833,72 @@ mod tests {
         assert_eq!(bw_cli_cache_dir().unwrap(), bw.cache_dir());
     }
 
+    /// **Every file and folder the default copy keeps is where it was before
+    /// profiles existed** (06dd6e8), spelled from the Windows folders
+    /// themselves rather than from `directories`, so a changed qualifier or a
+    /// swapped config and cache folder fails here even though both sides of
+    /// the test above would move together.
+    ///
+    /// The library's own paths are asked of their functions. The ones `main`
+    /// builds inline -- the icon and update caches, the fill counts and the
+    /// encrypted vault cache -- are held by their source text, joined onto the
+    /// two folders asserted here.
+    #[test]
+    fn every_default_path_is_where_it_was_before_profiles() {
+        let folder = |name: &str| {
+            PathBuf::from(std::env::var_os(name).unwrap_or_else(|| panic!("{name} is not set")))
+        };
+        let roaming = folder(concat!("APP", "DATA"));
+        let local = folder(concat!("LOCALAPP", "DATA"));
+        let config = roaming.join("Deskwarden").join("Deskwarden").join("config");
+        let cache = local.join("Deskwarden").join("Deskwarden").join("cache");
+        assert_eq!(active(), None, "control: this test process is in a profile");
+
+        let dirs = app_dirs().expect("the folders resolve");
+        assert_eq!(dirs.config_dir, config, "settings, the log, accounts and the histories");
+        assert_eq!(dirs.cache_dir, cache, "the favicon and update caches");
+        assert_eq!(crate::settings::config_dir(), Some(config.clone()));
+        assert_eq!(crate::settings::default_path(), Some(config.join("settings.json")));
+        assert_eq!(crate::logging::log_file_path(&config), config.join("deskwarden.log"));
+        assert_eq!(crate::accounts::accounts_root(&config), config.join("accounts"));
+        let id = crate::accounts::AccountId::parse("0123456789abcdef0123456789abcdef").unwrap();
+        assert_eq!(
+            crate::accounts::data_dir_for(&config, &id),
+            config.join("accounts").join("0123456789abcdef0123456789abcdef"),
+            "an account's folder, which also holds its encrypted vault cache"
+        );
+        assert_eq!(crate::sharing_state::default_path(), Some(config.join("sharing_state.json")));
+        assert_eq!(crate::sent_history::default_path(), Some(config.join("sent_history.json")));
+        assert_eq!(crate::hotkey::status_file_path(&config), config.join("daemon-shortcuts.txt"));
+        assert_eq!(crate::brand_mark::search_dirs().first(), Some(&config.join("brand-marks")));
+        assert_eq!(bw_cli_cache_dir(), Some(local.join("deskwarden").join("cache")));
+        assert_eq!(
+            bw_cli_fallback_for(Some(config.clone()), None),
+            None,
+            "the default copy leaves the CLI in its own %APPDATA%\\Bitwarden CLI"
+        );
+
+        let main_rs = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("main.rs"),
+        )
+        .unwrap()
+        .replace("\r\n", "\n");
+        for (needle, at_least) in [
+            ("let project_dirs =\n        deskwarden::app_profile::app_dirs()", 1),
+            ("let Some(project_dirs) = deskwarden::app_profile::app_dirs() else", 1),
+            ("let icon_cache_dir = project_dirs.cache_dir.join(\"icons\");", 2),
+            ("project_dirs.cache_dir.join(\"updates\")", 2),
+            ("config_dir.join(\"fill-stats.json\")", 1),
+            ("Some(account) => accounts::data_dir_for(config_dir, &account.id),", 1),
+            ("None => config_dir.to_path_buf(),", 1),
+        ] {
+            assert!(
+                main_rs.matches(needle).count() >= at_least,
+                "main.rs no longer builds a default path as `{needle}`"
+            );
+        }
+    }
+
     #[test]
     fn the_bw_serve_port_is_the_default_without_a_profile_and_its_own_with_one() {
         assert_eq!(bw_serve_port_for(8087, None), 8087);

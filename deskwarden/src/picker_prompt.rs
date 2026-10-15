@@ -1851,14 +1851,30 @@ mod win32 {
         // read from disk and never fetched from the network at any point on
         // this path -- see `make_icon`.
         drop_icons();
-        if let (Ok(offers), Ok(mut icons)) = (super::OFFERS.lock(), ICONS.lock()) {
-            for candidate in &candidates[..shown] {
-                let png = offers
-                    .iter()
-                    .find(|o| o.candidate.id == candidate.id)
-                    .and_then(|o| o.icon.as_deref());
-                icons.push(png.and_then(make_icon));
+        // Counted for the one log line below, which says whether a row with
+        // no icon was handed none or was handed one this card could not turn
+        // into a picture. Counts only.
+        let (mut handed, mut made) = (0usize, 0usize);
+        match (super::OFFERS.lock(), ICONS.lock()) {
+            (Ok(offers), Ok(mut icons)) => {
+                for candidate in &candidates[..shown] {
+                    let png = offers
+                        .iter()
+                        .find(|o| o.candidate.id == candidate.id)
+                        .and_then(|o| o.icon.as_deref());
+                    handed += usize::from(png.is_some());
+                    let icon = png.and_then(make_icon);
+                    made += usize::from(icon.is_some());
+                    icons.push(icon);
+                }
+                if shown > 0 {
+                    log::info!(
+                        "the account picker shows {shown} row(s): {handed} came with a cached \
+                         icon and {made} of those were drawable"
+                    );
+                }
             }
+            _ => log::warn!("the account picker's icon slots could not be locked; no row has an icon"),
         }
 
         register_class();
