@@ -47,7 +47,7 @@ pub const MARK_DIR_NAME: &str = "brand-marks";
 /// find out how big it was is the bug this constant exists to prevent.
 ///
 /// One megabyte is far more than any of these marks needs -- a network's
-/// logotype at the 30-odd physical pixels this app draws it at is a few
+/// logotype at the few dozen physical pixels this app draws it at is a few
 /// kilobytes -- and it is deliberately generous anyway, because the cost of
 /// being wrong in the tight direction is a legitimate asset silently refused
 /// and the cost of being wrong in the loose direction is one megabyte read
@@ -60,22 +60,29 @@ pub const MAX_MARK_BYTES: u64 = 1024 * 1024;
 /// are files on the user's own disk, and a user is not an attacker -- but a
 /// 20000x20000 PNG is a 1.6 GB decode whoever put it there, and this app's
 /// failure on meeting one must be a refused mark and a drawn word, never a
-/// hang and never an allocation failure. 2048 is over sixty times the ~32
-/// physical pixels the mark is drawn at and still bounds the decode at 16 MB.
+/// hang and never an allocation failure. 2048 is ten times the widest a mark
+/// is ever drawn -- 72 points at 300% is 216 physical pixels -- and still
+/// bounds the decode at 16 MB.
 pub const MAX_MARK_EDGE_PX: u32 = 2048;
 
-/// The longest edge a normalised mark is reduced to before it becomes a
-/// texture.
+/// The longest edge a normalised mark is reduced to and KEPT at, as the
+/// source every drawn size is resampled from.
 ///
-/// The mark is drawn at most [`crate::card_mark::MARK_DETAIL_HEIGHT`] (18)
-/// logical points tall, which is 36 physical pixels at the 200% display
-/// scaling Windows tops out at; a full-bleed logotype three times as wide as
-/// it is tall therefore covers about 110 physical pixels. 128 clears that
-/// without asking the renderer to magnify, and it is a fixed number rather
-/// than one derived from the live DPI for the same reason
-/// `favicon::ICON_TARGET_PX` is: one texture is shared by every monitor the
-/// window can be dragged to.
-const MARK_TEXTURE_PX: usize = 128;
+/// **This is a memory bound, not the drawn size.** No texture is made at this
+/// size any more: `card_mark` resamples from these pixels to the exact
+/// physical pixels each mark covers ([`Mark::resampled`]) and draws that
+/// texture one texel to one pixel. Until then this was `MARK_TEXTURE_PX`,
+/// 128, and the 128-pixel image WAS the texture -- which the GPU then
+/// minified about five times over to the 25 or so pixels a mark covers at
+/// 100%, with linear filtering and no mipmaps, so a reader saw two texels of
+/// every ten and called the logos "not sharp".
+///
+/// 512 is over twice the widest a mark is ever drawn -- four times the 18pt
+/// detail height is 72pt, 216 pixels at 300% scaling -- so the resampler
+/// always reduces and never has to invent detail, and it bounds what is held
+/// per brand at a megabyte whatever a user drops into the folder. The files
+/// brand centres publish at 256 pixels wide pass through untouched.
+const MARK_SOURCE_PX: usize = 512;
 
 /// Alpha at or below which a pixel counts as "not there" when a mark's ink is
 /// being found. Not zero, because a PNG exported from a vector tool carries a
@@ -178,6 +185,60 @@ impl Mark {
     /// Where the ink is centred, in pixels down from the top of the image.
     pub fn ink_center(&self) -> f32 {
         (self.ink_top + self.ink_bottom) / 2.0
+    }
+
+    /// This mark resampled to exactly `width` x `height` pixels, as
+    /// PREMULTIPLIED RGBA ready for `egui::ColorImage::from_rgba_premultiplied`.
+    ///
+    /// **Lanczos3, on the CPU, once per size**, because the alternative is
+    /// what this replaced: a texture several times bigger than the mark,
+    /// minified by the GPU's bilinear sampler with no mipmaps, which reads
+    /// four texels per pixel and skips the rest. A windowed-sinc filter takes
+    /// every source pixel under the footprint into account and keeps the
+    /// lettering's edges as hard as the target grid allows. `image` was
+    /// already a direct dependency (the QR import route), so this costs no
+    /// crate.
+    ///
+    /// **Premultiplied before filtering**, because filtering straight alpha
+    /// lets the colour of fully transparent pixels -- usually black, in a
+    /// file exported from a vector tool -- bleed into the edge of the artwork
+    /// as a dark fringe. Lanczos also overshoots at a hard edge; each colour
+    /// channel is clamped to its alpha afterwards so the result is a valid
+    /// premultiplied pixel and never brighter than opaque.
+    pub fn resampled(&self, width: usize, height: usize) -> Vec<u8> {
+        let (width, height) = (width.max(1), height.max(1));
+        let mut premultiplied = self.rgba.clone();
+        for pixel in premultiplied.chunks_exact_mut(4) {
+            let alpha = u32::from(pixel[3]);
+            for channel in &mut pixel[..3] {
+                *channel = ((u32::from(*channel) * alpha + 127) / 255) as u8;
+            }
+        }
+        if (width, height) == (self.width, self.height) {
+            return premultiplied;
+        }
+        let Some(source) =
+            image::RgbaImage::from_raw(self.width as u32, self.height as u32, premultiplied)
+        else {
+            // Unreachable for a `Mark` `normalise` built, whose buffer is
+            // exactly `width * height * 4`; a transparent rectangle is the
+            // answer that cannot draw anything wrong.
+            return vec![0; width * height * 4];
+        };
+        let mut out = image::imageops::resize(
+            &source,
+            width as u32,
+            height as u32,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .into_raw();
+        for pixel in out.chunks_exact_mut(4) {
+            let alpha = pixel[3];
+            for channel in &mut pixel[..3] {
+                *channel = (*channel).min(alpha);
+            }
+        }
+        out
     }
 }
 
@@ -297,7 +358,7 @@ pub fn normalise(png_bytes: &[u8]) -> Option<Mark> {
         MarkKind::Isolated => trim_to_ink(width, height, rgba),
         MarkKind::OnGround => (width, height, rgba),
     };
-    let (width, height, rgba) = reduce_for_texture(width, height, rgba);
+    let (width, height, rgba) = reduce_for_source(width, height, rgba);
     let (ink_top, ink_bottom) = match kind {
         // Trimmed: the image IS the ink.
         MarkKind::Isolated => (0.0, height as f32),
@@ -410,20 +471,20 @@ fn ground_ink_band(width: usize, height: usize, rgba: &[u8]) -> (f32, f32) {
     }
 }
 
-/// Reduces a normalised mark to [`MARK_TEXTURE_PX`] on its longest edge.
+/// Reduces a normalised mark to [`MARK_SOURCE_PX`] on its longest edge.
 ///
 /// Downscale only, and through `favicon::box_downscale` rather than a second
 /// reduction of this module's own -- the argument for area-averaging over a
 /// single bilinear tap, and for doing it premultiplied so a transparent edge
 /// does not fringe the artwork black, is made in full over there and is the
-/// same argument here. A mark already at or under the target is moved
-/// through untouched.
-fn reduce_for_texture(width: usize, height: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
+/// same argument here. A mark already at or under the bound is moved through
+/// untouched, which is every file seen so far.
+fn reduce_for_source(width: usize, height: usize, rgba: Vec<u8>) -> (usize, usize, Vec<u8>) {
     let longest = width.max(height);
-    if longest <= MARK_TEXTURE_PX {
+    if longest <= MARK_SOURCE_PX {
         return (width, height, rgba);
     }
-    let scale = MARK_TEXTURE_PX as f64 / longest as f64;
+    let scale = MARK_SOURCE_PX as f64 / longest as f64;
     let dst_w = ((width as f64 * scale).round() as usize).max(1);
     let dst_h = ((height as f64 * scale).round() as usize).max(1);
     let scaled = crate::favicon::box_downscale(&rgba, width, height, dst_w, dst_h);
@@ -669,14 +730,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_huge_mark_is_reduced_before_it_becomes_a_texture() {
+    fn a_huge_mark_is_reduced_before_it_is_kept() {
         let mark = normalise(&on_ground_png(1024, 512, 200)).expect("decodes");
         assert!(
-            mark.width.max(mark.height) <= MARK_TEXTURE_PX,
-            "a {}x{} texture was kept for a mark drawn at about 32 physical pixels",
+            mark.width.max(mark.height) <= MARK_SOURCE_PX,
+            "a {}x{} source was kept for a mark drawn at a few dozen physical pixels",
             mark.width,
             mark.height
         );
+        // ...and the bound is above what a real file needs: the 256-wide
+        // marks brand centres publish are kept at their own pixels, so the
+        // resampler has all of them to work from.
+        let published = normalise(&on_ground_png(256, 160, 80)).expect("decodes");
+        assert_eq!((published.width, published.height), (256, 160));
         assert_eq!(mark.rgba.len(), mark.width * mark.height * 4);
         // The ink band survives the reduction proportionally: it is measured
         // after it, so it cannot drift out of step with the pixels it
@@ -687,6 +753,72 @@ pub(crate) mod tests {
             "the ink band came out at {fraction} of the reduced image, not the {} it was",
             200.0 / 512.0
         );
+    }
+
+    /// **A resampled mark is exactly the size asked for, premultiplied, and
+    /// has no dark fringe.** The fringe is the failure premultiplying exists
+    /// to prevent: an isolated mark's transparent pixels are black, and a
+    /// filter run over straight alpha drags that black into the artwork's
+    /// edge.
+    #[test]
+    fn a_resampled_mark_is_the_size_asked_for_and_keeps_its_colour_to_the_edge() {
+        let mark = normalise(&isolated_png(210, 69, 66)).expect("decodes");
+        assert_eq!(mark.kind, MarkKind::Isolated);
+        for (w, h) in [(48, 16), (37, 13), (97, 32), (1, 1)] {
+            let out = mark.resampled(w, h);
+            assert_eq!(out.len(), w * h * 4, "asked for {w}x{h}");
+            for pixel in out.chunks_exact(4) {
+                assert!(
+                    pixel[..3].iter().all(|c| *c <= pixel[3]),
+                    "{pixel:?} is not a premultiplied pixel -- a colour over its alpha draws \
+                     brighter than opaque"
+                );
+            }
+        }
+        // Two bars of pure (0xEB, 0x00, 0x1B) with transparent BLACK between
+        // them -- what a vector export's empty pixels are. Every pixel with
+        // real coverage, unpremultiplied, must still be that red: a
+        // straight-alpha filter would darken the partly covered edges toward
+        // the black of the gap.
+        let (bw, bh) = (60usize, 20usize);
+        let mut rgba = Vec::with_capacity(bw * bh * 4);
+        for _ in 0..bh {
+            for x in 0..bw {
+                let ink = !(20..40).contains(&x);
+                rgba.extend_from_slice(if ink { &[0xEB, 0x00, 0x1B, 0xFF] } else { &[0, 0, 0, 0] });
+            }
+        }
+        let bars = Mark {
+            width: bw,
+            height: bh,
+            rgba,
+            kind: MarkKind::Isolated,
+            ink_top: 0.0,
+            ink_bottom: bh as f32,
+        };
+        let out = bars.resampled(13, 5);
+        let mut edge_pixels = 0;
+        for pixel in out.chunks_exact(4) {
+            let alpha = f32::from(pixel[3]);
+            if alpha < 64.0 {
+                continue;
+            }
+            if alpha < 250.0 {
+                edge_pixels += 1;
+            }
+            let red = f32::from(pixel[0]) * 255.0 / alpha;
+            assert!(
+                red > 0xEB as f32 - 12.0,
+                "an edge pixel {pixel:?} unpremultiplies to red {red}, darker than the ink's \
+                 {} -- the transparent black was filtered into the artwork",
+                0xEB
+            );
+        }
+        assert!(edge_pixels > 0, "the control: this downscale produced no partly covered pixel");
+        // At its own size the mark comes back pixel for pixel.
+        let same = mark.resampled(mark.width, mark.height);
+        assert_eq!(same.len(), mark.rgba.len());
+        assert_eq!(&same[..4], &mark.rgba[..4]);
     }
 
     /// A directory under the process's temp dir, **never

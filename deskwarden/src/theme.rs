@@ -1055,13 +1055,12 @@ pub fn ink_center_y(galley: &egui::Galley) -> Option<f32> {
 /// [`ink_center_y`] is the midpoint of this band and is expressed in terms of
 /// it, so the two cannot come to disagree about where a run's ink is.
 ///
-/// The BAND rather than only its centre is what a caller needs when it has to
-/// match a run's optical *size* and not just its position:
-/// [`crate::card_mark`] scales a brand logo so that the logo's ink stands
-/// exactly as tall as the wordmark it replaced, which is what makes a row of
-/// mixed marks -- some logos, some words, some logos on their own coloured
-/// ground -- read as one set rather than as whatever files the user happened
-/// to download.
+/// The BAND rather than only its centre is what [`crate::card_mark`] reads:
+/// it places a brand logo so that the logo's ink centre lands on the ink
+/// centre of the wordmark it replaced, which is what keeps a row of mixed
+/// marks -- some logos, some words -- on one line. (It once also scaled the
+/// logo to this band's HEIGHT; that made every logo the cap height of small
+/// type, and a logo now fills its box instead.)
 ///
 /// `None` for a run with no glyphs, where there is no ink to measure.
 pub fn ink_band_y(galley: &egui::Galley) -> Option<(f32, f32)> {
@@ -1501,7 +1500,10 @@ fn snap_to_pixels(ui: &Ui, rect: Rect) -> Rect {
 ///
 /// A non-positive `pixels_per_point` cannot be divided back out; the position
 /// is returned untouched, which is the same no-op the old code was.
-fn snapped_min(min: Pos2, pixels_per_point: f32) -> Pos2 {
+///
+/// `pub(crate)` for `card_mark`, which draws a brand logo one texel to one
+/// device pixel and needs its corner on this same grid for that to hold.
+pub(crate) fn snapped_min(min: Pos2, pixels_per_point: f32) -> Pos2 {
     if pixels_per_point <= 0.0 {
         return min;
     }

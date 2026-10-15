@@ -16974,6 +16974,12 @@ mod tests {
             "the control did not draw the word"
         );
 
+        let control_digits = texts
+            .iter()
+            .find(|(t, _)| t.contains("4242"))
+            .map(|(t, _)| t.clone())
+            .expect("the control painted the card number");
+
         let (texts, grounds, images) = painted_with_logos(&a_full_card(), Some(dir.to_path_buf()));
         assert_eq!(images.len(), 1, "the logo was not drawn on the read pane");
         assert!(
@@ -17004,6 +17010,40 @@ mod tests {
             digits.left() >= images[0].right(),
             "the digits at {digits:?} start inside the logo at {:?}",
             images[0]
+        );
+
+        // **The owner's own shape of file: a wide wordmark on transparency**
+        // (`visa.png` is 210x69). Fitted to the box rather than to the word's
+        // cap height it is the widest thing this row has drawn -- about 58pt
+        // of box, where it took 33 at the cap height -- so this is the case
+        // where a logo could crowd the digits.
+        std::fs::write(
+            dir.join(crate::brand_mark::file_name(CardBrand::Visa).expect("a name")),
+            crate::brand_mark::tests::isolated_png(210, 69, 65),
+        )
+        .expect("the fixture was replaced");
+        let (texts, _, images) = painted_with_logos(&a_full_card(), Some(dir.to_path_buf()));
+        assert_eq!(images.len(), 1, "the wide logo was not drawn on the read pane");
+        let inner = BRAND_MARK_SIZE - 2.0 * card_mark::LOGO_INSET;
+        assert!(
+            (images[0].height() - inner).abs() < 0.01,
+            "the logo is {}pt tall on an {BRAND_MARK_SIZE}pt row -- not the {inner}pt the box \
+             less its inset gives it",
+            images[0].height()
+        );
+        let (shown, digits) = texts
+            .iter()
+            .find(|(t, _)| t.contains("4242"))
+            .cloned()
+            .expect("the card number was painted beside the wide logo");
+        assert!(
+            digits.left() >= images[0].right(),
+            "the digits at {digits:?} start inside the wide logo at {:?}",
+            images[0]
+        );
+        assert_eq!(
+            shown, control_digits,
+            "the wider logo cost the masked number characters on a pane with room for both"
         );
     }
 

@@ -34,12 +34,35 @@
 //! their rectangle means. An isolated mark on transparency has been trimmed to
 //! its ink by `brand_mark`; a reversed mark on the brand's own colour carries
 //! that brand's mandated clear space *inside* the image, so its lettering is
-//! often barely half the file's height. Scaled to one image height, the second
-//! renders visibly smaller than the first and smaller than the words beside
-//! it. So both are scaled until their ink stands exactly as tall as the
-//! wordmark's ink at this size ([`theme::ink_band_y`]), and both are placed so
-//! that their ink centre lands where the word's ink centre would have. Mixed
-//! sources then read as one set. See [`logo_fit`].
+//! often barely half the file's height.
+//!
+//! **The ink fills the BOX, less [`LOGO_INSET`] top and bottom** -- 16pt on
+//! the read pane's 18pt row, 13pt in the list's 15pt box. It was first
+//! scaled to the WORDMARK's ink height instead ([`theme::ink_band_y`] of
+//! the word it replaces), which is the cap height of 9-11pt type: about 8pt.
+//! That kept a logo and a word the same optical size, and it made every logo
+//! a thumbnail -- the owner's report was "look tiny". A logo is a picture,
+//! not a run of capitals, and a picture at a word's cap height is too small
+//! to read its detail. A reversed mark whose image would overrun the box at
+//! that ink height is bounded by its image instead, so its GROUND fills the
+//! box exactly as an isolated mark's ink does, and the two still read as one
+//! set: one height of thing per row. Both are still placed so that their ink
+//! centre lands where the word's ink centre would have. See [`logo_fit`].
+//!
+//! # How a logo is made sharp
+//!
+//! **Drawn one texel to one device pixel.** The fit is rounded to whole
+//! physical pixels at the live `pixels_per_point`, the trimmed source is
+//! resampled to exactly that many on the CPU ([`brand_mark::Mark::resampled`],
+//! Lanczos3), and the result is painted with its corner snapped to the pixel
+//! grid ([`theme::snapped_min`]) -- so the GPU samples each texel once and
+//! filters nothing. The old path uploaded one 128-pixel texture per brand and
+//! let the GPU minify it about five times over with bilinear filtering and no
+//! mipmaps, which reads four texels per pixel and drops the rest: the other
+//! half of the report, "not sharp". Textures are kept per brand and per
+//! physical size, a few at most ([`MAX_SIZES_PER_LOGO`]), so the list's size
+//! and the read pane's both stay resident and a move to a monitor at another
+//! scale factor makes new ones rather than reusing the wrong ones.
 //!
 //! **A logo is drawn BARE -- no pill, no ground.** Three treatments were
 //! rendered side by side at the row's real geometry before this was picked:
@@ -73,7 +96,7 @@ use crate::card_brand::CardBrand;
 use crate::theme;
 use eframe::egui;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The mark's height on the detail pane's Number row.
@@ -185,7 +208,39 @@ fn galley(ui: &egui::Ui, brand: CardBrand, height: f32) -> std::sync::Arc<egui::
 /// 10:1 file through the moved layout and reads the cap back off the painted
 /// image, so this is pinned by what is drawn rather than by the arithmetic
 /// here.
+///
+/// **It is also what keeps a box-height logo inside the room the wordmark
+/// had**, now that a logo is fitted to the box rather than to the word's cap
+/// height. A logo is allowed to be wider than ITS OWN brand's word -- the
+/// owner's `visa.png` at 13pt tall is a 47pt box against the `VISA` pill's
+/// 28 -- and
+/// that is the point of the change, since capping it at its word's width
+/// would put it straight back at the cap height it was too small at. What it
+/// may not exceed is the room the row and the read pane were budgeted
+/// against, which is the WIDEST wordmark. Measured, padding included: a
+/// capped logo's box is 66pt against `MASTERCARD`'s 72 in the list, and 80pt
+/// against its 88 on the read pane's 18pt row.
 const MAX_LOGO_ASPECT: f32 = 4.0;
+
+/// How far a logo stands inside its box, top and bottom, in points.
+///
+/// One point, so a logo fills its box and still does not touch the edges a
+/// reader sees as the row's: on the read pane the 18pt box is the Number
+/// row's own line, and ink to its very edge reads as crowding the rows above
+/// and below. Two points was the other candidate and is a sixth of the list's
+/// 15pt box -- enough to make the logo visibly smaller than the space it was
+/// given, which is the complaint this fit answers.
+pub const LOGO_INSET: f32 = 1.0;
+
+/// How many physical sizes of one brand's logo are kept as textures at once.
+///
+/// Two are in use at any moment -- the list row's and the read pane's -- and
+/// a window dragged between monitors at different scale factors needs those
+/// two again at the new scale. Four holds both scales without thrashing; the
+/// least recently drawn is dropped past that, which frees its texture. At the
+/// largest size a mark is drawn (72 by 18 points at 300%) four textures are
+/// under half a megabyte per brand.
+const MAX_SIZES_PER_LOGO: usize = 4;
 
 /// How long a brand whose file was NOT FOUND is left alone before the
 /// directories are looked at again.
@@ -240,25 +295,74 @@ enum Slot {
     Absent(Instant),
     /// A file was there and will not be drawn. Terminal for this context.
     Refused,
-    /// A texture, and where its ink sits in it.
+    /// A decoded mark, and the textures made from it so far.
     Ready(Arc<Logo>),
 }
 
-/// A decoded, uploaded brand logo.
+/// A decoded brand logo: its normalised source pixels, and a texture per
+/// physical size it has been drawn at.
 struct Logo {
-    texture: egui::TextureHandle,
-    /// The texture's own pixel dimensions.
+    brand: CardBrand,
+    /// The trimmed, bounded source every drawn size is resampled from.
+    mark: brand_mark::Mark,
+    /// The source's own pixel dimensions.
     size: egui::Vec2,
     /// The ink's top and bottom within those pixels; see
     /// [`brand_mark::Mark::ink_top`].
     ink_top: f32,
     ink_bottom: f32,
+    /// Textures at the exact physical sizes drawn so far, least recently
+    /// drawn first; at most [`MAX_SIZES_PER_LOGO`]. Behind a lock because the
+    /// `Logo` is shared through the context's data map as an `Arc`, and a new
+    /// size is found while painting.
+    textures: Mutex<Vec<egui::TextureHandle>>,
 }
 
 impl Logo {
-    /// Where the ink is centred, in the texture's own pixels.
+    /// Where the ink is centred, in the source's own pixels.
     fn ink_center(&self) -> f32 {
         (self.ink_top + self.ink_bottom) / 2.0
+    }
+
+    /// The texture for this logo at exactly `size_px` physical pixels,
+    /// resampled and uploaded the first time that size is asked for.
+    ///
+    /// Keyed by the size alone because a `Logo` is one brand's: the key is
+    /// (brand, width, height) with the brand fixed by whose `Logo` this is.
+    fn texture(&self, ctx: &egui::Context, size_px: [usize; 2]) -> egui::TextureHandle {
+        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = textures.iter().position(|t| t.size() == size_px) {
+            // Most recently drawn goes last, so eviction takes the stale end.
+            let texture = textures.remove(at);
+            textures.push(texture.clone());
+            return texture;
+        }
+        let pixels = self.mark.resampled(size_px[0], size_px[1]);
+        let image = egui::ColorImage::from_rgba_premultiplied(size_px, &pixels);
+        let texture = ctx.load_texture(
+            format!("card-mark:{:?}:{}x{}", self.brand, size_px[0], size_px[1]),
+            image,
+            // Linear, though at one texel per pixel on the pixel grid it
+            // samples each texel's centre and filters nothing either way.
+            egui::TextureOptions::LINEAR,
+        );
+        textures.push(texture.clone());
+        if textures.len() > MAX_SIZES_PER_LOGO {
+            // Dropping the handle frees the texture.
+            drop(textures.remove(0));
+        }
+        texture
+    }
+
+    /// How many sizes are resident, for the tests that pin the bound.
+    #[cfg(test)]
+    fn sizes(&self) -> Vec<[usize; 2]> {
+        self.textures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(egui::TextureHandle::size)
+            .collect()
     }
 }
 
@@ -339,31 +443,23 @@ fn logo(ui: &egui::Ui, brand: CardBrand) -> Option<Arc<Logo>> {
         _ => {}
     }
     // Deliberately outside the `data_mut` above and the one below: this reads
-    // a file, decodes it and uploads a texture, and `egui`'s data map is
-    // locked while a closure over it runs.
+    // a file and decodes it, and `egui`'s data map is locked while a closure
+    // over it runs. No texture is made here -- the size it must be is not
+    // known until a caller paints it; see `Logo::texture`.
     let slot = match brand_mark::load(&policy.dirs, brand) {
         MarkLoad::Missing => Slot::Absent(Instant::now()),
         MarkLoad::Refused(why) => {
             log::debug!("brand mark for {brand:?} refused ({why:?}); drawing the wordmark");
             Slot::Refused
         }
-        MarkLoad::Loaded(mark) => {
-            let image = egui::ColorImage::from_rgba_unmultiplied(
-                [mark.width, mark.height],
-                &mark.rgba,
-            );
-            let texture = ctx.load_texture(
-                format!("card-mark:{brand:?}"),
-                image,
-                egui::TextureOptions::default(),
-            );
-            Slot::Ready(Arc::new(Logo {
-                texture,
-                size: egui::vec2(mark.width as f32, mark.height as f32),
-                ink_top: mark.ink_top,
-                ink_bottom: mark.ink_bottom,
-            }))
-        }
+        MarkLoad::Loaded(mark) => Slot::Ready(Arc::new(Logo {
+            brand,
+            size: egui::vec2(mark.width as f32, mark.height as f32),
+            ink_top: mark.ink_top,
+            ink_bottom: mark.ink_bottom,
+            mark,
+            textures: Mutex::new(Vec::new()),
+        })),
     };
     let ready = match &slot {
         Slot::Ready(logo) => Some(logo.clone()),
@@ -401,48 +497,56 @@ fn remember(ctx: &egui::Context, brand: CardBrand, slot: Slot) {
 /// stands in for.
 ///
 /// Returns the image's rect **relative to the top-left of the mark's box**,
-/// padding included, and the box's own width.
+/// padding included, and the box's own width. The rect's size is a whole
+/// number of physical pixels at `pixels_per_point`, which is the size the
+/// texture is resampled to.
 ///
-/// Three rules, in this order:
+/// Four rules, in this order:
 ///
-/// * **Scale by ink.** `scale = ink_target / logo_ink`, where `ink_target` is
-///   how tall the wordmark's own ink stands at this size. This is the rule
-///   that makes an isolated mark and a full-bleed one -- whose lettering may
-///   be half its file's height -- come out at the same optical size.
-/// * **Then bound the box.** The image may not be taller than `height` or
-///   wider than [`MAX_LOGO_ASPECT`] times it. A file with extravagant clear
-///   space, or one three times wider than it is tall, is fitted to the bound
-///   and loses some ink height; the alternative is a mark that overflows a row
-///   whose geometry is fixed.
-///
-///   **Where the height bound bites, measured.** At [`MARK_ROW_HEIGHT`] the
-///   wordmark's ink stands about 6pt in a 15pt box, so a mark on its own
-///   ground whose lettering is under about **40% of its file's height** hits
-///   the bound and draws its ink proportionally smaller -- a file at 30% comes
-///   out about a quarter under the words beside it. Assets from brand centres
-///   measured well over that line (the reversed marks seen so far run 45-50%),
-///   and an isolated mark can never hit it at all, because trimming makes its
-///   ink its whole height. The failure is graceful and bounded either way: a
-///   mark slightly small, never a row whose height depends on which files the
-///   user downloaded.
+/// * **Scale the ink to the box.** `scale = inner / logo_ink`, where `inner`
+///   is the box's height less [`LOGO_INSET`] top and bottom. For an isolated
+///   mark, which `brand_mark` has trimmed to its ink, that is the whole image
+///   standing `inner` tall.
+/// * **Then bound the image.** It may not be taller than `inner` or wider
+///   than [`MAX_LOGO_ASPECT`] times the box height. A reversed mark on its own
+///   ground always meets the first bound -- its lettering is a fraction of its
+///   file's height, so ink at `inner` would need an image several times the
+///   box -- and is drawn with its ground filling `inner` instead, which is
+///   the same height of thing an isolated mark draws. A file several times
+///   wider than it is tall meets the second and loses some height; the
+///   alternative is a mark that eats the name's truncation budget.
+/// * **Then round to whole physical pixels**, so the texture can be drawn one
+///   texel to one pixel. Each axis is rounded on its own; the aspect moves by
+///   at most half a pixel, which no reader can see, and the GPU no longer
+///   resamples anything, which every reader could.
 /// * **Then centre on the ink**, not on the rectangle: the image is placed so
 ///   its ink centre lands exactly where the word's ink centre sits inside the
 ///   same box. Box-centring is what put the pill visibly off the name's line
 ///   before `0d28e9f`, and a full-bleed logo whose lettering sits low in its
-///   own clear space would reintroduce it.
-fn logo_fit(logo: &Logo, height: f32, word: &egui::Galley) -> (egui::Rect, f32) {
+///   own clear space would reintroduce it. With the image `inner` tall and
+///   the word's ink centre a fraction of a point off the box's, the inset is
+///   what keeps it inside the box.
+fn logo_fit(
+    logo: &Logo,
+    height: f32,
+    word: &egui::Galley,
+    pixels_per_point: f32,
+) -> (egui::Rect, f32) {
     let (word_top, word_bottom) = theme::ink_band_y(word).unwrap_or((0.0, height));
     // The word's own ink, as `paint_mark` places it: its galley is centred in
     // the box, so its ink band moves with it.
     let word_offset = (height - word.size().y) / 2.0;
-    let ink_target = (word_bottom - word_top).max(1.0);
     let word_ink_center = word_offset + (word_top + word_bottom) / 2.0;
+    let inner = (height - 2.0 * LOGO_INSET).max(1.0);
 
     let logo_ink = (logo.ink_bottom - logo.ink_top).max(1.0);
-    let mut scale = ink_target / logo_ink;
-    scale = scale.min(height / logo.size.y.max(1.0));
+    let mut scale = inner / logo_ink;
+    scale = scale.min(inner / logo.size.y.max(1.0));
     scale = scale.min(MAX_LOGO_ASPECT * height / logo.size.x.max(1.0));
-    let drawn = logo.size * scale;
+    let drawn = whole_pixels(logo.size * scale, pixels_per_point);
+    // The scale the image is REALLY drawn at, vertically, after rounding --
+    // so the ink centre below lands where the drawn ink really is.
+    let scale = drawn.y / logo.size.y.max(1.0);
 
     let pad = pad_x(height);
     // **The ink centre lands on the word's, and is deliberately NOT clamped
@@ -466,6 +570,23 @@ fn logo_fit(logo: &Logo, height: f32, word: &egui::Galley) -> (egui::Rect, f32) 
     )
 }
 
+/// `size` in points, rounded on each axis to a whole number of physical
+/// pixels at `pixels_per_point` -- never fewer than one. A non-positive
+/// scale factor has no grid, and the size is returned as it was.
+fn whole_pixels(size: egui::Vec2, pixels_per_point: f32) -> egui::Vec2 {
+    if pixels_per_point <= 0.0 {
+        return size;
+    }
+    let axis = |v: f32| (v * pixels_per_point).round().max(1.0) / pixels_per_point;
+    egui::vec2(axis(size.x), axis(size.y))
+}
+
+/// The physical pixel size of a rect [`whole_pixels`] produced.
+fn size_px(size: egui::Vec2, pixels_per_point: f32) -> [usize; 2] {
+    let axis = |v: f32| (v * pixels_per_point.max(f32::MIN_POSITIVE)).round().max(1.0) as usize;
+    [axis(size.x), axis(size.y)]
+}
+
 /// How wide the mark for `brand` is when drawn `height` tall.
 ///
 /// Measured off the same galley -- or, when there is one, the same logo --
@@ -483,7 +604,7 @@ fn logo_fit(logo: &Logo, height: f32, word: &egui::Galley) -> (egui::Rect, f32) 
 pub fn mark_width(ui: &egui::Ui, brand: CardBrand, height: f32) -> f32 {
     let word = galley(ui, brand, height);
     match logo(ui, brand) {
-        Some(logo) => logo_fit(&logo, height, &word).1,
+        Some(logo) => logo_fit(&logo, height, &word, ui.ctx().pixels_per_point()).1,
         None => word.size().x + 2.0 * pad_x(height),
     }
 }
@@ -512,12 +633,28 @@ pub fn paint_mark(
 ) -> egui::Rect {
     let galley = galley(ui, brand, height);
     if let Some(logo) = logo(ui, brand) {
-        let (image, width) = logo_fit(&logo, height, &galley);
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let (image, width) = logo_fit(&logo, height, &galley, pixels_per_point);
         let rect = anchor.anchor_size(pos, egui::vec2(width, height));
         // `logo_fit` answers in the box's own coordinates, so the box can be
-        // anchored anywhere and the image follows it.
+        // anchored anywhere and the image follows it -- and then its corner
+        // goes onto the device-pixel grid, so that with its whole-pixel size
+        // every texel lands on exactly one pixel.
         let at = image.translate(rect.min.to_vec2());
-        egui::Image::new((logo.texture.id(), logo.texture.size_vec2())).paint_at(ui, at);
+        let at = egui::Rect::from_min_size(theme::snapped_min(at.min, pixels_per_point), at.size());
+        let texture = logo.texture(ui.ctx(), size_px(at.size(), pixels_per_point));
+        // A textured RECT, as `egui::Image` paints, rather than
+        // `Painter::image`'s mesh: it is the shape every caller's tests
+        // recognise an image by. On a whole-pixel rect its anti-aliasing
+        // feather falls exactly between pixels, so every texel still draws
+        // at full strength.
+        ui.painter().add(
+            egui::epaint::RectShape::filled(at, egui::CornerRadius::ZERO, egui::Color32::WHITE)
+                .with_texture(
+                    texture.id(),
+                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+                ),
+        );
         return rect;
     }
     let size = egui::vec2(galley.size().x + 2.0 * pad_x(height), height);
@@ -874,10 +1011,18 @@ mod tests {
     /// **The guarantee that lets a user mix assets from two brand centres.**
     /// An isolated mark on transparency and a reversed mark full-bleed on its
     /// own colour are the two shapes that turn up, they are shaped nothing
-    /// like each other, and they must come out looking like one set: the same
-    /// ink height, on the same optical line.
+    /// like each other, and they must come out looking like one set: one
+    /// height of thing in the box -- the isolated mark's ink, the grounded
+    /// mark's ground -- on the same optical line.
+    ///
+    /// **This pinned one INK height until logos were fitted to the box.** At
+    /// a wordmark's cap height a grounded mark's lettering could be matched to
+    /// an isolated mark's; at the box's height it cannot, because its image
+    /// would have to be several boxes tall. What a reader compares on one row
+    /// is then the height of each mark's visible extent, and that is what is
+    /// held equal now.
     #[test]
-    fn an_isolated_mark_and_a_full_bleed_one_draw_at_one_ink_size_on_one_line() {
+    fn an_isolated_mark_and_a_full_bleed_one_fill_one_box_on_one_line() {
         // Deliberately different in every dimension a file can differ in:
         // different pixel sizes, different aspect ratios, and lettering that
         // is 100% of one image and 40% of the other.
@@ -885,7 +1030,7 @@ mod tests {
             true,
             &[
                 (CardBrand::Visa, isolated_png(120, 60, 30)),
-                (CardBrand::Mastercard, on_ground_png(300, 100, 40)),
+                (CardBrand::Mastercard, on_ground_png(240, 100, 40)),
             ],
         );
         let mut ink = Vec::new();
@@ -893,18 +1038,15 @@ mod tests {
             let (_, images) = painted(&ctx, brand, MARK_ROW_HEIGHT);
             assert_eq!(images.len(), 1, "{brand:?} did not draw as a logo");
             let logo = logo_of(&ctx, brand);
-            // What the reader sees of each: the ink band, mapped out of the
-            // fit. For the trimmed isolated mark the ink is the whole image;
-            // for the grounded one it is the lettering inside its clear space.
+            // What the reader sees of each: its whole image, which for the
+            // trimmed isolated mark is its ink and for the grounded one is its
+            // ground; and where its ink is centred.
             let (fitted, _) = with_ui_on(&ctx, |ui| {
                 let word = word_galley(ui, brand, MARK_ROW_HEIGHT);
-                logo_fit(&logo, MARK_ROW_HEIGHT, &word)
+                logo_fit(&logo, MARK_ROW_HEIGHT, &word, ui.ctx().pixels_per_point())
             });
             let scale = fitted.height() / logo.size.y;
-            ink.push((
-                (logo.ink_bottom - logo.ink_top) * scale,
-                fitted.top() + logo.ink_center() * scale,
-            ));
+            ink.push((fitted.height(), fitted.top() + logo.ink_center() * scale));
             // ...and the fit is what was really painted, to within the
             // rounding `egui` does when it snaps an image onto the pixel grid
             // (one point is one pixel in this headless context; on a real
@@ -917,31 +1059,41 @@ mod tests {
             );
         }
         let (isolated, grounded) = (ink[0], ink[1]);
-        assert!(
-            (isolated.0 - grounded.0).abs() < 0.2,
-            "one mark's lettering is {}pt tall and the other's is {}pt -- the full-bleed asset's \
-             clear space was drawn as though it were part of the mark",
-            isolated.0,
-            grounded.0
-        );
+        let inner = MARK_ROW_HEIGHT - 2.0 * LOGO_INSET;
+        for (what, (drawn, _)) in [("isolated", isolated), ("grounded", grounded)] {
+            assert!(
+                (drawn - inner).abs() < 0.01,
+                "the {what} mark is {drawn}pt tall in a {MARK_ROW_HEIGHT}pt box -- not the \
+                 {inner}pt the box less its inset gives a logo"
+            );
+        }
         assert!(
             (isolated.1 - grounded.1).abs() < 0.01,
             "the two marks' ink centres are at {} and {} -- they sit on different lines",
             isolated.1,
             grounded.1
         );
-        // The positive control: the two rects really are different, so the
-        // agreement above is normalisation and not two identical inputs.
-        assert!(isolated.0 > 1.0, "the ink measured as nothing");
+        // The positive control: the two sources really are different shapes,
+        // so the agreement above is the fit and not two identical inputs.
+        let (iso, grd) = (logo_of(&ctx, CardBrand::Visa), logo_of(&ctx, CardBrand::Mastercard));
+        assert!(
+            (iso.size.x / iso.size.y - grd.size.x / grd.size.y).abs() > 0.5,
+            "the two fixtures have one aspect ratio"
+        );
     }
 
     /// **A logo lands on the WORD's optical line**, which is what lets
     /// `item_list` keep computing the row's alignment off the wordmark's
-    /// galley with a logo in the box.
+    /// galley with a logo in the box -- and its ink fills that box, less the
+    /// inset, rather than standing at the word's cap height.
+    ///
+    /// Until logos were fitted to the box this test pinned the opposite: the
+    /// logo's ink equal to the WORD's ink height, about 6pt in this 15pt box.
+    /// That is the rule the owner's "look tiny" report was about.
     #[test]
-    fn a_logo_takes_the_line_and_the_box_height_the_word_would_have_had() {
-        let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Visa, on_ground_png(240, 80, 32))]);
-        let (word_ink, height) = with_ui_on(&ctx, |ui| {
+    fn a_logo_fills_its_box_less_the_inset_on_the_words_line() {
+        let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Visa, isolated_png(120, 80, 40))]);
+        let (word_ink, word_height) = with_ui_on(&ctx, |ui| {
             let word = word_galley(ui, CardBrand::Visa, MARK_ROW_HEIGHT);
             let (top, bottom) = theme::ink_band_y(&word).expect("the word has ink");
             let offset = (MARK_ROW_HEIGHT - word.size().y) / 2.0;
@@ -952,7 +1104,7 @@ mod tests {
         assert_eq!(images.len(), 1, "the premise: this fixture draws as a logo");
         let (fitted, _) = with_ui_on(&ctx, |ui| {
             let word = word_galley(ui, CardBrand::Visa, MARK_ROW_HEIGHT);
-            logo_fit(&logo, MARK_ROW_HEIGHT, &word)
+            logo_fit(&logo, MARK_ROW_HEIGHT, &word, ui.ctx().pixels_per_point())
         });
         let scale = fitted.height() / logo.size.y;
         let logo_ink_center = fitted.top() + logo.ink_center() * scale;
@@ -962,9 +1114,22 @@ mod tests {
              {word_ink} -- so a row aligned off the word is not aligned to the logo"
         );
         let drawn_ink = (logo.ink_bottom - logo.ink_top) * scale;
+        let inner = MARK_ROW_HEIGHT - 2.0 * LOGO_INSET;
         assert!(
-            (drawn_ink - height).abs() < 0.2,
-            "the logo's lettering stands {drawn_ink}pt against the word's {height}pt"
+            (drawn_ink - inner).abs() < 0.01,
+            "the logo's ink stands {drawn_ink}pt in a {MARK_ROW_HEIGHT}pt box, not the {inner}pt \
+             the box less its inset gives it"
+        );
+        assert!(
+            drawn_ink > word_height * 1.5,
+            "the logo's ink is {drawn_ink}pt against the word's {word_height}pt cap height -- \
+             still a thumbnail"
+        );
+        // ...and inside the box: the inset is what absorbs the fraction of a
+        // point between the word's ink centre and the box's.
+        assert!(
+            fitted.top() >= -0.01 && fitted.bottom() <= MARK_ROW_HEIGHT + 0.01,
+            "the logo at {fitted:?} overhangs its {MARK_ROW_HEIGHT}pt box"
         );
     }
 
@@ -973,31 +1138,38 @@ mod tests {
     /// name's column, and it was tuned against `MASTERCARD`; a file with an
     /// extravagant aspect ratio must be fitted rather than allowed to eat the
     /// name.
+    ///
+    /// **Held on both surfaces**, now that a logo is fitted to the box: the
+    /// read pane's 18pt row reserves the mark's width before it decides how
+    /// much of the masked number fits, so the bound is that row's budget too.
     #[test]
     fn a_wildly_wide_file_is_bounded_to_less_than_the_widest_wordmark() {
-        let widest = with_ui(|ui| {
-            CARD_BRANDS
-                .iter()
-                .map(|brand| mark_width(ui, *brand, MARK_ROW_HEIGHT))
-                .fold(0.0f32, f32::max)
-        });
         // Twenty to one, which no real mark is: the point is that the bound
         // holds without knowing what a user will drop in.
         let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Discover, on_ground_png(1000, 50, 20))]);
-        let drawn = with_ui_on(&ctx, |ui| mark_width(ui, CardBrand::Discover, MARK_ROW_HEIGHT));
-        assert!(
-            drawn <= widest,
-            "a 20:1 file drew {drawn}pt wide, more than the {widest}pt the widest wordmark \
-             takes -- so the name's truncation room now depends on which files the user has"
-        );
-        // ...and the width it reports is the width it paints, which is what
-        // the row reserves.
-        let (_, images) = painted(&ctx, CardBrand::Discover, MARK_ROW_HEIGHT);
-        assert!(
-            images[0].width() <= drawn,
-            "the mark painted {}pt into a box it said was {drawn}pt",
-            images[0].width()
-        );
+        for height in [MARK_ROW_HEIGHT, MARK_DETAIL_HEIGHT] {
+            let widest = with_ui(|ui| {
+                CARD_BRANDS
+                    .iter()
+                    .map(|brand| mark_width(ui, *brand, height))
+                    .fold(0.0f32, f32::max)
+            });
+            let drawn = with_ui_on(&ctx, |ui| mark_width(ui, CardBrand::Discover, height));
+            assert!(
+                drawn <= widest,
+                "a 20:1 file drew {drawn}pt wide at {height}pt, more than the {widest}pt the \
+                 widest wordmark takes -- so the name's truncation room now depends on which \
+                 files the user has"
+            );
+            // ...and the width it reports is the width it paints, which is
+            // what the row reserves.
+            let (_, images) = painted(&ctx, CardBrand::Discover, height);
+            assert!(
+                images[0].width() <= drawn,
+                "the mark painted {}pt into a box it said was {drawn}pt",
+                images[0].width()
+            );
+        }
     }
 
     /// **A missing file is re-checked; a refused one is not.** The favicon
@@ -1045,6 +1217,186 @@ mod tests {
             "a refusal was retried -- which on a file that stays broken is a decode attempt \
              every two seconds for the life of the window"
         );
+    }
+
+    /// What one painted logo really was: the box `paint_mark` returned, the
+    /// image rect it painted, and the pixel size of the texture that image
+    /// was painted with.
+    struct PaintedLogo {
+        box_: egui::Rect,
+        image: egui::Rect,
+        texture_px: [usize; 2],
+    }
+
+    /// Paints `brand` at `height` on `ctx` at a deliberately FRACTIONAL
+    /// position, so a draw that is on the pixel grid is on it because it was
+    /// snapped and not because the test happened to start on a whole pixel.
+    fn paint_logo(ctx: &egui::Context, brand: CardBrand, height: f32) -> PaintedLogo {
+        let mut box_ = egui::Rect::NOTHING;
+        let output = ctx.run_ui(raw(), |ui| {
+            box_ = paint_mark(ui, brand, height, egui::Align2::LEFT_TOP, egui::pos2(20.3, 20.6));
+        });
+        fn walk(shape: &egui::Shape, out: &mut Vec<(egui::Rect, egui::TextureId)>) {
+            match shape {
+                egui::Shape::Rect(rect) => {
+                    if let Some(brush) = &rect.brush {
+                        out.push((rect.rect, brush.fill_texture_id));
+                    }
+                }
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        for clipped in &output.shapes {
+            walk(&clipped.shape, &mut found);
+        }
+        assert_eq!(found.len(), 1, "{brand:?} at {height}pt did not draw exactly one image");
+        let (image, id) = found[0];
+        let texture_px = ctx
+            .tex_manager()
+            .read()
+            .meta(id)
+            .map(|meta| meta.size)
+            .expect("the painted texture is allocated");
+        PaintedLogo { box_, image, texture_px }
+    }
+
+    fn at_scale(ctx: &egui::Context, pixels_per_point: f32) {
+        ctx.set_pixels_per_point(pixels_per_point);
+        let _ = ctx.run_ui(raw(), |_ui| {});
+        assert_eq!(ctx.pixels_per_point(), pixels_per_point, "the premise: the scale took");
+    }
+
+    /// **THE REPORT: card logos "look tiny and not sharp".** Both halves,
+    /// at the three scale factors a Windows display is commonly set to, on
+    /// both surfaces, with files shaped like the owner's: a wide wordmark on
+    /// transparency (`visa.png` is 210x69) and a squarer one
+    /// (`mastercard.png` is 222x158).
+    ///
+    /// * Tiny: the image stands the box less its inset -- 16pt on the read
+    ///   pane, 13pt in the list -- where it stood the word's cap height,
+    ///   about 8pt and 6pt.
+    /// * Not sharp: the texture is EXACTLY the physical pixels the image
+    ///   covers, and the image's corner is on the device-pixel grid, so the
+    ///   GPU draws one texel per pixel and minifies nothing. It was a 128-
+    ///   pixel texture drawn into about 25.
+    #[test]
+    fn a_logo_fills_its_box_and_is_drawn_one_texel_per_pixel_at_every_scale() {
+        let (ctx, _marks) = ctx_with_marks(
+            true,
+            &[
+                (CardBrand::Visa, isolated_png(210, 69, 65)),
+                (CardBrand::Mastercard, isolated_png(222, 158, 152)),
+            ],
+        );
+        for ppp in [1.0f32, 1.5, 2.0] {
+            at_scale(&ctx, ppp);
+            for brand in [CardBrand::Visa, CardBrand::Mastercard] {
+                for height in [MARK_DETAIL_HEIGHT, MARK_ROW_HEIGHT] {
+                    let drawn = paint_logo(&ctx, brand, height);
+                    let what = format!("{brand:?} at {height}pt, {ppp}x");
+                    let inner = height - 2.0 * LOGO_INSET;
+                    // Within one physical pixel: the height is rounded to
+                    // whole pixels, and 13pt is 19.5 of them at 1.5x.
+                    assert!(
+                        (drawn.image.height() - inner).abs() <= 0.5 / ppp + 1e-3,
+                        "{what}: the logo is {}pt tall, not the {inner}pt its box less the \
+                         inset gives it",
+                        drawn.image.height()
+                    );
+                    let physical = drawn.image.size() * ppp;
+                    assert_eq!(
+                        drawn.texture_px,
+                        [physical.x.round() as usize, physical.y.round() as usize],
+                        "{what}: a {:?} texture was drawn into {physical:?} physical pixels, so the \
+                         GPU resampled it",
+                        drawn.texture_px
+                    );
+                    for (v, name) in [
+                        (drawn.image.left(), "left"),
+                        (drawn.image.top(), "top"),
+                        (drawn.image.right(), "right"),
+                        (drawn.image.bottom(), "bottom"),
+                    ] {
+                        let px = v * ppp;
+                        assert!(
+                            (px - px.round()).abs() < 1e-3,
+                            "{what}: the logo's {name} edge is at {px} device pixels, between two \
+                             of them, so every texel is smeared across a pair"
+                        );
+                    }
+                    assert!(
+                        drawn.box_.expand(1e-3).contains_rect(drawn.image),
+                        "{what}: the logo at {:?} overhangs its box at {:?}",
+                        drawn.image,
+                        drawn.box_
+                    );
+                    assert!(
+                        (drawn.box_.height() - height).abs() < 1e-3,
+                        "{what}: the box is {}pt tall -- the row's alignment rests on it being \
+                         {height}pt whatever is in it",
+                        drawn.box_.height()
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A texture per physical size, and only a few.** A size already drawn
+    /// is not uploaded again; a change of scale factor makes new sizes rather
+    /// than drawing the old ones scaled; and past [`MAX_SIZES_PER_LOGO`] the
+    /// least recently drawn is dropped AND freed, so a window dragged between
+    /// monitors all day holds a bounded number of textures.
+    #[test]
+    fn a_logo_keeps_one_texture_per_size_drawn_and_drops_the_stalest() {
+        let (ctx, _marks) = ctx_with_marks(true, &[(CardBrand::Visa, isolated_png(210, 69, 65))]);
+        let resident = |ctx: &egui::Context| {
+            ctx.tex_manager()
+                .read()
+                .allocated()
+                .filter(|(_, meta)| meta.name.starts_with("card-mark:Visa:"))
+                .count()
+        };
+        at_scale(&ctx, 1.0);
+        let detail = paint_logo(&ctx, CardBrand::Visa, MARK_DETAIL_HEIGHT).texture_px;
+        let row = paint_logo(&ctx, CardBrand::Visa, MARK_ROW_HEIGHT).texture_px;
+        assert_ne!(detail, row, "the premise: the two surfaces draw two sizes");
+        assert_eq!(resident(&ctx), 2);
+        // The same sizes again: no new texture.
+        for _ in 0..3 {
+            paint_logo(&ctx, CardBrand::Visa, MARK_DETAIL_HEIGHT);
+            paint_logo(&ctx, CardBrand::Visa, MARK_ROW_HEIGHT);
+        }
+        assert_eq!(resident(&ctx), 2, "a size already drawn was uploaded again");
+
+        // A new scale factor is new sizes, drawn at the new scale.
+        at_scale(&ctx, 2.0);
+        let detail_2x = paint_logo(&ctx, CardBrand::Visa, MARK_DETAIL_HEIGHT).texture_px;
+        let row_2x = paint_logo(&ctx, CardBrand::Visa, MARK_ROW_HEIGHT).texture_px;
+        assert_eq!(detail_2x[1], detail[1] * 2, "the 2x detail texture is not twice the 1x");
+        assert_eq!(row_2x[1], row[1] * 2, "the 2x row texture is not twice the 1x");
+        assert_eq!(resident(&ctx), 4);
+
+        // A third scale: still bounded, and what was dropped is the 1x pair
+        // nothing has drawn since.
+        at_scale(&ctx, 1.5);
+        let detail_15 = paint_logo(&ctx, CardBrand::Visa, MARK_DETAIL_HEIGHT).texture_px;
+        let row_15 = paint_logo(&ctx, CardBrand::Visa, MARK_ROW_HEIGHT).texture_px;
+        let logo = logo_of(&ctx, CardBrand::Visa);
+        let sizes = logo.sizes();
+        assert_eq!(sizes.len(), MAX_SIZES_PER_LOGO, "the cache grew past its bound: {sizes:?}");
+        assert_eq!(
+            resident(&ctx),
+            MAX_SIZES_PER_LOGO,
+            "an evicted texture is still allocated -- the bound is on the list, not the memory"
+        );
+        for kept in [detail_2x, row_2x, detail_15, row_15] {
+            assert!(sizes.contains(&kept), "{kept:?} was evicted while it was in use: {sizes:?}");
+        }
+        for dropped in [detail, row] {
+            assert!(!sizes.contains(&dropped), "the stale {dropped:?} was kept over a live size");
+        }
     }
 
     fn logo_of(ctx: &egui::Context, brand: CardBrand) -> Arc<Logo> {
