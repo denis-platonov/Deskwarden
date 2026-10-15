@@ -3701,6 +3701,10 @@ fn main() {
                         &item_id,
                         hwnd,
                         shortcut.choice(),
+                        // The armed pair came from `handle_match`: the
+                        // record's own rule chose it, so the rule is still
+                        // checked against the window in front.
+                        deskwarden::app::FillOrigin::Binding,
                         &deskwarden::injector::sequence::REAL_NOTIFIER,
                         // **The hotkey is gated too.** It is the fill with no
                         // window of ours in front of the user, so it is the
@@ -5042,7 +5046,10 @@ enum Offered {
 /// the armed-hotkey branch and the account picker make, so this card's fill is
 /// gated by the master-password re-prompt, gated by the send preflight, and
 /// typed by the injector's own foreground check -- none of which this function
-/// re-implements or may bypass. A second fill site reachable from a card would
+/// re-implements or may bypass. Like the picker's, it is a
+/// `FillOrigin::Picked` fill: the record is on this card because the user
+/// picked it at this window, so the preflight does not hold it to its
+/// app-match rule -- "a picker choice types here". A second fill site reachable from a card would
 /// be a second place all three could be forgotten.
 ///
 /// **The memory is renewed by the fill it authorised**, which is the half of
@@ -5094,6 +5101,10 @@ fn offer_the_remembered_record<A: UiAutomationFiller, B: SendInputFiller>(
                 &item_id,
                 event.hwnd,
                 taken,
+                // The user picked this record at this window, by hand, the
+                // last time: a picked record types here, whatever program its
+                // rule was written for.
+                deskwarden::app::FillOrigin::Picked,
                 &deskwarden::injector::sequence::REAL_NOTIFIER,
                 reprompt,
             );
@@ -5299,7 +5310,12 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
             // -- the DECISION, which is all that is left of design 4b: the
             // confirmation card that used to ask a third time was removed on
             // the owner's instruction, precisely because the user had already
-            // asked twice on this very path -- and typed
+            // asked twice on this very path. It goes as `FillOrigin::Picked`,
+            // so that decision does NOT hold the record to its app-match
+            // rule: "a picker choice types here", on the owner's ruling, and
+            // a record bound to another program is typed into the window the
+            // user picked it at. The foreground must still be describable --
+            // and it is typed
             // by `Injector::fill_sequence`, whose foreground check refuses to
             // type into a window that is no longer in front. This line is the
             // only place in this function with an injector in scope, which is
@@ -5315,8 +5331,8 @@ fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
                         deskwarden::app::window_label(&event.exe_name, &event.title)
                     );
                     deskwarden::app::fill_from_vault(
-                        cache, injector, fill_stats, &item_id, event.hwnd, choice, notifier,
-                        reprompt,
+                        cache, injector, fill_stats, &item_id, event.hwnd, choice,
+                        deskwarden::app::FillOrigin::Picked, notifier, reprompt,
                     );
                     // **This is the search the feature exists to remove, and
                     // it is the one that has to be remembered.** The user has
@@ -33886,6 +33902,7 @@ mod tests {
                 "1",
                 0x4321,
                 deskwarden::app::FillChoice::Saved,
+                deskwarden::app::FillOrigin::Binding,
                 &recorder(),
                 &mut no_reprompt(),
             );

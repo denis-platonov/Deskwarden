@@ -111,6 +111,26 @@
 //! needs UI Automation, so `injector::target::describe_foreground` no longer
 //! asks it anything, and a provider that fails to answer can no longer turn
 //! into a refused fill.
+//!
+//! # The rule is checked only when the rule chose the record
+//!
+//! **Spec, on the owner's ruling "No: a picker choice types here":** the
+//! wrong-process check applies to a fill whose record was chosen by its own
+//! binding -- the matched-app prompt card and the armed fill hotkey,
+//! `app::handle_match`'s path, `app::FillOrigin::Binding`. It does **not**
+//! apply to a record the user picked by hand at this window -- the CTRL+ALT+B
+//! account picker, and the fill-recall card that offers that pick back --
+//! which is `app::FillOrigin::Picked`. A record's rule says where it is filled
+//! *automatically*; it is not a list of the only places the user may ever ask
+//! for it, and refusing a pick because the rule names another program refuses
+//! exactly what the user just chose.
+//!
+//! The origin is carried explicitly from each call site and is turned into a
+//! [`Guard`] by `app::preflight_guard_for`: a picked bare-secret fill is still
+//! [`Guard::Preflight`], with `rule_image: None`. So [`dispatch_with`] still
+//! describes the foreground and still refuses ([`Gated::NoTarget`]) when it
+//! cannot, and `injector::sequence::run` still re-checks the foreground before
+//! every step; only [`Refusal::WrongProcess`] is out of reach for a pick.
 
 use crate::injector::target::SendTarget;
 
@@ -241,7 +261,10 @@ impl SendGate {
 pub enum Guard<'a> {
     /// This fill types a secret into **whatever holds focus**, which is the
     /// case section 4b is written about. `rule_image` is the image name the
-    /// item's app-match rule records, when it records one.
+    /// item's app-match rule records, when it records one **and** that rule
+    /// is what chose the item (`app::FillOrigin::Binding`). A record the user
+    /// picked by hand arrives here with `None` -- a picker choice types here
+    /// -- so only the describable-foreground half of the gate applies to it.
     Preflight { rule_image: Option<&'a str> },
     /// Not a bare-secret fill. See the type doc.
     NotRequired,
@@ -270,9 +293,10 @@ pub fn dispatch_with<T>(
     let Some(target) = (gate.describe)() else {
         return Gated::NoTarget;
     };
-    // No rule was ever recorded for this item, so there is no process claim to
-    // check and `verdict` is satisfied by the target's own image. What a
-    // rule-less item is still gated on is the line above: a foreground that
+    // No rule was ever recorded for this item -- or the user picked it by hand,
+    // and a picker choice types here (see the module doc) -- so there is no
+    // process claim to check and `verdict` is satisfied by the target's own
+    // image. What such a fill is still gated on is the line above: a foreground that
     // could be described at all. Nothing is asked about the control holding
     // focus, for either kind of item -- see the module doc for the owner's
     // ruling that took the masking check out.

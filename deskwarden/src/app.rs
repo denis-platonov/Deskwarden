@@ -229,6 +229,13 @@ pub fn credentials_for(item: &VaultItem) -> (String, String) {
 /// `&dyn` and not a third type parameter: the call is once per fill, and the
 /// alternative would have added a turbofish-shaped burden to every one of this
 /// function's and [`handle_match`]'s call sites for nothing.
+///
+/// **`origin` says who chose the record**, and it is a parameter rather than
+/// anything this function could work out for itself: the matched-app card and
+/// the armed hotkey pass [`FillOrigin::Binding`], the account picker and the
+/// fill-recall card pass [`FillOrigin::Picked`]. It changes exactly one thing
+/// -- whether the record's app-match rule is checked against the window in
+/// front -- and [`preflight_guard_for`] is where that is decided.
 #[allow(clippy::too_many_arguments)]
 pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     cache: &VaultCache,
@@ -237,6 +244,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
     item_id: &str,
     hwnd: isize,
     choice: FillChoice,
+    origin: FillOrigin,
     notifier: &dyn sequence::Notifier,
     reprompt: &mut Reprompt<'_>,
 ) {
@@ -247,6 +255,7 @@ pub fn fill_from_vault<A: UiAutomationFiller, B: SendInputFiller>(
         item_id,
         hwnd,
         choice,
+        origin,
         notifier,
         &crate::vault_window::preflight::SendGate::production(),
         reprompt,
@@ -426,6 +435,7 @@ pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
     item_id: &str,
     hwnd: isize,
     choice: FillChoice,
+    origin: FillOrigin,
     notifier: &dyn sequence::Notifier,
     gate: &crate::vault_window::preflight::SendGate,
     reprompt: &mut Reprompt<'_>,
@@ -552,7 +562,7 @@ pub fn fill_from_vault_with<A: UiAutomationFiller, B: SendInputFiller>(
                     // that knows.
                     let sink = fill_outcome_sink(fill_stats, item_id);
                     let rule_image = crate::vault_bridge::extract_app_match(&item).map(|m| m.process);
-                    let guard = preflight_guard_for(&choice, rule_image.as_deref());
+                    let guard = preflight_guard_for(&choice, origin, rule_image.as_deref());
                     // **Nothing stands here any more, and the gap is the
                     // point.** Design 4b's card used to be opened on this
                     // line: a confirmation that named the target window,
@@ -689,7 +699,9 @@ pub fn fill_outcome_sink(
 /// focus**: [`FillChoice::Just`] of a password or a one-time code. That is
 /// precisely the case section 4b is written about, and what the gate asks of
 /// it is whose window that focus is in: an item whose rule names a process is
-/// not typed into a different one. It asks nothing about the control itself
+/// not typed into a different one **when that rule is what chose the item** --
+/// see the last section for the picked fill, which the rule does not govern.
+/// It asks nothing about the control itself
 /// -- the masking refusal was removed on the owner's ruling, and the reasons
 /// are in `vault_window::preflight`'s module doc -- so a one-time code typed
 /// into a web page's ordinary code box, in the rule's own browser, is sent.
@@ -710,19 +722,72 @@ pub fn fill_outcome_sink(
 /// window the fill was started against, and a `Saved` sequence runs under
 /// `injector::sequence::run`'s per-step foreground re-check, which abandons
 /// the plan the instant that window stops being in front.
+///
+/// # The rule is checked only for a fill the rule itself chose
+///
+/// **`origin` decides whether `rule_image` is carried into the guard**, on the
+/// owner's ruling: *"No: a picker choice types here"*.
+///
+/// * [`FillOrigin::Binding`] -- the matched-app prompt card and the armed fill
+///   hotkey, both reached through [`handle_match`]. The record was chosen
+///   *because* its rule matched a window, so a different process in front by
+///   the time the keystroke goes means focus moved after the match, and the
+///   wrong-process refusal is exactly the guard for that.
+/// * [`FillOrigin::Picked`] -- the CTRL+ALT+B account picker, and the
+///   fill-recall card that offers back a record the user picked at this very
+///   window. Here the **user** chose the record, by name, for the window they
+///   are in; the record's rule names where it is filled *automatically*, not
+///   the only place it may ever be typed. Refusing that fill because the rule
+///   was written for another program is refusing the thing the user just
+///   asked for. So the guard is still [`Guard::Preflight`] -- the foreground
+///   must still be describable, or nothing is sent -- but with no
+///   `rule_image`, so [`crate::vault_window::preflight::dispatch_with`] checks
+///   the target against its own image and the rule has no say.
+///
+/// Nothing else moves with it: the master-password re-prompt, the
+/// undescribable-foreground refusal, `Injector`'s foreground check and
+/// `injector::sequence::run`'s per-step re-check all apply to a picked fill
+/// exactly as to a bound one.
+///
+/// [`Guard::Preflight`]: crate::vault_window::preflight::Guard::Preflight
 pub fn preflight_guard_for<'a>(
     choice: &FillChoice,
+    origin: FillOrigin,
     rule_image: Option<&'a str>,
 ) -> crate::vault_window::preflight::Guard<'a> {
     match choice {
         FillChoice::Just(key_sequence::FieldRef::Password)
         | FillChoice::Just(key_sequence::FieldRef::Totp) => {
+            let rule_image = match origin {
+                FillOrigin::Binding => rule_image,
+                FillOrigin::Picked => None,
+            };
             crate::vault_window::preflight::Guard::Preflight { rule_image }
         }
         FillChoice::Just(_) | FillChoice::UserTabPass | FillChoice::Saved => {
             crate::vault_window::preflight::Guard::NotRequired
         }
     }
+}
+
+/// **Who chose the record a fill types**, carried from the call site into
+/// [`fill_from_vault`] and on to [`preflight_guard_for`].
+///
+/// Explicit at every call site, and never inferred: a fill does not know how
+/// it was asked for, and a default would let a new call site inherit whichever
+/// answer happened to be written here. `fill_call_site_tests` pins which
+/// production call passes which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillOrigin {
+    /// The record's own binding chose it: [`handle_match`]'s prompt card, or
+    /// the fill hotkey armed by that match. The app-match rule is checked
+    /// against the window in front.
+    Binding,
+    /// The user picked the record by hand at this window: the account
+    /// picker, or the fill-recall card offering back a record they picked
+    /// here. A picker choice types here -- the rule is not checked. Every
+    /// other guard is.
+    Picked,
 }
 
 /// The stored auto-type sequence for `item`, or `""` if it has no app match
@@ -1901,8 +1966,13 @@ pub fn handle_match<A: UiAutomationFiller, B: SendInputFiller>(
                 // really supports, so `UserTabPass` and `Just(field)` are
                 // both reachable here and naming a literal `Saved` would type
                 // something other than the row the user clicked.
+                //
+                // `FillOrigin::Binding`: this record is on the card because
+                // its rule matched this window, so the rule is still checked
+                // against whatever is in front when the keys go.
                 fill_from_vault(
-                    cache, injector, fill_stats, item_id, hwnd, choice, notifier, reprompt,
+                    cache, injector, fill_stats, item_id, hwnd, choice, FillOrigin::Binding,
+                    notifier, reprompt,
                 );
             }
         }
@@ -6192,16 +6262,75 @@ mod fill_call_site_tests {
         // argument, and a call that dropped it would not compile, but a call
         // that passed a *different* scoping would -- and the whole list is
         // what this test exists to hold.
+        //
+        // **Re-pinned again when the origin was threaded through.** The
+        // matched-app card's record was chosen by its own rule, so the call
+        // names `FillOrigin::Binding` -- and it is pinned in place, because a
+        // `Picked` here would let the matched card type a record into a window
+        // its rule does not name.
         let needle = concat!(
             "fill_from_vault", "(\n",
-            "                    cache, injector, fill_stats, item_id, hwnd, choice, notifier, ",
-            "reprompt,\n",
+            "                    cache, injector, fill_stats, item_id, hwnd, choice, ",
+            "FillOrigin::", "Binding,\n",
+            "                    notifier, reprompt,\n",
         );
         assert_eq!(
             production_only(include_str!("app.rs")).matches(needle).count(),
             1,
             "handle_match no longer hands the overlay's own answer to the fill"
         );
+    }
+
+    /// **Who chose the record, per call site.** Keyed by the same choice form
+    /// that identifies each call in [`RULES`], so a call site is named by
+    /// something the scan above already proves is unique to it.
+    ///
+    /// The owner's ruling is "a picker choice types here": the account
+    /// picker's fill and the fill-recall card's are [`super::FillOrigin::Picked`]
+    /// and skip the app-rule check; `handle_match`'s card and the armed hotkey
+    /// are [`super::FillOrigin::Binding`] and keep it. A call that swapped its
+    /// origin either loses the wrong-window guard on a bound fill or refuses a
+    /// pick the user made by hand -- and nothing behavioural in this crate can
+    /// reach these call sites to see it.
+    const ORIGINS: [(&str, &str, &str); 4] = [
+        ("app.rs", ", choice,", "Binding"),
+        ("main.rs", "shortcut.choice()", "Binding"),
+        ("main.rs", ", choice,", "Picked"),
+        ("main.rs", "taken,", "Picked"),
+    ];
+
+    #[test]
+    fn every_fill_call_site_names_who_chose_the_record() {
+        let origin = |name: &str| format!("{}{name},", concat!("FillOrigin", "::"));
+        let mut checked = 0;
+        for (file, source) in sources() {
+            let args = argument_lists(&production_only(source));
+            for arg in &args {
+                assert_eq!(
+                    arg.matches(concat!("FillOrigin", "::")).count(),
+                    1,
+                    "a fill in {file} does not name exactly one origin: ({arg})"
+                );
+            }
+            for (_, form, expected) in ORIGINS.iter().filter(|(f, _, _)| *f == file) {
+                let other = if *expected == "Binding" { "Picked" } else { "Binding" };
+                let call: Vec<_> = args.iter().filter(|arg| arg.contains(form)).collect();
+                assert_eq!(call.len(), 1, "{file}: no single call passes {form:?}: {args:?}");
+                assert!(
+                    call[0].contains(&origin(expected)) && !call[0].contains(&origin(other)),
+                    "{file}: the call passing {form:?} is not a {expected} fill. A picker \
+                     choice types here, and a bound record keeps its rule -- ({})",
+                    call[0]
+                );
+                checked += 1;
+            }
+            assert_eq!(
+                ORIGINS.iter().filter(|(f, _, _)| *f == file).count(),
+                args.len(),
+                "{file}: a production fill has no origin row"
+            );
+        }
+        assert_eq!(checked, ORIGINS.len(), "an origin row named a file that is not scanned");
     }
 }
 
@@ -6972,6 +7101,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Saved,
+            FillOrigin::Binding,
             &notifier,
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7265,6 +7395,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Saved,
+            FillOrigin::Binding,
             &sequence::RecordingNotifier::default(),
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7312,6 +7443,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Saved,
+            FillOrigin::Binding,
             &sequence::RecordingNotifier::default(),
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7359,6 +7491,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Just(key_sequence::FieldRef::Totp),
+            FillOrigin::Binding,
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
                 the_rules_process_in_front,
@@ -7400,6 +7533,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Just(key_sequence::FieldRef::Password),
+            FillOrigin::Binding,
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
                 the_rules_process_in_front,
@@ -7473,6 +7607,7 @@ mod fill_dispatch_tests {
                 "item-404",
                 4242,
                 FillChoice::Just(key_sequence::FieldRef::Password),
+                FillOrigin::Binding,
                 &sequence::RecordingNotifier::default(),
                 &crate::vault_window::preflight::SendGate::describing(
                     the_rules_process_in_front,
@@ -7591,6 +7726,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::UserTabPass,
+            FillOrigin::Binding,
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
                 the_rules_process_in_front,
@@ -7647,6 +7783,14 @@ mod fill_dispatch_tests {
     fn gated_password_fill(
         describe: fn() -> Option<crate::injector::target::SendTarget>,
     ) -> (usize, Vec<String>) {
+        gated_password_fill_from(describe, FillOrigin::Binding)
+    }
+
+    /// [`gated_password_fill`], with who chose the record named.
+    fn gated_password_fill_from(
+        describe: fn() -> Option<crate::injector::target::SendTarget>,
+        origin: FillOrigin,
+    ) -> (usize, Vec<String>) {
         let _serialised = crate::injector::sequence_test_lock();
         let cache = crate::test_vault::cache_with_items(vec![item_with("")]);
 
@@ -7661,6 +7805,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Just(key_sequence::FieldRef::Password),
+            origin,
             &notifier,
             &crate::vault_window::preflight::SendGate::describing(describe),
             &mut ungated(&mut crate::reprompt::Proof::default()),
@@ -7745,6 +7890,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Just(key_sequence::FieldRef::Totp),
+            FillOrigin::Binding,
             &notifier,
             &crate::vault_window::preflight::SendGate::describing(the_rules_process_in_front),
             &mut ungated(&mut crate::reprompt::Proof::default()),
@@ -7773,6 +7919,45 @@ mod fill_dispatch_tests {
         assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
     }
 
+    /// **A binding-origin fill of a record bound to another process is still
+    /// refused**, named as such so the rule it holds is the one the owner
+    /// kept: the matched-app card and the armed hotkey type a record its own
+    /// rule chose, and if focus has moved to another program since, nothing
+    /// is sent.
+    #[test]
+    fn a_binding_fill_into_another_process_is_still_refused() {
+        let (typed, said) = gated_password_fill_from(a_chat_box, FillOrigin::Binding);
+        assert_eq!(typed, 0, "a bound record was typed into a process its rule does not name");
+        assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
+        assert!(
+            said[0].contains("not the one this item's rule was written for"),
+            "the refusal was not the wrong-window one: {said:?}"
+        );
+    }
+
+    /// **A picker choice types here.** The owner's ruling, driven from the
+    /// entry point: a record the user picked by hand -- from the account
+    /// picker or the fill-recall card -- is typed into the window they are in,
+    /// even though its app-match rule names a different process.
+    ///
+    /// The other half is the guard that stays: a picked fill into a foreground
+    /// that cannot be described at all is still refused, so dropping the rule
+    /// did not drop the gate.
+    #[test]
+    fn a_picked_fill_of_a_record_bound_to_another_process_is_typed_here() {
+        let (typed, said) = gated_password_fill_from(a_chat_box, FillOrigin::Picked);
+        assert_eq!(
+            typed, 1,
+            "a record the user picked by hand was refused because its rule names another \
+             process; said: {said:?}"
+        );
+        assert!(said.is_empty(), "a picked fill told the user it was refused: {said:?}");
+
+        let (typed, said) = gated_password_fill_from(|| None, FillOrigin::Picked);
+        assert_eq!(typed, 0, "a picked fill was typed with no idea where it was going");
+        assert_eq!(said.len(), 1, "the refusal was silent: {said:?}");
+    }
+
     /// **`UserTabPass` reaches the UI-Automation-first path, not the runner.**
     ///
     /// `fill_action`'s unit test says `Ok(FillAction::Default)`; this says the
@@ -7797,6 +7982,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::UserTabPass,
+            FillOrigin::Binding,
             &sequence::RecordingNotifier::default(),
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7875,6 +8061,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Saved,
+            FillOrigin::Binding,
             &notifier,
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -7998,6 +8185,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Saved,
+            FillOrigin::Binding,
             &notifier,
             &mut ungated(&mut crate::reprompt::Proof::default()),
         );
@@ -8113,6 +8301,7 @@ mod fill_dispatch_tests {
                 "item-1",
                 4242,
                 FillChoice::Saved,
+                FillOrigin::Binding,
                 &notifier,
                 &mut ungated(&mut crate::reprompt::Proof::default()),
             );
@@ -8210,6 +8399,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             choice,
+            FillOrigin::Binding,
             &notifier,
             &crate::vault_window::preflight::SendGate::describing(
                 the_rules_process_in_front,
@@ -8346,6 +8536,7 @@ mod fill_dispatch_tests {
                 "item-1",
                 4242,
                 FillChoice::Just(key_sequence::FieldRef::Password),
+                FillOrigin::Binding,
                 &notifier,
                 &crate::vault_window::preflight::SendGate::describing(
                     the_rules_process_in_front,
@@ -8449,6 +8640,7 @@ mod fill_dispatch_tests {
             "item-1",
             4242,
             FillChoice::Just(key_sequence::FieldRef::Password),
+            FillOrigin::Binding,
             &sequence::RecordingNotifier::default(),
             &crate::vault_window::preflight::SendGate::describing(
                 the_rules_process_in_front,
@@ -9925,14 +10117,50 @@ mod preflight_guard_tests {
     fn a_bare_secret_typed_at_the_caret_is_gated_and_carries_the_items_rule() {
         for field in [key_sequence::FieldRef::Password, key_sequence::FieldRef::Totp] {
             assert_eq!(
-                preflight_guard_for(&FillChoice::Just(field.clone()), Some("saplogon.exe")),
+                preflight_guard_for(
+                    &FillChoice::Just(field.clone()),
+                    FillOrigin::Binding,
+                    Some("saplogon.exe"),
+                ),
                 Guard::Preflight { rule_image: Some("saplogon.exe") },
                 "{field:?} types a credential into whatever holds focus and must be gated"
             );
             assert_eq!(
-                preflight_guard_for(&FillChoice::Just(field), None),
+                preflight_guard_for(&FillChoice::Just(field), FillOrigin::Binding, None),
                 Guard::Preflight { rule_image: None },
                 "an item with no rule is still gated, on the foreground being describable"
+            );
+        }
+    }
+
+    /// **A picker choice types here.** The owner's ruling, as the guard: a
+    /// bare secret the user picked by hand is still gated -- the foreground
+    /// must be describable -- but the record's rule is not carried, so a
+    /// record bound to another process is not refused for it.
+    #[test]
+    fn a_picked_bare_secret_is_gated_without_the_items_rule() {
+        for field in [key_sequence::FieldRef::Password, key_sequence::FieldRef::Totp] {
+            assert_eq!(
+                preflight_guard_for(
+                    &FillChoice::Just(field.clone()),
+                    FillOrigin::Picked,
+                    Some("saplogon.exe"),
+                ),
+                Guard::Preflight { rule_image: None },
+                "{field:?} picked by hand was held to its rule's process; a picker choice \
+                 types here"
+            );
+        }
+        // And the choices outside the gate stay outside it whoever chose them.
+        for choice in [
+            FillChoice::UserTabPass,
+            FillChoice::Saved,
+            FillChoice::Just(key_sequence::FieldRef::Username),
+        ] {
+            assert_eq!(
+                preflight_guard_for(&choice, FillOrigin::Picked, Some("saplogon.exe")),
+                Guard::NotRequired,
+                "{choice:?} picked by hand was brought under the gate"
             );
         }
     }
@@ -9953,7 +10181,7 @@ mod preflight_guard_tests {
             FillChoice::Just(key_sequence::FieldRef::Username),
         ] {
             assert_eq!(
-                preflight_guard_for(&choice, Some("saplogon.exe")),
+                preflight_guard_for(&choice, FillOrigin::Binding, Some("saplogon.exe")),
                 Guard::NotRequired,
                 "{choice:?} was brought under the gate -- a new refusal on a fill that works today"
             );
