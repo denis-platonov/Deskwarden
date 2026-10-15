@@ -186,41 +186,27 @@ fn galley(ui: &egui::Ui, brand: CardBrand, height: f32) -> std::sync::Arc<egui::
     ui.painter().layout_job(job)
 }
 
-/// The widest a logo may be drawn, as a multiple of the mark's height.
+/// The shape of the room EVERY logo is drawn in: this many times as wide as
+/// the box's inner height (the box less [`LOGO_INSET`] top and bottom).
 ///
-/// **A bound on the row's budget, not on taste.** The list row allocates the
-/// mark's box out of the same width the item name is truncated into, and the
-/// existing rule ([`crate::vault_window::item_list`]'s
-/// `NETWORK_MARK_MIN_TITLE_ROOM`) is what stands the mark aside when the name
-/// would be left with nothing. This constant keeps a logo from ever *reaching*
-/// that rule where a word would not have: at [`MARK_ROW_HEIGHT`] it is 60pt,
-/// under the 72pt `MASTERCARD` already takes, so no file a user drops in can
-/// cost the name more room than this app's own widest wordmark does. A file
-/// wider than this is not refused -- it is fitted to the cap, which costs it
-/// some ink height and keeps it a mark rather than making it a word.
+/// **One room for all of them, so they read as one set.** The owner's ask was
+/// "very close in size with same paddings": a box as wide as each file made a
+/// square AMEX a small tile beside a long Discover, and every brand's padding
+/// differed. So every logo now gets the same room -- Visa's own shape, 1000 by
+/// 324.68 in its published artwork -- and is fitted into it WHOLE and centred:
+/// a tall mark stands the full inner height with room either side of it, a
+/// long wordmark spans the full width with room above and below. Nothing is
+/// cropped here; a file is never cut, only fitted.
 ///
-/// **The cap was chosen while the mark LED the row, and it survives the mark
-/// moving to the trailing edge unchanged** -- every term above is about width
-/// taken out of the name's budget, and none of them is about which side of the
-/// name it is taken from. The row allocates the same box out of the same total
-/// either way. `item_list`'s `a_marked_card_on_a_narrow_pane_keeps_its_mark_
-/// inside_the_tile_and_squeezes_the_title_instead` now drives a deliberately
-/// 10:1 file through the moved layout and reads the cap back off the painted
-/// image, so this is pinned by what is drawn rather than by the arithmetic
-/// here.
-///
-/// **It is also what keeps a box-height logo inside the room the wordmark
-/// had**, now that a logo is fitted to the box rather than to the word's cap
-/// height. A logo is allowed to be wider than ITS OWN brand's word -- the
-/// owner's `visa.png` at 13pt tall is a 47pt box against the `VISA` pill's
-/// 28 -- and
-/// that is the point of the change, since capping it at its word's width
-/// would put it straight back at the cap height it was too small at. What it
-/// may not exceed is the room the row and the read pane were budgeted
-/// against, which is the WIDEST wordmark. Measured, padding included: a
-/// capped logo's box is 66pt against `MASTERCARD`'s 72 in the list, and 80pt
-/// against its 88 on the read pane's 18pt row.
-const MAX_LOGO_ASPECT: f32 = 4.0;
+/// **Still a bound on the row's budget.** The list row allocates the mark's
+/// box out of the width the item name is truncated into, and at
+/// [`MARK_ROW_HEIGHT`] this room is about 40pt plus padding, under the 72pt
+/// `MASTERCARD` already takes -- so no file a user drops in can cost the name
+/// more room than this app's own widest wordmark does. `item_list`'s
+/// `a_marked_card_on_a_narrow_pane_keeps_its_mark_inside_the_tile_and_
+/// squeezes_the_title_instead` drives a deliberately 10:1 file through the
+/// row and reads the bound back off the painted image.
+const LOGO_BOX_ASPECT: f32 = 1000.0 / 324.68;
 
 /// How far a logo stands inside its box, top and bottom, in points.
 ///
@@ -508,13 +494,16 @@ fn remember(ctx: &egui::Context, brand: CardBrand, slot: Slot) {
 ///   mark, which `brand_mark` has trimmed to its ink, that is the whole image
 ///   standing `inner` tall.
 /// * **Then bound the image.** It may not be taller than `inner` or wider
-///   than [`MAX_LOGO_ASPECT`] times the box height. A reversed mark on its own
+///   than the shared room, [`LOGO_BOX_ASPECT`] times `inner`. A reversed mark on its own
 ///   ground always meets the first bound -- its lettering is a fraction of its
 ///   file's height, so ink at `inner` would need an image several times the
 ///   box -- and is drawn with its ground filling `inner` instead, which is
 ///   the same height of thing an isolated mark draws. A file several times
 ///   wider than it is tall meets the second and loses some height; the
-///   alternative is a mark that eats the name's truncation budget.
+///   alternative is a mark that eats the name's truncation budget. The box
+///   is the shared room plus padding whatever the file, and the image is
+///   centred across it, so every brand gets the same box and the same
+///   padding.
 /// * **Then round to whole physical pixels**, so the texture can be drawn one
 ///   texel to one pixel. Each axis is rounded on its own; the aspect moves by
 ///   at most half a pixel, which no reader can see, and the GPU no longer
@@ -539,16 +528,22 @@ fn logo_fit(
     let word_ink_center = word_offset + (word_top + word_bottom) / 2.0;
     let inner = (height - 2.0 * LOGO_INSET).max(1.0);
 
+    let room = whole_pixels(egui::vec2(LOGO_BOX_ASPECT * inner, inner), pixels_per_point);
+
     let logo_ink = (logo.ink_bottom - logo.ink_top).max(1.0);
     let mut scale = inner / logo_ink;
     scale = scale.min(inner / logo.size.y.max(1.0));
-    scale = scale.min(MAX_LOGO_ASPECT * height / logo.size.x.max(1.0));
+    scale = scale.min(room.x / logo.size.x.max(1.0));
     let drawn = whole_pixels(logo.size * scale, pixels_per_point);
     // The scale the image is REALLY drawn at, vertically, after rounding --
     // so the ink centre below lands where the drawn ink really is.
     let scale = drawn.y / logo.size.y.max(1.0);
 
     let pad = pad_x(height);
+    // Centred across the shared room, by whole physical pixels so the corner
+    // `paint_mark` snaps is the corner computed here.
+    let ppp = pixels_per_point.max(f32::MIN_POSITIVE);
+    let left = pad + (((room.x - drawn.x) / 2.0).max(0.0) * ppp).round() / ppp;
     // **The ink centre lands on the word's, and is deliberately NOT clamped
     // back inside the box afterwards.** The bound above already keeps the
     // image from being taller than the box, so the most it can overhang is the
@@ -565,8 +560,8 @@ fn logo_fit(
     // SOME marks have it and others do not is what a reader sees as ragged.
     let top = word_ink_center - logo.ink_center() * scale;
     (
-        egui::Rect::from_min_size(egui::pos2(pad, top), drawn),
-        drawn.x + 2.0 * pad,
+        egui::Rect::from_min_size(egui::pos2(left, top), drawn),
+        room.x + 2.0 * pad,
     )
 }
 
@@ -1339,6 +1334,82 @@ mod tests {
                         drawn.box_.height()
                     );
                 }
+            }
+        }
+    }
+
+    /// **THE REPORT: "very close in size with same paddings".** Every logo
+    /// gets ONE box, whatever shape its file is -- a square AMEX, a long
+    /// Discover and a Visa-shaped Visa take the same width out of the row --
+    /// and is drawn whole inside it, centred: a tall one stands the full inner
+    /// height, a long one spans the full room, and none is cut.
+    #[test]
+    fn every_logo_gets_the_same_box_and_is_drawn_whole_and_centred_in_it() {
+        let (ctx, _marks) = ctx_with_marks(
+            true,
+            &[
+                // After the trim, 1:1, 3:1 and 6:1.
+                (CardBrand::AmericanExpress, isolated_png(240, 200, 180)),
+                (CardBrand::Visa, isolated_png(280, 80, 70)),
+                (CardBrand::Discover, isolated_png(800, 120, 100)),
+            ],
+        );
+        for ppp in [1.0f32, 1.5, 2.0] {
+            at_scale(&ctx, ppp);
+            for height in [MARK_DETAIL_HEIGHT, MARK_ROW_HEIGHT] {
+                let inner = height - 2.0 * LOGO_INSET;
+                let drawn: Vec<_> = [CardBrand::AmericanExpress, CardBrand::Visa, CardBrand::Discover]
+                    .into_iter()
+                    .map(|brand| (brand, paint_logo(&ctx, brand, height)))
+                    .collect();
+                let width = drawn[0].1.box_.width();
+                for (brand, logo) in &drawn {
+                    let what = format!("{brand:?} at {height}pt, {ppp}x");
+                    assert!(
+                        (logo.box_.width() - width).abs() < 1e-3,
+                        "{what}: its box is {}pt wide and AMEX's is {width}pt -- the logos are \
+                         not one set",
+                        logo.box_.width()
+                    );
+                    let (left, right) = (
+                        logo.image.left() - logo.box_.left(),
+                        logo.box_.right() - logo.image.right(),
+                    );
+                    // Within two device pixels: an odd number of spare pixels
+                    // cannot be split evenly, and the image's corner is
+                    // snapped onto the grid while the box (anchored here at a
+                    // fractional point on purpose) is not.
+                    assert!(
+                        (left - right).abs() <= 2.0 / ppp + 1e-3,
+                        "{what}: {left}pt of room on its left and {right}pt on its right -- \
+                         not centred"
+                    );
+                    assert!(
+                        logo.box_.expand(1e-3).contains_rect(logo.image),
+                        "{what}: the logo at {:?} overhangs its box at {:?}",
+                        logo.image,
+                        logo.box_
+                    );
+                }
+                // The tall one fills the height; the long one fills the
+                // room and is shorter -- fitted whole, not cut to the box.
+                let (amex, discover) = (&drawn[0].1, &drawn[2].1);
+                assert!(
+                    (amex.image.height() - inner).abs() <= 0.5 / ppp + 1e-3,
+                    "AMEX at {height}pt, {ppp}x: {}pt tall, not the {inner}pt inner height",
+                    amex.image.height()
+                );
+                assert!(
+                    discover.image.height() < inner * 0.75,
+                    "Discover at {height}pt, {ppp}x: {}pt tall -- a 6:1 file at the full \
+                     height would be wider than the room, so it was cut or overhangs",
+                    discover.image.height()
+                );
+                let aspect = discover.image.width() / discover.image.height();
+                assert!(
+                    (aspect - 6.0).abs() < 0.5,
+                    "Discover at {height}pt, {ppp}x: drawn at {aspect}:1, not its file's 6:1"
+                );
             }
         }
     }

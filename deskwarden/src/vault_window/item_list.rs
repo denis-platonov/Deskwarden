@@ -7397,7 +7397,7 @@ mod row_tile_tests {
     /// Run over BOTH kinds of mark, because they are two different risks. The
     /// word's width is this app's own and bounded by `MASTERCARD`; a logo's is
     /// a stranger's, read off a file the user dropped into a folder, and the
-    /// fixture here is deliberately 10:1 so `card_mark::MAX_LOGO_ASPECT` is
+    /// fixture here is deliberately 10:1 so `card_mark::LOGO_BOX_ASPECT` is
     /// the only thing standing between the row and a mark 150pt wide.
     #[test]
     fn a_marked_card_on_a_narrow_pane_keeps_its_mark_inside_the_tile_and_squeezes_the_title_instead()
@@ -7452,10 +7452,11 @@ mod row_tile_tests {
         }
 
         // **The wide logo really was capped**, or the case above proves
-        // nothing about `MAX_LOGO_ASPECT`: a 1000x100 file fitted into a
+        // nothing about `LOGO_BOX_ASPECT`: a 1000x100 file fitted into a
         // 15pt-tall box would be 150pt wide uncapped, which is most of that
         // pane. At the REAL pane, where the mark is drawn rather than stood
-        // aside, it comes out at 4x the height and no more.
+        // aside, it comes out no wider than the room every logo shares,
+        // which is under 4x the height.
         let dir = marks_dir(&[(CardBrand::Mastercard, wide_logo)]);
         let real = paint_with_marks(&[card_branded(NAME, "Mastercard")], PANE_WIDTH, dir.to_path_buf());
         let row = row_tiles(&real)[0].rect;
@@ -7464,7 +7465,7 @@ mod row_tile_tests {
         assert!(
             logo[0].width() <= 4.0 * NETWORK_MARK_HEIGHT + 0.51,
             "a 10:1 file drew {}pt wide beside a {NETWORK_MARK_HEIGHT}pt-tall box -- \
-             `card_mark::MAX_LOGO_ASPECT` did not cap it, so a user's file can take the row",
+             `card_mark::LOGO_BOX_ASPECT` did not cap it, so a user's file can take the row",
             logo[0].width()
         );
         assert!(
