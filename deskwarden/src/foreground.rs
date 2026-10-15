@@ -855,8 +855,15 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 14] = [
+    const OPENS_WINDOWS: [&str; 15] = [
         "app_window",
+        // The autofill notice: a refused or abandoned fill, said on a card in
+        // the account picker's style rather than in the system message box it
+        // replaced. The SEVENTH bare-Win32 window, and the only one opened on
+        // a thread of its own -- the thread the message box had -- because its
+        // callers are the daemon's loop and the typing thread. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
+        "notice_card",
         // Design 3d's password generator. The THIRD bare-Win32 window in this
         // crate, and one for the same measured reason the other two are: an
         // egui window costs ~50 MB of OpenGL driver arenas that nothing
@@ -1109,13 +1116,20 @@ mod tests {
     /// *Unlock* button that is the one offer this state can honour. What its
     /// capture exclusion protects is neither a password nor an account list
     /// but the name of the app this user is signing into.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 6] = [
+    ///
+    /// **`notice_card` takes the foreground the way `MB_SETFOREGROUND` did for
+    /// the message box it replaced**: once, on open, because it advertises
+    /// Enter and Esc. It never retakes it, so a user who clicks back into
+    /// their app keeps it. Its capture exclusion covers a refusal's wording,
+    /// which can name an item's custom fields.
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 7] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
         ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
         ("prompt_card", include_str!("prompt_card.rs"), "PROMPT_CARD_TITLE"),
         ("locked_card", include_str!("locked_card.rs"), "LOCKED_CARD_TITLE"),
         ("save_login_card", include_str!("save_login_card.rs"), "SAVE_LOGIN_CARD_TITLE"),
+        ("notice_card", include_str!("notice_card.rs"), "NOTICE_CARD_TITLE"),
     ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**

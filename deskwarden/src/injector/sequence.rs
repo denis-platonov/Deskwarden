@@ -853,6 +853,12 @@ pub trait Keyboard {
     fn wait(&self, how_long: Duration);
 }
 
+/// How [`run`]'s abandoned-run message begins, and the one thing that tells it
+/// apart from every refusal that typed nothing: `crate::notice_card` titles
+/// the card "Typing stopped" for it rather than "Nothing was typed", because a
+/// run abandoned after its first step has already typed something.
+pub const STOPPED_PREFIX: &str = "auto-type stopped:";
+
 /// Performs `plan` against `hwnd`, abandoning it the instant `hwnd` stops
 /// being the foreground window.
 ///
@@ -865,7 +871,7 @@ pub fn run<K: Keyboard>(kb: &K, hwnd: isize, plan: &Plan) -> Result<(), String> 
     for (index, step) in plan.steps().iter().enumerate() {
         if !kb.holds_foreground(hwnd) {
             return Err(format!(
-                "auto-type stopped: window {hwnd} is no longer in front (after {index} of \
+                "{STOPPED_PREFIX} window {hwnd} is no longer in front (after {index} of \
                  {total} steps). Nothing further was typed."
             ));
         }
@@ -891,14 +897,14 @@ pub fn run<K: Keyboard>(kb: &K, hwnd: isize, plan: &Plan) -> Result<(), String> 
 /// reads.
 ///
 /// A trait so the decision to notify is pinned by a test with a recorder,
-/// rather than by a `MessageBoxW` nothing can call.
+/// rather than by a window nothing can call.
 ///
 /// **Passed in, never reached for.** There used to be a `RealNotifier` whose
 /// `refused` recorded under `#[cfg(test)]` and opened a window otherwise, and
 /// production named it through a `const REAL_NOTIFIER` inside `fill_from_vault`.
 /// A `cfg(test)` gate is a property of a *compilation unit*, and `main.rs`
 /// links this library compiled **without** it -- so every binary test that
-/// reached that const got the real task-modal dialog, on the desktop of
+/// reached that const got the real dialog, on the desktop of
 /// whoever ran `cargo test`. The gate is gone; the only way to a dialog is to
 /// hold a [`FnNotifier`] whose function is `show_refusal`, which is
 /// `pub(crate)` and so cannot be named from the binary at all; the only such
@@ -907,14 +913,21 @@ pub trait Notifier {
     fn refused(&self, detail: &str);
 }
 
-/// Shows the user a refusal: a plain task-modal message box, on its own thread.
+/// Shows the user a refusal: Deskwarden's own notice card
+/// ([`crate::notice_card`]), on its own thread.
 ///
-/// On its own thread because `MessageBoxW` blocks until dismissed, and the
-/// caller is either the app's message loop (a plan-time refusal) or the typing
-/// thread (a mid-sequence abort). Neither may sit in a modal loop -- the first
-/// would freeze the tray and every window, and the second would hold the
-/// plan's memory alive for as long as the box was on screen. Fire and forget:
-/// there is no answer to read back, because there is nothing to ask.
+/// **Not a message box any more.** This was a plain `MB_ICONWARNING` system
+/// box until the owner rejected it as not looking like the app ("this is not
+/// DW native modal"); the card is drawn in the account picker's style, through
+/// `crate::win32_draw`, like every other surface on the fill path.
+///
+/// On its own thread -- the one the message box had -- because the card pumps
+/// until dismissed, and the caller is either the app's message loop (a
+/// plan-time refusal) or the typing thread (a mid-sequence abort). Neither may
+/// sit in a modal loop -- the first would freeze the tray and every window, and
+/// the second would hold the plan's memory alive for as long as the card was
+/// on screen. Fire and forget: there is no answer to read back, because there
+/// is nothing to ask.
 ///
 /// A free `fn` and not a method body, for exactly the reason [`crate::app::FnPresenter`]
 /// gives: it lets the production notifier be a struct literal naming this
@@ -925,17 +938,7 @@ pub trait Notifier {
 pub(crate) fn show_refusal(detail: &str) {
     log::warn!("autofill refused: {detail}");
     let detail = detail.to_string();
-    std::thread::spawn(move || {
-        use windows::core::HSTRING;
-        use windows::Win32::UI::WindowsAndMessaging::{
-            MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
-        };
-        let text = HSTRING::from(detail);
-        let caption = HSTRING::from("Deskwarden autofill");
-        unsafe {
-            MessageBoxW(None, &text, &caption, MB_OK | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST);
-        }
-    });
+    std::thread::spawn(move || crate::notice_card::show_notice(&detail));
 }
 
 /// A [`Notifier`] that is nothing but the function it forwards to.
@@ -1042,6 +1045,68 @@ mod notifier_tests {
              mutation to hide in -- wrapping `show_refusal` in a closure here would re-open \
              the hole that shape exists to close"
         );
+    }
+
+    /// **A fill-time refusal is Deskwarden's card, never a system message
+    /// box.**
+    ///
+    /// The owner's report was a `MessageBoxW` on the fill path ("this is not
+    /// DW native modal"). Every fill refusal reaches the user through
+    /// `show_refusal`, so this holds two things by source: `show_refusal`
+    /// hands the refusal to `notice_card::show_notice`, and no file a fill
+    /// refuses from -- this runner, the injector that types, the dispatch in
+    /// `app`, the preflight, or the card itself -- calls `MessageBoxW` in its
+    /// production half. The message boxes left in `main` and `picker_ui` are
+    /// startup, account and "Add app..." surfaces, not fills.
+    #[test]
+    fn fill_time_refusals_no_longer_call_message_box_w() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // The whole file with comments stripped, tests included: stricter
+        // than a production cut, and none of these files' tests has reason to
+        // name the API.
+        let production = |relative: &str| -> String {
+            std::fs::read_to_string(src.join(relative))
+                .unwrap_or_else(|e| panic!("could not read {relative}: {e}"))
+                .replace("\r\n", "\n")
+                .lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let needle = concat!("MessageBox", "W");
+        for relative in [
+            "injector/sequence.rs",
+            "injector/mod.rs",
+            "app.rs",
+            "vault_window/preflight.rs",
+            "notice_card.rs",
+        ] {
+            assert_eq!(
+                production(relative).matches(needle).count(),
+                0,
+                "{relative} calls `{needle}` on the fill path. A refusal is shown on \
+                 Deskwarden's own notice card (`notice_card::show_notice`), not a system box"
+            );
+        }
+
+        let ours = production("injector/sequence.rs");
+        let body = ours
+            .split(concat!("fn show_", "refusal(detail: &str) {"))
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .expect("control: `show_refusal` is gone from sequence.rs");
+        assert!(
+            body.contains("crate::notice_card::show_notice(&detail)"),
+            "`show_refusal` no longer hands the refusal to the notice card: {body}"
+        );
+        assert!(
+            body.contains(concat!("std::thread::", "spawn(")),
+            "`show_refusal` shows the card on the caller's thread. Its callers are the daemon's \
+             message loop and the typing thread, and neither may sit in the card's pump"
+        );
+        // Control on the needle: it names an API this crate really still uses
+        // -- for the startup refusals that run before any card can exist.
+        assert!(production("main.rs").contains(needle), "control: the needle names nothing");
     }
 }
 

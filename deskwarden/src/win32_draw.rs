@@ -1637,6 +1637,9 @@ mod tests {
             "prompt_card.rs",
             "locked_card.rs",
             "save_login_card.rs",
+            // The autofill notice, which replaced a system message box and
+            // is the seventh again.
+            "notice_card.rs",
         ] {
             let raw = std::fs::read_to_string(src.join(card)).unwrap().replace("\r\n", "\n");
             let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();

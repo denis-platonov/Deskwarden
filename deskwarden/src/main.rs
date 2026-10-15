@@ -32554,7 +32554,7 @@ mod tests {
             assert_eq!(
                 source[boundary..].matches(named).count(),
                 0,
-                "a test passes the real notifier. That opens a task-modal `MessageBoxW` on \
+                "a test passes the real notifier. That opens a topmost notice card on \
                  the desktop of whoever ran `cargo test`, which is the entire hazard this \
                  parameter exists to remove: use `recorder()`"
             );

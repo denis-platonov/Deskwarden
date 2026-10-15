@@ -48,7 +48,7 @@
 //!
 //! It goes where [`Gated::Refused`] and [`Gated::NoTarget`] have always sent
 //! it: through [`crate::injector::sequence::Notifier`], which production wires
-//! to `sequence::REAL_NOTIFIER` -- a task-modal box on its own thread -- and
+//! to `sequence::REAL_NOTIFIER` -- Deskwarden's notice card on its own thread -- and
 //! which a test wires to a recorder. That path already existed, was already
 //! tested, and did not depend on the card.
 //!

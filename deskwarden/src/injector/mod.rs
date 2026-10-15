@@ -361,7 +361,7 @@ fn outcome_of_a_run(result: &Result<(), String>) -> FillOutcome {
 /// Generic over [`sequence::Keyboard`] and [`sequence::Notifier`] rather than
 /// hard-wired to the real ones, so `sequence::run_tests::FakeKeyboard` -- which
 /// answers `holds_foreground` however a test says and **sends no real input**
-/// -- can drive it, and a recording notifier can stand in for the message box.
+/// -- can drive it, and a recording notifier can stand in for the notice card.
 ///
 /// # Two things this is **not** covered for, stated so nobody assumes it is
 ///
@@ -670,7 +670,7 @@ mod orchestration_tests {
     /// Deliberately **not** the production notifier. There is now no
     /// configuration in which the production one is silent -- `REAL_NOTIFIER`
     /// is `show_refusal` in every build -- so a test that reached for it would
-    /// open a real message box on a real desktop rather than merely risking
+    /// open a real notice card on a real desktop rather than merely risking
     /// one. Recording is what a test is entitled to; the dialog is not.
     #[derive(Default)]
     struct RecordingNotifier(RefCell<Vec<String>>);

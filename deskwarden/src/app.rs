@@ -903,7 +903,7 @@ impl FillShortcut {
     ///   all of them. It would also mean a user who pressed the password chord
     ///   by accident at a browser got a save-this-login card about the browser.
     /// * **A refusal dialog** through `injector::sequence::REAL_NOTIFIER`.
-    ///   Rejected: that is a task-modal `MessageBoxW`, and a modal box for a
+    ///   Rejected: that is a topmost notice card that takes the foreground, and one for a
     ///   mistyped chord is the interruption `hotkey`'s module doc refuses to
     ///   put at startup, moved to a place it would happen far more often.
     /// * **Nothing, and say so where the question is asked.** Taken. The press

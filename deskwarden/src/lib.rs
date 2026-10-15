@@ -102,6 +102,9 @@ pub mod logging;
 pub mod locked_card;
 pub mod login_ui;
 pub mod match_engine;
+/// The autofill notice: a refused or abandoned fill, on Deskwarden's own card
+/// in bare Win32 rather than a system message box.
+pub mod notice_card;
 /// Parses and renders `otpauth://totp` URIs. Pure, and no I/O at all.
 pub mod otpauth;
 /// This crate's own password generator -- the one vault operation no server
