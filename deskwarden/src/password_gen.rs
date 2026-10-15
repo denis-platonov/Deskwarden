@@ -663,8 +663,8 @@ const MAX_WORDS: u32 = 20;
 ///
 /// **The user's config directory is deliberately NOT on this list**, and that
 /// is the one interesting thing about this function.
-/// [`crate::brand_mark::search_dirs`] looks there *first* (and in
-/// `%APPDATA%\Deskwarden\brand-marks` third), precisely so a user
+/// [`crate::brand_mark::search_dirs`] looks there *first* (the executable's
+/// folder second), precisely so a user
 /// can override what the app ships -- which is right for a card logo and would
 /// be a hole here: a user-writable word list is a file that anything running
 /// as the user can shrink to ten words, after which every passphrase this app

@@ -23,9 +23,9 @@
 //!   ([`profiled_root`]). [`app_dirs`] is the one place this crate resolves
 //!   its folders from the OS, so settings, logs, accounts, the vault caches,
 //!   the histories, the result files and the update and icon caches all
-//!   follow it. The one folder the default copy reads from above its own --
-//!   `%APPDATA%\Deskwarden\brand-marks`, for card logos
-//!   ([`AppDirs::organization_dir`]) -- is not read under a profile at all.
+//!   follow it. That includes the `brand-marks` folder card logos are read
+//!   from beside the settings; the other place logos are read, beside the
+//!   executable, is the profiled copy's own executable's.
 //! * **`bw serve`'s port** moves off 8087 ([`bw_serve_port_for`]), so a
 //!   profiled window can never read the owner's unlocked `bw serve`.
 //! * **Nothing outside those folders is written.** No logon entry, no user
@@ -372,31 +372,15 @@ pub struct AppDirs {
     pub config_dir: PathBuf,
     /// The update downloads and the favicon cache.
     pub cache_dir: PathBuf,
-    /// `%APPDATA%\Deskwarden` -- the organisation folder the config folder
-    /// sits two levels under -- **for the default copy only**, and `None`
-    /// under a profile. Read from, never written: it is the third place
-    /// `brand_mark::search_dirs` looks for logo files. A profile has no
-    /// folder of its own at this level, and the rule is that a profiled copy
-    /// reads and writes only under `profiles\<name>`, so it gets none.
-    pub organization_dir: Option<PathBuf>,
 }
 
 impl AppDirs {
-    /// The folders under `profile`, from the OS's answers. Pure.
-    ///
-    /// `config_dir` is the OS's own, unprofiled answer --
-    /// `%APPDATA%\Deskwarden\Deskwarden\config` -- so the organisation folder
-    /// is derived from it rather than asked of the OS a second time.
+    /// The two folders under `profile`, from the OS's answers. Pure.
     #[must_use]
     pub fn under(config_dir: PathBuf, cache_dir: PathBuf, profile: Option<&Profile>) -> Self {
-        let organization_dir = match profile {
-            Some(_) => None,
-            None => config_dir.parent().and_then(std::path::Path::parent).map(PathBuf::from),
-        };
         Self {
             config_dir: profiled_root(config_dir, profile),
             cache_dir: profiled_root(cache_dir, profile),
-            organization_dir,
         }
     }
 }
@@ -828,20 +812,11 @@ mod tests {
         let default = AppDirs::under(config.clone(), cache.clone(), None);
         assert_eq!(default.config_dir, config);
         assert_eq!(default.cache_dir, cache);
-        assert_eq!(
-            default.organization_dir,
-            Some(PathBuf::from(r"C:\Users\u\AppData\Roaming\Deskwarden")),
-            "the default copy reads logos from %APPDATA%\\Deskwarden as well"
-        );
 
         let p = profile("rc");
         let profiled = AppDirs::under(config.clone(), cache.clone(), Some(&p));
         assert_eq!(profiled.config_dir, config.join("profiles").join("rc"));
         assert_eq!(profiled.cache_dir, cache.join("profiles").join("rc"));
-        assert_eq!(
-            profiled.organization_dir, None,
-            "a profile was given a folder outside its own profiles\\rc"
-        );
         assert_eq!(
             profiled_root(PathBuf::from(r"C:\x\cache"), Some(&p)),
             PathBuf::from(r"C:\x\cache\profiles\rc")
@@ -898,13 +873,16 @@ mod tests {
         assert_eq!(crate::sent_history::default_path(), Some(config.join("sent_history.json")));
         assert_eq!(crate::hotkey::status_file_path(&config), config.join("daemon-shortcuts.txt"));
         assert_eq!(crate::brand_mark::search_dirs().first(), Some(&config.join("brand-marks")));
+        let exe_marks = std::env::current_exe()
+            .expect("the test executable's path")
+            .parent()
+            .expect("the test executable's folder")
+            .join("brand-marks");
         assert_eq!(
             crate::brand_mark::search_dirs().last(),
-            Some(&roaming.join("Deskwarden").join("brand-marks")),
-            "the default copy no longer looks in %APPDATA%\\Deskwarden\\brand-marks, where the \
-             owner keeps their logo files"
+            Some(&exe_marks),
+            "the brand-marks search no longer ends with the executable's folder"
         );
-        assert_eq!(dirs.organization_dir, Some(roaming.join("Deskwarden")));
         assert_eq!(bw_cli_cache_dir(), Some(local.join("deskwarden").join("cache")));
         assert_eq!(
             bw_cli_fallback_for(Some(config.clone()), None),

@@ -554,8 +554,8 @@ mod tests {
     /// **Its logo policy is installed off, and that is not incidental.** With
     /// none installed, [`policy`] resolves the user's real `settings.json`
     /// and, if they have turned the preference on, their real `brand-marks`
-    /// folders -- beside `settings.json`, beside the executable, then
-    /// `%APPDATA%\\Deskwarden\\brand-marks` -- so the suite would pass or fail
+    /// folders -- beside `settings.json`, then beside the executable -- so
+    /// the suite would pass or fail
     /// depending on what the developer happens to have in a folder. Every
     /// context in this module's tests is told what to think first, and the
     /// ones that want a logo are told where to find one they wrote themselves.
@@ -725,9 +725,9 @@ mod tests {
     //
     // Every test below writes its own fixture images into its own temp
     // directory and points the context at it. **None of them can reach the
-    // real `brand-marks` folders** -- beside `settings.json`, beside the
-    // executable, and `%APPDATA%\Deskwarden\brand-marks`, in that order
-    // -- which are where the real marks live and what a test must never
+    // real `brand-marks` folders** -- beside `settings.json`, then beside
+    // the executable, in that order -- which are where the real marks live
+    // and what a test must never
     // read: the policy is installed before a mark is drawn, and an installed
     // policy is the only thing `logo` consults.
 

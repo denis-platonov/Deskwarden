@@ -6815,8 +6815,8 @@ mod row_tile_tests {
 
     /// A directory holding brand logo fixtures, **under the process's temp
     /// directory and never the real one**: these are files this test wrote,
-    /// and the Deskwarden folder under `%APPDATA%` is not somewhere a test may
-    /// look.
+    /// and the real `brand-marks` folders -- beside the settings and beside
+    /// the executable -- are not somewhere a test may look.
     ///
     /// The guard comes back rather than the path: the marks are read off disk
     /// at paint time, so the directory has to outlive the paint, and it is the

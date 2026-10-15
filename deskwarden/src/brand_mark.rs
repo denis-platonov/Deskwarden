@@ -197,17 +197,14 @@ impl Mark {
 ///    development build and in every build until the images are supplied; a
 ///    missing directory is indistinguishable here from an empty one, by
 ///    design.
-/// 3. **`%APPDATA%\Deskwarden\brand-marks\`** -- the Deskwarden folder
-///    itself, one level above the app's own, which is where the owner keeps
-///    their logos and the folder a person browsing `%APPDATA%` finds first.
-///    **The default copy only**:
-///    [`crate::app_profile::AppDirs::organization_dir`] is `None` under a
-///    `DESKWARDEN_PROFILE`, because that folder is not the profile's own and a
-///    test copy reads nothing outside its own folders.
 ///
-/// Any of them may be absent from the returned list, when the platform has no
-/// resolvable folder or the running executable's path cannot be read. An
-/// empty list is a valid answer and means every brand falls back to its word.
+/// A profiled copy searches the same two, so only its own config folder and
+/// its own executable's.
+///
+/// Either may be absent from the returned list, when the platform has no
+/// resolvable config folder or the running executable's path cannot be read.
+/// An empty list is a valid answer and means every brand falls back to its
+/// word.
 pub fn search_dirs() -> Vec<PathBuf> {
     let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
     search_dirs_in(crate::app_profile::app_dirs().as_ref(), exe_dir)
@@ -226,9 +223,6 @@ pub fn search_dirs_in(
     }
     if let Some(exe_dir) = exe_dir {
         dirs.push(exe_dir.join(MARK_DIR_NAME));
-    }
-    if let Some(organization) = app_dirs.and_then(|dirs| dirs.organization_dir.as_ref()) {
-        dirs.push(organization.join(MARK_DIR_NAME));
     }
     dirs
 }
@@ -530,10 +524,9 @@ pub(crate) mod tests {
     }
 
     /// **The real search order, for the default copy**: beside the settings,
-    /// beside the executable, then `%APPDATA%\Deskwarden\brand-marks` -- the
-    /// folder the owner's logos are actually in.
+    /// then beside the executable, and nowhere else.
     #[test]
-    fn the_default_copy_searches_its_config_then_the_exe_then_the_deskwarden_folder() {
+    fn the_default_copy_searches_its_config_folder_then_the_exe_folder() {
         let roaming = PathBuf::from(r"C:\Users\u\AppData\Roaming");
         let config = roaming.join(r"Deskwarden\Deskwarden\config");
         let cache = PathBuf::from(r"C:\Users\u\AppData\Local\Deskwarden\Deskwarden\cache");
@@ -542,23 +535,16 @@ pub(crate) mod tests {
 
         assert_eq!(
             search_dirs_in(Some(&app_dirs), Some(exe.clone())),
-            vec![
-                config.join("brand-marks"),
-                exe.join("brand-marks"),
-                roaming.join(r"Deskwarden\brand-marks"),
-            ]
+            vec![config.join("brand-marks"), exe.join("brand-marks")]
         );
         // Each root is optional on its own; the order of what is left holds.
-        assert_eq!(
-            search_dirs_in(Some(&app_dirs), None),
-            vec![config.join("brand-marks"), roaming.join(r"Deskwarden\brand-marks")]
-        );
+        assert_eq!(search_dirs_in(Some(&app_dirs), None), vec![config.join("brand-marks")]);
         assert_eq!(search_dirs_in(None, Some(exe.clone())), vec![exe.join("brand-marks")]);
     }
 
     /// **Under a profile only the profile's own folders are read**: its config
-    /// folder and its own executable's, and never the shared
-    /// `%APPDATA%\Deskwarden\brand-marks` the default copy reads.
+    /// folder and its own executable's, and never the default copy's
+    /// `%APPDATA%\Deskwarden\Deskwarden\config\brand-marks`.
     #[test]
     fn a_profile_searches_only_its_own_folders() {
         let roaming = PathBuf::from(r"C:\Users\u\AppData\Roaming");
@@ -577,8 +563,8 @@ pub(crate) mod tests {
             "a profiled copy read logos from outside its own folders"
         );
         assert!(
-            !dirs.contains(&roaming.join(r"Deskwarden\brand-marks")),
-            "a profiled copy reads the default copy's shared logo folder"
+            !dirs.contains(&config.join("brand-marks")),
+            "a profiled copy reads the default copy's logo folder"
         );
     }
 

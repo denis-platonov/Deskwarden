@@ -684,8 +684,8 @@ const BRAND_LOGOS_LABEL: &str = "Show card network logos";
 const BRAND_LOGOS_DESCRIPTION: &str = "Off by default. Draws a card's network mark as that \
      network's own logo, read from PNG files you put in a brand-marks folder — visa.png, \
      mastercard.png, amex.png and so on. Deskwarden looks beside your settings first, then \
-     beside the program itself, then in %APPDATA%\\Deskwarden\\brand-marks. Nothing is \
-     downloaded. Any brand with no image keeps its printed name.";
+     beside the program itself. Nothing is downloaded. Any brand with no image keeps its \
+     printed name.";
 
 const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
 /// **Says what ON adds, and what it costs.** Off is the default and is stated
