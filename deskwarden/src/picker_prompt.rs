@@ -2139,6 +2139,17 @@ mod win32 {
                         }
                         continue;
                     }
+                    // **Up and Down walk the rows in the list, palette and
+                    // empty steps**, ahead of `IsDialogMessageW` for the
+                    // reason `row_arrow` gives. Search mode is not here: it
+                    // has its own Up/Down above, which moves a highlight
+                    // while the keyboard stays in the box being typed into.
+                    if msg.message == WM_KEYDOWN
+                        && !in_search()
+                        && row_arrow(msg.wParam.0 as u16, top)
+                    {
+                        continue;
+                    }
                     if !IsDialogMessageW(top, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
@@ -2155,6 +2166,58 @@ mod win32 {
             // the next message rather than a frame tick.
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
+    }
+
+    /// **Up and Down move the keyboard between this step's rows**, answering
+    /// whether the key was one of the two.
+    ///
+    /// The rows are focusable controls and focus is drawn as selection (see
+    /// `paint_control`), so moving focus is moving the highlight, and Enter --
+    /// which `IsDialogMessageW` turns into a click on the focused control --
+    /// fills the row the arrows stopped on.
+    ///
+    /// Taken here rather than left to `IsDialogMessageW` because its arrow
+    /// traversal wraps round the ends and walks onto the footer buttons;
+    /// [`crate::win32_draw::row_after_arrow`] clamps, and only ever answers a
+    /// row. From a footer button, Down enters the list at its first row and Up
+    /// at its last. A step with no rows (a palette that came back empty)
+    /// swallows the key and does nothing, rather than letting it reach a
+    /// button.
+    fn row_arrow(vk: u16, window: HWND) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_UP};
+        if vk != VK_DOWN.0 && vk != VK_UP.0 {
+            return false;
+        }
+        let count = visible_row_count();
+        if count == 0 {
+            return true;
+        }
+        unsafe {
+            let focus = GetFocus();
+            let current = (0..count).find(|index| {
+                matches!(
+                    GetDlgItem(window, (ID_ROW + index) as i32),
+                    Ok(control) if control == focus
+                )
+            });
+            let to = crate::win32_draw::row_after_arrow(current, count, vk == VK_DOWN.0);
+            if current != Some(to) {
+                if let Ok(control) = GetDlgItem(window, (ID_ROW + to) as i32) {
+                    let _ = SetFocus(control);
+                }
+                // The rows paint their own highlight from `GetFocus`, and
+                // invalidating the parent does not reach child windows.
+                repaint_rows(window);
+                // And the footer buttons, one of which may be the control
+                // that just lost the keyboard and its focus ring.
+                for id in [ID_SECONDARY, ID_CANCEL] {
+                    if let Ok(control) = GetDlgItem(window, id as i32) {
+                        let _ = InvalidateRect(control, None, false);
+                    }
+                }
+            }
+        }
+        true
     }
 
     /// Whether CTRL is held right now.
@@ -5217,6 +5280,52 @@ mod tests {
             code.contains("WM_KEYDOWN"),
             "control: the production cut contains no `WM_KEYDOWN` arm, so the rules above could \
              not fail"
+        );
+    }
+
+    /// **Up and Down walk the rows outside search mode, ahead of
+    /// `IsDialogMessageW`.**
+    ///
+    /// A source pin, for the reason the Escape pin beside it is one. The
+    /// dialog manager's own arrow traversal wraps round the ends and steps
+    /// onto the footer buttons; `next` takes the two keys first, outside
+    /// search mode (which has its own Up and Down over a highlight), and asks
+    /// the shared pure `row_after_arrow` where to go.
+    #[test]
+    fn up_and_down_walk_the_rows_before_the_dialog_manager_sees_them() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            production.len() < raw.len(),
+            "control: the `#[cfg(test)]` cut marker was not found"
+        );
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let arm = flat
+            .find("!in_search() && row_arrow(")
+            .expect("`next` no longer routes Up and Down through `row_arrow` outside search mode");
+        let traversal = flat
+            .find("IsDialogMessageW(top, &msg)")
+            .expect("control: the production cut does not contain the pump this rule is about");
+        assert!(
+            arm < traversal,
+            "Up and Down are handled after `IsDialogMessageW`, which wraps and walks onto the \
+             footer buttons before this card sees the key"
+        );
+        assert!(
+            flat.contains("crate::win32_draw::row_after_arrow(current, count, vk == VK_DOWN.0)"),
+            "`row_arrow` no longer asks the shared pure function where to go, so the clamp the \
+             unit tests pin is not the clamp the card uses"
+        );
+        assert!(
+            flat.contains("in_search() && search_key("),
+            "control: search mode's own Up and Down arm is gone"
         );
     }
 

@@ -658,6 +658,52 @@ pub fn visible_rows(total: usize, cap: usize) -> (usize, bool) {
     }
 }
 
+/// **Which row an Up or Down arrow puts the keyboard on**, for the two Win32
+/// cards whose choice rows are focusable controls
+/// (`prompt_card` and `picker_prompt`).
+///
+/// `focused` is the index of the row that has the keyboard, or `None` when it
+/// is somewhere else -- a footer button, say -- and `count` is how many rows
+/// the card is showing. The answer is always a row: the footer buttons are
+/// never a destination, so an arrow cannot walk off the list onto *Cancel*.
+///
+/// **It clamps at both ends and does not wrap**, which is the rule the vault
+/// window's item list already follows (`item_list::next_selection`), and for
+/// the reason `picker_prompt::moved_selection` gives: a card that cannot
+/// scroll and jumps from its last row back to its first moves the user's
+/// choice past the thing they were aiming at.
+///
+/// **With the keyboard off the rows, Down enters at the first row and Up at
+/// the last** -- again the item list's rule for "nothing selected". A
+/// `focused` at or past `count` is a stale index and is treated the same way,
+/// as the item list treats an id that is no longer in the list.
+///
+/// A `count` of zero has no row to answer; it answers `0` and a caller with
+/// no rows must not move focus at all. Pure, so the decision is one a test can
+/// make without opening a window.
+pub fn row_after_arrow(focused: Option<usize>, count: usize, down: bool) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let last = count - 1;
+    match focused {
+        Some(index) if index < count => {
+            if down {
+                (index + 1).min(last)
+            } else {
+                index.saturating_sub(1)
+            }
+        }
+        _ => {
+            if down {
+                0
+            } else {
+                last
+            }
+        }
+    }
+}
+
 /// Where a hint chip sits inside the surface it belongs to, and what it costs
 /// the label lane beside it. See [`hint_chip_lane`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1413,6 +1459,62 @@ pub fn draw_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **Down and Up step one row and stop at the ends.**
+    ///
+    /// The same shape `item_list`'s `next_selection` is pinned to: no wrap, so
+    /// Down on the last row stays on it and Up on the first stays on it.
+    #[test]
+    fn an_arrow_steps_one_row_and_clamps_at_both_ends() {
+        // Down walks 0 -> 1 -> 2 and then stays.
+        assert_eq!(row_after_arrow(Some(0), 3, true), 1);
+        assert_eq!(row_after_arrow(Some(1), 3, true), 2);
+        assert_eq!(row_after_arrow(Some(2), 3, true), 2, "Down wrapped past the last row");
+        // Up walks 2 -> 1 -> 0 and then stays.
+        assert_eq!(row_after_arrow(Some(2), 3, false), 1);
+        assert_eq!(row_after_arrow(Some(1), 3, false), 0);
+        assert_eq!(row_after_arrow(Some(0), 3, false), 0, "Up wrapped past the first row");
+        // A full six-row card, the largest either Win32 card lays out.
+        assert_eq!(row_after_arrow(Some(5), 6, true), 5);
+        assert_eq!(row_after_arrow(Some(4), 6, true), 5);
+    }
+
+    /// **With the keyboard off the rows, Down enters at the top and Up at the
+    /// bottom** -- including a stale index, which is not a row.
+    #[test]
+    fn an_arrow_from_off_the_rows_enters_the_list_at_the_matching_end() {
+        assert_eq!(row_after_arrow(None, 4, true), 0);
+        assert_eq!(row_after_arrow(None, 4, false), 3);
+        assert_eq!(row_after_arrow(Some(4), 4, true), 0, "a stale index is not a row");
+        assert_eq!(row_after_arrow(Some(4), 4, false), 3, "a stale index is not a row");
+        assert_eq!(row_after_arrow(Some(99), 4, false), 3);
+    }
+
+    /// **One row cannot be moved off.** Every key from every starting point
+    /// answers that row, and so does a card with nothing to move to.
+    #[test]
+    fn an_arrow_on_a_single_row_card_stays_on_it() {
+        for focused in [None, Some(0), Some(7)] {
+            for down in [true, false] {
+                assert_eq!(row_after_arrow(focused, 1, down), 0, "{focused:?} down={down}");
+            }
+        }
+        assert_eq!(row_after_arrow(None, 0, true), 0);
+        assert_eq!(row_after_arrow(Some(0), 0, false), 0);
+    }
+
+    /// **An arrow never answers a row that is not there.**
+    #[test]
+    fn an_arrow_always_answers_a_row_that_exists() {
+        for count in 1..=8 {
+            for focused in std::iter::once(None).chain((0..=count + 1).map(Some)) {
+                for down in [true, false] {
+                    let to = row_after_arrow(focused, count, down);
+                    assert!(to < count, "{focused:?} of {count} down={down} answered row {to}");
+                }
+            }
+        }
+    }
 
     /// **The close glyph is the one part of a frameless card's background
     /// that is not a title bar.**

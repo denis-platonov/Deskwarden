@@ -1017,8 +1017,14 @@ mod win32 {
     /// credentials from a row they had visibly moved off. `super::selected_row`
     /// is the same function the painter uses to decide which row wears the
     /// `Enter` chip, so the chip is provably on the row Enter takes.
+    ///
+    /// **Up and Down move that focus** from row to row -- see
+    /// [`arrow_to_row`] -- so a user can walk the list and press Enter without
+    /// reaching for Tab.
     pub(super) fn next(window: PromptWindow) -> Event {
-        use windows::Win32::UI::Input::KeyboardAndMouse::{VK_ESCAPE, VK_RETURN};
+        use windows::Win32::UI::Input::KeyboardAndMouse::{
+            VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP,
+        };
         use windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN;
 
         let top = hwnd(window.0);
@@ -1042,6 +1048,18 @@ mod win32 {
                     }
                     if msg.message == WM_KEYDOWN && msg.wParam.0 as u16 == VK_RETURN.0 {
                         return Event::Pick(focused_row(top));
+                    }
+                    // **Up and Down move the keyboard between the choice
+                    // rows**, ahead of `IsDialogMessageW`: its own arrow
+                    // traversal wraps round the ends, and the next row is a
+                    // decision `row_after_arrow` makes once for both Win32
+                    // cards. The row that now has focus is the one that wears
+                    // the `Enter` chip and the one Enter takes.
+                    if msg.message == WM_KEYDOWN
+                        && (msg.wParam.0 as u16 == VK_DOWN.0 || msg.wParam.0 as u16 == VK_UP.0)
+                    {
+                        arrow_to_row(top, msg.wParam.0 as u16 == VK_DOWN.0);
+                        continue;
                     }
                     if !IsDialogMessageW(top, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
@@ -1102,20 +1120,44 @@ mod win32 {
         ROW_COUNT.load(Ordering::SeqCst).max(1) as usize
     }
 
+    /// The row control that has the keyboard, or `None` when focus is
+    /// anywhere else.
+    fn focus_index(window: HWND) -> Option<usize> {
+        let focus = unsafe { GetFocus() };
+        (0..row_count()).find(|index| {
+            matches!(
+                unsafe { GetDlgItem(window, (ID_ROW + index) as i32) },
+                Ok(control) if control == focus
+            )
+        })
+    }
+
     /// Which row the keyboard is on, as [`super::selected_row`] wants it.
     fn focused_row(window: HWND) -> usize {
+        super::selected_row(focus_index(window), row_count())
+    }
+
+    /// **Up or Down: the keyboard moves to the neighbouring choice row.**
+    ///
+    /// The destination is [`crate::win32_draw::row_after_arrow`]'s, so it
+    /// clamps at both ends and is always a row -- this card has no footer
+    /// control for an arrow to land on. Every row is repainted afterwards
+    /// rather than trusting the focus change to: the painter reads
+    /// `GetFocus()` to put the selected treatment and the `Enter` chip on a
+    /// row, and the row that lost the keyboard has to lose both with it.
+    fn arrow_to_row(window: HWND, down: bool) {
         let count = row_count();
-        let focus = unsafe { GetFocus() };
-        let mut found = None;
-        for index in 0..count {
-            if let Ok(control) = unsafe { GetDlgItem(window, (ID_ROW + index) as i32) } {
-                if control == focus {
-                    found = Some(index);
-                    break;
-                }
+        let current = focus_index(window);
+        let to = crate::win32_draw::row_after_arrow(current, count, down);
+        if current == Some(to) {
+            return;
+        }
+        unsafe {
+            if let Ok(control) = GetDlgItem(window, (ID_ROW + to) as i32) {
+                let _ = SetFocus(control);
             }
         }
-        super::selected_row(found, count)
+        repaint_all(window);
     }
 
     fn take_pending() -> Option<Event> {
@@ -2411,6 +2453,52 @@ mod tests {
             0,
             "this card has become an `eframe` window, which is the ~50 MB of unreleasable OpenGL \
              driver arenas it exists to not spend"
+        );
+    }
+
+    /// **Up and Down move between the rows, ahead of `IsDialogMessageW`.**
+    ///
+    /// A source pin, because the key arrives in the card's own pump and no
+    /// test can open that window. Decidable: `next` answers `VK_UP` and
+    /// `VK_DOWN` itself through `arrow_to_row` -- which asks
+    /// `row_after_arrow` where to go, so the end-stops are the pure
+    /// function's -- and does so before `IsDialogMessageW`, whose own arrow
+    /// traversal wraps round the ends. And that Enter still takes the focused
+    /// row, which is what the arrows move.
+    #[test]
+    fn up_and_down_move_between_rows_before_the_dialog_manager_sees_them() {
+        let (production, discarded) = production();
+        assert!(discarded > 0, "control: nothing was cut out of the file");
+        let code = code(&production);
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let traversal = flat
+            .find("IsDialogMessageW(top, &msg)")
+            .expect("control: the production cut does not contain the pump this rule is about");
+        let escape = flat.find("VK_ESCAPE.0").expect("`next` no longer answers Escape");
+        assert!(escape < traversal, "control: Escape is handled after the dialog manager");
+
+        let down = flat
+            .find("VK_DOWN.0 ||")
+            .expect("`next` no longer handles VK_DOWN itself, so Down is left to the dialog manager");
+        let up = flat
+            .find("VK_UP.0")
+            .expect("`next` no longer handles VK_UP itself, so Up is left to the dialog manager");
+        assert!(
+            down < traversal && up < traversal,
+            "Up or Down is handled after `IsDialogMessageW`, which swallows it first"
+        );
+        assert!(
+            flat.contains("arrow_to_row(top, msg.wParam.0 as u16 == VK_DOWN.0)"),
+            "the arrow arm no longer moves the card's focus through `arrow_to_row`"
+        );
+        assert!(
+            flat.contains("crate::win32_draw::row_after_arrow(current, count, down)"),
+            "`arrow_to_row` no longer asks the shared pure function where to go, so the clamp \
+             the unit tests pin is not the clamp the card uses"
+        );
+        assert!(
+            flat.contains("return Event::Pick(focused_row(top))"),
+            "Enter no longer fills the focused row, which is the row the arrows move"
         );
     }
 
