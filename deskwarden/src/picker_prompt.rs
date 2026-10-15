@@ -2150,6 +2150,19 @@ mod win32 {
                     {
                         continue;
                     }
+                    // **Enter clicks the focused row or button, here.**
+                    // `IsDialogMessageW` was trusted with it and did nothing:
+                    // this card is not a dialog box, so the dialog manager's
+                    // Enter goes to the default-button id (`IDOK`), which no
+                    // control here has, and the owner-drawn rows never
+                    // answered as push buttons. The owner: "Enter doesn't
+                    // work but arrows are".
+                    if msg.message == WM_KEYDOWN && !in_search() && enter_clicks_focus(msg.wParam.0 as u16, top) {
+                        if let Some(event) = take_pending() {
+                            return event;
+                        }
+                        continue;
+                    }
                     if !IsDialogMessageW(top, &msg).as_bool() {
                         let _ = TranslateMessage(&msg);
                         DispatchMessageW(&msg);
@@ -2166,6 +2179,31 @@ mod win32 {
             // the next message rather than a frame tick.
             std::thread::sleep(std::time::Duration::from_millis(8));
         }
+    }
+
+    /// **Enter clicks whatever holds the keyboard**: a row, or one of the two
+    /// footer buttons, through [`clicked`] -- the same function the pointer
+    /// reaches, so a keyboard pick and a click cannot differ. Answers whether
+    /// the key was Enter and something was clicked; with the keyboard nowhere
+    /// this card knows, Enter falls through untouched.
+    fn enter_clicks_focus(vk: u16, window: HWND) -> bool {
+        use windows::Win32::UI::Input::KeyboardAndMouse::VK_RETURN;
+        if vk != VK_RETURN.0 {
+            return false;
+        }
+        unsafe {
+            let focus = GetFocus();
+            let ids = (0..visible_row_count())
+                .map(|index| ID_ROW + index)
+                .chain([ID_SECONDARY, ID_CANCEL]);
+            for id in ids {
+                if matches!(GetDlgItem(window, id as i32), Ok(control) if control == focus) {
+                    clicked(id);
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// **Up and Down move the keyboard between this step's rows**, answering
@@ -5327,6 +5365,41 @@ mod tests {
             flat.contains("in_search() && search_key("),
             "control: search mode's own Up and Down arm is gone"
         );
+    }
+
+    /// **Enter clicks the focused row or button, ahead of
+    /// `IsDialogMessageW`.**
+    ///
+    /// A source pin. The dialog manager sends Enter to the default-button id,
+    /// which this card -- not a dialog box -- does not have, so Enter did
+    /// nothing at all while the arrows worked. `next` must take it first,
+    /// outside search mode (which commits its highlight through `search_key`),
+    /// and click through `clicked`, the pointer's own path.
+    #[test]
+    fn enter_clicks_the_focused_control_before_the_dialog_manager_sees_it() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let raw =
+            std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
+        let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
+        let code: String = production
+            .lines()
+            .map(|line| line.split("//").next().unwrap_or(""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        let arm = flat
+            .find("!in_search() && enter_clicks_focus(")
+            .expect("`next` no longer takes Enter through `enter_clicks_focus` outside search mode");
+        let traversal = flat
+            .find("IsDialogMessageW(top, &msg)")
+            .expect("control: the production cut does not contain the pump this rule is about");
+        assert!(arm < traversal, "Enter is handled after `IsDialogMessageW`, which drops it");
+        let body = &flat[flat.find("fn enter_clicks_focus(").expect("the function is gone")..];
+        let body = &body[..body.find("fn row_arrow(").expect("control: `row_arrow` follows it")];
+        assert!(body.contains("clicked(id)"), "Enter no longer clicks through `clicked`");
+        for id in ["ID_ROW + index", "ID_SECONDARY", "ID_CANCEL"] {
+            assert!(body.contains(id), "Enter no longer reaches {id}");
+        }
     }
 
     /// **The *Cancel* button advertises the key that has always cancelled
