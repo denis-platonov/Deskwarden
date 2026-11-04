@@ -39,6 +39,12 @@ pub struct IconCache {
     /// allowed to serve what it has just re-fetched. A flag that stayed set
     /// would make one menu click into a permanent cache-buster on that row.
     pub refreshing: std::collections::HashSet<String>,
+    /// The websites each item's icon was resolved for -- what
+    /// `favicon::icon_authorities_for` answered -- keyed by item id. When an
+    /// item's answer changes, its texture and "already asked" mark are
+    /// dropped and the icon is looked up again; see `vault_window`'s
+    /// `forget_icon_if_websites_changed`.
+    pub sites: HashMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -715,11 +721,11 @@ pub(super) fn icon_menu(item: &VaultItem) -> Option<Vec<MenuCommand>> {
         // mentions refreshing. Such a row draws a monogram because there is
         // no site to have an icon OF, and a disabled "Refresh icon" on a
         // secure note would invite the user to wonder what icon it meant.
-        // `icon_authority_for` is asked rather than a `kind ==` test of its
+        // `icon_authorities_for` is asked rather than a `kind ==` test of its
         // own, so the one function that decides "does this item have an
         // automatic icon at all" decides it here too -- the same seam that
         // let cards grow icons without this file knowing cards exist.
-        None => crate::favicon::icon_authority_for(item).is_some(),
+        None => !crate::favicon::icon_authorities_for(item).is_empty(),
     };
     let mut rows = Vec::new();
     if refreshable {

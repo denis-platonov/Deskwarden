@@ -561,6 +561,12 @@ enum DetailMode {
 /// and the decoded pixels (`None` if this item had no usable icon).
 struct FaviconResult {
     item_id: String,
+    /// The websites the icon was looked up for -- what
+    /// `favicon::icon_authorities_for` answered when the job was sent. An
+    /// answer for a list the item no longer has is dropped on arrival: the
+    /// job was in flight when the item was edited, and drawing it would put
+    /// the OLD first site's icon back over the lookup the edit started.
+    sites: Vec<String>,
     pixels: Option<(usize, usize, Vec<u8>)>,
 }
 
@@ -2148,6 +2154,9 @@ pub fn build_frame_with_search(
         };
 
         while let Ok(result) = favicon_rx.try_recv() {
+            if icons.sites.get(&result.item_id).is_some_and(|now| *now != result.sites) {
+                continue;
+            }
             if let Some((w, h, rgba)) = result.pixels {
                 let image = egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba);
                 let tex = ui.ctx().load_texture(result.item_id.clone(), image, egui::TextureOptions::default());
@@ -15022,6 +15031,47 @@ fn icon_plan(ctx: &egui::Context, item: &VaultItem, icons: &mut IconCache) -> Ic
     IconPlan::Loaded
 }
 
+/// **A changed list of websites is a changed icon**, so the item's loaded
+/// icon and its "already asked" mark are dropped and [`ensure_icon_loaded`]
+/// looks again.
+///
+/// Both caches are keyed by item id, and before this nothing tied them to
+/// what the item SAID: the owner put a new website first on a login and the
+/// row kept the old site's icon for the rest of the session, because the id
+/// had been dealt with. The list compared is
+/// [`crate::favicon::icon_authorities_for`]'s -- every candidate in the order
+/// they are tried -- so moving a website up, adding one, or an edit synced in
+/// from another Bitwarden client all count, and a change to anything else
+/// about the item (its name, its notes, its password) does not.
+///
+/// **Behind the `fetch_icons` switch, like every other use of the item's
+/// websites here**: with icons off this works out nothing about the item.
+/// The first sighting of an id only records its list -- there is nothing
+/// loaded yet to be stale.
+fn forget_icon_if_websites_changed(
+    item: &VaultItem,
+    fetch: &IconFetch<'_>,
+    favicon_requested: &mut std::collections::HashSet<String>,
+    icons: &mut IconCache,
+) {
+    if !fetch.enabled {
+        return;
+    }
+    let sites = crate::favicon::icon_authorities_for(item);
+    match icons.sites.get(&item.id) {
+        Some(known) if *known == sites => {}
+        Some(_) => {
+            icons.textures.remove(&item.id);
+            favicon_requested.remove(&item.id);
+            icons.sites.insert(item.id.clone(), sites);
+            log::debug!("icon: item {}'s websites changed, so its icon is looked up again", item.id);
+        }
+        None => {
+            icons.sites.insert(item.id.clone(), sites);
+        }
+    }
+}
+
 /// Ensures `item`'s favicon is loading or loaded, doing as little work as
 /// possible: skips entirely if already resolved (loaded or a fetch already
 /// dispatched) this session, honours the owner's own choice of picture
@@ -15043,6 +15093,7 @@ fn ensure_icon_loaded(
     favicon_requested: &mut std::collections::HashSet<String>,
     icons: &mut IconCache,
 ) {
+    forget_icon_if_websites_changed(item, fetch, favicon_requested, icons);
     if icons.textures.contains_key(&item.id) || favicon_requested.contains(&item.id) {
         return;
     }
@@ -15108,13 +15159,20 @@ fn ensure_icon_loaded(
     // forever, and a `return` here would have made the URL route work for
     // logins and silently do nothing for everything else. The "nothing to do"
     // return moved one line down, where it now asks about both.
-    let domain = crate::favicon::icon_authority_for(item);
+    //
+    // **Every website, not the first alone.** `icon_authorities_for` lists
+    // the item's websites in order, each followed by its parent domains, and
+    // the background job below takes the first that yields an icon -- the
+    // owner's "whatever is first unless it cannot, then fallback to second".
+    // The disk cache is keyed per authority as before, so each site's file
+    // is still shared with every other item on that site.
+    let sites = crate::favicon::icon_authorities_for(item);
     let chosen_url = match plan {
         IconPlan::ChosenUrl(url) => Some(url),
         // `Loaded` returned above; `Automatic` is the ordinary path.
         IconPlan::Loaded | IconPlan::Automatic => None,
     };
-    if domain.is_none() && chosen_url.is_none() {
+    if sites.is_empty() && chosen_url.is_none() {
         return;
     }
     favicon_requested.insert(item.id.clone());
@@ -15134,8 +15192,8 @@ fn ensure_icon_loaded(
     // its id, not its URI -- a host:port the user chose to store, which is
     // the one fact the icon path acts on and the one this log is for. Every
     // other line below names the same string or a URL built from it.
-    if let Some(domain) = &domain {
-        log::debug!("icon: {domain} is this item's icon authority");
+    if !sites.is_empty() {
+        log::debug!("icon: {} are this item's icon authorities, in order", sites.join(", "));
     }
 
     // **The disk cache is skipped entirely when a URL was chosen**, and not
@@ -15159,9 +15217,14 @@ fn ensure_icon_loaded(
     // A menu entry that silently does nothing is worse than one that costs a
     // request, and this path is only ever taken right after a deliberate
     // click.
-    let cached = match (&chosen_url, &domain, freshness) {
-        (None, Some(domain), crate::favicon::IconFreshness::Cached) => {
-            crate::favicon::read_cached_icon(icon_cache_dir, domain)
+    //
+    // **Only the FIRST site's file is read here.** A later site's file would
+    // be an icon the owner ranked below one this app has not yet asked about;
+    // those are read by the background job, in order, after each site before
+    // them has had its chance.
+    let cached = match (&chosen_url, sites.first(), freshness) {
+        (None, Some(first), crate::favicon::IconFreshness::Cached) => {
+            crate::favicon::read_cached_icon(icon_cache_dir, first)
         }
         _ => None,
     };
@@ -15240,23 +15303,11 @@ fn ensure_icon_loaded(
         // warning that names only an item id cannot be read against the site
         // it tried -- the owner's `prod.beeline.com` was a monogram for a
         // whole session with nothing in the log to say which address failed.
-        let site = domain.clone();
         let pixels = chosen.or_else(|| {
-            let domain = domain?;
-            let source =
-                crate::favicon::icon_source_for(&domain, server_url.as_deref(), direct, freshness);
-            crate::favicon::fetch_icon_for(&source).and_then(|bytes| {
-                let decoded = crate::favicon::decode_rgba(&bytes);
-                if decoded.is_some() {
-                    crate::favicon::write_cached_icon(&cache_dir, &domain, &bytes);
-                } else {
-                    log::debug!(
-                        "icon: the {} bytes fetched for {domain} did not decode, so nothing was \
-                         cached",
-                        bytes.len()
-                    );
-                }
-                decoded
+            first_icon_among(&sites, freshness, &cache_dir, |site| {
+                let source =
+                    crate::favicon::icon_source_for(site, server_url.as_deref(), direct, freshness);
+                crate::favicon::fetch_icon_for(&source)
             })
         });
         if pixels.is_none() {
@@ -15264,13 +15315,65 @@ fn ensure_icon_loaded(
             // -- an item wearing a monogram when they expected a picture --
             // and the lines above it in the log say which candidate failed
             // and how.
+            let tried =
+                if sites.is_empty() { "its chosen icon URL".to_string() } else { sites.join(", ") };
             log::warn!(
-                "icon: nothing usable came back for item {item_id} ({}); it keeps its monogram",
-                site.as_deref().unwrap_or("its chosen icon URL")
+                "icon: nothing usable came back for item {item_id} ({tried}); it keeps its monogram"
             );
         }
-        let _ = tx.send(FaviconResult { item_id, pixels });
+        let _ = tx.send(FaviconResult { item_id, sites, pixels });
     });
+}
+
+/// **The first of `sites` that yields an icon**, asked in order: the owner's
+/// "whatever is first unless it cannot, then fallback to second, third etc".
+///
+/// `fetch` is the network half -- `favicon::fetch_icon_for` in production --
+/// and is a parameter so the ORDER can be pinned without a network. What it
+/// returns counts only if it decodes: bytes that do not, which includes the
+/// icon service's "no icon" globe, are a site that could not, and the next
+/// site is asked. Only an icon that decoded is written to the disk cache,
+/// under the site that gave it.
+///
+/// **A site after the first is looked for on disk before it is asked
+/// about**, because the UI thread only read the FIRST site's file: by the time
+/// a later site is reached, every site ranked above it has been asked and had
+/// nothing, so its saved copy is now the right answer. A refreshing pass reads
+/// no file at all, for the reason `ensure_icon_loaded`'s own read gives.
+///
+/// Blocking. Call only from the loader's background thread.
+fn first_icon_among(
+    sites: &[String],
+    freshness: crate::favicon::IconFreshness,
+    cache_dir: &std::path::Path,
+    fetch: impl Fn(&str) -> Option<Vec<u8>>,
+) -> Option<(usize, usize, Vec<u8>)> {
+    sites.iter().enumerate().find_map(|(index, site)| {
+        let on_disk = (index > 0 && freshness == crate::favicon::IconFreshness::Cached)
+            .then(|| crate::favicon::read_cached_icon(cache_dir, site))
+            .flatten()
+            .and_then(|bytes| crate::favicon::decode_rgba(&bytes));
+        if on_disk.is_some() {
+            log::debug!("icon: {site} was served from the on-disk cache");
+            return on_disk;
+        }
+        let fetched = fetch(site).and_then(|bytes| {
+            let decoded = crate::favicon::decode_rgba(&bytes);
+            if decoded.is_some() {
+                crate::favicon::write_cached_icon(cache_dir, site, &bytes);
+            } else {
+                log::debug!(
+                    "icon: the {} bytes fetched for {site} did not decode, so nothing was cached",
+                    bytes.len()
+                );
+            }
+            decoded
+        });
+        if fetched.is_none() && index + 1 < sites.len() {
+            log::debug!("icon: {site} gave no icon, so the next one in line is asked");
+        }
+        fetched
+    })
 }
 
 /// Forgets everything this app knows about `item`'s icon, so the next
@@ -15357,12 +15460,19 @@ fn refresh_item_icon(
     // `ensure_icon_loaded` states: the disk cache is keyed on the authority,
     // so a login on `http://192.168.68.95:8080/` has its file named for the
     // port too, and forgetting the bare host would delete nothing.
-    let domain = crate::favicon::icon_authority_for(item)?;
-    crate::favicon::forget_cached_icon(icon_cache_dir, &domain);
+    //
+    // **Every site in line, not the first alone**: the icon on screen may be
+    // a later site's, and forgetting only the first would leave that file to
+    // be read straight back.
+    let sites = crate::favicon::icon_authorities_for(item);
+    let domain = sites.first()?.clone();
+    for site in &sites {
+        crate::favicon::forget_cached_icon(icon_cache_dir, site);
+    }
     icons.textures.remove(&item.id);
     favicon_requested.remove(&item.id);
     icons.refreshing.insert(item.id.clone());
-    log::info!("icon: {domain} was forgotten on request; it will be fetched again");
+    log::info!("icon: {} were forgotten on request; they will be fetched again", sites.join(", "));
     Some(domain)
 }
 
@@ -26549,11 +26659,11 @@ mod account_details_tests {
             .find("if !fetch.enabled {")
             .expect("the `fetch_icons` guard is no longer in `ensure_icon_loaded`");
         let question = code
-            .find(concat!("crate::favicon::icon_authority_", "for(item)"))
-            .expect("the loader no longer consults `icon_authority_for`");
+            .find(concat!("crate::favicon::icon_authorities_", "for(item)"))
+            .expect("the loader no longer consults `icon_authorities_for`");
         assert!(
             guard < question,
-            "the `fetch_icons` guard sits AFTER `icon_authority_for`, so with icons switched \
+            "the `fetch_icons` guard sits AFTER `icon_authorities_for`, so with icons switched \
              off the app still works out which host each item would disclose"
         );
         // The needle really is a call in the production source and not a
@@ -26574,6 +26684,98 @@ mod account_details_tests {
     // that an item with no icon domain is offered nothing. These are the
     // other half -- what the command then DOES to the two caches this app
     // holds, and what the request it causes looks like on the wire.
+
+    // ---- Which website's icon an item wears ------------------------------
+
+    /// **THE REPORT: "changed the website so it should pick up a new icon
+    /// automatically".** The owner put a new first website on a login and
+    /// the row kept the old site's icon, because the loaded texture and the
+    /// "already asked" mark are keyed by item id and nothing ever looked at
+    /// the item's websites again.
+    ///
+    /// Driven through the real loader, with both sites' icons already on
+    /// disk so the whole exchange is the UI thread's and needs no network.
+    /// The CONTROL is the second call: the same item again keeps the very
+    /// same texture, so the swap below is the edit and not a loader that
+    /// reloads every frame.
+    #[test]
+    fn editing_an_items_websites_swaps_its_icon_for_the_new_first_sites() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-websites-edited");
+        crate::favicon::write_cached_icon(&dir, "beget.example", &tiny_png());
+        crate::favicon::write_cached_icon(&dir, "lark.example", &tiny_png());
+        let before = routing_item(
+            r#"{"id":"w1","name":"Mail","type":1,"login":{"uris":[{"uri":"https://beget.example/"}]}}"#,
+        );
+        let after = routing_item(
+            r#"{"id":"w1","name":"Mail","type":1,"login":{"uris":[{"uri":"https://lark.example/"},{"uri":"https://beget.example/"}]}}"#,
+        );
+
+        let ctx = egui::Context::default();
+        let (tx, _rx) = mpsc::channel::<FaviconResult>();
+        let mut requested = std::collections::HashSet::new();
+        let mut icons = IconCache::default();
+        let mut load = |item: &VaultItem| {
+            ensure_icon_loaded(
+                &ctx,
+                item,
+                &dir,
+                &IconFetch { enabled: true, direct: false, server_url: &None },
+                &tx,
+                &mut requested,
+                &mut icons,
+            );
+            icons.textures.get("w1").map(egui::TextureHandle::id)
+        };
+
+        let first = load(&before).expect("the fixture's icon was not loaded from disk");
+        assert_eq!(load(&before), Some(first), "control: an unchanged item reloaded its icon");
+        let edited = load(&after).expect("the edited item lost its icon altogether");
+        assert_ne!(
+            edited, first,
+            "the item's first website changed and the row kept the icon it had before"
+        );
+    }
+
+    /// **"Whatever is first unless it cannot, then fallback to second".** The
+    /// first site answers with something that is not an icon -- as the icon
+    /// service's "no icon" globe now counts -- so the second is asked, and its
+    /// icon is the one drawn and the one saved, under its own name.
+    ///
+    /// And the other half: a first site that DOES answer is the end of it --
+    /// the second is never asked about, which is both the owner's order and
+    /// one request fewer to a site the item did not need.
+    #[test]
+    fn the_first_site_that_yields_an_icon_wins_and_no_later_one_is_asked() {
+        let dir = crate::test_scratch::ScratchDir::new("test-icon-fallback-order");
+        let sites = vec!["first.example".to_string(), "second.example".to_string()];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let pixels = first_icon_among(&sites, crate::favicon::IconFreshness::Cached, &dir, |site| {
+            asked.borrow_mut().push(site.to_string());
+            match site {
+                "first.example" => Some(b"<html>no icon here</html>".to_vec()),
+                _ => Some(tiny_png()),
+            }
+        });
+        assert!(pixels.is_some(), "the second site's icon was not used");
+        assert_eq!(*asked.borrow(), sites, "the sites were not asked in order");
+        assert!(
+            crate::favicon::read_cached_icon(&dir, "second.example").is_some()
+                && crate::favicon::read_cached_icon(&dir, "first.example").is_none(),
+            "the icon was not saved under the site that gave it, and only that one"
+        );
+
+        asked.borrow_mut().clear();
+        let pixels = first_icon_among(&sites, crate::favicon::IconFreshness::Cached, &dir, |site| {
+            asked.borrow_mut().push(site.to_string());
+            Some(tiny_png())
+        });
+        assert!(pixels.is_some());
+        assert_eq!(
+            *asked.borrow(),
+            vec!["first.example".to_string()],
+            "a later site was asked although the first one had an icon"
+        );
+    }
 
     /// The fixture every refresh test below uses: a login on a PUBLIC host,
     /// so `favicon::icon_source_for` routes it to the proxy arm -- the only

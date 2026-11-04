@@ -605,6 +605,82 @@ pub fn icon_authority_for(item: &crate::vault_bridge::VaultItem) -> Option<Strin
     }
 }
 
+/// **Every authority whose icon may stand for `item`, in the order they are
+/// tried** -- the first that yields an icon is the item's icon.
+///
+/// The owner's rule: "pick up a new icon automatically of whatever is first
+/// unless it cannot, then fallback to second, third etc". So a login lists
+/// ALL its websites, top to bottom, where [`icon_authority_for`] answers with
+/// the first alone -- and a first website with no icon of its own used to
+/// leave the item on a grey globe or a monogram while the second sat unused.
+///
+/// **Each website is followed by its parent domains before the next website
+/// is reached.** `powernapps.usttp.larksuite.com` has no icon at the icon
+/// service, `larksuite.com` has Lark's, and both are the FIRST website:
+/// jumping straight to the second website would hand the item another site's
+/// picture while its own brand's was one label away. A parent stops above a
+/// public suffix -- `example.co.uk`, never `co.uk` -- and a private address,
+/// an IP literal or an authority with a port has no parent at all: none of
+/// those name a brand by their trailing labels.
+///
+/// Duplicates are dropped, keeping the first place a domain earned. Every
+/// other kind answers [`icon_authority_for`]'s one authority, or nothing.
+pub fn icon_authorities_for(item: &crate::vault_bridge::VaultItem) -> Vec<String> {
+    let crate::vault_bridge::ItemKind::Login = crate::vault_bridge::ItemKind::of(item) else {
+        return icon_authority_for(item).into_iter().collect();
+    };
+    let mut out: Vec<String> = Vec::new();
+    let websites = item
+        .login
+        .iter()
+        .flat_map(|l| l.uris.iter())
+        .filter_map(|u| u.uri.as_deref())
+        .filter_map(authority_from_uri);
+    for authority in websites {
+        let parents = parent_domains(&authority);
+        for candidate in std::iter::once(authority).chain(parents) {
+            if !out.contains(&candidate) {
+                out.push(candidate);
+            }
+        }
+    }
+    out
+}
+
+/// The domains above `authority`'s host, nearest first, stopping at the
+/// registrable one: `a.b.example.com` gives `b.example.com` and
+/// `example.com`. Empty for a private host, an IP literal or an authority
+/// with a port -- see [`icon_authorities_for`].
+fn parent_domains(authority: &str) -> Vec<String> {
+    let host = host_of_authority(authority);
+    if host != authority || is_private_host(host) || host.parse::<std::net::IpAddr>().is_ok() {
+        return Vec::new();
+    }
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    let floor = if ends_in_two_label_suffix(&labels) { 3 } else { 2 };
+    (1..labels.len())
+        .map(|skip| &labels[skip..])
+        .take_while(|rest| rest.len() >= floor)
+        .map(|rest| rest.join("."))
+        .collect()
+}
+
+/// Whether `labels` end in a two-label public suffix such as `co.uk` or
+/// `com.au`: a two-letter country code under one of the generic second
+/// levels countries register beneath. Not the Public Suffix List -- only what
+/// keeps [`parent_domains`] from offering a whole country's registry as a
+/// brand.
+fn ends_in_two_label_suffix(labels: &[&str]) -> bool {
+    const SECOND_LEVELS: [&str; 12] =
+        ["ac", "co", "com", "edu", "go", "gov", "ltd", "ne", "net", "or", "org", "plc"];
+    match labels {
+        [.., second, tld] => {
+            tld.len() == 2 && SECOND_LEVELS.iter().any(|s| s.eq_ignore_ascii_case(second))
+        }
+        _ => false,
+    }
+}
+
 /// How long to wait for the icon host's TCP handshake.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1244,6 +1320,9 @@ pub fn decode_rgba(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
 /// not shared, because they are not the same question -- see
 /// `card_mark::MAX_MARK_BYTES`.
 pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)> {
+    if is_icon_service_globe(png_bytes) {
+        return None;
+    }
     // **An SVG is drawn, not decoded**, and it is recognised by its own text
     // rather than by a content type, as the ICO below is by its magic. The
     // owner, of `https://23000268.xyz/`: "not getting favicon" -- that site's
@@ -1333,6 +1412,34 @@ fn looks_like_svg(bytes: &[u8]) -> bool {
 /// edge cache still holding one, another proxy with the same habit.
 fn is_placeholder_svg(bytes: &[u8]) -> bool {
     String::from_utf8_lossy(bytes).contains("Globe icon")
+}
+
+/// The size of the grey globe `icons.bitwarden.net` answers for every host it
+/// has no icon for -- `200 OK`, `image/png`, these 500 bytes, for a made-up
+/// domain exactly as for `powernapps.usttp.larksuite.com`.
+const BITWARDEN_GLOBE_BYTES: usize = 500;
+
+/// That globe's SHA-256, the same fingerprint NodeWarden's icon proxy refuses
+/// it by (`BITWARDEN_DEFAULT_GLOBE_ICON_SHA256` in `website-icons.ts`).
+const BITWARDEN_GLOBE_SHA256: [u8; 32] = [
+    0xaa, 0xa6, 0x48, 0x71, 0x33, 0x2a, 0xd5, 0xb7, 0xd2, 0x8f, 0xe8, 0x87, 0x4e, 0xfb, 0x19, 0xc2,
+    0xd9, 0xcc, 0x2f, 0x1e, 0x6d, 0xe7, 0x5d, 0x52, 0xb0, 0x80, 0xb4, 0x38, 0x22, 0x5a, 0x07, 0x83,
+];
+
+/// **Bitwarden's icon service saying "no icon" with a picture**, which is not
+/// the site's icon.
+///
+/// It is a PNG with a `200`, so nothing about the response says miss, and
+/// until this check it was drawn -- and cached on disk -- as the site's icon.
+/// Refusing it is what lets an item move on to its NEXT website: the owner
+/// gave a login a first website the service has no icon for, and expected the
+/// icon of whatever came after it rather than a grey globe. See
+/// [`icon_authorities_for`].
+///
+/// By exact bytes, so a real icon that happens to be a globe is untouched.
+fn is_icon_service_globe(bytes: &[u8]) -> bool {
+    use sha2::{Digest, Sha256};
+    bytes.len() == BITWARDEN_GLOBE_BYTES && Sha256::digest(bytes).as_slice() == BITWARDEN_GLOBE_SHA256
 }
 
 /// An SVG icon, drawn to straight-alpha RGBA with its longer side
@@ -1796,8 +1903,16 @@ fn letterbox(content: &[u8], width: usize, height: usize, side: usize) -> Vec<u8
 /// Reads a previously-cached icon for `domain` from disk, if one exists.
 /// `cache_dir` is a directory the caller owns (created if needed by
 /// `write_cached_icon`) -- this function does not create it, just reads.
+///
+/// **A cached copy of the icon service's "no icon" globe is no copy at all.**
+/// Builds before [`is_icon_service_globe`] wrote that globe to disk as the
+/// site's icon, and a reader that served it back would keep an item on it
+/// for good -- never moving on to its next website. It reads as absent here,
+/// which every caller already treats as "not cached".
 pub fn read_cached_icon(cache_dir: &Path, domain: &str) -> Option<Vec<u8>> {
-    std::fs::read(icon_cache_path(cache_dir, domain)).ok()
+    std::fs::read(icon_cache_path(cache_dir, domain))
+        .ok()
+        .filter(|bytes| !is_icon_service_globe(bytes))
 }
 
 /// Writes `png_bytes` to the on-disk cache for `domain`. Best-effort: a
@@ -2033,6 +2148,158 @@ mod tests {
         item_from_json(&format!(
             r#"{{"id":"i1","name":"Login","type":1,"login":{{"uris":[{{"uri":"{uri}"}}]}}}}"#
         ))
+    }
+
+    /// A login with `uris`, in that order.
+    fn login_with_uris(uris: &[&str]) -> crate::vault_bridge::VaultItem {
+        let list: Vec<String> = uris.iter().map(|u| format!(r#"{{"uri":"{u}"}}"#)).collect();
+        item_from_json(&format!(
+            r#"{{"id":"i1","name":"Login","type":1,"login":{{"uris":[{}]}}}}"#,
+            list.join(",")
+        ))
+    }
+
+    /// **THE REPORT: a new first website, and the icon of "whatever is first
+    /// unless it cannot, then fallback to second".** The owner's own record:
+    /// a Lark Suite address the icon service has no icon for, above the
+    /// beget mail site whose icon the row used to wear.
+    ///
+    /// Every website is listed, in order, and each is followed by its parent
+    /// domains before the next website -- so `larksuite.com`, which has
+    /// Lark's icon, is asked before the second website is.
+    #[test]
+    fn every_website_is_a_candidate_in_order_each_followed_by_its_parents() {
+        let item = login_with_uris(&[
+            "https://powernapps.usttp.larksuite.com/",
+            "https://web.beget.email/",
+        ]);
+        assert_eq!(
+            icon_authorities_for(&item),
+            vec![
+                "powernapps.usttp.larksuite.com",
+                "usttp.larksuite.com",
+                "larksuite.com",
+                "web.beget.email",
+                "beget.email",
+            ]
+        );
+        // The first candidate is still the one `icon_authority_for` names,
+        // so every reader of that single answer agrees on where the list
+        // starts.
+        assert_eq!(icon_authorities_for(&item).first().cloned(), icon_authority_for(&item));
+    }
+
+    /// **A parent is a brand's domain, never a registry's.** `co.uk` is no
+    /// one's icon; a private address, an IP literal and an authority with a
+    /// port name no brand by their trailing labels, so they get no parents.
+    /// A website that is already another's parent is not asked twice.
+    #[test]
+    fn parents_stop_above_public_suffixes_and_private_or_ported_hosts_have_none() {
+        let cases: [(&[&str], &[&str]); 6] = [
+            (&["https://shop.example.co.uk/"], &["shop.example.co.uk", "example.co.uk"]),
+            (&["https://example.com/"], &["example.com"]),
+            (&["http://192.168.68.95:8080/"], &["192.168.68.95:8080"]),
+            (&["https://8.8.8.8/"], &["8.8.8.8"]),
+            (&["https://www.testpro.io:2087/"], &["www.testpro.io:2087"]),
+            (
+                &["https://a.example.com/", "https://example.com/", "https://b.example.com/"],
+                &["a.example.com", "example.com", "b.example.com"],
+            ),
+        ];
+        for (uris, expected) in cases {
+            assert_eq!(icon_authorities_for(&login_with_uris(uris)), expected, "for {uris:?}");
+        }
+        // A website with no host this app can ask about is skipped, not the
+        // end of the list.
+        assert_eq!(
+            icon_authorities_for(&login_with_uris(&["androidapp://com.example", "https://example.org/"])),
+            vec!["example.org"]
+        );
+        // Other kinds keep their one answer.
+        assert_eq!(
+            icon_authorities_for(&card_with_field(BANK_DOMAIN_FIELD, "chase.com")),
+            vec!["chase.com"]
+        );
+    }
+
+    /// The exact bytes `icons.bitwarden.net` sent for
+    /// `powernapps.usttp.larksuite.com` -- and, identically, for a made-up
+    /// domain -- on 2026-11-03: its grey "no icon" globe.
+    const BITWARDEN_GLOBE_FIXTURE: [u8; 500] = [
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x13,
+        0x00, 0x00, 0x00, 0x13, 0x08, 0x04, 0x00, 0x00, 0x00, 0xd8, 0x59, 0xfe, 0x47, 0x00, 0x00, 0x01, 0xbb, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0xda, 0x75, 0xd2, 0xbd, 0x6b, 0x93, 0x51, 0x14, 0xc7, 0xf1, 0x1f, 0xad, 0xd2, 0x17, 0x88, 0xf5, 0x8d, 0x38,
+        0x68, 0x9c, 0x9c, 0x74, 0x12, 0xcd, 0x24, 0xda, 0xc1, 0x14, 0x15, 0x3b, 0x38, 0x58, 0x14, 0x11, 0x1d, 0xea, 0xdb, 0x52,
+        0x34, 0x6d, 0x72, 0xbe, 0x27, 0x06, 0x69, 0x5c, 0x84, 0xa6, 0xfd, 0x07, 0x5c, 0x44, 0x1d, 0xc4, 0x82, 0xa0, 0x41, 0xb0,
+        0xd8, 0xa1, 0xb1, 0x46, 0xdb, 0x80, 0xe0, 0xd0, 0x41, 0x22, 0x82, 0xb8, 0xa4, 0x83, 0x38, 0x0a, 0x49, 0xba, 0xe8, 0x63,
+        0xf2, 0xd0, 0x98, 0x42, 0x3f, 0xe3, 0xbd, 0x87, 0xc3, 0xef, 0xde, 0x73, 0xd4, 0xc6, 0x7e, 0x9c, 0x12, 0xab, 0x34, 0xa8,
+        0x52, 0xc2, 0xb3, 0x31, 0x6d, 0x94, 0xeb, 0xb5, 0x19, 0xea, 0x94, 0x48, 0xd9, 0x90, 0x1f, 0xf1, 0x0b, 0xfc, 0x66, 0x85,
+        0x9a, 0xe5, 0x73, 0xbd, 0x6a, 0x4b, 0x45, 0x29, 0xf3, 0x25, 0x73, 0x4c, 0x21, 0xae, 0x70, 0x53, 0x4a, 0x0f, 0x52, 0x61,
+        0x39, 0x15, 0x5d, 0xef, 0x44, 0x99, 0x35, 0x4e, 0x28, 0x90, 0xdc, 0x79, 0x77, 0x8f, 0x94, 0xd9, 0x45, 0xd1, 0x22, 0x92,
+        0x45, 0x58, 0xb0, 0xa5, 0xb1, 0x1e, 0xfd, 0x63, 0x33, 0x7c, 0xf3, 0x04, 0x2f, 0x2d, 0x63, 0x73, 0xcc, 0xf2, 0x84, 0x79,
+        0x2f, 0xf0, 0x91, 0x01, 0xa9, 0x59, 0x58, 0x61, 0xaa, 0x15, 0xbc, 0x4e, 0xd0, 0xc9, 0x0f, 0x73, 0x26, 0xd7, 0x1f, 0xf6,
+        0xdf, 0x32, 0xd2, 0xad, 0x90, 0x9d, 0xa4, 0x16, 0x3c, 0x06, 0xe7, 0x93, 0x36, 0x31, 0xd2, 0x6d, 0xcf, 0xbc, 0xc0, 0x2f,
+        0x47, 0x94, 0x78, 0x14, 0xe4, 0x08, 0xf9, 0x01, 0x6e, 0x73, 0x3d, 0xd7, 0x15, 0x76, 0x9a, 0xb4, 0x51, 0xc9, 0x27, 0x58,
+        0x14, 0xab, 0xfe, 0x98, 0xe2, 0xc4, 0xee, 0x20, 0x7e, 0x9f, 0x3d, 0xf4, 0xa7, 0x76, 0xde, 0x93, 0x36, 0xa9, 0x00, 0x87,
+        0xec, 0xb9, 0x02, 0x9e, 0xa0, 0x2a, 0x1a, 0x1e, 0xf7, 0x38, 0xaf, 0xfc, 0x34, 0xf3, 0x9c, 0x6a, 0x26, 0xeb, 0xf7, 0x42,
+        0xeb, 0x5b, 0xfc, 0x96, 0x02, 0x76, 0x94, 0x86, 0xa8, 0xda, 0x39, 0x29, 0x7d, 0x9c, 0x54, 0x76, 0xaf, 0x9a, 0xec, 0xaa,
+        0x8d, 0xb6, 0xca, 0x99, 0xf5, 0x07, 0x92, 0x0d, 0xf1, 0x53, 0x94, 0x30, 0x75, 0x60, 0x3a, 0x73, 0x50, 0x21, 0x7f, 0x9d,
+        0xeb, 0x6a, 0x65, 0x73, 0x3e, 0xab, 0x83, 0x5f, 0xe3, 0xb2, 0x42, 0xbc, 0x08, 0xc6, 0xf8, 0xc1, 0xee, 0x29, 0x1b, 0xa3,
+        0x96, 0x1e, 0xd4, 0x7f, 0x2c, 0x12, 0x64, 0x0b, 0x61, 0x38, 0x6b, 0xb6, 0x4f, 0x92, 0xe5, 0xf9, 0x9e, 0xdb, 0xa6, 0x00,
+        0xe3, 0x36, 0xc7, 0x1b, 0xde, 0x72, 0x51, 0x21, 0x2e, 0xf1, 0x87, 0xe9, 0x70, 0xa6, 0x2c, 0xfb, 0x3b, 0xdf, 0x91, 0x1e,
+        0xb6, 0xbc, 0x3a, 0xdc, 0xd9, 0xce, 0x82, 0xbf, 0x4f, 0xf6, 0xad, 0x6f, 0x88, 0x2d, 0xf1, 0x95, 0x15, 0x06, 0x3a, 0x32,
+        0x26, 0xa8, 0x50, 0xee, 0x38, 0x1b, 0xeb, 0x61, 0x8a, 0x1a, 0x65, 0x4f, 0x73, 0xd6, 0xe3, 0xe9, 0x61, 0xa7, 0xb9, 0x35,
+        0xf7, 0x6f, 0x6c, 0xd5, 0x46, 0xd9, 0x98, 0xc3, 0x22, 0x55, 0xea, 0xfe, 0x83, 0x22, 0xe3, 0xa9, 0x68, 0xfb, 0xee, 0x2f,
+        0x8e, 0x33, 0xc1, 0x97, 0x60, 0xe5, 0x83, 0x4d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// **The icon service's "no icon" globe is not an icon**, so a website
+    /// that only has the globe gives way to the next one -- and the globe is
+    /// neither drawn nor read back off disk, where earlier builds saved it.
+    ///
+    /// The control: the same picture re-encoded decodes, so the refusal is
+    /// the fingerprint and not a PNG this decoder cannot read.
+    #[test]
+    fn the_icon_services_no_icon_globe_is_refused_wherever_it_turns_up() {
+        assert_eq!(
+            BITWARDEN_GLOBE_SHA256
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "aaa64871332ad5b7d28fe8874efb19c2d9cc2f1e6de75d52b080b438225a0783",
+            "the fingerprint is no longer NodeWarden's BITWARDEN_DEFAULT_GLOBE_ICON_SHA256"
+        );
+        assert!(is_icon_service_globe(&BITWARDEN_GLOBE_FIXTURE));
+        assert_eq!(decode_rgba(&BITWARDEN_GLOBE_FIXTURE), None, "the globe was drawn as an icon");
+        assert_eq!(decode_rgba_unscaled(&BITWARDEN_GLOBE_FIXTURE), None);
+
+        // The same picture, re-encoded: other bytes, so not the fingerprint.
+        let mut recompressed = Vec::new();
+        {
+            let (w, h, rgba) = {
+                let mut decoder = png::Decoder::new(&BITWARDEN_GLOBE_FIXTURE[..]);
+                decoder.set_transformations(png::Transformations::EXPAND);
+                let mut reader = decoder.read_info().expect("the fixture is a PNG");
+                let mut buf = vec![0; reader.output_buffer_size()];
+                let info = reader.next_frame(&mut buf).expect("a frame");
+                (info.width, info.height, buf[..info.buffer_size()].to_vec())
+            };
+            let mut encoder = png::Encoder::new(&mut recompressed, w, h);
+            encoder.set_color(png::ColorType::GrayscaleAlpha);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header().expect("header").write_image_data(&rgba).expect("data");
+        }
+        assert!(!is_icon_service_globe(&recompressed), "control: a re-encoded copy is not the globe");
+        assert!(decode_rgba_unscaled(&recompressed).is_some(), "control: the same picture decodes");
+
+        let dir = std::env::temp_dir().join(format!("dw-globe-cache-{}", std::process::id()));
+        write_cached_icon(&dir, "powernapps.usttp.larksuite.com", &BITWARDEN_GLOBE_FIXTURE);
+        assert_eq!(
+            read_cached_icon(&dir, "powernapps.usttp.larksuite.com"),
+            None,
+            "a globe an earlier build saved was served back off disk, so the item never moves on"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// A `type: 3` card carrying a real number and one custom field.

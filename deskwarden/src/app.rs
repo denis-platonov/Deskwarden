@@ -3171,11 +3171,13 @@ pub struct ItemFacts {
     /// [`crate::key_sequence::field_palette`].
     pub palette: Vec<crate::key_sequence::FieldRef>,
     pub has_sequence: bool,
-    /// The favicon cache's key, resolved once:
-    /// [`crate::favicon::icon_authority_for`], so `www.testpro.io:2087` and
-    /// not a bare host. The name is kept for the wire, which carries these
-    /// from the daemon to the window.
-    pub icon_domain: Option<String>,
+    /// The favicon cache's keys, in the order the vault window tries them:
+    /// [`crate::favicon::icon_authorities_for`] -- every website, each
+    /// followed by its parent domains -- so `www.testpro.io:2087` and not a
+    /// bare host. The picker draws the first of these that has a cached
+    /// icon, which is the one the vault window settled on: it caches only
+    /// what it drew, and asks in this same order.
+    pub icon_domains: Vec<String>,
 }
 
 /// A fixture's `VaultItem`s as the projection the picker actually runs on,
@@ -3211,12 +3213,13 @@ impl ItemFacts {
                 .unwrap_or_default(),
             palette: key_sequence::field_palette(item),
             has_sequence: !sequence_for(item).is_empty(),
-            // `icon_authority_for`, the key the vault window SAVES icons
-            // under -- not `icon_domain_for`, which drops a port and so looked
-            // for `www.testpro.io.png` beside the `www.testpro.io_2087.png`
-            // the vault window had written. One function for both, so the
-            // picker and the read pane cannot disagree about a file name.
-            icon_domain: crate::favicon::icon_authority_for(item),
+            // `icon_authorities_for`, the keys the vault window SAVES icons
+            // under, in the order it tries them -- not `icon_domain_for`,
+            // which drops a port and so looked for `www.testpro.io.png`
+            // beside the `www.testpro.io_2087.png` the vault window had
+            // written. One function for both, so the picker and the read pane
+            // cannot disagree about a file name.
+            icon_domains: crate::favicon::icon_authorities_for(item),
         }
     }
 }
@@ -3302,9 +3305,9 @@ pub fn picker_offers_in(
             let facts = facts.iter().find(|f| f.id == candidate.id)?;
             let icon = dir.and_then(|dir| {
                 facts
-                    .icon_domain
-                    .as_deref()
-                    .and_then(|domain| crate::favicon::read_cached_icon(dir, domain))
+                    .icon_domains
+                    .iter()
+                    .find_map(|domain| crate::favicon::read_cached_icon(dir, domain))
             });
             Some(crate::picker_prompt::Offer {
                 candidate: candidate.clone(),
@@ -3346,7 +3349,7 @@ pub fn describe_picker_icons(
             corpus
                 .iter()
                 .find(|facts| facts.id == offer.candidate.id)
-                .is_none_or(|facts| facts.icon_domain.is_none())
+                .is_none_or(|facts| facts.icon_domains.is_empty())
         })
         .count();
     let not_cached = rows - with_icon - no_website;
@@ -10996,7 +10999,7 @@ mod picker_wiring_tests {
 
         let facts = facts_of(std::slice::from_ref(&item));
         assert_eq!(
-            facts[0].icon_domain.as_deref(),
+            facts[0].icon_domains.first().map(String::as_str),
             Some(saved_under.as_str()),
             "the picker's icon key is not the one the vault window saves under"
         );
