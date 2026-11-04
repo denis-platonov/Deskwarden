@@ -17772,7 +17772,8 @@ mod generator_row_tests {
         let overlap = name.bottom().min(chip.bottom()) - name.top().max(chip.top());
         assert!(
             overlap >= 0.8 * chip.height(),
-            "the executable chip at {chip:?} shares only {overlap} points of line with the              name at {name:?}, so it is not inside the box 8a puts it in"
+            "the executable chip at {chip:?} shares only {overlap} points of line with the \
+             name at {name:?}, so it is not inside the box 8a puts it in"
         );
     }
 
@@ -21233,7 +21234,8 @@ mod sequence_builder_tests {
         // laid inside it cannot reach the window's own centre.
         assert!(
             card.left() < crate::vault_window::SIDEBAR_WIDTH,
-            "the card starts at x = {}, which is inside the form's own column -- it is still              laid out by the pane it was opened from",
+            "the card starts at x = {}, which is inside the form's own column -- it is still \
+             laid out by the pane it was opened from",
             card.left()
         );
     }
@@ -29665,7 +29667,8 @@ mod edit_pane_layout_tests {
             };
             assert!(
                 (ink(true) - ink(false)).abs() <= 1.0,
-                "on a {width}-point pane the chip's ink is centred on y = {} and the name's                  on {} -- they are not on one line",
+                "on a {width}-point pane the chip's ink is centred on y = {} and the name's \
+                 on {} -- they are not on one line",
                 ink(true),
                 ink(false)
             );

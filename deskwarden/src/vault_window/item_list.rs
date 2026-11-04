@@ -2906,7 +2906,17 @@ pub(super) fn menu_command_button(ui: &mut egui::Ui, entry: &MenuCommand) -> egu
     } else {
         egui::WidgetText::from(entry.label.as_str())
     };
-    let button = ui.add_enabled(entry.enabled, egui::Button::new(label));
+    // **One line, and the menu widens to it.** egui remembers a menu's size
+    // between openings and lays wrapping text out inside that width, so it
+    // can never grow it: a submenu once opened with short folder names stayed
+    // that narrow, and "LA Lux Rental" broke over lines in it -- the owner's
+    // "no need to have two lines here". An entry is a name to click, never a
+    // paragraph. See `detail`'s
+    // `the_kebabs_move_submenu_draws_every_folder_name_on_one_line`.
+    let button = ui.add_enabled(
+        entry.enabled,
+        egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend),
+    );
     match entry.disabled_reason {
         Some(reason) => button.on_disabled_hover_text(reason),
         None => button,

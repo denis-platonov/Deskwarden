@@ -4158,7 +4158,8 @@ pub fn draw_detail_read(
                                                 action = DetailAction::Unfile;
                                             }
                                             other => log::warn!(
-                                                "the move submenu offered {other:?}, which is                                                  not a destination; the click was dropped"
+                                                "the move submenu offered {other:?}, which is \
+                                                 not a destination; the click was dropped"
                                             ),
                                         }
                                     }
@@ -12700,6 +12701,45 @@ mod tests {
              a write that achieves nothing; it reported {:?}",
             clicked.action
         );
+    }
+
+    /// **THE REPORT: "no need to have two lines here, plenty of space".** A
+    /// folder's name is drawn on ONE line however long it is, and the
+    /// submenu widens to it.
+    ///
+    /// **Why it wrapped: egui remembers a menu's size between openings**, and
+    /// wrapping text is laid out INSIDE the remembered width, so it can never
+    /// grow it. Opened once while every name was short, the submenu stayed
+    /// that narrow for good, and "LA Lux Rental" broke over lines in it. A
+    /// fresh context lays a menu out unbounded, which is why this test opens
+    /// the submenu twice: first with short names, then with long ones.
+    /// Measured against a one-word folder in the same menu, so the test needs
+    /// no copy of the font's line height.
+    #[test]
+    fn the_kebabs_move_submenu_draws_every_folder_name_on_one_line() {
+        let item = a_login();
+        let mut pane = Pane::new();
+        let long = "A Folder With A Rather Long Name Indeed";
+        // Opened once while every folder name is short: egui remembers a
+        // menu's size from one opening to the next.
+        pane.folders = vec![folder("f3", "Napps"), folder("f4", "OMF")];
+        let _ = pane.open_move_submenu(&item, &TotpState::NoSecret);
+        let _ = pane.open_kebab(&item, &TotpState::NoSecret);
+        pane.folders = vec![
+            folder("f1", "LA Lux Rental"),
+            folder("f2", long),
+            folder("f3", "Napps"),
+        ];
+        let submenu = pane.open_move_submenu(&item, &TotpState::NoSecret);
+        let line = submenu.rect_of("Napps").height();
+        for name in ["LA Lux Rental", long] {
+            let drawn = submenu.rect_of(name).height();
+            assert!(
+                (drawn - line).abs() < 0.5,
+                "{name:?} is drawn {drawn}pt tall against a one-word folder's {line}pt -- it \
+                 wrapped onto a second line"
+            );
+        }
     }
 
     /// A vault with no folders says so rather than opening an empty box,

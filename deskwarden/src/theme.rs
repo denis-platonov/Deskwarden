@@ -14681,7 +14681,8 @@ mod modal_card_tests {
     fn the_bands_are_painted_out_to_the_cards_own_edge() {
         assert_eq!(
             MODAL_BAND_BLEED, MODAL_STROKE,
-            "the bands bleed by something other than the border they have to cover, so a              fraction of the card's fill is left showing past them"
+            "the bands bleed by something other than the border they have to cover, so a \
+             fraction of the card's fill is left showing past them"
         );
         // A bleed of zero is what the bug WAS, and it would satisfy an
         // equality against a border of zero -- so the border is asserted to
