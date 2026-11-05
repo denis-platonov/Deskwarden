@@ -48,6 +48,17 @@ use crate::screen_capture::{rect_around, ScreenRect};
 /// rather than after a detection pass over it.
 pub const MAX_PIXELS: usize = 64 * 1024 * 1024;
 
+/// How many times each pixel is repeated, on both axes, for [`walk_codes`]'s
+/// second look. Three is the smallest that read the reported code: at two the
+/// detector still missed its third corner.
+const SECOND_LOOK_SCALE: usize = 3;
+
+/// The largest picture, **after** enlarging, the second look will build. It
+/// is one 5K monitor, so that a code on any ordinary screen gets it. The memory
+/// is `rqrr`'s and lasts as long as the pass. It is spent only when the first
+/// pass read nothing, and measured about two seconds on a blank 4K monitor.
+const MAX_SECOND_LOOK_PIXELS: usize = 134 * 1000 * 1000;
+
 /// Reads the **first** QR code found in an RGBA buffer, or `None`.
 ///
 /// `rgba` is 8 bits per channel, four channels per pixel, rows top to bottom
@@ -100,6 +111,24 @@ pub fn decode_qr(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<S
         // routes ask "what does this picture say" and none of them has a use
         // for a second answer. `false` stops the walk, so no further grid is
         // decoded and no further payload is ever built.
+        false
+    });
+    first
+}
+
+/// [`decode_qr`] for a caller on a loop: **one plain pass**, without the second
+/// look [`walk_codes`] gives a picture that read as nothing. The camera, and the
+/// hint the drag overlay refreshes while the box is still moving.
+///
+/// A camera decodes every frame on a loop and most frames hold no code, so the
+/// second look would run constantly, and at the size a camera delivers it costs
+/// far more than a frame is worth. It is also no use there: it rescues codes
+/// drawn with hard, swollen pixels, which is what a screen shows and a lens
+/// does not.
+pub fn decode_qr_frame(rgba: &[u8], width: usize, height: usize) -> Option<Zeroizing<String>> {
+    let mut first = None;
+    walk_grids(rgba, width, height, 1, &mut |text, _where| {
+        first = Some(text);
         false
     });
     first
@@ -342,6 +371,38 @@ fn walk_codes(
     height: usize,
     mut visit: impl FnMut(Zeroizing<String>, ScreenRect) -> bool,
 ) {
+    let mut read_any = false;
+    walk_grids(rgba, width, height, 1, &mut |text, at| {
+        read_any = true;
+        visit(text, at)
+    });
+    if read_any {
+        return;
+    }
+    // **The second look.** `rqrr` tests a corner square's proportions in whole
+    // pixels, so at about three pixels a module one stray pixel fails the test.
+    // A page drew its code that way: sharp black and white, each dark module a
+    // pixel too wide except along the code's far edge, which left one corner
+    // too narrow and no code found. Phones read it. Repeating every pixel adds
+    // nothing to the picture and gives that test room to round.
+    let enlarged = width
+        .saturating_mul(height)
+        .saturating_mul(SECOND_LOOK_SCALE * SECOND_LOOK_SCALE);
+    if enlarged <= MAX_SECOND_LOOK_PIXELS {
+        walk_grids(rgba, width, height, SECOND_LOOK_SCALE, &mut visit);
+    }
+}
+
+/// One pass of the detector over the picture, each of its pixels repeated
+/// `scale` times on both axes through the closure below, so no enlarged copy
+/// is built here. Boxes are reported in the picture's own pixels.
+fn walk_grids(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    scale: usize,
+    visit: &mut dyn FnMut(Zeroizing<String>, ScreenRect) -> bool,
+) {
     if width == 0 || height == 0 {
         return;
     }
@@ -361,10 +422,11 @@ fn walk_codes(
     // `prepare_from_greyscale` pulls each pixel through this closure, so no
     // greyscale copy of the image is built HERE. `rqrr` builds one of its own
     // and that one is not this module's to wipe; see the note above.
-    let mut prepared = rqrr::PreparedImage::prepare_from_greyscale(width, height, |x, y| {
-        let at = (y * width + x) * 4;
-        luma(rgba[at], rgba[at + 1], rgba[at + 2])
-    });
+    let mut prepared =
+        rqrr::PreparedImage::prepare_from_greyscale(width * scale, height * scale, |x, y| {
+            let at = (y / scale * width + x / scale) * 4;
+            luma(rgba[at], rgba[at + 1], rgba[at + 2])
+        });
 
     for grid in prepared.detect_grids() {
         // Reserved at the largest payload a QR code can hold, so writing into
@@ -380,7 +442,9 @@ fn walk_codes(
         // Read after the decode succeeded, so a grid that was detected but
         // could not be read never produces a place -- there is no payload for
         // it to be the place of.
-        let at = rect_around(grid.bounds.map(|point| (point.x, point.y)));
+        let at = rect_around(
+            grid.bounds.map(|point| (point.x / scale as i32, point.y / scale as i32)),
+        );
         // `take` moves the buffer out so `from_utf8` can re-use its
         // allocation; the `Zeroizing` left behind holds an empty `Vec`, and
         // the seed's one and only buffer is now inside the `Zeroizing<String>`
@@ -629,6 +693,83 @@ pub(crate) mod tests {
         // satisfied by `fn decode_qr(..) -> Option<_> { None }`.
         let (rgba, w, h) = fixture_rgba(4);
         assert_eq!(decode_qr(&rgba, w, h).as_deref().map(String::as_str), Some(FIXTURE_TEXT));
+    }
+
+    /// [`FIXTURE`] the way the reported page drew its code: modules three
+    /// pixels apart, each dark one **four** pixels wide and tall, so it runs
+    /// a pixel into its neighbour. Measured off the owner's screenshot: every
+    /// dark run 3n+1 pixels and every light run 3n-1, in pure black and white.
+    fn fixture_with_swollen_modules() -> (Vec<u8>, usize, usize) {
+        const QUIET: usize = 4;
+        const PITCH: usize = 3;
+        let modules = FIXTURE.len();
+        let side = (modules + 2 * QUIET) * PITCH;
+        let mut rgba = vec![0xffu8; side * side * 4];
+        for (row, line) in FIXTURE.iter().enumerate() {
+            for (col, cell) in line.chars().enumerate() {
+                if cell != '#' {
+                    continue;
+                }
+                // The last row and column stop at the code's own edge: the
+                // whole code still measures exactly 3 x modules.
+                let reach = |at: usize| if at + 1 == modules { PITCH } else { PITCH + 1 };
+                for dy in 0..reach(row) {
+                    for dx in 0..reach(col) {
+                        let x = (col + QUIET) * PITCH + dx;
+                        let y = (row + QUIET) * PITCH + dy;
+                        rgba[(y * side + x) * 4..][..3].fill(0);
+                    }
+                }
+            }
+        }
+        (rgba, side, side)
+    }
+
+    /// **THE REPORT: a sign-in page's setup code that "doesn't read".** Its
+    /// modules are swollen as above, and the detector finds nothing -- while
+    /// the same pixels repeated three times read at once. A phone reads such a
+    /// code; so must this.
+    ///
+    /// The owner's picture holds a live seed and is not committed. **The
+    /// control is the first assertion**: one plain pass finds nothing here, so
+    /// what reads it below is the second look and not a fixture that was never
+    /// hard.
+    #[test]
+    fn a_code_with_swollen_modules_is_read_on_a_second_look() {
+        let (rgba, w, h) = fixture_with_swollen_modules();
+        let mut plain = 0;
+        walk_grids(&rgba, w, h, 1, &mut |_, _| {
+            plain += 1;
+            true
+        });
+        assert_eq!(plain, 0, "the detector read this, so nothing below tests the second look");
+
+        assert_eq!(decode_qr(&rgba, w, h).as_deref().map(String::as_str), Some(FIXTURE_TEXT));
+        match codes_in(&rgba, w, h) {
+            // The box is in THIS picture's pixels, not the enlarged one's: the
+            // whole-screen scan rings the code with it.
+            Codes::One(text, at) => {
+                assert_eq!(&*text, FIXTURE_TEXT);
+                let (from, to) = (12, (4 + FIXTURE.len() as i32) * 3);
+                assert!(
+                    (at.left - from).abs() <= 6 && (at.right - to).abs() <= 6,
+                    "{at:?} is not where the code is in the picture"
+                );
+            }
+            other => panic!("the swollen code came back as {other:?}"),
+        }
+    }
+
+    /// **The camera does not take the second look.** It decodes every frame
+    /// on a loop, and a frame with no code in it is the normal case there, so
+    /// the slower pass would run all the time.
+    #[test]
+    fn a_camera_frame_gets_one_plain_pass() {
+        let (swollen, w, h) = fixture_with_swollen_modules();
+        assert!(decode_qr_frame(&swollen, w, h).is_none());
+        // Control: it is a working decoder and not a function that answers no.
+        let (plain, w, h) = fixture_rgba(4);
+        assert_eq!(decode_qr_frame(&plain, w, h).as_deref().map(String::as_str), Some(FIXTURE_TEXT));
     }
 
     /// A QR code that is not the whole buffer is still found -- which is the

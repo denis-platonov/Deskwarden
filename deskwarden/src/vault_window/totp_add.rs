@@ -9501,9 +9501,9 @@ mod tests {
             ("not!base32".to_string(), OtpRefusal::BadSecret),
             ("sdf".to_string(), OtpRefusal::PartialSecret(3)),
             (
-                "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&image=icon.png"
+                "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&surprise=icon.png"
                     .to_string(),
-                OtpRefusal::UnknownParameter("image".to_string()),
+                OtpRefusal::UnknownParameter("surprise".to_string()),
             ),
             (
                 "otpauth://totp/Git%20Host:anovak?secret=JBSWY3DPEHPK3PXP&period=0".to_string(),

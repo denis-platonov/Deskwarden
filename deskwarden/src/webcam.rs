@@ -639,7 +639,7 @@ impl WebcamSeams {
         WebcamSeams {
             devices,
             pump,
-            decode: crate::qr::decode_qr,
+            decode: crate::qr::decode_qr_frame,
         }
     }
 }
@@ -1950,10 +1950,10 @@ mod tests {
     #[test]
     fn the_webcam_route_runs_the_real_enumeration_decoder_and_capture_loop() {
         let seams = WebcamSeams::production();
-        let real_decode: DecodeFn = crate::qr::decode_qr;
+        let real_decode: DecodeFn = crate::qr::decode_qr_frame;
         assert!(
             std::ptr::fn_addr_eq(seams.decode, real_decode),
-            "the webcam route's production decoder is not `qr::decode_qr`"
+            "the webcam route's production decoder is not `qr::decode_qr_frame`"
         );
         let real_devices: fn() -> Result<Vec<Device>, CameraRefusal> = devices;
         assert!(

@@ -930,6 +930,12 @@ impl Outcome {
 pub struct RegionSeams {
     pub capture: fn(ScreenRect) -> Result<Rgba, CaptureRefusal>,
     pub decode: fn(&[u8], usize, usize) -> Option<Zeroizing<String>>,
+    /// What answers the badge **while the drag is still moving**:
+    /// [`crate::qr::decode_qr_frame`] in production, one plain pass. It runs
+    /// every [`DECODE_INTERVAL`] on the overlay's own frame, so it cannot
+    /// afford [`crate::qr::decode_qr`]'s second look, and the badge is only a
+    /// hint. Letting go is the real read, and that goes through `decode`.
+    pub preview: fn(&[u8], usize, usize) -> Option<Zeroizing<String>>,
     /// [`crate::qr::codes_in`] in production, and a **third** seam rather
     /// than a widening of `decode`: the drag reads one framed rectangle and
     /// has no use for a count, while the scan reads a desktop nobody framed
@@ -945,6 +951,7 @@ impl RegionSeams {
         RegionSeams {
             capture: screen_capture::capture_rect,
             decode: qr::decode_qr,
+            preview: qr::decode_qr_frame,
             scan: qr::codes_in,
         }
     }
@@ -2584,7 +2591,8 @@ impl RegionOverlay {
             // it would save one decode on release and would hold the seed in
             // memory for the whole rest of the drag; the badge only needs the
             // boolean, so the boolean is all that is kept.
-            let found = read_region_with(seams, rect).is_decoded();
+            let hint = RegionSeams { decode: seams.preview, ..*seams };
+            let found = read_region_with(&hint, rect).is_decoded();
             locked(&self.inner).found = found;
         }
     }
@@ -4400,6 +4408,7 @@ mod tests {
         RegionSeams {
             capture,
             decode,
+            preview: decode,
             scan: no_codes,
         }
     }
@@ -4415,6 +4424,7 @@ mod tests {
         RegionSeams {
             capture,
             decode: no_code,
+            preview: no_code,
             scan,
         }
     }
@@ -4801,6 +4811,11 @@ mod tests {
         assert!(std::ptr::fn_addr_eq(
             production.decode,
             qr::decode_qr as fn(&[u8], usize, usize) -> Option<Zeroizing<String>>
+        ));
+        // Letting go gets the second look; the drag's every-150ms hint must not.
+        assert!(std::ptr::fn_addr_eq(
+            production.preview,
+            qr::decode_qr_frame as fn(&[u8], usize, usize) -> Option<Zeroizing<String>>
         ));
         assert!(std::ptr::fn_addr_eq(
             production.scan,

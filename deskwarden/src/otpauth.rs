@@ -18,7 +18,8 @@
 //! * **Unknown query parameters are refused, not ignored.** Ignoring a key
 //!   nobody recognises is how a payload written for something else imports
 //!   silently and wrongly -- the reader sees a saved code and the code is
-//!   never right.
+//!   never right. The exception is the short list in [`only_decorates`]: keys
+//!   that say how to draw the entry and cannot change a digit.
 //! * **`otpauth://hotp/...` is refused by name**, and so is a plain URL. A
 //!   refusal naming the reason is the difference between the user fixing the
 //!   problem and the user retrying forever.
@@ -292,6 +293,7 @@ pub fn parse_otpauth(text: &str) -> Result<OtpAuth, OtpRefusal> {
                     return Err(OtpRefusal::BadParameter("period"));
                 }
             }
+            lower if only_decorates(lower) => {}
             _ => return Err(OtpRefusal::UnknownParameter(key.to_string())),
         }
     }
@@ -309,6 +311,19 @@ pub fn parse_otpauth(text: &str) -> Result<OtpAuth, OtpRefusal> {
         digits: digits.unwrap_or(6),
         period: period.unwrap_or(30),
     })
+}
+
+/// **Keys that say how an authenticator should draw the entry, and nothing about
+/// its code.** Real sites put them in their setup codes (`image` is a logo's
+/// address), and every other authenticator, the official Bitwarden clients
+/// included, reads such a URI. They are skipped and never stored: [`to_uri`]
+/// writes only what [`OtpAuth`] holds, so a stranger's address stays out of the
+/// vault, and nothing here ever fetches one.
+///
+/// A list and not "ignore what is unknown", because a key like `encoder=steam`
+/// changes every code, and skipping that one saves a code that is never right.
+fn only_decorates(key: &str) -> bool {
+    matches!(key, "image" | "icon" | "color" | "lock")
 }
 
 /// Splits `ISSUER:ACCOUNT` into its two percent-decoded halves.
@@ -674,6 +689,31 @@ mod tests {
         assert_eq!((stated.digits, stated.period, stated.algorithm), (8, 60, Algorithm::Sha512));
     }
 
+    /// **THE REPORT: a site's setup code was refused for its `image=`.** That
+    /// key and its neighbours say how an authenticator should DRAW the entry;
+    /// they cannot change a single digit, and the official Bitwarden clients
+    /// read such a URI without comment. So they are skipped, and -- the half
+    /// that matters -- they are not kept: nothing that later writes this entry
+    /// out can carry a stranger's image address into the vault.
+    #[test]
+    fn a_parameter_that_only_decorates_the_entry_is_skipped_and_not_kept() {
+        let plain = parse_otpauth("otpauth://totp/Mail:ann?secret=JBSWY3DPEHPK3PXP&issuer=Mail")
+            .expect("the control parses");
+        for extra in [
+            "image=https%3A%2F%2Fexample.test%2Flogo.png",
+            "IMAGE=x",
+            "icon=x",
+            "color=FF0000",
+            "lock=true",
+            "image",
+        ] {
+            let uri = format!("otpauth://totp/Mail:ann?secret=JBSWY3DPEHPK3PXP&{extra}&issuer=Mail");
+            let parsed = parse_otpauth(&uri).unwrap_or_else(|why| panic!("{extra}: {why:?}"));
+            assert_eq!(parsed, plain, "{extra} changed what was read");
+            assert_eq!(*to_uri(&parsed), *to_uri(&plain), "{extra} survived into the saved URI");
+        }
+    }
+
     #[test]
     fn an_unknown_parameter_is_refused_rather_than_ignored() {
         // Untrusted input. Ignoring unknown keys is how a payload written for
@@ -691,8 +731,14 @@ mod tests {
         // A bare flag with no `=` is an unknown key, not a known one that is
         // empty -- there is no valid bare flag in this URI shape.
         assert_eq!(
-            parse_otpauth("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&image"),
-            Err(OtpRefusal::UnknownParameter("image".to_string()))
+            parse_otpauth("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&flag"),
+            Err(OtpRefusal::UnknownParameter("flag".to_string()))
+        );
+        // A key that DOES change the code stays refused: this is what the rule
+        // is for. Skipping it would save a code that is never right.
+        assert_eq!(
+            parse_otpauth("otpauth://totp/x?secret=JBSWY3DPEHPK3PXP&encoder=steam"),
+            Err(OtpRefusal::UnknownParameter("encoder".to_string()))
         );
         // Control: with the unknown key removed, the same URI parses -- so the
         // refusal is about the key and not about the shape around it.
