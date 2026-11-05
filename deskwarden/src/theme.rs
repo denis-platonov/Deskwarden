@@ -6954,20 +6954,24 @@ const TEXT_AREA_PAD_Y: f32 = 9.0;
 /// control drawn privately on one screen is a second design system, and this
 /// one is a *variant of a control this file already owns*, which is the
 /// strongest case of all for it living beside its sibling.
+///
+/// **`rows` is the least it will be, not the most.** The box follows its text
+/// down and the page scrolls, the same as the note reads on the item's own
+/// page. It is measured from the text this frame rather than fixed beforehand,
+/// because a note longer than a fixed box ran straight out of the bottom of it.
 pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Response {
     let bg = ui.painter().add(egui::Shape::Noop);
     let row_height = text_area_row(ui);
-    let height = row_height * rows as f32 + TEXT_AREA_PAD_Y * 2.0;
-    let (outer, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), height),
-        Sense::hover(),
+    let top_left = ui.next_widget_position();
+    let width = ui.available_width();
+    let inner = Rect::from_min_size(
+        Pos2::new(top_left.x + 10.0, top_left.y + TEXT_AREA_PAD_Y),
+        Vec2::new(width - 20.0, row_height * rows as f32),
     );
-    let inner = Rect::from_min_max(
-        Pos2::new(outer.min.x + 10.0, outer.min.y + TEXT_AREA_PAD_Y),
-        Pos2::new(outer.max.x - 10.0, outer.max.y - TEXT_AREA_PAD_Y),
-    );
-    let response = ui.put(
-        inner,
+    // A child, so the text is laid out before the box round it is decided and
+    // the parent's cursor moves only once, past the whole box.
+    let mut text_ui = ui.new_child(egui::UiBuilder::new().max_rect(inner));
+    let response = text_ui.add(
         egui::TextEdit::multiline(value)
             .hint_text(hint)
             .frame(egui::Frame::new())
@@ -6976,6 +6980,11 @@ pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Re
             .desired_width(inner.width())
             .desired_rows(rows),
     );
+    let outer = Rect::from_min_size(
+        top_left,
+        Vec2::new(width, response.rect.height().max(inner.height()) + TEXT_AREA_PAD_Y * 2.0),
+    );
+    ui.advance_cursor_after_rect(outer);
     let border = field_border(ui, outer, response.has_focus());
     ui.painter().set(
         bg,
@@ -15967,6 +15976,68 @@ mod modal_drag_tests {
             after,
             before.translate(Vec2::new(90.0, 70.0)),
             "`modal_card`'s own header band did not drag the card"
+        );
+    }
+}
+
+#[cfg(test)]
+mod text_area_tests {
+    use super::*;
+
+    /// **THE REPORT: a note longer than its box ran out of the bottom of it.**
+    /// The box was drawn at its `rows` height whatever the text was, and the
+    /// text kept going over the card underneath. It must wrap all of the text,
+    /// with the same padding below as above.
+    ///
+    /// The CONTROL is the short note: it keeps the box the caller asked for, so
+    /// this is the box following its text and not a box that is simply taller.
+    #[test]
+    fn a_text_area_grows_around_a_note_longer_than_its_rows() {
+        fn draw(text: &str) -> (Rect, Rect, Rect) {
+            let ctx = egui::Context::default();
+            let mut value = text.to_string();
+            let mut edit = Rect::NOTHING;
+            let mut taken = Rect::NOTHING;
+            let input = || egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(600.0, 4000.0))),
+                ..Default::default()
+            };
+            let mut output = None;
+            for _ in 0..2 {
+                output = Some(ctx.run_ui(input(), |ui| {
+                    edit = text_area(ui, &mut value, "", 4).rect;
+                    taken = ui.min_rect();
+                }));
+            }
+            let mut drawn = Rect::NOTHING;
+            for clipped in output.expect("two frames ran").shapes {
+                if let egui::Shape::Rect(shape) = clipped.shape {
+                    if shape.corner_radius == CornerRadius::same(FIELD_RADIUS) {
+                        drawn = shape.rect;
+                    }
+                }
+            }
+            (edit, drawn, taken)
+        }
+
+        let (short_edit, short_box, _) = draw("one line");
+        assert!(short_box.is_positive(), "the box itself was not found among the shapes");
+        let (long_edit, long_box, long_taken) = draw(&"a line of the note\n".repeat(30));
+
+        let rows_four = (short_box.height() - 2.0 * TEXT_AREA_PAD_Y) / short_edit.height();
+        assert!((rows_four - 1.0).abs() < 0.01, "control: a short note left its {short_box:?}");
+        assert!(long_box.height() > short_box.height() * 3.0, "the box did not grow: {long_box:?}");
+        assert!(
+            long_box.contains_rect(long_edit),
+            "the text {long_edit:?} ran out of its box {long_box:?}"
+        );
+        assert!(
+            (long_box.bottom() - long_edit.bottom() - TEXT_AREA_PAD_Y).abs() < 0.5,
+            "the padding under the text is not the padding over it: {long_edit:?} in {long_box:?}"
+        );
+        assert!(
+            long_taken.bottom() >= long_box.bottom() - 0.5,
+            "what follows the box would be drawn over it: {long_taken:?} and {long_box:?}"
         );
     }
 }
