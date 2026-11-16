@@ -4845,6 +4845,10 @@ pub const FIELDS_CREATE_NOTICE: &str =
 /// on one form would be one phrase for two different gestures.
 pub const SLOT_ADD_BUTTON: &str = "Add\u{2026}";
 
+/// The gap between two buttons that sit side by side on the form. The cards
+/// zero egui's own spacing, so a row of buttons without it drew them touching.
+const BUTTON_GAP: f32 = 8.0;
+
 /// What the open menu says above its choices.
 ///
 /// **It states the blank rule on screen**, because that rule is otherwise
@@ -4977,16 +4981,18 @@ fn slot_add_block(ui: &mut egui::Ui, open: &mut bool, addable: &[Slot]) -> Optio
         return None;
     }
     let mut chosen = None;
-    ui.horizontal_wrapped(|ui| {
-        if ui.selectable_label(*open, SLOT_ADD_BUTTON).clicked() {
-            *open = !*open;
-        }
-    });
+    // The form's own button rather than egui's bare `selectable_label`, which
+    // drew an unframed word at its own inset beside framed buttons everywhere
+    // else on the form.
+    if theme::secondary_button(ui, SLOT_ADD_BUTTON).clicked() {
+        *open = !*open;
+    }
     if *open {
         ui.add_space(6.0);
         ui.label(RichText::new(SLOT_ADD_HINT).size(11.0).color(theme::TEXT_FAINT));
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(BUTTON_GAP, BUTTON_GAP);
             for slot in addable {
                 if theme::secondary_button(ui, slot.label()).clicked() {
                     chosen = Some(*slot);
@@ -5574,6 +5580,7 @@ fn custom_fields_block(
     // `aae9429`'s defect, and the generator row above carries the same fix
     // for the same reason.
     ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(BUTTON_GAP, BUTTON_GAP);
         if theme::secondary_button(ui, FIELD_ADD_TEXT_BUTTON).clicked() {
             fields.push(FieldDraft::new_of(FieldRole::Text));
         }
@@ -7878,15 +7885,13 @@ fn dropdown_button(
         );
         let pad = ui.spacing().button_padding.x;
         let icon = ui.spacing().icon_width;
+        // The chooser's own chevron, through the same hook its `ComboBox`
+        // paints with, in the square egui gives that hook.
         let caret = egui::Rect::from_center_size(
             egui::pos2(rect.right() - pad - icon / 2.0, rect.center().y),
-            egui::vec2(icon * 0.7, icon * 0.45),
+            egui::vec2(icon, icon),
         );
-        ui.painter().add(egui::Shape::convex_polygon(
-            vec![caret.left_top(), caret.right_top(), caret.center_bottom()],
-            visuals.fg_stroke.color,
-            Stroke::NONE,
-        ));
+        theme::combo_chevron(ui, caret, &visuals, open);
         let room = (rect.width() - 2.0 * pad - icon - ui.spacing().icon_spacing).max(0.0);
         let galley = egui::WidgetText::from(text).into_galley(
             ui,
@@ -10955,6 +10960,7 @@ fn form_combo(
     egui::ComboBox::from_id_salt(id_salt)
         .height(FORM_COMBO_HEIGHT)
         .popup_style(form_popup_style())
+        .icon(theme::combo_chevron)
 }
 
 /// **How tall a drop-down on this form may grow before it scrolls.**
@@ -23010,6 +23016,11 @@ mod edit_pane_layout_tests {
             match shape {
                 egui::Shape::Rect(r) => boxes.push(r.clone()),
                 egui::Shape::Path(p) => carets.push((shape.visual_bounding_rect(), p.fill)),
+                // The chevron is two strokes; either one, found the same way
+                // in both boxes, places and colours it.
+                egui::Shape::LineSegment { stroke, .. } => {
+                    carets.push((shape.visual_bounding_rect(), stroke.color));
+                }
                 egui::Shape::Text(t) => inks.push((t.galley.text().to_string(), t.fallback_color)),
                 egui::Shape::Vec(shapes) => {
                     for s in shapes {

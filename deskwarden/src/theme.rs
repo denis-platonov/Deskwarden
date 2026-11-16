@@ -3496,7 +3496,21 @@ const CHEVRON_HALF: f32 = 4.0;
 fn chevron_rect(box_rect: Rect) -> Rect {
     let centre =
         Pos2::new(box_rect.right() - DROPDOWN_PAD_X - CHEVRON_HALF, box_rect.center().y);
-    Rect::from_center_size(centre, Vec2::splat(CHEVRON_HALF * 2.0))
+    chevron_around(centre)
+}
+
+/// The chevron's box around `centre`: **half as tall as it is wide**. Drawn
+/// square, the two strokes met at a right angle and read as the letter "V"
+/// beside the value rather than as a dropdown's mark.
+fn chevron_around(centre: Pos2) -> Rect {
+    Rect::from_center_size(centre, Vec2::new(CHEVRON_HALF * 2.0, CHEVRON_HALF))
+}
+
+/// [`dropdown`]'s chevron, for an `egui::ComboBox` through its `icon` hook,
+/// so the form's folder and brand boxes wear the same mark as every other
+/// dropdown instead of egui's filled triangle.
+pub fn combo_chevron(ui: &Ui, rect: Rect, _visuals: &egui::style::WidgetVisuals, _open: bool) {
+    paint_chevron(ui, chevron_around(rect.center()), TEXT_MUTED);
 }
 
 /// The "there is more under this" glyph: two strokes, pointing down.
@@ -7940,7 +7954,10 @@ fn form_card_header_with(
                     paint(ui.painter(), at);
                     ui.add_space(SEND_PLANE_GAP);
                 }
-                ui.label(RichText::new(title).size(14.0).color(INK).strong()).rect
+                // `bold`, the design's 700 face. egui's `.strong()` only
+                // darkens the colour, so the title drew in the regular weight
+                // while every other modal's title was bold.
+                ui.label(bold(title, 14.0).color(INK)).rect
             })
             .inner
         })

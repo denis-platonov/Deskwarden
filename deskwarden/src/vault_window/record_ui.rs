@@ -1777,6 +1777,10 @@ impl RecordSend {
 /// labels do not fit 544 points any more than they fit 226.
 const MODAL_WIDTH: f32 = 690.0;
 
+/// The least room kept between the composer and the window's edge when the
+/// window is narrower than [`MODAL_WIDTH`].
+const MODAL_EDGE: f32 = 16.0;
+
 /// [`draw_export_form`] over a dimmed scrim, centred, for `vault_window::mod`
 /// to call from its frame closure.
 ///
@@ -1812,7 +1816,12 @@ pub fn draw_export_modal(
             // controls would swallow their clicks. See
             // `theme::modal_drag_handle`.
             theme::modal_drag_handle(ui, FORM_HEADER_HEIGHT);
-            ui.set_max_width(MODAL_WIDTH);
+            // A fixed width, not only a ceiling. The area sizes itself from
+            // what was drawn the frame before, and the rows here measure
+            // `available_width` at different moments, so with only a ceiling
+            // the header rule, the record tile and the caution band each ended
+            // at a different edge when the window was narrower than the card.
+            ui.set_width(MODAL_WIDTH.min(ctx.content_rect().width() - 2.0 * MODAL_EDGE));
             draw_export_form(
                 ui,
                 &mut state.draft,

@@ -734,7 +734,15 @@ pub fn draw_password_health(
         .inner_margin(Margin::same(12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(theme::semibold(HEALTH_PANE_TITLE, 13.0).color(theme::INK));
+            // The search box's height, so this strip is exactly as tall as the
+            // item list's and the Sends list's: these panes take turns in one
+            // column, and a 38-point strip after a 58-point one moved
+            // everything under it up as the user switched.
+            ui.allocate_ui_with_layout(
+                egui::vec2(ui.available_width(), theme::SEARCH_FIELD_HEIGHT),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| ui.label(theme::semibold(HEALTH_PANE_TITLE, 14.0).color(theme::INK)),
+            );
         });
     let strip_bottom = ui.min_rect().bottom();
     ui.painter().rect_filled(

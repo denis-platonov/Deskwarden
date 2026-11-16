@@ -93,6 +93,11 @@ const ROW_PAD_Y: i8 = 13;
 const ROW_GAP: f32 = 20.0;
 /// A row's label/description `gap: 2px`.
 const ROW_TEXT_GAP: f32 = 2.0;
+
+/// The line height of the 12-point text under a setting's name. egui's own
+/// is about the font's size, which set a wrapped description's lines nearly
+/// touching; this is the design's 1.4.
+const DESCRIPTION_LINE_HEIGHT: f32 = 17.0;
 /// Width reserved for a row's trailing control. 3e sizes its controls
 /// intrinsically and lets the text column flex; a fixed reservation is visually
 /// identical (the control is right-aligned inside it, so it still lands on the
@@ -2423,7 +2428,7 @@ fn row_text(ui: &mut Ui, label: &str, description: &str) {
         ui.label(theme::semibold(label, 14.0).color(theme::INK));
         ui.label(
             RichText::new(description)
-                .size(12.0)
+                .size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT))
                 .color(theme::TEXT_FAINT),
         );
     });
@@ -2472,7 +2477,15 @@ fn status_row(ui: &mut Ui, status: &str, control: impl FnOnce(&mut Ui)) {
     control_row_of(
         ui,
         |ui| {
-            ui.label(RichText::new(status).size(12.0).color(theme::TEXT_FAINT));
+            // Body text in ink, not grey fine print: "Version 0.9.0 is available."
+            // is the news this card exists to carry, and it can run to two
+            // sentences, which a bold title would shout.
+            ui.label(
+                RichText::new(status)
+                    .size(13.0)
+                    .line_height(Some(DESCRIPTION_LINE_HEIGHT))
+                    .color(theme::INK),
+            );
         },
         control,
     );
@@ -2854,7 +2867,7 @@ fn row_text_ghosted(ui: &mut Ui, label: &str, description: &str) {
         ui.label(theme::semibold(label, 14.0).color(theme::TEXT_GHOST));
         ui.label(
             RichText::new(description)
-                .size(12.0)
+                .size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT))
                 .color(theme::TEXT_GHOST),
         );
     });
@@ -2989,7 +3002,7 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
         card_row(ui, |ui| {
             ui.label(
                 RichText::new(crate::breach_scan::SCAN_CONSENT_NOTE)
-                    .size(12.0)
+                    .size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT))
                     .color(theme::TEXT_FAINT),
             );
         });
@@ -3002,7 +3015,7 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
         if state.scan_history.entries.is_empty() {
             row_separator(ui);
             card_row(ui, |ui| {
-                ui.label(RichText::new(SCAN_NO_HISTORY).size(12.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(SCAN_NO_HISTORY).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::TEXT_FAINT));
             });
             return;
         }
@@ -3011,7 +3024,7 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
             card_row(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
                 ui.label(
-                    RichText::new(scan_history_when(record)).size(12.0).color(theme::INK),
+                    RichText::new(scan_history_when(record)).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::INK),
                 );
                 ui.label(
                     RichText::new(crate::breach_scan::outcome_wording(record))
@@ -3714,7 +3727,7 @@ fn backend_switch_row(ui: &mut Ui, switch: BackendSwitch) -> Option<RowAction> {
     let mut action = None;
     card_row(ui, |ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-        ui.label(RichText::new(backend_switch_prompt(switch)).size(12.0).color(theme::ERROR));
+        ui.label(RichText::new(backend_switch_prompt(switch)).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::ERROR));
         ui.horizontal(|ui| {
             if key_button(ui, BACKEND_SWITCH_CONFIRM_BUTTON, REVOKE_BUTTON_WIDTH) {
                 action = Some(RowAction::Confirm);
@@ -4079,7 +4092,7 @@ fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
         if state.keys.is_empty() {
             row_separator(ui);
             card_row(ui, |ui| {
-                ui.label(RichText::new(KEYS_NONE).size(12.0).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(KEYS_NONE).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::TEXT_FAINT));
             });
             return;
         }
@@ -4150,14 +4163,14 @@ fn key_row(ui: &mut Ui, record: &KeyRecord, now_unix: u64, pending: bool) -> Opt
         let expired = record.expires_unix.is_some_and(|at| at <= now_unix);
         ui.label(
             RichText::new(when)
-                .size(12.0)
+                .size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT))
                 .color(if expired { theme::ERROR } else { theme::TEXT_FAINT }),
         );
         ui.label(
-            RichText::new(scopes_wording(&record.scopes)).size(12.0).color(theme::TEXT_FAINT),
+            RichText::new(scopes_wording(&record.scopes)).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::TEXT_FAINT),
         );
         if pending {
-            ui.label(RichText::new(revoke_prompt(&record.name)).size(12.0).color(theme::ERROR));
+            ui.label(RichText::new(revoke_prompt(&record.name)).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::ERROR));
             ui.horizontal(|ui| {
                 if key_button(ui, REVOKE_CONFIRM_BUTTON, REVOKE_BUTTON_WIDTH) {
                     action = Some(RowAction::Confirm);
@@ -4185,8 +4198,8 @@ fn draw_minted_key(ui: &mut Ui, state: &mut PrefsState) {
             card_row(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
                 ui.label(theme::semibold(REVEAL_LABEL, 14.0).color(theme::INK));
-                ui.label(RichText::new(&minted.name).size(12.0).color(theme::TEXT_FAINT));
-                ui.label(RichText::new(REVEAL_NOTE).size(12.0).color(theme::ERROR));
+                ui.label(RichText::new(&minted.name).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::TEXT_FAINT));
+                ui.label(RichText::new(REVEAL_NOTE).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::ERROR));
             });
             row_separator(ui);
             card_row(ui, |ui| {
@@ -4195,7 +4208,7 @@ fn draw_minted_key(ui: &mut Ui, state: &mut PrefsState) {
                 // mouse, and an elided one is a key they cannot use.
                 ui.label(
                     RichText::new(minted.secret.as_str())
-                        .size(12.0)
+                        .size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT))
                         .family(FontFamily::Monospace)
                         .color(theme::INK),
                 );
@@ -4227,7 +4240,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
             ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
             section_label(ui, MINT_SECTION_LABEL);
             ui.label(
-                RichText::new(MINT_SECTION_DESCRIPTION).size(12.0).color(theme::TEXT_FAINT),
+                RichText::new(MINT_SECTION_DESCRIPTION).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::TEXT_FAINT),
             );
         });
 
@@ -4307,7 +4320,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
         if let Some(message) = &state.key_message {
             row_separator(ui);
             card_row(ui, |ui| {
-                ui.label(RichText::new(message).size(12.0).color(theme::ERROR));
+                ui.label(RichText::new(message).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::ERROR));
             });
         }
     });
@@ -4408,13 +4421,15 @@ fn backend_choice_row(ui: &mut Ui, description: &str, official: bool, enabled: b
             (theme::TEXT_GHOST, theme::TEXT_GHOST)
         };
         ui.label(theme::semibold(BACKEND_CHOICE_LABEL, 14.0).color(title));
-        ui.label(RichText::new(description).size(12.0).color(body));
+        ui.label(RichText::new(description).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(body));
         // **The cells are not a third line of the copy.** They are a
         // control under it, so the air above the run is the row's own
         // padding -- the same gap that already sits between the run and
         // the row below -- rather than `ROW_TEXT_GAP`, which is the lead
         // between two lines of the same block of text.
-        ui.spacing_mut().item_spacing.y = f32::from(ROW_PAD_Y);
+        // A gap of its own: `item_spacing` set here would only apply after the
+        // NEXT widget, so the switch sat on the description's last line.
+        ui.add_space(f32::from(ROW_PAD_Y));
         let cells = [
             theme::Segment { label: OFFICIAL_CHOICE, selected: official },
             theme::Segment { label: BUILT_IN_CHOICE, selected: !official },
@@ -5414,7 +5429,7 @@ fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
             card_row(ui, |ui| {
                 ui.label(
                     RichText::new(UPDATE_AUTOMATIC_OFF_NOTE)
-                        .size(12.0)
+                        .size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT))
                         .color(theme::TEXT_FAINT),
                 );
             });
@@ -5479,7 +5494,7 @@ fn release_notes(ui: &mut Ui, body: &str) {
         // names the version, and it is the only one of the three the app does
         // not author. See `updater::notes_heading` for the other removal.
         if shown.is_empty() {
-            ui.label(RichText::new(UPDATE_NOTES_EMPTY).size(12.0).color(theme::TEXT_FAINT));
+            ui.label(RichText::new(UPDATE_NOTES_EMPTY).size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT)).color(theme::TEXT_FAINT));
             return;
         }
         // egui's default scrollbar is painted in its own light grey, which on
@@ -5924,7 +5939,7 @@ fn progress_bar(ui: &mut Ui, done: u64, total: Option<u64>) {
         }
         ui.label(
             RichText::new(download_label(done, total))
-                .size(12.0)
+                .size(12.0).line_height(Some(DESCRIPTION_LINE_HEIGHT))
                 .color(theme::TEXT_FAINT),
         );
     });
