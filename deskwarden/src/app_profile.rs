@@ -538,7 +538,7 @@ pub fn claim_port_with<H>(
     let refused = || {
         format!(
             "The Deskwarden test profile {:?} runs `bw serve` on port {port}, and another test \
-             profile's Deskwarden already holds that port -- two profile names can land on the \
+             profile's Deskwarden already holds that port \u{2014} two profile names can land on the \
              same one. A profile never reads another profile's vault, so this one was not \
              started. Close the other test copy, or pick a different {PROFILE_ENV} name.",
             profile.0

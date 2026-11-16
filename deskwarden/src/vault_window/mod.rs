@@ -9767,7 +9767,7 @@ fn move_failure_message(name: &str, e: &VaultError) -> String {
         // point of the variant is that a *different* backend can do it.
         VaultError::Unsupported { .. } => "this vault backend can't do that at all",
     };
-    format!("Couldn't move \"{name}\" -- {because}. It's still in its old folder.")
+    format!("Couldn't move \"{name}\" \u{2014} {because}. It's still in its old folder.")
 }
 
 /// One of the **five** commands that move an item between this window's three
@@ -9851,7 +9851,7 @@ fn list_command_failure_message(command: ListCommand, name: &str, e: &VaultError
         // was, in the live vault, NOT in the trash it was headed for.
         ListCommand::Delete => ("delete", "It's still in your vault."),
     };
-    format!("Couldn't {verb} \"{name}\" -- {because}. {unchanged}")
+    format!("Couldn't {verb} \"{name}\" \u{2014} {because}. {unchanged}")
 }
 
 /// The three writes in the detail pane that a refusal used to leave silent.
@@ -9937,28 +9937,28 @@ fn item_write_failure_message(write: ItemWrite, name: &str, e: &VaultError) -> S
         // of the item, which a refused write does not change -- so "it is not
         // a favourite" is the whole of what the user cannot otherwise see.
         ItemWrite::Favorite => {
-            format!("Couldn't add \"{name}\" to your favourites -- {because}. It still isn't one.")
+            format!("Couldn't add \"{name}\" to your favourites \u{2014} {because}. It still isn't one.")
         }
         ItemWrite::Unfavorite => {
             format!(
-                "Couldn't remove \"{name}\" from your favourites -- {because}. It still is one."
+                "Couldn't remove \"{name}\" from your favourites \u{2014} {because}. It still is one."
             )
         }
         // The editor stays open on failure (`mode` is left on `Edit`), so the
         // user's typing is not lost and the sentence says so -- otherwise the
         // safe reaction to "couldn't save" is to assume it is gone.
         ItemWrite::Save => format!(
-            "Couldn't save your changes to \"{name}\" -- {because}. Nothing has been written, and \
+            "Couldn't save your changes to \"{name}\" \u{2014} {because}. Nothing has been written, and \
              your edits are still in the form."
         ),
         // `name` is the draft's name, not a vault item's: there is no vault
         // item yet, which is exactly what this says.
         ItemWrite::Create => format!(
-            "Couldn't create \"{name}\" -- {because}. Nothing has been added to your vault, and \
+            "Couldn't create \"{name}\" \u{2014} {because}. Nothing has been added to your vault, and \
              what you typed is still in the form."
         ),
         ItemWrite::AppUnmatch => format!(
-            "Couldn't unmatch \"{name}\" from its app -- {because}. It is still matched to it."
+            "Couldn't unmatch \"{name}\" from its app \u{2014} {because}. It is still matched to it."
         ),
     }
 }
@@ -10031,7 +10031,7 @@ fn generate_failure(e: &VaultError) -> GenerateFailure {
     };
     GenerateFailure {
         message: format!(
-            "Couldn't generate a password -- {because}. Nothing in this form has changed.{tail}"
+            "Couldn't generate a password \u{2014} {because}. Nothing in this form has changed.{tail}"
         ),
         needs_reauth: matches!(e, VaultError::Unauthorized),
     }
@@ -11690,7 +11690,7 @@ fn export_message(report: &ExportReport) -> Option<(ExportTone, String)> {
                 .to_string(),
         ),
         ExportReport::Refused(ExportRefusal::IntoConfigDir) => bad(
-            "Deskwarden's own settings folder is not a safe place for a vault export -- an \
+            "Deskwarden's own settings folder is not a safe place for a vault export \u{2014} an \
              uninstall would delete it. Choose somewhere else."
                 .to_string(),
         ),
@@ -18975,12 +18975,12 @@ mod item_write_failure_tests {
 
         assert_eq!(
             refused,
-            "Couldn't save your changes to \"Toshiba Laptop\" -- the vault backend refused the \
+            "Couldn't save your changes to \"Toshiba Laptop\" \u{2014} the vault backend refused the \
              write. Nothing has been written, and your edits are still in the form."
         );
         assert_eq!(
             unreachable,
-            "Couldn't save your changes to \"Toshiba Laptop\" -- the vault backend couldn't be \
+            "Couldn't save your changes to \"Toshiba Laptop\" \u{2014} the vault backend couldn't be \
              reached. Nothing has been written, and your edits are still in the form."
         );
         assert!(

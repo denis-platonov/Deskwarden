@@ -917,7 +917,7 @@ fn host_process_refusal(process: &str) -> Option<String> {
         return None;
     }
     Some(format!(
-        "{process} isn\u{2019}t an app -- it\u{2019}s the Windows process that owns the window for \
+        "{process} isn\u{2019}t an app \u{2014} it\u{2019}s the Windows process that owns the window for \
          every Microsoft Store app, so matching it would fill this item into all of them. \
          Deskwarden won\u{2019}t save that. This row is showing the host because Deskwarden \
          couldn\u{2019}t see which app is inside it. Usually that\u{2019}s because the app is \
@@ -988,7 +988,7 @@ fn can_save_app_match_now(
 fn server_only_notice(item_name: &str) -> String {
     format!(
         "Your match was saved to \u{201c}{item_name}\u{201d} in your vault, but Deskwarden \
-         couldn\u{2019}t make it live in this session -- so autofill may not use it yet. Reopen \
+         couldn\u{2019}t make it live in this session \u{2014} so autofill may not use it yet. Reopen \
          your vault (or restart Deskwarden) and check the item; if the match isn\u{2019}t there, \
          the item was changed or removed elsewhere while you were saving."
     )
@@ -1358,7 +1358,7 @@ pub fn run_picker(
                             RichText::new(format!(
                                 "Deskwarden\u{2019}s Bitwarden backend hasn\u{2019}t answered yet, \
                                  so Save is unavailable right now. It may still be starting up \
-                                 -- click Retry to keep waiting, or Cancel and use \u{201c}Add \
+                                 \u{2014} click Retry to keep waiting, or Cancel and use \u{201c}Add \
                                  app\u{2026}\u{201d} again in a moment.\n\n{reason}"
                             ))
                             .size(11.0)

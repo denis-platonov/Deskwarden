@@ -150,7 +150,7 @@ pub const FAILED_HEADLINE: &str = "Your Sends could not be listed.";
 /// never render as success, and the strongest form of that untruth on this
 /// screen is a blank pane that reads as "you have none".
 pub const AMBIGUOUS_DETAIL: &str =
-    "Deskwarden could not check, so this is not a list of nothing -- you may still have Sends.";
+    "Deskwarden could not check, so this is not a list of nothing \u{2014} you may still have Sends.";
 
 /// What the pane says while the CLI has not answered yet.
 pub const LOADING_LABEL: &str = "Asking Bitwarden for your Sends\u{2026}";
@@ -680,7 +680,7 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
 /// **Not "never".** The record still goes on its deletion date and the link
 /// goes with it, so "never" would be the one wrong word available here; the
 /// pane prints this beside a `Deleted` row that gives the actual date.
-pub const NO_EXPIRY_OF_ITS_OWN: &str = "None of its own -- it lasts until the Send is deleted";
+pub const NO_EXPIRY_OF_ITS_OWN: &str = "None of its own \u{2014} it lasts until the Send is deleted";
 
 /// What the detail pane says for a deletion date it could not read.
 ///
@@ -1490,7 +1490,7 @@ pub struct ReceivedRow {
 /// nothing. It names both innocent explanations, because both are common and
 /// neither is a fault.
 pub const RECEIVED_ITEM_GONE: &str =
-    "The item this created is no longer in your vault -- it was deleted, or it is in the trash.";
+    "The item this created is no longer in your vault \u{2014} it was deleted, or it is in the trash.";
 /// Its opposite, said just as plainly so the two rows read as one question
 /// answered two ways rather than as a warning and a silence.
 pub const RECEIVED_ITEM_PRESENT: &str = "The item this created is still in your vault.";

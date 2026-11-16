@@ -1109,7 +1109,7 @@ pub fn search_row_text(row: SearchRow) -> (String, String) {
         SearchRow::Result(_) => (String::new(), String::new()),
         SearchRow::Overflow { shown, total } => (
             format!("{total} accounts match"),
-            format!("Showing the first {shown} -- keep typing to narrow it"),
+            format!("Showing the first {shown} \u{2014} keep typing to narrow it"),
         ),
         SearchRow::Nothing => (
             "No matches".to_string(),

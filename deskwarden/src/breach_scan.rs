@@ -130,8 +130,8 @@ pub const SCAN_POLL_INTERVAL: Duration = Duration::from_millis(120);
 /// needs to say so where both are on screen at once.
 pub const SCAN_CONSENT_NOTE: &str =
     "This button always checks, whatever the setting above says: pressing it is you asking for \
-     the check. The setting governs what Deskwarden does on its own -- the breach badge on an \
-     item you open -- and nothing here runs on its own, ever.";
+     the check. The setting governs what Deskwarden does on its own \u{2014} the breach badge on an \
+     item you open \u{2014} and nothing here runs on its own, ever.";
 
 // ---------------------------------------------------------------------------
 // The plan

@@ -593,6 +593,22 @@ pub fn reuse_group_heading(group: &ReuseGroup) -> String {
     format!("One password, {} items", group.items.len())
 }
 
+/// The detail line under one reused row: the OTHER items on its password,
+/// by name, in the group's order. Weak and breached rows each say why they
+/// are listed; a reused row without this was a bare name under a caption,
+/// and the caption does not say which rows go with which once a list runs
+/// past the screen.
+pub fn reuse_detail(group: &ReuseGroup, at: usize) -> String {
+    let others: Vec<&str> = group
+        .items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != at)
+        .map(|(_, item)| finding_name(&item.name))
+        .collect();
+    format!("Also used by {}", others.join(", "))
+}
+
 /// What the top of the screen says, before any list.
 ///
 /// Three states, and **the clean one is a result, not an absence.** A blank
@@ -671,7 +687,7 @@ impl Summary {
 /// resolve; saying which of the two things the pill decides is not.
 pub fn breach_note(breach_checking_on: bool) -> String {
     let source = format!(
-        "Breach findings come from the last scan you ran, not from opening this screen -- \
+        "Breach findings come from the last scan you ran, not from opening this screen \u{2014} \
          nothing here checks anything. Run one in {SCAN_LOCATION}."
     );
     if breach_checking_on {
@@ -809,9 +825,10 @@ pub fn draw_password_health(
                     section_heading(ui, REUSED_HEADING);
                     for group in &report.reused {
                         group_heading(ui, &reuse_group_heading(group));
-                        for item in &group.items {
+                        for (at, item) in group.items.iter().enumerate() {
+                            let detail = reuse_detail(group, at);
                             let selected = selected_id.as_deref() == Some(item.id.as_str());
-                            if finding_row(ui, &item.name, None, selected) {
+                            if finding_row(ui, &item.name, Some(&detail), selected) {
                                 *selected_id = Some(item.id.clone());
                             }
                         }
@@ -887,7 +904,7 @@ pub fn draw_password_health(
 /// Per row as well as in the band's note, because a row is what gets clicked
 /// through to an item and the pane behind it will show an ordinary password
 /// with no badge on it. "Unknown" has to travel with the row.
-pub const UNKNOWN_ROW_DETAIL: &str = "Not checked -- the lookup did not complete.";
+pub const UNKNOWN_ROW_DETAIL: &str = "Not checked \u{2014} the lookup did not complete.";
 
 /// Height of a filter chip, and the gap between chips.
 const CHIP_HEIGHT: f32 = 26.0;
@@ -1107,10 +1124,10 @@ pub fn breach_group_heading(group: &BreachGroup) -> String {
     let times = crate::breach::breach_count_phrase(group.count);
     match (group.items.len(), group.one_password) {
         (1, _) => times,
-        (n, true) => format!("{times} -- one password, {n} items"),
+        (n, true) => format!("{times} \u{2014} one password, {n} items"),
         // Same count, different passwords. Rare above a handful, and stated
         // as the fact it is rather than as a guess either way.
-        (n, false) => format!("{times} -- {n} items, different passwords"),
+        (n, false) => format!("{times} \u{2014} {n} items, different passwords"),
     }
 }
 
@@ -1407,6 +1424,10 @@ mod tests {
         assert_eq!(report.reused.len(), 1, "{:?}", group_names(&report));
         assert_eq!(group_names(&report), vec![vec!["Bank", "Shop", "Forum"]]);
         assert_eq!(reuse_group_heading(&report.reused[0]), "One password, 3 items");
+        // Each row names the others on its password, never itself.
+        assert_eq!(reuse_detail(&report.reused[0], 0), "Also used by Shop, Forum");
+        assert_eq!(reuse_detail(&report.reused[0], 1), "Also used by Bank, Forum");
+        assert_eq!(reuse_detail(&report.reused[0], 2), "Also used by Bank, Shop");
     }
 
     /// Two independent groups, and the exact count -- an implementation that

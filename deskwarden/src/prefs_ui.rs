@@ -447,11 +447,11 @@ const READ_THROUGH_LABEL: &str = "Read from that copy first";
 /// unchanged.
 fn read_through_description(cache_on: bool) -> &'static str {
     if cache_on {
-        "On, Deskwarden answers from the encrypted copy before asking your server -- which is \
+        "On, Deskwarden answers from the encrypted copy before asking your server \u{2014} which is \
          what makes filling work when the connection to Bitwarden is stopped. Off keeps the \
          copy on disk for a fast start but always asks the server for what it fills."
     } else {
-        "Only applies when there is a copy to read -- the switch above."
+        "Only applies when there is a copy to read \u{2014} the switch above."
     }
 }
 
@@ -551,7 +551,7 @@ const SCAN_RUNNING_BUTTON: &str = "Scanning...";
 /// leaves the machine, because the button beside it is the one control in
 /// this app that makes hundreds of outbound calls from a single click.
 const SCAN_IDLE_DESCRIPTION: &str = "Checks every saved password against Have I Been Pwned, one \
-     request per distinct password -- so a vault full of reused passwords is far fewer requests \
+     request per distinct password \u{2014} so a vault full of reused passwords is far fewer requests \
      than it has items. Only the first 5 characters of each hash leave your PC.";
 /// The empty state of the history list. A result, not a blank panel: see
 /// `password_health`'s summary for the same argument.
@@ -1087,7 +1087,7 @@ const UPDATE_UP_TO_DATE_DESCRIPTION: &str = "This is the latest release.";
 const UPDATE_READY_DESCRIPTION: &str =
     "Downloaded and signature-checked. Deskwarden will close, install, and start again.";
 const UPDATE_UNAVAILABLE_DESCRIPTION: &str =
-    "This build cannot check for updates. Please report it -- it is a defect, not a setting.";
+    "This build cannot check for updates. Please report it \u{2014} it is a defect, not a setting.";
 
 /// Shown under the button when `Settings::check_for_updates` is off.
 ///
@@ -2480,12 +2480,24 @@ fn status_row(ui: &mut Ui, status: &str, control: impl FnOnce(&mut Ui)) {
             // Body text in ink, not grey fine print: "Version 0.9.0 is available."
             // is the news this card exists to carry, and it can run to two
             // sentences, which a bold title would shout.
-            ui.label(
+            let text = egui::WidgetText::from(
                 RichText::new(status)
                     .size(13.0)
                     .line_height(Some(DESCRIPTION_LINE_HEIGHT))
                     .color(theme::INK),
             );
+            let galley = text.into_galley(
+                ui,
+                Some(egui::TextWrapMode::Wrap),
+                ui.available_width(),
+                egui::FontSelection::Default,
+            );
+            // **Centred on the button beside it.** One line is shorter than
+            // the row's control height, and the button is centred on that
+            // height, so a status drawn from the top sat above the button's
+            // middle. Two lines are taller and need no help.
+            ui.add_space(((CONTROL_MIN_HEIGHT - galley.size().y) / 2.0).max(0.0));
+            ui.label(galley);
         },
         control,
     );
@@ -3122,15 +3134,15 @@ const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
 ///    who assumes it does has misjudged the entire trade.
 fn service_description(enabled: bool) -> &'static str {
     if enabled {
-        "On. Deskwarden is listening on 127.0.0.1 and will hand out decrypted vault items -- \
-         usernames, passwords, notes and two-factor secrets -- to any program on this PC that \
+        "On. Deskwarden is listening on 127.0.0.1 and will hand out decrypted vault items \u{2014} \
+         usernames, passwords, notes and two-factor secrets \u{2014} to any program on this PC that \
          presents one of the keys below. It never asks for your master password: a key is the \
          whole credential, so anyone who can read one can use it. Turning this off stops the \
          endpoint and leaves the keys where they are."
     } else {
         "Off, which is the default. Turning it on starts a local HTTP endpoint on 127.0.0.1 \
-         that hands out decrypted vault items -- usernames, passwords, notes and two-factor \
-         secrets -- to any program on this PC that presents one of the keys you mint below. It \
+         that hands out decrypted vault items \u{2014} usernames, passwords, notes and two-factor \
+         secrets \u{2014} to any program on this PC that presents one of the keys you mint below. It \
          never asks for your master password: a key is the whole credential, so anyone who can \
          read one can use it. Nothing is listening, and no key opens anything, until you turn \
          this on."
@@ -3231,7 +3243,7 @@ const REVEAL_LABEL: &str = "Copy this key now";
 /// keep only a hash of it" is the reason it cannot be relaxed. A reader who
 /// believes the key is retrievable will close this card and come back for it.
 const REVEAL_NOTE: &str = "This is the only time this key is shown. Deskwarden stores nothing \
-                           but a hash of it, so it cannot be shown again -- not by this screen, \
+                           but a hash of it, so it cannot be shown again \u{2014} not by this screen, \
                            not from the file. If you lose it, revoke this key and mint another.";
 
 const COPY_BUTTON: &str = "Copy";
@@ -3250,7 +3262,7 @@ const REVOKE_CANCEL_BUTTON: &str = "Keep it";
 fn revoke_prompt(name: &str) -> String {
     format!(
         "Revoke \u{201c}{name}\u{201d}? Any program still holding this key stops being answered \
-         the moment you do -- with a refusal that tells it nothing about why -- and the key \
+         the moment you do \u{2014} with a refusal that tells it nothing about why \u{2014} and the key \
          cannot be brought back. Replacing it means putting a new key into whatever was using \
          this one."
     )
@@ -3265,7 +3277,7 @@ fn revoke_prompt(name: &str) -> String {
 /// permissions" by the time it is called -- both of which are legitimate
 /// values it must accept. Judging them here is the only place they are still
 /// distinguishable from the thing the owner meant.
-const EXPIRY_NOT_A_NUMBER: &str = "Enter the number of days this key should last -- 30, say -- \
+const EXPIRY_NOT_A_NUMBER: &str = "Enter the number of days this key should last \u{2014} 30, say \u{2014} \
                                    or leave the box empty for a key that never expires.";
 const NO_ITEM_ID: &str = "Enter the id of the item this key is for. A key scoped to no item is \
                           refused every item, which is a key that looks live and is not.";
@@ -3287,7 +3299,7 @@ const MINT_NOT_SAVED: &str = "The key was made, but the key store could not be w
 /// only "could not save" would leave the owner believing they had revoked
 /// it.
 const REVOKE_NOT_SAVED: &str = "The key is gone from this list, but the key store could not be \
-                                written -- so it still works, and will be back in this list when \
+                                written \u{2014} so it still works, and will be back in this list when \
                                 Deskwarden restarts: ";
 
 // -- what a key is, in words ------------------------------------------------
@@ -3707,12 +3719,12 @@ const BACKEND_SWITCH_CANCEL_BUTTON: &str = "Leave it";
 fn backend_switch_prompt(switch: BackendSwitch) -> &'static str {
     if switch.deletes_the_stored_vault_key() {
         "Switch back to the official Bitwarden CLI? It does not take effect until you next \
-         sign in to this account -- either sign out and back in, or close Deskwarden and open \
+         sign in to this account \u{2014} either sign out and back in, or close Deskwarden and open \
          it again yourself. This also deletes the vault key stored on this PC, so nothing is \
          left behind by the switch."
     } else {
         "Switch to Deskwarden's built-in client? It does not take effect until you next sign \
-         in to this account -- either sign out and back in, or close Deskwarden and open it \
+         in to this account \u{2014} either sign out and back in, or close Deskwarden and open it \
          again yourself."
     }
 }
@@ -13730,6 +13742,25 @@ mod tests {
             "the notes region is writing a heading of its own again, above the one the \
              release already carries: {:?}",
             painted.strings()
+        );
+    }
+
+    /// "Version 9.9.9 is available." sits level with the Download button
+    /// beside it. It was drawn from the row's top while the button was centred
+    /// on the row, so the line read as raised above the button.
+    #[test]
+    fn the_update_status_is_level_with_its_button() {
+        let painted = paint_updates(
+            crate::update_panel::UpdateStage::Available(a_release()),
+            Settings::default(),
+        );
+        let status = painted.rect_of("Version 9.9.9 is available.");
+        let button = painted.rect_of(UPDATE_DOWNLOAD_BUTTON);
+        assert!(
+            (status.center().y - button.center().y).abs() <= 1.0,
+            "status centred at {} but the button's label at {}",
+            status.center().y,
+            button.center().y
         );
     }
 

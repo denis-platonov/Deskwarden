@@ -2216,7 +2216,7 @@ fn draw_cli_setup_modal(
 /// Worded as setup rather than as an error, because nothing has gone wrong --
 /// and nothing of the user's has been touched: the CLI's own profile
 /// directory is left exactly where it is.
-pub const FIRST_RUN_NOTICE: &str = "Deskwarden now keeps each account in its own profile -- sign \
+pub const FIRST_RUN_NOTICE: &str = "Deskwarden now keeps each account in its own profile \u{2014} sign \
      in once to set this one up. Windows Hello quick unlock has to be set up again too.";
 
 /// Paints [`FIRST_RUN_NOTICE`]. One definition, two call sites (with the Hello

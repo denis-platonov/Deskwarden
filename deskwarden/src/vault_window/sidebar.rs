@@ -702,7 +702,7 @@ impl SendScope {
             SendScope::Opened => Some("The link is live, and somebody has opened it."),
             SendScope::Used => Some("Opened, with every permitted view spent."),
             SendScope::Ended => {
-                Some("Out of time or turned off -- expired and revoked links together.")
+                Some("Out of time or turned off \u{2014} expired and revoked links together.")
             }
         }
     }
@@ -1490,7 +1490,7 @@ pub enum DropOutcome {
 /// assigns `folderId` unconditionally, so this looks like a version
 /// difference rather than a permanent property of the API.
 pub const CANNOT_UNFILE: &str =
-    "\"No Folder\" isn't a place an item can be moved to -- the Bitwarden CLI this build talks \
+    "\"No Folder\" isn't a place an item can be moved to \u{2014} the Bitwarden CLI this build talks \
      to cannot take an item out of a folder, so the drop was refused rather than looking like \
      it worked.";
 
