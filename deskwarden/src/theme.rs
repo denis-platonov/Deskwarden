@@ -781,6 +781,10 @@ pub fn apply(ctx: &egui::Context) {
     // pill and edit-pencil) set this themselves via `on_hover_cursor`/
     // `set_cursor_icon` at their own call sites instead.
     v.interact_cursor = Some(egui::CursorIcon::PointingHand);
+    // `ui.indent` is used to inset text, never to show nesting, and egui's
+    // default draws a grey guide line down its left edge, which hung beside
+    // the Sends pane's empty, loading and failed notices as a stray bar.
+    v.indent_has_left_vline = false;
     v.panel_fill = CANVAS;
     v.window_fill = CARD;
     v.faint_bg_color = CARD_TINT;
@@ -12448,6 +12452,26 @@ mod tests {
         assert_eq!(SharePillKind::Shared.label(), "Shared");
         assert_eq!(SharePillKind::Invited.label(), "Invited");
         assert_eq!(SharePillKind::Shared.tone().fill, BLUE, "Shared is the filled blue of the list's `shared` chip");
+    }
+
+    /// An indented block draws its text and nothing beside it: egui's default
+    /// guide line hung left of the Sends pane's empty notice as a stray bar.
+    #[test]
+    fn an_indented_block_draws_no_guide_line_beside_it() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
+        apply(&ctx);
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.indent("guide", |ui| {
+                ui.label("You have no Sends.");
+            });
+        });
+        let lines = output
+            .shapes
+            .iter()
+            .filter(|c| matches!(c.shape, egui::Shape::LineSegment { .. }))
+            .count();
+        assert_eq!(lines, 0, "the indent drew a guide line");
     }
 
     /// The Share control is a 34-point header control that reports a click,
