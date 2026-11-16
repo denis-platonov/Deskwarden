@@ -1116,12 +1116,16 @@ fn inside_convex(poly: &[Pos2], p: Pos2) -> bool {
 }
 
 /// The mark rasterized as an OS window icon (titlebar + taskbar), per the
-/// design's window mocks (3h shows the mark in the titlebar). 32px with 4×
+/// design's window mocks (3h shows the mark in the titlebar). 64px with 4×
 /// supersampling, same approach as `assets/generate-icon.py` — this one is
 /// generated at runtime because eframe windows take an `egui::IconData`, not
 /// the .ico resource `build.rs` embeds for the exe itself.
+///
+/// **64, not 32**: the taskbar wants 40-48 px at 125-150% scaling, and a 32
+/// px icon is stretched up to that, soft beside the exe's own sharp frames.
+/// Scaling down from 64 stays crisp.
 pub fn window_icon() -> egui::IconData {
-    const SIZE: usize = 32;
+    const SIZE: usize = 64;
     const SS: usize = 4;
     let outlines = quadrant_outlines();
 
@@ -1131,12 +1135,16 @@ pub fn window_icon() -> egui::IconData {
             let (mut r, mut g, mut b, mut a) = (0u32, 0u32, 0u32, 0u32);
             for sy in 0..SS {
                 for sx in 0..SS {
-                    // Map the sample into the 24×28 viewbox, centered in the
-                    // square (the viewbox is taller than wide by 4 units).
+                    // The 24×28 viewbox spread over the whole square, as
+                    // `assets/generate-icon.py` draws the exe's icon: the
+                    // shield fills the icon's width rather than keeping the
+                    // viewbox's proportions inside it. Kept to the exact
+                    // aspect it read slim beside the exe's own icon on the
+                    // taskbar, and the full one is the one chosen.
                     let nx = (px * SS + sx) as f32 + 0.5;
                     let ny = (py * SS + sy) as f32 + 0.5;
                     let p = Pos2::new(
-                        nx / (SIZE * SS) as f32 * 28.0 - 2.0,
+                        nx / (SIZE * SS) as f32 * 24.0,
                         ny / (SIZE * SS) as f32 * 28.0,
                     );
                     if let Some(idx) = outlines.iter().position(|o| inside_convex(o, p)) {
@@ -11949,15 +11957,55 @@ mod tests {
     #[test]
     fn window_icon_is_opaque_in_the_shield_and_transparent_outside() {
         let icon = window_icon();
-        assert_eq!((icon.width, icon.height), (32, 32));
-        assert_eq!(icon.rgba.len(), 32 * 32 * 4);
-        let alpha = |x: usize, y: usize| icon.rgba[(y * 32 + x) * 4 + 3];
+        assert_eq!((icon.width, icon.height), (64, 64));
+        assert_eq!(icon.rgba.len(), 64 * 64 * 4);
+        let alpha = |x: usize, y: usize| icon.rgba[(y * 64 + x) * 4 + 3];
         // Corners are outside the shield; the center is deep inside it.
         assert_eq!(alpha(0, 0), 0);
-        assert_eq!(alpha(31, 0), 0);
-        assert_eq!(alpha(0, 31), 0);
-        assert_eq!(alpha(31, 31), 0);
-        assert_eq!(alpha(16, 14), 255);
+        assert_eq!(alpha(63, 0), 0);
+        assert_eq!(alpha(0, 63), 0);
+        assert_eq!(alpha(63, 63), 0);
+        assert_eq!(alpha(32, 28), 255);
+    }
+
+    /// **The window's icon and the exe's are one shield.** They are drawn by
+    /// two programs -- this module at runtime, `assets/generate-icon.py` into
+    /// the `.ico` -- and they once framed it differently: the generator spread
+    /// the 24-unit viewbox across the whole square, this module kept its
+    /// proportions, and two taskbar buttons showed one fat shield and one
+    /// slim. The full one is the chosen one. Compared here against the
+    /// `.ico`'s own 64 px frame, pixel by pixel, in coverage.
+    #[test]
+    fn the_window_icon_is_the_shield_the_exe_carries() {
+        let ico = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/deskwarden.ico"))
+            .expect("assets/deskwarden.ico");
+        let u16_at = |at: usize| u16::from_le_bytes([ico[at], ico[at + 1]]) as usize;
+        let u32_at = |at: usize| {
+            u32::from_le_bytes([ico[at], ico[at + 1], ico[at + 2], ico[at + 3]]) as usize
+        };
+        let entry = (0..u16_at(4))
+            .map(|i| 6 + 16 * i)
+            .find(|&e| ico[e] == 64)
+            .expect("the .ico has a 64 px frame");
+        // A 40-byte BITMAPINFOHEADER, then BGRA rows from the bottom up.
+        let pixels = u32_at(entry + 12) + 40;
+        let ico_alpha = |x: usize, y: usize| ico[pixels + ((63 - y) * 64 + x) * 4 + 3];
+
+        let icon = window_icon();
+        let ours = |x: usize, y: usize| icon.rgba[(y * 64 + x) * 4 + 3];
+        let mut apart = Vec::new();
+        for y in 0..64 {
+            for x in 0..64 {
+                let (a, b) = (ours(x, y), ico_alpha(x, y));
+                // The two flatten the curves differently, so an edge pixel
+                // may differ by a few samples; a stretched shield differs by
+                // whole columns of full coverage.
+                if a.abs_diff(b) > 64 {
+                    apart.push((x, y, a, b));
+                }
+            }
+        }
+        assert!(apart.is_empty(), "the window icon and the .ico differ at {apart:?}");
     }
 
     /// Every shared edge in the mark must divide a dark quadrant from a
