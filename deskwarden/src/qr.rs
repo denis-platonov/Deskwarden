@@ -389,8 +389,218 @@ fn walk_codes(
         .saturating_mul(height)
         .saturating_mul(SECOND_LOOK_SCALE * SECOND_LOOK_SCALE);
     if enlarged <= MAX_SECOND_LOOK_PIXELS {
-        walk_grids(rgba, width, height, SECOND_LOOK_SCALE, &mut visit);
+        walk_grids(rgba, width, height, SECOND_LOOK_SCALE, &mut |text, at| {
+            read_any = true;
+            visit(text, at)
+        });
     }
+    if read_any {
+        return;
+    }
+    // **The third look: corner squares drawn round.** `rqrr` takes each corner
+    // square's corners from the outermost points of its ring. A page drew its
+    // rings rounded nearly to circles, which put those points a sixth of the
+    // way in, and the grid built from them missed the code. Phones find a
+    // corner square by its middle instead. So does this: it finds each one by
+    // its 1:1:3:1:1 runs through the middle, then decodes once more with a
+    // square-cornered one drawn in its place.
+    let finders = find_finders(rgba, width, height);
+    if finders.len() >= 3 {
+        walk_squared(rgba, width, height, &finders, &mut visit);
+    }
+}
+
+/// A corner square [`find_finders`] located, as the box it fills in the
+/// picture's own pixels. Axis-aligned: a code on a screen or in a screenshot
+/// is upright, and a tilted one never reaches this pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Finder {
+    left: usize,
+    top: usize,
+    side: usize,
+}
+
+impl Finder {
+    /// What a square-cornered corner square has at `(x, y)`: `Some(true)` for
+    /// dark, `Some(false)` for light, `None` outside its box.
+    fn shade(&self, x: usize, y: usize) -> Option<bool> {
+        if x < self.left || y < self.top || x >= self.left + self.side || y >= self.top + self.side {
+            return None;
+        }
+        let module = |at: usize, from: usize| (at - from) * 7 / self.side;
+        let (mx, my) = (module(x, self.left), module(y, self.top));
+        let ring = mx == 0 || mx == 6 || my == 0 || my == 6;
+        let stone = (2..=4).contains(&mx) && (2..=4).contains(&my);
+        Some(ring || stone)
+    }
+}
+
+/// The most corner squares [`find_finders`] keeps. A code has three; a whole
+/// screen of them is still far below this, and the bound keeps a picture full
+/// of look-alikes from growing the list without end.
+const MAX_FINDERS: usize = 64;
+
+/// Whether five runs, dark-light-dark-light-dark, are a corner square's
+/// 1:1:3:1:1. The tolerance is quirc's, the detector `rqrr` is a port of: each
+/// run within three quarters of a module of what it should be.
+fn finder_runs(runs: [usize; 5]) -> bool {
+    let module = (runs[0] + runs[1] + runs[3] + runs[4]) as f64 / 4.0;
+    if module < 1.0 {
+        return false;
+    }
+    let slack = module * 0.75;
+    runs.iter()
+        .zip([1.0, 1.0, 3.0, 1.0, 1.0])
+        .all(|(&run, want)| (run as f64 - want * module).abs() <= slack)
+}
+
+/// Finds corner squares by their middles: a row whose runs read 1:1:3:1:1,
+/// confirmed by the column through the middle of its centre run reading the
+/// same. Sightings of one square on neighbouring rows are folded into one box.
+///
+/// Reads the picture through [`luma`] against the midpoint of its own darkest
+/// and lightest pixel, and builds no copy of it. What it returns is geometry
+/// only: boxes on a page, which the user is looking at.
+fn find_finders(rgba: &[u8], width: usize, height: usize) -> Vec<Finder> {
+    let Some(pixels) = width.checked_mul(height) else {
+        return Vec::new();
+    };
+    if width == 0 || height == 0 || pixels > MAX_PIXELS || rgba.len() < pixels * 4 {
+        return Vec::new();
+    }
+    let shade = |x: usize, y: usize| {
+        let at = (y * width + x) * 4;
+        luma(rgba[at], rgba[at + 1], rgba[at + 2])
+    };
+    let (mut darkest, mut lightest) = (u8::MAX, u8::MIN);
+    for at in 0..pixels {
+        let v = shade(at % width, at / width);
+        darkest = darkest.min(v);
+        lightest = lightest.max(v);
+    }
+    if lightest - darkest < 64 {
+        return Vec::new();
+    }
+    let cut = ((darkest as u16 + lightest as u16) / 2) as u8;
+    let dark = |x: usize, y: usize| shade(x, y) < cut;
+
+    // The column through `(x, y)`, which is inside a centre run: how far the
+    // five runs reach up and down, or `None` if they are not 1:1:3:1:1.
+    let column = |x: usize, y: usize| -> Option<(usize, usize)> {
+        let mut up = [0usize; 3];
+        let mut at = y;
+        for (n, want) in [true, false, true].into_iter().enumerate() {
+            while at > 0 && dark(x, at - 1) == want {
+                at -= 1;
+                up[n] += 1;
+            }
+        }
+        let mut down = [0usize; 3];
+        let mut at = y;
+        for (n, want) in [true, false, true].into_iter().enumerate() {
+            while at + 1 < height && dark(x, at + 1) == want {
+                at += 1;
+                down[n] += 1;
+            }
+        }
+        let runs = [up[2], up[1], up[0] + 1 + down[0], down[1], down[2]];
+        if !finder_runs(runs) {
+            return None;
+        }
+        let top = y - up[0] - up[1] - up[2];
+        Some((top, runs.iter().sum()))
+    };
+
+    // Each sighting: (centre x, centre y, width, height), summed per square.
+    let mut found: Vec<([f64; 4], f64)> = Vec::new();
+    for y in 0..height {
+        let mut runs: Vec<(usize, usize)> = Vec::new(); // (start, length)
+        let mut start = 0;
+        for x in 1..=width {
+            if x == width || dark(x, y) != dark(start, y) {
+                runs.push((start, x - start));
+                start = x;
+            }
+        }
+        for window in runs.windows(5) {
+            if !dark(window[0].0, y) {
+                continue;
+            }
+            let lengths = [window[0].1, window[1].1, window[2].1, window[3].1, window[4].1];
+            if !finder_runs(lengths) {
+                continue;
+            }
+            let across: usize = lengths.iter().sum();
+            let mid_x = window[2].0 + window[2].1 / 2;
+            let Some((top, down)) = column(mid_x, y) else {
+                continue;
+            };
+            // A square: the column agrees with the row to within a quarter.
+            if down * 4 < across * 3 || across * 4 < down * 3 {
+                continue;
+            }
+            let sighting = [
+                window[0].0 as f64 + across as f64 / 2.0,
+                top as f64 + down as f64 / 2.0,
+                across as f64,
+                down as f64,
+            ];
+            let near = found.iter().position(|(sum, n)| {
+                let reach = sum[2] / n / 7.0;
+                (sum[0] / n - sighting[0]).abs() <= reach && (sum[1] / n - sighting[1]).abs() <= reach
+            });
+            match near {
+                Some(at) => {
+                    let (sum, n) = &mut found[at];
+                    for (total, part) in sum.iter_mut().zip(sighting) {
+                        *total += part;
+                    }
+                    *n += 1.0;
+                }
+                None if found.len() < MAX_FINDERS => found.push((sighting, 1.0)),
+                None => {}
+            }
+        }
+    }
+
+    found
+        .into_iter()
+        // One row is a coincidence; a corner square is crossed by several.
+        .filter(|(_, n)| *n >= 2.0)
+        .filter_map(|(sum, n)| {
+            let [cx, cy, across, down] = sum.map(|total| total / n);
+            let side = ((across + down) / 2.0).round() as usize;
+            let left = (cx - side as f64 / 2.0).round();
+            let top = (cy - side as f64 / 2.0).round();
+            if side < 7 || left < 0.0 || top < 0.0 {
+                return None;
+            }
+            let finder = Finder { left: left as usize, top: top as usize, side };
+            (finder.left + side <= width && finder.top + side <= height).then_some(finder)
+        })
+        .collect()
+}
+
+/// [`walk_grids`]' one pass with each of `finders` drawn square-cornered over
+/// whatever the picture has there. Drawn in the closure `rqrr` pulls pixels
+/// through, so no altered copy of the picture is built here either.
+fn walk_squared(
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+    finders: &[Finder],
+    visit: &mut dyn FnMut(Zeroizing<String>, ScreenRect) -> bool,
+) {
+    walk_pixels(rgba.len(), width, height, 1, visit, |x, y| {
+        match finders.iter().find_map(|finder| finder.shade(x, y)) {
+            Some(true) => 0,
+            Some(false) => 0xff,
+            None => {
+                let at = (y * width + x) * 4;
+                luma(rgba[at], rgba[at + 1], rgba[at + 2])
+            }
+        }
+    });
 }
 
 /// One pass of the detector over the picture, each of its pixels repeated
@@ -403,6 +613,24 @@ fn walk_grids(
     scale: usize,
     visit: &mut dyn FnMut(Zeroizing<String>, ScreenRect) -> bool,
 ) {
+    walk_pixels(rgba.len(), width, height, scale, visit, |x, y| {
+        let at = (y * width + x) * 4;
+        luma(rgba[at], rgba[at + 1], rgba[at + 2])
+    });
+}
+
+/// The detector pass both [`walk_grids`] and [`walk_squared`] run: `pixel`
+/// answers the grey of the picture's own `(x, y)`, and each one is repeated
+/// `scale` times on both axes. `bytes` is the RGBA buffer's length, checked
+/// here against `width` and `height` before `pixel` is ever called.
+fn walk_pixels(
+    bytes: usize,
+    width: usize,
+    height: usize,
+    scale: usize,
+    visit: &mut dyn FnMut(Zeroizing<String>, ScreenRect) -> bool,
+    pixel: impl Fn(usize, usize) -> u8,
+) {
     if width == 0 || height == 0 {
         return;
     }
@@ -412,10 +640,10 @@ fn walk_grids(
     if pixels > MAX_PIXELS {
         return;
     }
-    let Some(bytes) = pixels.checked_mul(4) else {
+    let Some(needed) = pixels.checked_mul(4) else {
         return;
     };
-    if rgba.len() < bytes {
+    if bytes < needed {
         return;
     }
 
@@ -424,8 +652,7 @@ fn walk_grids(
     // and that one is not this module's to wipe; see the note above.
     let mut prepared =
         rqrr::PreparedImage::prepare_from_greyscale(width * scale, height * scale, |x, y| {
-            let at = (y / scale * width + x / scale) * 4;
-            luma(rgba[at], rgba[at + 1], rgba[at + 2])
+            pixel(x / scale, y / scale)
         });
 
     for grid in prepared.detect_grids() {
@@ -770,6 +997,98 @@ pub(crate) mod tests {
         // Control: it is a working decoder and not a function that answers no.
         let (plain, w, h) = fixture_rgba(4);
         assert_eq!(decode_qr_frame(&plain, w, h).as_deref().map(String::as_str), Some(FIXTURE_TEXT));
+    }
+
+    /// Whether `(x, y)` lies in the square `[from, from + side)` on both axes
+    /// with its corners rounded to `radius`.
+    fn in_rounded_square(x: f64, y: f64, from: (f64, f64), side: f64, radius: f64) -> bool {
+        let (left, top) = from;
+        if x < left || y < top || x >= left + side || y >= top + side {
+            return false;
+        }
+        let cx = x.clamp(left + radius, left + side - radius);
+        let cy = y.clamp(top + radius, top + side - radius);
+        (x - cx).powi(2) + (y - cy).powi(2) <= radius * radius
+    }
+
+    /// [`FIXTURE`] the way the second reported code was drawn: five pixels a
+    /// module, every data module a round dot, and each corner square drawn as
+    /// a ring whose corners are rounded almost to a circle. Measured off the
+    /// owner's screenshot: rings 34 pixels across, four or five thick, with
+    /// corners rounded over about two modules.
+    fn fixture_with_rounded_corner_squares() -> (Vec<u8>, usize, usize) {
+        const QUIET: usize = 4;
+        const PITCH: usize = 5;
+        let modules = FIXTURE.len();
+        let side = (modules + 2 * QUIET) * PITCH;
+        let mut rgba = vec![0xffu8; side * side * 4];
+        let m = PITCH as f64;
+        let corners = [(0, 0), (modules - 7, 0), (0, modules - 7)];
+        let in_corner = |col: usize, row: usize| {
+            corners.iter().any(|&(c, r)| (c..c + 7).contains(&col) && (r..r + 7).contains(&row))
+        };
+        for y in 0..side {
+            for x in 0..side {
+                let (px, py) = (x as f64 + 0.5, y as f64 + 0.5);
+                let (gx, gy) = (px / m - QUIET as f64, py / m - QUIET as f64);
+                let mut dark = false;
+                for &(c, r) in &corners {
+                    let at = ((QUIET + c) as f64 * m, (QUIET + r) as f64 * m);
+                    let ring = in_rounded_square(px, py, at, 7.0 * m, 2.2 * m)
+                        && !in_rounded_square(px, py, (at.0 + m, at.1 + m), 5.0 * m, 1.4 * m);
+                    let stone = in_rounded_square(px, py, (at.0 + 2.0 * m, at.1 + 2.0 * m), 3.0 * m, 0.8 * m);
+                    dark |= ring || stone;
+                }
+                if gx >= 0.0 && gy >= 0.0 && (gx as usize) < modules && (gy as usize) < modules {
+                    let (col, row) = (gx as usize, gy as usize);
+                    let dot = (gx.fract() - 0.5).powi(2) + (gy.fract() - 0.5).powi(2) <= 0.42 * 0.42;
+                    if !in_corner(col, row) && FIXTURE[row].as_bytes()[col] == b'#' && dot {
+                        dark = true;
+                    }
+                }
+                if dark {
+                    rgba[(y * side + x) * 4..][..3].fill(0);
+                }
+            }
+        }
+        (rgba, side, side)
+    }
+
+    /// **THE SECOND REPORT: a setup code drawn in dots, with round corner
+    /// squares, that "doesn't work on screen".** The detector takes each corner
+    /// square's corners from the outermost points of its ring, and a ring
+    /// rounded nearly to a circle puts them a sixth of the way in -- so the
+    /// grid built from them misses. Squaring the three corner squares off made
+    /// the owner's picture read at once; the dots were never the trouble.
+    ///
+    /// The owner's picture holds a live seed and is not committed. **The
+    /// controls come first**: neither the plain pass nor the enlarged second
+    /// look reads this, so what reads it below is the new pass and not a
+    /// fixture that was never hard.
+    #[test]
+    fn a_code_with_rounded_corner_squares_is_read() {
+        let (rgba, w, h) = fixture_with_rounded_corner_squares();
+        for scale in [1, SECOND_LOOK_SCALE] {
+            let mut read = 0;
+            walk_grids(&rgba, w, h, scale, &mut |_, _| {
+                read += 1;
+                true
+            });
+            assert_eq!(read, 0, "scale {scale} read this, so nothing below tests the new pass");
+        }
+
+        assert_eq!(decode_qr(&rgba, w, h).as_deref().map(String::as_str), Some(FIXTURE_TEXT));
+        match codes_in(&rgba, w, h) {
+            Codes::One(text, at) => {
+                assert_eq!(&*text, FIXTURE_TEXT);
+                let (from, to) = (20, (4 + FIXTURE.len() as i32) * 5);
+                assert!(
+                    (at.left - from).abs() <= 8 && (at.right - to).abs() <= 8,
+                    "{at:?} is not where the code is in the picture"
+                );
+            }
+            other => panic!("the rounded code came back as {other:?}"),
+        }
     }
 
     /// A QR code that is not the whole buffer is still found -- which is the
