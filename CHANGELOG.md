@@ -15,6 +15,22 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.30 - 2026-11-16
+
+> A security release: nothing in the app changed, only the libraries it is
+> built from.
+
+### Security
+
+- rustls moves to 0.23.46 (RUSTSEC-2026-0346, -0347, -0348, -0349),
+  rustls-webpki to 0.103.17 (RUSTSEC-2026-0382) and webpki-roots to 1.0.12
+  (RUSTSEC-2026-0381). Every connection Deskwarden makes goes through these.
+- zip moves from 2 to 9 (RUSTSEC-2026-0367, -0368, -0369, -0429). The flaws
+  are in archive extraction, which Deskwarden never calls -- it reads one file
+  out of Bitwarden's own `bw` download -- but the old version no longer gets
+  fixes.
+- clipboard-win 5.4.1 was withdrawn by its author; 5.4.3 replaces it.
+
 ## 0.15.29 - 2026-11-16
 
 > 0.15.28 was tagged but never released: its build stopped on a test the
