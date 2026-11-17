@@ -2787,6 +2787,7 @@ pub mod tests {
     /// passphrase reads one local file and nothing else.
     #[test]
     fn a_password_and_a_passphrase_are_both_generated_locally() {
+        crate::password_gen::installed_list::beside_this_test();
         let (mut server, backend) = logged_in();
         // Default expectation, not `expect(0)` -- see the note in
         // `an_archive_sends_a_batch_of_one_and_reads_the_answer_back`.

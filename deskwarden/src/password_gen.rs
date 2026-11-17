@@ -968,6 +968,43 @@ fn verify(text: &str) -> Result<Vec<String>, PasswordGenError> {
     Ok(words)
 }
 
+/// The installed layout, made by the test that needs it.
+///
+/// [`generate_passphrase`] reads the list from beside the running executable,
+/// and its tests call it for real -- file search, verification and all --
+/// rather than a decomposed half of it. `build.rs` used to put the list
+/// beside the test binaries, in `<target>/<profile>/deps`. **Cargo 1.100 moved
+/// them** into a per-unit folder under `build/` whose name the build script
+/// cannot know, and every one of these tests went red on CI with
+/// `WordlistMissing` while passing on an older local toolchain. So the test
+/// lays the file down itself, from `assets/` -- the very file the installer
+/// ships -- once per test process, and the function under test is unchanged.
+#[cfg(test)]
+pub(crate) mod installed_list {
+    /// Puts `assets/wordlist.txt` beside this test binary, once per process.
+    pub(crate) fn beside_this_test() {
+        static DONE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        DONE.get_or_init(|| {
+            let exe = std::env::current_exe().unwrap();
+            let dir = exe.parent().unwrap();
+            let dest = dir.join(super::WORDLIST_FILE);
+            let shipped =
+                std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/wordlist.txt"))
+                    .expect("the shipped word list");
+            if std::fs::read(&dest).ok().as_deref() == Some(&shipped[..]) {
+                return;
+            }
+            // Written under a name of its own and then renamed, so a reader
+            // never meets a half-written list.
+            let staged = dir.join(format!("{}.{}.part", super::WORDLIST_FILE, std::process::id()));
+            std::fs::write(&staged, &shipped).expect("stage the word list");
+            if std::fs::rename(&staged, &dest).is_err() {
+                let _ = std::fs::remove_file(&staged);
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1723,6 +1760,7 @@ mod tests {
     /// buffer or a clock seed, the same one the password side carries.
     #[test]
     fn two_passphrases_in_a_row_are_not_the_same() {
+        super::installed_list::beside_this_test();
         let recipe = PassphraseRecipe::default();
         let first = generate_passphrase(&recipe).expect("the shipped list");
         let second = generate_passphrase(&recipe).expect("the shipped list");
@@ -1735,6 +1773,7 @@ mod tests {
     /// it -- never down to a shorter passphrase than was asked for.
     #[test]
     fn the_word_count_is_honoured_and_clamped_up_to_three() {
+        super::installed_list::beside_this_test();
         for (asked, expected) in [(0u32, 3usize), (1, 3), (3, 3), (4, 4), (9, 9)] {
             let recipe = PassphraseRecipe {
                 words: asked,
@@ -1756,6 +1795,7 @@ mod tests {
     /// [`normalize`] records for a password's length.
     #[test]
     fn an_absurd_word_count_is_bounded_instead_of_allocating_forever() {
+        super::installed_list::beside_this_test();
         let recipe = PassphraseRecipe {
             words: u32::MAX,
             separator: "-".to_string(),
@@ -1771,6 +1811,7 @@ mod tests {
     /// the two literal words that are not separators at all.
     #[test]
     fn the_separator_is_the_one_the_recipe_documents() {
+        super::installed_list::beside_this_test();
         let phrase = |separator: &str| {
             let recipe = PassphraseRecipe {
                 words: 4,
@@ -1802,6 +1843,7 @@ mod tests {
     /// else, and with it off the passphrase is all lowercase.
     #[test]
     fn capitalize_raises_the_first_letter_of_every_word_and_only_that() {
+        super::installed_list::beside_this_test();
         for _ in 0..200 {
             let recipe = PassphraseRecipe {
                 words: 5,
@@ -1834,6 +1876,7 @@ mod tests {
     /// none there when it is off.
     #[test]
     fn include_number_adds_exactly_one_digit_and_none_when_off() {
+        super::installed_list::beside_this_test();
         let base = PassphraseRecipe {
             words: 4,
             separator: "-".to_string(),
@@ -1875,6 +1918,7 @@ mod tests {
     /// the last bin, 500% out.
     #[test]
     fn the_included_number_lands_on_every_word_not_just_the_last() {
+        super::installed_list::beside_this_test();
         const WORDS: usize = 6;
         const ROUNDS: usize = 8_000;
         let recipe = PassphraseRecipe {
@@ -1913,6 +1957,7 @@ mod tests {
     /// A generator that only ever appended `7` would pass the position test.
     #[test]
     fn the_included_digit_reaches_all_ten_values() {
+        super::installed_list::beside_this_test();
         let recipe = PassphraseRecipe {
             words: 3,
             separator: "-".to_string(),
@@ -1937,6 +1982,7 @@ mod tests {
     /// refused there. This is the wiring `RestBackend::generate` depends on.
     #[test]
     fn the_dispatch_generates_a_passphrase_rather_than_refusing_it() {
+        super::installed_list::beside_this_test();
         let phrase = generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
             .expect("a passphrase");
         // The default recipe: four words, `-`, capitalised, with a number.
