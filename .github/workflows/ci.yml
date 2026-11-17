@@ -324,8 +324,16 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # **1.99.1, not stable, for this job only.** Rust 1.100 (2026-11-09)
+      # moved test binaries from `target/<profile>/deps` into per-unit folders
+      # under `build/`, and cargo-llvm-cov 0.9.1 -- the latest when this was
+      # written -- then reports "no coverage data found" for every one of
+      # them while all the tests pass. Every other job stays on stable, so
+      # the code is still built and tested on the newest compiler; only the
+      # measurement waits. Return this to `stable` once a cargo-llvm-cov
+      # release reads the new layout.
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.1
         with:
           components: llvm-tools-preview
 
