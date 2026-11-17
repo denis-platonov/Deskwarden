@@ -15,6 +15,94 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
+## 0.15.28 - 2026-11-16
+
+### Share a record with a person
+
+A record can now be shared with someone, not only sent. `Share` on the read
+pane opens design 6a's dialog: invite a person by email, check their
+fingerprint phrase -- Bitwarden's own, from the EFF long list -- and the record
+moves into an organisation the two of you hold, with nothing left under your
+key alone. The `SHARING` card lists who can see a record; stopping the last
+share brings it home. A person can be re-invited or forgotten, and forgetting
+someone first stops everything shared with them.
+
+On the other side, `Shared with me` lists records people share with you,
+read-only where they are, and an invitation is accepted by pasting its link.
+A sharer is named only when the server attests who owns what is shared;
+otherwise the name is marked unverified. Invitations, files and moves go over
+Bitwarden's own routes, so sharing works against any Bitwarden-compatible
+server, and Deskwarden uses an organisation it did not create only after you
+say yes. `Share anyway` and a re-invite ask for the master password first.
+
+### Sends remember what went to whom
+
+`Send a record` asks who it is for and remembers them. The Sent screen is the
+list of what went to whom -- in the records list's shape, with each record's
+icon -- and says `Opened` once somebody has opened a Send. A Send can be
+extended by a week from there, and a record's own `Revoke` deletes its Send
+after asking. A record is sent whole unless advanced sharing is on.
+
+### The right login for the page in the browser
+
+In a browser the fill hotkey reads the address bar and matches it against each
+login's saved websites by Bitwarden's own rules, including `localhost` and IP
+addresses on any port. The login saved most exactly for the page is offered
+first, and a login whose saved website refuses the page is never brought back
+by the window title. The read is the browser's own address field: a page
+cannot plant a look-alike one, and an address the browser only half shows does
+not refuse a login.
+
+### The daemon owns the vault
+
+The background process holds the vault, and the window reads it from there, as
+Bitwarden's `bw serve` is read. A window opens without reading the vault a
+second time, live updates live in one place, and a window whose background
+process has gone says so and closes.
+
+### The account picker and fills
+
+- `Up` and `Down` move between rows on the fill cards, and `Enter` fills the
+  highlighted one.
+- A record picked in the account picker is typed into the window you are in,
+  and a password or one-time code goes into the rule's window whichever box
+  has focus.
+- A refused fill is told on Deskwarden's own notice card, not a system message
+  box.
+
+### Screens
+
+- The details screen shows an item's custom fields, and a card's bank (by
+  name) and billing ZIP. The edit form's card details are three rows with
+  their buttons inline, plus a PIN.
+- Card logos fill one Visa-shaped box with the same padding each, and can also
+  be read from `%APPDATA%\Deskwarden\brand-marks`.
+- An item's icon is the first of its websites that has one, and follows edits.
+- A long note stays inside its box, which grows to hold it.
+- Menu entries stay on one line. Drop-downs share one chevron, and an open one
+  no longer jumps under the pointer or shows a scroll bar.
+- Framed `Add` buttons with room between them, bold modal titles, and settings
+  descriptions with room between their lines.
+- Password health: the header is the item list's height, and each reused row
+  names the other items on its password.
+- The update line sits level with its button, and the Sends notices lose the
+  stray bar beside them.
+- Messages use a dash where they used `--`.
+- The taskbar shows the same full shield for every Deskwarden window, sharp at
+  any scaling.
+
+### Fixes
+
+- A setup QR code that drew unevenly on screen, or carried a logo address, now
+  reads.
+- An empty field's caret is as tall as a filled one's.
+- A record with a saved sequence still offers its username, password and
+  one-time code.
+- Nothing is wrapped to an RSA key shorter than 2048 bits, and the log never
+  carries a URL's query string.
+- A test copy can run beside your own under `DESKWARDEN_PROFILE` without
+  touching it.
+
 ## 0.15.27 - 2026-09-26
 
 ### Changes made in other Bitwarden apps show up on their own
