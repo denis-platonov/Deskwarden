@@ -3123,7 +3123,29 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (29244, 0x4c2d_ba2e_4811_0cdd) exactly, so it is measuring
             // what this test measures.
-            (29248, 0x5d24_e867_c1c1_cbf1_u64),
+            // **29705 bytes, new hash: ONE DEPENDENCY MOVED A MAJOR VERSION.**
+            // `zip` goes from `"2"` with `["deflate"]` to `"9"` with
+            // `["deflate-flate2"]`, still from crates.io, no path, no git source,
+            // no `[patch]`. RUSTSEC-2026-0367/-0368/-0369/-0429 are fixed only from
+            // 9.0.0; the feature is renamed because 9's `deflate` also brings a
+            // compressor this crate never uses. In `Cargo.lock`: `arbitrary`,
+            // `derive_arbitrary` and `zopfli` leave; `constant_time_eq`,
+            // `typed-path`, `zeroize_derive` and the unix-only `nix` arrive.
+            // `cargo deny check` passes advisories, bans, licenses and sources with
+            // no change to `deny.toml`. 29248 -> 29705 bytes: the version string,
+            // the feature name and the comment above the entry.
+            //
+            // Nothing else moved: no other dependency was re-pointed or re-featured,
+            // no `[patch]`/`[replace]`/`[workspace.dependencies]` table appeared, and
+            // `[build-dependencies]` still reads exactly `winresource = "0.1"`.
+            //
+            // Recomputed the way every hop above records -- FNV-1a/64 over the file
+            // with CRLF normalised to LF, in a separate implementation outside this
+            // crate -- rather than copied out of the failure message. That
+            // implementation was first run against the PREVIOUS pinned pair and
+            // reproduced (29248, 0x5d24_e867_c1c1_cbf1) exactly, so it is measuring
+            // what this test measures.
+            (29705, 0x4aa8_7de6_069f_58b7_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

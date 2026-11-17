@@ -438,7 +438,14 @@ rsa = "0.9"
 # (`signature::verify_authenticode`) before it is copied to the install path,
 # and it is never run -- not even `bw --version` -- so a malformed archive
 # yields a refusal, not a process.
-zip = { version = "2", default-features = false, features = ["deflate"] }
+#
+# **9, not 2** (0.15.30): RUSTSEC-2026-0367, -0368, -0369 and -0429 are fixed
+# only from 9.0.0. All four are in `extract`/`ZipStreamReader`, which this
+# crate never calls -- it reads one entry by index -- but the fixed version is
+# the honest answer to an audit, not an exemption. `deflate-flate2` rather
+# than 9's `deflate`, which now also brings the zopfli COMPRESSOR and zlib-rs;
+# reading needs only the decompressor this crate already had.
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 # The address bar's text as a URL (src/browser_url.rs), and a login's saved
 # websites parsed into the same type (src/uri_match.rs), so the page and the
 # saved website are compared as hosts and ports rather than as strings.
