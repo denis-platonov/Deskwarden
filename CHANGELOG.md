@@ -15,7 +15,11 @@ Builds from this section report their version with a `-dev` suffix -- see
 `-dev`, the build is from the working tree and not from a
 [GitHub release](https://github.com/denis-platonov/deskwarden/releases).
 
-## 0.15.28 - 2026-11-16
+## 0.15.29 - 2026-11-16
+
+> 0.15.28 was tagged but never released: its build stopped on a test the
+> newest Rust toolchain broke, not on anything in the app. This is that
+> release, with the test fixed.
 
 ### Share a record with a person
 

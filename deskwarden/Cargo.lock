@@ -761,7 +761,7 @@ dependencies = [
 
 [[package]]
 name = "deskwarden"
-version = "0.15.29-dev"
+version = "0.15.29"
 dependencies = [
  "aes",
  "aes-gcm",
