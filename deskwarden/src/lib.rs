@@ -93,6 +93,9 @@ pub mod item_icon;
 pub mod job_object;
 pub mod key_sequence;
 pub mod kind_mark;
+/// The v2 design's widget kit: tokens, motion, icons, controls, cards, tips
+/// and toasts. Screens move onto it slice by slice; `theme` stays the v1 look.
+pub mod kit;
 pub mod loading_ui;
 /// Civil dates, and the one place a stored UTC instant becomes the wall clock
 /// the user is reading. Store UTC, display local, never print "UTC".
