@@ -22,6 +22,7 @@
 //! cargo run --example ui_preview -- --sends --screenshot        # design 5b's Sends screen, six states
 //! cargo run --example ui_preview -- --totp --screenshot         # designs 6a/6c/6d, the add-a-code card, seven states
 //! cargo run --example ui_preview -- --edit --screenshot         # design 8a's Edit login form, five states
+//! cargo run --example ui_preview -- --kit --screenshot          # the v2 kit sheet (1.0 redesign)
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
 //!
@@ -631,6 +632,12 @@ enum Surface {
     /// [`Surface::ProgressBarCycle`] is drawn through `paint_progress_bar`:
     /// a second drawing of the marks could drift from the shipped one.
     ItemKindMarks,
+    /// **The v2 kit, every piece on one sheet**: both sidebars, the mark ramp,
+    /// switches, segments, buttons, a card with tags, a help bubble, a hint
+    /// and a toast. Slice 1 of the 1.0 redesign; held beside design 1a/1c.
+    /// Every piece is drawn through `kit`'s own calls, so nothing here is a
+    /// second drawing that could drift.
+    KitSheet,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -866,6 +873,7 @@ const ALL: &[Surface] = &[
     Surface::VaultListWide,
     Surface::VaultListKinds,
     Surface::ItemKindMarks,
+    Surface::KitSheet,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -952,6 +960,7 @@ impl Surface {
             Surface::VaultListWide => "vault_item_list_wide",
             Surface::VaultListKinds => "vault_item_list_kinds",
             Surface::ItemKindMarks => "item_kind_marks",
+            Surface::KitSheet => "kit_sheet",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1118,6 +1127,7 @@ impl Surface {
             Surface::VaultListKinds => egui::vec2(LIST_WIDTH, 620.0),
             // A sheet, not a pane: its size is what the sheet needs.
             Surface::ItemKindMarks => egui::vec2(LIST_WIDTH, 360.0),
+            Surface::KitSheet => egui::vec2(1280.0, 900.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1201,6 +1211,7 @@ fn main() -> eframe::Result {
     // The kind marks and the odd-shaped favicons, together: the two
     // reports they answer were filed together and are looked at together.
     let kinds = arg("--kinds");
+    let kit = arg("--kit");
     let rail = arg("--rail");
     let health = arg("--health");
     // Design 5b's Sends screen, in every state that has a different SHAPE:
@@ -1244,6 +1255,8 @@ fn main() -> eframe::Result {
         vec![Surface::LoginUnlock]
     } else if kinds {
         vec![Surface::VaultListKinds, Surface::ItemKindMarks, Surface::LoginDetailFavicon]
+    } else if kit {
+        vec![Surface::KitSheet]
     } else if list {
         vec![Surface::VaultList]
     } else if rail {
@@ -1334,6 +1347,8 @@ fn main() -> eframe::Result {
         // A DIRECTORY: this flag renders the rows and the mark sheet, and the
         // pair is only useful together.
         target_dir().join("ui_preview_kinds")
+    } else if kit {
+        target_dir().join("ui_preview_kit.png")
     } else if list {
         target_dir().join("ui_preview_vault_item_list.png")
     } else if rail {
@@ -1677,6 +1692,7 @@ impl eframe::App for Preview {
             Surface::VaultListWide => self.draw_vault_list_wide(root),
             Surface::VaultListKinds => self.draw_vault_list_kinds(root),
             Surface::ItemKindMarks => draw_item_kind_marks(root),
+            Surface::KitSheet => draw_kit_sheet(root),
             Surface::LoginDetailFavicon => {
                 self.draw_pane(root, PaneKind::Detail(DetailShot::LoginFavicon))
             }
@@ -3393,6 +3409,132 @@ fn rehearsal_view() -> scratch_window::RehearsalView {
 /// the question the report asks is not "is this a nice key" but "can a note,
 /// an identity, an SSH key and a card be told apart at 32pt -- from each
 /// other, and from the letters a login still shows".
+/// **The v2 kit sheet**: everything slice 1 of the 1.0 redesign built, drawn
+/// through `kit`'s own calls, to hold beside the design (artboards 1a and 1c).
+fn draw_kit_sheet(root: &mut egui::Ui) {
+    use deskwarden::kit::{card, controls, icon, tips, toast, tokens};
+    use egui::{pos2, vec2, CornerRadius, Rect, UiBuilder};
+
+    let p = tokens::palette(root.ctx());
+    let area = root.max_rect();
+    root.painter().rect_filled(area, CornerRadius::ZERO, p.window_bg);
+
+    // 1. Both sidebars, side by side.
+    for (i, style) in [tokens::SidebarStyle::Navy, tokens::SidebarStyle::Light].into_iter().enumerate() {
+        let sb = style.palette();
+        let strip = Rect::from_min_size(area.min + vec2(24.0 + i as f32 * 268.0, 24.0), vec2(252.0, 400.0));
+        root.painter().rect_filled(strip, CornerRadius::same(tokens::R_CARD), sb.bg);
+        root.scope_builder(UiBuilder::new().max_rect(strip.shrink2(vec2(14.0, 22.0))), |ui| {
+            ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
+            ui.horizontal(|ui| {
+                ui.add_space(10.0);
+                let (mark, _) = ui.allocate_exact_size(vec2(28.0, 32.0), egui::Sense::hover());
+                theme::paint_mark_colours(ui.painter(), mark, theme::mark_on_sidebar(sb.q1));
+                ui.add_space(11.0);
+                ui.label(tokens::job(tokens::WORDMARK, "Deskwarden", sb.text));
+            });
+            ui.add_space(18.0);
+            let (new_item, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), egui::Sense::hover());
+            ui.painter().rect_filled(new_item, CornerRadius::same(12), sb.new_bg);
+            let plus = Rect::from_min_size(new_item.min + vec2(16.0, 14.0), vec2(18.0, 18.0));
+            icon::stroke(ui.painter(), plus, icon::glyph::PLUS, 2.4, sb.new_fg);
+            let label = ui.painter().layout_job(tokens::job(tokens::BUTTON, "New item", sb.new_fg));
+            ui.painter().galley(pos2(plus.right() + 10.0, new_item.center().y - label.size().y / 2.0), label, sb.new_fg);
+            ui.add_space(18.0);
+            ui.horizontal(|ui| {
+                ui.add_space(12.0);
+                card::section_label(ui, "Vault", sb.muted);
+            });
+            for (row, (glyph, name, count, active)) in [
+                (icon::glyph::ALL, "All items", "12", true),
+                (icon::glyph::FAV, "Favorites", "3", false),
+                (icon::glyph::LOGIN, "Logins", "9", false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), egui::Sense::hover());
+                let fg = if active { sb.active_fg } else { sb.nav_fg };
+                if active {
+                    ui.painter().rect_filled(rect, CornerRadius::same(12), sb.active);
+                }
+                let glyph_rect = Rect::from_min_size(rect.min + vec2(12.0, 12.5), vec2(19.0, 19.0));
+                icon::stroke(ui.painter(), glyph_rect, glyph, 2.0, fg);
+                let text = ui.painter().layout_job(tokens::job(tokens::NAV, name, fg));
+                ui.painter().galley(pos2(glyph_rect.right() + 12.0, rect.center().y - text.size().y / 2.0), text, fg);
+                let n = ui.painter().layout_job(tokens::job(tokens::LABEL, count, fg.gamma_multiply(0.7)));
+                ui.painter().galley(pos2(rect.right() - 12.0 - n.size().x, rect.center().y - n.size().y / 2.0), n, fg);
+                let _ = row;
+            }
+            ui.add_space(12.0);
+            let (lock, _) = ui.allocate_exact_size(vec2(ui.available_width(), 44.0), egui::Sense::hover());
+            let glyph_rect = Rect::from_min_size(lock.min + vec2(12.0, 12.5), vec2(19.0, 19.0));
+            icon::stroke(ui.painter(), glyph_rect, icon::glyph::LOCK, 2.0, sb.nav_fg);
+            let text = ui.painter().layout_job(tokens::job(tokens::NAV, "Lock", sb.nav_fg));
+            ui.painter().galley(pos2(glyph_rect.right() + 12.0, lock.center().y - text.size().y / 2.0), text, sb.nav_fg);
+        });
+    }
+
+    // 2. The mark ramp, then reversed on deep blue.
+    let mut x = area.left() + 580.0;
+    let base = area.top() + 24.0 + 56.0;
+    for (w, h) in [(48.0, 56.0), (32.0, 37.0), (22.0, 26.0), (14.0, 16.0)] {
+        theme::paint_mark(root.painter(), Rect::from_min_size(pos2(x, base - h), vec2(w, h)));
+        x += w + 26.0;
+    }
+    let tile = Rect::from_min_size(pos2(x + 10.0, area.top() + 24.0), vec2(92.0, 92.0));
+    root.painter().rect_filled(tile, CornerRadius::same(24), p.blue_deep);
+    theme::paint_mark_colours(root.painter(), Rect::from_center_size(tile.center(), vec2(46.0, 53.0)), theme::MARK_REVERSED);
+
+    // 3-6. Controls, a card, help and a hint, laid out to the right.
+    let column = Rect::from_min_max(pos2(area.left() + 580.0, area.top() + 140.0), pos2(area.right() - 24.0, area.bottom() - 110.0));
+    root.scope_builder(UiBuilder::new().max_rect(column), |ui| {
+        ui.spacing_mut().item_spacing = vec2(12.0, 14.0);
+        ui.horizontal(|ui| {
+            let (mut on, mut off) = (true, false);
+            controls::switch(ui, &mut on);
+            controls::switch(ui, &mut off);
+            controls::segmented(ui, &["Light", "Dark", "System"], 2, controls::SEG_SETTINGS);
+        });
+        ui.horizontal(|ui| {
+            controls::button(ui, controls::ButtonKind::Primary, controls::LARGE, "Save", None);
+            controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, "Cancel", None);
+            controls::button(ui, controls::ButtonKind::Tinted, controls::SMALL, "Generate", Some(icon::glyph::GEN));
+            controls::button(ui, controls::ButtonKind::Danger, controls::ROW, "Delete forever", None);
+        });
+        card::card(ui, tokens::R_CARD, egui::Margin::symmetric(24, 18), |ui| {
+            ui.set_width(560.0);
+            card::field_label(ui, "Username");
+            ui.label(tokens::job(tokens::FIELD_VALUE, "a.novak", p.ink));
+            card::row_rule(ui);
+            ui.horizontal(|ui| {
+                card::field_label(ui, "Fills in");
+                let dot = tips::help_dot(ui, egui::Id::new("sheet-tip"), "", 260.0).rect;
+                tips::paint_help_bubble(
+                    ui,
+                    dot,
+                    "Deskwarden fills these apps and sites when you press the shortcut.",
+                    260.0,
+                );
+            });
+            ui.horizontal(|ui| {
+                for size in [card::TagSize::List, card::TagSize::Detail] {
+                    card::tag(ui, card::TagKind::App, size);
+                    card::tag(ui, card::TagKind::TwoFa, size);
+                    card::tag(ui, card::TagKind::Shared, size);
+                }
+            });
+        });
+        ui.add_space(60.0);
+        let search = ui.allocate_exact_size(vec2(60.0, 26.0), egui::Sense::hover()).0;
+        ui.painter().rect_stroke(search, CornerRadius::same(6), egui::Stroke::new(1.0, p.kbd_border), egui::StrokeKind::Inside);
+        tips::paint_hint(ui, search, "Quick search", &["Mod", "K"]);
+    });
+
+    // 7. A toast, at the bottom.
+    toast::paint_message(root.ctx(), "Folder created");
+}
+
 fn draw_item_kind_marks(root: &mut egui::Ui) {
     theme::paint_window_background(root);
     egui::Frame::new()

@@ -69,13 +69,21 @@ pub fn paint(ctx: &egui::Context) {
         // Settled: wake once more when it is due to leave.
         ctx.request_repaint_after(std::time::Duration::from_secs_f64(remaining));
     }
-    let pose = motion::toast(OVERSHOOT.at(entered).min(1.0));
-    let opacity = pose.opacity.clamp(0.0, 1.0);
+    paint_at(ctx, &toast.message, motion::toast(OVERSHOOT.at(entered).min(1.0)));
+}
 
+/// Paints `message` as a toast, fully shown, whatever is or is not up: for
+/// the kit sheet and for tests.
+pub fn paint_message(ctx: &egui::Context, message: &str) {
+    paint_at(ctx, message, motion::Pose::REST);
+}
+
+fn paint_at(ctx: &egui::Context, message: &str, pose: motion::Pose) {
+    let opacity = pose.opacity.clamp(0.0, 1.0);
     let p = palette(ctx);
     let white = Color32::WHITE.gamma_multiply(opacity);
     let role = Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 };
-    let mut job: LayoutJob = tokens::job(role, &toast.message, white);
+    let mut job: LayoutJob = tokens::job(role, message, white);
     job.wrap.max_width = MAX_WIDTH - PAD_LEFT - BADGE - GAP - PAD_RIGHT;
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
