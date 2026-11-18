@@ -264,6 +264,11 @@ pub fn job(role: Role, text: &str, color: Color32) -> egui::text::LayoutJob {
     job
 }
 
+/// The height of one line set in `role`, as laid out in `ctx`.
+pub fn font_height(ctx: &egui::Context, role: Role) -> f32 {
+    ctx.fonts_mut(|f| f.layout_job(job(role, "Ag", Color32::BLACK)).size().y)
+}
+
 /// A card's soft drop shadow: `0 1px 3px rgba(32,30,29,.06)`.
 pub fn card_shadow() -> Shadow {
     Shadow {
