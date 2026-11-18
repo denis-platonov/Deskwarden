@@ -6,4 +6,5 @@
 //! `docs/superpowers/specs/2026-11-18-deskwarden-1-0-redesign-design.md`).
 //! The spec these values come from is `docs/design/deskwarden-v2-design-spec.md`.
 
+pub mod motion;
 pub mod tokens;
