@@ -12,4 +12,5 @@ pub mod icon;
 pub mod motion;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod tips;
 pub mod tokens;
