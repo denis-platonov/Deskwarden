@@ -26,7 +26,10 @@ fn collect(shape: &Shape, out: &mut Painted) {
             let color = t.override_text_color.unwrap_or_else(|| {
                 t.galley.job.sections.first().map(|s| s.format.color).unwrap_or(t.fallback_color)
             });
-            out.texts.push((t.galley.text().to_string(), color, t.visual_bounding_rect()));
+            // What was DRAWN, glyph by glyph: an elided run's `text()` is
+            // still the whole string, but its glyphs end in the ellipsis.
+            let drawn: String = t.galley.rows.iter().flat_map(|row| row.glyphs.iter().map(|g| g.chr)).collect();
+            out.texts.push((drawn, color, t.visual_bounding_rect()));
         }
         Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
         _ => {}
