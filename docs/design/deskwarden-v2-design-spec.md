@@ -66,10 +66,16 @@ These rules override anything in parts A to D that conflicts with them.
 | Sidebar | Navy and Light, chosen by a setting (General > Look), Navy by default |
 | Delivery | Built on branch `v1`, slice by slice, each green and previewable; merged and released as one 1.0.0 |
 | Version | 1.0.0 (the design's "2.0.1" is mock copy) |
+| D1 logos | Bundled, as recommended below |
+| D2 dark mode | Derived from the v2 tokens, as recommended below; reviewed in previews |
+| D3 Send | Bitwarden's own Send, as recommended below |
+| D9 tray | Popup on left click, short native menu on right click, as recommended below |
 
-### 0.2 Decisions still open
+### 0.2 Open questions and their recommendations
 
-Each item gives a recommendation. It is decided before the slice that needs it.
+D1, D2, D3 and D9 were decided as recommended (see 0.1). D4 to D8 follow
+their recommendation unless the owner changes it before the slice that needs
+it.
 
 | # | Question | Recommendation |
 |---|---|---|
