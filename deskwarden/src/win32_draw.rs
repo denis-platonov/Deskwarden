@@ -1075,9 +1075,9 @@ pub fn draw_button_with_return(
 pub struct Lockup {
     pub mark_h: i32,
     pub mark_w: i32,
-    /// The optical gap between the shield and the word. Wider than it looks
-    /// it should be because the artboard pads the shield's ink by two of its
-    /// own units on every side -- see [`crate::theme::mark_ink_rect`].
+    /// The optical gap between the shield and the word. The artboard pads
+    /// the shield's ink a little on every side (under a unit since the v2
+    /// shape) -- see [`crate::theme::mark_ink_rect`].
     pub gap: i32,
     pub word_w: i32,
     pub word_px: i32,

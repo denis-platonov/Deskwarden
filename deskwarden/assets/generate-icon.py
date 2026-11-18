@@ -4,7 +4,7 @@
 The icon is generated rather than drawn by hand so it is reproducible and
 reviewable as source: there is no binary asset here whose provenance or
 licensing anyone has to take on trust. The mark is the quartered shield from
-the design document committed at docs/design/Deskwarden.dc.html (section 3g): four
+the v2 design document, docs/design/Deskwarden v2.dc.html (artboard 1c): four
 quadrants in four values of one blue -- one quarter per vault kind (logins,
 passkeys, cards, notes) -- reading as a single blue shield at icon size. It
 is *not* derived from Bitwarden's branding (this project is unofficial and
@@ -49,15 +49,18 @@ PNG_SIZE = 256
 
 
 # The design's SVG viewbox is 24 wide by 28 tall; all the geometry below is
-# in that coordinate space. Shield body: x in [2, 22], top edge at y=2 with
-# rounded corners of radius 2.4, straight sides down to y=14, then two
-# mirrored cubic curves meeting at the bottom point (12, 26).
-CORNER_RADIUS = 2.4
+# in that coordinate space. The v2 shield (design 1c, `Deskwarden v2.dc.html`):
+# body x in [0.5, 23.5], top edge at y=1 with rounded corners of radius 5,
+# straight sides down to y=14, then two mirrored cubic curves meeting at the
+# bottom point (12, 27.2). theme.rs paints the same four paths (MARK_TL ..
+# MARK_BR) at runtime.
+LEFT, RIGHT, TOP, MID, TIP = 0.5, 23.5, 1.0, 14.0, 27.2
+CORNER_RADIUS = 5.0
 
-# The bottom-left edge, from the design's `C6.6 23.2, 3.2 19.4, 2 14` cubic:
-# P0=(12,26) -> P3=(2,14) with control points (6.6,23.2) and (3.2,19.4). The
+# The bottom-left edge, from the design's `C5 25.4 .9 21 .5 14` cubic:
+# P0=(12,27.2) -> P3=(0.5,14) with control points (5,25.4) and (0.9,21). The
 # bottom-right edge is its mirror around x=12.
-_BOTTOM_CUBIC = ((12.0, 26.0), (6.6, 23.2), (3.2, 19.4), (2.0, 14.0))
+_BOTTOM_CUBIC = ((12.0, TIP), (5.0, 25.4), (0.9, 21.0), (LEFT, MID))
 
 
 def _cubic_point(t: float):
@@ -72,7 +75,7 @@ def _cubic_point(t: float):
 def _left_edge_at(y: float) -> float:
     """X of the shield's left edge at height y in the curved lower section.
 
-    y(t) on the cubic is monotonic (26 down to 14), so plain bisection on t
+    y(t) on the cubic is monotonic (27.2 down to 14), so plain bisection on t
     converges; 40 iterations is far below a supersampled pixel at 256 px.
     """
     lo, hi = 0.0, 1.0
@@ -89,19 +92,19 @@ def _left_edge_at(y: float) -> float:
 
 def inside_shield(sx: float, sy: float) -> bool:
     """True if the viewbox-space point is inside the quartered shield body."""
-    if not (2.0 <= sy <= 26.0):
+    if not (TOP <= sy <= TIP):
         return False
 
     # Upper section: a rectangle with two rounded top corners.
-    if sy <= 14.0:
-        if not (2.0 <= sx <= 22.0):
+    if sy <= MID:
+        if not (LEFT <= sx <= RIGHT):
             return False
-        if sy < 2.0 + CORNER_RADIUS:
-            for cx in (2.0 + CORNER_RADIUS, 22.0 - CORNER_RADIUS):
-                near_left = sx < 2.0 + CORNER_RADIUS and cx < 12.0
-                near_right = sx > 22.0 - CORNER_RADIUS and cx > 12.0
+        if sy < TOP + CORNER_RADIUS:
+            for cx in (LEFT + CORNER_RADIUS, RIGHT - CORNER_RADIUS):
+                near_left = sx < LEFT + CORNER_RADIUS and cx < 12.0
+                near_right = sx > RIGHT - CORNER_RADIUS and cx > 12.0
                 if near_left or near_right:
-                    dx, dy = sx - cx, sy - (2.0 + CORNER_RADIUS)
+                    dx, dy = sx - cx, sy - (TOP + CORNER_RADIUS)
                     return dx * dx + dy * dy <= CORNER_RADIUS * CORNER_RADIUS
         return True
 
@@ -115,7 +118,7 @@ def sample(x: float, y: float):
     sx, sy = x * 24.0, y * 28.0
     if not inside_shield(sx, sy):
         return (0, 0, 0, 0)
-    key = ("t" if sy < 14.0 else "b") + ("l" if sx < 12.0 else "r")
+    key = ("t" if sy < MID else "b") + ("l" if sx < 12.0 else "r")
     return (*QUADRANT_RGB[key], 255)
 
 

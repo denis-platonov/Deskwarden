@@ -849,6 +849,11 @@ pub fn apply(ctx: &egui::Context) {
 /// is a bug in this file" does not hold: the mismatch is the fix, and
 /// `quadrant_tones_alternate_around_the_mark` locks it in so it cannot be
 /// quietly reverted to palette order.
+///
+/// **Kept on the v2 shape (owner decision, 2026-11-18).** The v2 brand artboard
+/// lays the four values out in palette order again (Deep, Brand / Bright,
+/// Light). The owner chose the v2 geometry with these checkerboard fills, for
+/// the reason above, which holds just as much for the wider v2 body.
 /// **Public because the mark is painted by two renderers, not one.**
 /// `unlock_prompt` draws the same shield through GDI `Polygon` with no egui
 /// anywhere in the process, and it reads the fills and the outlines from here
@@ -857,27 +862,33 @@ pub fn apply(ctx: &egui::Context) {
 /// a cross-renderer copy is the version of it nobody would notice drifting.
 pub const QUADRANT_FILLS: [Color32; 4] = [BLUE_DEEP, BLUE_BRIGHT, BLUE_SOFT, BLUE];
 
-/// Kappa for approximating a 90° circular arc with one cubic Bézier,
-/// pre-multiplied by the design's 2.4-unit corner radius.
-const ARC_K: f32 = 0.552_285 * 2.4;
+/// The mark reversed onto a navy or brand-blue ground (design 1c's app-icon
+/// tiles, and the sign-in, lock and splash screens): white, then the three
+/// lighter blues. Reading order, as [`QUADRANT_FILLS`].
+pub const MARK_REVERSED: [Color32; 4] = [Color32::WHITE, BLUE_EDGE, BLUE_SOFT, BLUE_BRIGHT];
 
-/// Flattens one cubic Bézier into `steps` points (excluding the start point,
-/// including the end point), appending to `out`.
-fn flatten_cubic(out: &mut Vec<Pos2>, p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, steps: usize) {
-    for i in 1..=steps {
-        let t = i as f32 / steps as f32;
-        let u = 1.0 - t;
-        let x =
-            u * u * u * p0.x + 3.0 * u * u * t * p1.x + 3.0 * u * t * t * p2.x + t * t * t * p3.x;
-        let y =
-            u * u * u * p0.y + 3.0 * u * u * t * p1.y + 3.0 * u * t * t * p2.y + t * t * t * p3.y;
-        out.push(Pos2::new(x, y));
-    }
+/// The mark in the v2 sidebar's lockup: `q1` (white on Navy, deep blue on
+/// Light) then bright, soft and edge blue, as design 1a draws it.
+pub const fn mark_on_sidebar(q1: Color32) -> [Color32; 4] {
+    [q1, BLUE_BRIGHT, BLUE_SOFT, BLUE_EDGE]
 }
 
+/// The v2 shield's top-left quadrant (design 1c), exactly as the design's
+/// SVG draws it. The v2 shape is wider than v1's (x 0.5..23.5 against 2..22),
+/// rounds its top corners at 5 rather than 2.4, and reaches a deeper tip
+/// (y 27.2 against 26).
+pub const MARK_TL: &str = "M12 1H5.5A5 5 0 0 0 .5 6v8H12Z";
+/// The v2 shield's top-right quadrant.
+pub const MARK_TR: &str = "M12 1h6.5a5 5 0 0 1 5 5v8H12Z";
+/// The v2 shield's bottom-left quadrant.
+pub const MARK_BL: &str = "M.5 14H12v13.2C5 25.4.9 21 .5 14Z";
+/// The v2 shield's bottom-right quadrant.
+pub const MARK_BR: &str = "M12 14h11.5c-.4 7-4.5 11.4-11.5 13.2Z";
+
 /// The four quadrant outlines of the mark, in the design's 24×28 SVG
-/// coordinate space. Each is convex (a rectangle with one rounded or one
-/// elliptically-curved corner), which is what lets `paint_mark` use
+/// coordinate space: [`MARK_TL`], [`MARK_TR`], [`MARK_BL`] and [`MARK_BR`],
+/// read by [`crate::kit::icon::parse`]. Each is convex (a rectangle with one
+/// rounded or one curved corner), which is what lets `paint_mark` use
 /// `Shape::convex_polygon` directly.
 ///
 /// Flattened once and kept, rather than rebuilt per call: `paint_mark` runs
@@ -894,55 +905,11 @@ pub fn quadrant_outlines() -> &'static [Vec<Pos2>; 4] {
 }
 
 fn build_quadrant_outlines() -> [Vec<Pos2>; 4] {
-    let p = Pos2::new;
-
-    // Top-left: M12 2 H4.4 A2.4 2.4 0 0 0 2 4.4 V14 H12 Z
-    let mut tl = vec![p(12.0, 2.0), p(4.4, 2.0)];
-    flatten_cubic(
-        &mut tl,
-        p(4.4, 2.0),
-        p(4.4 - ARC_K, 2.0),
-        p(2.0, 4.4 - ARC_K),
-        p(2.0, 4.4),
-        8,
-    );
-    tl.extend([p(2.0, 14.0), p(12.0, 14.0)]);
-
-    // Top-right: M12 2 h7.6 A2.4 2.4 0 0 1 22 4.4 V14 H12 Z
-    let mut tr = vec![p(12.0, 2.0), p(19.6, 2.0)];
-    flatten_cubic(
-        &mut tr,
-        p(19.6, 2.0),
-        p(19.6 + ARC_K, 2.0),
-        p(22.0, 4.4 - ARC_K),
-        p(22.0, 4.4),
-        8,
-    );
-    tr.extend([p(22.0, 14.0), p(12.0, 14.0)]);
-
-    // Bottom-left: M2 14 h10 v12 C6.6 23.2 3.2 19.4 2 14 Z
-    let mut bl = vec![p(2.0, 14.0), p(12.0, 14.0), p(12.0, 26.0)];
-    flatten_cubic(
-        &mut bl,
-        p(12.0, 26.0),
-        p(6.6, 23.2),
-        p(3.2, 19.4),
-        p(2.0, 14.0),
-        12,
-    );
-
-    // Bottom-right: M12 14 h10 c-1.2 5.4 -4.6 9.2 -10 12 Z
-    let mut br = vec![p(12.0, 14.0), p(22.0, 14.0)];
-    flatten_cubic(
-        &mut br,
-        p(22.0, 14.0),
-        p(20.8, 19.4),
-        p(17.4, 23.2),
-        p(12.0, 26.0),
-        12,
-    );
-
-    [tl, tr, bl, br]
+    [MARK_TL, MARK_TR, MARK_BL, MARK_BR].map(|d| {
+        let mut paths = crate::kit::icon::parse(d).expect("the mark's path data is the design's own");
+        assert_eq!(paths.len(), 1, "each quadrant is one closed shape");
+        paths.remove(0).points
+    })
 }
 
 /// Paints the full-color quartered-shield mark filling `rect` (preserving the
@@ -958,26 +925,29 @@ pub fn paint_mark_tinted(painter: &egui::Painter, rect: Rect, tint: Color32) {
 }
 
 fn paint_mark_with(painter: &egui::Painter, rect: Rect, tint: Option<Color32>) {
+    paint_mark_colours(painter, rect, tint.map_or(QUADRANT_FILLS, |t| [t; 4]));
+}
+
+/// Paints the mark into `rect` with each quadrant in its own colour, in
+/// reading order: [`QUADRANT_FILLS`], [`MARK_REVERSED`] or
+/// [`mark_on_sidebar`].
+pub fn paint_mark_colours(painter: &egui::Painter, rect: Rect, fills: [Color32; 4]) {
     let scale = (rect.width() / MARK_ARTBOARD.0).min(rect.height() / MARK_ARTBOARD.1);
     let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
-    for (outline, fill) in quadrant_outlines().iter().zip(QUADRANT_FILLS) {
+    for (outline, fill) in quadrant_outlines().iter().zip(fills) {
         let points: Vec<Pos2> = outline
             .iter()
             .map(|p| origin + Vec2::new(p.x * scale, p.y * scale))
             .collect();
-        painter.add(egui::Shape::convex_polygon(
-            points,
-            tint.unwrap_or(fill),
-            Stroke::NONE,
-        ));
+        painter.add(egui::Shape::convex_polygon(points, fill, Stroke::NONE));
     }
 }
 
 /// Where the shield's *ink* lands when the mark is painted into `rect`.
 ///
-/// The artboard is 24×28 but the shield only spans 2..22 horizontally and
-/// 2..26 vertically — two units of padding on every side (see
-/// `quadrant_outlines_stay_inside_the_design_viewbox`). [`paint_mark`] fits
+/// The artboard is 24×28 but the v2 shield spans 0.5..23.5 horizontally and
+/// 1..27.2 vertically — under a unit of padding on each side (see
+/// `quadrant_outlines_stay_inside_the_v2_ink_box`). [`paint_mark`] fits
 /// the whole artboard into `rect`, so the shield's visible left edge sits
 /// inset from `rect.left()`, and a mark box flush against a text column
 /// looks *indented* relative to it.
@@ -988,8 +958,8 @@ pub fn mark_ink_rect(rect: Rect) -> Rect {
     let scale = (rect.width() / MARK_ARTBOARD.0).min(rect.height() / MARK_ARTBOARD.1);
     let origin = rect.center() - Vec2::new(12.0 * scale, 14.0 * scale);
     Rect::from_min_max(
-        origin + Vec2::new(2.0 * scale, 2.0 * scale),
-        origin + Vec2::new(22.0 * scale, 26.0 * scale),
+        origin + Vec2::new(0.5 * scale, 1.0 * scale),
+        origin + Vec2::new(23.5 * scale, 27.2 * scale),
     )
 }
 
@@ -11942,14 +11912,64 @@ mod tests {
         });
     }
 
+    /// The v2 shield's ink spans x 0.5..23.5 and y 1..27.2 of its 24x28 box
+    /// (design 1c): a wider body and a deeper tip than v1's 2..22 by 2..26.
     #[test]
-    fn quadrant_outlines_stay_inside_the_design_viewbox() {
+    fn quadrant_outlines_stay_inside_the_v2_ink_box() {
         for outline in quadrant_outlines() {
             for p in outline {
                 assert!(
-                    (2.0..=22.0).contains(&p.x) && (2.0..=26.0).contains(&p.y),
-                    "point {p:?} escapes the 24x28 viewbox's shield bounds"
+                    (0.49..=23.51).contains(&p.x) && (0.99..=27.21).contains(&p.y),
+                    "point {p:?} escapes the v2 shield's ink box"
                 );
+            }
+        }
+        let xs = quadrant_outlines().iter().flatten().map(|p| p.x);
+        let (lo, hi) = xs.fold((f32::MAX, f32::MIN), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        assert!((lo - 0.5).abs() < 0.01 && (hi - 23.5).abs() < 0.01, "the body is {lo}..{hi} wide");
+    }
+
+    #[test]
+    fn the_quadrants_meet_at_the_centre_and_the_tip() {
+        let near = |a: Pos2, b: Pos2| (a.x - b.x).abs() < 0.01 && (a.y - b.y).abs() < 0.01;
+        let outlines = quadrant_outlines();
+        for outline in outlines {
+            assert!(outline.iter().any(|p| near(*p, Pos2::new(12.0, 14.0))), "{outline:?}");
+        }
+        for bottom in &outlines[2..] {
+            assert!(bottom.iter().any(|p| near(*p, Pos2::new(12.0, 27.2))));
+        }
+    }
+
+    #[test]
+    fn reversed_and_sidebar_colourways_match_the_design() {
+        assert_eq!(MARK_REVERSED, [Color32::WHITE, BLUE_EDGE, BLUE_SOFT, BLUE_BRIGHT]);
+        assert_eq!(mark_on_sidebar(Color32::WHITE), [Color32::WHITE, BLUE_BRIGHT, BLUE_SOFT, BLUE_EDGE]);
+        assert_eq!(mark_on_sidebar(BLUE_DEEP)[0], BLUE_DEEP);
+    }
+
+    /// The ramp in design 1c, down to the 14 px tray and field badge: at the
+    /// display scales Windows offers, the mark never paints outside its box.
+    #[test]
+    fn the_mark_stays_inside_its_box_at_every_ramp_size() {
+        for (w, h) in [(14.0, 16.0), (22.0, 26.0), (32.0, 37.0), (48.0, 56.0)] {
+            for ppp in [1.0, 1.25, 1.5] {
+                let ctx = egui::Context::default();
+                ctx.set_pixels_per_point(ppp);
+                let target = Rect::from_min_size(Pos2::new(10.3, 7.7), Vec2::new(w, h));
+                let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    paint_mark(ui.painter(), target);
+                });
+                let mut points = Vec::new();
+                for clipped in &output.shapes {
+                    if let egui::Shape::Path(path) = &clipped.shape {
+                        points.extend(path.points.iter().copied());
+                    }
+                }
+                assert!(!points.is_empty(), "nothing painted at {w}x{h}");
+                for p in points {
+                    assert!(target.expand(0.01).contains(p), "{p:?} outside {target:?} at {ppp}");
+                }
             }
         }
     }
