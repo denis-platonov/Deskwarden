@@ -3509,12 +3509,13 @@ fn draw_kit_sheet(root: &mut egui::Ui) {
             card::row_rule(ui);
             ui.horizontal(|ui| {
                 card::field_label(ui, "Fills in");
-                let dot = tips::help_dot(ui, egui::Id::new("sheet-tip"), "", 260.0).rect;
+                let dot = tips::help_dot(ui, egui::Id::new("sheet-tip"), "", 260.0, tips::Placement::Above).rect;
                 tips::paint_help_bubble(
                     ui,
                     dot,
                     "Deskwarden fills these apps and sites when you press the shortcut.",
                     260.0,
+                    tips::Placement::Above,
                 );
             });
             ui.horizontal(|ui| {

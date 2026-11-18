@@ -24,6 +24,8 @@ const PAD_LEFT: f32 = 16.0;
 const PAD_RIGHT: f32 = 22.0;
 const BADGE: f32 = 26.0;
 const GAP: f32 = 10.0;
+/// The badge's white tick (design 1a: `M20 6 9 17l-5-5`).
+const BADGE_GLYPH: &str = glyph::TICK;
 /// The entrance, in seconds.
 const ENTRANCE: f64 = 0.28;
 
@@ -107,7 +109,7 @@ fn paint_at(ctx: &egui::Context, message: &str, pose: motion::Pose) {
     painter.rect_filled(rect, CornerRadius::same(255), p.ink.gamma_multiply(opacity));
     let badge = pos2(rect.left() + PAD_LEFT + BADGE / 2.0, rect.center().y);
     painter.circle_filled(badge, BADGE / 2.0, p.done_mark.gamma_multiply(opacity));
-    icon::stroke(&painter, Rect::from_center_size(badge, Vec2::splat(15.0)), glyph::CHECK, 3.0, white);
+    icon::stroke(&painter, Rect::from_center_size(badge, Vec2::splat(15.0)), BADGE_GLYPH, 3.0, white);
     let text_at = pos2(rect.left() + PAD_LEFT + BADGE + GAP, rect.center().y - galley.size().y / 2.0);
     painter.galley(text_at, galley, white);
 }
@@ -164,6 +166,13 @@ mod tests {
         assert_eq!(pill.rect.height(), 50.0);
         assert!((pill.rect.center().x - 400.0).abs() < 0.5);
         assert!(painted.circles.iter().any(|c| c.fill == Palette::LIGHT.done_mark && c.radius == 13.0));
+    }
+
+    /// The badge's tick is the design's own path, `M20 6 9 17l-5-5`.
+    #[test]
+    fn the_badge_carries_the_designs_tick() {
+        assert_eq!(crate::kit::icon::glyph::TICK, "M20 6 9 17l-5-5");
+        assert_eq!(BADGE_GLYPH, crate::kit::icon::glyph::TICK);
     }
 
     #[test]

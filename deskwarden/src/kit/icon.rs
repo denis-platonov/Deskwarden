@@ -359,9 +359,11 @@ pub mod glyph {
     pub const LOCK: &str = "M5 11h14v10H5zM8 11V7a4 4 0 0 1 8 0v4";
     pub const BACK: &str = "M19 12H5M12 19l-7-7 7-7";
     pub const CHECK: &str = "M5 12l5 5 9-10";
+    /// The toast badge's tick, as design 1a draws it.
+    pub const TICK: &str = "M20 6 9 17l-5-5";
 
     /// Every glyph, named, for tests and the kit sheet.
-    pub const ALL_GLYPHS: [(&str, &str); 14] = [
+    pub const ALL_GLYPHS: [(&str, &str); 15] = [
         ("all", ALL),
         ("fav", FAV),
         ("login", LOGIN),
@@ -376,6 +378,7 @@ pub mod glyph {
         ("lock", LOCK),
         ("back", BACK),
         ("check", CHECK),
+        ("tick", TICK),
     ];
 }
 

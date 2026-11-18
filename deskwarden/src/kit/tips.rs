@@ -37,18 +37,32 @@ pub fn hint_rect(target: Rect, window: Rect, bubble: Vec2) -> Rect {
     let below = target.top() - window.top() < FLIP_BELOW;
     let top = if below { target.bottom() + HINT_GAP } else { target.top() - HINT_GAP - bubble.y };
     let cx = target.center().x.clamp(window.left() + SIDE_CLAMP, window.right() - SIDE_CLAMP);
-    let rect = Rect::from_min_size(pos2(cx - bubble.x / 2.0, top), bubble);
-    let dx = (window.left() - rect.left()).max(0.0) + (window.right() - rect.right()).min(0.0);
-    let dy = (window.top() - rect.top()).max(0.0) + (window.bottom() - rect.bottom()).min(0.0);
-    rect.translate(Vec2::new(dx, dy))
+    inside(Rect::from_min_size(pos2(cx - bubble.x / 2.0, top), bubble), window)
 }
 
 fn tooltip_painter(ui: &Ui, salt: &str) -> egui::Painter {
     ui.ctx().layer_painter(LayerId::new(Order::Tooltip, egui::Id::new(("kit-tips", salt))))
 }
 
-/// The 18 px `?` dot. Hovering it shows `text` in a `width`-wide bubble.
-pub fn help_dot(ui: &mut Ui, id: egui::Id, text: &str, width: f32) -> Response {
+/// Which side of its dot a help bubble opens on. The design opens most above;
+/// the Shared header, the QR modal and the generator's look-alike dot open
+/// below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Placement {
+    Above,
+    Below,
+}
+
+/// Moves `rect` the least distance that puts it inside `window`.
+fn inside(rect: Rect, window: Rect) -> Rect {
+    let dx = (window.left() - rect.left()).max(0.0) + (window.right() - rect.right()).min(0.0);
+    let dy = (window.top() - rect.top()).max(0.0) + (window.bottom() - rect.bottom()).min(0.0);
+    rect.translate(Vec2::new(dx, dy))
+}
+
+/// The 18 px `?` dot. Hovering it shows `text` in a `width`-wide bubble on
+/// the `placement` side.
+pub fn help_dot(ui: &mut Ui, id: egui::Id, text: &str, width: f32, placement: Placement) -> Response {
     let p = palette(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
     ui.painter().circle_filled(rect.center(), 9.0, p.badge_bg);
@@ -59,7 +73,7 @@ pub fn help_dot(ui: &mut Ui, id: egui::Id, text: &str, width: f32) -> Response {
     let clock = id.with("help-bubble");
     if response.hovered() {
         let shown = motion::progress(ui.ctx(), clock, 0.0, 0.16, EASE_OUT);
-        paint_help_bubble_at(ui, rect, text, width, motion::tip(shown));
+        paint_help_bubble_at(ui, rect, text, width, placement, motion::tip(shown));
     } else {
         motion::restart(ui.ctx(), clock);
     }
@@ -67,19 +81,35 @@ pub fn help_dot(ui: &mut Ui, id: egui::Id, text: &str, width: f32) -> Response {
 }
 
 /// The help bubble for a dot at `anchor`, fully shown.
-pub fn paint_help_bubble(ui: &Ui, anchor: Rect, text: &str, width: f32) {
-    paint_help_bubble_at(ui, anchor, text, width, motion::Pose::REST);
+pub fn paint_help_bubble(ui: &Ui, anchor: Rect, text: &str, width: f32, placement: Placement) {
+    paint_help_bubble_at(ui, anchor, text, width, placement, motion::Pose::REST);
 }
 
-fn paint_help_bubble_at(ui: &Ui, anchor: Rect, text: &str, width: f32, pose: motion::Pose) {
+fn paint_help_bubble_at(
+    ui: &Ui,
+    anchor: Rect,
+    text: &str,
+    width: f32,
+    placement: Placement,
+    pose: motion::Pose,
+) {
     let white = Color32::WHITE.gamma_multiply(pose.opacity);
     let mut job = tokens::job(TOOLTIP, text, white);
     job.sections[0].format.line_height = Some(TOOLTIP.size * 1.45);
     job.wrap.max_width = width - 26.0;
     let galley = ui.fonts_mut(|f| f.layout_job(job));
     let height = galley.size().y + 22.0;
-    let rect = Rect::from_min_size(pos2(anchor.left() - 12.0, anchor.top() - 10.0 - height), Vec2::new(width, height))
-        .translate(Vec2::new(pose.dx, pose.dy));
+    let top = match placement {
+        Placement::Above => anchor.top() - 10.0 - height,
+        Placement::Below => anchor.bottom() + 10.0,
+    };
+    // Kept inside the window whatever the dot's position: a dot in the top
+    // bar or by the right edge must not lose half its explanation.
+    let placed = inside(
+        Rect::from_min_size(pos2(anchor.left() - 12.0, top), Vec2::new(width, height)),
+        ui.ctx().content_rect(),
+    );
+    let rect = placed.translate(Vec2::new(pose.dx, pose.dy));
     let p = palette(ui.ctx());
     let painter = tooltip_painter(ui, "help");
     let shadow = Shadow { offset: [0, 12], blur: 28, spread: 0, color: Color32::from_rgba_unmultiplied(0, 0, 0, 56).gamma_multiply(pose.opacity) };
@@ -201,7 +231,11 @@ mod tests {
         let mut dot = Rect::NOTHING;
         let draw = |ui: &mut egui::Ui, dot: &mut Rect| {
             ui.add_space(200.0);
-            *dot = help_dot(ui, id, TIP, 260.0).rect;
+            // In from the left edge, so the bubble's -12 offset stays on screen.
+            ui.horizontal(|ui| {
+                ui.add_space(100.0);
+                *dot = help_dot(ui, id, TIP, 260.0, Placement::Above).rect;
+            });
         };
         let quiet = frame(&ctx, 0.0, size, vec![], |ui| draw(ui, &mut dot));
         assert!(quiet.text("Autofill only").is_none());
@@ -221,6 +255,34 @@ mod tests {
         assert_eq!(bubble.rect.width(), 260.0);
         assert!((bubble.rect.left() - (dot.left() - 12.0)).abs() < 0.5);
         assert!(bubble.rect.bottom() <= dot.top() - 10.0 + 0.5);
+    }
+
+    fn bubble_rect(at: Rect, placement: Placement) -> Rect {
+        let ctx = ctx();
+        let painted = frame(&ctx, 0.0, Vec2::new(800.0, 600.0), vec![], |ui| {
+            paint_help_bubble(ui, at, TIP, 260.0, placement);
+        });
+        painted.rects.iter().find(|r| r.fill == P.ink).expect("a bubble").rect
+    }
+
+    #[test]
+    fn a_help_bubble_below_opens_under_its_dot() {
+        let dot = Rect::from_min_size(pos2(300.0, 300.0), Vec2::splat(18.0));
+        let r = bubble_rect(dot, Placement::Below);
+        assert_eq!(r.top(), dot.bottom() + 10.0);
+        assert_eq!(r.left(), dot.left() - 12.0);
+    }
+
+    #[test]
+    fn a_help_bubble_never_leaves_the_window() {
+        let window = Rect::from_min_size(pos2(0.0, 0.0), Vec2::new(800.0, 600.0));
+        for (dot, placement) in [
+            (Rect::from_min_size(pos2(780.0, 4.0), Vec2::splat(18.0)), Placement::Above),
+            (Rect::from_min_size(pos2(2.0, 580.0), Vec2::splat(18.0)), Placement::Below),
+        ] {
+            let r = bubble_rect(dot, placement);
+            assert!(window.contains_rect(r), "{dot:?} {placement:?} put its bubble at {r:?}");
+        }
     }
 
     #[test]

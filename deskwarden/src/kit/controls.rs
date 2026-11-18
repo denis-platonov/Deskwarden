@@ -86,7 +86,9 @@ pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize, style: SegmentS
     } else {
         natural.iter().sum::<f32>()
     };
-    let (track, _) = ui.allocate_exact_size(Vec2::new(inner_w + 8.0, cell_h + 8.0), Sense::hover());
+    // The track's own id is unique per control, so two controls with the
+    // same labels in one Ui keep their cells' clicks apart.
+    let (track, track_response) = ui.allocate_exact_size(Vec2::new(inner_w + 8.0, cell_h + 8.0), Sense::hover());
     ui.painter().rect_filled(track, CornerRadius::same(style.track_radius), p.hover);
     let mut clicked = None;
     let mut x = track.left() + 4.0;
@@ -94,7 +96,7 @@ pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize, style: SegmentS
         let w = if style.full_width { inner_w / options.len() as f32 } else { natural[i] };
         let cell = Rect::from_min_size(egui::pos2(x, track.top() + 4.0), Vec2::new(w, cell_h));
         x += w;
-        let response = ui.interact(cell, ui.id().with(("segment", i, options[i])), Sense::click());
+        let response = ui.interact(cell, track_response.id.with(("segment", i)), Sense::click());
         if response.clicked() && i != selected {
             clicked = Some(i);
         }
@@ -266,6 +268,25 @@ mod tests {
         assert_eq!(painted.text("Light").unwrap().1, P.text_icon);
         assert_eq!(painted.text("Dark").unwrap().1, P.text_icon);
         assert!(painted.rects.iter().any(|r| r.fill == P.hover), "the track");
+    }
+
+    /// Two settings rows can both offer "Off / On" in one card: a click on
+    /// the second must reach the second, not the first.
+    #[test]
+    fn two_segmented_controls_with_the_same_labels_keep_their_own_clicks() {
+        let ctx = crate::kit::testing::ctx();
+        const OFF_ON: [&str; 2] = ["Off", "On"];
+        let painted = frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            segmented(ui, &OFF_ON, 0, SEG_SETTINGS);
+            segmented(ui, &OFF_ON, 0, SEG_SETTINGS);
+        });
+        let second_on = painted.texts.iter().filter(|(t, _, _)| t == "On").nth(1).unwrap().2.center();
+        let (mut first, mut second) = (None, None);
+        frame(&ctx, 0.1, SCREEN, click_at(second_on), |ui| {
+            first = segmented(ui, &OFF_ON, 0, SEG_SETTINGS);
+            second = segmented(ui, &OFF_ON, 0, SEG_SETTINGS);
+        });
+        assert_eq!((first, second), (None, Some(1)));
     }
 
     #[test]
