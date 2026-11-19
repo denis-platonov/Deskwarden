@@ -973,6 +973,97 @@ pub fn take_initial_search(path: &Path) -> Option<String> {
     (!term.is_empty()).then_some(term)
 }
 
+/// **Where the vault window opens**, when the tray popup asked for somewhere
+/// other than the item list: a new item's editor, the Sends screen, the
+/// Generator.
+///
+/// The popup's *New item*, *Share* and *Generate* tiles are shortcuts into the
+/// window, and the window is another process, so the place has to cross the
+/// way the search term does -- a file the child takes as it starts. It reaches
+/// the places the window already answers for the rail (`ShellRequest::NewItem`)
+/// and for the command palette (the Sends and Generator screens); it adds no
+/// new screen of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landing {
+    NewItem,
+    Sends,
+    Generator,
+}
+
+impl Landing {
+    fn word(self) -> &'static str {
+        match self {
+            Landing::NewItem => "new-item",
+            Landing::Sends => "sends",
+            Landing::Generator => "generator",
+        }
+    }
+
+    fn from_word(word: &str) -> Option<Self> {
+        [Landing::NewItem, Landing::Sends, Landing::Generator]
+            .into_iter()
+            .find(|landing| landing.word() == word)
+    }
+}
+
+/// How long a landing left on disk stays good. The window that is meant to take
+/// it starts within a second or two; a file older than this belongs to a spawn
+/// that never happened, and opening a window on somewhere nobody asked for
+/// minutes ago is worse than opening it on the list.
+pub const LANDING_FRESH_SECS: u64 = 30;
+
+/// Whether a landing written at `at` (seconds since the epoch) is still good at
+/// `now`. Pure.
+#[must_use]
+pub fn landing_is_fresh(at: u64, now: u64) -> bool {
+    now.saturating_sub(at) <= LANDING_FRESH_SECS
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Where [`write_initial_landing`] leaves the landing. **Not named by pid**, for
+/// [`initial_search_path`]'s reason, and not the search file itself: that one is
+/// written on every spawn and a landing is not.
+#[must_use]
+pub fn initial_landing_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("ui-initial-landing.json")
+}
+
+/// Leave the landing for the child about to be spawned, atomically
+/// (temp-then-rename, [`write_initial_search`]'s way). **No secret**: a word and
+/// a time.
+pub fn write_initial_landing(path: &Path, landing: Landing) -> io::Result<()> {
+    let json = serde_json::json!({ "landing": landing.word(), "at": unix_now() }).to_string();
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, json)?;
+    std::fs::rename(&temp, path)
+}
+
+/// Read the landing, from the child, at startup -- and **delete it in the same
+/// breath**, so one write lands one window. Absent, unreadable, unknown and
+/// stale ([`landing_is_fresh`]) are all `None`: the ordinary window.
+#[must_use]
+pub fn take_initial_landing(path: &Path) -> Option<Landing> {
+    let text = std::fs::read_to_string(path).ok();
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != io::ErrorKind::NotFound {
+            log::warn!("could not delete {} after reading it: {e}", path.display());
+        }
+    }
+    let value: serde_json::Value = serde_json::from_str(&text?).ok()?;
+    let at = value.get("at")?.as_u64()?;
+    if !landing_is_fresh(at, unix_now()) {
+        log::info!("a landing left for the vault window was stale and is ignored");
+        return None;
+    }
+    Landing::from_word(value.get("landing")?.as_str()?)
+}
+
 /// Delete the result file once it has been read.
 ///
 /// Best effort. A leftover is inert -- the next UI process has a different
@@ -1560,6 +1651,51 @@ mod tests {
             edited_settings_path(&dir, 77),
             "the term shares a name with the settings delivery"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_landing_is_taken_once_and_then_gone() {
+        let dir = scratch("landing-once", line!());
+        let path = initial_landing_path(&dir);
+        assert_eq!(take_initial_landing(&path), None, "nothing was written");
+        for landing in [Landing::NewItem, Landing::Sends, Landing::Generator] {
+            write_initial_landing(&path, landing).expect("writable");
+            assert_eq!(take_initial_landing(&path), Some(landing));
+            assert_eq!(take_initial_landing(&path), None, "taken, not read: one write, one window");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_or_unreadable_landing_is_the_ordinary_window_and_is_still_consumed() {
+        let dir = scratch("landing-stale", line!());
+        let path = initial_landing_path(&dir);
+        std::fs::write(&path, r#"{"landing":"new-item","at":1}"#).expect("writable");
+        assert_eq!(take_initial_landing(&path), None, "a landing from 1970 is not for this window");
+        assert!(!path.exists(), "a stale file left in place is read by every later window");
+        for junk in ["not json", r#"{"landing":"nowhere","at":5000000000}"#, r#"{"at":5000000000}"#] {
+            std::fs::write(&path, junk).expect("writable");
+            assert_eq!(take_initial_landing(&path), None, "{junk}");
+            assert!(!path.exists());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_landing_is_fresh_for_half_a_minute() {
+        assert!(landing_is_fresh(100, 100));
+        assert!(landing_is_fresh(100, 100 + LANDING_FRESH_SECS));
+        assert!(!landing_is_fresh(100, 101 + LANDING_FRESH_SECS));
+        assert!(landing_is_fresh(100, 50), "a clock that went backwards is not stale");
+    }
+
+    #[test]
+    fn the_landing_file_shares_a_name_with_nothing_else() {
+        let dir = scratch("landing-name", line!());
+        assert_ne!(initial_landing_path(&dir), initial_search_path(&dir));
+        assert_ne!(initial_landing_path(&dir), result_path(&dir, 77));
+        assert_ne!(initial_landing_path(&dir), edited_settings_path(&dir, 77));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

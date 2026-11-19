@@ -2710,6 +2710,11 @@ fn main() {
     // `requests_outliving_a_window`.
     let mut pending_menu_events: VecDeque<MenuEvent> = VecDeque::new();
 
+    // **When the tray popup last closed because the foreground moved off it**,
+    // so the click on the tray icon that moved it is not read as a second click
+    // that opens it again. See `tray_popup::click_reopens`.
+    let mut popup_lost_focus_at: Option<Instant> = None;
+
     // When the loop last started a backend because somebody attached. Kept
     // here rather than in the estate because it is a fact about this LOOP's
     // throttling, not about the vault session -- a re-settle must not clear
@@ -3059,6 +3064,20 @@ fn main() {
                 // adopt the file between the removal and its own death.
                 hotkey::forget_status_file(&config_dir);
                 std::process::exit(0);
+            }
+
+            if event.id == tray.lock_id {
+                // The right-click menu's Lock: the short menu's one way to lock
+                // without a window (D9). The same effect the popup's padlock has.
+                lock_from_the_tray(
+                    &mut estate,
+                    &job,
+                    &schedule,
+                    &tray,
+                    &backend_op_rx,
+                    &config_dir,
+                    &mut ui_windows,
+                );
             }
 
             if event.id == tray.open_vault_id {
@@ -3591,11 +3610,74 @@ fn main() {
 
         }
 
-        // Left click opens the vault directly; right click still shows the
-        // menu (built with `with_menu_on_left_click(false)` specifically so
-        // the two aren't the same action). Same event, same recovery path as
-        // the menu's "Open Vault" item above -- just a different trigger.
-        if tray::next_left_click() == Some(true) {
+        // **Left click opens the tray popup** (design 1d, decision D9); right
+        // click still shows the short menu (built with
+        // `with_menu_on_left_click(false)` specifically so the two aren't the
+        // same action). The popup is modal on this thread like every card here,
+        // and what it answers is a request this loop carries out once it is
+        // down: the vault window opens below, by the same door as the menu's
+        // "Open Vault" item above.
+        let mut open_the_vault = false;
+        if tray::next_left_click() == Some(true)
+            && deskwarden::tray_popup::click_reopens(popup_lost_focus_at, Instant::now())
+        {
+            use deskwarden::tray_popup::Outcome;
+            let answer = run_the_tray_popup(&mut estate, &mut fill_proof, &fill_stats, &tray);
+            popup_lost_focus_at = (answer == Outcome::LostFocus).then(Instant::now);
+            log::info!("the tray popup was answered: {answer:?}");
+            match answer {
+                Outcome::Dismissed | Outcome::LostFocus => {}
+                // A popup that could not be drawn is a left click that does
+                // nothing, which is worse than the vault window 0.15 opened.
+                Outcome::OpenWindow | Outcome::Unavailable => open_the_vault = true,
+                Outcome::NewItem => {
+                    ask_for_a_landing(
+                        &ui_windows,
+                        &config_dir,
+                        deskwarden::ui_process::Landing::NewItem,
+                    );
+                    open_the_vault = true;
+                }
+                Outcome::Share => {
+                    ask_for_a_landing(
+                        &ui_windows,
+                        &config_dir,
+                        deskwarden::ui_process::Landing::Sends,
+                    );
+                    open_the_vault = true;
+                }
+                Outcome::Generate => {
+                    ask_for_a_landing(
+                        &ui_windows,
+                        &config_dir,
+                        deskwarden::ui_process::Landing::Generator,
+                    );
+                    open_the_vault = true;
+                }
+                Outcome::Lock => lock_from_the_tray(
+                    &mut estate,
+                    &job,
+                    &schedule,
+                    &tray,
+                    &backend_op_rx,
+                    &config_dir,
+                    &mut ui_windows,
+                ),
+                Outcome::Unlock => {
+                    let came_back = unlock_from_the_locked_card(
+                        &mut estate,
+                        &job,
+                        &schedule,
+                        &tray,
+                        &backend_op_rx,
+                        &config_dir,
+                        deskwarden::unlock_prompt::ask,
+                    );
+                    log::info!("the tray popup's unlock ended: {came_back:?}");
+                }
+            }
+        }
+        if open_the_vault {
             estate = open_vault_window(
                 estate,
                 VaultDeps {
@@ -9033,6 +9115,123 @@ fn lock_after_walking_away(
     token.clear();
 }
 
+/// **Locking the vault because the user asked to**, from the tray: the right-click
+/// menu's *Lock*, and the popup's padlock.
+///
+/// [`lock_after_walking_away`] without the question. That function asks
+/// `away_lock::locks_the_vault` whether Windows' report locks this vault under
+/// the user's auto-lock setting; here the user has said so, which needs no
+/// setting. What follows is the same four steps in the same order, for the same
+/// reasons, and each of them is pinned (`neither_lock_recovery_draws_and_both_
+/// forget_the_key` reads this body too):
+///
+///  * the clipboard is cleared first, under the `Lock` trigger;
+///  * the vault window is closed **before** `resettle_session`, so a decrypted
+///    vault is not left on screen in another process;
+///  * `resettle_session` tears the backend down and does not draw a sign-in;
+///  * the stored master key is forgotten and the session token cleared, so the
+///    next `--ui` window opens on a lock and not on the item list.
+///
+/// Harmless when there is nothing to lock: a vault already locked has no
+/// populated cache and no session.
+#[allow(clippy::too_many_arguments)]
+fn lock_from_the_tray(
+    est: &mut SessionEstate,
+    job: &Arc<Option<job_object::KillOnCloseJob>>,
+    schedule: &[Duration],
+    tray: &tray::AppTray,
+    backend_op_rx: &Arc<Mutex<mpsc::Receiver<BackendOp>>>,
+    config_dir: &Path,
+    ui: &mut UiWindows,
+) {
+    if !est.cache.is_populated() && est.token.is_empty() {
+        log::debug!("the tray asked to lock a vault that is already locked");
+        return;
+    }
+    log::info!("the user locked the vault from the tray");
+    deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Lock);
+    ui.close_because_the_user_walked_away(config_dir);
+    let SessionEstate {
+        cache,
+        engine,
+        child,
+        token,
+        details,
+        task_in_progress,
+        active_account,
+        ..
+    } = est;
+    resettle_session(
+        cache,
+        engine,
+        child,
+        job,
+        schedule,
+        tray,
+        backend_op_rx,
+        task_in_progress,
+        details,
+        &mut *token,
+        || {
+            forget_the_stored_master_key(config_dir, active_account.as_ref());
+            None
+        },
+    );
+    token.clear();
+}
+
+/// **The tray popup, with the vault as the daemon sees it right now.**
+///
+/// Everything the panel is given is a name or a count: the listing is
+/// `app::tray_popup_listing` (no password leaves the cache) and the copy
+/// closure is `app::copy_login_field`, which asks the master-password
+/// re-prompt through the same proof the fill path holds -- `fill_proof`, scoped
+/// to the account on screen, so a gesture given a moment ago for a fill covers
+/// a copy and one given for another account does not.
+fn run_the_tray_popup(
+    est: &mut SessionEstate,
+    fill_proof: &mut deskwarden::app::FillProof,
+    fill_stats: &fill_stats::FillStats,
+    tray: &tray::AppTray,
+) -> deskwarden::tray_popup::Outcome {
+    use deskwarden::tray_popup as popup;
+    let vault = if est.cache.is_populated() {
+        popup::Vault::Open(deskwarden::app::tray_popup_listing(&est.cache, fill_stats))
+    } else {
+        popup::Vault::Locked
+    };
+    let status = popup::Status {
+        sync: tray.popup_sync(),
+        auto_lock_minutes: popup::auto_lock_minutes(est.settings.auto_lock()),
+    };
+    let cache = Arc::clone(&est.cache);
+    let account = est.active_account.as_ref().map(|a| a.id.clone());
+    let mut reprompt = fill_proof.scoped_to(account.as_ref());
+    popup::show(vault, status, &mut |id, field| {
+        deskwarden::app::copy_login_field(&cache, id, field, &mut reprompt)
+    })
+}
+
+/// Leaves the place the vault window should open on, for the window about to be
+/// spawned.
+///
+/// **Only when no window exists.** A window that is already open (or hidden and
+/// resident) is brought forward, not re-seeded -- the same limit the search term
+/// has -- so a landing written for it would sit on disk until some later spawn
+/// took it. `take_initial_landing` also refuses one older than half a minute.
+fn ask_for_a_landing(ui: &UiWindows, config_dir: &Path, landing: deskwarden::ui_process::Landing) {
+    if ui.vault_pid().is_some() {
+        log::info!("the vault window is already open, so it is raised and not moved to {landing:?}");
+        return;
+    }
+    if let Err(e) = deskwarden::ui_process::write_initial_landing(
+        &deskwarden::ui_process::initial_landing_path(config_dir),
+        landing,
+    ) {
+        log::warn!("could not leave the vault window's landing ({e}); it opens on the list");
+    }
+}
+
 /// **Unlocking because the overlay's locked card asked to.**
 ///
 /// [`lock_after_walking_away`]'s mirror image, written the same way and made
@@ -12504,6 +12703,13 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
     // call above, and re-deriving this from the backend choice is the same
     // answer read off the same two facts the child started from.
     let signing_in_over_bw_serve = a_bw_serve_sign_in_is_owed;
+    // **Where the tray popup asked this window to open** -- New item, Sends or
+    // the Generator -- taken here, once, whichever of the two hosts below runs.
+    // The first frame with a vault on screen answers it; see
+    // `vault_window::landing`. `None` is the ordinary tray click.
+    vault_window::landing::set(deskwarden::ui_process::take_initial_landing(
+        &deskwarden::ui_process::initial_landing_path(&config_dir),
+    ));
     let (result, signed_in_here) = if sign_in_here {
         // Everything the host's `'static` closures need, taken by value here.
         // A frame closure cannot borrow this stack frame, which is the same
@@ -16259,8 +16465,8 @@ mod tests {
             source
                 .matches(concat!("clipboard::clear_if_still_ours_", "for("))
                 .count(),
-            6,
-            "expected the tray Quit, the shutdown-for-update path, the takeover handover, \
+            7,
+            "expected the user's own lock from the tray, the tray Quit, the shutdown-for-update path, the takeover handover, \
              the walked-away lock, the UI process's own before-install clear and a linked \
              window closing because its daemon let it go, and no others"
         );
@@ -16276,8 +16482,8 @@ mod tests {
         // the case that feature exists for.
         assert_eq!(
             source.matches(concat!("clipboard::ClearTrigger::Lo", "ck")).count(),
-            1,
-            "the lock that runs when the user walks away no longer clears the clipboard as a lock"
+            2,
+            "the lock that runs when the user walks away, or the one asked for from the tray, no longer clears the clipboard as a lock"
         );
         // Control: the unconditional entry point this replaced is gone, so
         // there is no call site left that the preferences page cannot govern.
@@ -16404,15 +16610,98 @@ mod tests {
         let source = include_str!("main.rs");
         assert_eq!(
             source.matches(concat!("close_because_the_user_walked_", "away(")).count(),
-            2,
-            "expected exactly the definition and its one call inside lock_after_walking_away, and \
-             no others"
+            3,
+            "expected exactly the definition, its one call inside lock_after_walking_away, and the \
+             user's own lock from the tray (`lock_from_the_tray`, which needs no gate because the \
+             user is the one who said so) -- and no others"
         );
         assert_eq!(
             source.matches(concat!("close_on_", "quit(")).count(),
             2,
             "control: the quit path's own killer still has exactly its definition and its one \
              call, so the count above is measuring what it claims to"
+        );
+    }
+
+    /// **The user's own lock from the tray does what the walked-away lock does,
+    /// in the same order.**
+    ///
+    /// A source pin for `lock_after_walking_away`'s reason: it takes an
+    /// `AppTray` and a `SessionEstate` and cannot be called from a test. The
+    /// clipboard goes first, the window is closed before `resettle_session`
+    /// (which can block), and the stored key is forgotten and the token cleared
+    /// -- the last two are `neither_lock_recovery_draws_and_both_forget_the_key`'s.
+    #[test]
+    fn the_tray_lock_clears_the_clipboard_then_closes_the_window_then_resettles() {
+        let body = body_of(production_half_of_this_file(), concat!("fn lock_from_the_", "tray("));
+        let clipboard = body
+            .find(concat!("clear_if_still_ours_", "for("))
+            .expect("the clipboard clear is on the tray's lock");
+        let close = body
+            .find(concat!("close_because_the_user_walked_", "away("))
+            .expect("the tray's lock must close the vault window");
+        let resettle = body.find(concat!("resettle_", "session(")).expect("the resettle");
+        assert!(clipboard < close && close < resettle, "{body}");
+        assert!(
+            body.contains(concat!("ClearTrigger::", "Lock")),
+            "the clipboard is cleared as a lock, which is what ends a copied secret's life"
+        );
+    }
+
+    /// **Both of the tray's locks -- the menu item and the popup's padlock --
+    /// are `lock_from_the_tray` and nothing else.**
+    #[test]
+    fn the_menu_and_the_popup_both_lock_through_the_one_function() {
+        let code = code_only_lines(production_half_of_this_file());
+        assert_eq!(
+            code.matches(concat!("lock_from_the_", "tray(")).count(),
+            3,
+            "the definition, the right-click menu's Lock and the popup's padlock"
+        );
+        let menu = code
+            .split_once(concat!("event.id == tray.lock", "_id"))
+            .expect("the menu's Lock is handled")
+            .1;
+        assert!(
+            menu[..400].contains(concat!("lock_from_the_", "tray(")),
+            "the menu's Lock no longer reaches the tray's lock"
+        );
+    }
+
+    /// **A left click opens the popup, and the vault window only when the popup
+    /// asks for it.** (Design decision D9.)
+    ///
+    /// The door was `if tray::next_left_click() == Some(true) { open_vault_window }`.
+    /// It must still be the only reader of the tray-icon channel, and the
+    /// `open_vault_window` it keeps must sit behind the popup's answer.
+    #[test]
+    fn a_left_click_opens_the_popup_and_the_window_only_on_its_answer() {
+        let code = code_only_lines(production_half_of_this_file());
+        assert_eq!(code.matches(concat!("tray::next_left_", "click()")).count(), 1);
+        let click = code.find(concat!("tray::next_left_", "click()")).unwrap();
+        let reopen = code.find(concat!("tray_popup::click_", "reopens(")).expect("the toggle rule");
+        let popup = code.find(concat!("run_the_tray_", "popup(&mut")).expect("the popup door");
+        let gate = code.find(concat!("if open_the_", "vault {")).expect("the gated open");
+        assert!(click < reopen && reopen < popup && popup < gate, "the door is out of order");
+        let after = &code[gate..];
+        assert!(
+            after[..300].contains(concat!("open_vault_", "window(")),
+            "the window opens behind the popup's answer, and nowhere else on a left click"
+        );
+    }
+
+    /// **The popup's copy goes through the fill path's proof and the one copy
+    /// function, and reads nothing from the vault but names.**
+    #[test]
+    fn the_popups_copy_is_gated_by_the_fill_paths_proof() {
+        let body = body_of(production_half_of_this_file(), concat!("fn run_the_tray_", "popup("));
+        assert!(body.contains(concat!("fill_proof.scoped_", "to(")), "{body}");
+        assert!(body.contains(concat!("app::copy_login_", "field(")), "{body}");
+        assert!(body.contains(concat!("app::tray_popup_", "listing(")), "{body}");
+        assert!(!body.contains(concat!(".items", "()")), "the popup cloned the whole vault");
+        assert!(
+            !body.contains(concat!("clipboard", "::")),
+            "the daemon's loop never touches the clipboard here"
         );
     }
 
@@ -21193,6 +21482,7 @@ mod tests {
                 vault_ops_method_body(raw, "resettle_after_lost_session"),
             ),
             ("lock_after_walking_away", body_of(raw, concat!("fn lock_after_walking_", "away("))),
+            ("lock_from_the_tray", body_of(raw, concat!("fn lock_from_the_", "tray("))),
         ] {
             assert!(
                 body.len() > 400,
@@ -34034,8 +34324,8 @@ mod tests {
                 .expect("the test module is gone from main.rs");
             assert_eq!(
                 source[..boundary].matches(real).count(),
-                3,
-                "expected the bare-Win32 prompt to be named exactly three times in `run` -- \
+                4,
+                "expected the bare-Win32 prompt to be named exactly four times in `run` (the tray popup's Unlock is the fourth) -- \
                  the seeding dispatch door, the event-loop one, and the fill hotkey's, which \
                  dispatches with `Trigger::Hotkey` when nothing is armed and so can raise the \
                  locked card too. Fewer means one of the three answers the Unlock button with \

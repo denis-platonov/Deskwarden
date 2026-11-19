@@ -217,6 +217,9 @@ pub struct AppTray {
     /// rests on the icon. See [`IDLE_TOOLTIP`].
     icon: TrayIcon,
     pub open_vault_id: MenuId,
+    /// Id of the "Lock" item: the right-click menu's way to lock the vault, and
+    /// the same action the popup's padlock button asks for.
+    pub lock_id: MenuId,
     pub add_app_id: MenuId,
     /// Id of the "Sync" item. With the periodic match-engine refresh gone
     /// (see `main.rs`), this is the only way to pull in a match added on
@@ -242,6 +245,10 @@ pub struct AppTray {
     /// [`AppTray::rebuild_accounts_menu`] -- the ids are minted with the items,
     /// so a stale map is a click that switches to the wrong account.
     accounts: AccountsMenu,
+    /// What the popup's footer says about the last sync. Kept beside the menu
+    /// item it mirrors, and moved by the same three `set_sync_*` functions, so
+    /// the two cannot disagree about whether a sync is running or failed.
+    popup_sync: std::cell::Cell<crate::tray_popup::Sync>,
 }
 
 /// The chord this app registers for filling, **out of the box**.
@@ -292,6 +299,15 @@ pub fn fill_hint(status: &crate::hotkey::HotkeyStatus, chord: &str) -> String {
 pub fn build_tray() -> AppTray {
     let menu = Menu::new();
     let open_vault = MenuItem::new("Open Vault", true, None);
+    // **Design decision D9: the right-click menu is short.** Left click opens
+    // the popup (`crate::tray_popup`), and this menu stays for the user who
+    // cannot or does not want to use a pointer-driven panel -- a keyboard or
+    // screen-reader user reaches it from the tray's own context-menu key. Open,
+    // Lock and Quit are the three things such a user needs without a window;
+    // everything 0.15 had here that is not one of them moves under "More"
+    // rather than being dropped.
+    let lock = MenuItem::new("Lock", true, None);
+    let more = Submenu::new("More", true);
     let add_app = MenuItem::new("Add app...", true, None);
     // **Disabled: a label, not a command.** See `fill_hint` for why a
     // clickable Fill would fill the wrong window. Placed under Add app so
@@ -322,21 +338,23 @@ pub fn build_tray() -> AppTray {
     // empty rather than not at all so there is exactly one place that decides
     // what is in it.
     let accounts_submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+    more.append(&add_app).unwrap();
+    more.append(&fill_hint_item).unwrap();
+    more.append(&sync_item).unwrap();
+    more.append(&accounts_submenu).unwrap();
+    more.append(&preferences).unwrap();
     menu.append(&open_vault).unwrap();
-    menu.append(&add_app).unwrap();
-    menu.append(&fill_hint_item).unwrap();
-    menu.append(&sync_item).unwrap();
-    menu.append(&accounts_submenu).unwrap();
-    menu.append(&preferences).unwrap();
+    menu.append(&lock).unwrap();
+    menu.append(&more).unwrap();
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&quit).unwrap();
 
     let mut builder = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
         .with_tooltip(crate::app_profile::window_title(IDLE_TOOLTIP))
-        // Left click opens the vault directly (see `next_tray_icon_event`'s
-        // caller in `main.rs`) instead of showing the same menu right-click
-        // already shows -- this crate's default is to show the menu on
-        // either button.
+        // Left click opens the popup (see `next_left_click`'s caller in
+        // `main.rs`) instead of showing the same menu right-click already
+        // shows -- this crate's default is to show the menu on either button.
         .with_menu_on_left_click(false);
     if let Some(app_icon) = app_icon() {
         builder = builder.with_icon(app_icon);
@@ -347,6 +365,7 @@ pub fn build_tray() -> AppTray {
     AppTray {
         icon,
         open_vault_id: open_vault.id().clone(),
+        lock_id: lock.id().clone(),
         add_app_id: add_app.id().clone(),
         sync_id: sync_item.id().clone(),
         preferences_id: preferences.id().clone(),
@@ -354,6 +373,7 @@ pub fn build_tray() -> AppTray {
         sync_item,
         accounts_submenu,
         accounts: AccountsMenu::default(),
+        popup_sync: std::cell::Cell::new(crate::tray_popup::Sync::Synced),
     }
 }
 
@@ -361,6 +381,11 @@ impl AppTray {
     /// What the "Accounts" submenu currently means.
     pub fn accounts(&self) -> &AccountsMenu {
         &self.accounts
+    }
+
+    /// What the popup's footer reports about the last sync.
+    pub fn popup_sync(&self) -> crate::tray_popup::Sync {
+        self.popup_sync.get()
     }
 
     /// Rebuilds the submenu from [`accounts_menu_plan`], and replaces the id
@@ -523,6 +548,7 @@ pub fn discard_queued_icon_events() -> usize {
 /// without this the item would just appear to do nothing while it's running.
 pub fn set_sync_in_progress(tray: &AppTray) {
     sync_item_to_in_progress(&tray.sync_item);
+    tray.popup_sync.set(crate::tray_popup::Sync::Syncing);
     set_tooltip(tray, "Deskwarden - syncing...".to_string());
 }
 
@@ -542,6 +568,7 @@ pub fn set_sync_in_progress(tray: &AppTray) {
 /// would have relabelled it is the one that never reported back.
 pub fn set_sync_idle(tray: &AppTray) {
     sync_item_to_idle(&tray.sync_item);
+    tray.popup_sync.set(crate::tray_popup::Sync::Synced);
     set_tooltip(tray, IDLE_TOOLTIP.to_string());
 }
 
@@ -560,6 +587,7 @@ pub fn set_sync_idle(tray: &AppTray) {
 /// which is also the same click that retries.
 pub fn set_sync_failed(tray: &AppTray) {
     sync_item_to_failed(&tray.sync_item);
+    tray.popup_sync.set(crate::tray_popup::Sync::Failed);
     set_tooltip(tray, "Deskwarden - sync failed; see the log file".to_string());
 }
 
@@ -1315,5 +1343,54 @@ mod tests {
                  here spent nearly every session asserting an update nobody had."
             );
         }
+    }
+    /// **Design decision D9: the right-click menu is short, and nothing it used
+    /// to hold is gone.**
+    ///
+    /// Open, Lock and Quit are the top level -- the three things a keyboard or
+    /// screen-reader user needs without a window -- and the rest of what 0.15
+    /// offered (Add app, the fill hint, Sync, Accounts, Preferences) lives under
+    /// *More*. A source-text guard for the reason the update-claim guard above
+    /// is one: `build_tray` needs a real `TrayIcon` and cannot run in a test.
+    #[test]
+    fn the_native_menu_is_short_and_everything_else_is_under_more() {
+        let production = include_str!("tray.rs").split_once("
+#[cfg(test)]").expect("tests").0;
+        let build = production
+            .split_once(concat!("pub fn build_", "tray("))
+            .expect("the menu builder")
+            .1
+            .split_once("
+impl AppTray")
+            .expect("its end")
+            .0;
+        let top = build.matches(concat!("
+    menu.", "append(")).count();
+        assert_eq!(top, 5, "open, lock, more, a separator and quit -- and nothing else");
+        for kept in ["open_vault", "lock", "more", "quit"] {
+            assert!(
+                build.contains(&format!("menu.append(&{kept})")),
+                "`{kept}` is no longer in the short menu"
+            );
+        }
+        for moved in ["add_app", "fill_hint_item", "sync_item", "accounts_submenu", "preferences"] {
+            assert!(
+                build.contains(&format!("more.append(&{moved})")),
+                "`{moved}` was dropped from the tray rather than moved under More"
+            );
+            assert!(
+                !build.contains(&format!("menu.append(&{moved})")),
+                "`{moved}` is back on the short menu"
+            );
+        }
+    }
+
+    /// The tray still reports a left click, and does not show the menu for it:
+    /// the popup is what a left click opens.
+    #[test]
+    fn a_left_click_does_not_open_the_menu() {
+        let production = include_str!("tray.rs").split_once("
+#[cfg(test)]").expect("tests").0;
+        assert!(production.contains(".with_menu_on_left_click(false)"));
     }
 }

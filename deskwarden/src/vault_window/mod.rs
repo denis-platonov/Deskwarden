@@ -2949,6 +2949,34 @@ pub fn build_frame_with_search(
         // behind a modal (one Esc would then close two) nor before the vault
         // is on screen. Ctrl+L still locks from anywhere.
         let chords = shortcuts && !item_list::a_modal_is_up(ui.ctx()) && !vault_loading;
+        // **Where the tray popup asked the window to open** -- once, and only
+        // when the vault is on screen to land in. Each place is the one the rail
+        // or the palette already answers for, so this adds no screen: New item
+        // is the rail's request, Sends and the Generator are the palette's
+        // `Share` and `Generate` destinations.
+        if !vault_loading {
+            if let Some(landing) = landing::take() {
+                match landing {
+                    crate::ui_process::Landing::NewItem => {
+                        sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::NewItem)
+                    }
+                    crate::ui_process::Landing::Sends => {
+                        received_selected = false;
+                        health_selected = false;
+                        settings_selected = false;
+                        generator_selected = false;
+                        sends_selected = true;
+                    }
+                    crate::ui_process::Landing::Generator => {
+                        sends_selected = false;
+                        received_selected = false;
+                        health_selected = false;
+                        settings_selected = false;
+                        generator_selected = true;
+                    }
+                }
+            }
+        }
         let rail_new_item = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::NewItem);
         let rail_lock = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::Lock);
         let (ctrl_k, ctrl_l, ctrl_n, send_record_chord, add_totp_chord) = ui.ctx().input(|i| {
@@ -9033,6 +9061,31 @@ impl VaultFrameHandles {
         // one field whose absence means "spawn the CLI again".
         let account_details = self.account_details.borrow().clone();
         VaultWindowResult { locked, needs_reauth, edited_settings, switch_to, add_account, remove_account, account_details }
+    }
+}
+
+/// **Where this window opens**, handed over by the process that started it.
+///
+/// A process-wide slot rather than another parameter on `run`, whose argument
+/// list every host of this window already spells: the child's `main` sets it
+/// once from [`crate::ui_process::take_initial_landing`], and the first frame
+/// with the vault on screen takes it.
+pub mod landing {
+    use crate::ui_process::Landing;
+    use std::sync::Mutex;
+
+    static SLOT: Mutex<Option<Landing>> = Mutex::new(None);
+
+    /// Records where the window should open. `None` leaves the item list.
+    pub fn set(landing: Option<Landing>) {
+        if let Ok(mut slot) = SLOT.lock() {
+            *slot = landing;
+        }
+    }
+
+    /// Takes the landing, leaving nothing -- each is answered once.
+    pub fn take() -> Option<Landing> {
+        SLOT.lock().ok().and_then(|mut slot| slot.take())
     }
 }
 
