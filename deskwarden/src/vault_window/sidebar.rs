@@ -997,6 +997,8 @@ pub enum ShellRequest {
     OpenPalette,
     /// Settings > Import & export > Import: open the Import wizard.
     OpenImport,
+    /// Settings > Security > the score card: open Password health.
+    OpenHealth,
 }
 
 /// Records `request` for the window to answer on its next frame.

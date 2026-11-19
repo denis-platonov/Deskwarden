@@ -354,6 +354,13 @@ fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
             switch_row(ui, prefs::PROMPT_LABEL, prefs::PROMPT_DESCRIPTION, &mut state.settings.prompt_on_match, true);
         });
     });
+    group(ui, Some("Sign-in steps"), |ui| {
+        card(ui, |ui| {
+            if button_row(ui, DEFAULT_STEPS_LABEL, DEFAULT_STEPS_SUB, DEFAULT_STEPS_VALUE, false) {
+                crate::kit::toast::show(ui.ctx(), DEFAULT_STEPS_TOAST);
+            }
+        });
+    });
     group(ui, Some("Shortcut"), |ui| {
         card(ui, |ui| {
             let chord = match state.settings.shortcuts.picker {
@@ -367,6 +374,14 @@ fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
     });
 }
 
+/// Autofill > Sign-in steps: what an app sign-in types when its login stores
+/// no sequence of its own (`key_sequence::DEFAULT_SEQUENCE`). Read-only; the
+/// steps of one login are edited on that login's Edit page.
+pub const DEFAULT_STEPS_LABEL: &str = "Default sign-in steps";
+const DEFAULT_STEPS_VALUE: &str = "Standard";
+const DEFAULT_STEPS_SUB: &str = "Username, Tab, password";
+pub const DEFAULT_STEPS_TOAST: &str = "Change steps for one login from its Edit page";
+
 /// The Autofill page's pointer at the Shortcuts page.
 pub const FILL_SHORTCUT_LABEL: &str = "Fill shortcut";
 const FILL_SHORTCUT_SUB: &str = "Works in any app, even without the panel";
@@ -376,6 +391,7 @@ fn apps(ui: &mut Ui, state: &mut PrefsState) {
 }
 
 fn security(ui: &mut Ui, state: &mut PrefsState) {
+    super::security_score::draw(ui);
     group(ui, Some("Locking"), |ui| {
         prefs::draw_lock(ui, state);
         card(ui, |ui| {
@@ -459,6 +475,46 @@ fn about(ui: &mut Ui, state: &mut PrefsState) {
         });
     });
     group(ui, Some("Updates"), |ui| prefs::draw_updates(ui, state));
+    group(ui, Some("Support"), |ui| {
+        card(ui, |ui| {
+            if button_row(ui, HELP_LABEL, "How Deskwarden works, in your browser", "Open", false) {
+                crate::vault_window::webbrowser_open(HELP_URL);
+            }
+            kit_card::row_rule(ui);
+            if button_row(ui, FEEDBACK_LABEL, "Tell us what is missing or broken, in your browser", "Write", false) {
+                crate::vault_window::webbrowser_open(FEEDBACK_URL);
+            }
+            kit_card::row_rule(ui);
+            if button_row(ui, LOGS_LABEL, LOGS_SUB, "Copy", false) {
+                match log_location() {
+                    Some(path) => {
+                        ui.ctx().copy_text(path);
+                        crate::kit::toast::show(ui.ctx(), LOGS_COPIED_TOAST);
+                    }
+                    None => crate::kit::toast::show(ui.ctx(), LOGS_MISSING_TOAST),
+                }
+            }
+        });
+    });
+}
+
+/// About > Support (spec C 2.4). Both open the project's pages in the browser.
+pub const HELP_LABEL: &str = "Help center";
+pub const FEEDBACK_LABEL: &str = "Send feedback";
+pub const LOGS_LABEL: &str = "Diagnostic logs";
+const HELP_URL: &str = "https://github.com/denis-platonov/deskwarden#readme";
+const FEEDBACK_URL: &str = "https://github.com/denis-platonov/deskwarden/issues/new";
+const LOGS_SUB: &str = "Copies where the log file is, not what is in it";
+pub const LOGS_COPIED_TOAST: &str = "Log file location copied";
+pub const LOGS_MISSING_TOAST: &str = "There is no log file yet";
+
+/// Where `deskwarden.log` is, as text, when there is one. **The path, never
+/// the file**: a log is written by many parts of the app and this screen
+/// cannot vouch for every line, so what leaves it is a location the user can
+/// open and read before they decide to share anything.
+fn log_location() -> Option<String> {
+    let path = crate::logging::log_file_path(&crate::settings::config_dir()?);
+    path.exists().then(|| path.display().to_string())
 }
 
 /// One marked-disabled row, for a page whose behaviour is not built yet.
@@ -772,6 +828,39 @@ mod tests {
             let painted = fixture.settle();
             assert!(painted.text("later release").is_some(), "{page:?} says nothing about why it is empty");
         }
+    }
+
+    #[test]
+    fn the_about_page_has_the_support_rows_and_https_links() {
+        let painted = Fixture::new(Page::About).settle();
+        for label in [HELP_LABEL, FEEDBACK_LABEL, LOGS_LABEL] {
+            assert!(painted.text(label).is_some(), "{label} is not drawn");
+        }
+        for url in [HELP_URL, FEEDBACK_URL] {
+            assert!(url.starts_with("https://github.com/denis-platonov/deskwarden"), "{url}");
+        }
+    }
+
+    #[test]
+    fn copying_the_logs_says_whether_it_had_a_file_to_name() {
+        let mut fixture = Fixture::new(Page::About);
+        let painted = fixture.settle();
+        let copy = painted.texts.iter().filter(|(t, _, _)| t == "Copy").last().expect("a Copy button").2.center();
+        fixture.frame(click_at(copy));
+        let toast = crate::kit::toast::current(&fixture.ctx).expect("a toast");
+        assert!(toast == LOGS_COPIED_TOAST || toast == LOGS_MISSING_TOAST, "{toast}");
+        assert_eq!(log_location().is_some(), toast == LOGS_COPIED_TOAST);
+    }
+
+    #[test]
+    fn the_default_steps_row_says_what_a_login_without_steps_types() {
+        assert_eq!(crate::key_sequence::DEFAULT_SEQUENCE, "{USERNAME}{TAB}{PASSWORD}");
+        let mut fixture = Fixture::new(Page::Autofill);
+        let painted = fixture.settle();
+        assert!(painted.text(DEFAULT_STEPS_LABEL).is_some());
+        let at = painted.texts.iter().find(|(t, _, _)| t == DEFAULT_STEPS_VALUE).expect("the value button").2.center();
+        fixture.frame(click_at(at));
+        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some(DEFAULT_STEPS_TOAST));
     }
 
     #[test]
