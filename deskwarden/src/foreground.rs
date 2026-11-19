@@ -855,7 +855,7 @@ mod tests {
     /// the two tables it was chaining, which made it unfailable; this list is
     /// reconciled with `lib.rs` by a different test, so counting against it is
     /// a claim that can actually come out false.
-    const OPENS_WINDOWS: [&str; 15] = [
+    const OPENS_WINDOWS: [&str; 16] = [
         "app_window",
         // The autofill notice: a refused or abandoned fill, said on a card in
         // the account picker's style rather than in the system message box it
@@ -929,6 +929,15 @@ mod tests {
         // [`OPENS_A_VIEWPORT_AND_RAISES_IT`], which is the table that holds
         // its raise.
         "scratch_window",
+        // Design 1d's tray popup (slice 12 of the 1.0 redesign): left click on
+        // the tray icon opens it. The EIGHTH bare-Win32 window in this crate,
+        // for the measured reason the other seven are -- the daemon owns the
+        // tray, and an egui window would cost it ~50 MB of driver arenas for
+        // ever. It takes the foreground because it is typed into (the search
+        // box) and because it closes when it loses it: a panel that never has
+        // focus can neither hear Esc nor notice a click elsewhere. See
+        // [`OPENS_A_WIN32_WINDOW_AND_RAISES_IT`].
+        "tray_popup",
         // The daemon's unlock prompt. The FIRST window in this crate that is
         // neither an `eframe` loop nor an egui viewport since the rehearsal
         // window stopped being one -- it is bare Win32, deliberately, because
@@ -1122,7 +1131,7 @@ mod tests {
     /// Enter and Esc. It never retakes it, so a user who clicks back into
     /// their app keeps it. Its capture exclusion covers a refusal's wording,
     /// which can name an item's custom fields.
-    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 7] = [
+    const OPENS_A_WIN32_WINDOW_AND_RAISES_IT: [(&str, &str, &str); 8] = [
         ("unlock_prompt", include_str!("unlock_prompt.rs"), "UNLOCK_PROMPT_TITLE"),
         ("picker_prompt", include_str!("picker_prompt.rs"), "PICKER_PROMPT_TITLE"),
         ("generate_prompt", include_str!("generate_prompt.rs"), "GENERATE_PROMPT_TITLE"),
@@ -1130,6 +1139,7 @@ mod tests {
         ("locked_card", include_str!("locked_card.rs"), "LOCKED_CARD_TITLE"),
         ("save_login_card", include_str!("save_login_card.rs"), "SAVE_LOGIN_CARD_TITLE"),
         ("notice_card", include_str!("notice_card.rs"), "NOTICE_CARD_TITLE"),
+        ("tray_popup", include_str!("tray_popup.rs"), "TRAY_POPUP_TITLE"),
     ];
 
     /// **Opens a window, and deliberately does not raise it -- because.**
@@ -2156,6 +2166,20 @@ mod tests {
         );
         assert!(!crate::generate_prompt::GENERATE_PROMPT_TITLE.is_empty());
 
+        // **The tray popup**, opened from the daemon's loop on a left click and
+        // found by title like the cards above. It can be up while the vault
+        // window is, so it shares a title with none of them.
+        for other in [
+            crate::vault_window::WINDOW_TITLE,
+            crate::picker_prompt::PICKER_PROMPT_TITLE,
+            crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
+            crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::locked_card::LOCKED_CARD_TITLE,
+        ] {
+            assert_ne!(crate::tray_popup::TRAY_POPUP_TITLE, other);
+        }
+        assert!(!crate::tray_popup::TRAY_POPUP_TITLE.is_empty());
+
         // **The 6b region overlay, the second viewport.** It is open alongside
         // the vault window too, and it takes the foreground deliberately -- so
         // a title it shared with anything would let `raise_window` bring the
@@ -2484,13 +2508,14 @@ mod tests {
     #[test]
     fn every_title_this_crate_looks_up_fits_the_buffer() {
         let capacity = win32::TITLE_CAPACITY;
-        let public: [&str; 6] = [
+        let public: [&str; 7] = [
             crate::vault_window::WINDOW_TITLE,
             crate::vault_window::rehearsal::SCRATCH_TITLE,
             crate::region_overlay::REGION_TITLE,
             crate::picker_prompt::PICKER_PROMPT_TITLE,
             crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
             crate::generate_prompt::GENERATE_PROMPT_TITLE,
+            crate::tray_popup::TRAY_POPUP_TITLE,
         ];
         for title in public {
             let units = title.encode_utf16().count();

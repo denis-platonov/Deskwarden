@@ -220,6 +220,7 @@ pub mod test_vault;
 pub mod system_theme;
 pub mod theme;
 pub mod tray;
+pub mod tray_popup;
 pub mod update_panel;
 pub mod updater;
 /// The daemon's bare-Win32 unlock prompt: the app asking for the master

@@ -399,14 +399,7 @@ fn permitted_by_reprompt(
     item_id: &str,
     notifier: &dyn sequence::Notifier,
 ) -> bool {
-    let protected = crate::vault_bridge::reprompt_protected(item);
-    let gate = if protected {
-        (reprompt.gate_for)(reprompt.account.as_ref())
-    } else {
-        crate::reprompt::RepromptGate::unprovable()
-    };
-    let outcome =
-        crate::reprompt::permit(&gate, protected, reprompt.proof, std::time::Instant::now(), || {});
+    let outcome = reprompt_outcome(reprompt, item);
     if outcome.happened() {
         return true;
     }
@@ -414,6 +407,25 @@ fn permitted_by_reprompt(
     log::warn!("a master-password re-prompt withheld a fill of item {item_id}: {message}");
     notifier.refused(message);
     false
+}
+
+/// **The re-prompt decision for one item, as an outcome rather than a `bool`.**
+///
+/// [`permitted_by_reprompt`]'s body, lifted out so a surface that tells the user
+/// what happened in its own words -- the tray popup's footer -- asks the one
+/// gate and not a second copy of it. The gate is built only for a protected
+/// item, for the reason [`permitted_by_reprompt`] records.
+fn reprompt_outcome(
+    reprompt: &mut Reprompt<'_>,
+    item: &VaultItem,
+) -> crate::reprompt::Outcome<()> {
+    let protected = crate::vault_bridge::reprompt_protected(item);
+    let gate = if protected {
+        (reprompt.gate_for)(reprompt.account.as_ref())
+    } else {
+        crate::reprompt::RepromptGate::unprovable()
+    };
+    crate::reprompt::permit(&gate, protected, reprompt.proof, std::time::Instant::now(), || {})
 }
 
 /// [`fill_from_vault`] with the preflight's foreground lookup **injected**.
@@ -3586,6 +3598,101 @@ fn search_parked_vault(query: &str, cap: usize) -> crate::picker_prompt::SearchR
         }
     }
     crate::picker_prompt::SearchResults { offers, total }
+}
+
+/// **One vault item as the tray popup lists it**, or `None` for anything that is
+/// not a login.
+///
+/// Whether a password exists, never the password: this runs under
+/// [`VaultCache::project`]'s lock over a borrowed item, and what it returns is
+/// what the panel keeps for as long as it is open.
+fn tray_popup_item(item: &VaultItem) -> Option<crate::tray_popup::Item> {
+    let login = item.login.as_ref()?;
+    Some(crate::tray_popup::Item {
+        id: item.id.clone(),
+        name: item.name.clone(),
+        username: login.username.clone().unwrap_or_default(),
+        has_password: login.password.as_ref().is_some_and(|password| !password.is_empty()),
+    })
+}
+
+/// **Everything the tray popup lists and searches**, read once as it opens.
+///
+/// Through [`VaultCache::project`], so no `VaultItem` is cloned and no password
+/// leaves the cache -- the account picker's rule, for the account picker's
+/// reason. The fill counts are `crate::fill_stats`'s, which is the one record of
+/// use this app keeps and what "recent" is ranked by.
+pub fn tray_popup_listing(
+    cache: &VaultCache,
+    fill_stats: &crate::fill_stats::FillStats,
+) -> crate::tray_popup::Listing {
+    crate::tray_popup::Listing {
+        items: cache.project(tray_popup_item).into_iter().flatten().collect(),
+        fill_counts: fill_stats.counts(),
+    }
+}
+
+/// **The tray popup's copy buttons**: the one secret of one login, onto the
+/// clipboard through [`crate::clipboard::copy_secret`] and its clearing
+/// behaviour, **behind the master-password re-prompt**.
+///
+/// The popup hands over an id and a field and is told what happened; it never
+/// holds the value. The re-prompt is [`reprompt_outcome`], the decision every
+/// fill and every copy row in the vault window goes through, asked **before**
+/// the secret is read out of the item -- a refused copy has not looked at it.
+pub fn copy_login_field(
+    cache: &VaultCache,
+    item_id: &str,
+    field: crate::tray_popup::Field,
+    reprompt: &mut Reprompt<'_>,
+) -> crate::tray_popup::CopyResult {
+    copy_login_field_with(cache, item_id, field, reprompt, &crate::clipboard::copy_secret)
+}
+
+/// [`copy_login_field`] with the clipboard passed in, so a test can see what
+/// would have been put there without touching the machine's clipboard.
+pub fn copy_login_field_with(
+    cache: &VaultCache,
+    item_id: &str,
+    field: crate::tray_popup::Field,
+    reprompt: &mut Reprompt<'_>,
+    put: &dyn Fn(&str),
+) -> crate::tray_popup::CopyResult {
+    use crate::tray_popup::{CopyResult, Field};
+    let Some(item) = cache.get_by_id(item_id) else {
+        log::warn!("the tray popup asked to copy from item {item_id}, which is not in the vault");
+        return CopyResult::Gone;
+    };
+    match reprompt_outcome(reprompt, &item) {
+        crate::reprompt::Outcome::Done(()) => {}
+        crate::reprompt::Outcome::Refused => {
+            log::warn!("a master-password re-prompt withheld a copy from item {item_id}");
+            return CopyResult::Cancelled;
+        }
+        crate::reprompt::Outcome::Cannot => {
+            log::warn!("a protected item {item_id} could not be copied: no way to ask");
+            return CopyResult::NeedsHello;
+        }
+    }
+    let Some(login) = item.login.as_ref() else {
+        return CopyResult::Empty;
+    };
+    match field {
+        Field::Username => match login.username.as_deref() {
+            Some(username) if !username.is_empty() => {
+                put(username);
+                CopyResult::Copied
+            }
+            _ => CopyResult::Empty,
+        },
+        Field::Password => match login.password.as_ref() {
+            Some(password) if !password.is_empty() => {
+                put(password.as_str());
+                CopyResult::Copied
+            }
+            _ => CopyResult::Empty,
+        },
+    }
 }
 
 /// How long [`handle_no_match`] waits for the foreground app's version
@@ -8429,6 +8536,137 @@ mod fill_dispatch_tests {
         let defaults = rec.default_fills.lock().unwrap().len();
         let sequences = rec.sequences.lock().unwrap().len();
         (defaults, sequences, notifier.take())
+    }
+
+    // ---- the tray popup's copy buttons ---------------------------------------
+
+    /// What `copy_login_field_with` would have put on the clipboard, and what it
+    /// answered.
+    fn copy_under(
+        item: VaultItem,
+        field: crate::tray_popup::Field,
+        gate_for: fn(Option<&crate::accounts::AccountId>) -> crate::reprompt::RepromptGate,
+    ) -> (crate::tray_popup::CopyResult, Vec<String>) {
+        let cache = cache_with(item);
+        let put = std::cell::RefCell::new(Vec::new());
+        let mut proof = crate::reprompt::Proof::default();
+        let result = copy_login_field_with(
+            &cache,
+            "item-1",
+            field,
+            &mut Reprompt::with_gate_for(&mut proof, gate_for),
+            &|text: &str| put.borrow_mut().push(text.to_string()),
+        );
+        (result, put.into_inner())
+    }
+
+    #[test]
+    fn an_unprotected_login_copies_exactly_the_field_asked_for_and_builds_no_gate() {
+        use crate::tray_popup::{CopyResult, Field};
+        let (result, put) = copy_under(item_with(""), Field::Username, must_not_be_asked_at_all);
+        assert_eq!((result, put), (CopyResult::Copied, vec![USER.to_string()]));
+        let (result, put) = copy_under(item_with(""), Field::Password, must_not_be_asked_at_all);
+        assert_eq!((result, put), (CopyResult::Copied, vec![PASS.to_string()]));
+    }
+
+    /// **A cancelled gesture copies nothing, and the secret is never read.**
+    ///
+    /// Neutralise the gate -- `let _ = reprompt_outcome(..);` -- and this is
+    /// red: the clipboard sees the password.
+    #[test]
+    fn a_cancelled_reprompt_copies_nothing_from_a_protected_login() {
+        use crate::tray_popup::{CopyResult, Field};
+        for field in [Field::Username, Field::Password] {
+            let (result, put) = copy_under(a_protected(item_with("")), field, a_cancelled_gesture);
+            assert_eq!(result, CopyResult::Cancelled);
+            assert!(put.is_empty(), "a cancelled re-prompt still put {put:?} on the clipboard");
+        }
+    }
+
+    #[test]
+    fn a_protected_login_with_no_way_to_ask_copies_nothing_and_says_why() {
+        use crate::tray_popup::{CopyResult, Field};
+        let (result, put) = copy_under(a_protected(item_with("")), Field::Password, no_way_to_ask);
+        assert_eq!(result, CopyResult::NeedsHello);
+        assert!(put.is_empty());
+    }
+
+    #[test]
+    fn a_satisfied_reprompt_copies_the_protected_login() {
+        use crate::tray_popup::{CopyResult, Field};
+        let (result, put) =
+            copy_under(a_protected(item_with("")), Field::Password, a_satisfied_gesture);
+        assert_eq!((result, put), (CopyResult::Copied, vec![PASS.to_string()]));
+    }
+
+    #[test]
+    fn a_login_with_nothing_in_the_field_copies_nothing() {
+        use crate::tray_popup::{CopyResult, Field};
+        let mut bare = item_with("");
+        bare.login = Some(LoginData::default());
+        let (result, put) = copy_under(bare.clone(), Field::Username, must_not_be_asked_at_all);
+        assert_eq!((result, put.len()), (CopyResult::Empty, 0));
+        let (result, put) = copy_under(bare, Field::Password, must_not_be_asked_at_all);
+        assert_eq!((result, put.len()), (CopyResult::Empty, 0));
+        let mut note = item_with("");
+        note.login = None;
+        let (result, put) = copy_under(note, Field::Password, must_not_be_asked_at_all);
+        assert_eq!((result, put.len()), (CopyResult::Empty, 0));
+    }
+
+    #[test]
+    fn an_item_that_is_not_in_the_vault_is_gone_not_copied() {
+        use crate::tray_popup::{CopyResult, Field};
+        let cache = cache_with(item_with(""));
+        let mut proof = crate::reprompt::Proof::default();
+        let result = copy_login_field_with(
+            &cache,
+            "no-such-item",
+            Field::Password,
+            &mut Reprompt::with_gate_for(&mut proof, must_not_be_asked_at_all),
+            &|_: &str| panic!("nothing should reach the clipboard"),
+        );
+        assert_eq!(result, CopyResult::Gone);
+    }
+
+    #[test]
+    fn the_production_copy_goes_through_the_one_clipboard_door() {
+        let source = include_str!("app.rs");
+        let body = source
+            .split_once(concat!("pub fn copy_login_", "field("))
+            .expect("the production copy")
+            .1
+            .split_once("\n}")
+            .expect("its end")
+            .0;
+        assert!(body.contains(concat!("crate::clipboard::copy_", "secret")), "{body}");
+    }
+
+    #[test]
+    fn the_popups_listing_holds_logins_only_and_no_password() {
+        let mut note = item_with("");
+        note.id = "note-1".into();
+        note.login = None;
+        let cache = crate::test_vault::cache_with_items(vec![item_with(""), note]);
+        let (_dir, stats) = scratch_stats("popup-listing");
+        stats.record_fill("item-1");
+        stats.record_fill("item-1");
+        let listing = tray_popup_listing(&cache, &stats);
+        assert_eq!(listing.items.len(), 1, "a note is not a login");
+        assert_eq!(
+            listing.items[0],
+            crate::tray_popup::Item {
+                id: "item-1".into(),
+                name: "Work Microsoft 365".into(),
+                username: USER.into(),
+                has_password: true,
+            }
+        );
+        assert_eq!(listing.fill_counts.get("item-1"), Some(&2));
+        assert!(
+            !format!("{listing:?}").contains(PASS),
+            "the listing the popup keeps open holds a password"
+        );
     }
 
     /// **A cancelled gesture types nothing, on either arm.**
