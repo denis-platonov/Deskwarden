@@ -5163,7 +5163,7 @@ mod tests {
         );
         assert_eq!(
             g.row.width(),
-            192.0,
+            crate::vault_window::SIDEBAR_WIDTH - 20.0,
             "the rail's rows are {}pt wide, not the 192pt they were before the bar was given a \
              lane; the whole point of paying for it out of the panel's right margin is that the \
              rows do not resize",

@@ -692,6 +692,11 @@ const BRAND_LOGOS_DESCRIPTION: &str = "Off by default. Draws a card's network ma
      beside the program itself. Nothing is downloaded. Any brand with no image keeps its \
      printed name.";
 
+/// The v2 sidebar's two looks. On View until slice 7 gives Settings its
+/// General > Look page.
+const SIDEBAR_STYLE_LABEL: &str = "Sidebar";
+const SIDEBAR_STYLE_DESCRIPTION: &str = "Navy or light, beside your vault.";
+
 const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
 /// **Says what ON adds, and what it costs.** Off is the default and is stated
 /// in the copy rather than left to `Settings::default`, exactly as
@@ -2731,6 +2736,20 @@ fn draw_view(ui: &mut Ui, state: &mut PrefsState) {
             TOTP_SECRET_DESCRIPTION,
             state.settings.reveal_totp_seed,
         );
+        row_separator(ui);
+        control_row(ui, SIDEBAR_STYLE_LABEL, SIDEBAR_STYLE_DESCRIPTION, |ui| {
+            use crate::kit::tokens::SidebarStyle;
+            let style = state.settings.sidebar_style;
+            let cells = [
+                theme::Segment { label: "Navy", selected: style == SidebarStyle::Navy },
+                theme::Segment { label: "Light", selected: style == SidebarStyle::Light },
+            ];
+            match theme::segmented_control(ui, &cells) {
+                Some(0) => state.settings.sidebar_style = SidebarStyle::Navy,
+                Some(1) => state.settings.sidebar_style = SidebarStyle::Light,
+                _ => {}
+            }
+        });
     });
 }
 
@@ -6711,6 +6730,20 @@ mod tests {
             // not something an exhaustive match here could usefully catch.
             _ => {}
         }
+    }
+
+    /// The v2 sidebar comes in navy or light; until the Settings screen of
+    /// slice 7, the choice lives on View.
+    #[test]
+    fn the_view_page_offers_the_sidebar_style() {
+        let ctx = tall_context();
+        let mut state = PrefsState::new(Settings::default());
+        state.section = Section::View;
+        let painted = tall_frame(&ctx, &mut state, &[]);
+        assert!(painted.texts.iter().any(|(t, _)| t == SIDEBAR_STYLE_LABEL));
+        let light = painted.rect_of("Light").center();
+        let _ = tall_click(&ctx, &mut state, light);
+        assert_eq!(state.settings.sidebar_style, crate::kit::tokens::SidebarStyle::Light);
     }
 
     /// A context with `theme::apply`'s fonts actually live. The two throwaway

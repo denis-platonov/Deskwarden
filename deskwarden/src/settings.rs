@@ -593,7 +593,7 @@ pub fn parse_clipboard_minutes(text: &str) -> ClipboardEntry {
 /// and [`clamp_window_geometry`] stops a *stored* value below it being
 /// restored at launch -- a settings.json that was hand-edited, or written by
 /// a future build with a smaller floor, never reaches the window.
-pub const MIN_VAULT_WINDOW_SIZE: (i32, i32) = (900, 600);
+pub const MIN_VAULT_WINDOW_SIZE: (i32, i32) = (930, 600);
 
 /// A vault-window position and size as last seen on screen, in egui points
 /// (the same space `ViewportBuilder::with_position` and `with_inner_size`
@@ -1366,6 +1366,9 @@ pub struct Settings {
     /// would have meant loosening that scan to make room, which is exactly
     /// the trade not to make: the field is renamed and the guard stays blunt.
     pub reveal_totp_seed: bool,
+    /// The v2 sidebar's colours: navy (the design's default) or light.
+    /// Missing from files written before 1.0, which read as navy.
+    pub sidebar_style: crate::kit::tokens::SidebarStyle,
     /// Whether the vault window locks itself at all.
     ///
     /// `true` (the default, and what an older `settings.json` without this
@@ -1789,6 +1792,7 @@ impl Default for Settings {
             use_brand_logos: false,
             check_for_updates: true,
             reveal_totp_seed: false,
+            sidebar_style: crate::kit::tokens::SidebarStyle::Navy,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             sync_push: true,
@@ -1925,6 +1929,7 @@ impl Settings {
     pub fn persist_preferences(&self, path: &Path) -> std::io::Result<()> {
         let Settings {
             keep_backend_running,
+            sidebar_style,
             keep_ui_loaded,
             prompt_on_match,
             shortcuts,
@@ -1990,6 +1995,7 @@ impl Settings {
         on_disk.use_brand_logos = *use_brand_logos;
         on_disk.check_for_updates = *check_for_updates;
         on_disk.reveal_totp_seed = *reveal_totp_seed;
+        on_disk.sidebar_style = *sidebar_style;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
         on_disk.sync_push = *sync_push;
@@ -2143,6 +2149,28 @@ impl Settings {
 mod tests {
     use super::*;
     use std::env::temp_dir;
+
+    #[test]
+    fn a_settings_file_without_a_sidebar_style_reads_as_navy() {
+        let old: Settings = serde_json::from_str("{}").expect("an empty file parses");
+        assert_eq!(old.sidebar_style, crate::kit::tokens::SidebarStyle::Navy);
+    }
+
+    #[test]
+    fn the_sidebar_style_is_saved_and_read_back() {
+        let chosen = Settings { sidebar_style: crate::kit::tokens::SidebarStyle::Light, ..Settings::default() };
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert!(json.contains("\"sidebar_style\":\"light\""), "{json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sidebar_style, crate::kit::tokens::SidebarStyle::Light);
+    }
+
+    /// The design's 1280 by 820, and a minimum that still leaves the detail
+    /// pane the 298 points its narrow layouts are built for.
+    #[test]
+    fn the_window_minimum_keeps_room_for_the_narrow_detail() {
+        assert_eq!(MIN_VAULT_WINDOW_SIZE, (930, 600));
+    }
 
     /// A scratch settings file, unique to this process **and to this call**.
     ///
@@ -2553,6 +2581,7 @@ mod tests {
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
+            sidebar_style: crate::kit::tokens::SidebarStyle::Light,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             sync_push: false,
@@ -2889,6 +2918,7 @@ mod tests {
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
+            sidebar_style: crate::kit::tokens::SidebarStyle::Light,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
             sync_push: false,
@@ -3635,6 +3665,7 @@ mod tests {
             use_brand_logos: true,
             check_for_updates: false,
             reveal_totp_seed: true,
+            sidebar_style: crate::kit::tokens::SidebarStyle::Light,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             sync_push: false,
@@ -5066,7 +5097,7 @@ mod clamp_window_geometry_tests {
         // different floor. 320x200 is the three-pane layout squeezed into
         // exactly the sliver `MIN_VAULT_WINDOW_SIZE` exists to prevent.
         let placement = clamp_window_geometry(geometry(100, 100, 320, 200), &[PRIMARY]);
-        assert_eq!(placement.width, 900);
+        assert_eq!(placement.width, crate::settings::MIN_VAULT_WINDOW_SIZE.0);
         assert_eq!(placement.height, 600);
         assert_inside(placement, PRIMARY);
     }
@@ -5091,7 +5122,7 @@ mod clamp_window_geometry_tests {
         // 640x480 three-pane layout cannot be used at all.
         let tiny = WorkArea { x: 0, y: 0, width: 640, height: 480 };
         let placement = clamp_window_geometry(geometry(50, 50, 1240, 740), &[tiny]);
-        assert_eq!(placement.width, 900, "the floor, not the 640px screen");
+        assert_eq!(placement.width, crate::settings::MIN_VAULT_WINDOW_SIZE.0, "the floor, not the 640px screen");
         assert_eq!(placement.height, 600);
         assert_eq!(
             placement.position,
@@ -5135,7 +5166,7 @@ mod clamp_window_geometry_tests {
         // handed back to the OS.
         let placement = clamp_window_geometry(geometry(3000, 3000, 400, 300), &[]);
         assert_eq!(placement.position, None);
-        assert_eq!(placement.width, 900, "the floor still applies -- it needs no monitor");
+        assert_eq!(placement.width, crate::settings::MIN_VAULT_WINDOW_SIZE.0, "the floor still applies -- it needs no monitor");
         assert_eq!(placement.height, 600);
     }
 
@@ -5174,7 +5205,7 @@ mod clamp_window_geometry_tests {
         // for it), so it takes the primary-monitor fallback rather than
         // producing a nonsense "best" match.
         let placement = clamp_window_geometry(geometry(50, 50, 0, -10), &[PRIMARY]);
-        assert_eq!(placement.width, 900);
+        assert_eq!(placement.width, crate::settings::MIN_VAULT_WINDOW_SIZE.0);
         assert_eq!(placement.height, 600);
         assert_inside(placement, PRIMARY);
     }

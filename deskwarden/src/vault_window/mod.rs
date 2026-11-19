@@ -283,9 +283,9 @@ pub(crate) const WINDOW_TITLE: &str = "Deskwarden";
 /// user's sign-in does not end in a small card vanishing and a large window
 /// appearing somewhere else (see `login_ui::vault_skeleton`). Copies of these
 /// three numbers over there would be three numbers that drift.
-pub(crate) const WINDOW_SIZE: [f32; 2] = [1240.0, 740.0];
-pub(crate) const SIDEBAR_WIDTH: f32 = 212.0;
-pub(crate) const LIST_WIDTH: f32 = 390.0;
+pub(crate) const WINDOW_SIZE: [f32; 2] = [1280.0, 820.0];
+pub(crate) const SIDEBAR_WIDTH: f32 = 252.0;
+pub(crate) const LIST_WIDTH: f32 = 380.0;
 
 /// The detail pane's width once it has finished coming in: everything the
 /// window has that the sidebar and the item list do not.
@@ -15982,6 +15982,19 @@ mod hide_shape_tests {
 /// `SetEvent` are `main.rs`'s production `deliver_settings` hook, and this
 /// module drives the decisions around it with a hook of its own.
 #[cfg(test)]
+mod v2_window_size_tests {
+    use super::*;
+
+    #[test]
+    fn the_window_opens_at_the_designs_size_and_keeps_room_for_the_narrow_detail() {
+        assert_eq!(WINDOW_SIZE, [1280.0, 820.0]);
+        assert_eq!((SIDEBAR_WIDTH, LIST_WIDTH), (252.0, 380.0));
+        let min_width = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32;
+        assert_eq!(min_width - SIDEBAR_WIDTH - LIST_WIDTH, 298.0);
+    }
+}
+
+#[cfg(test)]
 mod hide_delivery_tests {
     use super::*;
 
@@ -22748,7 +22761,7 @@ mod window_geometry_tests {
         // fine on the monitor that wrote it.
         let placement =
             initial_placement(Some(WindowGeometry { x: 9000, y: 9000, width: 10, height: 10 }), &[SCREEN]);
-        assert_eq!(placement.width, 900, "the floor was applied");
+        assert_eq!(placement.width, crate::settings::MIN_VAULT_WINDOW_SIZE.0, "the floor was applied");
         assert_eq!(placement.height, 600);
         let (x, y) = placement.position.expect("a known monitor yields a position");
         assert!(x + 900 <= 1920 && y + 600 <= 1040, "{placement:?} is off-screen");
@@ -29304,7 +29317,9 @@ mod preferences_modal_wiring_tests {
             // answers Ok, and kept when it fails, and the source guard that
             // the daemon's forget is sent from one gated place. Recounted
             // independently (top-level `mod` lines under `#[cfg(test)]`).
-            modules, 69,
+            // 70 as of the v2 shell, which added `mod v2_window_size_tests`
+            // -- the design's 1280 by 820 and the 298pt narrow-detail budget.
+            modules, 70,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -35077,7 +35092,7 @@ mod send_delete_wiring {
                 text != row
                     && (rect.center().y - row_y).abs() < 16.0
                     && rect.center().x > row_rect.right()
-                    && rect.center().x - row_rect.right() < 150.0
+                    && rect.center().x - row_rect.right() < super::SIDEBAR_WIDTH - 60.0
             })
             .collect();
         match beside.as_slice() {
