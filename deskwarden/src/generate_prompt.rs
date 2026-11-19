@@ -1007,7 +1007,7 @@ pub const GENERATE_LABEL: &str = "New password";
 ///
 /// Upper case in the constant rather than upper-cased at the paint site,
 /// because `text-transform` is a rendering instruction and this is the word.
-pub const GENERATE_CAPTION: &str = "GENERATED";
+pub const GENERATE_CAPTION: &str = "Suggested password";
 
 /// 3d's primary button.
 ///
@@ -1170,11 +1170,11 @@ pub const WIDTH: i32 = crate::panel_draw::CARD_W;
 /// 3d's `padding: 14px` on the panel body -- which is also the horizontal half
 /// of its footer band's `padding: 12px 14px`, so the card has one left edge all
 /// the way down rather than a body inset and a footer inset that have to agree.
-const BODY_PAD: i32 = 14;
+const BODY_PAD: i32 = crate::panel_draw::PAD;
 
 /// Content inset, and the top margin. The inset is [`BODY_PAD`].
 const MARGIN_X: i32 = BODY_PAD;
-const MARGIN_TOP: i32 = 12;
+const MARGIN_TOP: i32 = crate::panel_draw::PAD;
 
 /// 3d's `gap: 12px` down the panel body, and its `gap: 10px` across the control
 /// row.
@@ -1183,7 +1183,7 @@ const ROW_GAP: i32 = 10;
 
 /// The caption row's height, which is the strength badge's: 3d sets the badge
 /// `font-size: 11px; padding: 2px 8px`, and an 11px line box measures ~14.
-const BADGE_H: i32 = 18;
+const BADGE_H: i32 = crate::panel_draw::PILL_H;
 
 /// The badge's width.
 ///
@@ -1193,7 +1193,7 @@ const BADGE_H: i32 = 18;
 /// caption row every time the user pressed `Ctrl+R`. Wide enough for the
 /// longest of the four labels at 11px semibold plus `theme::PILL_PAD_X` either
 /// side, which is 3d's own `padding: 2px 8px`.
-const BADGE_W: i32 = 54;
+const BADGE_W: i32 = 78;
 
 /// 3d's value: `font-size: 17px` on `line-height: 1.35`, which is 22.95.
 ///
@@ -1205,8 +1205,8 @@ const BADGE_W: i32 = 54;
 /// characters, which is three times the design's and visible across a
 /// twenty-character value. The egui copy of this card in the vault window can
 /// and does set the 0.34, because egui's tracking is a float.
-const VALUE_PX: i32 = 17;
-const VALUE_H: i32 = 23;
+const VALUE_PX: i32 = crate::panel_draw::VALUE_PX;
+const VALUE_H: i32 = 28;
 
 /// The three kind cells' widths, in [`GeneratedKind::ALL`] order: each label at
 /// `theme::SEGMENT_TEXT_SIZE` plus `theme::SEGMENT_PADDING`, which is the
@@ -1317,7 +1317,7 @@ const TOGGLE_H: i32 = 22;
 /// the theme's 32. One button height in the app beats a card whose footer is
 /// two points shorter than the card beside it. Pinned by
 /// [`the_cards_dimensions_are_the_themes`].
-const BUTTON_H: i32 = 32;
+const BUTTON_H: i32 = crate::panel_draw::BUTTON_H;
 
 /// 3d's footer band: `padding: 12px 14px` -- this is the 12 -- over a hairline,
 /// with `gap: 8px` between its two answers.
@@ -1330,8 +1330,8 @@ const BUTTON_GAP: i32 = 8;
 /// device context how wide "Save to vault" came out in the user's own
 /// rendering -- and `win32_draw::draw_button_with_return` centres what it is
 /// given, so slack shows as padding and a shortfall shows as a clipped label.
-const SAVE_W: i32 = 132;
-const COPY_W: i32 = 64;
+const SAVE_W: i32 = 200;
+const COPY_W: i32 = 100;
 
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1484,16 +1484,25 @@ pub struct Layout {
 pub fn layout() -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
-    let lockup = crate::win32_draw::card_lockup();
+    let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
         Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    // The ✕ moves up onto the lockup's line, which is where every card header
-    // in the design carries it -- and where it has to be now that the title is
-    // no longer the top line.
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
-    let title =
-        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w - 24, h: 21 };
+    // The ✕ sits on the lockup's line, which is where every card header in the
+    // design carries it.
+    let close = crate::panel_draw::CLOSE;
+    let close_glyph = Box2 {
+        x: WIDTH - MARGIN_X - close,
+        y: mark.y + (mark.h - close) / 2,
+        w: close,
+        h: close,
+    };
+    let title = Box2 {
+        x: MARGIN_X,
+        y: mark.bottom() + crate::panel_draw::BLOCK_GAP,
+        w: content_w - 24,
+        h: 26,
+    };
     let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
 
     // 3d's body: `padding: 14px`, then `gap: 12px` between each of its rows.
@@ -1766,7 +1775,7 @@ mod win32 {
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse,
         EndPaint, FillRect, GetDC, GetDeviceCaps, GetStockObject, InvalidateRect, NULL_BRUSH,
         Polyline, ReleaseDC, RoundRect,
-        SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, CLEARTYPE_QUALITY,
+        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
         DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
         DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
         LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
@@ -1789,7 +1798,7 @@ mod win32 {
 
     use crate::vault_window::detail_edit::CharClass;
     use crate::win32_draw::{
-        draw_button_with_return, draw_card_lockup, draw_hint_chip, draw_segment_cell,
+        draw_button_with_return, draw_hint_chip, draw_segment_cell,
         draw_text_utf16, rgb, text_width_utf16, ButtonSkin,
     };
 
@@ -1974,20 +1983,25 @@ mod win32 {
         /// chip it is the chip's size, or the pill would not fit the run it is
         /// drawn around.
         hint: HFONT,
+        /// The caption over the value (15) and the footer's two buttons (15/700).
+        caption: HFONT,
+        footer: HFONT,
     }
 
     impl Fonts {
         fn build() -> Self {
-            use crate::theme::{BOLD, REGULAR, SEMIBOLD};
+            use crate::theme::{BOLD, EXTRABOLD, REGULAR, SEMIBOLD};
             Fonts {
-                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
-                title: font(BOLD, 15),
-                value: mono(super::VALUE_PX, FW_NORMAL.0 as i32),
+                brand: font(EXTRABOLD, crate::panel_draw::WORD_PX),
+                title: font(EXTRABOLD, crate::panel_draw::TITLE_PX),
+                value: mono(super::VALUE_PX, 600),
                 prose: font(REGULAR, 12),
                 sample: font(REGULAR, crate::theme::EYEBROW_PX as i32),
-                badge: font(SEMIBOLD, crate::theme::EYEBROW_PX as i32),
+                badge: font(BOLD, crate::panel_draw::PILL_PX),
                 button: font(SEMIBOLD, crate::theme::SEGMENT_TEXT_SIZE as i32),
                 hint: mono(crate::theme::CHIP_TEXT_PX as i32, 600),
+                caption: font(REGULAR, crate::panel_draw::BODY_PX),
+                footer: font(BOLD, crate::panel_draw::BUTTON_PX),
             }
         }
 
@@ -2002,6 +2016,8 @@ mod win32 {
                     self.badge,
                     self.button,
                     self.hint,
+                    self.caption,
+                    self.footer,
                 ] {
                     let _ = DeleteObject(f);
                 }
@@ -3228,30 +3244,17 @@ mod win32 {
             // 20px` round it is the frameless popup's DWM chrome. See the
             // module doc.
             fill_rect(mem, client, crate::theme::CARD);
-            // 3d's footer band: `background: #fbfaf9` under a `border-top: 1px
-            // solid #eae7e7`, which are `CARD_TINT` and `HAIRLINE` exactly.
-            fill_box(mem, l.footer, crate::theme::CARD_TINT);
-            fill_box(mem, l.header_rule, crate::theme::HAIRLINE);
-            fill_box(mem, l.footer_rule, crate::theme::HAIRLINE);
+            // Design 1b's New password panel has no rules and no tinted footer
+            // band: the layout keeps the slots those occupied as spacing, and
+            // nothing is painted in them.
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
                 paint_lockup(mem, &l, fonts.brand);
                 text(mem, fonts.title, l.title, GENERATE_LABEL, crate::theme::INK);
 
-                // 3d's eyebrow: `font-weight: 700; letter-spacing: 0.1em`,
-                // which at 11px is `theme::EYEBROW_TRACKING` -- the same
-                // tracking the wordmark above it is set with, and the same
-                // face, so this is `fonts.brand` rather than a second copy of
-                // Archivo Bold 11.
-                text_tracked(
-                    mem,
-                    fonts.brand,
-                    l.caption,
-                    GENERATE_CAPTION,
-                    crate::theme::TEXT_FAINT,
-                    crate::theme::EYEBROW_TRACKING.round() as i32,
-                );
+                // The caption over the value (D 1.8): 15 in the faint ink.
+                text(mem, fonts.caption, l.caption, GENERATE_CAPTION, crate::theme::TEXT_FAINT);
 
                 match form.state() {
                     ValueState::InFlight => text(
@@ -3385,7 +3388,8 @@ mod win32 {
         rating: crate::password_strength::Strength,
     ) -> (eframe::egui::Color32, eframe::egui::Color32) {
         if rating == crate::password_strength::Strength::Strong {
-            (crate::theme::BLUE_WASH, crate::theme::BLUE_DEEP)
+            // The design's "Very strong" pill (D 1.8): the done-green pair.
+            (crate::theme::DONE_WASH, crate::theme::DONE_INK)
         } else {
             (crate::theme::CANVAS, crate::theme::TEXT_FAINT)
         }
@@ -3416,11 +3420,7 @@ mod win32 {
             // The footer's two buttons sit on the band's tint, everything else
             // on the card -- otherwise a control's rounded corners show the
             // wrong colour through them.
-            let under = if id == ID_SAVE || id == ID_COPY {
-                crate::theme::CARD_TINT
-            } else {
-                crate::theme::CARD
-            };
+            let under = crate::theme::CARD;
             fill_rect(mem, whole, under);
             SetBkMode(mem, TRANSPARENT);
 
@@ -3433,9 +3433,9 @@ mod win32 {
                     // (drawn at [`super::BUTTON_H`]), `padding: 0 12px`,
                     // `border-radius: 7px`.
                     let (label, skin, glyph) = if id == ID_SAVE {
-                        (GENERATE_SAVE_LABEL, ButtonSkin::primary(), true)
+                        (GENERATE_SAVE_LABEL, ButtonSkin::panel_primary(), true)
                     } else {
-                        (GENERATE_COPY_LABEL, ButtonSkin::secondary(), false)
+                        (GENERATE_COPY_LABEL, ButtonSkin::panel_outline(), false)
                     };
                     let skin = if !live {
                         skin.disabled()
@@ -3455,7 +3455,7 @@ mod win32 {
                         rounded(
                             mem,
                             Box2 { x: 0, y: 0, w: at.w, h: at.h },
-                            super::RADIUS + 1,
+                            crate::panel_draw::BUTTON_RADIUS + 1,
                             crate::theme::FOCUS_RING,
                             None,
                         );
@@ -3472,9 +3472,9 @@ mod win32 {
                         mem,
                         pill,
                         label,
-                        fonts.button,
+                        fonts.footer,
                         skin,
-                        scale(super::RADIUS),
+                        scale(crate::panel_draw::BUTTON_RADIUS),
                         glyph,
                         dpi,
                     );
@@ -3680,8 +3680,7 @@ mod win32 {
     /// no other card's `Box2` type can share -- and that is [`dev`], the one
     /// this module's other painters use rather than a closure of its own.
     fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
-        let tracking = scale(crate::win32_draw::card_lockup().tracking);
-        draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
+        crate::panel_draw::draw_lockup(hdc, dev(l.mark), dev(l.wordmark), font);
     }
 
     /// The header's close glyph, drawn as two strokes because no bundled face
@@ -3708,20 +3707,6 @@ mod win32 {
             FillRect(hdc, &rc, brush);
             let _ = DeleteObject(brush);
         }
-    }
-
-    /// [`fill_rect`], for a **logical** rectangle.
-    fn fill_box(hdc: HDC, at: Box2, colour: eframe::egui::Color32) {
-        fill_rect(
-            hdc,
-            RECT {
-                left: scale(at.x),
-                top: scale(at.y),
-                right: scale(at.right()),
-                bottom: scale(at.bottom()).max(scale(at.y) + 1),
-            },
-            colour,
-        );
     }
 
     /// A rounded rectangle in logical coordinates, optionally stroked.
@@ -3876,26 +3861,6 @@ mod win32 {
         // site it was a comment; there it is a precondition.
         let mut chars: Vec<u16> = run.encode_utf16().collect();
         text_utf16_in(hdc, font, rc, &mut chars, colour, format);
-    }
-
-    /// [`text`] with letterspacing, which is what 3d's eyebrow asks for
-    /// (`letter-spacing: 0.1em`) and what the wordmark beside it already uses.
-    ///
-    /// `tracking` is in LOGICAL pixels and scaled here, so a caller cannot hand
-    /// this one a device number and the lockup a logical one.
-    fn text_tracked(
-        hdc: HDC,
-        font: HFONT,
-        at: Box2,
-        run: &str,
-        colour: eframe::egui::Color32,
-        tracking: i32,
-    ) {
-        unsafe {
-            SetTextCharacterExtra(hdc, scale(tracking));
-            text(hdc, font, at, run, colour);
-            SetTextCharacterExtra(hdc, 0);
-        }
     }
 
     /// The one text painter. Takes the UTF-16 buffer by `&mut` because
@@ -4682,7 +4647,7 @@ mod tests {
         // this card now carries again. Pinned to the new truth rather than
         // loosened: the card grew by the lockup's height plus its gap, and the
         // window's own height assertions below are what hold that honest.
-        let lockup = crate::win32_draw::card_lockup();
+        let lockup = crate::panel_draw::lockup();
         assert_eq!(
             (l.mark.x, l.mark.y),
             (MARGIN_X, MARGIN_TOP),
@@ -4933,17 +4898,17 @@ mod tests {
     #[test]
     fn the_body_is_3ds_panel_body() {
         let l = layout();
-        assert_eq!(BODY_PAD, 14, "3d's panel body is `padding: 14px`");
+        assert_eq!(BODY_PAD, 18, "design 1b's New password card is `pad 18`");
         assert_eq!(MARGIN_X, BODY_PAD, "the body's inset and the footer band's are not one edge");
         assert_eq!(BODY_GAP, 12, "3d's panel body is `gap: 12px`");
         assert_eq!(ROW_GAP, 10, "3d's control row is `gap: 10px`");
-        assert_eq!(VALUE_PX, 17, "3d's value is `font-size: 17px`");
+        assert_eq!(VALUE_PX, 21, "design 1b's value is 21 px monospace");
         assert_eq!(
             VALUE_H,
             (f64::from(VALUE_PX) * 1.35).round() as i32,
             "the value's line box is not 3d's `line-height: 1.35`"
         );
-        assert_eq!(BADGE_H, 18, "3d's badge is an 11px line box inside `padding: 2px 8px`");
+        assert_eq!(BADGE_H, 22, "design 1b's strength pill is 22 px tall");
         assert_eq!(RADIUS, 7, "3d gives its run and its footer buttons `border-radius: 7px`");
 
         assert_eq!(
@@ -4973,8 +4938,8 @@ mod tests {
     #[test]
     fn the_cards_dimensions_are_the_themes() {
         assert_eq!(
-            BUTTON_H, crate::theme::BUTTON_HEIGHT as i32,
-            "the footer's buttons are not the app's button height"
+            BUTTON_H, crate::panel_draw::BUTTON_H,
+            "the footer's buttons are not design 1b's 46 px"
         );
         assert_eq!(
             WIDTH,
@@ -5005,8 +4970,8 @@ mod tests {
         }
         assert_eq!(
             BADGE_W,
-            2 * crate::theme::PILL_PAD_X as i32 + 38,
-            "the badge is not its widest label inside 3d's `padding: 2px 8px`"
+            2 * crate::panel_draw::PILL_PAD_X + 58,
+            "the badge is not its widest label inside design 1b's pill padding"
         );
         assert_eq!(
             (TOGGLE_W, TOGGLE_H),
@@ -5224,7 +5189,7 @@ mod tests {
     #[test]
     fn the_cards_words_are_the_ones_it_promises() {
         assert_eq!(GENERATE_LABEL, "New password", "3d's caption over the field");
-        assert_eq!(GENERATE_CAPTION, "GENERATED", "3d's eyebrow over the value");
+        assert_eq!(GENERATE_CAPTION, "Suggested password", "design 1b's label over the value");
         assert_eq!(
             GENERATE_SAVE_LABEL, "Save to vault",
             "the primary button says *Fill*, on a path that holds no injector and cannot type \
@@ -5320,12 +5285,12 @@ mod tests {
     /// digits, which `password_strength::rate` calls `Weak`, and a badge that
     /// approved of that in the same blue would be a badge that says nothing.
     #[test]
-    fn the_strength_badge_is_only_blue_when_the_rating_earns_it() {
+    fn the_strength_badge_is_only_green_when_the_rating_earns_it() {
         use crate::password_strength::Strength;
         assert_eq!(
             win32::badge_tone(Strength::Strong),
-            (crate::theme::BLUE_WASH, crate::theme::BLUE_DEEP),
-            "3d's own badge colours are not what a strong password gets"
+            (crate::theme::DONE_WASH, crate::theme::DONE_INK),
+            "design 1b's green pill is not what a strong password gets"
         );
         for lesser in [Strength::Weak, Strength::Fair, Strength::Good] {
             let tone = win32::badge_tone(lesser);
