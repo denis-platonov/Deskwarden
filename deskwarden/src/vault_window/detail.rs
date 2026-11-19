@@ -1846,14 +1846,14 @@ pub fn out_of_vault_text(out: OutOfVault) -> (&'static str, &'static str) {
         OutOfVault::Trash => (
             "This item is in the Trash.",
             "Deskwarden does not edit, fill or copy from a trashed item -- the vault would \
-             reject the write and the fill would have nothing to type. Right-click its row to \
-             Restore it, or to delete it forever.",
+             reject the write and the fill would have nothing to type. Restore it, or delete \
+             it forever, with the buttons above.",
         ),
         OutOfVault::Archive => (
             "This item is archived.",
             "Archived items are kept out of the vault list, out of app matching and out of \
-             autofill -- which is what archiving them is for. Right-click its row to Unarchive \
-             it, and everything it can normally do comes back.",
+             autofill -- which is what archiving them is for. Unarchive it with the button \
+             above, and everything it can normally do comes back.",
         ),
     }
 }
@@ -1918,9 +1918,18 @@ pub fn draw_out_of_vault_read(
         .inner_margin(Margin { left: 32, right: 32, top: 28, bottom: 0 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
+            // Esc first, so a click on Restore in the same frame is the click.
+            if esc_closes_pane(ui.ctx()) {
+                action = DetailAction::ClosePane;
+            }
             let top = header_top(ui, &HeaderTop { item, icon, folder, shared_by: None, tags: Vec::new() });
             if top.close {
                 action = DetailAction::ClosePane;
+            }
+            if top.folder {
+                if let Some(id) = item.folder_id.clone() {
+                    action = DetailAction::ShowFolder(id);
+                }
             }
             ui.add_space(V2_ROW_GAP);
             let entries = super::item_list::out_of_vault_entries_for(item, out);
@@ -1956,9 +1965,6 @@ pub fn draw_out_of_vault_read(
                 }
             });
         });
-    if esc_closes_pane(ui.ctx()) {
-        action = DetailAction::ClosePane;
-    }
     ui.add_space(18.0);
     // **The explanation is a card, like everything else this pane says.**
     //
@@ -2932,9 +2938,18 @@ fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
     let shared_galley = top.shared_by.map(|(from, unverified)| {
         ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::BODY, &shared_by_line(from, unverified), p.text_faint)))
     });
-    let chip_galley = top
-        .folder
-        .map(|name| ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::LABEL, name, p.tag_neutral_ink))));
+    // The line's own budget: whatever the kind and shared-by leave, the chip's
+    // name is cut to (its padding and glyph are 35pt).
+    let line_right = if stacked { row.left() + row.width() } else { close_rect.left() - V2_HEADER_GAP };
+    let chip_room = (line_right - (if stacked { row.left() } else { avatar.right() + V2_HEADER_GAP }) - kind_galley.size().x - 8.0
+        - shared_galley.as_ref().map_or(0.0, |g| g.size().x + 8.0)
+        - 35.0)
+        .max(0.0);
+    let chip_galley = top.folder.filter(|_| chip_room > 24.0).map(|name| {
+        let mut job = tokens::job(tokens::LABEL, name, p.tag_neutral_ink);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(chip_room);
+        ctx.fonts_mut(|f| f.layout_job(job))
+    });
     // The chip's `padding: 3 9 3 7`, a 13pt glyph and a gap of 6.
     let chip_size = chip_galley.as_ref().map(|g| egui::vec2(7.0 + 13.0 + 6.0 + g.size().x + 9.0, g.size().y + 6.0));
     let tag_sizes: Vec<egui::Vec2> = top
@@ -2992,6 +3007,10 @@ fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
         x = chip.right() + 8.0;
     }
     for (tag, size) in top.tags.iter().zip(&tag_sizes) {
+        // A tag that would cross the line's edge is left off rather than cut.
+        if x + size.x > left + width {
+            break;
+        }
         kit::card::paint_tag(ui.painter(), egui::pos2(x, centred(size.y)), *tag, kit::card::TagSize::Detail);
         x += size.x + 8.0;
     }
@@ -7379,7 +7398,13 @@ fn card_hero(
         crate::card_brand::mask_for(number, network)
     };
     let mono = tokens::Role { size: 22.0 * k, face: theme::MONO_BOLD, tracking_em: 0.1 };
-    let digits = galley(mono, &shown, white);
+    let mut digits = galley(mono, &shown, white);
+    // The number and its eye fit the face: a 19-digit number is set smaller.
+    let number_room = inner.width() - 44.0 * k;
+    if digits.size().x > number_room {
+        let scaled = tokens::Role { size: (mono.size * number_room / digits.size().x).floor(), ..mono };
+        digits = galley(scaled, &shown, white);
+    }
     let digits_at = egui::pos2(inner.left(), chip.bottom() + 18.0 * k);
     let digits_size = digits.size();
     ui.painter().galley(digits_at, digits, white);
@@ -7416,9 +7441,22 @@ fn card_hero(
     let value_h = tokens::font_height(&ctx, value_role);
     let label_h = tokens::font_height(&ctx, label_role);
     let label_y = inner.bottom() - value_h - 2.0 - label_h;
+    // The columns share the room left of the network's box. Expires and the
+    // code keep their natural widths; the holder takes what is left, and an
+    // overlong name ends in an ellipsis rather than pushing them off.
+    let limit = if network.is_some() { inner.right() - 76.0 * k - 8.0 * k } else { inner.right() };
+    let natural = |label: &str, value: &str| galley(label_role, label, faint).size().x.max(galley(value_role, value, white).size().x);
+    let others = natural(HERO_EXPIRES, &columns[1].1) + natural(HERO_CODE, &columns[2].1) + (16.0 * 2.0 + 32.0) * k;
+    let holder_room = (limit - inner.left() - others).max(24.0 * k);
     for (label, value) in columns {
         let l = galley(label_role, label, faint);
-        let v = galley(value_role, &value, white);
+        let v = if label == HERO_HOLDER {
+            let mut job = tokens::job(value_role, &value, white);
+            job.wrap = egui::text::TextWrapping::truncate_at_width(holder_room);
+            ctx.fonts_mut(|f| f.layout_job(job))
+        } else {
+            galley(value_role, &value, white)
+        };
         let w = l.size().x.max(v.size().x);
         let value_w = v.size().x;
         ui.painter().galley(egui::pos2(x, label_y), l, faint);
@@ -8288,13 +8326,24 @@ fn totp_code_row(
     let label_w = label.size().x;
     ui.painter().galley(egui::pos2(inner.left(), top), label, p.text_label);
     let tip = egui::Rect::from_min_size(egui::pos2(inner.left() + label_w + 8.0, top + label_h / 2.0 - 9.0), egui::Vec2::splat(18.0));
-    ui.scope_builder(egui::UiBuilder::new().max_rect(tip), |ui| {
-        kit::tips::help_dot(ui, ui.id().with("totp-tip"), TOTP_TIP, 250.0, kit::tips::Placement::Above);
-    });
-    let digits = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::TOTP, &grouped_code(code), ink)));
-    ui.painter().galley(egui::pos2(inner.left(), top + label_h + 4.0), digits, ink);
+    // A child that does not advance this card's cursor: `scope_builder` would
+    // move it back up to the tip and the next row would draw over the code.
+    let mut tip_ui = ui.new_child(egui::UiBuilder::new().max_rect(tip));
+    let tip_id = tip_ui.id().with("totp-tip");
+    kit::tips::help_dot(&mut tip_ui, tip_id, TOTP_TIP, 250.0, kit::tips::Placement::Above);
 
     let copy_rect = egui::Rect::from_min_size(egui::pos2(inner.right() - 42.0, inner.center().y - 21.0), egui::Vec2::splat(42.0));
+    let centre = egui::pos2(copy_rect.left() - 14.0 - 20.0, inner.center().y);
+    // The code fits between the label's edge and the ring: on a narrow pane an
+    // 8-digit code is set smaller rather than run into the seconds.
+    let room = (centre.x - 20.0 - 8.0 - inner.left()).max(1.0);
+    let mut role = tokens::TOTP;
+    let mut digits = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, &grouped_code(code), ink)));
+    if digits.size().x > room {
+        role.size = (role.size * room / digits.size().x).floor();
+        digits = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, &grouped_code(code), ink)));
+    }
+    ui.painter().galley(egui::pos2(inner.left(), top + label_h + 4.0), digits, ink);
     let copy = ui
         .interact(copy_rect, ui.id().with("totp-copy"), egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -8312,7 +8361,6 @@ fn totp_code_row(
     }
 
     // The 40pt ring: a track, and the time left drawn clockwise from twelve.
-    let centre = egui::pos2(copy_rect.left() - 14.0 - 20.0, inner.center().y);
     ui.painter().circle_stroke(centre, 15.0, egui::Stroke::new(4.0, p.badge_bg));
     let fraction = totp_bar_fraction(seconds_left, period);
     let points = ring_points(centre, 15.0, fraction);
@@ -18475,6 +18523,89 @@ mod tests {
                 for (text, rect) in &f.texts {
                     assert!(rect.right() <= MIN_PANE + 0.5, "{text:?} runs past the {MIN_PANE}pt pane to {}", rect.right());
                 }
+            }
+        }
+
+        /// Review finding 1: the `?` tip must not pull the card's cursor back
+        /// up, or the seed row draws over the code.
+        #[test]
+        fn the_seed_row_sits_below_the_code_digits() {
+            let mut item = a_login_with_a_code();
+            item.login.as_mut().unwrap().totp = Some("JBSWY3DPEHPK3PXP".to_string().into());
+            let f = Pane::new().revealing_secrets().tall().idle(&item, &code(20));
+            let digits = f.rect_of("123 456");
+            let seed = f.rect_of(TOTP_SECRET_LABEL);
+            assert!(seed.top() >= digits.bottom(), "the seed row {seed:?} overlaps the code {digits:?}");
+        }
+
+        /// Review finding 2: at the 298pt pane an 8-digit code stays clear of
+        /// the ring's seconds.
+        #[test]
+        fn an_eight_digit_code_clears_the_ring_on_the_narrowest_pane() {
+            let totp = TotpState::Code { code: "12345678".to_string(), seconds_left: 30, period: 60 };
+            let f = Pane::wide(MIN_PANE).tall().idle(&a_login_with_a_code(), &totp);
+            let digits = f.rect_of("1234 5678");
+            let seconds = f.rect_of("30");
+            // The ring is 40 wide around the seconds; the code must end left of it.
+            assert!(digits.right() <= seconds.center().x - 20.0, "the code {digits:?} runs into the ring at {seconds:?}");
+        }
+
+        /// Review finding 3: long values stay on the card's face.
+        #[test]
+        fn long_card_values_stay_on_the_face() {
+            let mut item = a_full_card();
+            item.card.as_mut().unwrap().cardholder_name = Some("MAXIMILIANA OKONKWO-FERNANDEZ".into());
+            item.card.as_mut().unwrap().number = Some("4111111111111111111".to_string().into());
+            for width in [MIN_PANE, PANE] {
+                let f = Pane::wide(width).tall().idle(&item, &TotpState::NoSecret);
+                let visa = f
+                    .texts
+                    .iter()
+                    .filter(|(t, _)| t == CardBrand::Visa.wordmark())
+                    .map(|(_, r)| *r)
+                    .max_by(|a, b| a.width().total_cmp(&b.width()))
+                    .expect("the face's network word");
+                for (text, rect) in &f.texts {
+                    if rect.top() > visa.top() - 40.0 && rect.bottom() < visa.bottom() + 40.0 && text != CardBrand::Visa.wordmark() && rect.left() < visa.left() {
+                        assert!(rect.right() <= visa.left() + 0.5, "at {width}: {text:?} runs into the network word");
+                    }
+                }
+            }
+        }
+
+        /// Review finding 4: on a trashed item, a click on Restore in the same
+        /// frame as Esc is the click; and the pane no longer says
+        /// "right-click".
+        #[test]
+        fn the_trash_pane_takes_its_buttons_over_esc_and_says_so() {
+            let (_, first) = painted_out_of_vault(&a_login(), OutOfVault::Trash);
+            let restore = first.rect_of("Restore").center();
+            let mut events = out_of_vault_click(restore);
+            events.push(egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            });
+            let (_, clicked) = out_of_vault_frames(&a_login(), OutOfVault::Trash, None, &[events]);
+            assert_eq!(clicked.action, DetailAction::Restore);
+            for out in [OutOfVault::Trash, OutOfVault::Archive] {
+                assert!(!out_of_vault_text(out).1.contains("Right-click"), "{out:?}");
+            }
+        }
+
+        /// Review finding 5: the header's line under the title stays inside
+        /// the pane, however long the folder's name.
+        #[test]
+        fn a_long_folder_name_stays_inside_the_header() {
+            let mut item = a_login_with_a_code();
+            item.folder_id = Some("f1".into());
+            let item = bound_to(&item, &a_desktop_match());
+            let mut pane = Pane::wide(MIN_PANE).in_folder("Engineering, platform and infrastructure");
+            let f = pane.idle(&item, &code(20));
+            for (text, rect) in &f.texts {
+                assert!(rect.right() <= MIN_PANE + 0.5, "{text:?} runs past the pane to {}", rect.right());
             }
         }
 
