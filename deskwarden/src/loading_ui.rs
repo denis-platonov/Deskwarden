@@ -714,6 +714,15 @@ pub fn draw_first_window_body(
     let full = ui.max_rect();
     let mut retry = false;
     let mut open_local_copy = false;
+    // **The v2 splash over the whole first window while it loads** (design
+    // 1a). Painted above the body, which still lays itself out beneath it,
+    // and claiming no input, so the chrome's close still works. Slow and
+    // Unreachable keep their bodies -- their retry and local-copy offers are
+    // things to press, which a splash would hide.
+    if matches!(body, FirstWindowBody::Loading) {
+        crate::vault_window::splash::paint(ui.ctx(), full, false, 0.0);
+        ui.ctx().request_repaint();
+    }
 
     egui::CentralPanel::default()
         .frame(egui::Frame::new().fill(theme::CANVAS).inner_margin(Margin {
@@ -1545,6 +1554,18 @@ mod first_window_body_tests {
 
     fn frame(body: FirstWindowBody) -> egui::FullOutput {
         frame_with(body, Some("a.novak@ledgerline.com"))
+    }
+
+    /// **The v2 splash covers the first window while it loads** -- and only
+    /// then: Slow and Unreachable keep their bodies, with their retry and
+    /// local-copy offers, rather than a splash that never ends.
+    #[test]
+    fn the_first_window_loads_behind_the_splash_and_slow_and_unreachable_keep_their_bodies() {
+        let opening = crate::vault_window::splash::OPENING;
+        assert!(rendered(&frame(FirstWindowBody::Loading)).contains(opening));
+        let slow = rendered(&frame(FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None }));
+        assert!(!slow.contains(opening), "{slow}");
+        assert!(slow.contains("Still syncing with Bitwarden"), "{slow}");
     }
 
     /// Every character actually RENDERED, glyph by glyph off the galleys --

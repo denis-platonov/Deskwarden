@@ -22,6 +22,7 @@ pub mod send_ui;
 pub mod share_ui;
 pub mod sequence_builder;
 pub mod sidebar;
+pub mod splash;
 pub mod totp_add;
 pub mod top_bar;
 
@@ -3060,6 +3061,15 @@ pub fn build_frame_with_search(
         // empty while Sends is up" -- and buying that costs a second frame
         // local, which is one more thing a shadow can be gated on. So: no
         // clear, no park, nothing.
+        // The v2 splash (design 1a): over the whole window while the vault
+        // loads, fading as it becomes ready. "Opening your saved copy" when
+        // what is opening is the encrypted copy on disk.
+        splash::host(
+            ui.ctx(),
+            window_rect,
+            matches!(body, VaultBodyState::Loading),
+            cache.loaded_from_disk_at().is_some(),
+        );
         match body {
             VaultBodyState::Loading => {
                 top_bar_band(ui);
