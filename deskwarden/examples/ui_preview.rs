@@ -2662,7 +2662,7 @@ impl Preview {
         let pill = top_bar::SyncPill::from_v1(theme::BLUE, "Synced just now");
         let mut search = String::new();
         let placeholder = item_list::search_hint(Some(self.fixtures.list.len()), &SidebarFilter::All);
-        let _ = top_bar::draw(root, bar, &mut search, &placeholder, &pill, false, |ui| {
+        let _ = top_bar::draw(root, bar, &mut search, &placeholder, &pill, false, false, |ui| {
             let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(top_bar::AVATAR), egui::Sense::hover());
             ui.painter().circle_filled(rect.center(), top_bar::AVATAR / 2.0, theme::INK);
             ui.painter().text(

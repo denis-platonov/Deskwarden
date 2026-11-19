@@ -1550,6 +1550,14 @@ fn nav_key(ctx: &egui::Context) -> Option<ListNavKey> {
         return None;
     }
     let typing = ctx.memory(|m| m.has_focus(search_field_id()));
+    // **Any OTHER text field with the keyboard keeps every key** -- the rail's
+    // New folder input above all: a folder name being typed owns its caret,
+    // and Up/Down/Home/End moving the list (and the detail pane with it)
+    // under it is the selection changing while the user types elsewhere.
+    // The search field keeps its carve-out below: Up/Down walk the results.
+    if ctx.text_edit_focused() && !typing {
+        return None;
+    }
     ctx.input(|i| {
         i.events.iter().find_map(|event| match event {
             egui::Event::Key {
@@ -10314,6 +10322,8 @@ mod keyboard_selection_tests {
         /// Whether a modal's scrim is drawn over the pane, after it, exactly
         /// where `vault_window::mod` draws its modals.
         modal: bool,
+        /// Draw a second text field (the rail's New folder input, say).
+        other_field: bool,
     }
 
     impl Pane {
@@ -10332,6 +10342,7 @@ mod keyboard_selection_tests {
                 selected: None,
                 drawn: Vec::new(),
                 modal: false,
+                other_field: false,
             };
             pane.frame(Vec::new());
             pane
@@ -10345,7 +10356,12 @@ mod keyboard_selection_tests {
             let search = &mut self.search;
             let selected = &mut self.selected;
             let modal = self.modal;
+            let other_field = self.other_field;
+            let mut other_text = String::new();
             let _ = ctx.run_ui(raw(events), |ui| {
+                if other_field {
+                    ui.add(egui::TextEdit::singleline(&mut other_text).id(egui::Id::new("other-field")));
+                }
                 // The search field lives in the v2 top bar now, drawn by the
                 // window above the panes; so does it here, with the same
                 // `search` string, so focus and typing reach it as they do in
@@ -10361,6 +10377,7 @@ mod keyboard_selection_tests {
                     search,
                     crate::vault_window::top_bar::SEARCH_PLACEHOLDER,
                     &pill,
+                    false,
                     false,
                     |_| {},
                 );
@@ -10670,6 +10687,22 @@ mod keyboard_selection_tests {
             Some("Charlie"),
             "End is dead even outside the field"
         );
+    }
+
+    /// **A folder name being typed keeps its arrows and Home/End.** The
+    /// rail's New folder input is a second text field; while it (or any field
+    /// other than the search) has the keyboard, those keys are the caret's.
+    #[test]
+    fn the_list_leaves_the_keys_alone_while_another_field_has_the_keyboard() {
+        let mut pane = Pane::new(three());
+        pane.other_field = true;
+        pane.frame(Vec::new());
+        pane.ctx.memory_mut(|m| m.request_focus(egui::Id::new("other-field")));
+        pane.frame(Vec::new());
+        for k in [egui::Key::ArrowDown, egui::Key::ArrowUp, egui::Key::Home, egui::Key::End] {
+            pane.press(k);
+            assert_eq!(pane.selected, None, "{k:?} moved the list while a folder name was being typed");
+        }
     }
 
     #[test]

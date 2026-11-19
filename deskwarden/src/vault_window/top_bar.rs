@@ -17,8 +17,10 @@ const PAD_LEFT: f32 = 28.0;
 const GAP: f32 = 14.0;
 /// The search field at full width (design 1a: 460 by 46).
 const SEARCH: egui::Vec2 = egui::vec2(460.0, 46.0);
-/// The narrowest the search field gives way to at the window's minimum.
-const SEARCH_MIN_WIDTH: f32 = 220.0;
+/// The narrowest the search field gives way to: at the window's 930 minimum
+/// with the longest failure pill ("Vault not refreshed · 30 d old") the
+/// field is about 200 wide, so the floor sits well under that.
+const SEARCH_MIN_WIDTH: f32 = 120.0;
 /// The account avatar's diameter.
 pub const AVATAR: f32 = 38.0;
 /// One caption button (design 1a: 46 by 34, flush to the top-right).
@@ -95,6 +97,12 @@ pub enum TopBarAction {
 /// empty field's hint: the window passes the count-aware one 0.15 showed
 /// ("Search 12 logins") until slice 3 gives the list a header that carries
 /// the count, after which it is [`SEARCH_PLACEHOLDER`].
+///
+/// `controls_only` is the splash's case: while the vault loads the splash
+/// covers the bar, so only the caption buttons and the drag area answer --
+/// nothing hidden under it may start a sync, take the keyboard or open the
+/// account menu.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     ui: &mut Ui,
     bar: Rect,
@@ -102,6 +110,7 @@ pub fn draw(
     placeholder: &str,
     pill: &SyncPill,
     maximized: bool,
+    controls_only: bool,
     avatar: impl FnOnce(&mut Ui),
 ) -> TopBarAction {
     let p = palette(ui.ctx());
@@ -121,6 +130,17 @@ pub fn draw(
                 Caption::Close => TopBarAction::Close,
             };
         }
+    }
+    if controls_only {
+        let zone = Rect::from_min_max(bar.min, pos2(captions_left, bar.bottom()));
+        let response = ui.interact(zone, ui.id().with("drag-loading"), Sense::click_and_drag());
+        if response.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if response.double_clicked() {
+            action = TopBarAction::ToggleMaximize;
+        }
+        return action;
     }
     let avatar_rect = Rect::from_center_size(
         pos2(captions_left - GAP - AVATAR / 2.0, bar.center().y),
@@ -314,10 +334,24 @@ mod tests {
     }
 
     fn run(ctx: &egui::Context, time: f64, size: egui::Vec2, bar: Rect, pill: &SyncPill, search: &str, events: Vec<egui::Event>) -> Run {
+        run_mode(ctx, time, size, bar, pill, search, events, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_mode(
+        ctx: &egui::Context,
+        time: f64,
+        size: egui::Vec2,
+        bar: Rect,
+        pill: &SyncPill,
+        search: &str,
+        events: Vec<egui::Event>,
+        controls_only: bool,
+    ) -> Run {
         let mut text = search.to_owned();
         let mut action = TopBarAction::None;
         let painted = testing::frame(ctx, time, size, events, |ui| {
-            action = draw(ui, bar, &mut text, SEARCH_PLACEHOLDER, pill, false, |ui| {
+            action = draw(ui, bar, &mut text, SEARCH_PLACEHOLDER, pill, false, controls_only, |ui| {
                 ui.allocate_exact_size(egui::Vec2::splat(AVATAR), egui::Sense::click());
             });
         });
@@ -472,6 +506,86 @@ mod tests {
         assert!(search.right() < pill_at.left(), "search {search:?} runs into the pill {pill_at:?}");
         assert!(caption(bar, 2).left() >= pill_at.right(), "the pill runs under the caption buttons");
         assert!(caption(bar, 0).right() <= width);
+    }
+
+    /// While the vault loads the splash covers the bar, so nothing under it
+    /// may answer a click -- except the window's own caption buttons.
+    #[test]
+    fn while_the_vault_loads_only_the_window_controls_answer() {
+        let ctx = testing::ctx();
+        let shown = run(&ctx, 0.0, SCREEN, BAR, &green(), "", vec![]);
+        let pill = shown.painted.text("Synced").unwrap().2.center();
+        let field = shown.painted.text(SEARCH_PLACEHOLDER).unwrap().2.center();
+        let ctx = testing::ctx();
+        run_mode(&ctx, 0.0, SCREEN, BAR, &green(), "", vec![], true);
+        let pressed = run_mode(&ctx, 0.1, SCREEN, BAR, &green(), "", testing::click_at(pill), true);
+        assert_eq!(pressed.action, TopBarAction::None, "the hidden pill started a sync");
+        run_mode(&ctx, 0.2, SCREEN, BAR, &green(), "", testing::click_at(field), true);
+        assert_eq!(ctx.memory(|m| m.focused()), None, "the hidden search took the keyboard");
+        let close = run_mode(&ctx, 0.3, SCREEN, BAR, &green(), "", testing::click_at(caption(BAR, 0).center()), true);
+        assert_eq!(close.action, TopBarAction::Close);
+    }
+
+    /// The longest pill the window can show, at the window's minimum width:
+    /// it must not run over the search field.
+    #[test]
+    fn a_long_failure_pill_never_overlaps_the_search_at_the_minimum_width() {
+        let width = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32;
+        let bar = Rect::from_min_max(pos2(252.0, 0.0), pos2(width, 72.0));
+        let ctx = testing::ctx();
+        let label = "Vault not refreshed · 30 d old";
+        let pill = SyncPill { label: label.into(), tone: PillTone::Amber, hint: "Sync now".into() };
+        let r = run(&ctx, 0.0, vec2(width, 600.0), bar, &pill, "", vec![]);
+        let search = rect_filled(&r.painted, P.field_bg).into_iter().find(|f| f.height() == 46.0).unwrap();
+        let pill_box = r
+            .painted
+            .rects
+            .iter()
+            .find(|p| p.fill == P.caution_wash && p.rect.height() == 34.0)
+            .expect("the pill")
+            .rect;
+        assert!(search.right() <= pill_box.left(), "search {search:?} runs into the pill {pill_box:?}");
+        assert!(search.left() >= bar.left(), "the search left the bar");
+    }
+
+    fn focus_search(ctx: &egui::Context, text: &str) {
+        let first = run(ctx, 0.0, SCREEN, BAR, &green(), text, vec![]);
+        let field = first
+            .painted
+            .texts
+            .iter()
+            .find(|(t, _, _)| t == text || t == SEARCH_PLACEHOLDER)
+            .unwrap()
+            .2
+            .center();
+        run(ctx, 0.1, SCREEN, BAR, &green(), text, testing::click_at(field));
+    }
+
+    fn escape() -> Vec<egui::Event> {
+        vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Default::default(),
+        }]
+    }
+
+    #[test]
+    fn escape_clears_a_focused_search_with_text() {
+        let ctx = testing::ctx();
+        focus_search(&ctx, "led");
+        let after = run(&ctx, 0.2, SCREEN, BAR, &green(), "led", escape());
+        assert_eq!(after.search, "");
+    }
+
+    #[test]
+    fn escape_on_an_empty_focused_search_leaves_it_alone() {
+        let ctx = testing::ctx();
+        focus_search(&ctx, "");
+        let after = run(&ctx, 0.2, SCREEN, BAR, &green(), "", escape());
+        assert_eq!(after.search, "");
+        assert_eq!(after.action, TopBarAction::None, "Esc on an empty field asked the window for something");
     }
 
     #[test]

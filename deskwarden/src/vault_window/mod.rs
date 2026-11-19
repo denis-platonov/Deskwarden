@@ -2752,9 +2752,24 @@ pub fn build_frame_with_search(
         let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
         // "Search 180 logins": the scope's own count, as 0.15's list header
         // said it, until slice 3's list header carries it.
-        let search_placeholder =
-            item_list::search_hint(Some(sidebar::count_for(&items, &filter)), &filter);
-        let bar_action = top_bar::draw(ui, bar_rect, &mut search, &search_placeholder, &pill, maximized, |ui| {
+        let search_placeholder = search_placeholder(
+            sidebar::VaultLists {
+                trash: trash_list.items.as_deref(),
+                archive: archive_list.items.as_deref(),
+                ..sidebar::VaultLists::live_only(&items)
+            },
+            &filter,
+        );
+        let bar_action = top_bar::draw(
+            ui,
+            bar_rect,
+            &mut search,
+            &search_placeholder,
+            &pill,
+            maximized,
+            // Under the splash: only the window's own controls answer.
+            vault_loading,
+            |ui| {
             account_action = account_menu(
                 ui,
                 accounts.as_ref(),
@@ -14261,6 +14276,14 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
 /// The top bar's band: an empty, frameless panel the height of the bar, so
 /// the panels laid out after it start below the bar `top_bar::draw` already
 /// painted at the top of the frame.
+/// The search placeholder for `filter`: "Search 3 items" in a Trash of three,
+/// counting the list the filter actually lists (`sidebar::badge_for`, the
+/// rail badge's own count), and no number at all while that list has not
+/// been fetched.
+fn search_placeholder(lists: sidebar::VaultLists<'_>, filter: &SidebarFilter) -> String {
+    item_list::search_hint(sidebar::badge_for(filter, lists), filter)
+}
+
 fn top_bar_band(ui: &mut egui::Ui) {
     egui::Panel::top("vault-top-bar-band")
         .exact_size(top_bar::HEIGHT)
@@ -15921,6 +15944,24 @@ mod hide_shape_tests {
 #[cfg(test)]
 mod v2_window_size_tests {
     use super::*;
+
+    fn trashed(id: &str) -> VaultItem {
+        serde_json::from_value(serde_json::json!({ "id": id, "name": id, "fields": [], "type": 1, "login": {} })).unwrap()
+    }
+
+    /// The search placeholder counts what the filter LISTS: three trashed
+    /// items are "Search 3 items", not the live vault's count, and an
+    /// unfetched Trash is not given a number at all.
+    #[test]
+    fn the_search_placeholder_counts_the_filters_own_list() {
+        let live: Vec<VaultItem> = (0..5).map(|i| trashed(&format!("live-{i}"))).collect();
+        let bin: Vec<VaultItem> = (0..3).map(|i| trashed(&format!("bin-{i}"))).collect();
+        let lists = sidebar::VaultLists { trash: Some(&bin), ..sidebar::VaultLists::live_only(&live) };
+        assert_eq!(search_placeholder(lists, &SidebarFilter::Trash), item_list::search_hint(Some(3), &SidebarFilter::Trash));
+        assert_eq!(search_placeholder(lists, &SidebarFilter::All), item_list::search_hint(Some(5), &SidebarFilter::All));
+        let unfetched = sidebar::VaultLists::live_only(&live);
+        assert_eq!(search_placeholder(unfetched, &SidebarFilter::Archive), item_list::search_hint(None, &SidebarFilter::Archive));
+    }
 
     fn production() -> &'static str {
         let source = include_str!("mod.rs");
