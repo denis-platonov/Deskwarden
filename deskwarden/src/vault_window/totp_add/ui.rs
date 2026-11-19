@@ -119,7 +119,7 @@ pub fn draw_add_modal(ctx: &egui::Context, state: &mut TotpAdd, now_unix: u64) -
     let sub = format!("For {}", state.item_name);
     // A body taller than the window scrolls inside the card instead of running
     // off it: the title block and the margins stay put.
-    let room = (ctx.content_rect().height() - 2.0 * modal::GUTTER - 2.0 * f32::from(modal::PADDING) - 110.0).max(240.0);
+    let room = (ctx.content_rect().height() - 2.0 * modal::GUTTER - 2.0 * f32::from(modal::PADDING) - 76.0).max(240.0);
     let (outcome, action) = Dialog::new(ID, WIDTH)
         .title(PICKER_TITLE)
         .sub(&sub)
