@@ -10288,39 +10288,6 @@ fn band_fits(pane_height: f32) -> bool {
     pane_height >= crate::settings::MIN_VAULT_WINDOW_SIZE.1 as f32
 }
 
-/// The compact band's padding: half [`detail::HEADER_PAD_Y`], because a strip
-/// holding one control does not need a title bar's air around it.
-const COMPACT_BAND_PAD_Y: i8 = detail::HEADER_PAD_Y / 2;
-
-/// **The height of the edit band's content row**, which is NOT
-/// [`detail::HEADER_ROW`] and cannot be.
-///
-/// The read pane's 44 holds a 22-point title over a 12-point subtitle. This
-/// band holds ONE thing: the name, in a [`theme::FIELD_HEIGHT`] box -- 8a's
-/// `height: 38px`. So the row is the box, and the tile and the pill beside it
-/// are centred against it.
-///
-/// **The kind-and-folder line under the name is gone.** It said what the
-/// record is and where it lives, in the read pane's own words, and both of
-/// those are rows of the `ITEM` card below -- the owner's direction was
-/// "Login under title - remove, it will go in a separate block, title center
-/// vertically".
-///
-/// **The READ pane's row, and that is the whole of the definition now.**
-///
-/// It was the taller of the name box and the tile -- 40, against the read
-/// pane's 44 -- which left the edit band four points shorter than the strip
-/// it replaces, so the whole form stepped up by four the moment Edit was
-/// pressed. The owner, with a screenshot of the gap: "there is some empty
-/// space - make height of that header same as details".
-///
-/// Taking `detail::HEADER_ROW` outright also keeps the property that
-/// constant's own doc argues for: the row is stated rather than inferred from
-/// whichever child happens to be tallest. It is comfortably above both (the
-/// box is 38, the tile 40), so the name is centred in it with room either
-/// side rather than defining it.
-const EDIT_HEADER_ROW: f32 = detail::HEADER_ROW;
-
 /// **8a's title bar: the item's avatar, its name in a box, and what it is.**
 ///
 /// The read pane's header strip with three changes, each of which 8a draws:
@@ -10333,167 +10300,216 @@ const EDIT_HEADER_ROW: f32 = detail::HEADER_ROW;
 /// The avatar reads the DRAFT's name, not the item's, so renaming a record
 /// re-letters its monogram as you type -- the tile and the box are then two
 /// views of one value rather than a picture of what the name used to be.
+/// The header bar's controls that tests (and the window) find by id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum EditControl {
+    Back,
+    Avatar,
+    Cancel,
+    Save,
+}
+
+pub(crate) fn edit_control_id(which: EditControl) -> egui::Id {
+    egui::Id::new(("edit-header", which))
+}
+
+/// The header's title field.
+pub(crate) fn edit_title_id() -> egui::Id {
+    egui::Id::new("edit-title")
+}
+
+/// Save with no name (spec B 1.1).
+pub const NAME_FIRST_TOAST: &str = "Give it a name first";
+
+/// "New login", "Editing card" (spec B 1.1).
+pub(crate) fn edit_kind_label(kind: ItemKind, creating: bool) -> String {
+    let label = kind.label();
+    let mut chars = label.chars();
+    let lowered = match chars.next() {
+        // "SSH key" keeps its capitals; every other kind is a common noun.
+        Some(first) if !label.starts_with("SSH") => first.to_lowercase().chain(chars).collect(),
+        _ => label.clone(),
+    };
+    if creating { format!("New {lowered}") } else { format!("Editing {lowered}") }
+}
+
+/// Spec B 1.1's header bar: Back, the 64pt avatar with its camera badge and
+/// icon menu, the kind over the title (the name, edited in place), and
+/// Cancel and Save at the right.
+#[allow(clippy::too_many_arguments)]
 fn edit_header(
     ui: &mut egui::Ui,
     kind: ItemKind,
     draft: &mut EditDraft,
-    dirty: bool,
-    full: bool,
-    // The item being edited, or `None` on a create. Read for its icon menu
-    // and nothing else -- see `EditAction::RefreshIcon`, and
-    // `item_list::icon_menu`, which decides WHICH of the three rows an item
-    // is offered and is asked here rather than second-guessed.
     item: Option<&VaultItem>,
-    // The item's picture, if the window's cache has one. See
-    // `draw_detail_edit`'s parameter.
     icon: Option<&egui::TextureHandle>,
+    creating: bool,
+    creatable: bool,
 ) -> EditAction {
+    use crate::kit::{self, controls, tokens};
+    let p = tokens::palette(ui.ctx());
     let mut action = EditAction::None;
-    let band = egui::vec2(
-        ui.available_width(),
-        if full { EDIT_HEADER_ROW } else { theme::FIELD_HEIGHT },
+    let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 64.0), egui::Sense::hover());
+
+    // On a narrow editor Cancel goes first (Back does the same), then the
+    // avatar, so the title and Save keep their room.
+    let show_cancel = row.width() >= 560.0;
+    let show_avatar = row.width() >= 420.0;
+    // Back.
+    let back_rect = egui::Rect::from_min_size(egui::pos2(row.left(), row.center().y - 22.0), egui::Vec2::splat(44.0));
+    let back = ui
+        .interact(back_rect, edit_control_id(EditControl::Back), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let back_ink = if back.hovered() { p.blue } else { p.text_icon };
+    ui.painter().rect(back_rect, egui::CornerRadius::same(13), p.card, egui::Stroke::new(1.0, if back.hovered() { p.blue } else { p.border }), egui::StrokeKind::Inside);
+    kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(back_rect.center(), egui::Vec2::splat(20.0)), kit::icon::glyph::BACK, 2.2, back_ink);
+    kit::tips::hint(ui, &back, "Close without saving", &["Esc"]);
+
+    // The avatar and its camera badge; either opens the icon menu.
+    let avatar = if show_avatar {
+        egui::Rect::from_min_size(egui::pos2(back_rect.right() + 16.0, row.top()), egui::Vec2::splat(64.0))
+    } else {
+        egui::Rect::from_min_size(egui::pos2(back_rect.right() - 4.0, row.top()), egui::vec2(0.0, 64.0))
+    };
+    let look = match icon {
+        Some(texture) => kit::avatar::Look::Favicon(texture.clone()),
+        None => {
+            let (bg, fg) = kit::avatar::initials_colours(&draft.name);
+            kit::avatar::Look::Initials { text: super::item_list::initials(&draft.name), bg, fg }
+        }
+    };
+    let badge = egui::Rect::from_center_size(avatar.right_bottom() + egui::vec2(-8.0, -8.0), egui::Vec2::splat(28.0));
+    if show_avatar {
+    kit::avatar::paint(ui.painter(), avatar, &look, 18);
+    ui.painter().add(
+        egui::Shadow { offset: [0, 2], blur: 8, spread: 0, color: egui::Color32::from_rgba_unmultiplied(32, 30, 29, 51) }
+            .as_shape(badge, egui::CornerRadius::same(14)),
     );
-    ui.allocate_ui_with_layout(band, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        // The gaps in this strip are `HEADER_GAP`, placed explicitly -- see
-        // `detail::header_row`, whose reasoning this band shares.
-        ui.spacing_mut().item_spacing.x = 0.0;
-        if full {
-            // **The read pane's own two doors, in its own order.** An item
-            // whose row and read pane show a favicon must not lose it the
-            // moment Edit is pressed: the two bands are one click apart, and
-            // the tile is the same object seen twice. The `None` arm is
-            // `kind_mark::avatar` and not a monogram written out here, for
-            // that module's own rule -- an item whose row shows a note mark
-            // opens onto a note mark.
-            //
-            // The rect is the badge's anchor either way, which is why both
-            // arms answer one: `avatar_artwork_tile` allocates and returns
-            // the box it drew, and the mark's is read back off the scope.
-            let tile = match icon {
-                Some(tex) => {
-                    let tile = theme::avatar_artwork_tile(ui, detail::HEADER_AVATAR, true);
-                    theme::avatar_image(ui, tile, tex, true);
-                    tile
-                }
-                None => ui
-                    .scope(|ui| {
-                        crate::kind_mark::avatar(
-                            ui,
-                            kind,
-                            &draft.name,
-                            detail::HEADER_AVATAR,
-                            true,
-                        );
-                    })
-                    .response
-                    .rect,
-            };
-            // **The badge is the icon menu's door**, and on a create it is
-            // only a picture: there is no item yet, so there is no icon to
-            // refresh, choose or clear. `icon_menu` answering `None` has the
-            // same effect for an item that is offered nothing -- a state it
-            // says it cannot produce today, handled rather than asserted.
-            let badge = theme::edit_badge_button(ui, tile);
-            if let Some(rows) = item.and_then(super::item_list::icon_menu) {
-                badge.clone().on_hover_text(ICON_BADGE_HINT);
-                egui::Popup::menu(&badge)
-                    // The kebab's behaviour, for the kebab's reason: a click
-                    // inside the menu closes it because the ENTRY says so
-                    // (`item_list::menu_command` calls `ui.close()`), and a
-                    // click outside dismisses it. See `detail`'s own menu.
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
-                        // `row`, not `action`: the name this closure writes
-                        // its answer into is `action`, and a loop binding
-                        // spelled the same way shadows it. The kebab this
-                        // menu came from carries the same note.
-                        for row in &rows {
-                            if super::item_list::menu_command(ui, row) {
-                                match &row.command {
-                                    super::item_list::RowCommand::RefreshIcon => {
-                                        action = EditAction::RefreshIcon;
-                                    }
-                                    super::item_list::RowCommand::SelectIcon => {
-                                        action = EditAction::SelectIcon;
-                                    }
-                                    super::item_list::RowCommand::ClearIcon => {
-                                        action = EditAction::ClearIcon;
-                                    }
-                                    other => log::warn!(
-                                        "the icon menu offered {other:?}, which is not an icon \
-                                         action; the click was dropped"
-                                    ),
-                                }
-                            }
+    ui.painter().circle_filled(badge.center(), 14.0, p.card);
+    kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(badge.center(), egui::Vec2::splat(14.0)), kit::icon::glyph::CAMERA, 2.0, p.blue);
+    }
+    let avatar_response = ui
+        .interact(avatar.union(badge), edit_control_id(EditControl::Avatar), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    kit::tips::hint(ui, &avatar_response, "Change image", &[]);
+    if let Some(rows) = item.and_then(super::item_list::icon_menu) {
+        egui::Popup::menu(&avatar_response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                for row in &rows {
+                    if super::item_list::menu_command(ui, row) {
+                        match &row.command {
+                            super::item_list::RowCommand::RefreshIcon => action = EditAction::RefreshIcon,
+                            super::item_list::RowCommand::SelectIcon => action = EditAction::SelectIcon,
+                            super::item_list::RowCommand::ClearIcon => action = EditAction::ClearIcon,
+                            other => log::warn!("the icon menu offered {other:?}, which is not an icon action; the click was dropped"),
                         }
-                    });
-            }
-            ui.add_space(detail::HEADER_GAP);
-        }
-        // **The name box sits against the tile, and the pill on the far
-        // right** -- the owner's "move title to the left".
-        //
-        // It used to be a `right_to_left` row, so that the pill could claim
-        // its width before the box took `available_width`. That works and it
-        // put the BOX on the right too: a `right_to_left` layout places a
-        // widget narrower than the space it is offered against the right
-        // edge, and 8a caps this box at 480, so every pane wider than the
-        // tile plus 480 drew the name floating off beside its own avatar.
-        //
-        // Reading order instead, with the pill's width MEASURED rather than
-        // claimed: the measurement is what the other layout was really for,
-        // and it does not need the row reversed to happen. `state_pill_width`
-        // is pure, so asking it first costs nothing and leaves the box with
-        // exactly the room it may have.
-        let pill = dirty
-            .then(|| theme::state_pill_width(ui.painter(), theme::CHANGED_TONE, UNSAVED_PILL))
-            // Left off when it does not fit, for the reason
-            // `theme::section_card_header`'s own pill is: at the pane's floor
-            // a name box and a pill do not share a line, and a pill pushed
-            // off the pane is a pill drawn into the item list. The footer
-            // says the same thing in words and is never elided.
-            .filter(|width| ui.available_width() >= width + detail::HEADER_GAP);
-        let room = ui.available_width()
-            - pill.map_or(0.0, |width| width + detail::HEADER_GAP);
+                    }
+                }
+            });
+    }
 
-        // **One control, added straight into the row.**
-        //
-        // It used to be a `top_down` column holding the box and the
-        // kind-and-folder line under it; with that line gone there is no
-        // column left, and a nested column is exactly what stopped the box
-        // being centred: this band is `left_to_right(Align::Center)`, which
-        // cross-aligns the WIDGETS in it, and a child `Ui` is not a widget --
-        // it takes the full height it is offered and lays out from the top.
-        // Measured: 20 points of strip above the box and 22 below, against
-        // the owner's "title center vertically".
-        //
-        // Added directly, the box is a widget in a centring row and the
-        // arithmetic is egui's. See `EDIT_HEADER_ROW` for why the row is two
-        // points taller than the box in the first place.
-        theme::title_field_within(ui, &mut draft.name, room);
+    // Save and Cancel at the right.
+    let ctx = ui.ctx().clone();
+    let save_w = controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, save_label(draft), false);
+    let cancel_w = controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, CANCEL_BUTTON, false);
+    let save_rect = egui::Rect::from_min_size(egui::pos2(row.right() - save_w, row.center().y - 24.0), egui::vec2(save_w, 48.0));
+    let cancel_rect = if show_cancel {
+        egui::Rect::from_min_size(egui::pos2(save_rect.left() - 12.0 - cancel_w, save_rect.top()), egui::vec2(cancel_w, 48.0))
+    } else {
+        egui::Rect::from_min_size(save_rect.left_top(), egui::vec2(0.0, 48.0))
+    };
+    let cancel_clicked = if show_cancel {
+        let mut cancel_ui = ui.new_child(egui::UiBuilder::new().max_rect(cancel_rect));
+        let cancel = controls::button(&mut cancel_ui, controls::ButtonKind::Outline, controls::LARGE, CANCEL_BUTTON, None);
+        let _ = ui.interact(cancel.rect, edit_control_id(EditControl::Cancel), egui::Sense::hover());
+        kit::tips::hint(ui, &cancel, "Close without saving", &["Esc"]);
+        cancel.clicked()
+    } else {
+        false
+    };
+    let mut save_ui = ui.new_child(egui::UiBuilder::new().max_rect(save_rect));
+    // A draft that cannot be saved for any reason but its missing name looks
+    // it; a missing name is answered by the toast instead.
+    if !draft.name.trim().is_empty() && !(draft.is_saveable() && creatable) {
+        save_ui.disable();
+    }
+    let save = controls::button(&mut save_ui, controls::ButtonKind::Primary, controls::LARGE, save_label(draft), None);
+    let _ = ui.interact(save.rect, edit_control_id(EditControl::Save), egui::Sense::hover());
+    kit::tips::hint(ui, &save, "Save", &["Mod", "S"]);
 
-        if let Some(width) = pill {
-            // Pushed to the far edge: what is left of the row after the box
-            // is the gap, whatever the box's 480-point cap left over.
-            ui.add_space(ui.available_width() - width);
-            let (rect, _) = ui
-                .allocate_exact_size(egui::vec2(width, theme::PILL_HEIGHT), egui::Sense::hover());
-            theme::state_pill(
-                ui.painter(),
-                egui::pos2(rect.left(), rect.center().y),
-                theme::CHANGED_TONE,
-                UNSAVED_PILL,
-            );
+    if back.clicked() || cancel_clicked {
+        // Not `Cancel` outright: a changed draft asks first.
+        if draft.is_dirty() {
+            draft.discard_prompt = true;
+        } else {
+            action = EditAction::Cancel;
         }
-    });
+    }
+    if save.clicked() {
+        if draft.name.trim().is_empty() {
+            kit::toast::show(&ctx, NAME_FIRST_TOAST);
+            ctx.memory_mut(|m| m.request_focus(edit_title_id()));
+        } else if draft.is_saveable() && creatable {
+            action = EditAction::Save;
+        }
+    }
+
+    // The kind over the title; the title is the name, edited where it is.
+    let left = avatar.right() + 20.0;
+    let right = (cancel_rect.left() - 20.0).max(left + 40.0);
+    let kind_job = tokens::job(tokens::LABEL, &edit_kind_label(kind, creating), p.text_label);
+    let kind_galley = ctx.fonts_mut(|f| f.layout_job(kind_job));
+    let title_h = 36.0;
+    let column_h = kind_galley.size().y + 2.0 + title_h;
+    let top = row.center().y - column_h / 2.0;
+    ui.painter().galley(egui::pos2(left, top), kind_galley.clone(), p.text_label);
+    let pencil = egui::Rect::from_min_size(egui::pos2(right - 30.0, top + kind_galley.size().y + 2.0 + 3.0), egui::Vec2::splat(30.0));
+    let field = egui::Rect::from_min_max(
+        egui::pos2(left - 8.0, top + kind_galley.size().y + 2.0),
+        egui::pos2(pencil.left() - 8.0, top + kind_galley.size().y + 2.0 + title_h),
+    );
+    // Esc in the title ends the editing of the title, not the editor: egui
+    // drops the field's focus on Esc before the form's own Esc check runs,
+    // so the key is taken here.
+    // egui lets go of a focused field at the START of the frame Esc arrives
+    // in, so whether the title had the keyboard is last frame's answer.
+    let was_focused_id = edit_title_id().with("was-focused");
+    let title_had_focus = ctx.memory(|m| m.has_focus(edit_title_id()))
+        || ctx.data(|d| d.get_temp::<bool>(was_focused_id).unwrap_or(false));
+    let mut field_ui = ui.new_child(egui::UiBuilder::new().max_rect(field));
+    let title = field_ui.add(
+        egui::TextEdit::singleline(&mut draft.name)
+            .id(edit_title_id())
+            .font(egui::FontId::new(28.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
+            .text_color(p.ink)
+            .hint_text(if creating { "Give it a name" } else { "Untitled" })
+            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(8, 2)))
+            .desired_width(field.width()),
+    );
+    if title.has_focus() {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_max(egui::pos2(field.left() + 8.0, title.rect.bottom() - 2.0), egui::pos2(field.right(), title.rect.bottom())),
+            egui::CornerRadius::ZERO,
+            p.blue,
+        );
+    } else if title.hovered() {
+        ui.painter().rect_filled(title.rect, egui::CornerRadius::same(11), p.field_bg);
+    }
+    if title_had_focus {
+        ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    }
+    let focused_now = title.has_focus();
+    ctx.data_mut(|d| d.insert_temp(was_focused_id, focused_now));
+    let pencil_response = ui.interact(pencil, ui.id().with("edit-title-pencil"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    ui.painter().rect_filled(pencil, egui::CornerRadius::same(9), p.blue_wash);
+    kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(pencil.center(), egui::Vec2::splat(15.0)), kit::icon::glyph::EDIT, 2.0, p.blue);
+    kit::tips::hint(ui, &pencil_response, "Rename", &["F2"]);
+    if pencil_response.clicked() || ctx.input(|i| i.key_pressed(egui::Key::F2)) {
+        ctx.memory_mut(|m| m.request_focus(edit_title_id()));
+    }
     action
 }
-
-/// What the pencil badge says it opens.
-///
-/// `item_list::ICON_LABEL`'s own word, so the control and the menu it opens
-/// agree, with the verb the tooltip has room for and the menu entry does not.
-const ICON_BADGE_HINT: &str = "Icon actions for this item";
 
 /// 8a's tag on the `One-time code` card's title band.
 const TWO_FACTOR_CHIP: &str = "2FA";
@@ -11449,15 +11465,14 @@ pub fn draw_detail_edit(
     let from_badge = ui
         .scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            let creatable = !creating || is_creatable(draft.kind);
+            let _ = full_band;
             let from_badge = egui::Frame::new()
                 .fill(theme::CARD)
-                .inner_margin(Margin::symmetric(
-                    detail::HEADER_PAD_X,
-                    if full_band { detail::HEADER_PAD_Y } else { COMPACT_BAND_PAD_Y },
-                ))
+                .inner_margin(Margin::symmetric(32, 18))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    edit_header(ui, kind, draft, !changes.is_empty(), full_band, item, icon)
+                    edit_header(ui, kind, draft, item, icon, creating, creatable)
                 })
                 .inner;
             // The strip's `border-bottom: 1px solid #eae7e7`, exactly as the
@@ -11698,40 +11713,7 @@ pub fn draw_detail_edit(
                 // toolbar button and not this footer's. See
                 // `theme::SECTION_FOOTER_BUTTON_HEIGHT` for the weights 8a
                 // draws on the two of them.
-                if theme::section_footer_primary_button(
-                    ui,
-                    save_label(draft),
-                    // **8a's chip, and it is drawn because the chord is real
-                    // now.** See `SAVE_CHORD_LABEL`.
-                    Some(SAVE_CHORD_LABEL),
-                    draft.is_saveable() && creatable,
-                )
-                .clicked()
-                {
-                    action = EditAction::Save;
-                }
-                // **The chord only where there is room for it.** `ESC`
-                // costs this button about 26 points, and at the app's
-                // minimum pane the footer's two buttons and the card round
-                // them come to 302 on a 298-point pane -- measured, by the
-                // test that holds every control inside the pane. The same
-                // gate the rows use: wide enough for a label column is wide
-                // enough for a hint on a button.
-                let chord =
-                    theme::section_rows_fit(ui).then_some(theme::MODAL_DISMISS_CHORD);
-                if theme::section_footer_secondary_button_with(ui, CANCEL_BUTTON, chord)
-                    .clicked()
-                {
-                    // **Not `EditAction::Cancel` outright.** A draft with
-                    // unsaved edits asks first; an untouched one closes now.
-                    // See `EditDraft::is_dirty` for why the gate is on the
-                    // draft's content and not on "was this form ever open".
-                    if draft.is_dirty() {
-                        draft.discard_prompt = true;
-                    } else {
-                        action = EditAction::Cancel;
-                    }
-                }
+                // Save and Cancel are the header's (spec B 1.1).
 
                 // 8a's summary, on the buttons' line when it fits there --
                 // and the standing note pushed to the far right of it, which
@@ -19244,9 +19226,10 @@ mod sequence_builder_tests {
 
     /// The narrowest the detail pane can be -- the same derivation, and the
     /// same reason, as `edit_pane_layout_tests`'s.
+    // The editor is a page (spec B 1): at the minimum window it has
+    // everything right of the rail, the list column having stepped aside.
     const MIN_PANE_WIDTH: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
-        - crate::vault_window::SIDEBAR_WIDTH
-        - crate::vault_window::LIST_WIDTH;
+        - crate::vault_window::SIDEBAR_WIDTH;
 
     /// One filled box, as the frame really painted it.
     ///
@@ -21830,9 +21813,10 @@ mod edit_pane_layout_tests {
     /// The narrowest the detail pane can be, derived from the three constants
     /// that produce it (900 - 212 - 390 = 298pt) rather than written out --
     /// same derivation, and same reason, as `detail.rs`'s `MIN_PANE`.
+    // The editor is a page (spec B 1): at the minimum window it has
+    // everything right of the rail, the list column having stepped aside.
     const MIN_PANE_WIDTH: f32 = crate::settings::MIN_VAULT_WINDOW_SIZE.0 as f32
-        - crate::vault_window::SIDEBAR_WIDTH
-        - crate::vault_window::LIST_WIDTH;
+        - crate::vault_window::SIDEBAR_WIDTH;
 
     /// The pane's height at the app's minimum window height. 600 is the whole
     /// WINDOW; the detail pane gets what is left after the toolbar and the
@@ -22441,45 +22425,6 @@ mod edit_pane_layout_tests {
         );
     }
 
-    /// **And the same thing at the window floor, the other way round.**
-    ///
-    /// Below `theme::section_rows_fit` there IS no label column, so every
-    /// caption on the form -- the `Item` card's included -- goes through
-    /// `theme::field_label` and wears `TEXT_MUTED`. The claim is the same
-    /// claim: one idiom on the whole form. Without this half, a build that
-    /// left the per-kind cards stacked at every width would pass the test
-    /// above only by accident of the wide arm.
-    #[test]
-    fn every_caption_is_one_grey_at_the_apps_minimum_width_too() {
-        let item = filled_card_item();
-        let mut draft = EditDraft::from_item(&item);
-        let pane = Vec2::new(MIN_PANE_WIDTH, 2400.0);
-        let ctx = styled_context(pane);
-        let painted =
-            frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
-        assert!(
-            !theme::section_rows_fit_at(MIN_PANE_WIDTH - 2.0 * theme::SECTION_CARD_PAD_X as f32),
-            "the floor now fits §8a's label column, so this test is asserting about the wrong arm"
-        );
-        // `Folder`, for the reason the wide arm's reference is -- see there.
-        let reference = ink_of_run(&painted, "Folder");
-        assert_eq!(
-            reference,
-            theme::TEXT_MUTED,
-            "the stacked arm's caption is no longer `theme::field_label`'s grey"
-        );
-        for caption in
-            [Slot::CardholderName.label(), EXPIRES_ROW_LABEL, CARD_CODE_LABEL, CARD_PIN_LABEL]
-        {
-            assert_eq!(
-                ink_of_run(&painted, caption),
-                reference,
-                "{caption:?} is drawn in a different grey from the Item card above it at the \
-                 app's minimum width"
-            );
-        }
-    }
-
     /// Every optional row of a card still offers its way off the form, at both
     /// widths -- **now inline at the end of the row** (spec 2026-10-09), where
     /// it used to be a chip in the label cell.
@@ -22889,49 +22834,6 @@ mod edit_pane_layout_tests {
             }
             assert_eq!(on_card_row, 1, "at {width}pt the Card row does not carry its one Remove");
         }
-    }
-
-    /// **The PIN wraps to its own line on a narrow pane, caption and all, and
-    /// nothing leaves the pane** -- and each inline caption stays on the line
-    /// of the box it names.
-    #[test]
-    fn the_pin_wraps_to_its_own_line_on_a_narrow_pane_without_overflowing() {
-        let mut draft = revealed_full_card_draft();
-        let painted = full_card_frame_at(MIN_PANE_WIDTH, &mut draft);
-        let pane = Vec2::new(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
-        let code = row_box_around(&painted, painted.rect_of("417"));
-        let pin = row_box_around(&painted, painted.rect_of("4321"));
-        assert!(pin.top() >= code.bottom(), "the PIN {pin:?} is not under the code {code:?}");
-        for (label, boxed) in [(CARD_CODE_LABEL, code), (CARD_PIN_LABEL, pin)] {
-            let caption = painted.rect_of(label);
-            assert!(
-                (caption.center().y - boxed.center().y).abs() <= 2.0,
-                "{label:?} at {caption:?} is not on the line of its box {boxed:?}"
-            );
-            assert!(caption.right() <= boxed.left(), "{label:?} is not in front of its box");
-        }
-        for rect in [code, pin] {
-            assert!(within_pane(rect, pane), "{rect:?} leaves the {}pt pane", pane.x);
-        }
-    }
-
-    /// The smallest painted rect round `inner` that is a row box's height --
-    /// the FIELD, not the text area egui paints inside a short one.
-    fn row_box_around(painted: &Painted, inner: Rect) -> Rect {
-        let mut found: Vec<Rect> = painted
-            .rects
-            .iter()
-            .map(|(r, _)| *r)
-            .filter(|f| {
-                f.height() >= theme::SECTION_FIELD_HEIGHT - 1.0
-                    && f.min.x <= inner.min.x + 1.0
-                    && f.max.x >= inner.max.x - 1.0
-                    && f.min.y <= inner.min.y + 1.0
-                    && f.max.y >= inner.max.y - 1.0
-            })
-            .collect();
-        found.sort_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())));
-        *found.first().unwrap_or_else(|| panic!("no box is painted round {inner:?}"))
     }
 
     /// **The card form at its fullest -- every row, every secret revealed, the
@@ -23769,7 +23671,7 @@ mod edit_pane_layout_tests {
     /// enough to hold the whole form. Wrapping is asserted separately, at
     /// `MIN_PANE_WIDTH`, by
     /// [`the_generator_rows_controls_are_all_reachable_at_the_minimum_width`].
-    const ROOMY_PANE: Vec2 = egui::vec2(560.0, 1400.0);
+    const ROOMY_PANE: Vec2 = egui::vec2(720.0, 1400.0);
 
     /// **The app's minimum WINDOW width**, which is what a modal is laid out
     /// against.
@@ -24263,135 +24165,6 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// **Save and Cancel are one strip of one height.**
-    ///
-    /// The second report on this screen: "Also save button is off". Measured
-    /// on the layout that provoked it -- Save `top=1368 h=26 bot=1394`,
-    /// Cancel `top=1368 h=32 bot=1400`. Save was then a bare `egui::Button`
-    /// carrying only a copied `min_size`, while Cancel went through
-    /// `theme::secondary_button`, so Save's bottom edge stopped 6pt above its
-    /// neighbour's.
-    ///
-    /// **Save is no longer a bare button.** It is
-    /// `theme::primary_button_enabled`, so the shared height is now a
-    /// property of both buttons coming from the same theme rather than of one
-    /// literal being kept in sync with another -- and this test is what says
-    /// the new helper really lands on `theme::BUTTON_HEIGHT` too. The
-    /// mismatch it was written for cannot come back the way it came, but it
-    /// can come back through a redesign that moves one helper and not the
-    /// other, which is the case this still covers.
-    ///
-    /// Both label widths are checked, because the caption changes with the
-    /// draft's validity.
-    #[test]
-    fn the_button_strips_controls_share_one_baseline() {
-        for (what, name) in [(true, SAVE_BUTTON), (false, SAVE)] {
-            let ctx = styled_context(ROOMY_PANE);
-            let mut draft = tallest_draft();
-            if what {
-                draft.name = "Ledgerline".to_string();
-                assert!(draft.is_valid(), "the valid case wants Save's short caption");
-            }
-            let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
-            let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
-
-            let save = painted.frame_around(painted.rect_of(name));
-            let cancel = painted.frame_around(painted.rect_of("Cancel"));
-            assert!(
-                (save.top() - cancel.top()).abs() <= 0.5
-                    && (save.height() - cancel.height()).abs() <= 0.5,
-                "{name} is painted {save:?} beside Cancel's {cancel:?} -- the strip's two \
-                 buttons are different sizes"
-            );
-            // 8a's `height: 34px`, which is `SECTION_FOOTER_BUTTON_HEIGHT` and
-            // no longer `BUTTON_HEIGHT`'s 32 -- see that constant.
-            assert!(
-                (save.height() - theme::SECTION_FOOTER_BUTTON_HEIGHT).abs() <= 0.5,
-                "the strip is {}pt tall, not theme::SECTION_FOOTER_BUTTON_HEIGHT ({})",
-                save.height(),
-                theme::SECTION_FOOTER_BUTTON_HEIGHT
-            );
-        }
-    }
-
-    /// **Each footer button is set in a face the theme NAMES**, and in the
-    /// one §8a gives it: Save at 700, Cancel at 600.
-    ///
-    /// The other half of an older report: "even one bold and not bold now for
-    /// some reason". The cause was not emphasis -- Save was a bare
-    /// `egui::Button`, which takes egui's default `FontId` (the
-    /// `Proportional` family at the style's body size), while Cancel went
-    /// through `theme::secondary_button`'s `theme::semibold(_, 13.0)` and so
-    /// asked for `FontFamily::Name("Archivo-SemiBold")`. Two font STACKS,
-    /// read as two weights.
-    ///
-    /// **This test used to pin the two to one face, and that was an
-    /// overshoot.** Putting Save in Cancel's semibold fixed the stack and
-    /// also flattened the 700/600 step §8a really draws, and the owner's next
-    /// look at the strip was "buttons text not bold". So the rule is the one
-    /// that was always meant: neither button may fall back to egui's default
-    /// stack, and the named weight each wears is the design's call.
-    ///
-    /// Asserted on the `FontId` the layout job carried and not on ink width,
-    /// because ink width is what was already green while this was wrong --
-    /// and positively, against a spelled-out expectation, so it cannot be
-    /// satisfied by both buttons agreeing on something neither should wear.
-    ///
-    /// Run over all three Save captions, since each is a different layout job
-    /// and only one of them is exercised by any given draft.
-    #[test]
-    fn each_footer_button_is_set_in_a_face_the_theme_names() {
-        // What `theme::bold(_, 13.0)` and `theme::semibold(_, 13.0)` resolve
-        // to. Spelled out rather than read back off a `RichText`, whose font
-        // id is private.
-        let expect_save =
-            egui::FontId::new(13.0, egui::FontFamily::Name(theme::BOLD.into()));
-        let expect_cancel =
-            egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
-        for name in [SAVE, SAVE_TEMPLATE_BLOCKED, SAVE_BUTTON] {
-            let ctx = styled_context(ROOMY_PANE);
-            let mut draft = tallest_draft();
-            if name != SAVE {
-                draft.name = "Ledgerline".to_string();
-            }
-            if name == SAVE_TEMPLATE_BLOCKED {
-                let app = draft.app.as_mut().expect("the tallest draft carries an app block");
-                // `template_touched`, because `AppMatchDraft::template_fault`
-                // withholds the verdict on a template the user has not
-                // edited -- an untouched one is the item's own and is not
-                // this form's to refuse.
-                app.template_touched = true;
-                // An unclosed brace, which is what the parser cannot render
-                // back -- an unknown-but-closed `{NOPE}` round-trips as a
-                // literal and is saveable.
-                app.sequence = "{USERNAME}{TAB".to_string();
-                assert!(
-                    draft.sequence_fault().is_some(),
-                    "the blocked case wants a template this build cannot read back"
-                );
-            } else if name == SAVE_BUTTON {
-                assert!(draft.is_saveable(), "the plain case wants a saveable draft");
-            }
-            let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
-            let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, &[]);
-
-            let save = painted.font_of(name);
-            let cancel = painted.font_of("Cancel");
-            assert_eq!(
-                save,
-                expect_save,
-                "{name} is laid out in {save:?}, which is not the theme's bold \
-                 ({expect_save:?}) -- 8a draws this button at font-weight: 700, and egui's \
-                 default proportional face is what a bare `egui::Button` here would give it"
-            );
-            assert_eq!(
-                cancel, expect_cancel,
-                "Cancel is laid out in {cancel:?}, which is not the theme's semibold \
-                 ({expect_cancel:?}) -- 8a draws it at 600, one step under the Save beside it"
-            );
-        }
-    }
-
     /// **The program-file row's Browse is the theme's own row button.**
     ///
     /// [`each_footer_button_is_set_in_a_face_the_theme_names`]'s defect, found a second
@@ -24590,45 +24363,6 @@ mod edit_pane_layout_tests {
     /// control is [`APP_PICK_LINK`] now, which the form exports for the same
     /// reason, so there is nothing left for a second local spelling to do.
     const BROWSE: &str = APP_BROWSE_BUTTON;
-
-    /// **A Save that cannot be pressed does not look like one that can.**
-    ///
-    /// The trap in giving Save the height its neighbour has: a button styled
-    /// into agreement with Cancel can lose the one signal that says the form
-    /// is not saveable yet. `add_enabled` greys the fill, and this asserts
-    /// that on the painted rect's colour -- the frame at the identical
-    /// position and size, so nothing but the fill can be carrying it.
-    #[test]
-    fn the_disabled_save_button_does_not_look_enabled() {
-        let fill_of = |draft: &mut EditDraft, label: &str| -> (Rect, egui::Color32) {
-            let ctx = styled_context(ROOMY_PANE);
-            let _ = frame(&ctx, ROOMY_PANE, draft, true, &[]);
-            let painted = frame(&ctx, ROOMY_PANE, draft, true, &[]);
-            let text = painted.rect_of(label);
-            let frame_rect = painted.frame_around(text);
-            let fill = painted
-                .rects
-                .iter()
-                .find(|(r, _)| *r == frame_rect)
-                .map(|(_, c)| *c)
-                .expect("the frame just found by `frame_around` is not in `rects`");
-            (frame_rect, fill)
-        };
-
-        let mut enabled = tallest_draft();
-        enabled.name = "Ledgerline".to_string();
-        let (_, on) = fill_of(&mut enabled, SAVE_BUTTON);
-
-        let mut disabled = tallest_draft();
-        assert!(!disabled.is_valid(), "the disabled case wants an invalid draft");
-        let (_, off) = fill_of(&mut disabled, SAVE);
-
-        assert_ne!(
-            on, off,
-            "the Save button paints the same fill whether it can be pressed or not -- the \
-             form gives the user no sign that it will not save"
-        );
-    }
 
     /// **A Save that cannot be pressed does not save**, asserted on the
     /// action the form returns and not on how the button looks.
@@ -25182,50 +24916,6 @@ mod edit_pane_layout_tests {
         assert_eq!(draft.totp, typed.totp, "Escape wiped the TOTP seed");
     }
 
-    /// The bug, stated as geometry: on a pane the app can really be resized
-    /// to, holding the form the user really had, Save and Cancel are on
-    /// screen.
-    ///
-    /// Positive control: the same assertion FAILS on the pre-fix layout (one
-    /// plain `Ui`, no scroll area) -- verified by running it against that
-    /// layout before the fix, where Save landed several hundred points below
-    /// the pane. It cannot pass by accident, because a form drawn top-down
-    /// with no scrolling puts its last widget at the form's full height.
-    #[test]
-    fn save_and_cancel_are_on_screen_at_the_minimum_window_size() {
-        for height in [MIN_PANE_HEIGHT, TINY_PANE_HEIGHT] {
-            let pane = egui::vec2(MIN_PANE_WIDTH, height);
-            let ctx = styled_context(pane);
-            let mut draft = tallest_draft();
-            // Two frames: a `ScrollArea` needs one to learn its content size,
-            // and the app draws this form continuously anyway.
-            let _ = frame(&ctx, pane, &mut draft, true, &[]);
-            let painted = frame(&ctx, pane, &mut draft, true, &[]);
-
-            assert_inside("Save", SAVE, pane, &painted);
-            assert_inside("Cancel", "Cancel", pane, &painted);
-            // The error label belongs to the buttons: it is the reason Save is
-            // disabled, and it is useless where it cannot be read.
-            assert_inside("the name error", "Name is required.", pane, &painted);
-
-            // On screen is not enough: the strip has to be at the BOTTOM of
-            // the pane, below the form, which is where a form's actions
-            // belong and where the user looks for them. Without this a strip
-            // pinned to the TOP -- directly under the title, above every
-            // field it acts on -- passes everything above. The slack is the
-            // button's own padding under its glyphs plus the strip's bottom
-            // edge, not room for a whole widget.
-            let save = painted.rect_of(SAVE);
-            assert!(
-                pane.y - save.bottom() <= 30.0,
-                "Save's glyphs end at y = {} on a pane {} tall -- the action strip is not \
-                 pinned to the bottom of the pane",
-                save.bottom(),
-                pane.y
-            );
-        }
-    }
-
     /// The other half of the fix: the fields the buttons were pinned away
     /// from are reachable. Scrolling brings the LAST thing in the form on
     /// screen, and it does not drag the buttons off.
@@ -25295,34 +24985,6 @@ mod edit_pane_layout_tests {
             after.rect_of("Cancel"),
             cancel_before,
             "scrolling the form moved Cancel -- the buttons are not pinned"
-        );
-    }
-
-    /// The title is the other thing a naive "wrap the whole function in a
-    /// ScrollArea" fix loses -- and this crate has already shipped a layout
-    /// test that certified a pane whose title had been annihilated. It stays
-    /// on screen, above the form, at the minimum size.
-    ///
-    /// **The title is the NAME now**, not a `form_title` heading over the
-    /// pane: 8a has no such heading, and the last of it came off the strip at
-    /// the owner's direction. So the draft is given a name and the claim is
-    /// made about that -- which is the stronger version of the same test,
-    /// since the name is a control and not a label.
-    #[test]
-    fn the_form_title_survives_the_short_pane() {
-        let pane = egui::vec2(MIN_PANE_WIDTH, MIN_PANE_HEIGHT);
-        let ctx = styled_context(pane);
-        let mut draft = tallest_draft();
-        draft.name = "Ledgerline".to_string();
-        let _ = frame(&ctx, pane, &mut draft, true, &[]);
-        let painted = frame(&ctx, pane, &mut draft, true, &[]);
-
-        let title = painted.rect_of(&draft.name);
-        assert_inside("the name box", &draft.name, pane, &painted);
-        assert!(
-            title.bottom() < painted.rect_of(SAVE_BUTTON).top(),
-            "the name is not above the buttons: name {title:?}, Save {:?}",
-            painted.rect_of(SAVE_BUTTON)
         );
     }
 
@@ -26969,208 +26631,6 @@ mod edit_pane_layout_tests {
     // result set and details to strictly to Edit screen"). The negatives are
     // in `item_list` and `detail`; these are the positives that moved.
 
-    /// Where the badge is, derived from the constants that place it rather
-    /// than written out.
-    ///
-    /// The avatar is allocated first in a `left_to_right(Align::Center)` band
-    /// of `EDIT_HEADER_ROW`, inset by the header's own padding, so its box is
-    /// arithmetic -- and `theme::edit_badge_rect` is the same arithmetic the
-    /// badge itself uses. A layout change that moved either makes the clicks
-    /// below miss, which every test here catches through its own positive
-    /// control rather than by silently passing.
-    fn badge_rect() -> Rect {
-        let top = f32::from(detail::HEADER_PAD_Y)
-            + (EDIT_HEADER_ROW - detail::HEADER_AVATAR) / 2.0;
-        theme::edit_badge_rect(Rect::from_min_size(
-            Pos2::new(f32::from(detail::HEADER_PAD_X), top),
-            Vec2::splat(detail::HEADER_AVATAR),
-        ))
-    }
-
-    /// An item wearing a chosen icon read off `url` -- the one state that is
-    /// offered all three rows.
-    fn with_a_chosen_url(item: &VaultItem, url: &str) -> VaultItem {
-        crate::vault_bridge::with_custom_field(
-            item,
-            crate::item_icon::ICON_FIELD_NAME,
-            &crate::item_icon::choice_from_url(url).expect("a good URL").to_field_value(),
-        )
-    }
-
-    /// Opens the pencil menu and answers with the frame it was drawn on.
-    fn open_pencil_menu(ctx: &egui::Context, pane: Vec2, item: &VaultItem) -> Painted {
-        let mut draft = EditDraft::from_item(item);
-        let _ = frame_for(ctx, pane, &mut draft, false, &[], Some(item), &detail::TotpState::NoSecret);
-        let _ = frame_for(
-            ctx,
-            pane,
-            &mut draft,
-            false,
-            &click(badge_rect().center()),
-            Some(item),
-            &detail::TotpState::NoSecret,
-        );
-        frame_for(ctx, pane, &mut draft, false, &[], Some(item), &detail::TotpState::NoSecret)
-    }
-
-    /// Every icon wording, so the assertions below are absolute rather than
-    /// "the ones I looked for".
-    const ICON_ROWS: [&str; 3] = [
-        crate::vault_window::item_list::REFRESH_ICON_LABEL,
-        crate::vault_window::item_list::SELECT_ICON_LABEL,
-        crate::vault_window::item_list::CLEAR_ICON_LABEL,
-    ];
-
-    fn icon_rows_painted(painted: &Painted) -> Vec<String> {
-        painted
-            .texts
-            .iter()
-            .map(|(text, _)| text.clone())
-            .filter(|text| ICON_ROWS.contains(&text.as_str()))
-            .collect()
-    }
-
-    /// **The menu the badge opens is `item_list::icon_menu`'s decision, not a
-    /// list this form wrote out again.**
-    ///
-    /// One side is what the pane really PAINTED after a real click at the
-    /// coordinates the badge is really drawn at; the other is what
-    /// `icon_menu` decides. Three items, chosen so the answer differs between
-    /// them -- a login with a site gets Refresh, a note without one does not,
-    /// a chosen URL adds the way back and keeps Refresh -- so a form that had
-    /// grown a constant list of its own fails across the set rather than
-    /// agreeing by luck on one.
-    #[test]
-    fn the_pencil_menu_offers_exactly_what_icon_menu_decided() {
-        let pane = egui::vec2(560.0, UNCULLED_PANE_HEIGHT);
-        let login = login_with_websites(1);
-        let cases = [
-            ("a login with a site", login.clone()),
-            ("a chosen URL", with_a_chosen_url(&login, "https://cdn.example.com/logo.png")),
-            ("a secure note", {
-                let mut note = login.clone();
-                note.item_type = Some(2);
-                note.login = None;
-                note
-            }),
-        ];
-        let decided: Vec<Vec<String>> = cases
-            .iter()
-            .map(|(_, item)| {
-                crate::vault_window::item_list::icon_menu(item)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|row| row.label.clone())
-                    .collect()
-            })
-            .collect();
-        // The premise, checked before anything is compared: the three items
-        // really do disagree. Without it a build in which every item got the
-        // identical menu would satisfy every equality below.
-        assert!(
-            decided.iter().any(|rows| rows != &decided[0]),
-            "every fixture was offered the same rows ({decided:?}), so the comparisons below \
-             would pass against a surface that returned a constant"
-        );
-        for ((what, item), expected) in cases.iter().zip(&decided) {
-            let ctx = styled_context(pane);
-            let painted = open_pencil_menu(&ctx, pane, item);
-            assert_eq!(
-                &icon_rows_painted(&painted),
-                expected,
-                "{what}: the pencil menu and `icon_menu` disagree. Painted: {:?}",
-                painted.strings()
-            );
-            // And the menu really opened: `icon_menu` never answers with an
-            // empty list, so an empty painted list is a click that missed.
-            assert!(
-                !expected.is_empty(),
-                "{what}: `icon_menu` offered nothing, which it does not do -- so the equality \
-                 above compared two empty lists"
-            );
-        }
-    }
-
-    /// **The rows are not decoration**: each reports its own action, on the
-    /// menu the pane really opened, at the coordinates it really painted.
-    ///
-    /// The item wears a chosen URL, the one state offered all three rows, so
-    /// this drives every arm of the match behind them in one pass -- and a
-    /// wiring that reported the same action for all three fails on two.
-    #[test]
-    fn every_row_of_the_pencil_menu_reports_its_own_action() {
-        let pane = egui::vec2(560.0, UNCULLED_PANE_HEIGHT);
-        let item =
-            with_a_chosen_url(&login_with_websites(1), "https://cdn.example.com/logo.png");
-        let expected = [
-            (crate::vault_window::item_list::REFRESH_ICON_LABEL, EditAction::RefreshIcon),
-            (crate::vault_window::item_list::SELECT_ICON_LABEL, EditAction::SelectIcon),
-            (crate::vault_window::item_list::CLEAR_ICON_LABEL, EditAction::ClearIcon),
-        ];
-        {
-            let ctx = styled_context(pane);
-            let painted = open_pencil_menu(&ctx, pane, &item);
-            assert_eq!(
-                icon_rows_painted(&painted),
-                expected.iter().map(|(label, _)| label.to_string()).collect::<Vec<_>>(),
-                "the fixture is no longer the item offered all three rows, so the clicks below \
-                 would be aimed at entries that are not there"
-            );
-        }
-        for (label, action) in expected {
-            let ctx = styled_context(pane);
-            let opened = open_pencil_menu(&ctx, pane, &item);
-            let row = opened
-                .texts
-                .iter()
-                .find(|(text, _)| text == label)
-                .map(|(_, rect)| *rect)
-                .unwrap_or_else(|| panic!("{label:?} was not painted: {:?}", opened.strings()));
-            let mut draft = EditDraft::from_item(&item);
-            let (reported, _) = acting_frame_for(
-                &ctx,
-                pane,
-                &mut draft,
-                false,
-                &click(row.center()),
-                Some(&item),
-                &detail::TotpState::NoSecret,
-            );
-            assert_eq!(
-                reported, action,
-                "clicking {label:?} in the pencil menu reported {reported:?}"
-            );
-        }
-    }
-
-    /// **A create is offered nothing**, because there is no item yet: no icon
-    /// to refresh, to replace or to clear before the record exists.
-    ///
-    /// The badge is still drawn -- it is what says this pane is the editor --
-    /// so the claim is about the menu and not about the pencil.
-    #[test]
-    fn the_pencil_opens_no_menu_while_an_item_is_being_created() {
-        let pane = egui::vec2(560.0, UNCULLED_PANE_HEIGHT);
-        let ctx = styled_context(pane);
-        let mut draft = EditDraft::empty();
-        draft.name = "Ledgerline".to_string();
-        let _ = frame(&ctx, pane, &mut draft, true, &[]);
-        let _ = frame(&ctx, pane, &mut draft, true, &click(badge_rect().center()));
-        let painted = frame(&ctx, pane, &mut draft, true, &[]);
-        assert!(
-            icon_rows_painted(&painted).is_empty(),
-            "the create form's badge opened an icon menu: {:?}",
-            painted.strings()
-        );
-        // The live control: the form really drew, so the absence above is
-        // about the menu rather than about a frame that painted nothing.
-        assert!(
-            painted.strings().contains(&SAVE_BUTTON),
-            "the create form painted no Save, so nothing here was exercised: {:?}",
-            painted.strings()
-        );
-    }
-
     /// **Every website the login carries is drawn, labelled and reachable at
     /// the app's minimum window WIDTH.**
     ///
@@ -27528,13 +26988,26 @@ mod edit_pane_layout_tests {
         // The box is the first wide filled rectangle under the caption. Found
         // by geometry rather than guessed at a fixed offset, so a change to
         // the row's spacing does not turn this into a click on the card.
+        // The box is beside its caption (the label-column layout) or under
+        // it (the stacked one): the first wide filled rectangle on the
+        // caption's line to its right, else the first under it.
+        let wide = |r: &Rect| r.width() > 120.0 && r.height() < 60.0;
         let mut boxes: Vec<Rect> = painted
             .rects
             .iter()
             .map(|(r, _)| *r)
-            .filter(|r| r.top() >= caption.bottom() - 1.0 && r.width() > 120.0 && r.height() < 60.0)
+            .filter(|r| wide(r) && r.left() >= caption.right() && r.top() <= caption.center().y && r.bottom() >= caption.center().y)
             .collect();
-        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        if boxes.is_empty() {
+            boxes = painted
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .filter(|r| wide(r) && r.top() >= caption.bottom() - 1.0)
+                .filter(|r| r.left() <= caption.left() + 1.0 && r.right() >= caption.right())
+                .collect();
+        }
+        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()).then(a.left().total_cmp(&b.left())));
         let field = *boxes.first().unwrap_or_else(|| {
             panic!("nothing box-shaped is painted under {label:?}, so that row has no box at all")
         });
@@ -28169,59 +27642,6 @@ mod edit_pane_layout_tests {
         );
     }
 
-    /// **The controls on the two assertions above.**
-    ///
-    /// Both are loops over what a frame happened to paint, and a loop over an
-    /// empty list passes. These feed the same predicates hand-built geometry
-    /// no layout produced and demand that each one refuses it -- the same
-    /// shape, and the same reason, as `detail.rs`'s `assert_visible_refuses_*`
-    /// pair.
-    #[test]
-    fn the_layout_predicates_refuse_the_geometry_they_exist_to_catch() {
-        let pane = egui::vec2(MIN_PANE_WIDTH, UNCULLED_PANE_HEIGHT);
-
-        // The card as it really was measured: 309.4 wide on a 298pt pane.
-        let overflowing = Rect::from_min_max(Pos2::new(0.0, 41.0), Pos2::new(309.4, 913.9));
-        assert!(
-            !within_pane(overflowing, pane),
-            "a 309.4pt-wide card is being called inside a {}pt pane",
-            pane.x
-        );
-        // ...and the control on THAT: the fixed card is accepted, so the
-        // refusal above is about the width and not about the rect being
-        // hand-built.
-        let fitting = Rect::from_min_max(Pos2::new(0.0, 41.0), Pos2::new(292.0, 913.9));
-        assert!(within_pane(fitting, pane), "a 292pt card does not fit a {}pt pane", pane.x);
-        // `within_pane` is horizontal by design, so it must also refuse a box
-        // off the LEFT edge -- a one-sided check would pass everything the
-        // wrap fix could get wrong on the other side.
-        let off_left = Rect::from_min_max(Pos2::new(-3.0, 41.0), Pos2::new(200.0, 913.9));
-        assert!(!within_pane(off_left, pane), "a box starting at x = -3 is being called inside");
-        // ...and it must NOT refuse a box that is merely far below the pane,
-        // which is the scrollable axis and which the glyph metrics lie about.
-        let below = Rect::from_min_max(Pos2::new(10.0, 9000.0), Pos2::new(200.0, 9014.0));
-        assert!(
-            within_pane(below, pane),
-            "a box below a pane that SCROLLS vertically is being called unreachable"
-        );
-
-        // Two runs sharing ink, which the overlap loop must refuse.
-        let a = Rect::from_min_max(Pos2::new(19.0, 1213.9), Pos2::new(60.0, 1227.9));
-        let b = Rect::from_min_max(Pos2::new(40.0, 1215.0), Pos2::new(108.0, 1229.9));
-        let shared = a.intersect(b);
-        assert!(
-            shared.width() > 0.5 && shared.height() > 0.5,
-            "two runs overlapping by {shared:?} are being called disjoint"
-        );
-        // And two that merely share an edge are not an overlap.
-        let touching = Rect::from_min_max(Pos2::new(60.0, 1213.9), Pos2::new(108.0, 1227.9));
-        let grazed = a.intersect(touching);
-        assert!(
-            grazed.width() <= 0.5 || grazed.height() <= 0.5,
-            "two runs that share an edge ({grazed:?}) are being called an overlap"
-        );
-    }
-
     // -----------------------------------------------------------------
     // Design 8a -- the card grid, the rail, the sticky footer, the dirty
     // state
@@ -28727,48 +28147,6 @@ mod edit_pane_layout_tests {
         assert_eq!(cases, 6, "the case loop visited {cases} cases, not six");
     }
 
-    /// **Ctrl+S is not advertised.**
-    ///
-    /// 8a puts a `CTRL+S` chip on its Save button and `Ctrl+S save \u{b7} Esc
-    /// cancel \u{b7} Ctrl+G generate` down its rail. None of the three is
-    /// bound by this form -- `egui::Key::S` belongs to Send-a-record and a
-    /// guard in `vault_window::mod` asserts it is spelled nowhere else in
-    /// production -- so drawing the hints would be three controls that lie.
-    ///
-    /// Pinned rather than left to judgement, because the next person to put
-    /// this form beside 8a will see three missing hints and reach for them.
-    #[test]
-    fn the_form_advertises_no_keyboard_shortcut_it_does_not_have() {
-        let mut panes = 0;
-        for pane in GRID_PANES {
-            panes += 1;
-            let ctx = styled_context(pane);
-            let mut draft = full_login_draft();
-            let _ = frame(&ctx, pane, &mut draft, false, &[]);
-            let painted = frame(&ctx, pane, &mut draft, false, &[]);
-            // **`CTRL+S` came off this list when the chord was bound**, and
-            // the rest stayed. The rule is unchanged and is the point of the
-            // test: a hint is drawn exactly when the form reads the chord.
-            // `Ctrl+G` and `Esc cancel` are 8a's rail hints, and this form
-            // binds neither -- Escape belongs to the discard prompt.
-            for chord in ["Ctrl+G", "Esc cancel"] {
-                assert!(
-                    !painted.strings().iter().any(|s| s.contains(chord)),
-                    "{pane:?}: the form advertises {chord:?}, which nothing in it binds: {:?}",
-                    painted.strings()
-                );
-            }
-            // And the one it does bind is drawn, on both panes, so this test
-            // cannot pass by the footer having quietly lost its chip.
-            assert!(
-                painted.strings().contains(&SAVE_CHORD_LABEL),
-                "{pane:?}: the footer does not advertise the chord it reads: {:?}",
-                painted.strings()
-            );
-        }
-        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
-    }
-
     // -----------------------------------------------------------------
     // Design 8a -- the numbers, measured off the paint
     // -----------------------------------------------------------------
@@ -28834,85 +28212,6 @@ mod edit_pane_layout_tests {
             .unwrap_or_else(|| panic!("no white box is painted around {text:?} at {inner:?}"))
     }
 
-    /// **8a's `padding: 11px 16px` on the title band and `12px 16px` on the
-    /// rows, at the width 8a draws them -- and 12 where the card cannot
-    /// afford 16.** `theme::section_card_pad_x`, measured off the paint at
-    /// both of the widths the window really has.
-    ///
-    /// Two runs are measured on the same card, the band's title and the
-    /// first row's caption, because the two bands are two `inner_margin`
-    /// calls: a header at 16 over rows at 12 is the defect asking both at one
-    /// width exists to prevent, and it would not show in either run alone.
-    #[test]
-    fn the_section_cards_take_8as_padding_at_the_width_8a_draws_them() {
-        let mut panes = 0;
-        for (pane, expected) in [
-            (GRID_PANE, theme::SECTION_CARD_PAD_X_WIDE),
-            (GRID_MIN_PANE, theme::SECTION_CARD_PAD_X),
-        ] {
-            panes += 1;
-            let ctx = styled_context(pane);
-            let mut draft = full_login_draft();
-            let _ = frame(&ctx, pane, &mut draft, false, &[]);
-            let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-            let title = painted.rect_of(&Section::Item.title(draft.kind).to_uppercase());
-            let card = card_around(&painted, title);
-            let expected = f32::from(expected);
-            assert!(
-                (title.left() - card.left() - expected).abs() <= 0.5,
-                "{pane:?}: the ITEM band's title starts {} in from the card's edge, not 8a's {}",
-                title.left() - card.left(),
-                expected
-            );
-            let caption = painted.rect_of("Folder");
-            assert!(
-                (caption.left() - card.left() - expected).abs() <= 0.5,
-                "{pane:?}: the first row's caption starts {} in from the card's edge, not {} -- \
-                 the rows are not padded like the band above them",
-                caption.left() - card.left(),
-                expected
-            );
-        }
-        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
-    }
-
-    /// **A row's box is 8a's `height: 34px`, and the name box in the title bar
-    /// is still the design's 38.**
-    ///
-    /// Both are asserted, because the fix that put the rows at 34 could have
-    /// been a change to `theme::FIELD_HEIGHT` -- which would have taken the
-    /// title bar, the login window and the overlay down with it -- and a
-    /// test of the rows alone would be green after that too.
-    #[test]
-    fn a_row_field_is_8as_34_points_and_the_name_box_is_the_designs_38() {
-        let mut panes = 0;
-        for pane in GRID_PANES {
-            panes += 1;
-            let ctx = styled_context(pane);
-            let mut draft = full_login_draft();
-            let _ = frame(&ctx, pane, &mut draft, false, &[]);
-            let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-            let username = field_around(&painted, "a.novak@ledgerline.com");
-            assert!(
-                (username.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5,
-                "{pane:?}: the user-name box is {}pt tall, not 8a's `height: 34px` ({})",
-                username.height(),
-                theme::SECTION_FIELD_HEIGHT
-            );
-            let name = field_around(&painted, "Ledgerline");
-            assert!(
-                (name.height() - theme::FIELD_HEIGHT).abs() <= 0.5,
-                "{pane:?}: the name box is {}pt tall, not 8a's `height: 38px` ({}) -- the row \
-                 height has leaked into the title bar",
-                name.height(),
-                theme::FIELD_HEIGHT
-            );
-        }
-        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
-    }
-
     /// **The label column is 8a's `width: 130px` and the gap after it 8a's
     /// `gap: 16px`**, measured from a caption's left edge to its box's --
     /// in the shipped pane, which is the one wide enough for the row to be a
@@ -28945,46 +28244,6 @@ mod edit_pane_layout_tests {
             field.left() - caption.left()
         );
         assert_eq!(theme::SECTION_ROW_GAP, 16.0, "8a's `gap: 16px` on every row");
-    }
-
-    /// **The chord chip is drawn INSIDE the button that carries it.**
-    ///
-    /// The owner's screenshot was `CTRL·` -- the `+S` clipped off the
-    /// button's right edge, with a left inset half the row wide to match. The
-    /// cause is in `theme::section_footer_primary_button`'s doc: egui centres
-    /// a button's own galley, so a chip hung off the label's right edge ends
-    /// past the button by exactly half of what was reserved for it.
-    ///
-    /// Asserted as containment and not as a width, because a width is the
-    /// thing that was already agreed between the measurement and the drawing
-    /// while the chip hung outside anyway. Both ends: the chip inside the
-    /// button, and the button's two insets equal, which is what says the row
-    /// is centred as a row rather than pushed against one edge.
-    #[test]
-    fn the_chord_chip_is_drawn_inside_the_button_that_carries_it() {
-        for pane in GRID_PANES {
-            let ctx = styled_context(pane);
-            let mut draft = full_login_draft();
-            let _ = frame(&ctx, pane, &mut draft, false, &[]);
-            let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-            let label = painted.rect_of(SAVE_BUTTON);
-            let chip = painted.rect_of(SAVE_CHORD_LABEL);
-            let button = painted.frame_around(label);
-            assert!(
-                button.contains_rect(chip),
-                "{pane:?}: the chord chip is {chip:?} on a button of {button:?} -- \
-                 {}pt of it is outside the control it is drawn on",
-                (chip.max.x - button.max.x).max(button.min.x - chip.min.x)
-            );
-            let left = label.min.x - button.min.x;
-            let right = button.max.x - chip.max.x;
-            assert!(
-                (left - right).abs() <= 1.0,
-                "{pane:?}: the label starts {left}pt inside the button and the chip ends \
-                 {right}pt from its far edge -- 8a's `padding: 0 14px` is one number"
-            );
-        }
     }
 
     /// **8a's `ITEM` card is three cells on one line**, in the design's own
@@ -29020,192 +28279,6 @@ mod edit_pane_layout_tests {
             folder.left() < owner.left() && owner.left() < kind.left(),
             "the cells are out of 8a's order: Folder {folder:?}, Owner {owner:?}, \
              Type {kind:?}"
-        );
-    }
-
-    /// ...and falls back to stacked rows where it cannot.
-    ///
-    /// The other half, and the reason the grid has a floor at all: three
-    /// cells of a 472-point card body are 148 points each, and three cells of
-    /// the app's MINIMUM pane would be 86 -- which is not a field. The
-    /// fallback is the shape this card shipped before the grid, so the narrow
-    /// pane loses 8a's row and nothing else.
-    #[test]
-    fn the_item_cards_cells_stack_again_on_the_narrowest_pane() {
-        let pane = Vec2::new(MIN_PANE_WIDTH, 2400.0);
-        let ctx = styled_context(pane);
-        let mut draft = full_login_draft();
-        let _ = frame(&ctx, pane, &mut draft, false, &[]);
-        let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-        let folder = painted.rect_of(ITEM_FOLDER_LABEL);
-        let owner = painted.rect_of(ITEM_OWNER_LABEL);
-        assert!(
-            owner.top() > folder.bottom(),
-            "Owner is at {owner:?} against Folder's {folder:?} -- the card is still trying \
-             to draw 8a's grid at a width `theme::section_grid_fits_at` refuses"
-        );
-    }
-
-    /// **The name box sits against the tile, not against the far edge.**
-    ///
-    /// The owner: "move title to the left". The band was a `right_to_left`
-    /// row -- so that the `Unsaved changes` pill could claim its width before
-    /// the box took the rest -- and a `right_to_left` layout places a widget
-    /// NARROWER than its space against the right edge. 8a caps this box at
-    /// `theme::TITLE_FIELD_WIDTH`, so every pane wider than the tile plus 480
-    /// drew the name floating away from its own avatar.
-    ///
-    /// Measured at a pane where that cap really binds, since at a narrow one
-    /// the box fills the row and the two layouts are indistinguishable. Both
-    /// ends: the box begins a `HEADER_GAP` after the tile, and the pill is
-    /// still on the far right -- the property the old layout was for.
-    #[test]
-    fn the_name_box_sits_against_the_tile_with_the_pill_on_the_far_edge() {
-        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
-        let ctx = styled_context(pane);
-        let item = login_with_websites(1);
-        let mut draft = EditDraft::from_item(&item);
-        // Renamed, so the `Unsaved changes` pill is really up: this test is
-        // about where that pill sits as much as about where the box does.
-        draft.name = "Ledgerline Holdings".to_string();
-        let dirty = |draft: &mut EditDraft| {
-            frame_for(&ctx, pane, draft, false, &[], Some(&item), &detail::TotpState::NoSecret)
-        };
-        let _ = dirty(&mut draft);
-        let painted = dirty(&mut draft);
-        assert!(
-            painted.strings().contains(&UNSAVED_PILL),
-            "the fixture is not dirty, so the pill this test is about was never drawn: {:?}",
-            painted.strings()
-        );
-
-        let ink = painted.rect_of(&draft.name);
-        let name_box = painted
-            .rects
-            .iter()
-            .map(|(r, _)| *r)
-            .find(|r| (r.height() - theme::FIELD_HEIGHT).abs() <= 0.5 && r.contains(ink.center()))
-            .expect("the name sits in a field box");
-        assert!(
-            name_box.width() <= theme::TITLE_FIELD_WIDTH + 0.5,
-            "the box is {}pt wide, so 8a's cap is not binding at this pane and this test \
-             cannot tell the two layouts apart",
-            name_box.width()
-        );
-
-        let tile_right = f32::from(detail::HEADER_PAD_X) + detail::HEADER_AVATAR;
-        let wanted = tile_right + detail::HEADER_GAP;
-        assert!(
-            (name_box.left() - wanted).abs() <= 0.5,
-            "the name box starts at {} and the tile ends at {tile_right} -- the box is not \
-             a HEADER_GAP from the avatar",
-            name_box.left()
-        );
-
-        let pill = painted.rect_of(UNSAVED_PILL);
-        assert!(
-            pill.left() > name_box.right(),
-            "the pill is at {pill:?} and the box ends at {} -- the pill lost its place on \
-             the far edge",
-            name_box.right()
-        );
-    }
-
-    /// **A name too long for 8a's cap widens the box instead of being cut.**
-    ///
-    /// The owner: "text cut off with no reason - there's plenty of space for
-    /// title". `theme::title_field_within` asked for `room.min(480)` flat, and
-    /// `theme::field_box` gives the run inside a box `outer - 10 - right_pad`
-    /// -- 460 points at the cap. Measured on this 1200-point pane: `room`
-    /// reaching the field is 980.7, the box was 480 wide, and the clip rect
-    /// egui handed the run was `87..549` around a galley 672.4 wide. The name
-    /// ended mid-word with five hundred points of empty row between the box
-    /// and the `Unsaved changes` pill.
-    ///
-    /// **Not asked of `Painted::rendered`.** That is the right question for
-    /// every elided LABEL on this form, and it is the wrong one here: the box
-    /// sets `TextWrapping::no_max_width` in its layouter, so the galley always
-    /// carries every glyph and egui hides the overflow with a CLIP RECT
-    /// instead. A rendered-glyph assertion would have been green against the
-    /// defect this test is named for. What is asked instead is the geometry
-    /// the clip follows -- whether the ink the form laid out actually fits
-    /// inside the box that is painted around it.
-    ///
-    /// Both halves, because either alone passes trivially. A box that simply
-    /// took the whole row would hold any name and throw 8a's `max-width: 480`
-    /// away with it, so the ordinary name is measured at the SAME pane and
-    /// must still get exactly the 480 the design draws -- the cap is the
-    /// box's resting width, and only the content may push it.
-    #[test]
-    fn a_name_longer_than_the_cap_widens_its_box_rather_than_being_cut() {
-        let pane = Vec2::new(1200.0, 2400.0);
-        let ctx = styled_context(pane);
-        let item = login_with_websites(1);
-        let shot = |draft: &mut EditDraft| {
-            frame_for(&ctx, pane, draft, false, &[], Some(&item), &detail::TotpState::NoSecret)
-        };
-        // The one box on the strip: `theme::FIELD_HEIGHT` tall and drawn round
-        // the name's own ink. Found by geometry rather than by order, the way
-        // `the_name_box_sits_against_the_tile_with_the_pill_on_the_far_edge`
-        // finds it -- `left_center` and not `center`, because the whole point
-        // of the defect is ink that runs out past the box's right edge.
-        let box_round = |painted: &Painted, ink: Rect| {
-            painted
-                .rects
-                .iter()
-                .map(|(r, _)| *r)
-                .find(|r| {
-                    (r.height() - theme::FIELD_HEIGHT).abs() <= 0.5
-                        && r.contains(ink.left_center())
-                })
-                .unwrap_or_else(|| panic!("the name at {ink:?} sits in no field box"))
-        };
-
-        let long = "Microsoft (Tivity) Long Enough To Wrap And Then Some More Words";
-        let mut draft = EditDraft::from_item(&item);
-        draft.name = long.to_string();
-        let _ = shot(&mut draft);
-        let painted = shot(&mut draft);
-        let ink = painted.rect_of(long);
-        // The fixture has to be long enough that the OLD width really cut it:
-        // the text area at the cap is 460 points, and a name that fits there
-        // cannot tell the two behaviours apart. Measured: 672.4.
-        assert!(
-            ink.width() > theme::TITLE_FIELD_WIDTH - 20.0,
-            "the fixture name is only {}pt of ink, which fits inside 8a's capped box -- this \
-             test cannot see the defect it is named for",
-            ink.width()
-        );
-        let name_box = box_round(&painted, ink);
-        assert!(
-            ink.right() <= name_box.right() - 10.0 + 0.5,
-            "the name's ink ends at {} and its box's text area ends at {} -- the name is cut \
-             off inside a box the row had the width to widen",
-            ink.right(),
-            name_box.right() - 10.0
-        );
-        // ... and it widened into space that was empty, not into the pill's.
-        let pill = painted.rect_of(UNSAVED_PILL);
-        assert!(
-            pill.left() > name_box.right(),
-            "the box now ends at {} and the pill starts at {} -- the name grew over the one \
-             thing on this strip that was holding the far edge",
-            name_box.right(),
-            pill.left()
-        );
-
-        let plain = "Microsoft (Tivity)";
-        let mut draft = EditDraft::from_item(&item);
-        draft.name = plain.to_string();
-        let _ = shot(&mut draft);
-        let painted = shot(&mut draft);
-        let name_box = box_round(&painted, painted.rect_of(plain));
-        assert!(
-            (name_box.width() - theme::TITLE_FIELD_WIDTH).abs() <= 0.5,
-            "an ordinary name is in a {}pt box on a 1200pt pane -- 8a's `max-width: 480` is no \
-             longer the box's resting width",
-            name_box.width()
         );
     }
 
@@ -30903,114 +29976,6 @@ mod edit_pane_layout_tests {
                 "{caption} stands {gap}pt over its control, not 8a's `gap: 6px`"
             );
         }
-    }
-
-    /// **The name box is the whole of the title band, centred in it.**
-    ///
-    /// This replaces `the_kind_line_clears_the_name_box_it_sits_under`, which
-    /// pinned the gap between the box and the kind-and-folder line under it.
-    /// That line is gone -- the owner: "Login under title - remove, it will
-    /// go in a separate block, title center vertically" -- and what is left
-    /// to hold is the band: exactly one control in it, with equal air above
-    /// and below.
-    ///
-    /// Equal air is the assertion and not the band's height, because the
-    /// height is `EDIT_HEADER_ROW` plus two paddings and would be satisfied
-    /// by a box hanging off the top of it, which is what a `top_down` column
-    /// in a band taller than its content really does.
-    #[test]
-    fn the_name_box_is_centred_in_the_title_band() {
-        for pane in GRID_PANES {
-            let ctx = styled_context(pane);
-            let mut draft = full_login_draft();
-            draft.name = "Ledgerline".to_string();
-            let _ = frame(&ctx, pane, &mut draft, false, &[]);
-            let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-            // The box, found by its own height: the smallest rect around the
-            // name is the TextEdit's one-ascent lane, which `theme`'s
-            // `field_box` places centred inside the box.
-            let ink = painted.rect_of(&draft.name);
-            let boxes: Vec<Rect> = painted
-                .rects
-                .iter()
-                .map(|(r, _)| *r)
-                .filter(|r| {
-                    (r.height() - theme::FIELD_HEIGHT).abs() <= 0.5 && r.contains(ink.center())
-                })
-                .collect();
-            assert_eq!(
-                boxes.len(),
-                1,
-                "{pane:?}: expected exactly one {}pt box around the name, found {boxes:?}",
-                theme::FIELD_HEIGHT
-            );
-            let name_box = boxes[0];
-
-            // The band: the white strip behind it, which is the widest
-            // `theme::CARD` rect the box sits inside.
-            let band = painted
-                .rects
-                .iter()
-                .filter(|(r, fill)| *fill == theme::CARD && r.contains(name_box.center()))
-                .map(|(r, _)| *r)
-                .max_by(|a, b| a.width().total_cmp(&b.width()))
-                .expect("the title strip is painted");
-            let above = name_box.top() - band.top();
-            let below = band.bottom() - name_box.bottom();
-            assert!(
-                (above - below).abs() <= 0.5,
-                "{pane:?}: the name box has {above}pt of band above it and {below}pt below -- \
-                 it is not centred in the strip"
-            );
-            // And the strip is the row plus the read pane's own padding,
-            // which is what keeps the two bands from jumping under each other
-            // when Edit is pressed.
-            // And it is the READ pane's strip, to the point -- the owner:
-            // "make height of that header same as details". Pinned as the
-            // constants rather than as a number so the two move together.
-            assert_eq!(
-                EDIT_HEADER_ROW,
-                detail::HEADER_ROW,
-                "the edit band's row is no longer the read pane's, so the form steps up or                  down the moment Edit is pressed"
-            );
-            let wanted = EDIT_HEADER_ROW + 2.0 * f32::from(detail::HEADER_PAD_Y);
-            assert!(
-                (band.height() - wanted).abs() <= 0.5,
-                "{pane:?}: the title strip is {}pt tall, not `EDIT_HEADER_ROW` plus two \
-                 `HEADER_PAD_Y` ({wanted})",
-                band.height()
-            );
-        }
-    }
-
-    /// **The footer's two buttons are 8a's `height: 34px`, `gap: 10px`
-    /// apart.** `the_button_strips_controls_share_one_baseline` holds them to
-    /// one height; this holds that height and the gap to the design's own
-    /// numbers.
-    #[test]
-    fn the_footer_buttons_are_8as_34_points_and_10_apart() {
-        let ctx = styled_context(ROOMY_PANE);
-        let mut draft = full_login_draft();
-        let _ = frame(&ctx, ROOMY_PANE, &mut draft, false, &[]);
-        let painted = frame(&ctx, ROOMY_PANE, &mut draft, false, &[]);
-
-        let save = painted.frame_around(painted.rect_of(SAVE_BUTTON));
-        let cancel = painted.frame_around(painted.rect_of(CANCEL_BUTTON));
-        for (name, rect) in [(SAVE_BUTTON, save), (CANCEL_BUTTON, cancel)] {
-            assert!(
-                (rect.height() - theme::SECTION_FOOTER_BUTTON_HEIGHT).abs() <= 0.5,
-                "{name:?} is {}pt tall, not 8a's `height: 34px`",
-                rect.height()
-            );
-        }
-        assert!(
-            (cancel.left() - save.right() - theme::SECTION_FOOTER_GAP).abs() <= 0.5,
-            "Cancel starts {} right of Save's edge, not 8a's `gap: 10px`",
-            cancel.left() - save.right()
-        );
-        assert_eq!(theme::SECTION_FOOTER_BUTTON_HEIGHT, 34.0);
-        assert_eq!(theme::SECTION_FOOTER_GAP, 10.0);
     }
 
     /// **The strength meter's bars are 8a's `width: 26px; height: 4px`, 3
@@ -33132,5 +32097,147 @@ mod autofill_card_tests {
                 choice
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod v2_editor_tests {
+    //! Spec B section 1: the editor as a page -- its header bar.
+    use super::*;
+    use crate::kit::testing::{self, click_at, Painted};
+    use eframe::egui::{self, vec2};
+
+    const SCREEN: egui::Vec2 = egui::vec2(1028.0, 900.0);
+
+    fn draw(ctx: &egui::Context, time: f64, draft: &mut EditDraft, creating: bool, events: Vec<egui::Event>) -> (EditAction, Painted) {
+        let mut apps = AppIdentityCache::default();
+        let mut action = EditAction::None;
+        let p = testing::frame(ctx, time, SCREEN, events, |ui| {
+            action = draw_detail_edit(
+                ui,
+                draft,
+                &[],
+                creating,
+                &mut apps,
+                None,
+                0,
+                &crate::rest::organizations::Audience::Personal,
+                &detail::TotpState::NoSecret,
+                None,
+            );
+        });
+        (action, p)
+    }
+
+    fn control(ctx: &egui::Context, which: EditControl) -> egui::Rect {
+        ctx.read_response(edit_control_id(which)).unwrap_or_else(|| panic!("no {which:?}")).rect
+    }
+
+    fn an_item(item_type: Option<i64>) -> VaultItem {
+        VaultItem {
+            id: "id-1".to_string(),
+            name: "Sample".to_string(),
+            fields: Vec::new(),
+            login: None,
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            item_type,
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn a_login() -> VaultItem {
+        let mut item = an_item(Some(1));
+        item.name = "Ledgerline".into();
+        item.login = Some(crate::vault_bridge::LoginData {
+            username: Some("a.novak".into()),
+            password: Some("hunter2".to_string().into()),
+            totp: None,
+            uris: vec![],
+            other: serde_json::Map::new(),
+        });
+        item
+    }
+
+    #[test]
+    fn the_header_names_the_kind_and_the_title_edits_in_place() {
+        let ctx = testing::ctx();
+        let mut new = EditDraft::empty_of(ItemKind::Login);
+        let (_, p) = draw(&ctx, 0.0, &mut new, true, vec![]);
+        assert!(p.text("New login").is_some(), "{:?}", p.texts.iter().map(|t| &t.0).collect::<Vec<_>>());
+        let ctx = testing::ctx();
+        let mut card = EditDraft::from_item(&an_item(Some(3)));
+        let (_, p) = draw(&ctx, 0.0, &mut card, false, vec![]);
+        assert!(p.text("Editing card").is_some());
+        // The title is the header's own field: typing there renames.
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let _ = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        ctx.memory_mut(|m| m.request_focus(edit_title_id()));
+        let _ = draw(&ctx, 0.1, &mut draft, false, vec![]);
+        let _ = draw(&ctx, 0.2, &mut draft, false, vec![egui::Event::Text(" Two".into())]);
+        assert_eq!(draft.name, "Ledgerline Two");
+    }
+
+    #[test]
+    fn save_with_no_title_asks_for_one() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        draft.name.clear();
+        let _ = draw(&ctx, 0.0, &mut draft, true, vec![]);
+        let save = control(&ctx, EditControl::Save);
+        let (action, _) = draw(&ctx, 0.1, &mut draft, true, click_at(save.center()));
+        assert_eq!(action, EditAction::None, "nothing is saved without a name");
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(NAME_FIRST_TOAST));
+    }
+
+    #[test]
+    fn esc_in_the_title_ends_title_editing_only() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let _ = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        ctx.memory_mut(|m| m.request_focus(edit_title_id()));
+        let _ = draw(&ctx, 0.1, &mut draft, false, vec![]);
+        let esc = vec![egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::default() }];
+        let (action, _) = draw(&ctx, 0.2, &mut draft, false, esc);
+        assert_ne!(action, EditAction::Cancel);
+    }
+
+    #[test]
+    fn back_with_a_changed_draft_asks_first_and_with_none_closes() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let _ = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        let back = control(&ctx, EditControl::Back);
+        assert_eq!(back.size(), vec2(44.0, 44.0));
+        let (action, _) = draw(&ctx, 0.1, &mut draft, false, click_at(back.center()));
+        assert_eq!(action, EditAction::Cancel, "an untouched draft closes at once");
+
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        draft.name = "Changed".into();
+        let _ = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        let back = control(&ctx, EditControl::Back);
+        let (action, _) = draw(&ctx, 0.1, &mut draft, false, click_at(back.center()));
+        assert_ne!(action, EditAction::Cancel);
+        assert!(draft.discard_prompt, "a changed draft asks before it is thrown away");
+    }
+
+    #[test]
+    fn the_header_carries_back_avatar_cancel_and_save() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let (_, p) = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        let (back, cancel, save) = (control(&ctx, EditControl::Back), control(&ctx, EditControl::Cancel), control(&ctx, EditControl::Save));
+        assert!(back.left() < 40.0 && back.top() < 30.0, "back is at the top left: {back:?}");
+        assert!(cancel.right() < save.left() && save.right() > SCREEN.x - 40.0, "Cancel then Save at the right");
+        assert_eq!(save.height(), 48.0);
+        assert!(p.rects.iter().any(|r| (r.rect.width() - 64.0).abs() < 0.5 && (r.rect.height() - 64.0).abs() < 0.5), "a 64pt avatar");
+        let label = save_label(&draft);
+        assert_eq!(p.texts.iter().filter(|t| t.0 == label).count(), 1, "one {label:?}, in the header");
     }
 }

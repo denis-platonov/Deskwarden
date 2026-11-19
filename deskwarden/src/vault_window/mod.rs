@@ -3636,13 +3636,18 @@ pub fn build_frame_with_search(
         // before drawing the builder over it. What disables that surface is
         // the scrim, which is `theme::modal_scrim`'s job and not a width of
         // zero here.
+        // Spec B 1: the editor is a page of its own -- the list column steps
+        // aside while a draft is open.
+        let editing = matches!(mode, DetailMode::Edit(_) | DetailMode::Create(_));
         let detail_pane_width = if show_sends || on_health {
             0.0
+        } else if editing {
+            ui.available_width()
         } else {
             let full = (ui.available_width() - LIST_WIDTH).max(0.0);
             detail_slide.width(ui.ctx(), full, selected_id.is_some())
         };
-        if !show_sends && !on_health {
+        if !show_sends && !on_health && !editing {
             // **Whether a detail pane is on screen RIGHT NOW**, read before
             // the list is drawn, because the list is what changes it. This is
             // the "with no details panel" half of the owner's second gesture:
@@ -35304,6 +35309,54 @@ mod send_delete_wiring {
     ///
     /// **No `bw`, no dialog, no network** -- the same harness, and the same
     /// stubbed seams, as the test below.
+    /// Spec B 1: the editor is a page. While it is up the list column is not
+    /// drawn, and the editor has the window under the top bar.
+    #[test]
+    fn editing_takes_the_whole_area_under_the_top_bar() {
+        let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        FRAME_REVOKES.lock().expect("not poisoned").clear();
+        *FRAME_TX.lock().expect("not poisoned") = None;
+        *FRAME_LIST_TX.lock().expect("not poisoned") = None;
+        FRAME_LIST_FAILS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
+        FRAME_VAULT_IS_EMPTY.store(false, std::sync::atomic::Ordering::SeqCst);
+        let scratch = crate::test_scratch::ScratchDir::new("edit-page");
+        let (_options, mut frame_fn, _handles) = build_frame(
+            Arc::new(VaultCache::new(crate::vault_bridge::VaultBridge::new("http://127.0.0.1:1"))),
+            crate::fill_stats::FillStats::new(scratch.join("fill-stats.json")),
+            crate::login_ui::BwStatusDetails {
+                status: crate::login_ui::BwStatus::Unlocked,
+                user_email: Some("harness@example.invalid".to_string()),
+                server_url: None,
+            },
+            FRAME_SESSION.to_string(),
+            scratch.join("icons"),
+            crate::settings::AutoLock::Never,
+            true,
+            None,
+            true,
+            super::frame_env_seam::stubbed(frame_sync, frame_load, frame_send_list, Some(scratch.join("settings.json"))),
+        );
+        let state = ReachableState::Fresh;
+        let ctx = egui::Context::default();
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        crate::theme::apply(&ctx);
+        let _ = ctx.run_ui(matrix_input(), |_ui| {});
+        let _ = matrix_frame(&ctx, &mut frame_fn);
+        let open = matrix_frame(&ctx, &mut frame_fn);
+        assert!(ctx.read_response(item_list::new_button_id()).is_some(), "control: the list is drawn while reading");
+        let edit_at = matrix_locate(state, &open, crate::vault_window::detail::EDIT_LABEL);
+        let _ = matrix_click(&ctx, &mut frame_fn, edit_at);
+        for _ in 0..3 {
+            let _ = matrix_frame(&ctx, &mut frame_fn);
+        }
+        assert!(ctx.read_response(item_list::new_button_id()).is_none(), "the list is still drawn beside the editor");
+        let back = ctx
+            .read_response(crate::vault_window::detail_edit::edit_control_id(crate::vault_window::detail_edit::EditControl::Back))
+            .expect("the editor's Back");
+        assert!(back.rect.left() < SIDEBAR_WIDTH + 60.0, "the editor starts at the rail's edge, not after the list: {:?}", back.rect);
+    }
+
     #[test]
     fn the_headers_close_really_hides_the_detail_pane() {
         let _serialised = FRAME_LOCK.lock().unwrap_or_else(|e| e.into_inner());

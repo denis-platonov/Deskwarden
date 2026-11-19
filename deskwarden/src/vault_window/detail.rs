@@ -52,59 +52,6 @@ use zeroize::Zeroizing;
 
 /// The white header strip's `padding: 20px 24px`.
 pub(crate) const HEADER_PAD_X: i8 = 24;
-pub(crate) const HEADER_PAD_Y: i8 = 20;
-/// `gap: 14px` between the strip's avatar, title column and buttons.
-pub(crate) const HEADER_GAP: f32 = 14.0;
-/// The strip's avatar tile, which is [`item_list`]'s row tile at exactly the
-/// same size.
-///
-/// **32, not the design's 44.** Design 2b draws this strip's tile at
-/// `width: 44px; height: 44px`, and that is what this was. The owner asked for
-/// the two tiles to match outright -- the tile in the list row and the tile in
-/// the header of the item that row opens are the same object seen twice, and
-/// at 44 against 32 they read as two different components. So this is the
-/// list's `AVATAR_SIZE`, deliberately overriding the spec's number rather than
-/// drifting from it by accident.
-///
-/// **Kept as its own constant, not an import of `AVATAR_SIZE`.** The two are
-/// equal by decision, not by construction: this is the detail pane's metric
-/// and that one is the list's, they are asserted separately in each module's
-/// pins, and a future decision to move one is a decision this name is here to
-/// make visible. `the_header_tile_is_the_list_row_tile` is what holds them
-/// equal in the meantime.
-///
-/// The strip's height no longer follows this number -- [`HEADER_ROW`] does.
-pub(crate) const HEADER_AVATAR: f32 = 40.0;
-
-/// **The height of the strip's content row**, and therefore the strip's own
-/// height once `padding: 20px` is added above and below it: design 2b's 44px.
-///
-/// This constant is the re-tuning that shrinking [`HEADER_AVATAR`] to 32
-/// required, and it exists because the strip's height used to be an ACCIDENT
-/// of its tallest child. That child was the 44pt avatar, so the strip came out
-/// at the design's 84pt without anyone stating it. Take the avatar to 32 and
-/// the tallest child becomes the title column -- 22pt at the `1.1` line height
-/// [`title_text`] documents, plus [`TITLE_GAP`], plus the 12pt subtitle, or
-/// about 40.1pt -- and the strip silently became 80.1pt tall. The design's
-/// number would have been lost to a rounding of two font metrics, which is not
-/// a number anyone chose.
-///
-/// So the row is stated instead of inferred. The avatar and the title column
-/// are laid out inside a band of exactly this height, cross-aligned centre,
-/// which buys three things at once:
-///
-/// * the strip stays 84pt, so nothing below it in the pane moved;
-/// * the 32pt tile is CENTRED against the title column rather than sitting at
-///   the top of the row -- egui's `horizontal` cannot centre its first child
-///   against siblings it has not laid out yet, so a shorter avatar in an
-///   auto-height row hangs from the top edge, which is exactly what it did;
-/// * the title column is free to change size within the band without moving
-///   the strip's bottom edge or the avatar.
-///
-/// It is deliberately NOT `HEADER_AVATAR.max(title height)`: the design gives
-/// a 44px row, and a row that quietly tracks whichever child is tallest is the
-/// thing that just went wrong.
-pub(crate) const HEADER_ROW: f32 = 44.0;
 
 /// **Whether the read pane offers anything that writes** -- the ONE predicate
 /// the strip's count, its drawing, the ⋮'s contents and the matched app's

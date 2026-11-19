@@ -391,8 +391,10 @@ pub mod glyph {
     pub const MORE: &str = "M5 12h.01M12 12h.01M19 12h.01";
     pub const WIFI_OFF: &str = "M1 1l22 22M16.7 11.1A10.9 10.9 0 0 1 19 12.6M5 12.6a10.9 10.9 0 0 1 5.2-2.5M10.7 5A16 16 0 0 1 22.6 9M1.4 9a15.9 15.9 0 0 1 4.7-2.9M8.5 16.1a5 5 0 0 1 7 0M12 20h.01";
     pub const CONTACTLESS: &str = "M8.5 8.5a5 5 0 0 1 0 7M12 6a8.5 8.5 0 0 1 0 12M15.5 3.5a12 12 0 0 1 0 17";
+    /// The editor's avatar badge (spec B 1.1).
+    pub const CAMERA: &str = "M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z";
     /// Every glyph, named, for tests and the kit sheet.
-    pub const ALL_GLYPHS: [(&str, &str); 37] = [
+    pub const ALL_GLYPHS: [(&str, &str); 38] = [
         ("all", ALL),
         ("fav", FAV),
         ("login", LOGIN),
@@ -430,6 +432,7 @@ pub mod glyph {
         ("more", MORE),
         ("wifi-off", WIFI_OFF),
         ("contactless", CONTACTLESS),
+        ("camera", CAMERA),
     ];
 }
 
