@@ -1585,6 +1585,16 @@ const SHARE_EMAIL: &str = "anna@example.com";
 
 fn main() -> eframe::Result {
     let arg = |name: &str| std::env::args().any(|a| a == name);
+    // `--lang <tag>`: draw every surface in that language, so a translator
+    // can see where a longer sentence wraps or overflows. With `--all` the
+    // shots go to `ui_preview_<tag>/` beside the English ones.
+    let lang: Option<String> = {
+        let args: Vec<String> = std::env::args().collect();
+        args.iter().position(|a| a == "--lang").and_then(|i| args.get(i + 1).cloned())
+    };
+    if let Some(tag) = lang.as_deref() {
+        assert!(deskwarden::i18n::set_language(tag), "no catalog for language {tag}");
+    }
     // The sign-in, unlock, first-window and second-factor screens only.
     let auth = arg("--auth");
     let all = arg("--all") || auth;
@@ -1782,7 +1792,10 @@ fn main() -> eframe::Result {
     // this project forbids writing to, because the user runs the app out of
     // it. See `target_dir` for the fallback that keeps CI's path unchanged.
     let out: PathBuf = if all {
-        target_dir().join("ui_preview")
+        match lang.as_deref() {
+            Some(tag) => target_dir().join(format!("ui_preview_{tag}")),
+            None => target_dir().join("ui_preview"),
+        }
     } else if cli_setup {
         target_dir().join("ui_preview_cli_setup.png")
     } else if backend_choice {
