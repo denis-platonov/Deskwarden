@@ -12183,45 +12183,37 @@ fn draw_export_report(ctx: &egui::Context, report: &ExportReport) -> bool {
     let Some((tone, text)) = export_message(report) else {
         return true;
     };
-    let text = text.as_str();
+    report_dialog(
+        crate::kit::modal::Dialog::new(EXPORT_REPORT_ID, 480.0).title("Vault export").modeless(),
+        text.as_str(),
+        matches!(tone, ExportTone::Bad),
+        ctx,
+    )
+}
+
+/// The dialog's id; its scrim is `"vault-export-report-scrim"`.
+const EXPORT_REPORT_ID: &str = "vault-export-report";
+
+/// A v2 dialog with one sentence and an OK: the shape of the export report
+/// and of the revoke banner. A bad outcome is the danger note, a good one is
+/// plain text. True once it has been dismissed -- by OK, the close mark, the
+/// scrim or Esc, none of which can do anything else.
+fn report_dialog(dialog: crate::kit::modal::Dialog<'_>, text: &str, bad: bool, ctx: &egui::Context) -> bool {
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    use crate::kit::modal;
     let mut dismissed = false;
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("vault-export-report")))
-        .show(ctx, |ui| {
-            // Dragged by its title line; centred again the next time an
-            // export reports. See `theme::movable_modal`.
-            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-            egui::Frame::new()
-                .fill(theme::CARD)
-                .corner_radius(egui::CornerRadius::same(10))
-                .stroke(egui::Stroke::new(
-                    1.0,
-                    match tone {
-                        ExportTone::Good => theme::BORDER,
-                        ExportTone::Bad => theme::ERROR,
-                    },
-                ))
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_width(360.0);
-                    ui.label(theme::bold("Vault export", 15.0).color(theme::INK));
-                    ui.add_space(10.0);
-                    ui.add(
-                        egui::Label::new(egui::RichText::new(text).size(12.0).color(
-                            match tone {
-                                ExportTone::Good => theme::INK,
-                                ExportTone::Bad => theme::ERROR,
-                            },
-                        ))
-                        .wrap(),
-                    );
-                    ui.add_space(16.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::primary_button(ui, "OK", None).clicked() {
-                            dismissed = true;
-                        }
-                    });
-                });
-        });
+    // Modeless: a report must not stand between the user and the next thing
+    // they press, and the next revoke is not refused because of this answer.
+    let (_, ()) = dialog.show(ctx, |ui| {
+        if bad {
+            modal::note(ui, modal::Tone::Danger, text);
+        } else {
+            ui.add(egui::Label::new(egui::RichText::new(text).size(15.0).color(theme::INK)).wrap());
+        }
+        ui.add_space(18.0);
+        let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        dismissed = controls::button_filling(ui, ButtonKind::Primary, size, "OK").clicked();
+    });
     dismissed
 }
 
@@ -12237,33 +12229,18 @@ const EXPORTING: &str = "Exporting the vault...";
 /// The in-flight half of [`draw_export_report`]: the same card, with no
 /// dismiss button on it.
 fn draw_export_in_flight(ctx: &egui::Context) {
-    // **Movable even though it has no dismiss control at all.** This is the
-    // one card in the app the user cannot close -- it goes when the export
-    // finishes -- which is exactly why being able to push it aside is worth
-    // having: until now the only way to see what it covered was to wait.
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("vault-export-progress")))
-        .show(ctx, |ui| {
-            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-            egui::Frame::new()
-                .fill(theme::CARD)
-                .corner_radius(egui::CornerRadius::same(10))
-                .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_width(360.0);
-                    ui.label(theme::bold("Vault export", 15.0).color(theme::INK));
-                    ui.add_space(10.0);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(EXPORTING)
-                                .size(12.0)
-                                .color(theme::TEXT_SECONDARY),
-                        )
-                        .wrap(),
-                    );
-                });
-        });
+    // Nothing to answer: no close mark, no scrim and no Esc; the card is
+    // drawn again on the next frame for as long as the export runs.
+    let _ = crate::kit::modal::Dialog::new(EXPORT_PROGRESS_ID, 480.0)
+        .title("Vault export")
+        .sub(EXPORTING)
+        .without_close()
+        .modeless()
+        .show(ctx, |_ui| {});
 }
+
+/// The dialog's id; its scrim is `"vault-export-progress-scrim"`.
+const EXPORT_PROGRESS_ID: &str = "vault-export-progress";
 
 /// The export channel's sending half. Named because three signatures carry it.
 type ExportSender = mpsc::Sender<ExportReport>;
@@ -12782,44 +12759,16 @@ fn send_delete_message(report: &SendDeleteReport) -> (DeleteTone, String) {
 /// Answers `true` when the user dismissed it.
 fn draw_send_delete_report(ctx: &egui::Context, report: &SendDeleteReport) -> bool {
     let (tone, text) = send_delete_message(report);
-    let accent = match tone {
-        DeleteTone::Good => theme::BORDER,
-        DeleteTone::Bad => theme::ERROR,
-    };
-    let ink = match tone {
-        DeleteTone::Good => theme::INK,
-        DeleteTone::Bad => theme::ERROR,
-    };
-    let mut dismissed = false;
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("vault-send-delete-report")))
-        .show(ctx, |ui| {
-            // Dragged by its title line; centred again on the next report.
-            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-            egui::Frame::new()
-                .fill(theme::CARD)
-                .corner_radius(egui::CornerRadius::same(10))
-                .stroke(egui::Stroke::new(1.0, accent))
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_width(360.0);
-                    ui.label(theme::bold("Send", 15.0).color(theme::INK));
-                    ui.add_space(10.0);
-                    ui.add(
-                        egui::Label::new(
-                            egui::RichText::new(text.as_str()).size(12.0).color(ink),
-                        )
-                        .wrap(),
-                    );
-                    ui.add_space(16.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::primary_button(ui, "OK", None).clicked() {
-                            dismissed = true;
-                        }
-                    });
-                });
-        });
-    dismissed
+    report_dialog(
+        crate::kit::modal::Dialog::new(SEND_DELETE_REPORT_ID, 480.0).title("Send").modeless(),
+        text.as_str(),
+        matches!(tone, DeleteTone::Bad),
+        ctx,
+    )
 }
+
+/// The dialog's id; its scrim is `"vault-send-delete-report-scrim"`.
+const SEND_DELETE_REPORT_ID: &str = "vault-send-delete-report";
 
 /// The revoke channel's sending half. Named because three signatures carry it.
 type SendDeleteSender = mpsc::Sender<SendDeleteReport>;
@@ -16325,70 +16274,51 @@ const LAUNCH_CONFIRM_GO: &str = "Open";
 ///
 /// Pure view: it starts nothing. The caller launches, which is what lets this
 /// be driven from a test at all.
+/// The dialog's id; its scrim is `"launch-confirm-scrim"`.
+const LAUNCH_CONFIRM_ID: &str = "launch-confirm";
+
 fn draw_launch_confirm_modal(ctx: &egui::Context, pending: &PendingLaunch) -> LaunchConfirmAction {
-    use eframe::egui::{CornerRadius, Margin, RichText, Stroke};
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    use crate::kit::modal::{Dialog, ModalOutcome};
+    use eframe::egui::{CornerRadius, Margin, RichText};
 
     let mut action = LaunchConfirmAction::None;
-
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("launch-confirm-scrim")));
-
-    // Movable by its title line. It matters more here than on most cards:
-    // this one shows a command line in full, and a command line long enough
-    // to need reading is a card tall enough to cover the item it came from.
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("launch-confirm-modal")))
+    let (outcome, ()) = Dialog::new(LAUNCH_CONFIRM_ID, 520.0)
+        .title(LAUNCH_CONFIRM_TITLE)
+        .sub(&pending.item_name)
         .show(ctx, |ui| {
-            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
+            ui.add(egui::Label::new(RichText::new(LAUNCH_CONFIRM_BODY).size(15.0).color(theme::INK)).wrap());
+            ui.add_space(10.0);
+            // The exact command line, in a quiet box: what the vault says to
+            // run, character for character.
             egui::Frame::new()
-                .fill(theme::CARD)
-                .corner_radius(CornerRadius::same(10))
-                .stroke(Stroke::new(1.0, theme::BORDER))
-                .inner_margin(Margin::same(20))
+                .fill(crate::kit::tokens::palette(ctx).field_bg)
+                .corner_radius(CornerRadius::same(14))
+                .inner_margin(Margin::same(14))
                 .show(ui, |ui| {
-                    ui.set_width(420.0);
-                    ui.label(theme::bold(LAUNCH_CONFIRM_TITLE, 15.0).color(theme::INK));
-                    ui.add_space(10.0);
+                    ui.set_width(ui.available_width());
                     ui.label(
-                        RichText::new(&pending.item_name)
-                            .size(12.0)
-                            .color(theme::TEXT_GHOST),
+                        RichText::new(detail::command_line(&pending.plan))
+                            .size(13.0)
+                            .monospace()
+                            .color(theme::INK),
                     );
-                    ui.add_space(10.0);
-                    ui.label(RichText::new(LAUNCH_CONFIRM_BODY).size(12.0).color(theme::INK));
-                    ui.add_space(10.0);
-                    // The string itself. Monospace because it is a command
-                    // line, and `wrap()` because the alternative at this width
-                    // is an ellipsis over the part that matters.
-                    egui::Frame::new()
-                        .fill(theme::CARD_TINT)
-                        .corner_radius(CornerRadius::same(7))
-                        .inner_margin(Margin::same(10))
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.label(
-                                RichText::new(detail::command_line(&pending.plan))
-                                    .size(12.0)
-                                    .monospace()
-                                    .color(theme::INK),
-                            );
-                        });
-                    ui.add_space(18.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if theme::primary_button(ui, LAUNCH_CONFIRM_GO, None).clicked() {
-                            action = LaunchConfirmAction::Launch;
-                        }
-                        ui.add_space(8.0);
-                        if theme::secondary_button(ui, "Cancel").clicked() {
-                            action = LaunchConfirmAction::Cancel;
-                        }
-                    });
                 });
+            ui.add_space(18.0);
+            let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.columns(2, |columns| {
+                if controls::button_filling(&mut columns[0], ButtonKind::Outline, size, "Cancel").clicked() {
+                    action = LaunchConfirmAction::Cancel;
+                }
+                if controls::button_filling(&mut columns[1], ButtonKind::Primary, size, LAUNCH_CONFIRM_GO).clicked() {
+                    action = LaunchConfirmAction::Launch;
+                }
+            });
         });
-
-    // Esc cancels, same as every other transient overlay in this app.
-    if action == LaunchConfirmAction::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if action == LaunchConfirmAction::None && outcome == ModalOutcome::Closed {
         action = LaunchConfirmAction::Cancel;
     }
-
     action
 }
 

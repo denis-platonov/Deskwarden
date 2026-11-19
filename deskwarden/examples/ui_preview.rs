@@ -665,6 +665,18 @@ enum Surface {
     ModalNewItem,
     /// The Ctrl+K palette over the shell, with a query (spec B §4).
     ModalPalette,
+    /// The delete confirmation over the shell (slice 15c).
+    ModalDelete,
+    /// The folder editor over the shell.
+    ModalFolder,
+    /// The icon picker over the shell.
+    ModalIcon,
+    /// The Empty trash confirmation over the shell.
+    ModalEmptyTrash,
+    /// The forget-a-person confirmation over the shell.
+    ModalForget,
+    /// The Add 2FA modal while the screen is being read.
+    ModalTotpScanning,
     /// The Import wizard's four steps over the shell (spec B §3).
     ModalImportSource,
     ModalImportFile,
@@ -938,6 +950,12 @@ const ALL: &[Surface] = &[
     Surface::VaultShellOffline,
     Surface::ModalNewItem,
     Surface::ModalPalette,
+    Surface::ModalDelete,
+    Surface::ModalFolder,
+    Surface::ModalIcon,
+    Surface::ModalEmptyTrash,
+    Surface::ModalForget,
+    Surface::ModalTotpScanning,
     Surface::ModalImportSource,
     Surface::ModalImportFile,
     Surface::ModalImportProgress,
@@ -1051,6 +1069,12 @@ impl Surface {
             Surface::VaultShellOffline => "vault_shell_offline",
             Surface::ModalNewItem => "modal_new_item",
             Surface::ModalPalette => "modal_palette",
+            Surface::ModalDelete => "modal_delete",
+            Surface::ModalFolder => "modal_folder_edit",
+            Surface::ModalIcon => "modal_icon_pick",
+            Surface::ModalEmptyTrash => "modal_empty_trash",
+            Surface::ModalForget => "modal_forget",
+            Surface::ModalTotpScanning => "totp_add_scanning",
             Surface::ModalImportSource => "modal_import_source",
             Surface::ModalImportFile => "modal_import_file",
             Surface::ModalImportProgress => "modal_import_progress",
@@ -1137,7 +1161,7 @@ impl Surface {
             | Surface::TotpAddTyped
             | Surface::TotpAddRefused
             | Surface::TotpAddRefusedLongest
-            | Surface::TotpAddScanned => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
+            | Surface::TotpAddScanned => egui::vec2(PANE_WIDTH, 900.0),
             // **The shipped window's floor, not a pane's width.** The
             // add-a-code card is a modal over the whole vault window rather
             // than a pane inside it, and the number it reads is
@@ -1255,6 +1279,12 @@ impl Surface {
             | Surface::ModalImportFile
             | Surface::ModalImportProgress
             | Surface::ModalImportDone
+            | Surface::ModalDelete
+            | Surface::ModalFolder
+            | Surface::ModalIcon
+            | Surface::ModalEmptyTrash
+            | Surface::ModalForget
+            | Surface::ModalTotpScanning
             | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
             Surface::ToolGenerator
             | Surface::SettingsGeneral
@@ -1406,6 +1436,12 @@ fn main() -> eframe::Result {
             Surface::VaultShellOffline,
             Surface::ModalNewItem,
             Surface::ModalPalette,
+            Surface::ModalDelete,
+            Surface::ModalFolder,
+            Surface::ModalIcon,
+            Surface::ModalEmptyTrash,
+            Surface::ModalForget,
+            Surface::ModalTotpScanning,
             Surface::ModalImportSource,
             Surface::ModalImportFile,
             Surface::ModalImportProgress,
@@ -1967,6 +2003,43 @@ impl eframe::App for Preview {
                 self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
                 let _ = deskwarden::vault_window::new_item_modal::draw(root.ctx());
+            }
+            surface @ (Surface::ModalDelete
+            | Surface::ModalFolder
+            | Surface::ModalIcon
+            | Surface::ModalEmptyTrash
+            | Surface::ModalForget
+            | Surface::ModalTotpScanning) => {
+                use deskwarden::vault_window::{delete_modal, folder_modal, icon_modal, record_ui, trash_modal};
+                self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
+                let ctx = root.ctx().clone();
+                match surface {
+                    Surface::ModalDelete => {
+                        let mut state = delete_modal::DeleteConfirmState::new(&self.fixtures.login, None, delete_modal::DeleteKind::ToTrash);
+                        let _ = delete_modal::draw_delete_modal(&ctx, &mut state);
+                    }
+                    Surface::ModalFolder => {
+                        let mut state = folder_modal::FolderEditState::new("f1".into(), "Work/Clients".into());
+                        let _ = folder_modal::draw_folder_edit_modal(&ctx, &mut state);
+                    }
+                    Surface::ModalIcon => {
+                        let mut state = icon_modal::IconPickState::new(&self.fixtures.login, None, None);
+                        let _ = icon_modal::draw_icon_modal(&ctx, &mut state);
+                    }
+                    Surface::ModalEmptyTrash => {
+                        let _ = trash_modal::draw(&ctx, 3);
+                    }
+                    Surface::ModalForget => {
+                        let names = vec!["Ledgerline".to_string(), "Northwind Mail".to_string()];
+                        let _ = record_ui::draw_forget_confirm(&ctx, "anna@northwind.example", &names);
+                    }
+                    _ => {
+                        let mut state = TotpAdd::opening("1", "Ledgerline", false);
+                        state.stage = totp_add::Stage::Scanning;
+                        let _ = totp_add::draw_add_modal(&ctx, &mut state, PREVIEW_UNIX);
+                    }
+                }
             }
             Surface::ModalPalette => {
                 self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
@@ -3399,10 +3472,11 @@ impl Preview {
                     // the countdown are the point of this shot, and a
                     // screenshot whose two most prominent numbers change every
                     // run is a screenshot no reviewer can diff.
-                    let _ = totp_add::draw_add_form(ui, &mut fixtures.totp_add, PREVIEW_UNIX);
+                    fixtures.totp_add.stage = totp_add::Stage::Manual;
+                    let _ = totp_add::draw_add_modal(ui.ctx(), &mut fixtures.totp_add, PREVIEW_UNIX);
                 }
                 PaneKind::TotpPicker => {
-                    let _ = totp_add::draw_picker(ui, &mut fixtures.totp_picker);
+                    let _ = totp_add::draw_add_modal(ui.ctx(), &mut fixtures.totp_picker, PREVIEW_UNIX);
                 }
                 // **One fixture per shot, never one fixture re-typed.** The
                 // `--all` walk shares a single `Fixtures`, so a state
@@ -3418,7 +3492,8 @@ impl Preview {
                         TotpShot::Scanned => &mut fixtures.totp_scanned,
                         TotpShot::Narrow => &mut fixtures.totp_narrow,
                     };
-                    let _ = totp_add::draw_add_form(ui, state, PREVIEW_UNIX);
+                    state.stage = totp_add::Stage::Manual;
+                    let _ = totp_add::draw_add_modal(ui.ctx(), state, PREVIEW_UNIX);
                 }
             });
     }

@@ -5650,28 +5650,31 @@ fn move_to_trash_button(ui: &mut egui::Ui) -> bool {
 
 /// Spec B 1.4 C: the live code, grouped, and its 34pt ring.
 fn live_code_line(ui: &mut egui::Ui, code: &str, seconds_left: u8, period: u16) {
+    use crate::kit::tokens::{self, palette};
+    let p = palette(ui.ctx());
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 16.0;
+        // Spec B 1.4 B: 26/700, `.12em`, blue and red for the last five
+        // seconds; the ring is 34 with a 4 px stroke.
         let urgent = seconds_left <= 5;
-        let ink = if urgent { theme::ERROR } else { theme::INK };
-        ui.label(
-            RichText::new(detail::grouped_code(code))
-                .font(egui::FontId::new(24.0, egui::FontFamily::Monospace))
-                .color(ink),
-        );
+        let ink = if urgent { p.error } else { p.blue };
+        let galley = ui.fonts_mut(|f| f.layout_job(tokens::job(tokens::TOTP, &detail::grouped_code(code), ink)));
+        let (slot, _) = ui.allocate_exact_size(galley.size(), egui::Sense::hover());
+        ui.painter().galley(slot.min, galley, ink);
         let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
         let centre = rect.center();
-        ui.painter().circle_stroke(centre, 15.0, egui::Stroke::new(3.0, theme::BORDER));
+        ui.painter().circle_stroke(centre, 14.0, egui::Stroke::new(4.0, p.badge_bg));
         let fraction = f32::from(seconds_left) / f32::from(period.max(1));
-        let arc = detail::ring_points(centre, 15.0, fraction);
+        let arc = detail::ring_points(centre, 14.0, fraction);
         if arc.len() > 1 {
-            ui.painter().add(egui::Shape::line(arc, egui::Stroke::new(3.0, if urgent { theme::ERROR } else { theme::BLUE })));
+            ui.painter().add(egui::Shape::line(arc, egui::Stroke::new(4.0, ink)));
         }
         ui.painter().text(
             centre,
             egui::Align2::CENTER_CENTER,
             seconds_left.to_string(),
-            egui::FontId::proportional(11.0),
-            theme::TEXT_MUTED,
+            egui::FontId::new(11.0, egui::FontFamily::Name(theme::BOLD.into())),
+            p.text_icon,
         );
     });
     ui.add_space(8.0);
@@ -12954,7 +12957,7 @@ pub fn draw_detail_edit(
                             if has_seed || creating {
                                 ui.add_space(4.0);
                                 ui.label(
-                                    RichText::new(TOTP_HINT).size(11.0).color(theme::TEXT_FAINT),
+                                    RichText::new(TOTP_HINT).size(13.0).color(theme::TEXT_FAINT),
                                 );
                             }
                         });
@@ -13856,116 +13859,35 @@ pub(crate) enum DiscardAnswer {
 }
 
 /// The confirmation the item form's Cancel puts up when the draft has unsaved
-/// changes.
+/// changes: a v2 dialog (`kit::modal::confirm`), drawn from inside the vault
+/// window's running frame like every other in-window overlay.
 ///
-/// **An in-window overlay, drawn from inside the vault window's running
-/// frame**, on the same `Area`-over-scrim pattern as
-/// [`folder_modal::draw_folder_edit_modal`](super::folder_modal). It cannot be
-/// a second OS window: `overlay_ui::show_prompt_overlay` and `preflight_host`
-/// each pump their own message loop, and this is called from inside egui's.
-///
-/// Two rules the layout encodes rather than merely permits:
-///
-/// * **Discard is not preselected.** It is the outlined destructive control,
-///   the way the folder modal's Delete is; "Keep editing" is the filled
-///   primary. Nothing here binds `Enter`, so a stray return keypress on the
-///   way out of a text box cannot answer this dialog at all.
-/// * **Escape means keep editing.** Escape is the reflex for "get this off my
-///   screen", and every other transient overlay in this app cancels on it --
-///   which is precisely why it must resolve to the SAFE answer here. The
-///   destructive answer requires the pointer.
+/// * **Discard is not preselected.** It is the red outline on the left;
+///   "Keep editing" is the filled primary. Nothing here binds `Enter`.
+/// * **Escape, the close mark and the scrim all mean keep editing.** Those are
+///   the reflexes for "get this off my screen", which is exactly why they must
+///   resolve to the SAFE answer here: the destructive answer needs a press on
+///   the button that says what it does.
 pub(crate) fn draw_discard_confirm(ctx: &egui::Context) -> Option<DiscardAnswer> {
-    let mut answer = None;
-
-    // Full-window click-catcher under the card, so a click aimed at the form
-    // behind cannot reach it. A click on the scrim itself is swallowed and
-    // decides nothing -- neither answer is safe to give by accident, and
-    // "dismiss by clicking away" would give the destructive one to anyone who
-    // read the two buttons as a toolbar.
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("detail-edit-discard-scrim")));
-
-    // Movable by its title line, centred again the next time it opens --
-    // `theme::movable_modal`, which is where the `.anchor(CENTER_CENTER, ZERO)`
-    // that used to pin every card in this app went.
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("detail-edit-discard-modal")))
-        .show(ctx, |ui| {
-            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-            let framed = egui::Frame::new()
-                .fill(theme::CARD)
-                .corner_radius(CornerRadius::same(10))
-                .stroke(Stroke::new(1.0, theme::BORDER))
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_width(320.0);
-                    // The title's own rectangle goes back out to the caller:
-                    // it is the line the dismiss ✕ is hung on, once this frame
-                    // has measured the card. See `theme::modal_corner_mark`.
-                    let title =
-                        ui.label(theme::bold(DISCARD_TITLE, 15.0).color(theme::INK)).rect;
-                    ui.add_space(10.0);
-                    ui.label(
-                        RichText::new(DISCARD_BODY).size(12.0).color(theme::TEXT_FAINT),
-                    );
-                    ui.add_space(18.0);
-                    ui.horizontal(|ui| {
-                        // The destructive answer, in the design's error
-                        // outline and on the far side of the row from the
-                        // pointer's resting place -- the same treatment the
-                        // folder modal gives Delete.
-                        let discard = ui.add(
-                            egui::Button::new(
-                                theme::semibold(DISCARD_CONFIRM, 13.0).color(theme::ERROR),
-                            )
-                            .fill(theme::CARD)
-                            .stroke(Stroke::new(1.0, theme::ERROR))
-                            .corner_radius(CornerRadius::same(7))
-                            .min_size(egui::Vec2::new(0.0, theme::BUTTON_HEIGHT)),
-                        );
-                        if discard.clicked() {
-                            answer = Some(DiscardAnswer::Discard);
-                        }
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center),
-                            |ui| {
-                                if theme::primary_button(ui, DISCARD_KEEP, None).clicked() {
-                                    answer = Some(DiscardAnswer::KeepEditing);
-                                }
-                            },
-                        );
-                    });
-                    title
-                });
-            // **The ✕ means "keep editing", and on this one card that had to
-            // be worked out rather than assumed.**
-            //
-            // Everywhere else in this app the dismiss mark is the harmless
-            // answer by construction: the card is a report, or a form whose
-            // Cancel throws away nothing that was not already provisional.
-            // Here both answers are real, one of them destroys typing the user
-            // has not saved, and the mark sits in the corner a person reaches
-            // for reflexively to make a dialog go away. If it resolved to
-            // Discard, this card would be a confirmation whose most reflexive
-            // gesture gives the answer it was put on screen to stop someone
-            // giving by accident -- with no second chance and nothing to undo.
-            //
-            // So it resolves to `DiscardAnswer::KeepEditing`, which is what
-            // Escape already resolves to here for the same reason (see this
-            // function's doc). The two get-me-out gestures agree, the
-            // destructive answer still requires the pointer on a button that
-            // says what it does, and nothing reachable through the mark is
-            // unreachable through the key.
-            if theme::modal_corner_mark(ui, framed.response.rect, framed.inner) {
-                answer = Some(DiscardAnswer::KeepEditing);
-            }
-        });
-
-    // Escape resolves to the SAFE answer. See this function's doc.
-    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        answer = Some(DiscardAnswer::KeepEditing);
+    use crate::kit::controls::ButtonKind;
+    use crate::kit::modal::{confirm, Confirmed, Side};
+    match confirm(
+        ctx,
+        DISCARD_ID,
+        480.0,
+        DISCARD_TITLE,
+        Some(DISCARD_BODY),
+        (DISCARD_CONFIRM, ButtonKind::Danger),
+        (DISCARD_KEEP, ButtonKind::Primary),
+    ) {
+        Confirmed::Pressed(Side::Left) => Some(DiscardAnswer::Discard),
+        Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(DiscardAnswer::KeepEditing),
+        Confirmed::Open => None,
     }
-
-    answer
 }
+
+/// The dialog's id; its scrim is `"detail-edit-discard-scrim"`.
+pub(crate) const DISCARD_ID: &str = "detail-edit-discard";
 
 /// The confirmation's four strings, named so the tests assert on the same
 /// bytes the screen shows rather than on a re-typed copy of them.
@@ -25226,114 +25148,6 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// Where the discard confirmation's dismiss ✕ crosses, found from the
-    /// paint.
-    ///
-    /// The mark draws no galley, so it is found by geometry: two strokes whose
-    /// visual bounds are the same square box [`theme::CLOSE_MARK_SPAN`]
-    /// across, sitting on the card's title line. Both arms of a ✕ share one
-    /// bounding box exactly because they cross, which is the cheap way to say
-    /// "this is a ✕ and not two parallel slashes".
-    fn discard_dismiss_mark(painted: &Painted) -> Pos2 {
-        let title = painted.rect_of(DISCARD_TITLE);
-        // The stroke widens the visual bounds by half its width on each side.
-        let span = theme::CLOSE_MARK_SPAN;
-        let arms: Vec<Rect> = painted
-            .marks
-            .iter()
-            .filter(|(kind, r)| {
-                *kind == "a line"
-                    && (r.width() - r.height()).abs() < 0.01
-                    && (r.width() - span).abs() < 2.0
-                    && (r.center().y - title.center().y).abs() < 1.0
-            })
-            .map(|(_, r)| *r)
-            .collect();
-        assert_eq!(
-            arms.len(),
-            2,
-            "the confirmation's title line carries {} strokes the size of a ✕ arm; it needs \
-             exactly two, and none at all is the card having no way out of its corner. It \
-             painted {:?}",
-            arms.len(),
-            painted.marks
-        );
-        assert_eq!(
-            arms[0], arms[1],
-            "the two arms do not share a bounding box, so they do not cross"
-        );
-        arms[0].center()
-    }
-
-    /// **The confirmation carries a dismiss ✕, and it means KEEP EDITING.**
-    ///
-    /// This is the one card in the app where the corner mark's meaning had to
-    /// be argued rather than assumed, and the argument is
-    /// [`draw_discard_confirm`]'s: both of this card's answers are real, one
-    /// of them destroys typing that was never saved, and the corner ✕ is the
-    /// gesture a person makes without reading. So it resolves to the safe
-    /// answer -- which is also exactly what Escape resolves to here. This test
-    /// and [`escape_on_the_discard_confirmation_keeps_editing`] are the same
-    /// assertion about the two gestures, deliberately written out twice: what
-    /// has to hold is that neither reaches a state the other cannot, and a
-    /// single test that drove one of them would say nothing about the pair.
-    ///
-    /// Asserted with the secrets, for
-    /// [`escape_on_the_discard_confirmation_keeps_editing`]'s reason: "the ✕
-    /// closed the dialog" and "the ✕ discarded the draft" look identical from
-    /// the outside if the only thing checked is that the dialog went away.
-    ///
-    /// It is also the guard that the card's drag strip does not swallow the
-    /// click. The strip covers `theme::MODAL_PLAIN_HEADER_HEIGHT`, which is
-    /// this whole title line, so a mark registered before it would paint,
-    /// hover, and do nothing.
-    #[test]
-    fn the_dismiss_mark_on_the_discard_confirmation_keeps_editing() {
-        let ctx = styled_context(ROOMY_PANE);
-        let mut draft = edited_draft_full_of_secrets();
-        let typed = draft.clone();
-        assert_eq!(click_labelled(&ctx, &mut draft, "Cancel"), EditAction::None);
-        assert!(draft.discard_prompt, "nothing is up for the ✕ to answer");
-
-        // Two frames with the card up: an `egui::Area` egui has not seen
-        // spends its first pass measuring and paints nothing, so the mark is
-        // only hittable from the pass after that.
-        let no_input: &[egui::Event] = &[];
-        let _ = frame(&ctx, ROOMY_PANE, &mut draft, true, no_input);
-        let painted = frame(&ctx, ROOMY_PANE, &mut draft, true, no_input);
-        let at = discard_dismiss_mark(&painted);
-
-        let (action, _) = acting_frame_for(
-            &ctx,
-            ROOMY_PANE,
-            &mut draft,
-            true,
-            &click(at),
-            None,
-            &detail::TotpState::NoSecret,
-        );
-
-        assert!(
-            !draft.discard_prompt,
-            "the ✕ at {at:?} did not dismiss the confirmation -- either it is drawn and dead, \
-             or the header's drag strip swallowed the click"
-        );
-        assert_eq!(
-            action,
-            EditAction::None,
-            "the ✕ on the discard confirmation DISCARDED the draft -- the corner gesture was \
-             wired to the destructive answer"
-        );
-        assert_eq!(draft.password, typed.password, "the ✕ wiped the password");
-        assert_eq!(draft.totp, typed.totp, "the ✕ wiped the TOTP seed");
-        assert_eq!(draft.note_body, typed.note_body, "the ✕ wiped the note body");
-        assert!(
-            draft.is_dirty(),
-            "a draft kept by the ✕ stopped counting as dirty, so the next Cancel walks straight \
-             out with the user's edits"
-        );
-    }
-
     /// **Escape answers the confirmation SAFELY, and cannot answer it any
     /// other way.**
     ///
@@ -25379,6 +25193,52 @@ mod edit_pane_layout_tests {
         );
         assert_eq!(draft.password, typed.password, "Escape wiped the password");
         assert_eq!(draft.totp, typed.totp, "Escape wiped the TOTP seed");
+    }
+
+    /// **The discard confirmation, as the v2 dialog: every get-me-out gesture
+    /// keeps editing and only the red button discards.** The close mark, the
+    /// scrim and Escape are the reflexes for "make this go away", so they
+    /// resolve to the safe answer; the destructive one needs a press on the
+    /// button that says what it does.
+    #[test]
+    fn the_discard_dialogs_reflexes_keep_editing_and_only_the_red_button_discards() {
+        use crate::kit::modal::{close_id, confirm_button_id, Side};
+        use crate::kit::testing;
+        let screen = egui::vec2(1280.0, 820.0);
+        let settle = || {
+            let ctx = testing::ctx();
+            for t in [0.0, 0.1, 0.2] {
+                let _ = testing::frame(&ctx, t, screen, vec![], |ui| {
+                    let _ = draw_discard_confirm(ui.ctx());
+                });
+            }
+            ctx
+        };
+        let ask = |ctx: &egui::Context, events: Vec<egui::Event>| {
+            let mut answer = None;
+            let _ = testing::frame(ctx, 0.3, screen, events, |ui| answer = draw_discard_confirm(ui.ctx()));
+            answer
+        };
+        let ctx = settle();
+        let mark = ctx.read_response(close_id(DISCARD_ID)).expect("the close mark").rect.center();
+        assert_eq!(ask(&ctx, testing::click_at(mark)), Some(DiscardAnswer::KeepEditing), "the close mark");
+        let ctx = settle();
+        assert_eq!(ask(&ctx, testing::click_at(egui::pos2(6.0, 410.0))), Some(DiscardAnswer::KeepEditing), "the scrim");
+        let ctx = settle();
+        let esc = vec![egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        assert_eq!(ask(&ctx, esc), Some(DiscardAnswer::KeepEditing), "Escape");
+        let ctx = settle();
+        let red = ctx.read_response(confirm_button_id(DISCARD_ID, Side::Left)).expect("the red button").rect.center();
+        assert_eq!(ask(&ctx, testing::click_at(red)), Some(DiscardAnswer::Discard), "the red button");
+        let ctx = settle();
+        let keep = ctx.read_response(confirm_button_id(DISCARD_ID, Side::Right)).expect("the keep button").rect.center();
+        assert_eq!(ask(&ctx, testing::click_at(keep)), Some(DiscardAnswer::KeepEditing), "Keep editing");
     }
 
     /// The other half of the fix: the fields the buttons were pinned away

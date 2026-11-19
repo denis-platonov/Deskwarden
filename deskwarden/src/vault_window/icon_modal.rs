@@ -128,165 +128,109 @@ const URL_HINT: &str = "A direct link to an image, e.g. https://example.com/logo
 /// How wide the card is. Unchanged from the plain card this replaced: two
 /// hints of three lines each set the height, and 360 is the width at which
 /// neither of them runs to four.
-const CARD_WIDTH: f32 = 360.0;
+const CARD_WIDTH: f32 = 480.0;
 
 /// The heading, which is now the header band's words rather than the body's
 /// first line.
 const CARD_TITLE: &str = "Select icon";
 
-/// Draws the modal as a centred card over a dimmed scrim and reports what was
-/// pressed.
-///
-/// **The card is [`theme::modal_card`]'s**, which is the app's one modal
-/// shape: a coloured header band, a white body, and a footer whose two
-/// answers split its width. This file and [`super::delete_modal`] each used
-/// to assemble that card by hand, and the layout moved into `theme` when the
-/// two were brought into line -- a third hand-assembled copy is what the move
-/// was made to prevent.
-///
-/// **The header is [`theme::BLUE`], and there was no precedent to copy.**
-/// The design this card follows is the send preflight's refusal, which is the
-/// only card in the app with a coloured header band at all, and its accent is
-/// [`theme::ERROR`] because a refusal is what it is. Nothing in this crate
-/// draws that band for an ordinary question -- `prefs_ui`'s modal has a
-/// header, but it is white with a hairline under it and a ✕ at its end, which
-/// is a window title bar rather than an accent. So the colour is chosen here
-/// rather than found: blue is this app's one non-alarming accent, it is what
-/// [`theme::primary_button`] already fills the affirmative answer with, and
-/// the pairing means the header and the button a user is being steered toward
-/// are the same colour on every card that is not a warning.
+/// The dialog's id; its scrim is `"icon-pick-scrim"`.
+pub const ID: &str = "icon-pick";
+
+/// The id of the "Use this address" button, for the window's tests.
+pub fn use_id() -> egui::Id {
+    egui::Id::new((ID, "use"))
+}
+
+/// The id of the address field, for tests.
+pub fn url_id() -> egui::Id {
+    egui::Id::new((ID, "url"))
+}
+
+/// Draws the icon picker as a v2 dialog (480 wide, "Select icon") and reports
+/// what was pressed: the row it is about, an image file, or an image address.
 ///
 /// **The URL is validated HERE, on the click, and a bad one never leaves this
 /// function.** `item_icon::choice_from_url` is the shape check -- a scheme
 /// this app fetches, and a host -- and its refusal goes straight into
 /// [`IconPickState::error`] rather than being carried out to a handler that
-/// would have to decide what to do with it. The reason is that the two
-/// failures are different in kind: a mistyped address is something the user
-/// can fix in the box they are looking at, and a vault write that fails is
-/// not. Only the second needs to reach the caller.
+/// would have to decide what to do with it: a mistyped address is something
+/// the user can fix in the box they are looking at, and a vault write that
+/// fails is not. Only the second needs to reach the caller.
 ///
 /// **What it does NOT check is whether the URL answers.** That would be a
-/// blocking HTTP request on the UI thread -- up to ten seconds of frozen
-/// window under a modal, on a `favicon` deadline chosen for a background
-/// thread -- or a whole in-flight state on this struct for a fetch the icon
-/// loader is about to make anyway, one frame later, on the thread it belongs
-/// on. So a URL that 404s is stored, the loader's fetch produces nothing, and
-/// the item shows the icon it would have had otherwise. The choice is still
-/// there to see and to fix, and "Use the automatic icon" is on the menu
-/// beneath the entry that opened this.
+/// blocking HTTP request on the UI thread under a modal, or a whole in-flight
+/// state for a fetch the icon loader is about to make anyway on the thread it
+/// belongs on. A URL that 404s is stored, the loader's fetch produces
+/// nothing, and the item shows the icon it would have had otherwise.
+///
+/// The primary is dimmed while the box is empty rather than refusing on the
+/// click: an empty box is a user who has not typed yet, and painting a refusal
+/// at one is how a form nags.
 pub fn draw_icon_modal(ctx: &egui::Context, state: &mut IconPickState) -> IconPickAction {
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    use crate::kit::modal::{Dialog, ModalOutcome};
     let mut action = IconPickAction::None;
-
-    // The `Area` is declared HERE rather than inside `theme::modal_scrim`,
-    // and the id is a literal on purpose: `item_list::MODAL_SCRIM_AREAS` is
-    // walked for exactly this declaration, and a scrim it cannot see is a
-    // modal the item list's arrow keys steer straight through.
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("icon-pick-scrim")));
-
-    // **Greyed while the box is empty, rather than refusing on the click.**
-    // An empty box is not a wrong answer -- it is a user who has not typed
-    // yet, and painting a refusal at one is how a form nags
-    // (`totp_add::Reading::Empty`'s rule). A box with something wrong IN it
-    // does get the refusal, below.
-    //
-    // **Read before the body draws, where it used to be read after.** The
-    // body and the footer are separate closures now, so the one that edits
-    // the box and the one that reads it cannot both hold it; the answer is
-    // worked out here and passed in by value. The only frame on which the two
-    // orders disagree is the one the first character is typed on, and no
-    // click can land on that frame anyway -- egui hit-tests a press against
-    // the widget rects registered on the PREVIOUS frame, which is the very
-    // thing `an_empty_box_reports_nothing_and_refuses_nothing` puts an idle
-    // frame in the middle of itself for.
     let typed = !state.url.trim().is_empty();
+    let mut use_url = false;
+    let (outcome, ()) = Dialog::new(ID, CARD_WIDTH).title(CARD_TITLE).show(ctx, |ui| {
+        let width = ui.available_width();
+        state.subject.draw(ui);
+        ui.add_space(12.0);
+        field_label(ui, "Image file");
+        ui.add_space(7.0);
+        let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        if controls::button(ui, ButtonKind::Outline, size, "Choose a file\u{2026}", None).clicked() {
+            action = IconPickAction::ChooseFile;
+        }
+        ui.add_space(6.0);
+        hint(ui, &file_hint());
 
-    let press = theme::modal_card(
-        ctx,
-        egui::Area::new(egui::Id::new("icon-pick-modal")),
-        theme::ModalCard {
-            accent: theme::BLUE,
-            // No mark. This is a question, not a refusal -- see the doc above.
-            glyph: theme::ModalGlyph::None,
-            title: CARD_TITLE,
-            width: CARD_WIDTH,
-            dismiss: "Cancel",
-            body: theme::ModalBody::Padded,
-        },
-        |ui| {
-            // The row this is about, drawn as the results list draws it --
-            // and on this card the tile is doing a second job, because the
-            // picture in it is the one about to be replaced. The menu that
-            // opened this is long gone from the screen by now, and a modal
-            // that did not say which item it was about would be one click
-            // away from putting a logo on the wrong credential.
-            state.subject.draw(ui);
+        ui.add_space(16.0);
+        field_label(ui, "Or an image address");
+        ui.add_space(7.0);
+        crate::kit::input::text(ui, url_id(), &mut state.url, "https://example.com/logo.png", false, width);
+        ui.add_space(6.0);
+        hint(ui, URL_HINT);
 
-            ui.add_space(12.0);
-            theme::field_label(ui, "Image file");
-            ui.add_space(6.0);
-            // **Still in the BODY, not in the footer.** The footer holds the
-            // two answers to the card's own question, and this is a third
-            // thing: it opens a dialog and leaves the modal standing. Putting
-            // it beside "Use this address" would offer three buttons as if
-            // they were alternatives of the same weight.
-            if theme::secondary_button(ui, "Choose a file\u{2026}").clicked() {
-                action = IconPickAction::ChooseFile;
+        if let Some(error) = &state.error {
+            ui.add_space(10.0);
+            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(theme::ERROR)).wrap());
+        }
+        ui.add_space(18.0);
+        ui.scope(|ui| {
+            if !typed {
+                ui.set_opacity(0.4);
             }
-            ui.add_space(4.0);
-            hint(ui, &file_hint());
-
-            ui.add_space(16.0);
-            theme::field_label(ui, "Or an image address");
-            ui.add_space(6.0);
-            theme::text_field(ui, &mut state.url, false);
-            ui.add_space(4.0);
-            hint(ui, URL_HINT);
-
-            if let Some(error) = &state.error {
-                ui.add_space(10.0);
-                // Wrapped, not truncated: every sentence here explains a
-                // refusal, and a truncated explanation is worse than none.
-                // `move_error_band`'s rule one file over.
-                ui.add(
-                    egui::Label::new(RichText::new(error).size(12.0).color(theme::ERROR)).wrap(),
-                );
-            }
-        },
-        |ui| theme::primary_button_enabled(ui, "Use this address", None, typed),
-    );
-
-    // **The URL is still validated HERE**, one statement further down than it
-    // used to be: the click now comes back from the frame rather than being
-    // read inside it, and nothing else about the rule changed. A bad address
-    // sets the refusal and leaves the modal standing.
-    //
-    // Only one of these three can have happened -- egui reports at most one
-    // click per frame, and the file button is in the body while the other two
-    // are the footer's own answers -- so the order they are read in is not
-    // load-bearing.
-    if press.confirmed {
+            let press = controls::button_filling(ui, ButtonKind::Primary, size, "Use this address");
+            let _ = ui.interact(press.rect, use_id(), egui::Sense::hover());
+            use_url = press.clicked() && typed;
+        });
+    });
+    if use_url {
         match crate::item_icon::choice_from_url(&state.url) {
             Ok(_) => action = IconPickAction::UseUrl(state.url.trim().to_string()),
             Err(why) => state.error = Some(why.sentence()),
         }
     }
-    if press.dismissed {
+    if action == IconPickAction::None && outcome == ModalOutcome::Closed {
         action = IconPickAction::Cancel;
     }
-
-    // Esc cancels, same as every other transient overlay in this app.
-    if action == IconPickAction::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        action = IconPickAction::Cancel;
-    }
-
     action
 }
 
-/// One faint explanatory line under a control, wrapped.
-fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.add(
-        egui::Label::new(RichText::new(text).size(11.0).color(theme::TEXT_GHOST)).wrap(),
+/// A field's label: 14/700.
+fn field_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .font(egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())))
+            .color(theme::TEXT_SECONDARY),
     );
+}
+
+/// A hint under a field.
+fn hint(ui: &mut egui::Ui, text: &str) {
+    ui.add(egui::Label::new(RichText::new(text).size(13.0).color(theme::TEXT_FAINT)).wrap());
 }
 
 /// The refusal a caller shows when the vault write itself fails.
@@ -334,38 +278,6 @@ mod tests {
     impl Painted {
         fn strings(&self) -> Vec<&str> {
             self.texts.iter().map(|(t, _)| t.as_str()).collect()
-        }
-
-        /// The one band that runs the card's whole width in `fill`.
-        ///
-        /// The width is part of the question: the blue accent is also the
-        /// fill of the affirmative button under it, and only the bands run
-        /// edge to edge.
-        fn band(&self, fill: egui::Color32) -> Rect {
-            let found: Vec<Rect> = self
-                .rects
-                .iter()
-                // **`CARD_WIDTH` plus the border on each side.** The bands are
-                // painted out over the card's border rather than stopping
-                // inside it, so that none of the card's own fill shows past
-                // them -- see `theme::MODAL_BAND_BLEED`, which is the fix for
-                // "there is some white line along the curve".
-                .filter(|r| {
-                    r.fill == fill
-                        && (r.rect.width() - (CARD_WIDTH + 2.0 * theme::MODAL_BAND_BLEED))
-                            .abs()
-                            < 0.5
-                })
-                .map(|r| r.rect)
-                .collect();
-            assert_eq!(
-                found.len(),
-                1,
-                "expected one full-width band filled {fill:?}, found {}; the card painted {:?}",
-                found.len(),
-                self.rects.iter().map(|r| (r.fill, r.rect.width())).collect::<Vec<_>>()
-            );
-            found[0]
         }
 
         fn has(&self, label: &str) -> bool {
@@ -605,78 +517,6 @@ mod tests {
         }
     }
 
-    /// **The header band is the ordinary accent, and it carries no warning
-    /// mark.** This card asks a question -- it neither destroys anything nor
-    /// refuses anything -- so it wears the blue the affirmative button under
-    /// it wears, and the glyph slot the refusal card fills with a triangle
-    /// stays empty. A red band here would be the app telling the user that
-    /// choosing a picture is dangerous.
-    #[test]
-    fn the_header_band_is_the_ordinary_accent_and_carries_no_warning() {
-        let ctx = styled_context();
-        let mut state = state();
-        let painted = opened(&ctx, &mut state);
-
-        let band = painted.band(theme::BLUE);
-        assert!(
-            // The band's own height plus the point it bleeds upward over the
-            // card's border -- see `theme::MODAL_BAND_BLEED`.
-            (band.height() - (theme::MODAL_HEADER_HEIGHT + theme::MODAL_BAND_BLEED))
-                .abs()
-                < 0.5,
-            "the blue band is {} tall, so it is not the header",
-            band.height()
-        );
-        assert!(
-            painted
-                .texts
-                .iter()
-                .any(|(t, r)| t == CARD_TITLE && band.contains_rect(*r)),
-            "{CARD_TITLE:?} is not painted inside the header band at {band:?}; the card painted \
-             {:?}",
-            painted.strings()
-        );
-        assert!(
-            painted.rects.iter().all(|r| r.fill != theme::ERROR),
-            "something on this card is painted in the destructive red"
-        );
-        // **The only strokes in this band are the dismiss ✕'s two diagonals.**
-        //
-        // This used to read "the band contains no line segments at all",
-        // which said the same thing until the band grew a ✕ -- the warning
-        // glyph's bang is a vertical bar and a dot, and neither is a diagonal.
-        // Asserting the exact pair keeps both halves: a warning mark appearing
-        // here would be a third segment and would fail, and a dismiss mark
-        // disappearing would leave two too few.
-        let strokes: Vec<&[Pos2; 2]> = painted
-            .segments
-            .iter()
-            .filter(|[a, b]| band.contains(*a) && band.contains(*b))
-            .collect();
-        assert_eq!(
-            strokes.len(),
-            2,
-            "the header band carries {} strokes; the dismiss ✕'s two arms are the only ones \
-             this card has -- it asks a question and has no warning to give",
-            strokes.len()
-        );
-        for arm in &strokes {
-            let (dx, dy) = (arm[1].x - arm[0].x, arm[1].y - arm[0].y);
-            assert!(
-                dx.abs() > 0.5 && (dx.abs() - dy.abs()).abs() < 0.01,
-                "a stroke in the header band runs {dx}x{dy}, which is not an arm of a ✕ -- the \
-                 warning glyph's bang is exactly the upright bar this rules out"
-            );
-        }
-        // And the footer really is the third band, so this is the frame's
-        // card and not a plain one with a blue rectangle on it.
-        let footer = painted.band(theme::CARD_TINT);
-        assert!(
-            footer.top() > band.bottom(),
-            "the footer band at {footer:?} is not below the header at {band:?}"
-        );
-    }
-
     // -- what it reports ----------------------------------------------------
 
     /// Escape closes it, like every other overlay in this window.
@@ -686,15 +526,6 @@ mod tests {
         let mut state = state();
         let _ = opened(&ctx, &mut state);
         let (action, _) = frame(&ctx, &mut state, &escape());
-        assert_eq!(action, IconPickAction::Cancel);
-    }
-
-    #[test]
-    fn cancel_cancels() {
-        let ctx = styled_context();
-        let mut state = state();
-        let painted = opened(&ctx, &mut state);
-        let (action, _) = frame(&ctx, &mut state, &click(painted.rect_of("Cancel").center()));
         assert_eq!(action, IconPickAction::Cancel);
     }
 
@@ -858,5 +689,24 @@ mod tests {
         // Positive control: a needle that IS there, so the absences above are
         // about this file and not about the split.
         assert!(code.contains("choice_from_url"));
+    }
+    /// The v2 dialog's close mark cancels; there is no second Cancel button.
+    #[test]
+    fn the_close_mark_cancels() {
+        use crate::kit::testing;
+        let ctx = testing::ctx();
+        let mut st = state();
+        let screen = egui::vec2(1280.0, 820.0);
+        for t in [0.0, 0.1, 0.2] {
+            let _ = testing::frame(&ctx, t, screen, vec![], |ui| {
+                let _ = draw_icon_modal(ui.ctx(), &mut st);
+            });
+        }
+        let mark = ctx.read_response(crate::kit::modal::close_id(ID)).expect("the close mark").rect;
+        let mut action = IconPickAction::None;
+        let _ = testing::frame(&ctx, 0.3, screen, testing::click_at(mark.center()), |ui| {
+            action = draw_icon_modal(ui.ctx(), &mut st);
+        });
+        assert_eq!(action, IconPickAction::Cancel);
     }
 }

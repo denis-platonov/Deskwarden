@@ -196,7 +196,7 @@ fn send_through_injector(hwnd: isize, plan: Plan, done: OutcomeSink) -> Result<(
 /// Design 4d's card is 470 wide; the window is that, because the card *is* the
 /// window here.
 pub const SCRATCH_WIDTH: f32 = 470.0;
-pub const SCRATCH_HEIGHT: f32 = 400.0;
+pub const SCRATCH_HEIGHT: f32 = 440.0;
 
 /// The viewport this window is. A named `ViewportId` derived from the title
 /// rather than a fresh one per rehearsal: a second id would be a second OS
@@ -697,7 +697,7 @@ pub fn act_row(act: &Arrival) -> (String, String) {
 pub const SENT_HEADING: &str = "WHAT WAS SENT";
 
 /// The width of the label column in the acts list, from 4d's own rows.
-const ACT_LABEL_WIDTH: f32 = 96.0;
+const ACT_LABEL_WIDTH: f32 = 104.0;
 
 /// **Design 4d, drawn.** Answers `true` on the frame the user asks to close.
 ///
@@ -711,7 +711,7 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
     egui::Frame::new()
         .fill(theme::CARD)
         .stroke(Stroke::new(1.0, theme::BORDER))
-        .corner_radius(CornerRadius::same(12))
+        .corner_radius(CornerRadius::same(20))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
 
@@ -721,10 +721,10 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
                 ui.horizontal(|ui| {
                     check_mark(ui, view.finished);
                     ui.add_space(9.0);
-                    ui.label(theme::bold(view.headline.clone(), 14.0).color(theme::INK));
+                    ui.label(theme::bold(view.headline.clone(), 16.0).color(theme::INK));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
-                            RichText::new("scratch window").size(11.0).color(theme::TEXT_GHOST),
+                            RichText::new("scratch window").size(13.0).color(theme::TEXT_GHOST),
                         );
                     });
                 });
@@ -740,11 +740,11 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
                     ui.spacing_mut().item_spacing.y = 8.0;
                     ui.label(theme::letterspaced_mono(
                         rehearsal::ARRIVED_HEADING,
-                        11.0,
+                        12.0,
                         0.66,
                         theme::TEXT_GHOST,
                     ));
-                    let font = egui::FontId::new(13.0, egui::FontFamily::Monospace);
+                    let font = egui::FontId::new(14.0, egui::FontFamily::Monospace);
                     if view.finished {
                         // The invisible keys, drawn, in the design's blue.
                         ui.label(arrived_job(arrived, font));
@@ -779,18 +779,18 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
             egui::Frame::new().inner_margin(Margin::symmetric(16, 14)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(theme::letterspaced_mono(SENT_HEADING, 11.0, 0.66, theme::TEXT_FAINT));
+                ui.label(theme::letterspaced_mono(SENT_HEADING, 12.0, 0.66, theme::TEXT_FAINT));
                 for act in &view.sent {
                     let (label, value) = act_row(act);
                     ui.horizontal(|ui| {
                         ui.add_sized(
-                            [ACT_LABEL_WIDTH, 16.0],
+                            [ACT_LABEL_WIDTH, 18.0],
                             egui::Label::new(
-                                RichText::new(label).size(12.0).color(theme::TEXT_FAINT),
+                                RichText::new(label).size(14.0).color(theme::TEXT_FAINT),
                             )
                             .halign(egui::Align::LEFT),
                         );
-                        ui.label(theme::semibold(value, 12.0).color(theme::INK));
+                        ui.label(theme::semibold(value, 14.0).color(theme::INK));
                     });
                 }
                 if let Some(failure) = &view.failure {
@@ -807,7 +807,7 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close |= theme::secondary_button(ui, "Close").clicked();
+                        close |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, "Close", None).clicked();
                     });
                 });
         });
@@ -843,11 +843,11 @@ fn failure_band(ui: &mut egui::Ui, failure: &str) {
     egui::Frame::new()
         .fill(BAND_FILL)
         .stroke(Stroke::new(1.0, BAND_EDGE))
-        .corner_radius(CornerRadius::same(8))
-        .inner_margin(Margin::symmetric(11, 10))
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(failure).size(12.0).color(theme::ERROR));
+            ui.label(RichText::new(failure).size(14.0).color(theme::ERROR));
         });
 }
 

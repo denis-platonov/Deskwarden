@@ -6,7 +6,7 @@
 //! [`draw_folder_edit_modal`]'s returned [`FolderEditAction`].
 
 use crate::theme;
-use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
+use eframe::egui::{self, RichText};
 
 /// The modal's own per-open state: which folder is being edited, the name
 /// draft (seeded from the folder's current name, edited in place), and a
@@ -47,107 +47,66 @@ pub enum FolderEditAction {
     Cancel,
 }
 
-/// Draws the modal as a centered card over a dimmed scrim covering the whole
-/// window. Pure view plus the tiny bit of state (`delete_armed`) the confirm
-/// button needs -- the caller performs the actual rename/delete against
-/// `VaultBridge` and closes the modal in response to the returned action.
+/// The dialog's id; its scrim is `"folder-edit-scrim"`.
+pub const ID: &str = "folder-edit";
+
+/// The id of the name field, for tests.
+pub fn name_id() -> egui::Id {
+    egui::Id::new((ID, "name"))
+}
+
+/// Draws the folder editor as a v2 dialog and reports what was pressed. Pure
+/// view plus the one bit of state (`delete_armed`) the red button needs: the
+/// caller performs the rename or the delete against `VaultBridge` and closes
+/// the dialog in response to the returned action.
+///
+/// **The close mark, the scrim and Esc are Cancel and nothing else.** This
+/// dialog also has a Save that writes and a Delete that, once armed, destroys
+/// a folder; a dismissal that resolved to either would mean something
+/// different here than on every other dialog.
 pub fn draw_folder_edit_modal(ctx: &egui::Context, state: &mut FolderEditState) -> FolderEditAction {
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    use crate::kit::modal::{Dialog, ModalOutcome};
     let mut action = FolderEditAction::None;
-
-    // Dimmed scrim: a full-window click-catcher (so a click outside the
-    // card can't reach whatever is behind it) painted at a low alpha, on
-    // `theme::SCRIM_ORDER` -- above the sidebar, list and detail panels and
-    // BELOW this card. See that constant for the freeze the order fixes.
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("folder-edit-scrim")));
-
-    // Centred on the frame it opens and wherever the user has dragged it
-    // after that -- `theme::movable_modal` replaces the `.anchor(CENTER_CENTER,
-    // ZERO)` that used to pin this card, and the handle below is its title
-    // line. The offset resets when the modal closes, so the next open is
-    // centred again.
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("folder-edit-modal")))
-        .show(ctx, |ui| {
-            theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-            let framed = egui::Frame::new()
-                .fill(theme::CARD)
-                .corner_radius(CornerRadius::same(10))
-                .stroke(Stroke::new(1.0, theme::BORDER))
-                .inner_margin(Margin::same(20))
-                .show(ui, |ui| {
-                    ui.set_width(320.0);
-                    // The title's own rectangle goes back out to the caller,
-                    // which is the line the dismiss ✕ is hung on once this
-                    // frame has measured the card. See `theme::modal_corner_mark`.
-                    let title =
-                        ui.label(theme::bold("Edit folder", 15.0).color(theme::INK)).rect;
-                    ui.add_space(14.0);
-                    theme::field_label(ui, "Folder name");
-                    ui.add_space(6.0);
-                    theme::text_field(ui, &mut state.name, false);
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new("Use \"/\" to nest, e.g. Work/Clients")
-                            .size(11.0)
-                            .color(theme::TEXT_GHOST),
-                    );
-                    if let Some(error) = &state.error {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new(error).size(12.0).color(theme::ERROR));
-                    }
-                    ui.add_space(18.0);
-                    ui.horizontal(|ui| {
-                        let delete_label = if state.delete_armed { "Confirm delete" } else { "Delete" };
-                        let delete_clicked = ui
-                            .add(
-                                egui::Button::new(RichText::new(delete_label).size(12.0).color(theme::ERROR))
-                                    .fill(theme::CARD)
-                                    .stroke(Stroke::new(1.0, theme::ERROR))
-                                    .corner_radius(CornerRadius::same(7))
-                                    .min_size(egui::vec2(0.0, 32.0)),
-                            )
-                            .clicked();
-                        if delete_clicked {
-                            if state.delete_armed {
-                                action = FolderEditAction::Delete;
-                            } else {
-                                state.delete_armed = true;
-                            }
-                        }
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if theme::primary_button(ui, "Save", None).clicked() {
-                                action = FolderEditAction::Save;
-                            }
-                            ui.add_space(8.0);
-                            if theme::secondary_button(ui, "Cancel").clicked() {
-                                action = FolderEditAction::Cancel;
-                            }
-                        });
-                    });
-                    title
-                });
-            // The ✕ in the card's corner, drawn last so it is on top of both
-            // the card's own contents and the drag strip under them.
-            //
-            // **It is Cancel and nothing else.** This card has two other
-            // answers -- a Save that writes and a Delete that, once armed,
-            // destroys a folder -- and a dismiss control that resolved to
-            // either of those would be a gesture meaning something different
-            // here than on every other card in the app. It is exactly what
-            // Escape does at the bottom of this function, which is the rule:
-            // the mark is a second surface for a gesture that already exists,
-            // never a third outcome. A folder half-renamed in the box is
-            // thrown away either way, and that is already true of the Cancel
-            // button beside Save.
-            if theme::modal_corner_mark(ui, framed.response.rect, framed.inner) {
-                action = FolderEditAction::Cancel;
+    let (outcome, ()) = Dialog::new(ID, 480.0).title("Edit folder").show(ctx, |ui| {
+        let width = ui.available_width();
+        ui.spacing_mut().item_spacing.y = 7.0;
+        ui.label(
+            RichText::new("Folder name")
+                .font(egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())))
+                .color(theme::TEXT_SECONDARY),
+        );
+        crate::kit::input::text(ui, name_id(), &mut state.name, "", false, width);
+        ui.label(RichText::new("Use \"/\" to nest, e.g. Work/Clients").size(13.0).color(theme::TEXT_FAINT));
+        if let Some(error) = &state.error {
+            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(theme::ERROR)).wrap());
+        }
+        ui.add_space(11.0);
+        let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 10.0;
+            let delete_label = if state.delete_armed { "Confirm delete" } else { "Delete" };
+            if controls::button(ui, ButtonKind::Danger, size, delete_label, None).clicked() {
+                if state.delete_armed {
+                    action = FolderEditAction::Delete;
+                } else {
+                    state.delete_armed = true;
+                }
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if controls::button(ui, ButtonKind::Primary, size, "Save", None).clicked() {
+                    action = FolderEditAction::Save;
+                }
+                if controls::button(ui, ButtonKind::Outline, size, "Cancel", None).clicked() {
+                    action = FolderEditAction::Cancel;
+                }
+            });
         });
-
-    // Esc cancels, same as every other transient overlay in this app.
-    if action == FolderEditAction::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    });
+    if action == FolderEditAction::None && outcome == ModalOutcome::Closed {
         action = FolderEditAction::Cancel;
     }
-
     action
 }
 
@@ -373,131 +332,6 @@ mod tests {
 
     // -- the dismiss ✕ --------------------------------------------------------
 
-    /// Where the dismiss ✕'s two arms cross, found from the paint.
-    ///
-    /// By geometry rather than by a computed rectangle, so the test cannot be
-    /// satisfied by a mark this file *thinks* it placed: the two arms are the
-    /// only diagonals this card strokes at all.
-    fn dismiss_mark(painted: &Painted) -> Pos2 {
-        let arms: Vec<&[Pos2; 2]> = painted
-            .segments
-            .iter()
-            .filter(|[a, b]| {
-                (b.x - a.x).abs() > 0.5 && ((b.x - a.x).abs() - (b.y - a.y).abs()).abs() < 0.01
-            })
-            .collect();
-        assert_eq!(
-            arms.len(),
-            2,
-            "the card strokes {} diagonals; the dismiss ✕ is exactly two, and a card with no \
-             mark on it is the defect this test exists for",
-            arms.len()
-        );
-        let centre = arms[0][0].lerp(arms[0][1], 0.5);
-        assert!(
-            (arms[1][0].lerp(arms[1][1], 0.5) - centre).length() < 0.01,
-            "the two arms do not cross, so this is not a ✕"
-        );
-        centre
-    }
-
-    /// **The mark is drawn, on the title's own line, at the app's one corner
-    /// inset.**
-    ///
-    /// The inset is asserted against `theme::MODAL_CLOSE_INSET` and the card's
-    /// own geometry rather than against a number typed here, because the whole
-    /// point of the shared primitive is that this card cannot have an inset of
-    /// its own. Get this wrong and the mark drifts card by card, which is the
-    /// state the ✕ pass was opened to end.
-    #[test]
-    fn the_title_line_carries_the_dismiss_mark_at_the_shared_inset() {
-        let ctx = styled_context();
-        let mut state = state();
-        let painted = opened(&ctx, &mut state);
-
-        let title = painted.rect_of("Edit folder");
-        let at = dismiss_mark(&painted);
-
-        // The card's right-hand edge, taken from the rectangle egui really
-        // laid the modal's `Area` out in -- not re-derived here from the
-        // column width and the frame's padding, which is exactly the
-        // arithmetic `theme::modal_corner_mark` refuses to trust.
-        let card = egui::AreaState::load(&ctx, egui::Id::new("folder-edit-modal"))
-            .expect("the modal has never been drawn")
-            .rect();
-        let box_right = at.x + theme::CLOSE_MARK_HIT / 2.0;
-        assert!(
-            (card.right() - box_right - theme::MODAL_CLOSE_INSET).abs() < 0.5,
-            "the mark's hit box ends {} points inside the card's edge, not \
-             `theme::MODAL_CLOSE_INSET`'s {}",
-            card.right() - box_right,
-            theme::MODAL_CLOSE_INSET
-        );
-        assert!(
-            (at.y - title.center().y).abs() < 1.0,
-            "the mark sits at y={} and the title's line is centred on {}; a mark centred on \
-             `MODAL_PLAIN_HEADER_HEIGHT` instead floats above the words it belongs beside",
-            at.y,
-            title.center().y
-        );
-    }
-
-    /// **And pressing it cancels -- the same answer Escape gives.**
-    ///
-    /// The half a paint test cannot reach, and the half this app has shipped
-    /// broken before. It is also the guard that the header's drag strip does
-    /// not swallow the click: that strip covers `MODAL_PLAIN_HEADER_HEIGHT`,
-    /// which is this whole title line, so a mark registered before it would be
-    /// drawn, hovered, and dead. `theme::modal_drag_handle` records why.
-    ///
-    /// The answer is `Cancel` and could not be Save or Delete: the mark is a
-    /// second surface for a gesture this card already had, never a third
-    /// outcome. The control below is that Escape reaches the same one.
-    #[test]
-    fn pressing_the_dismiss_mark_cancels_exactly_as_escape_does() {
-        let ctx = styled_context();
-        let mut state = state();
-        let at = dismiss_mark(&opened(&ctx, &mut state));
-
-        let (action, _) = frame(&ctx, &mut state, &click(at));
-        assert_eq!(
-            action,
-            FolderEditAction::Cancel,
-            "the ✕ at {at:?} did not cancel the folder modal"
-        );
-
-        // The control: Escape, on a freshly opened card, reaches the same
-        // answer -- so the mark is the existing gesture and not a new one.
-        let keyed_ctx = styled_context();
-        let mut keyed = FolderEditState::new("fld-7".into(), "Work/Clients".into());
-        let _ = opened(&keyed_ctx, &mut keyed);
-        let (by_key, _) = frame(&keyed_ctx, &mut keyed, &escape());
-        assert_eq!(
-            by_key, action,
-            "the ✕ and Escape give this card different answers"
-        );
-    }
-
-    /// **The mark does not answer the armed delete.** Arming Delete and then
-    /// pressing the ✕ must leave the folder alone -- the corner mark is the
-    /// way OUT of a card, and a card whose way out could destroy a folder is
-    /// the accident the two-click arm exists to prevent.
-    #[test]
-    fn the_dismiss_mark_over_an_armed_delete_still_only_cancels() {
-        let ctx = styled_context();
-        let mut state = state();
-        let _ = opened(&ctx, &mut state);
-        state.delete_armed = true;
-        let at = dismiss_mark(&frame(&ctx, &mut state, &[]).1);
-
-        let (action, _) = frame(&ctx, &mut state, &click(at));
-        assert_eq!(
-            action,
-            FolderEditAction::Cancel,
-            "the ✕ over an armed delete answered something other than cancel"
-        );
-    }
-
     #[test]
     fn an_error_the_caller_set_is_on_screen() {
         // The whole reason `error` exists: without it a failed save left the
@@ -555,26 +389,6 @@ mod tests {
             action,
             FolderEditAction::Cancel,
             "clicking Cancel did not cancel"
-        );
-    }
-
-    #[test]
-    fn a_click_that_hits_the_scrim_answers_nothing() {
-        // The positive control for both tests above: the scrim is a
-        // full-window click-catcher, and if any click anywhere produced an
-        // answer they would pass with every button deleted. It also pins the
-        // scrim's own rule -- clicking away from this card must NOT be read
-        // as one of the answers, none of which is safe to guess.
-        let ctx = styled_context();
-        let mut state = state();
-        let card = opened(&ctx, &mut state).rect_of("Edit folder");
-
-        let away = Pos2::new(card.center().x, card.top() - 120.0);
-        let (action, _) = frame(&ctx, &mut state, &click(away));
-        assert_eq!(
-            action,
-            FolderEditAction::None,
-            "a click on the scrim answered the modal"
         );
     }
 
@@ -734,5 +548,34 @@ mod tests {
             state.name, "Archive",
             "typing into the folder-name box did not reach the draft the caller saves"
         );
+    }
+    /// The v2 dialog's close mark and its scrim both cancel, and neither can
+    /// reach Save or Delete -- armed or not.
+    #[test]
+    fn the_close_mark_and_the_scrim_only_cancel() {
+        use crate::kit::testing;
+        for armed in [false, true] {
+            for use_mark in [true, false] {
+                let ctx = testing::ctx();
+                let mut st = state();
+                st.delete_armed = armed;
+                let screen = egui::vec2(1280.0, 820.0);
+                for t in [0.0, 0.1, 0.2] {
+                    let _ = testing::frame(&ctx, t, screen, vec![], |ui| {
+                        let _ = draw_folder_edit_modal(ui.ctx(), &mut st);
+                    });
+                }
+                let at = if use_mark {
+                    ctx.read_response(crate::kit::modal::close_id(ID)).expect("the close mark").rect.center()
+                } else {
+                    egui::pos2(6.0, 410.0)
+                };
+                let mut action = FolderEditAction::None;
+                let _ = testing::frame(&ctx, 0.3, screen, testing::click_at(at), |ui| {
+                    action = draw_folder_edit_modal(ui.ctx(), &mut st);
+                });
+                assert_eq!(action, FolderEditAction::Cancel, "armed {armed}, mark {use_mark}");
+            }
+        }
     }
 }

@@ -2008,19 +2008,14 @@ fn draw_send_list(
                     });
             });
     };
+    // The list pane's empty states, set as spec 3.1's placeholders are: a
+    // centred column 48 down, a 17/700 line and a 15 px line under it.
     let headline = |ui: &mut egui::Ui, head: &str, detail: &str, colour: egui::Color32| {
-        ui.add_space(LIST_PAD);
-        ui.indent("send-empty", |ui| {
-            ui.set_width(text_width);
-            // [`ANSWER_LINE_PX`] through `theme::semibold`, not `size(14).
-            // strong()`. `RichText::strong` is an EGUI treatment -- it swaps
-            // in `visuals.strong_text_color` and leaves the face alone -- so
-            // this line was the app's body face in a slightly darker grey
-            // while every other headline in the window is Archivo SemiBold.
-            // It is the same class of drift as the row's plain-face name.
-            ui.label(theme::semibold(head, ANSWER_LINE_PX).color(colour));
-            ui.add_space(4.0);
-            ui.label(egui::RichText::new(detail).size(12.0).color(theme::TEXT_MUTED));
+        ui.add_space(48.0);
+        ui.vertical_centered(|ui| {
+            ui.spacing_mut().item_spacing.y = 8.0;
+            ui.label(theme::bold(head, 17.0).color(colour));
+            ui.add(egui::Label::new(egui::RichText::new(detail).size(15.0).color(theme::TEXT_FAINT)).wrap());
         });
     };
 

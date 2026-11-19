@@ -57,11 +57,14 @@ pub struct Dialog<'a> {
     closable: bool,
     padding: i8,
     radius: u8,
+    tip: Option<(&'a str, f32)>,
+    esc_closes: bool,
+    modeless: bool,
 }
 
 impl<'a> Dialog<'a> {
     pub fn new(id: &'a str, width: f32) -> Self {
-        Self { id, width, title: None, sub: None, top: None, closable: true, padding: PADDING, radius: RADIUS }
+        Self { id, width, title: None, sub: None, top: None, closable: true, padding: PADDING, radius: RADIUS, tip: None, esc_closes: true, modeless: false }
     }
 
     pub fn title(mut self, title: &'a str) -> Self {
@@ -73,6 +76,29 @@ impl<'a> Dialog<'a> {
     #[allow(clippy::should_implement_trait)]
     pub fn sub(mut self, sub: &'a str) -> Self {
         self.sub = Some(sub);
+        self
+    }
+
+    /// A `?` dot after the title whose bubble opens below it (the QR modal's
+    /// 20 px dot, spec B 0.4), `width` wide.
+    pub fn title_tip(mut self, text: &'a str, width: f32) -> Self {
+        self.tip = Some((text, width));
+        self
+    }
+
+    /// Whether Esc closes the dialog (default yes). A dialog whose stage
+    /// hands the keyboard to a window of its own turns it off for that stage.
+    pub fn esc_closes(mut self, yes: bool) -> Self {
+        self.esc_closes = yes;
+        self
+    }
+
+    /// A card with no scrim and no outside click: it sits over the window and
+    /// leaves it live. For a report that must not stand between the user and
+    /// the next thing they press (the export report, the revoke banner); it
+    /// closes only by its own button, and Esc is not taken.
+    pub fn modeless(mut self) -> Self {
+        self.modeless = true;
         self
     }
 
@@ -111,6 +137,9 @@ impl<'a> Dialog<'a> {
         let width = self.width_on(screen);
 
         let scrim_area = egui::Id::new(scrim_name(self.id));
+        let scrim = if self.modeless {
+            false
+        } else {
         let scrim_widget = egui::Area::new(scrim_area)
             .order(egui::Order::Middle)
             .fixed_pos(screen.min)
@@ -132,9 +161,10 @@ impl<'a> Dialog<'a> {
         let last = ctx.data(|d| d.get_temp::<u64>(seen_id));
         ctx.data_mut(|d| d.insert_temp(seen_id, pass));
         let fresh = last.is_none_or(|last| last + 1 < pass);
-        let scrim = !fresh
+        !fresh
             && (scrim_widget
-                || (clicked && at.is_some_and(|at| ctx.memory(|m| m.layer_id_at(at)) == Some(scrim_layer))));
+                || (clicked && at.is_some_and(|at| ctx.memory(|m| m.layer_id_at(at)) == Some(scrim_layer))))
+        };
 
         // `sense(click)`: the card takes the clicks that land on it, so they
         // never reach the scrim behind it.
@@ -157,11 +187,25 @@ impl<'a> Dialog<'a> {
                             // Room on the title's line for the close mark.
                             let reserve = if self.closable { 44.0 } else { 0.0 };
                             ui.allocate_ui(Vec2::new(inner_width - reserve, 0.0), |ui| {
-                                ui.label(
-                                    egui::RichText::new(title)
-                                        .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
-                                        .color(theme::INK),
-                                );
+                                let heading = egui::RichText::new(title)
+                                    .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
+                                    .color(theme::INK);
+                                if let Some((text, bubble)) = self.tip {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 8.0;
+                                        ui.label(heading);
+                                        crate::kit::tips::help_dot_sized(
+                                            ui,
+                                            egui::Id::new((self.id, "title-tip")),
+                                            text,
+                                            bubble,
+                                            crate::kit::tips::Placement::Below,
+                                            20.0,
+                                        );
+                                    });
+                                } else {
+                                    ui.label(heading);
+                                }
                                 if let Some(sub) = self.sub {
                                     ui.label(egui::RichText::new(sub).size(16.0).color(SUB_INK));
                                 }
@@ -194,9 +238,110 @@ impl<'a> Dialog<'a> {
             })
             .inner;
 
-        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let esc = self.esc_closes && !self.modeless && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
         let outcome = if scrim || closed_by_mark || esc { ModalOutcome::Closed } else { ModalOutcome::Open };
         (outcome, inner)
+    }
+}
+
+/// What a note under a dialog's body is telling the reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    /// Something went wrong or cannot be done: the danger wash.
+    Danger,
+    /// Something to be careful about: the amber wash.
+    Caution,
+}
+
+/// The warning triangle the design draws in an amber row (spec B 7: 20 px).
+pub const WARNING_GLYPH: &str = "M12 3 2 20h20zM12 10v5M12 17.5h.01";
+
+/// A note in a dialog: a tinted box, radius 16 and a 1 px edge, the sentence
+/// at 14 px in the tone's ink, and the triangle in front of a caution. Wraps
+/// to the dialog's width.
+pub fn note(ui: &mut egui::Ui, tone: Tone, text: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
+    let (fill, edge, ink) = match tone {
+        Tone::Danger => (p.danger_wash, p.danger_edge, p.error),
+        Tone::Caution => (p.caution_wash, p.caution_edge, p.caution_ink),
+    };
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(egui::Stroke::new(1.0, edge))
+        .corner_radius(CornerRadius::same(16))
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 14.0;
+                if tone == Tone::Caution {
+                    let (slot, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                    crate::kit::icon::stroke(ui.painter(), slot, WARNING_GLYPH, 2.0, p.caution_mark);
+                }
+                ui.add(egui::Label::new(egui::RichText::new(text).size(14.0).color(ink)).wrap());
+            });
+        });
+}
+
+/// Which of a confirmation's two buttons was pressed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Left,
+    Right,
+}
+
+/// What a confirmation did this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Confirmed {
+    Open,
+    /// One of its two buttons.
+    Pressed(Side),
+    /// The scrim, the close mark or Esc.
+    Dismissed,
+}
+
+/// The id of a confirmation's button, for tests and the window.
+pub fn confirm_button_id(id: &str, side: Side) -> egui::Id {
+    egui::Id::new((id, "confirm", side == Side::Left))
+}
+
+/// The v2 small confirmation: a dialog with a title, an optional line under
+/// it, and two equal buttons (48 high, radius 14). The caller says which kind
+/// each is; the destructive one is the red outline, the safe one the blue or
+/// the grey.
+pub fn confirm(
+    ctx: &egui::Context,
+    id: &str,
+    width: f32,
+    title: &str,
+    body: Option<&str>,
+    left: (&str, crate::kit::controls::ButtonKind),
+    right: (&str, crate::kit::controls::ButtonKind),
+) -> Confirmed {
+    use crate::kit::controls::{self, ButtonSize};
+    let mut dialog = Dialog::new(id, width).title(title);
+    if let Some(body) = body {
+        dialog = dialog.sub(body);
+    }
+    let (outcome, pressed) = dialog.show(ctx, |ui| {
+        let mut pressed = None;
+        let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.columns(2, |columns| {
+            for (column, side, (label, kind)) in [(0, Side::Left, left), (1, Side::Right, right)] {
+                let response = controls::button_filling(&mut columns[column], kind, size, label);
+                let _ = columns[column].interact(response.rect, confirm_button_id(id, side), Sense::hover());
+                if response.clicked() {
+                    pressed = Some(side);
+                }
+            }
+        });
+        pressed
+    });
+    match (pressed, outcome) {
+        (Some(side), _) => Confirmed::Pressed(side),
+        (None, ModalOutcome::Closed) => Confirmed::Dismissed,
+        (None, ModalOutcome::Open) => Confirmed::Open,
     }
 }
 

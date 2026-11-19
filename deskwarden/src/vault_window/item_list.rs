@@ -7717,22 +7717,52 @@ mod keyboard_selection_tests {
                 }
             }
         }
-        // `kit::modal::Dialog`s name their scrim "<ID>-scrim" from the
-        // module's ID const, which the module passes to the Dialog it opens.
-        let dialog = concat!("Dialog::new", "(ID,");
-        let decl = concat!("pub const ID: &str = ", "\"");
+        // `kit::modal::Dialog`s and `kit::modal::confirm`s name their scrim
+        // "<id>-scrim" from the id they are opened with: a literal, or a
+        // `const` in the same file. Read off the call sites, so a dialog opened
+        // with a new id is found without this test changing.
+        let dialog = concat!("Dialog::new", "(");
+        let confirm = concat!("confirm", "(");
         for (file, source) in crate_sources() {
-            if !source.contains(dialog) {
+            if file.replace('\\', "/").ends_with("kit/modal.rs") {
                 continue;
             }
-            let at = source.find(decl).unwrap_or_else(|| panic!("`{file}` opens a Dialog with no `pub const ID`"));
-            let rest = &source[at + decl.len()..];
-            let scrim = format!("{}-scrim", &rest[..rest.find('"').expect("a closed literal")]);
-            assert!(
-                MODAL_SCRIM_AREAS.contains(&scrim.as_str()),
-                "`{file}` draws a dialog whose scrim `{scrim}` `MODAL_SCRIM_AREAS` does not name"
-            );
-            found.push(scrim);
+            let source = source.replace("\r\n", "\n");
+            let mut ids: Vec<String> = Vec::new();
+            for (at, _) in source.match_indices(dialog) {
+                let rest = &source[at + dialog.len()..];
+                // A modeless card draws no scrim, so it names none.
+                let chain = &rest[..rest.find(';').unwrap_or(rest.len()).min(400)];
+                if chain.contains(concat!(".modeless", "()")) {
+                    continue;
+                }
+                ids.push(rest[..rest.find(',').unwrap_or(0)].trim().to_string());
+            }
+            for (at, _) in source.match_indices(confirm) {
+                if source[..at].ends_with(|c: char| c.is_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let rest = source[at + confirm.len()..].trim_start();
+                let Some(rest) = rest.strip_prefix("ctx,") else { continue };
+                let rest = rest.trim_start();
+                ids.push(rest[..rest.find(',').unwrap_or(0)].trim().to_string());
+            }
+            for id in ids {
+                let value = if let Some(literal) = id.strip_prefix('"') {
+                    literal.trim_end_matches('"').to_string()
+                } else {
+                    let decl = format!("const {id}: &str = \"");
+                    let Some(at) = source.find(&decl) else { continue };
+                    let rest = &source[at + decl.len()..];
+                    rest[..rest.find('"').expect("a closed literal")].to_string()
+                };
+                let scrim = format!("{value}-scrim");
+                assert!(
+                    MODAL_SCRIM_AREAS.contains(&scrim.as_str()),
+                    "`{file}` draws a dialog whose scrim `{scrim}` `MODAL_SCRIM_AREAS` does not name"
+                );
+                found.push(scrim);
+            }
         }
         found.sort();
         found.dedup();
