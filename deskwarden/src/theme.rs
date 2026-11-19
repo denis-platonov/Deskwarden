@@ -6917,6 +6917,7 @@ pub fn inline_field(
             height: BUTTON_HEIGHT,
             right_pad: 10.0,
             font: FontId::new(14.0, FontFamily::Proportional),
+            v2: false,
         },
     )
     .0
@@ -7409,6 +7410,9 @@ struct FieldShape<'a> {
     height: f32,
     /// How much room to leave at the right for an in-field affordance.
     right_pad: f32,
+    /// The v2 editor's field (spec B 0.6): radius 14, a 1pt border that is
+    /// blue with the keyboard and no halo, 16pt in from the left.
+    v2: bool,
     /// The type size the box sets what is typed in it.
     ///
     /// A field rather than the 14 every box used to hardcode, because
@@ -7429,6 +7433,7 @@ impl<'a> FieldShape<'a> {
             height: FIELD_HEIGHT,
             right_pad: FIELD_PAD_RIGHT,
             font: FontId::new(14.0, FontFamily::Proportional),
+            v2: false,
         }
     }
 
@@ -7439,6 +7444,7 @@ impl<'a> FieldShape<'a> {
         Self {
             height: SECTION_FIELD_HEIGHT,
             font: FontId::new(SECTION_FIELD_PX, FontFamily::Proportional),
+            v2: true,
             ..Self::wide(ui)
         }
     }
@@ -7519,9 +7525,10 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     // put it high and centring THIS value's ink would move the box with the
     // letters in it.
     let top = outer.center().y - line_ink_middle(ui.ctx(), &font, line);
+    let inset = if shape.v2 { 16.0 } else { 10.0 };
     let inner = Rect::from_min_size(
-        Pos2::new(outer.min.x + 10.0, top),
-        Vec2::new(outer.width() - 10.0 - right_pad, line),
+        Pos2::new(outer.min.x + inset, top),
+        Vec2::new(outer.width() - inset - right_pad, line),
     );
     // The face is carried in through a layouter rather than `.font()`, which
     // takes a `FontId` and can express no line height -- the same reason
@@ -7619,17 +7626,15 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
         ui.ctx().set_cursor_icon(egui::CursorIcon::Text);
     }
 
-    let border = field_border(ui, outer, response.has_focus());
-    ui.painter().set(
-        bg,
-        egui::epaint::RectShape::new(
-            outer,
-            CornerRadius::same(FIELD_RADIUS),
-            CARD,
-            border,
-            StrokeKind::Middle,
-        ),
-    );
+    let shape_v2 = shape.v2;
+    let (radius, border, kind) = if shape_v2 {
+        let p = crate::kit::tokens::palette(ui.ctx());
+        let edge = if response.has_focus() { p.blue } else { p.border };
+        (CornerRadius::same(14), Stroke::new(1.0, edge), StrokeKind::Inside)
+    } else {
+        (CornerRadius::same(FIELD_RADIUS), field_border(ui, outer, response.has_focus()), StrokeKind::Middle)
+    };
+    ui.painter().set(bg, egui::epaint::RectShape::new(outer, radius, CARD, border, kind));
     (response, outer)
 }
 
@@ -8658,7 +8663,7 @@ pub const SECTION_HEADER_GAP: f32 = 10.0;
 /// Only the section-row variants below draw at this height. [`text_field`],
 /// [`password_field`] and [`disabled_text_field`] are the login window's and
 /// the overlay's, and their designs say 38.
-pub const SECTION_FIELD_HEIGHT: f32 = 28.0;
+pub const SECTION_FIELD_HEIGHT: f32 = 50.0;
 
 /// The type size inside a row field.
 ///
@@ -8670,7 +8675,7 @@ pub const SECTION_FIELD_HEIGHT: f32 = 28.0;
 ///
 /// So the BOX is what says a field is editable, and nothing else does: same
 /// type, same size, a border around it.
-pub const SECTION_FIELD_PX: f32 = 14.0;
+pub const SECTION_FIELD_PX: f32 = 16.0;
 
 /// §8a's `gap: 14px` between the cells of a card's COLUMN grid -- the
 /// `ITEM` card's `grid-template-columns: 1fr 1fr 1fr`.

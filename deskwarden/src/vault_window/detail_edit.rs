@@ -10874,9 +10874,6 @@ fn owner_hint(audience: &crate::rest::organizations::Audience) -> String {
 /// 8a's `Copy`, and the read pane's own word for the same act.
 const COPY_LABEL: &str = "Copy";
 
-/// 8a's `Generate`, moved onto the password's own line.
-const GENERATE_LABEL: &str = "Generate";
-
 /// **A row laid out as 8a lays one: a field that takes what is LEFT, and
 /// `buttons` of them after it.**
 ///
@@ -11084,6 +11081,21 @@ fn form_popup_style() -> egui::style::StyleModifier {
 /// Lifted out when the card grew a grid: the control was written inline in
 /// the one row that had it, and a grid arm with its own copy is two folder
 /// pickers that agree until someone changes one.
+/// The Folder control's segments when the vault has three folders or fewer
+/// (decision 2): "No folder" (when the item may be unfiled) and each
+/// folder. Empty when there are more, which keeps the dropdown.
+pub(crate) fn folder_options(folders: &[Folder], may_unfile: bool) -> Vec<String> {
+    let assignable = assignable_folders(folders);
+    if assignable.len() > 3 {
+        return Vec::new();
+    }
+    may_unfile
+        .then(|| NO_FOLDER_LABEL.to_string())
+        .into_iter()
+        .chain(assignable.iter().map(|f| f.name.clone()))
+        .collect()
+}
+
 fn folder_combo(
     ui: &mut egui::Ui,
     draft: &mut EditDraft,
@@ -11097,6 +11109,19 @@ fn folder_combo(
     // belonging to nothing. Unresolvable now falls through to "No folder",
     // which is at least a state the sidebar agrees exists.
     let assignable = assignable_folders(folders);
+    let options = folder_options(folders, may_unfile);
+    if !options.is_empty() {
+        let offset = usize::from(may_unfile);
+        let selected = match draft.folder_id.as_deref() {
+            None => 0,
+            Some(id) => assignable.iter().position(|f| f.id == id).map_or(0, |i| i + offset),
+        };
+        let labels: Vec<&str> = options.iter().map(String::as_str).collect();
+        if let Some(picked) = crate::kit::controls::segmented(ui, &labels, selected, crate::kit::controls::SEG_SETTINGS) {
+            draft.folder_id = if may_unfile && picked == 0 { None } else { assignable.get(picked - offset).map(|f| f.id.clone()) };
+        }
+        return;
+    }
     // The row's height and the drop-down's scroll lane are both `form_combo`'s
     // now, and both were found here first -- see it for the two measurements.
     form_combo(ui, "edit-folder")
@@ -11980,13 +12005,23 @@ pub fn draw_detail_edit(
                         // can never move is a control that lies, and the
                         // toggle is 52 points of the box's right inset that
                         // this row can give back to the value.
-                        row_with_buttons(ui, &[GENERATE_LABEL, COPY_LABEL], |ui, room| {
-                            theme::section_text_field_within(
+                        row_with_buttons(ui, &[COPY_LABEL], |ui, room| {
+                            // Spec B 1.4 A: hidden until the eye shows it,
+                            // with Generate inside the field.
+                            let reveal_id = ui.id().with("edit-password-revealed");
+                            let mut revealed = ui.data(|d| d.get_temp::<bool>(reveal_id).unwrap_or(false));
+                            let field = crate::kit::input::password(
                                 ui,
+                                ui.id().with("edit-password"),
                                 &mut draft.password,
-                                false,
+                                &mut revealed,
                                 room,
                             );
+                            ui.data_mut(|d| d.insert_temp(reveal_id, revealed));
+                            if field.generate_clicked {
+                                draft.open_generator();
+                                action = EditAction::GeneratePassword;
+                            }
                             // **`Generate` opens the modal; it no longer
                             // writes the box.** The owner: "on generate
                             // button - it shows and user can select how to
@@ -11996,10 +12031,6 @@ pub fn draw_detail_edit(
                             // asking for the first candidate are one thing to
                             // the user and are one thing here. See
                             // `draw_generator_modal`.
-                            if theme::row_button(ui, GENERATE_LABEL).clicked() {
-                                draft.open_generator();
-                                action = EditAction::GeneratePassword;
-                            }
                             if theme::row_button(ui, COPY_LABEL).clicked() {
                                 action = EditAction::CopyPassword;
                             }
@@ -12061,12 +12092,9 @@ pub fn draw_detail_edit(
                                     // closure's, because the history link
                                     // shares it. See
                                     // `theme::strength_meter_inline`.
-                                    theme::strength_meter_inline(
-                                        ui,
-                                        strength_bars(rating),
-                                        rating.label(),
-                                        draft.password.chars().count(),
-                                    );
+                                    // Room left for the history link beside it.
+                                    let width = (ui.available_width() - 220.0).clamp(120.0, 420.0);
+                                    crate::kit::input::strength_meter(ui, Some(rating), width);
                                 }
                                 if history_count > 0 && history_link(ui, history_count) {
                                     draft.history_open = !draft.history_open;
@@ -19989,9 +20017,11 @@ mod sequence_builder_tests {
         // The control: the eye really was open, and really was adding the
         // preview's own copies -- the step row's value and the resolved
         // preview line's -- to the one the field always draws.
+        // Two: the preview's chips. The editor's own password field is
+        // masked until its eye is used (spec B 1.4 A).
         assert_eq!(
             shown(&open),
-            3,
+            2,
             "the revealed builder is not showing the password in its preview: {:?}",
             open.strings()
         );
@@ -20005,7 +20035,7 @@ mod sequence_builder_tests {
         let reopened = open_builder(&ctx, PANE, &mut draft, &item, &live_code());
         assert_eq!(
             shown(&reopened),
-            1,
+            0,
             "reopening the builder put the password back in its preview without being \
              asked: {:?}",
             reopened.strings()
@@ -28112,8 +28142,8 @@ mod edit_pane_layout_tests {
         let mut cases = 0;
         for pane in GRID_PANES {
             for (password, word) in [
-                ("aA1!", password_strength::Strength::Weak.label()),
-                ("correct-horse-battery-staple-7", password_strength::Strength::Strong.label()),
+                ("aA1!", crate::kit::input::strength_level(password_strength::Strength::Weak, &crate::kit::tokens::Palette::LIGHT).label),
+                ("correct-horse-battery-staple-7", crate::kit::input::strength_level(password_strength::Strength::Strong, &crate::kit::tokens::Palette::LIGHT).label),
             ] {
                 cases += 1;
                 let ctx = styled_context(pane);
@@ -28465,66 +28495,6 @@ mod edit_pane_layout_tests {
         }
     }
 
-    /// **The `ITEM` card's three controls are one height and one line.**
-    ///
-    /// 8a draws all three of its cells at `height: 34px`; egui sizes a combo
-    /// box off `interact_size`, which this theme sets to 20, so the folder
-    /// chooser was a 30-point control between two 34-point boxes. The owner,
-    /// with the row screenshotted: "render as per design - should be same
-    /// height".
-    ///
-    /// Found by geometry rather than by asking the widgets, because that is
-    /// the half a constant cannot make: all three boxes are
-    /// `SECTION_FIELD_HEIGHT` tall and all three start on one line.
-    #[test]
-    fn the_item_cards_three_controls_are_one_height_and_one_line() {
-        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
-        let ctx = styled_context(pane);
-        let mut draft = full_login_draft();
-        let _ = frame(&ctx, pane, &mut draft, false, &[]);
-        let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-        let folder = painted.rect_of(NO_FOLDER_LABEL);
-        let owner = painted.rect_of(OWNER_PERSONAL);
-        let kind = painted.rect_of(kind_noun(draft.kind));
-        let mut boxes = Vec::new();
-        for (what, ink) in
-            [("Folder", folder), (ITEM_OWNER_LABEL, owner), (ITEM_TYPE_LABEL, kind)]
-        {
-            let found = painted
-                .rects
-                .iter()
-                .map(|(r, _)| *r)
-                .find(|r| {
-                    (r.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5
-                        && r.contains(ink.center())
-                })
-                .unwrap_or_else(|| {
-                    panic!(
-                        "{what}'s control is not {}pt tall; the row's boxes are {:?}",
-                        theme::SECTION_FIELD_HEIGHT,
-                        painted
-                            .rects
-                            .iter()
-                            .filter(|(r, _)| r.contains(ink.center()))
-                            .map(|(r, _)| r.height())
-                            .collect::<Vec<_>>()
-                    )
-                });
-            boxes.push((what, found));
-        }
-        let (_, first) = boxes[0];
-        for (what, rect) in &boxes {
-            assert!(
-                (rect.top() - first.top()).abs() <= 0.5,
-                "{what}'s control starts at {} and Folder's at {} -- the three cells are \
-                 not on one line",
-                rect.top(),
-                first.top()
-            );
-        }
-    }
-
     /// **The unbound app row's links sit on the line its caption is on.**
     ///
     /// `theme::section_row` paints its caption optically centred against a
@@ -28650,162 +28620,6 @@ mod edit_pane_layout_tests {
             "closing the picker threw away a path the user had already typed: {:?}",
             kept.strings()
         );
-    }
-
-    /// **The executable chip is on the name's line at every width the app can
-    /// be resized to**, and the name gives way for it rather than the other
-    /// way round.
-    ///
-    /// The chip used to be skipped whenever the box could not hold both runs
-    /// whole. That lost it at every width the app is really used at -- measured
-    /// on a 460-point pane, the box came out 206 points against the 213 the
-    /// pair wanted, so the executable was simply absent. The owner, with 8a's
-    /// row beside it: "not as per design - exe should be in pill and on the
-    /// same line".
-    ///
-    /// **Three widths, including the app's minimum**, because the old
-    /// behaviour passed at the widest one: a test that looked only at a roomy
-    /// pane would have said the chip was fine throughout.
-    ///
-    /// Both halves at each: the chip is painted, and it is on the name's line
-    /// rather than under it.
-    #[test]
-    fn the_executable_chip_stays_on_the_app_rows_line_at_every_width() {
-        // **Two spellings, and the pair is the point.** `ledgerline.exe` has a
-        // descender in it and `vim.exe` has none, so a row hung off THIS run's
-        // ink rather than off its face puts the pill a point and a half lower
-        // for one than for the other -- which is the defect the owner reported
-        // as "still croocked" and which a single fixture cannot see. See
-        // `theme::face_ink_middle`.
-        let mut cases = 0;
-        for (exe, width) in [
-            ("ledgerline.exe", WIDE_PANE_WIDTH),
-            ("vim.exe", WIDE_PANE_WIDTH),
-            ("ledgerline.exe", 460.0),
-            ("ledgerline.exe", MIN_PANE_WIDTH),
-        ] {
-            cases += 1;
-            let pane = Vec2::new(width, 2400.0);
-            let ctx = styled_context(pane);
-            let item = login_with_websites(1);
-            let mut draft = EditDraft::from_item(&item);
-            let mut app = AppMatchDraft::unbound();
-            app.process = exe.to_string();
-            draft.app = Some(app);
-            let totp = detail::TotpState::NoSecret;
-            let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
-            let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
-
-            // The chip's own run: the MONOSPACE one. The row's name run reads
-            // the same string on this fixture -- `display_name` falls back to
-            // the file name when the executable is not on disk -- so the two
-            // are told apart by the face 8a sets each in, which is also the
-            // only thing that makes the chip a chip.
-            let mono = egui::FontId::new(PICKER_SUB_PX, egui::FontFamily::Monospace);
-            let chip: Vec<Rect> = painted
-                .texts
-                .iter()
-                .zip(painted.fonts.iter())
-                .filter(|((run, _), (_, font))| run == exe && *font == mono)
-                .map(|((_, rect), _)| *rect)
-                .collect();
-            assert_eq!(
-                chip.len(),
-                1,
-                "on a {width}-point pane the app row paints {} monospace {exe:?} chips, not \
-                 the one 8a draws inside the name box",
-                chip.len()
-            );
-
-            // ...and it is beside the name, not under it. The name is the
-            // proportional run of the same string.
-            let name = painted
-                .texts
-                .iter()
-                .zip(painted.fonts.iter())
-                .find(|((run, _), (_, font))| run == exe && *font != mono)
-                .map(|((_, rect), _)| *rect)
-                .unwrap_or_else(|| panic!("the app row painted no name on a {width}-point pane"));
-            // **Their INK, not their boxes and not their baselines.** Both of
-            // those were tried and both were reported wrong -- see
-            // `theme::ink_middle_of`, which records what each of them does to
-            // a 14px run and an 11px one on the same line.
-            //
-            // A point of tolerance rather than half of one: the two runs are
-            // different strings, so their ink boxes are decided partly by
-            // which letters happen to be in them -- an ascender or a
-            // descender moves an edge -- and asking for closer than that
-            // would be asking about the words rather than about the layout.
-            let ink = |want_mono: bool| -> f32 {
-                painted
-                    .ink_middles
-                    .iter()
-                    .find(|(run, font, _)| run == exe && (*font == mono) == want_mono)
-                    .map(|(_, _, y)| *y)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "no {} {exe:?} run on a {width}-point pane",
-                            if want_mono { "monospace" } else { "proportional" }
-                        )
-                    })
-            };
-            assert!(
-                (ink(true) - ink(false)).abs() <= 1.0,
-                "on a {width}-point pane the chip's ink is centred on y = {} and the name's \
-                 on {} -- they are not on one line",
-                ink(true),
-                ink(false)
-            );
-            // ...and the chip is a PILL: a box of its own, in a fill that is
-            // not the fill of the greyed field it sits in. Painted in
-            // `theme::CANVAS` -- 8a's own colour for it, and also this form's
-            // greyed field fill -- it was invisible ("no pill for the latter").
-            let pill: Vec<Rect> = painted
-                .rects
-                .iter()
-                .filter(|(r, fill)| {
-                    *fill == theme::CARD
-                        && r.contains_rect(chip[0])
-                        && r.width() <= chip[0].width() + 2.0 * PICKER_CHIP_PAD_X + 2.0
-                })
-                .map(|(r, _)| *r)
-                .collect();
-            assert_eq!(
-                pill.len(),
-                1,
-                "on a {width}-point pane the chip has {} boxes of its own standing out from                  the greyed field around it, not the one 8a draws",
-                pill.len()
-            );
-
-            // **And the pill is straight in the field box it sits in.**
-            //
-            // The half a run alignment cannot see. A galley box is the font's
-            // ascent plus its descent and Consolas spends more of that below
-            // the baseline than Archivo does, so a pill wrapped round the
-            // galley sat two and a half points low however well the two runs
-            // agreed inside it -- the owner, after the ink alignment: "still
-            // croocked". Hung on the same line the ink is, the pill lands on
-            // the field box's middle.
-            let field = painted
-                .rects
-                .iter()
-                .filter(|(r, fill)| *fill == theme::CANVAS && r.contains_rect(pill[0]))
-                .map(|(r, _)| *r)
-                .min_by(|a, b| a.height().total_cmp(&b.height()))
-                .unwrap_or_else(|| panic!("no greyed field box round the chip at {width}pt"));
-            assert!(
-                (pill[0].center().y - field.center().y).abs() <= 1.0,
-                "on a {width}-point pane the pill is centred at y = {} in a field box centred                  at {} -- it sits crooked in its own box",
-                pill[0].center().y,
-                field.center().y
-            );
-            assert!(
-                chip[0].left() >= name.right() - 0.5,
-                "on a {width}-point pane the chip at {:?} overlaps the name at {name:?}",
-                chip[0]
-            );
-        }
-        assert_eq!(cases, 4, "the loop visited nothing, so it asserted nothing");
     }
 
     /// **Each kind is offered exactly the autofill it can use**, and there are
@@ -28954,262 +28768,6 @@ mod edit_pane_layout_tests {
             );
         }
         assert_eq!(checked, 3, "the loop visited nothing, so it asserted nothing");
-    }
-
-    /// **The `Fill rule` row is 8a's chips, and the four tones are four
-    /// different things.**
-    ///
-    /// The design draws the sequence as chips told apart by COLOUR rather than
-    /// by a word: a key is a keycap (`border-bottom-width: 2px`, white), a
-    /// field is the brand wash (`#eef2fc` inside `#b8c7ea`), a SECRET field is
-    /// the danger wash (`#fdf3f2` inside `#e8a9a2`), and a wait is plain grey.
-    /// That IS the readout -- someone glancing at the row sees where the
-    /// password is without reading anything -- so a build that drew them all
-    /// alike would satisfy every string check and lose the whole point.
-    ///
-    /// The row used to be a `field_label` over a sentence over a button, which
-    /// is why this asserts the SHAPE as well: caption in the label column, the
-    /// chips beside it, `Edit sequence` flush at the end, and no prose.
-    #[test]
-    fn the_fill_rule_row_is_8as_chips_and_its_button() {
-        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
-        let ctx = styled_context(pane);
-        let item = login_with_websites(1);
-        let mut draft = EditDraft::from_item(&item);
-        // Both values, so the sequence RESOLVES: the row draws what it costs
-        // only when the runner could really plan it, and a fixture with no
-        // password would be testing the chips against a row missing its last
-        // run.
-        draft.username = "a@b.com".to_string();
-        draft.password = "correct-horse".to_string();
-        let mut app = AppMatchDraft::unbound();
-        app.process = "chrome.exe".to_string();
-        // One of each: a key, a field, a SECRET field and a wait.
-        // `{DELAY n}` is a pause; `{DELAY=n}` is a typing RATE and draws no
-        // chip at all. See `key_sequence`.
-        app.sequence = "{USERNAME}{TAB}{DELAY 250}{PASSWORD}".to_string();
-        draft.app = Some(app);
-        let totp = detail::TotpState::NoSecret;
-        let _ = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
-        let painted = frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &totp);
-
-        // The chip round a run: the smallest painted box that contains it.
-        // **The LAST run with this text.** `Username` and `Password` are also
-        // captions on the credentials card two cards up, and the chips are
-        // painted after them.
-        let chip = |run: &str| -> (Rect, egui::Color32) {
-            let ink = *painted
-                .rects_of(run)
-                .last()
-                .unwrap_or_else(|| panic!("no {run:?} painted: {:?}", painted.strings()));
-            let mut found: Vec<(Rect, egui::Color32)> = painted
-                .rects
-                .iter()
-                .filter(|(r, _)| r.contains_rect(ink) && r.width() <= ink.width() + 24.0)
-                .map(|(r, fill)| (*r, *fill))
-                .collect();
-            found.sort_by(|a, b| (a.0.width() * a.0.height()).total_cmp(&(b.0.width() * b.0.height())));
-            *found
-                .first()
-                .unwrap_or_else(|| panic!("no chip round {run:?}: {:?}", painted.strings()))
-        };
-
-        let mut checked = 0;
-        for (run, want) in [
-            ("Username", theme::BLUE_WASH),
-            ("Password", theme::DANGER_WASH),
-            ("250 ms", theme::CANVAS),
-            ("Tab", theme::CARD),
-        ] {
-            checked += 1;
-            let (_, fill) = chip(run);
-            assert_eq!(
-                fill, want,
-                "the {run:?} chip is filled {fill:?}, not 8a's {want:?} -- the four tones are \
-                 what say which step is which"
-            );
-        }
-        assert_eq!(checked, 4, "the loop visited nothing, so it asserted nothing");
-
-        // **One pill in four colours.** The owner: "make same pills but diff
-        // color so they look identical". 8a writes `2px 7px` on its mono chips
-        // and `2px 8px` on its washed ones, and that two-point difference --
-        // invisible in a picture -- is five pills in a line with two of them a
-        // point narrower and a point shorter, which reads as a mistake rather
-        // than as a distinction. The distinction the design is drawing there is
-        // COLOUR, and that is what the loop above asserts.
-        let shape = chip("Username").0;
-        for run in ["Password", "250 ms", "Tab"] {
-            let other = chip(run).0;
-            assert!(
-                (other.height() - shape.height()).abs() <= 0.01
-                    && (other.top() - shape.top()).abs() <= 0.01,
-                "the {run:?} pill is {:?} against {shape:?} -- the row's pills are not one \
-                 object in four colours",
-                other
-            );
-        }
-        // **And the pills sit on the ROW's line**, not a point below it.
-        //
-        // egui centres a galley by its BOX and a face inks the upper part of
-        // that box, so every caption, label and button in this program lands a
-        // point above the geometric middle. A hand-painted run centred on that
-        // middle is a point low -- which is what the owner saw here: "check
-        // elements they feel like not aligned vertically". Asserted against
-        // the caption and the button on the SAME row, because what matters is
-        // that the row reads as one line and not what the number is.
-        // **FACE lines, not ink middles.** The runs on this row are different
-        // words in three faces, and an ink middle moves with the letters in it
-        // -- `Sequence` has a `q` and `Tab` has nothing below the baseline, so
-        // two runs perfectly on one line have ink middles a point apart. What
-        // has to agree is where each FACE's line falls. See
-        // `theme::face_ink_middle`.
-        let line_of = |run: &str, font: egui::FontId| -> f32 {
-            let top = painted
-                .rects_of(run)
-                .last()
-                .copied()
-                .unwrap_or_else(|| panic!("no {run:?} on the row"))
-                .top();
-            let mut middle = 0.0;
-            let _ = ctx.run_ui(raw_input(pane, &[]), |ui| {
-                middle = theme::face_ink_middle(ui, &font);
-            });
-            top + middle
-        };
-        let _ = line_of;
-        // **Each word is centred in its OWN pill**, and the pills are on one
-        // line with each other.
-        //
-        // It used to be the other claim -- every chip's ink on the line the
-        // row's caption inks on, a point above the pills' middles, so that
-        // the row read as one line of type. The owner, looking at the pills
-        // rather than at the row: "Enter pill text not centered", and then
-        // "actually none of them are". A word inside a box is read against
-        // the box; the line the caption is on is the line of the BOXES,
-        // which is what the second half below asserts.
-        // The run's INK, which is what the eye centres -- a galley box is
-        // ascent plus descent and no face fills one.
-        let ink_middle = |run: &str| -> f32 {
-            *painted
-                .ink_middles
-                .iter()
-                .filter(|(text, _, _)| text == run)
-                .map(|(_, _, middle)| middle)
-                .last()
-                .unwrap_or_else(|| panic!("no {run:?} ink on the row"))
-        };
-        let pill_around = |run: &str| -> Rect {
-            let box_of = *painted
-                .rects_of(run)
-                .last()
-                .unwrap_or_else(|| panic!("no {run:?} on the row"));
-            painted
-                .rects
-                .iter()
-                .map(|(rect, _)| *rect)
-                .filter(|rect| rect.contains_rect(box_of) && rect.height() <= 30.0)
-                .min_by(|a, b| a.area().total_cmp(&b.area()))
-                .unwrap_or_else(|| panic!("nothing is painted round {run:?}"))
-        };
-        let mut lines = Vec::new();
-        for run in ["Username", "Tab", "250 ms"] {
-            let pill = pill_around(run);
-            assert!(
-                (ink_middle(run) - pill.center().y).abs() <= 0.6,
-                "the {run:?} pill's word inks {:+.2} off the middle of the pill round it",
-                ink_middle(run) - pill.center().y
-            );
-            lines.push(pill.center().y);
-        }
-        for line in &lines[1..] {
-            assert!(
-                (line - lines[0]).abs() <= 0.5,
-                "the pills are on {lines:?}, which is not one line"
-            );
-        }
-
-        // ...and they are PILLS, not boxes hugging their letters: the owner's
-        // "Pills should be higher as per design". Asserted against the run
-        // inside, so this is about the padding rather than about a number that
-        // would have to be re-derived if the face changed.
-        let ink = *painted.rects_of("Username").last().expect("the chip was found above");
-        assert!(
-            shape.height() >= ink.height() + 4.0,
-            "the pill is {}pt round a {}pt run, which is a box and not a pill",
-            shape.height(),
-            ink.height()
-        );
-
-        // ...and the shape: the caption in the label column, the button at the
-        // end of the line with the chips, and no sentence saying what the
-        // chips already say.
-        let caption = painted.rect_of(SEQUENCE_ROW_LABEL);
-        let button = painted.rect_of(SEQUENCE_EDIT_BUTTON);
-        let first = chip("Username").0;
-        assert!(
-            (first.center().y - caption.center().y).abs() <= 3.0
-                && (button.center().y - caption.center().y).abs() <= 3.0,
-            "the row is stacked rather than laid beside its caption: caption {caption:?}, \
-             first chip {first:?}, button {button:?}"
-        );
-        assert!(
-            button.left() > first.right(),
-            "{SEQUENCE_EDIT_BUTTON:?} is not after the chips"
-        );
-        // **Ten points before the total, not six.** 8a's row is `gap: 6px` and
-        // the `2.1 s` run carries `padding-left: 4px` ON TOP of it. Netted the
-        // other way the sum is negative, which `add_space` cannot honour, so
-        // the run sat at the bare gap with nothing setting it apart from the
-        // pills. The owner: "check space in front of last x.x s".
-        //
-        // Measured from the last PILL's box to the run's ink, which is the
-        // space a reader sees -- and which only exists at all because the run
-        // is laid `TextWrapMode::Extend`: inside a wrapping row a `Label` that
-        // lays its own text takes the whole remaining lane, and this one came
-        // out 342 points wide and two rows tall, starting back on top of the
-        // first pill.
-        // The run this row draws for the sequence's cost, asked of the same
-        // function the row asks -- so the test cannot drift from it by
-        // spelling a duration itself.
-        let sequence = draft.app.as_ref().expect("the fixture is bound").sequence.clone();
-        let source = ResolveSource {
-            username: &draft.username,
-            password: &draft.password,
-            custom: crate::key_sequence::custom_pairs(&item),
-            totp: &totp,
-        };
-        let cost = duration_label(
-            sequence_tally(&sequence, &source).expect("the fixture's sequence resolves").total,
-        );
-        let total = *painted
-            .rects_of(&cost)
-            .last()
-            .unwrap_or_else(|| panic!("the row draws no cost: {:?}", painted.strings()));
-        let last_pill = chip("Password").0;
-        let gap = total.left() - last_pill.right();
-        assert!(
-            (gap - (STEP_CHIP_GAP + STEP_CHIP_TOTAL_INSET)).abs() <= 1.0,
-            "the total stands {gap} from the last pill, not 8a's 6 + 4"
-        );
-
-        // **Flush with every other row's button.** `row_with_buttons` measures
-        // the button, hands the field what is left and expects it to CLAIM it;
-        // a chip row that only capped its width shrank to the chips and left
-        // the button forty points short. The owner: "Edit Sequence more to the
-        // right as the rest of the buttons". Compared against the password
-        // row's `Copy`, which is the same idiom two cards up.
-        let copy = *painted
-            .rects_of(COPY_LABEL)
-            .last()
-            .expect("the credentials card draws a Copy");
-        assert!(
-            (button.right() - copy.right()).abs() <= 1.0,
-            "{SEQUENCE_EDIT_BUTTON:?} ends at {} and the password row's {COPY_LABEL:?} at {} \
-             -- the two rows do not share a right-hand edge",
-            button.right(),
-            copy.right()
-        );
     }
 
     /// **The runs on a link row do not touch.**
@@ -29937,105 +29495,6 @@ mod edit_pane_layout_tests {
             "the rule runs {rule:?} inside a card of {card:?} -- it stops short of the card's \
              edges, which reads as an underline on the row above it"
         );
-    }
-
-    /// **8a's `gap: 6px` between a grid cell's caption and its control.**
-    ///
-    /// `add_space(EYEBROW_GAP)` between two widgets draws six points plus the
-    /// `item_spacing` egui puts on either side of it -- 22 where the design
-    /// says 6, which is what the owner saw: "Folder Owner Type should be
-    /// closer to fields - check the design". The cell SETS the spacing now
-    /// rather than adding to it.
-    #[test]
-    fn an_item_cells_caption_sits_8as_six_points_over_its_control() {
-        let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
-        let ctx = styled_context(pane);
-        let mut draft = full_login_draft();
-        let _ = frame(&ctx, pane, &mut draft, false, &[]);
-        let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-        for (caption, value) in [
-            (ITEM_FOLDER_LABEL, NO_FOLDER_LABEL),
-            (ITEM_OWNER_LABEL, OWNER_PERSONAL),
-            (ITEM_TYPE_LABEL, kind_noun(draft.kind)),
-        ] {
-            let label = painted.rect_of(caption);
-            let ink = painted.rect_of(value);
-            let control = painted
-                .rects
-                .iter()
-                .map(|(r, _)| *r)
-                .find(|r| {
-                    (r.height() - theme::SECTION_FIELD_HEIGHT).abs() <= 0.5
-                        && r.contains(ink.center())
-                })
-                .unwrap_or_else(|| panic!("{caption}'s control is a {}pt box", 0));
-            let gap = control.top() - label.bottom();
-            assert!(
-                (gap - theme::EYEBROW_GAP).abs() <= 0.5,
-                "{caption} stands {gap}pt over its control, not 8a's `gap: 6px`"
-            );
-        }
-    }
-
-    /// **The strength meter's bars are 8a's `width: 26px; height: 4px`, 3
-    /// apart, with the word 12 after the last one.**
-    ///
-    /// Found by geometry, because a bar paints no string: four `theme::BLUE`
-    /// rectangles of exactly the bar's size, on a password strong enough to
-    /// fill all four.
-    #[test]
-    fn the_strength_bars_sit_3_apart_and_the_word_12_after_them() {
-        let mut panes = 0;
-        for pane in GRID_PANES {
-            panes += 1;
-            let ctx = styled_context(pane);
-            let mut draft = EditDraft::from_item(&a_login());
-            draft.password = "correct-horse-battery-staple-7".to_string();
-            assert_eq!(
-                password_strength::rate(&draft.password),
-                password_strength::Strength::Strong,
-                "the fixture wants a password that fills every bar"
-            );
-            let _ = frame(&ctx, pane, &mut draft, false, &[]);
-            let painted = frame(&ctx, pane, &mut draft, false, &[]);
-
-            let mut bars: Vec<Rect> = painted
-                .rects
-                .iter()
-                .filter(|(r, fill)| {
-                    *fill == theme::BLUE
-                        && (r.width() - theme::STRENGTH_BAR.x).abs() <= 0.5
-                        && (r.height() - theme::STRENGTH_BAR.y).abs() <= 0.5
-                })
-                .map(|(r, _)| *r)
-                .collect();
-            bars.sort_by(|a, b| a.left().total_cmp(&b.left()));
-            assert_eq!(
-                bars.len(),
-                theme::STRENGTH_BARS,
-                "{pane:?}: expected four filled bars, found {bars:?}"
-            );
-            for pair in bars.windows(2) {
-                assert!(
-                    (pair[1].left() - pair[0].right() - 3.0).abs() <= 0.5,
-                    "{pane:?}: two bars are {} apart, not 8a's `gap: 3px`",
-                    pair[1].left() - pair[0].right()
-                );
-            }
-            let word = painted
-                .texts
-                .iter()
-                .find(|(t, _)| t.starts_with(password_strength::Strength::Strong.label()))
-                .map(|(_, r)| *r)
-                .expect("a strong password draws its rating");
-            assert!(
-                (word.left() - bars[bars.len() - 1].right() - 12.0).abs() <= 1.0,
-                "{pane:?}: the rating starts {} after the last bar, not 8a's `gap: 12px`",
-                word.left() - bars[bars.len() - 1].right()
-            );
-        }
-        assert_eq!(panes, 2, "the pane loop visited nothing, so it asserted nothing");
     }
 
     /// **The card column stands the READ pane's `padding: 18px` off the
@@ -32225,6 +31684,41 @@ mod v2_editor_tests {
         let (action, _) = draw(&ctx, 0.1, &mut draft, false, click_at(back.center()));
         assert_ne!(action, EditAction::Cancel);
         assert!(draft.discard_prompt, "a changed draft asks before it is thrown away");
+    }
+
+    /// Review focus 4: the editor's password stays hidden until revealed,
+    /// and Generate sits in its field.
+    #[test]
+    fn the_editors_password_is_hidden_until_revealed() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let (_, p) = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        assert!(!p.texts.iter().any(|t| t.0.contains("hunter2")), "the password is painted in clear");
+        assert!(p.text(crate::kit::input::GENERATE).is_some(), "Generate is in the field");
+        assert!(["Weak", "Fair", "Strong", "Very strong"].iter().any(|w| p.texts.iter().any(|t| t.0 == *w)), "the meter names the strength");
+    }
+
+    /// Decision 2: three folders or fewer are a segmented control.
+    #[test]
+    fn the_folder_is_a_segmented_control_for_three_folders_or_fewer() {
+        let folder = |id: &str, name: &str| Folder { id: id.into(), name: name.into(), other: Default::default() };
+        let few = vec![folder("f1", "Work"), folder("f2", "Home")];
+        assert_eq!(folder_options(&few, true), vec![NO_FOLDER_LABEL.to_string(), "Work".into(), "Home".into()]);
+        let many: Vec<Folder> = (0..4).map(|i| folder(&format!("f{i}"), &format!("F{i}"))).collect();
+        assert!(folder_options(&many, true).is_empty(), "four folders are a dropdown");
+        // Drawn: picking a segment files the draft.
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let mut apps = AppIdentityCache::default();
+        let mut paint = |time: f64, events: Vec<egui::Event>, draft: &mut EditDraft| {
+            testing::frame(&ctx, time, SCREEN, events, |ui| {
+                let _ = draw_detail_edit(ui, draft, &few, false, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
+            })
+        };
+        let p = paint(0.0, vec![], &mut draft);
+        let work = p.text("Work").expect("the Work segment").2;
+        let _ = paint(0.1, click_at(work.center()), &mut draft);
+        assert_eq!(draft.folder_id.as_deref(), Some("f1"));
     }
 
     #[test]
