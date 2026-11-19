@@ -890,6 +890,9 @@ pub enum SendUiAction {
     AskDelete(String),
     /// `Open record`: show the vault item this Send was made from.
     OpenRecord(String),
+    /// Spec B §7's "Change password": open the item this Send was made
+    /// from in its editor.
+    ChangePassword(String),
     /// **Step two of two.** The confirmation's own destructive button was
     /// pressed, on the row named here.
     ///
@@ -2888,6 +2891,49 @@ fn draw_send_detail(
 
 /// The detail column with nothing picked. **Words on the canvas, not a blank
 /// column**; see [`NOTHING_PICKED`].
+pub const SEEN_TITLE: &str = "Someone has seen this password";
+pub const SEEN_BODY: &str = "Change it once they're done.";
+pub const CHANGE_PASSWORD: &str = "Change password";
+
+/// Whether `row` was opened and carried the item's password.
+pub fn password_was_seen(row: &SendRow) -> bool {
+    row.state == crate::send::SendState::Opened
+        && row.sent.as_ref().is_some_and(|sent| {
+            !sent.item_id.is_empty() && sent.fields.iter().any(|f| f == super::record_ui::PASSWORD_LABEL)
+        })
+}
+
+/// Spec B §7's caution band; the item to edit when Change password is
+/// pressed.
+fn seen_password_warning(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
+    let ink = egui::Color32::from_rgb(0x7a, 0x4f, 0x05);
+    let edge = egui::Color32::from_rgb(0xf2, 0xd9, 0x9b);
+    let mut pressed = false;
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(0xfe, 0xf6, 0xe7))
+        .stroke(egui::Stroke::new(1.0, edge))
+        .corner_radius(CornerRadius::same(16))
+        .inner_margin(Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.label(theme::bold(SEEN_TITLE, 15.0).color(ink));
+                    ui.label(egui::RichText::new(SEEN_BODY).size(14.0).color(ink));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let button = egui::Button::new(theme::bold(CHANGE_PASSWORD, 14.0).color(ink))
+                        .fill(theme::CARD)
+                        .stroke(egui::Stroke::new(1.0, edge))
+                        .corner_radius(CornerRadius::same(11))
+                        .min_size(egui::vec2(0.0, 40.0));
+                    pressed = ui.add(button).clicked();
+                });
+            });
+        });
+    pressed.then(|| row.sent.as_ref().map(|s| s.item_id.clone())).flatten()
+}
+
 fn detail_prompt(ui: &mut egui::Ui, text: &str) {
     egui::Frame::new()
         .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
@@ -3226,6 +3272,15 @@ fn draw_send_card(
                     }
                 });
         });
+
+    // Spec B §7: an opened Send that carried the password asks for it to be
+    // changed.
+    if password_was_seen(row) {
+        ui.add_space(14.0);
+        if let Some(item_id) = seen_password_warning(ui, row) {
+            action = Some(SendUiAction::ChangePassword(item_id));
+        }
+    }
 
     action
 }
@@ -14523,7 +14578,8 @@ mod source_pins {
         );
         assert_eq!(depth, 0, "the walk ended inside a module, at depth {depth}");
         assert_eq!(
-            modules, 6,
+            // 7 with `seen_password_tests` (spec B §7).
+            modules, 7,
             "the number of top-level test modules below this file's cut changed. That is fine \
              -- but this count is the control that proves the walk really visited them, so \
              update it deliberately rather than loosening it"
@@ -16470,5 +16526,36 @@ mod frame_promptness {
             "the harness left {path:?} behind, contents and all. One abandoned directory per \
              test process is what this drop guard exists to stop"
         );
+    }
+}
+
+#[cfg(test)]
+mod seen_password_tests {
+    use super::*;
+
+    fn row(state: crate::send::SendState, fields: &[&str]) -> SendRow {
+        SendRow {
+            sent: Some(SentFacts { recipient: String::new(), item_id: "item-1".into(), fields: fields.iter().map(|f| f.to_string()).collect() }),
+            state,
+            id: "send-1".into(),
+            name: "Ledgerline".into(),
+            expiry: String::new(),
+            is_file: false,
+            access_url: String::new(),
+            access_count: 1,
+            max_access_count: Some(1),
+            has_password: false,
+            activity: String::new(),
+            expires: String::new(),
+            deletes: String::new(),
+            extendable: false,
+        }
+    }
+
+    #[test]
+    fn the_warning_shows_for_an_opened_password_send() {
+        assert!(password_was_seen(&row(crate::send::SendState::Opened, &["Username", "Password"])));
+        assert!(!password_was_seen(&row(crate::send::SendState::Waiting, &["Password"])), "not before it is opened");
+        assert!(!password_was_seen(&row(crate::send::SendState::Opened, &["Username"])), "not without the password");
     }
 }

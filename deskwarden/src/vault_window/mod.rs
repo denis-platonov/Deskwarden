@@ -6803,9 +6803,15 @@ pub fn build_frame_with_search(
                 received_selected = false;
                 health_selected = false;
                 filter = home;
-                selected_id = Some(item_id);
+                selected_id = Some(item_id.clone());
                 detail_dismissed = false;
                 mode = DetailMode::Read;
+                // Spec B §7's Change password: straight into the editor.
+                if ctx_edit_after_open(false) {
+                    if let Some(item) = items.iter().find(|i| i.id == item_id) {
+                        mode = DetailMode::Edit(EditDraft::from_item(item));
+                    }
+                }
             }
         }
 
@@ -12622,6 +12628,16 @@ impl SendDeleteState {
     }
 }
 
+thread_local! {
+    static EDIT_AFTER_OPEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Asks (`true`) that the next Open record go straight into the editor, or
+/// (`false`) takes that ask, answering whether it was made.
+fn ctx_edit_after_open(ask: bool) -> bool {
+    EDIT_AFTER_OPEN.with(|flag| if ask { flag.set(true); true } else { flag.replace(false) })
+}
+
 /// **The whole of what a frame of the Sends pane reports back does** -- every
 /// arm, as one plain function the tests really run.
 ///
@@ -12775,6 +12791,11 @@ fn apply_send_action(
             }
         }
         send_ui::SendUiAction::OpenRecord(item_id) => open_record = Some(item_id),
+        // Opened like Open record, then in its editor (see the consumer).
+        send_ui::SendUiAction::ChangePassword(item_id) => {
+            ctx_edit_after_open(true);
+            open_record = Some(item_id);
+        }
         send_ui::SendUiAction::None => {}
     }
     open_record
