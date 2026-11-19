@@ -6015,6 +6015,18 @@ pub fn build_frame_with_search(
                             EditAction::AddTotp => {
                                 add_totp_asked = true;
                             }
+                            // **Move to trash** (spec B 1.4 I): the read
+                            // pane's Delete -- the same modal, the same soft
+                            // delete.
+                            EditAction::Delete => {
+                                if let Some(item) = selected_item.as_ref() {
+                                    delete_confirm = Some(delete_modal::DeleteConfirmState::new(
+                                        item,
+                                        icons.textures.get(item.id.as_str()),
+                                        delete_modal::DeleteKind::ToTrash,
+                                    ));
+                                }
+                            }
                             // **The pencil badge's icon menu, handed straight
                             // to the row menu's own arms.** The read pane's
                             // kebab used to do exactly this and the reason is
@@ -6617,6 +6629,10 @@ pub fn build_frame_with_search(
                                 "the create form asked to scan a one-time code for an item \
                                  that does not exist yet"
                             ),
+                            // Unreachable: a create draws no Move to trash.
+                            EditAction::Delete => log::warn!(
+                                "the create form asked to delete an item that does not exist yet"
+                            ),
                             EditAction::Cancel => mode = DetailMode::Read,
                             EditAction::None => {}
                         }
@@ -7010,6 +7026,8 @@ pub fn build_frame_with_search(
                         delete_confirm = None;
                         selected_id = None;
                         detail_dismissed = true;
+                        // A delete from the editor closes the editor with it.
+                        mode = DetailMode::Read;
                     }
                 }
             }
@@ -28973,7 +28991,8 @@ mod preferences_modal_wiring_tests {
             // 69 again when the v2 top bar retired
             // `mod titlebar_switcher_placement_tests`, which measured the v1
             // chrome's gear, chevron and drag zone.
-            modules, 69,
+            // 70 with `edit_trash_wiring` (v2 editor, Move to trash).
+            modules, 70,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -41905,5 +41924,22 @@ mod forget_step_tests {
         assert!(before.contains(concat!("!forget_", "daemon ||")), "the forget is not gated on the daemon having someone to forget");
         let after = &production[at..at + 400];
         assert!(after.contains(concat!("sharing.begin_", "forget(")), "a sent forget is not recorded, so nothing waits for it");
+    }
+}
+
+#[cfg(test)]
+mod edit_trash_wiring {
+    //! Move to trash from the editor: the read pane's delete modal, and a
+    //! confirmed delete closes the editor with the pane. Source guards, for
+    //! `edit_history_copy_wiring`'s reason; needles split across literals.
+    const SOURCE: &str = include_str!("mod.rs");
+
+    #[test]
+    fn the_editors_delete_opens_the_trash_modal_and_a_delete_closes_the_editor() {
+        let arm = SOURCE.find(concat!("EditAction::Delete", " => {")).expect("the edit arm");
+        let body = &SOURCE[arm..arm + 600];
+        assert!(body.contains(concat!("delete_modal::DeleteKind::", "ToTrash")), "{body}");
+        let done = SOURCE.find(concat!("selected_id = None;", "\r\n                        detail_dismissed = true;")).expect("the delete's success arm");
+        assert!(SOURCE[done..done + 200].contains(concat!("mode = DetailMode::", "Read;")), "the editor outlives its item");
     }
 }

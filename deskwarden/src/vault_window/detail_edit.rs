@@ -1600,7 +1600,7 @@ impl Section {
             Section::CustomFields => "Custom fields",
             Section::Notes => "Notes",
             Section::Sharing => "Sharing",
-            Section::History => "Password history",
+            Section::History => "About",
         }
     }
 
@@ -4532,6 +4532,16 @@ pub enum EditAction {
     /// The form has no way to scan a screen itself -- the modal pumps its own
     /// message loop -- so this could not be answered here in any case.
     AddTotp,
+    /// Spec B 1.4 I's "Move to trash": the read pane's Delete, from the
+    /// editor (0.15's confirmation and soft delete).
+    Delete,
+}
+
+/// Spec B 1.4 I.
+pub const MOVE_TO_TRASH: &str = "Move to trash";
+
+pub(crate) fn move_to_trash_id() -> egui::Id {
+    egui::Id::new("edit-move-to-trash")
 }
 
 /// The folders this form may actually move an item **into**: the folder list
@@ -5455,6 +5465,29 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     }
     ui.data_mut(|d| d.insert_temp(typed_id.with("text"), typed));
     ui.add_space(4.0);
+}
+
+/// Spec B 1.4 I's button: 50 high, radius 14, a red outline and red type,
+/// the whole column wide.
+fn move_to_trash_button(ui: &mut egui::Ui) -> bool {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 50.0), egui::Sense::click());
+    let _ = ui.interact(rect, move_to_trash_id(), egui::Sense::hover());
+    let fill = if response.hovered() { theme::DANGER_WASH } else { theme::CARD };
+    ui.painter().rect(
+        rect,
+        egui::CornerRadius::same(14),
+        fill,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(0xf0, 0xcf, 0xca)),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        MOVE_TO_TRASH,
+        egui::FontId::new(16.0, egui::FontFamily::Name(theme::BOLD.into())),
+        theme::ERROR,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
 /// Spec B 1.4 C: the live code, grouped, and its 34pt ring.
@@ -10756,7 +10789,7 @@ fn history_rows(
         rows.push(("Created", detail::history_label(Some(&created))));
     }
     if let Some(updated) = stamp("revisionDate") {
-        rows.push(("Updated", detail::history_label(Some(&updated))));
+        rows.push(("Last changed", detail::history_label(Some(&updated))));
     }
     // 8a's `3 previous`, as a count rather than a link: the previous
     // passwords are drawn in full on the credentials card above, so a link
@@ -12964,6 +12997,15 @@ pub fn draw_detail_edit(
                         });
                     }
                 });
+            }
+            // Spec B 1.4 I: Move to trash ends the right column; a new item
+            // has nothing to move.
+            if !creating && item.is_some() {
+                let column: &mut egui::Ui = match right_ui.as_mut() { Some(right) => right, None => &mut *ui };
+                column.add_space(12.0);
+                if move_to_trash_button(column) {
+                    action = EditAction::Delete;
+                }
             }
             if let (Some(left), Some(right)) = (left_ui.as_ref(), right_ui.as_ref()) {
                 let used = left.min_rect().union(right.min_rect());
@@ -28020,7 +28062,7 @@ mod edit_pane_layout_tests {
 
         let rows = history_rows(Some(&item), 41, 3);
         let labels: Vec<&str> = rows.iter().map(|(l, _)| *l).collect();
-        assert_eq!(labels, ["Created", "Updated", "Password changed", "Filled"]);
+        assert_eq!(labels, ["Created", "Last changed", "Password changed", "Filled"]);
         assert_eq!(rows[3].1, "41 times");
         assert_eq!(rows[2].1, "3 previous passwords");
 
@@ -31633,6 +31675,81 @@ mod v2_editor_tests {
     /// The rect of a text painted exactly as `needle`.
     fn exact(p: &Painted, needle: &str) -> Option<egui::Rect> {
         p.texts.iter().find(|(t, _, _)| t == needle).map(|(_, _, r)| *r)
+    }
+
+    fn a_saved_login() -> VaultItem {
+        let mut item = a_login();
+        item.other.insert("creationDate".into(), serde_json::json!("2026-01-04T09:00:00Z"));
+        item.other.insert("revisionDate".into(), serde_json::json!("2026-11-16T09:00:00Z"));
+        item.other.insert(
+            "passwordHistory".into(),
+            serde_json::json!([{ "password": "old-one", "lastUsedDate": "2026-03-12T09:00:00Z" }]),
+        );
+        item
+    }
+
+    fn draw_saved(ctx: &egui::Context, time: f64, screen: egui::Vec2, draft: &mut EditDraft, item: &VaultItem, creating: bool, events: Vec<egui::Event>) -> (EditAction, Painted) {
+        let mut apps = AppIdentityCache::default();
+        let mut action = EditAction::None;
+        let p = testing::frame(ctx, time, screen, events, |ui| {
+            action = draw_detail_edit(
+                ui,
+                draft,
+                &[],
+                creating,
+                &mut apps,
+                (!creating).then_some(item),
+                0,
+                &crate::rest::organizations::Audience::Personal,
+                &detail::TotpState::NoSecret,
+                None,
+            );
+        });
+        (action, p)
+    }
+
+    /// Spec B 1.4 F-I: Custom fields, About (with the password history's
+    /// count) and Move to trash are the right column.
+    #[test]
+    fn the_right_column_holds_fields_history_about_and_trash() {
+        let item = a_saved_login();
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&item);
+        let wide = egui::vec2(1200.0, 1600.0);
+        let _ = draw_saved(&ctx, 0.0, wide, &mut draft, &item, false, vec![]);
+        let (_, p) = draw_saved(&ctx, 0.1, wide, &mut draft, &item, false, vec![]);
+        let left = exact(&p, Section::Notes.title(ItemKind::Login)).expect("Notes").right();
+        for title in [Section::CustomFields.title(ItemKind::Login), "About", MOVE_TO_TRASH] {
+            let at = exact(&p, title).unwrap_or_else(|| panic!("no {title}"));
+            assert!(at.left() > left, "{title} is not in the right column");
+        }
+        assert!(exact(&p, "Last changed").is_some());
+        assert!(exact(&p, "1 previous password").is_some(), "the history's count");
+    }
+
+    #[test]
+    fn a_new_item_has_no_about_and_no_trash() {
+        let item = a_saved_login();
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        let wide = egui::vec2(1200.0, 1600.0);
+        let _ = draw_saved(&ctx, 0.0, wide, &mut draft, &item, true, vec![]);
+        let (_, p) = draw_saved(&ctx, 0.1, wide, &mut draft, &item, true, vec![]);
+        assert!(exact(&p, "About").is_none());
+        assert!(exact(&p, MOVE_TO_TRASH).is_none());
+    }
+
+    #[test]
+    fn move_to_trash_is_the_items_delete() {
+        let item = a_saved_login();
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&item);
+        let wide = egui::vec2(1200.0, 1600.0);
+        let _ = draw_saved(&ctx, 0.0, wide, &mut draft, &item, false, vec![]);
+        let _ = draw_saved(&ctx, 0.1, wide, &mut draft, &item, false, vec![]);
+        let at = ctx.read_response(move_to_trash_id()).expect("Move to trash").rect;
+        let (action, _) = draw_saved(&ctx, 0.2, wide, &mut draft, &item, false, click_at(at.center()));
+        assert_eq!(action, EditAction::Delete);
     }
 
     /// Spec B 1.3: Custom fields, Sharing and History are a 320 column
