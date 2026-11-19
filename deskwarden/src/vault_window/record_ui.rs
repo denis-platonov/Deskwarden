@@ -1781,7 +1781,7 @@ pub fn draw_forget_confirm(ctx: &egui::Context, email: &str, names: &[String]) -
             .inner_margin(egui::Margin::same(20))
             .show(ui, |ui| {
                 ui.set_width(380.0);
-                ui.label(theme::bold(&forget_title(email), 15.0).color(theme::INK));
+                ui.label(theme::bold(forget_title(email), 15.0).color(theme::INK));
                 ui.add_space(10.0);
                 ui.label(egui::RichText::new(forget_body(names)).size(12.0).color(theme::TEXT_SECONDARY));
                 ui.add_space(18.0);

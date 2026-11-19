@@ -5448,7 +5448,7 @@ pub fn build_frame_with_search(
                                 // Spec decision 3: Fill answers with where to
                                 // click -- the filling itself is the hotkey's.
                                 DetailAction::Fill => {
-                                    crate::kit::toast::show(ui.ctx(), &detail::fill_toast(item));
+                                    crate::kit::toast::show(ui.ctx(), detail::fill_toast(item));
                                 }
                                 // The folder chip: that folder's items.
                                 DetailAction::ShowFolder(id) => {
@@ -12627,7 +12627,7 @@ mod export_thread {
     {
         std::thread::spawn(move || {
             let report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
-                .unwrap_or_else(|_| ExportReport::Interrupted);
+                .unwrap_or(ExportReport::Interrupted);
             let _ = tx.send(report);
             ctx_for_export.request_repaint();
         });
@@ -17895,7 +17895,7 @@ mod totp_backend_cadence_tests {
     #[test]
     fn a_hidden_window_does_not_compute_either_and_resumes_immediately() {
         let item = item_with_seed(RFC_SEED);
-        let frames = drive(&item, 0, 100, |now| now < 10 || now >= 90, |_| Ok(None));
+        let frames = drive(&item, 0, 100, |now| !(10..90).contains(&now), |_| Ok(None));
 
         assert_eq!(frames.computed, 20, "the hidden 80 seconds were computed anyway");
         assert_eq!(frames.asked_at, Vec::<u64>::new());
@@ -29698,7 +29698,7 @@ mod export_wiring {
         // false-redded. No spawner has a brace in a literal today, so this was
         // latent -- but a latent hole in the one reader that is supposed to
         // notice new work is a hole aimed at exactly the case it was built for.
-        let end = crate::below_cut::match_brace(&source, open) + 1;
+        let end = crate::below_cut::match_brace(source, open) + 1;
         code_squashed(&source[start..end])
     }
 
@@ -33444,7 +33444,7 @@ mod export_wiring {
             // The INK, not the card's outline: `egui::Frame`'s stroke reaches
             // the tessellator rather than the shape list at this layer, so
             // reading it here would discriminate nothing.
-            let error_ink = card.text_colours.iter().any(|c| *c == theme::ERROR);
+            let error_ink = card.text_colours.contains(&theme::ERROR);
             match tone {
                 ExportTone::Bad => assert!(
                     error_ink,
@@ -37809,7 +37809,7 @@ mod send_delete_wiring {
             error: SendError::Offline,
         });
         assert!(
-            card.text_colours.iter().any(|c| *c == theme::ERROR),
+            card.text_colours.contains(&theme::ERROR),
             "a failed Extend is painted like a success: {:?}",
             card.text_colours
         );
@@ -37905,7 +37905,7 @@ mod send_delete_wiring {
             // loud because the first draft of this test asserted on it and
             // the assertion was vacuous in one direction and false in the
             // other.
-            let error_ink = card.text_colours.iter().any(|c| *c == theme::ERROR);
+            let error_ink = card.text_colours.contains(&theme::ERROR);
             match tone {
                 DeleteTone::Bad => assert!(
                     error_ink,
@@ -39851,7 +39851,7 @@ mod send_create_wiring {
             // which reaches the tessellator rather than the shape list at
             // this layer, so reading it would be reading a value that is the
             // same for every report.
-            let error_ink = card.text_colours.iter().any(|c| *c == theme::ERROR);
+            let error_ink = card.text_colours.contains(&theme::ERROR);
             match tone {
                 CreateTone::Bad => assert!(
                     error_ink,

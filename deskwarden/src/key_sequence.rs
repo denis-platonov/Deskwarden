@@ -293,7 +293,7 @@ pub fn wait_label(ms: u32) -> String {
         return format!("Wait {ms} ms");
     }
     let tenths = (ms + 50) / 100;
-    if tenths % 10 == 0 {
+    if tenths.is_multiple_of(10) {
         format!("Wait {}s", tenths / 10)
     } else {
         format!("Wait {}.{}s", tenths / 10, tenths % 10)
@@ -1422,7 +1422,7 @@ mod tests {
         let totp = TotpState::NoSecret;
         let source = source(&item, &totp);
         assert_eq!(
-            source.custom_value("MFA secret").as_deref(),
+            source.custom_value("MFA secret"),
             Some("JBSWY3DPEHPK3PXP"),
             "a hand-written reference to it no longer resolves"
         );

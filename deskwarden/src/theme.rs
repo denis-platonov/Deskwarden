@@ -3160,7 +3160,7 @@ fn segmented_run(ui: &mut Ui, segments: &[Segment<'_>], height: f32) -> Option<u
             segment.label,
         );
     }
-    response.clicked().then(|| hovered).flatten()
+    response.clicked().then_some(hovered).flatten()
 }
 
 /// [`segmented_control`]'s inert twin, for a question whose answer is fixed
@@ -5112,7 +5112,7 @@ const STAR_INNER_RATIO: f32 = 0.46;
 fn star_outline(center: Pos2, outer: f32) -> Vec<Pos2> {
     let inner = outer * STAR_INNER_RATIO;
     let corner = |i: usize| {
-        let radius = if i % 2 == 0 { outer } else { inner };
+        let radius = if i.is_multiple_of(2) { outer } else { inner };
         // -90° so a POINT is at the top, not a valley.
         let angle = -std::f32::consts::FRAC_PI_2
             + i as f32 * std::f32::consts::TAU / STAR_CORNERS as f32;
@@ -12818,11 +12818,10 @@ mod drawn_icon_family_tests {
                             }
                         }
                     }
-                    egui::Shape::Rect(rect) => {
-                        if (rect.rect.height() - SECTION_FIELD_HEIGHT).abs() < 0.6 {
+                    egui::Shape::Rect(rect)
+                        if (rect.rect.height() - SECTION_FIELD_HEIGHT).abs() < 0.6 => {
                             boxes.push(rect.rect);
                         }
-                    }
                     _ => {}
                 }
             }
@@ -13171,7 +13170,7 @@ mod drawn_icon_family_tests {
             ("★", control(|ui| star_toggle(ui, false)).1),
             ("✉", control(send_record_button).1),
             ("⏱", control(add_totp_button).1),
-            ("⋮", control(|ui| kebab_button(ui)).1),
+            ("⋮", control(kebab_button).1),
             ("✕", control(close_pane_button).1),
         ]
     }
@@ -13593,7 +13592,7 @@ mod drawn_icon_family_tests {
     fn the_tune_icon_repeats_no_more_marks_than_the_kebab_beside_it() {
         let (_, tune) = control(tune_button);
         let (_, eye) = control(|ui| eye_toggle(ui, false));
-        let (_, kebab) = control(|ui| kebab_button(ui));
+        let (_, kebab) = control(kebab_button);
 
         // Positive control: `marks_in` really does find marks, so the counts
         // below are counts of something.
@@ -14340,7 +14339,7 @@ pub mod icon_probe {
             })
             .collect();
         assert!(
-            arms.len() % 2 == 0,
+            arms.len().is_multiple_of(2),
             "found {} chevron arms, which is not a whole number of chevrons -- this probe \
              has stopped matching what `account_switcher_button` draws",
             arms.len()
@@ -14616,7 +14615,7 @@ mod modal_card_tests {
             egui::Shape::Rect(rect) => painted.rects.push(rect.clone()),
             egui::Shape::LineSegment { points, stroke } => {
                 painted.segments.push(*points);
-                painted.inked_segments.push(((*stroke).into(), *points));
+                painted.inked_segments.push(((*stroke), *points));
             }
             egui::Shape::Path(path) => painted.paths.push(path.clone()),
             egui::Shape::Circle(circle) => painted.circles.push(*circle),

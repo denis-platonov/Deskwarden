@@ -406,7 +406,7 @@ pub(crate) fn decode_body_with(
 ) -> Result<DiskSnapshot, String> {
     let mut items = Vec::with_capacity(header.index.len());
     for slot in &header.index {
-        let plaintext = open_item_at(&content_key, &parsed.header_bytes, &parsed.body, slot)?;
+        let plaintext = open_item_at(content_key, &parsed.header_bytes, &parsed.body, slot)?;
         items.push(
             serde_json::from_slice(&plaintext)
                 .map_err(|e| format!("a cached item is malformed: {e}"))?,
@@ -414,7 +414,7 @@ pub(crate) fn decode_body_with(
     }
     // Folders ride in the facts section: they carry no secret, and a reader
     // that wants names wants theirs too.
-    let facts = open_facts(&content_key, &parsed.header_bytes, &parsed.body, header.facts_len)?;
+    let facts = open_facts(content_key, &parsed.header_bytes, &parsed.body, header.facts_len)?;
     let folders = folders_from_facts(&facts)?;
     Ok(DiskSnapshot { items, folders })
 }

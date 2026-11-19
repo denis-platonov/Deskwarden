@@ -1270,7 +1270,7 @@ mod tests {
         use crate::accounts::{resolve_startup, Account, AccountId, StartupAccounts};
         let p = profile("rc");
         let path = std::path::Path::new(r"C:\cfg\profiles\rc\settings.json");
-        let one = vec![Account {
+        let one = [Account {
             id: AccountId::generate(),
             email: "a@example.test".into(),
             server_url: None,

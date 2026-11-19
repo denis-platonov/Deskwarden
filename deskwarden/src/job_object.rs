@@ -4870,9 +4870,8 @@ mod tests {
                 "{file} produced almost no code, so every rule below is vacuous"
             );
             if is_runner {
-                assert_eq!(
+                assert!(
                     code.matches("JobCommand").count() >= 1,
-                    true,
                     "{file} no longer names the wrapper at all, so it is not building its child \
                      through the one type that can only be spawned into a job"
                 );

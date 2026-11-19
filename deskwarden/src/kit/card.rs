@@ -170,7 +170,7 @@ mod tests {
     #[test]
     fn the_row_rule_is_one_pixel_of_row_rule() {
         let ctx = ctx();
-        let painted = frame(&ctx, 0.0, SCREEN, vec![], |ui| row_rule(ui));
+        let painted = frame(&ctx, 0.0, SCREEN, vec![], row_rule);
         let rule = painted.rects.iter().find(|r| r.fill == P.row_rule).expect("a rule");
         assert_eq!(rule.rect.height(), 1.0);
     }

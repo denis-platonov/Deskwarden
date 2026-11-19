@@ -457,7 +457,7 @@ fn texture(ctx: &egui::Context, mark: Mark, glyph: &Parsed, w: usize, h: usize) 
         .entry((mark, w, h))
         .or_insert_with(|| {
             let alpha = rasterise(&glyph.paths, glyph.min, glyph.size, w, h);
-            let pixels = alpha.into_iter().map(|a| Color32::from_white_alpha(a)).collect();
+            let pixels = alpha.into_iter().map(Color32::from_white_alpha).collect();
             ctx.load_texture(
                 format!("logo-{mark:?}-{w}x{h}"),
                 ColorImage { size: [w, h], pixels, source_size: vec2(w as f32, h as f32) },

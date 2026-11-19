@@ -4342,7 +4342,7 @@ mod tests {
         let last = painted.row_around(painted.rect_of("Enter"));
         assert!(text.top() > last.bottom(), "the add row is not under the list");
         assert!(
-            !painted.strings().iter().any(|painted| *painted == "Add a step"),
+            !painted.strings().contains(&"Add a step"),
             "the Add a step card is still drawn"
         );
     }

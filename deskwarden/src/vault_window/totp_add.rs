@@ -802,7 +802,7 @@ fn expand_to_rgba(
     match color {
         image::ColorType::Rgba8 => rgba.extend_from_slice(source),
         image::ColorType::Rgb8 => {
-            for px in source.chunks_exact(3) {
+            for px in source.as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[px[0], px[1], px[2], 0xff]);
             }
         }
@@ -814,7 +814,7 @@ fn expand_to_rgba(
             }
         }
         image::ColorType::La8 => {
-            for px in source.chunks_exact(2) {
+            for px in source.as_chunks::<2>().0 {
                 rgba.extend_from_slice(&[px[0], px[0], px[0], px[1]]);
             }
         }
@@ -824,19 +824,19 @@ fn expand_to_rgba(
         // weighs the three channels into one eight-bit luma before it looks
         // at a single module.
         image::ColorType::L16 => {
-            for px in source.chunks_exact(2) {
+            for px in source.as_chunks::<2>().0 {
                 let grey = high_byte(px);
                 rgba.extend_from_slice(&[grey, grey, grey, 0xff]);
             }
         }
         image::ColorType::La16 => {
-            for px in source.chunks_exact(4) {
+            for px in source.as_chunks::<4>().0 {
                 let grey = high_byte(&px[..2]);
                 rgba.extend_from_slice(&[grey, grey, grey, high_byte(&px[2..])]);
             }
         }
         image::ColorType::Rgb16 => {
-            for px in source.chunks_exact(6) {
+            for px in source.as_chunks::<6>().0 {
                 rgba.extend_from_slice(&[
                     high_byte(&px[..2]),
                     high_byte(&px[2..4]),
@@ -846,7 +846,7 @@ fn expand_to_rgba(
             }
         }
         image::ColorType::Rgba16 => {
-            for px in source.chunks_exact(8) {
+            for px in source.as_chunks::<8>().0 {
                 rgba.extend_from_slice(&[
                     high_byte(&px[..2]),
                     high_byte(&px[2..4]),
@@ -6996,7 +6996,7 @@ mod tests {
     fn fixture_pixels(scale: usize) -> (Vec<u8>, Vec<u8>, u32, u32) {
         let (rgba, width, height) = crate::qr::tests::fixture_rgba(scale);
         let rgb: Vec<u8> =
-            rgba.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]).collect();
+            rgba.as_chunks::<4>().0.iter().flat_map(|px| [px[0], px[1], px[2]]).collect();
         (rgba, rgb, width as u32, height as u32)
     }
 

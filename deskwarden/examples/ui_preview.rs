@@ -3362,7 +3362,7 @@ impl Preview {
                     // v2: the Share modal over the shot (spec B §6), with
                     // the chips (advanced sharing on).
                     let mut state = record_ui::RecordSend::opening(&fixtures.login.id, "Ledgerline");
-                    state.draft.selection = fixtures.record.selection.clone();
+                    state.draft.selection = fixtures.record.selection;
                     let _ = record_ui::draw_export_modal(
                         ui.ctx(),
                         &mut state,

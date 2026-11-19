@@ -340,9 +340,8 @@ fn open_blob(
     })?;
 
     let key = hello_key()?;
-    let plaintext = unseal(&key, &sealed).map_err(|e| {
+    let plaintext = unseal(&key, &sealed).inspect_err(|_e| {
         let _ = std::fs::remove_file(path);
-        e
     })?;
 
     String::from_utf8(plaintext.to_vec())

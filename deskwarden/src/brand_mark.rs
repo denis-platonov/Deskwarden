@@ -208,7 +208,7 @@ impl Mark {
     pub fn resampled(&self, width: usize, height: usize) -> Vec<u8> {
         let (width, height) = (width.max(1), height.max(1));
         let mut premultiplied = self.rgba.clone();
-        for pixel in premultiplied.chunks_exact_mut(4) {
+        for pixel in premultiplied.as_chunks_mut::<4>().0 {
             let alpha = u32::from(pixel[3]);
             for channel in &mut pixel[..3] {
                 *channel = ((u32::from(*channel) * alpha + 127) / 255) as u8;
@@ -232,7 +232,7 @@ impl Mark {
             image::imageops::FilterType::Lanczos3,
         )
         .into_raw();
-        for pixel in out.chunks_exact_mut(4) {
+        for pixel in out.as_chunks_mut::<4>().0 {
             let alpha = pixel[3];
             for channel in &mut pixel[..3] {
                 *channel = (*channel).min(alpha);
@@ -767,7 +767,7 @@ pub(crate) mod tests {
         for (w, h) in [(48, 16), (37, 13), (97, 32), (1, 1)] {
             let out = mark.resampled(w, h);
             assert_eq!(out.len(), w * h * 4, "asked for {w}x{h}");
-            for pixel in out.chunks_exact(4) {
+            for pixel in out.as_chunks::<4>().0 {
                 assert!(
                     pixel[..3].iter().all(|c| *c <= pixel[3]),
                     "{pixel:?} is not a premultiplied pixel -- a colour over its alpha draws \
@@ -798,7 +798,7 @@ pub(crate) mod tests {
         };
         let out = bars.resampled(13, 5);
         let mut edge_pixels = 0;
-        for pixel in out.chunks_exact(4) {
+        for pixel in out.as_chunks::<4>().0 {
             let alpha = f32::from(pixel[3]);
             if alpha < 64.0 {
                 continue;

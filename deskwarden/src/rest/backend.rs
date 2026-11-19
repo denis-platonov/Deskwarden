@@ -2803,7 +2803,7 @@ pub mod tests {
             .generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
             .expect("a generated passphrase");
         // The default recipe: four words, `-`, capitalised, with a number.
-        assert_eq!(passphrase.split('-').count(), 4, "{}", &*passphrase);
+        assert_eq!(passphrase.split('-').count(), 4, "{}", *passphrase);
         assert_eq!(passphrase.chars().filter(char::is_ascii_digit).count(), 1);
 
         assert!(!any.matched(), "generate reached the network; there is no endpoint for it");

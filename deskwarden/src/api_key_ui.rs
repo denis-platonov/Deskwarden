@@ -557,7 +557,7 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
                 input::secret(
                     ui,
                     egui::Id::new("auth-api-client-secret"),
-                    &mut *form.secret,
+                    &mut form.secret,
                     &mut revealed,
                     "",
                     width,
@@ -577,7 +577,7 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
                 input::secret(
                     ui,
                     egui::Id::new("auth-api-master-password"),
-                    &mut *form.password,
+                    &mut form.password,
                     &mut revealed,
                     "",
                     width,

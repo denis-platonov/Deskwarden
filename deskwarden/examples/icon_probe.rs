@@ -124,7 +124,7 @@ fn describe_icon_pixels(label: &str, hicon_raw: isize) {
             );
             if read > 0 {
                 let (mut opaque, mut bluish) = (0usize, 0usize);
-                for px in buf.chunks_exact(4) {
+                for px in buf.as_chunks::<4>().0 {
                     let (b, _g, r, a) = (px[0], px[1], px[2], px[3]);
                     if a > 128 {
                         opaque += 1;

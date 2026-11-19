@@ -1970,7 +1970,7 @@ mod tests {
             Some(a.id.clone())
         );
         assert!(
-            next_active_after_removal(&[a.clone()], &a.id).is_none(),
+            next_active_after_removal(std::slice::from_ref(&a), &a.id).is_none(),
             "the last account"
         );
         assert!(next_active_after_removal(&[], &a.id).is_none());
@@ -2558,7 +2558,7 @@ mod tests {
             let a = account(A);
             let ghost = AccountId::parse(&"9".repeat(32)).unwrap();
             let (active, _, needs_persist, first_run) =
-                ready(resolve_startup(&[a.clone()], Some(&ghost), None));
+                ready(resolve_startup(std::slice::from_ref(&a), Some(&ghost), None));
             assert_eq!(active.id, a.id);
             assert!(
                 needs_persist,
@@ -2629,7 +2629,7 @@ mod tests {
             // perfectly good account list and take the app account-less.
             let a = account(A);
             let (active, _, _, first_run) = ready(resolve_startup(
-                &[a.clone()],
+                std::slice::from_ref(&a),
                 Some(&a.id),
                 Some("settings.json could not be read"),
             ));

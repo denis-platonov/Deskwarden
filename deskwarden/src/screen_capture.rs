@@ -581,7 +581,7 @@ pub fn looks_blocked(rgba: &[u8]) -> bool {
     if rgba.len() < 4 {
         return false;
     }
-    rgba.chunks_exact(4).all(|px| px[0..3] == [0, 0, 0])
+    rgba.as_chunks::<4>().0.iter().all(|px| px[0..3] == [0, 0, 0])
 }
 
 /// Every monitor's full bounds (including the taskbar, unlike
@@ -762,7 +762,7 @@ fn blit_rect(rect: ScreenRect) -> Result<Rgba, CaptureRefusal> {
         }
 
         // GDI hands back BGRA; `decode_qr` and egui both want RGBA.
-        for px in buffer.chunks_exact_mut(4) {
+        for px in buffer.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
 

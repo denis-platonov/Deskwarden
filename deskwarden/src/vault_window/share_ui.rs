@@ -302,7 +302,7 @@ pub(crate) fn records_shared_with(view: Option<&SharingView>, email: &str, items
     let email = normalise_email(email);
     view.records
         .iter()
-        .filter(|r| r.people.iter().any(|p| *p == email))
+        .filter(|r| r.people.contains(&email))
         .filter_map(|r| items.iter().find(|i| i.id == r.item_id).map(|i| i.name.clone()))
         .collect()
 }
@@ -4294,7 +4294,7 @@ mod tests {
         ];
         let at_rest = super::super::detail::PeopleSharing { people: &people_lines, ..Default::default() };
         let (_, texts) = block_frame(at_rest, Vec::new());
-        let eves = texts.iter().filter(|(t, _)| t == SHOW_FINGERPRINT).map(|(_, r)| r.center()).last().expect("eve's Show");
+        let eves = texts.iter().filter(|(t, _)| t == SHOW_FINGERPRINT).map(|(_, r)| r.center()).next_back().expect("eve's Show");
         let fetching = super::super::detail::PeopleSharing { people: &people_lines, fingerprinting: Some("anna@x.io"), ..Default::default() };
         let (action, texts) = block_frame(fetching, click(eves));
         assert_eq!(action, DetailAction::None, "a second Show while one is out");

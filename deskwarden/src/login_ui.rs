@@ -4394,7 +4394,7 @@ mod close_control_tests {
         for close in [CloseControl::Active, CloseControl::Disabled] {
             let flat = horizontal_colors(&painted(close));
             assert!(
-                flat.iter().any(|color| *color == theme::TEXT_FAINT),
+                flat.contains(&theme::TEXT_FAINT),
                 "{close:?} ghosted the — control as well: {flat:?}"
             );
         }
@@ -5260,7 +5260,7 @@ mod login_entry_point_tests {
                 "let c = check_bw_status_details", "(); let d = format!(\"x\");"
             )),
             vec![
-                concat!("bw_command").to_string(),
+                "bw_command".to_string(),
                 concat!("active_data", "_dir").to_string(),
                 concat!("check_bw_status", "_details").to_string(),
             ],
@@ -8145,13 +8145,13 @@ pub(crate) mod password_lifetime_tests {
                 // opened, so a non-UTF-8 gitlink name still produces a loud
                 // refusal naming a mangled path rather than a silent skip.
                 let path = root.join(String::from_utf8_lossy(&record[tab + 1..]).as_ref());
-                if !gitlinked.iter().any(|g| *g == path) {
+                if !gitlinked.contains(&path) {
                     gitlinked.push(path);
                 }
             }
         }
         for path in gitlinked {
-            if !refused.iter().any(|r| *r == path) {
+            if !refused.contains(&path) {
                 refused.push(path);
             }
         }
@@ -8217,7 +8217,7 @@ pub(crate) mod password_lifetime_tests {
             // those as a bare directory with no index entry at all. It is an
             // addition, not a replacement, in both directions.
             if path.is_dir() && nested_repository_shape(&path) {
-                if !refused.iter().any(|r| *r == path) {
+                if !refused.contains(&path) {
                     refused.push(path);
                 }
                 continue;
@@ -9427,7 +9427,7 @@ pub(crate) mod password_lifetime_tests {
         let this_file =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src").join("login_ui.rs");
         assert!(
-            files.iter().any(|p| *p == this_file),
+            files.contains(&this_file),
             "control: the listing does not contain {this_file:?} -- the file that declares the \
              probe, named by absolute path rather than by suffix. Either the listing dropped \
              it, or the listing is of a DIFFERENT checkout that merely also has a file whose \
@@ -10057,7 +10057,7 @@ pub(crate) mod password_lifetime_tests {
                     .is_some_and(|name| fold(name) == fold(".gitignore"));
                 named_gitignore
                     && as_path.starts_with(&root)
-                    && tracked.iter().any(|entry| *entry == source_rel)
+                    && tracked.contains(&source_rel)
             };
             // The fixture's "tracked" set is built HERE, not read from the
             // repository, and it deliberately contains all four spellings the
@@ -11684,7 +11684,7 @@ mod login_frame_host_tests {
         // argument list names nothing and `pre_styled` is a `bool` two lines
         // above it.
         assert!(
-            host.contains(concat!("// ...and a produced token is the end of the window,")),
+            host.contains("// ...and a produced token is the end of the window,"),
             "the comment naming `run_login_flow_for`'s `close_on_success` argument is gone, \
              so the two bare `bool`s in this call are unlabelled and can be swapped silently: \
              {host:?}"

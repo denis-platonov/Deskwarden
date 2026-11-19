@@ -925,7 +925,7 @@ mod win32 {
                 LRESULT(0)
             }
             WM_COMMAND => {
-                let id = (wparam.0 & 0xffff) as usize;
+                let id = wparam.0 & 0xffff;
                 let notification = ((wparam.0 >> 16) & 0xffff) as u32;
                 if notification == BN_CLICKED && id == ID_UNLOCK {
                     set_pending(Event::Unlock);

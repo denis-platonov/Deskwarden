@@ -1401,7 +1401,7 @@ impl RestClient {
             // answering this question; only something that is neither is not.
             .or_else(|| value.as_f64().map(|seconds| seconds as i64))
             .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-            .ok_or_else(|| {
+            .ok_or({
                 RestError::Parse("a number from the revision-date route")
             })
     }

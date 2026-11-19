@@ -492,7 +492,7 @@ pub fn with_app_match(item: &VaultItem, m: &AppMatch) -> VaultItem {
     // Every *other* field is cloned wholesale, so anything unmodelled on it
     // (`type`, `linkedId`, ...) rides `VaultField::other` untouched.
     let mut fields: Vec<VaultField> = item.fields.clone();
-    let existing = fields.iter().position(|f| is_app_match(f));
+    let existing = fields.iter().position(is_app_match);
 
     // The app-match field is the one field rebuilt rather than copied, because
     // its `value` is the thing being changed. Its extra keys are still the
@@ -4934,7 +4934,7 @@ mod tests {
              {body}"
         );
         assert_eq!(
-            serde_json::to_value(&an_item_in_folder(None)).unwrap().get("folderId"),
+            serde_json::to_value(an_item_in_folder(None)).unwrap().get("folderId"),
             None,
             "the premise: an ordinary write of this same item omits the key entirely"
         );

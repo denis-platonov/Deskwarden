@@ -1160,7 +1160,7 @@ pub(crate) mod tests {
         let (mut rgba, w, h) = fixture_rgba(4);
         // Control first: as rendered, it reads.
         assert!(decode_qr(&rgba, w, h).is_some());
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel[0] = 255 - pixel[0];
             pixel[1] = 255 - pixel[1];
             pixel[2] = 255 - pixel[2];
@@ -1178,7 +1178,7 @@ pub(crate) mod tests {
     #[test]
     fn a_fully_transparent_capture_still_decodes() {
         let (mut rgba, w, h) = fixture_rgba(4);
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel[3] = 0;
         }
         assert_eq!(decode_qr(&rgba, w, h).as_deref().map(String::as_str), Some(FIXTURE_TEXT));

@@ -2195,7 +2195,7 @@ mod tests {
             matches!(&blocks[0], NotesBlock::Heading { level: 2, .. }) &&
                 painted[0] == "What's new in 0.14.0",
             "got {:?}",
-            &blocks[0]
+            blocks[0]
         );
         let threes: Vec<&String> = blocks
             .iter()
@@ -4959,7 +4959,7 @@ mod tests {
             if let Some(r) = raw_r {
                 let fresh = out
                     .last()
-                    .map_or(true, |p| !(p.ch.is_alphanumeric() || p.ch == '_'));
+                    .is_none_or(|p| !(p.ch.is_alphanumeric() || p.ch == '_'));
                 let mut h = r + 1;
                 while at(h) == '#' {
                     h += 1;

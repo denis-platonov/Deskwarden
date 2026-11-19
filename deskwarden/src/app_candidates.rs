@@ -561,7 +561,7 @@ mod tests {
     #[test]
     fn a_never_rule_on_the_site_refuses_a_guessed_address_too() {
         let never = saved_with("n", "Twitter", "me@x", Some("https://x.com"), Some(serde_json::json!(5)));
-        let found = candidates("chrome.exe", "Twitter - Google Chrome", &[never.clone()], Some(&guessed("https://x.com/")));
+        let found = candidates("chrome.exe", "Twitter - Google Chrome", std::slice::from_ref(&never), Some(&guessed("https://x.com/")));
         assert!(found.is_empty(), "`Never` refuses whatever the scheme and path turn out to be");
         assert_eq!(
             ids(&candidates("chrome.exe", "Twitter - Google Chrome", &[never], None)),
@@ -597,7 +597,7 @@ mod tests {
         let found = candidates(
             "firefox.exe",
             "Google Sign-in - Mozilla Firefox",
-            &[mail.clone()],
+            std::slice::from_ref(&mail),
             Some(&guessed("https://accounts.google.com/")),
         );
         assert!(found.is_empty(), "Host `mail.google.com` was offered on `accounts.google.com` by the title");
@@ -608,7 +608,7 @@ mod tests {
         );
 
         let exact = saved_with("e", "Twitter", "me@x", Some("https://mail.x.com/a"), Some(serde_json::json!(3)));
-        let found = candidates("chrome.exe", "Twitter - Google Chrome", &[exact.clone()], Some(&guessed("https://x.com/")));
+        let found = candidates("chrome.exe", "Twitter - Google Chrome", std::slice::from_ref(&exact), Some(&guessed("https://x.com/")));
         assert!(found.is_empty(), "Exact `https://mail.x.com/a` was offered on `x.com` by the title");
         assert_eq!(ids(&candidates("chrome.exe", "Twitter - Google Chrome", &[exact], None)), vec!["e"], "control");
     }
@@ -626,7 +626,7 @@ mod tests {
         );
         let exact = saved_with("e", "Twitter", "me@x", Some("http://x.com/login"), Some(serde_json::json!(3)));
         assert_eq!(
-            ids(&candidates("chrome.exe", title, &[exact.clone()], Some(&guessed("https://x.com/other")))),
+            ids(&candidates("chrome.exe", title, std::slice::from_ref(&exact), Some(&guessed("https://x.com/other")))),
             vec!["e"],
             "only the scheme and the path are uncertain"
         );
@@ -640,7 +640,7 @@ mod tests {
             "control: the pattern reads as a website on this very site"
         );
         assert_eq!(
-            ids(&candidates("chrome.exe", title, &[regex.clone()], Some(&guessed("https://x.com/other")))),
+            ids(&candidates("chrome.exe", title, std::slice::from_ref(&regex), Some(&guessed("https://x.com/other")))),
             vec!["r"],
             "a pattern reads whatever it says, so its refusal may be the guess's"
         );

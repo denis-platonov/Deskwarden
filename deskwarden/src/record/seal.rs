@@ -195,7 +195,7 @@ pub(crate) fn base64_into(out: &mut String, bytes: &[u8]) {
 /// **this is a reader of untrusted text**, so a stray character is a refusal
 /// and never a byte quietly skipped.
 pub(crate) fn base64_from(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 4 != 0 {
+    if !text.len().is_multiple_of(4) {
         return None;
     }
     let bytes = text.as_bytes();

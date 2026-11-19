@@ -19334,7 +19334,7 @@ mod sequence_builder_tests {
         // The trap this closes: starting from an empty token list would make
         // one click on `{TOTP}` silently delete the user name and password
         // this item has always typed.
-        let next = sequence_with(&String::new(), Token::Field(FieldRef::Totp));
+        let next = sequence_with("", Token::Field(FieldRef::Totp));
         assert_eq!(next, "{USERNAME}{TAB}{PASSWORD}{TOTP}");
     }
 
@@ -23535,7 +23535,7 @@ mod edit_pane_layout_tests {
         assert!(!dates.is_empty(), "the fixture lost its history, so the absence below is vacuous");
         for when in &dates {
             assert!(
-                !painted.strings().iter().any(|s| *s == when.as_str()),
+                !painted.strings().contains(&when.as_str()),
                 "the shut list drew its {when:?} row anyway: {:?}",
                 painted.strings()
             );
@@ -23594,7 +23594,7 @@ mod edit_pane_layout_tests {
             let strings = painted.strings();
             for when in &dates {
                 assert!(
-                    strings.iter().any(|s| *s == when.as_str()),
+                    strings.contains(&when.as_str()),
                     "the {width}pt form's open history is missing its {when:?} row: {strings:?}"
                 );
             }
@@ -23773,9 +23773,7 @@ mod edit_pane_layout_tests {
             // rule added elsewhere on the card does not silently re-aim this.
             let above = |y: f32| -> Rect {
                 *drawn
-                    .iter()
-                    .filter(|r| r.bottom() <= y)
-                    .next_back()
+                    .iter().rfind(|r| r.bottom() <= y)
                     .unwrap_or_else(|| panic!("no rule above y = {y} at {width}pt: {drawn:?}"))
             };
             let opening = above(rows[0].top());
@@ -26443,11 +26441,11 @@ mod edit_pane_layout_tests {
             after.strings()
         );
         assert!(
-            !after.strings().iter().any(|s| *s == "first"),
+            !after.strings().contains(&"first"),
             "the first row is still on screen, so nothing was removed"
         );
         assert!(
-            after.strings().iter().any(|s| *s == "third"),
+            after.strings().contains(&"third"),
             "the third row stopped being drawn: {:?}",
             after.strings()
         );
@@ -26825,7 +26823,7 @@ mod edit_pane_layout_tests {
              body at all: {strings:?}"
         );
         assert!(
-            strings.iter().any(|s| *s == TOTP_LABEL),
+            strings.contains(&TOTP_LABEL),
             "the seed row was not drawn: {strings:?}"
         );
         assert!(
@@ -29452,11 +29450,11 @@ mod edit_pane_layout_tests {
 
         // The card's span: from its title to the next card's.
         let top = painted
-            .rect_of(&Section::Autofill.title(ItemKind::Login).to_string())
+            .rect_of(Section::Autofill.title(ItemKind::Login))
             .bottom();
         // The next card in the same column: Custom fields moved to the right
         // column on a wide editor (spec B 1.3), so Notes follows Fills in.
-        let bottom = painted.rect_of(&Section::Notes.title(ItemKind::Login).to_string()).top();
+        let bottom = painted.rect_of(Section::Notes.title(ItemKind::Login)).top();
         let rules: Vec<f32> = painted
             .rects
             .iter()
@@ -29803,7 +29801,7 @@ mod edit_pane_layout_tests {
                 .map(|(r, _)| *r)
                 .min_by(|a, b| a.top().total_cmp(&b.top()))
                 .expect("the strip is closed by a hairline");
-            let item = card_around(&painted, painted.rect_of(&Section::Item.title(draft.kind).to_string()));
+            let item = card_around(&painted, painted.rect_of(Section::Item.title(draft.kind)));
             let inset = f32::from(detail::BODY_PAD_Y);
             assert!(
                 (item.top() - rule.bottom() - inset).abs() <= 0.5,
@@ -29813,7 +29811,7 @@ mod edit_pane_layout_tests {
             );
             let details = card_around(
                 &painted,
-                painted.rect_of(&Section::Details.title(draft.kind).to_string()),
+                painted.rect_of(Section::Details.title(draft.kind)),
             );
             assert!(
                 (details.top() - item.bottom() - theme::SECTION_COLUMN_GAP).abs() <= 0.5,

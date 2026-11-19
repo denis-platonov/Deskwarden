@@ -845,7 +845,7 @@ mod tests {
     fn copying_the_logs_says_whether_it_had_a_file_to_name() {
         let mut fixture = Fixture::new(Page::About);
         let painted = fixture.settle();
-        let copy = painted.texts.iter().filter(|(t, _, _)| t == "Copy").last().expect("a Copy button").2.center();
+        let copy = painted.texts.iter().filter(|(t, _, _)| t == "Copy").next_back().expect("a Copy button").2.center();
         fixture.frame(click_at(copy));
         let toast = crate::kit::toast::current(&fixture.ctx).expect("a toast");
         assert!(toast == LOGS_COPIED_TOAST || toast == LOGS_MISSING_TOAST, "{toast}");

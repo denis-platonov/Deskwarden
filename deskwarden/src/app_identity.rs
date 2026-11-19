@@ -585,7 +585,7 @@ fn version_names(path: &str) -> (Option<String>, Option<String>) {
             // Pairs of u16: language id, then codepage.
             let pairs = (len as usize) / 4;
             let words = std::slice::from_raw_parts(buffer as *const u16, pairs * 2);
-            for pair in words.chunks_exact(2) {
+            for pair in words.as_chunks::<2>().0 {
                 keys.push(format!("{:04x}{:04x}", pair[0], pair[1]));
             }
         }

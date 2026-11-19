@@ -901,7 +901,7 @@ fn main() {
     let backend_env =
         settle_the_vault_backend(config_dir.as_path(), active_account.as_ref(), &vault_slot);
     let backend_choice = backend_policy::install_env(backend_env)
-        .then(|| backend_policy::selected())
+        .then(backend_policy::selected)
         .unwrap_or_else(|| {
             // `install_env` refuses only `DirectRest` with no login, which
             // `settle_the_vault_backend` does not build. Handled rather than
@@ -6215,7 +6215,7 @@ fn requests_outliving_a_window(queued: Vec<MenuEvent>, satisfied: &MenuId) -> Ve
     queued
         .into_iter()
         .filter(|event| {
-            if &event.id == satisfied {
+            if event.id == satisfied {
                 log::info!(
                     "ignoring a tray request for `{}` queued while that window was already open",
                     event.id.0
@@ -8099,6 +8099,8 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 =
     windows::Win32::System::Threading::CREATE_BREAKAWAY_FROM_JOB.0;
 
 impl VaultOps for RealVaultOps<'_> {
+    // The explicit `return` is pinned: see the comment above it.
+    #[allow(clippy::needless_return)]
     fn open_window(
         &mut self,
         est: SessionEstate,
@@ -13364,7 +13366,7 @@ fn wait_for_the_vault(
         },
         ProbeWindow::InAWindow => {
             let OfflineCopy { offer, open } = offline;
-            match app_window::run_recovery(account, probe, move || offer()) {
+            match app_window::run_recovery(account, probe, offer) {
                 app_window::RecoveryOutcome::Ready(items) => VaultReadyOutcome::Ready(items),
                 app_window::RecoveryOutcome::Abandoned => VaultReadyOutcome::Dismissed,
                 app_window::RecoveryOutcome::Unreachable(e) => VaultReadyOutcome::Failed(e),
@@ -14184,10 +14186,7 @@ fn settle_the_vault_backend_when(
     // here would be a panic in the launch path resting on a property of
     // another module.
     let direct = match (choice, account) {
-        (VaultBackendChoice::DirectRest, Some(account)) => match account.server_url.as_deref() {
-            Some(server_url) => Some((account, server_url.to_string())),
-            None => None,
-        },
+        (VaultBackendChoice::DirectRest, Some(account)) => account.server_url.as_deref().map(|server_url| (account, server_url.to_string())),
         _ => None,
     };
 
@@ -25003,14 +25002,14 @@ mod tests {
         impl VaultOps for FakeVaultOps {
             fn open_window(
                 &mut self,
-                mut est: SessionEstate,
+                est: SessionEstate,
                 _deps: &VaultDeps<'_>,
             ) -> (SessionEstate, Option<VaultWindowSession>) {
                 self.charge();
                 // **Before anything else in this method.** What is recorded
                 // has to be the estate the LOOP handed over, not one this fake
                 // has already had a turn at.
-                self.seen.push(SeenEstate::of(&mut est));
+                self.seen.push(SeenEstate::of(&est));
                 self.log.push(OpLog::OpenedWindow);
                 // The estate is handed back on BOTH arms, including the panic
                 // arm's -- there is no arm here that keeps it, which is the
@@ -26373,7 +26372,7 @@ mod tests {
         fn fake_vault_ops_method_body(source: &str, name: &str) -> String {
             let impl_body = body_of(source, concat!("impl VaultOps for Fake", "VaultOps {"));
             assert!(
-                impl_body.contains(concat!("self.seen.", "push(SeenEstate::of(&mut est))")),
+                impl_body.contains(concat!("self.seen.", "push(SeenEstate::of(&est))")),
                 "control: the slice is not the fake's own impl block"
             );
             body_of(&impl_body, &format!("fn {name}("))
@@ -32479,7 +32478,7 @@ mod tests {
             use std::cell::RefCell;
 
             thread_local! {
-                static LINES: RefCell<Option<Vec<String>>> = RefCell::new(None);
+                static LINES: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
             }
 
             struct Capture;
@@ -38610,7 +38609,7 @@ mod a_missing_cli_is_never_fatal {
     #[test]
     fn the_recovery_reuses_the_sign_ins_download_and_verify_path() {
         let source = main_source();
-        let body = fn_body(&source, concat!("fn acquire_the_", "cli()"));
+        let body = fn_body(source, concat!("fn acquire_the_", "cli()"));
         assert!(
             body.contains(concat!("bw_acquire::acquire_if_", "needed(")),
             "the missing-CLI recovery no longer goes through `bw_acquire::acquire_if_needed`, \
@@ -38641,7 +38640,7 @@ mod a_missing_cli_is_never_fatal {
 
         let mut guarded = 0;
         for (at, _) in source.match_indices(failed_arm) {
-            let body = fatal_arm_body(&source, at);
+            let body = fatal_arm_body(source, at);
             if !body.contains(fatal) {
                 continue;
             }
@@ -38806,7 +38805,7 @@ mod a_missing_cli_is_never_fatal {
     #[test]
     fn the_missing_cli_is_found_before_anything_is_waited_on() {
         let source = main_source();
-        let body = fn_body(&source, concat!("fn try_start_back", "end("));
+        let body = fn_body(source, concat!("fn try_start_back", "end("));
         let found = body
             .find(concat!("the_cli_is_", "missing()"))
             .expect("`try_start_backend` no longer asks whether the CLI is on the disk at all");

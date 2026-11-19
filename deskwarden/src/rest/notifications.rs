@@ -316,10 +316,9 @@ fn hub_url(base_url: &str) -> Option<String> {
     let base = base_url.trim_end_matches('/');
     let rest = if let Some(rest) = base.strip_prefix("https://") {
         format!("wss://{rest}")
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        format!("ws://{rest}")
     } else {
-        return None;
+        let rest = base.strip_prefix("http://")?;
+        format!("ws://{rest}")
     };
     Some(format!("{rest}{HUB_PATH}"))
 }

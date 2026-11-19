@@ -731,7 +731,7 @@ pub fn pack_rgba(
         // from the far end.
         let source_row = if stride < 0 { height - 1 - y } else { y };
         let at = source_row * row_bytes;
-        for px in src[at..at + width * 4].chunks_exact(4) {
+        for px in src[at..at + width * 4].as_chunks::<4>().0 {
             out.extend_from_slice(&[px[2], px[1], px[0], 0xff]);
         }
     }

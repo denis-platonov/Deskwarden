@@ -8077,7 +8077,7 @@ mod trash_tests {
     #[test]
     fn an_empty_trash_says_so() {
         let ctx = crate::kit::testing::ctx();
-        let p = crate::kit::testing::frame(&ctx, 0.0, egui::vec2(380.0, 400.0), vec![], |ui| draw_trash_empty(ui));
+        let p = crate::kit::testing::frame(&ctx, 0.0, egui::vec2(380.0, 400.0), vec![], draw_trash_empty);
         assert!(p.text(TRASH_EMPTY).is_some() && p.text(TRASH_EMPTY_DETAIL).is_some());
     }
 }

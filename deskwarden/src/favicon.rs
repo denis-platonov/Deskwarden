@@ -1359,7 +1359,7 @@ pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)>
     let rgba = match info.color_type {
         png::ColorType::Rgba => buf[..info.buffer_size()].to_vec(),
         png::ColorType::Rgb => buf[..info.buffer_size()]
-            .chunks_exact(3)
+            .as_chunks::<3>().0.iter()
             .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
             .collect(),
         png::ColorType::Grayscale => buf[..info.buffer_size()]
@@ -1367,7 +1367,7 @@ pub fn decode_rgba_unscaled(png_bytes: &[u8]) -> Option<(usize, usize, Vec<u8>)>
             .flat_map(|&g| [g, g, g, 255])
             .collect(),
         png::ColorType::GrayscaleAlpha => buf[..info.buffer_size()]
-            .chunks_exact(2)
+            .as_chunks::<2>().0.iter()
             .flat_map(|ga| [ga[0], ga[0], ga[0], ga[1]])
             .collect(),
         // Unreachable in practice: `EXPAND` (part of `normalize_to_color8()`
@@ -1683,7 +1683,7 @@ fn decode_ico_dib(payload: &[u8]) -> Option<IcoImage<'static>> {
         } else if bpp == 32 {
             // No mask and no alpha at all: an entirely invisible image is
             // never what was meant, so read the payload as opaque.
-            for pixel in rgba.chunks_exact_mut(4) {
+            for pixel in rgba.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }
@@ -2021,9 +2021,9 @@ mod tests {
              centres what the eye actually sees"
         );
         assert!(
-            px.chunks_exact(4).all(|p| p[3] == 255),
+            px.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
             "the cropped image still carries transparent padding: {:?}",
-            px.chunks_exact(4).map(|p| p[3]).collect::<Vec<_>>()
+            px.as_chunks::<4>().0.iter().map(|p| p[3]).collect::<Vec<_>>()
         );
     }
 
@@ -3478,7 +3478,7 @@ mod tests {
         let no_mask = &flat[..flat.len() - 8];
         let (_, _, rgba) = decode_rgba_unscaled(&ico_of(2, 2, 32, no_mask)).expect("decodes");
         assert!(
-            rgba.chunks_exact(4).all(|p| p[3] == 255),
+            rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 255),
             "a 32bpp payload with no alpha and no mask decoded to an invisible image"
         );
     }

@@ -2034,7 +2034,7 @@ pub(crate) mod run_tests {
         /// Foreground for the first `n` checks, then gone for good.
         pub(crate) fn loses_foreground_after(n: usize) -> Self {
             let me = Self::new();
-            let mut answers: std::collections::VecDeque<bool> = std::iter::repeat(true).take(n).collect();
+            let mut answers: std::collections::VecDeque<bool> = std::iter::repeat_n(true, n).collect();
             answers.push_back(false);
             *me.answers.borrow_mut() = answers;
             me

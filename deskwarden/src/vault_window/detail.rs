@@ -4099,8 +4099,7 @@ pub fn draw_detail_read(
     // is that the confirmation belongs to the topmost surface, and a modal is
     // topmost whenever there is one; see `item_list::a_modal_is_up`, which the
     // list already asks the same question of for the same kind of reason.
-    if !super::item_list::a_modal_is_up(ui.ctx()) {
-    }
+    super::item_list::a_modal_is_up(ui.ctx());
     action
 }
 
@@ -4282,7 +4281,7 @@ pub fn app_match_is_dead(m: &AppMatch) -> bool {
 ///    worker, so the name falls back to the file name, no icon is fetched at
 ///    all, and no dialog is raised. The `Program file` row below is still
 ///    showing the full path, which is the thing the user has to act on.
-pub(crate) fn app_name_lookup_path<'a>(m: &'a AppMatch) -> &'a str {
+pub(crate) fn app_name_lookup_path(m: &AppMatch) -> &str {
     if app_match_is_dead(m) {
         return "";
     }
@@ -10238,7 +10237,8 @@ mod tests {
             // now the only line this kebab draws for EVERY kind. One sibling
             // still makes the point the loop exists for: a menu that had
             // turned uniformly red fails here.
-            for sibling in [crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
+            {
+                let sibling = crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL;
                 assert_ne!(
                     open.text_colour_of(sibling),
                     theme::ERROR,
@@ -11728,7 +11728,8 @@ mod tests {
                     // because the whole point of the login fixture is that
                     // they are in the frame this assertion is made against --
                     // a count alone would be satisfied by two other cards.
-                    for heading in ["PREVIOUS PASSWORDS"] {
+                    {
+                        let heading = "PREVIOUS PASSWORDS";
                         assert!(
                             headings.iter().any(|(h, _)| *h == heading),
                             "the login fixture drew no {heading} card, so 'NOTES is below \
@@ -14560,7 +14561,7 @@ mod tests {
         );
         assert_eq!(view_only_footer("denis@x.io", false), "Shared by denis@x.io, view-only. Only they can edit or delete it.");
         for writer in ["Edit", "Clone", crate::vault_window::item_list::DELETE_LABEL, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
-            assert!(!painted.iter().any(|s| *s == writer), "a received record's kebab offers {writer:?}: {painted:?}");
+            assert!(!painted.contains(&writer), "a received record's kebab offers {writer:?}: {painted:?}");
         }
     }
 
@@ -14584,7 +14585,7 @@ mod tests {
         let mut unnamed = Pane::new();
         let open = unnamed.open_kebab(&item, &TotpState::NoSecret);
         let painted = open.strings();
-        assert!(painted.iter().any(|s| *s == VIEW_ONLY_FOOTER), "control: the unnamed kebab opened: {painted:?}");
+        assert!(painted.contains(&VIEW_ONLY_FOOTER), "control: the unnamed kebab opened: {painted:?}");
         assert!(!painted.iter().any(|s| s.starts_with("Stop receiving")), "{painted:?}");
     }
 
@@ -14645,9 +14646,9 @@ mod tests {
         assert!(!frame.texts.iter().any(|(t, _)| t.contains("Shared by")), "{:?}", frame.texts);
         let open = pane.open_kebab(&item, &TotpState::NoSecret);
         let painted = open.strings();
-        assert!(painted.iter().any(|s| *s == VIEW_ONLY_FOOTER), "{painted:?}");
+        assert!(painted.contains(&VIEW_ONLY_FOOTER), "{painted:?}");
         for writer in ["Edit", "Clone", crate::vault_window::item_list::DELETE_LABEL, crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL] {
-            assert!(!painted.iter().any(|s| *s == writer), "an edit:false item's kebab offers {writer:?}: {painted:?}");
+            assert!(!painted.contains(&writer), "an edit:false item's kebab offers {writer:?}: {painted:?}");
         }
     }
 

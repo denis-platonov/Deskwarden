@@ -4280,7 +4280,7 @@ mod tests {
     /// A valid id made of one repeated hex digit, so the literal it must equal
     /// is readable at the assertion site.
     fn id_of(c: char) -> AccountId {
-        AccountId::parse(&std::iter::repeat(c).take(32).collect::<String>())
+        AccountId::parse(&std::iter::repeat_n(c, 32).collect::<String>())
             .expect("32 repeated lowercase hex characters is a valid id")
     }
 

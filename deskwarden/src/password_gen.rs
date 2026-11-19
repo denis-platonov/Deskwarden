@@ -1628,7 +1628,7 @@ mod tests {
         // very function the refusals below are asked of.
         let good = dir.join(WORDLIST_FILE);
         std::fs::write(&good, shipped.as_bytes()).unwrap();
-        let words = load_wordlist_from(&[good.clone()])
+        let words = load_wordlist_from(std::slice::from_ref(&good))
             .expect("the shipped list, through the loader under test");
         assert_eq!(words.len(), WORDLIST_WORDS);
 
@@ -1636,7 +1636,7 @@ mod tests {
         // file. The content is byte-for-byte the list that just verified, so
         // any answer about the CONTENT here is provably wrong.
         let lock = std::fs::OpenOptions::new().write(true).share_mode(0).open(&good).unwrap();
-        let busy = load_wordlist_from(&[good.clone()]).unwrap_err();
+        let busy = load_wordlist_from(std::slice::from_ref(&good)).unwrap_err();
         drop(lock);
         assert_eq!(
             busy,
@@ -1645,7 +1645,7 @@ mod tests {
         );
         // And it reads as its own answer once the writer lets go, which is the
         // whole claim the sentence makes to the user.
-        load_wordlist_from(&[good.clone()]).expect("the same file, after the lock was released");
+        load_wordlist_from(std::slice::from_ref(&good)).expect("the same file, after the lock was released");
 
         // 2: not a busy file, a wrong one. `read_to_string` fails this with
         // `InvalidData`, and that must not have been swept into the new
@@ -1754,7 +1754,7 @@ mod tests {
             let phrase =
                 generate_passphrase_from(&list, &recipe).expect("the shipped list and the CSPRNG");
             let parts: Vec<&str> = phrase.split('-').collect();
-            assert_eq!(parts.len(), WORDS, "a {WORDS}-word passphrase came back as `{}`", &*phrase);
+            assert_eq!(parts.len(), WORDS, "a {WORDS}-word passphrase came back as `{}`", *phrase);
             for part in parts {
                 let index = *index_of
                     .get(part)
@@ -1820,7 +1820,7 @@ mod tests {
                 phrase.split(' ').count(),
                 expected,
                 "asking for {asked} words produced `{}`",
-                &*phrase
+                *phrase
             );
         }
     }
@@ -1901,7 +1901,7 @@ mod tests {
             assert!(
                 plain.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
                 "`{}` is not all lowercase with capitalize off",
-                &*plain
+                *plain
             );
         }
     }
@@ -1923,7 +1923,7 @@ mod tests {
                 with.chars().filter(char::is_ascii_digit).count(),
                 1,
                 "`{}` does not carry exactly one digit",
-                &*with
+                *with
             );
             let without =
                 generate_passphrase(&PassphraseRecipe { include_number: false, ..base.clone() })
@@ -1931,7 +1931,7 @@ mod tests {
             assert!(
                 !without.chars().any(|c| c.is_ascii_digit()),
                 "`{}` carries a digit with includeNumber off",
-                &*without
+                *without
             );
         }
     }
@@ -1968,7 +1968,7 @@ mod tests {
             let mut found = None;
             for (index, word) in phrase.split('-').enumerate() {
                 if word.chars().any(|c| c.is_ascii_digit()) {
-                    assert!(found.is_none(), "`{}` carries two numbered words", &*phrase);
+                    assert!(found.is_none(), "`{}` carries two numbered words", *phrase);
                     found = Some(index);
                 }
             }
@@ -2020,7 +2020,7 @@ mod tests {
         let phrase = generate(&GenerateRequest::Passphrase(PassphraseRecipe::default()))
             .expect("a passphrase");
         // The default recipe: four words, `-`, capitalised, with a number.
-        assert_eq!(phrase.split('-').count(), 4, "{}", &*phrase);
+        assert_eq!(phrase.split('-').count(), 4, "{}", *phrase);
         assert_eq!(phrase.chars().filter(char::is_ascii_digit).count(), 1);
     }
 

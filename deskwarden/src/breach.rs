@@ -402,7 +402,7 @@ fn group_thousands(count: u64) -> String {
     let digits = count.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(suffix.len(), 35);
         // And the two halves really do reassemble into the vector, so neither
         // assertion above can be satisfied by an overlap or a gap.
-        assert_eq!(format!("{prefix}{}", &*suffix), PASSWORD_SHA1);
+        assert_eq!(format!("{prefix}{}", *suffix), PASSWORD_SHA1);
     }
 
     #[test]
@@ -2051,7 +2051,7 @@ mod tests {
             assert_eq!(prefix.as_str().len(), PREFIX_LEN, "{password:?}");
             assert_eq!(prefix.as_str(), &hex[..PREFIX_LEN], "{password:?}");
             assert_eq!(
-                format!("{}{}", prefix.as_str(), &*suffix).as_str(),
+                format!("{}{}", prefix.as_str(), *suffix).as_str(),
                 hex.as_str(),
                 "prefix and suffix do not reassemble into the hash for {password:?}"
             );

@@ -104,7 +104,7 @@ pub fn extract_small_icon(exe_path: &str) -> Option<IconRgba> {
         }
 
         // GDI hands back BGRA; egui wants RGBA.
-        for px in buffer.chunks_exact_mut(4) {
+        for px in buffer.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
         }
 

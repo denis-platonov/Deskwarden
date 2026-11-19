@@ -1554,10 +1554,10 @@ fn iso_from_millis(millis: i64) -> String {
 /// rail counted. The predicate is [`crate::vault_window::sidebar::SendScope::admits`]
 /// -- the SAME function the badge counts through -- which is what stops a
 /// sub-row saying 2 over a list of three.
-pub fn rows_in_scope<'a>(
-    rows: &'a [SendRow],
+pub fn rows_in_scope(
+    rows: &[SendRow],
     scope: crate::vault_window::sidebar::SendScope,
-) -> Vec<&'a SendRow> {
+) -> Vec<&SendRow> {
     rows.iter().filter(|row| scope.admits(row.state)).collect()
 }
 
@@ -3831,7 +3831,7 @@ fn draw_fact_card(
         // width, so the pane looks identical whether it fits or not, and the
         // reader is shown a string that has quietly lost its end.
         let label_galley =
-            elided(&p, label, label_font.clone(), theme::TEXT_FAINT, label_width);
+            elided(p, label, label_font.clone(), theme::TEXT_FAINT, label_width);
         p.galley(
             egui::pos2(rect.left() + CARD_PAD_X, middle - label_galley.size().y / 2.0),
             label_galley,
@@ -3898,7 +3898,7 @@ fn draw_fact_card(
                 // rest.
                 let galley = elided(
                     &clip,
-                    *url,
+                    url,
                     egui::FontId::new(12.0, egui::FontFamily::Monospace),
                     colour,
                     (right - cell.left()).max(0.0),
@@ -3993,7 +3993,7 @@ fn draw_fact_card(
         // 5c's `width: 15; height: 15` triangle, through the theme's own
         // glyph rather than a second drawing of one.
         theme::paint_warning_glyph(
-            &p,
+            p,
             egui::Rect::from_min_size(
                 egui::pos2(band_rect.left() + CARD_PAD_X, top + CAUTION_PAD_Y + 1.0),
                 egui::Vec2::splat(CAUTION_GLYPH),
@@ -9407,7 +9407,8 @@ mod paint_tests {
         // And the row is still INSIDE the pane, which is the whole reason the
         // padding shrinks rather than the labels.
         let right = min_pane_size().x;
-        for label in [REVOKE_LABEL] {
+        {
+            let label = REVOKE_LABEL;
             let rect = detail_rect(&tight, label);
             assert!(
                 rect.right() <= right,
@@ -10222,7 +10223,7 @@ mod source_pins {
                     blank(&mut out, i + 1, j + 1);
                     i = j + 1;
                     let close: Vec<u8> =
-                        std::iter::once(b'"').chain(std::iter::repeat(b'#').take(hashes)).collect();
+                        std::iter::once(b'"').chain(std::iter::repeat_n(b'#', hashes)).collect();
                     let start = i;
                     while i < b.len() && !b[i..].starts_with(&close) {
                         i += 1;
@@ -12005,7 +12006,7 @@ mod source_pins {
                         .iter()
                         .map(|name| region.matches(&format!("{name}(")).count())
                         .sum();
-                    std::iter::repeat(path.as_str()).take(count)
+                    std::iter::repeat_n(path.as_str(), count)
                 })
                 .collect();
             let needle = format!("{item}(");
@@ -12137,7 +12138,7 @@ mod source_pins {
                     .iter()
                     .map(|name| mentions(&region, name))
                     .sum();
-                std::iter::repeat(path.as_str()).take(count)
+                std::iter::repeat_n(path.as_str(), count)
             })
             .collect();
 
@@ -14801,7 +14802,7 @@ mod source_pins {
                 let end = start + needle.len();
                 let before = hay[..start].chars().next_back();
                 let after = hay[end..].chars().next();
-                if before.map_or(true, |c| !ident(c)) && after.map_or(true, |c| !ident(c)) {
+                if before.is_none_or(|c| !ident(c)) && after.is_none_or(|c| !ident(c)) {
                     count += 1;
                 }
                 from = start + 1;

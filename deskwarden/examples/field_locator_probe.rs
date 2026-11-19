@@ -214,10 +214,7 @@ fn walk(
         out.push(describe(element, path, control_type, is_password));
     }
 
-    let mut child = match unsafe { walker.GetFirstChildElement(element) } {
-        Ok(c) => Some(c),
-        Err(_) => None,
-    };
+    let mut child = unsafe { walker.GetFirstChildElement(element) }.ok();
     let mut index = 0usize;
     while let Some(c) = child {
         if *visited >= max_nodes {
@@ -411,8 +408,8 @@ fn print_summary(reports: &[WindowReport]) {
     println!("================================================================");
     println!("SUMMARY (one line per window with at least one field)");
     println!(
-        "{:<28} {:<18} {:>6} {:>4} {:>10}  {}",
-        "exe", "frameworks", "fields", "pw", "with-aid", "title"
+        "{:<28} {:<18} {:>6} {:>4} {:>10}  title",
+        "exe", "frameworks", "fields", "pw", "with-aid"
     );
     for r in reports {
         if r.fields.is_empty() {

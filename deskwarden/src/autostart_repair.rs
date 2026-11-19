@@ -137,7 +137,7 @@ pub fn repair_logon_entry() {
             .is_ok()
             {
                 let wide: Vec<u16> = buf
-                    .chunks_exact(2)
+                    .as_chunks::<2>().0.iter()
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
                     .take_while(|c| *c != 0)
                     .collect();
@@ -231,7 +231,7 @@ fn read_run_value() -> Option<String> {
             let mut got = len;
             if RegQueryValueExW(key, PCWSTR(name.as_ptr()), None, None, Some(buf.as_mut_ptr()), Some(&mut got)).is_ok() {
                 let wide: Vec<u16> =
-                    buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|c| *c != 0).collect();
+                    buf.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|c| *c != 0).collect();
                 out = Some(String::from_utf16_lossy(&wide));
             }
         }
