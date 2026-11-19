@@ -12565,7 +12565,10 @@ fn apply_send_action(
         // asserts in the same breath that egui's clipboard was handed
         // NOTHING, which is exactly what a revert to `ctx.copy_text(url)`
         // here would do.
-        send_ui::SendUiAction::CopyLink(url) => copy(&url),
+        send_ui::SendUiAction::CopyLink(url) => {
+            copy(&url);
+            crate::kit::toast::show(ctx, send_ui::LINK_COPIED_TOAST);
+        }
         // Refresh and a dismissed band are the same operation: forget the
         // answer, so `wants_fetch` is true on the next frame and the list is
         // asked for again. A dismissal that only hid the message would leave

@@ -1195,47 +1195,23 @@ pub fn state_label(state: crate::send::SendState) -> &'static str {
 /// locally, because 5b draws this pill in the list and again in the detail
 /// header and 5d draws it on a record; see `theme::state_pill`.
 pub fn state_tone(state: crate::send::SendState) -> theme::PillTone {
+    // Spec section 4's pills, borderless: the edge is the fill.
+    let p = crate::kit::tokens::Palette::LIGHT;
+    let pill = |fill, ink, mark| theme::PillTone { fill, edge: fill, ink, mark };
     match state {
-        crate::send::SendState::Waiting => theme::PillTone {
-            fill: theme::BLUE_WASH,
-            edge: theme::BLUE_EDGE,
-            ink: theme::BLUE_DEEP,
-            mark: theme::PillMark::Dot(theme::BLUE),
-        },
-        // **`Opened` is green with a dot**: the design's "done" wash, because
-        // a link somebody has opened has done what it was sent to do, and the
-        // live state's dot, because it still works. Distinct from `Waiting`'s
-        // blue at a glance, and from `Used` -- the same green -- by its mark:
-        // a dot is a link still answering, the tick is one that is spent.
-        crate::send::SendState::Opened => theme::PillTone {
-            fill: theme::DONE_WASH,
-            edge: theme::DONE_EDGE,
-            ink: theme::DONE_INK,
-            mark: theme::PillMark::Dot(theme::DONE_MARK),
-        },
-        crate::send::SendState::Used => theme::PillTone {
-            fill: theme::DONE_WASH,
-            edge: theme::DONE_EDGE,
-            ink: theme::DONE_INK,
-            mark: theme::PillMark::Check(theme::DONE_MARK),
-        },
+        crate::send::SendState::Waiting => pill(p.blue_wash, p.blue_deep, theme::PillMark::Dot(p.blue)),
+        crate::send::SendState::Opened => pill(p.done_wash, p.done_ink, theme::PillMark::Dot(p.done_mark)),
+        crate::send::SendState::Used => pill(p.done_wash, p.done_ink, theme::PillMark::Check(p.done_mark)),
         // **No mark, and that is the design's own distinction**, not an
         // omission: a dot on these two would say the link is still doing
         // something. See `theme::PillMark`.
-        crate::send::SendState::Expired => theme::PillTone {
-            fill: theme::CANVAS,
-            edge: theme::BORDER,
-            ink: theme::TEXT_FAINT,
-            mark: theme::PillMark::None,
-        },
-        crate::send::SendState::Revoked => theme::PillTone {
-            fill: theme::DANGER_WASH,
-            edge: theme::DANGER_EDGE,
-            ink: theme::DANGER_INK,
-            mark: theme::PillMark::None,
-        },
+        crate::send::SendState::Expired => pill(p.hover, p.text_faint, theme::PillMark::None),
+        crate::send::SendState::Revoked => pill(p.danger_wash, p.error, theme::PillMark::None),
     }
 }
+
+/// What copying a Send's link says (spec section 4).
+pub const LINK_COPIED_TOAST: &str = "Link copied";
 
 /// **A record's fields as a row of pills** -- design 5b's `WHAT WAS SHARED`
 /// and the whole-record line of 5a's card both draw one. Blue for an ordinary
@@ -5226,6 +5202,26 @@ fn draw_notice_band(ui: &mut egui::Ui, message: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Spec section 4's state pills: Waiting blue, Opened and Used green,
+    /// Expired grey, Revoked red -- each fill with its own ink.
+    #[test]
+    fn state_pills_wear_the_designs_colours() {
+        use crate::kit::tokens::Palette;
+        use crate::send::SendState;
+        let p = Palette::LIGHT;
+        for (state, fill, ink) in [
+            (SendState::Waiting, p.blue_wash, p.blue_deep),
+            (SendState::Opened, p.done_wash, p.done_ink),
+            (SendState::Used, p.done_wash, p.done_ink),
+            (SendState::Expired, p.hover, p.text_faint),
+            (SendState::Revoked, p.danger_wash, p.error),
+        ] {
+            let tone = super::state_tone(state);
+            assert_eq!((tone.fill, tone.ink), (fill, ink), "{state:?}");
+        }
+        assert_eq!(super::LINK_COPIED_TOAST, "Link copied");
+    }
+
     use super::*;
     use crate::send::{list_sends, FixedClock, RawOutput, SendInvocation, SendRunner};
     use std::cell::RefCell;
@@ -8434,7 +8430,7 @@ mod paint_tests {
             with_icon.images
         );
         assert!(
-            !with_icon.text.iter().any(|t| t == &theme::initials(&record.name)),
+            !with_icon.text.iter().any(|t| t == &crate::vault_window::item_list::initials(&record.name)),
             "the monogram was painted as well as the icon: {:?}",
             with_icon.text
         );
@@ -8445,7 +8441,7 @@ mod paint_tests {
         let without = paint_sent_with(&state, size, |_| (vec![record.clone()], None));
         assert!(without.images.is_empty(), "a picture with no icon: {:?}", without.images);
         assert!(
-            without.text.iter().any(|t| t == &theme::initials(&record.name)),
+            without.text.iter().any(|t| t == &crate::vault_window::item_list::initials(&record.name)),
             "no monogram when the record has no icon: {:?}",
             without.text
         );

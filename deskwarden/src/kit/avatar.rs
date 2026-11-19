@@ -63,7 +63,12 @@ pub fn paint(painter: &Painter, rect: Rect, look: &Look, radius: u8) {
             painter.add(RectShape::new(rect, corner, Color32::WHITE, Stroke::new(1.0, FAVICON_RING), StrokeKind::Inside));
             let side = at(h, 22.0, 34.0);
             let image = Rect::from_center_size(rect.center(), Vec2::splat(side));
-            painter.image(texture.id(), image, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+            // A textured rect rather than `Painter::image`'s mesh: the same
+            // pixels, and a shape the window's tests can recognise as a picture.
+            painter.add(
+                RectShape::filled(image, CornerRadius::ZERO, Color32::WHITE)
+                    .with_texture(texture.id(), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))),
+            );
         }
         Look::Brand { label, bg, italic } => {
             painter.add(RectShape::filled(rect, corner, *bg));

@@ -8,7 +8,6 @@ use super::detail::{kind_offers_edit, kind_offers_fill};
 use super::detail_edit::assignable_folders;
 use super::sidebar::{FilterSource, OutOfVault, SidebarFilter};
 use crate::card_brand::{brand_for_number, CardBrand};
-use crate::kind_mark;
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
 use crate::kit::{self, motion, tokens};
@@ -2003,13 +2002,16 @@ pub(crate) fn row_tile(
     size: f32,
     selected: bool,
 ) {
-    match icon {
-        Some(tex) => {
-            let tile = theme::avatar_artwork_tile(ui, size, selected);
-            theme::avatar_image(ui, tile, tex, selected);
+    let _ = (kind, selected);
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(size), Sense::hover());
+    let look = match icon {
+        Some(texture) => kit::avatar::Look::Favicon(texture.clone()),
+        None => {
+            let (bg, fg) = kit::avatar::initials_colours(name);
+            kit::avatar::Look::Initials { text: initials(name), bg, fg }
         }
-        None => kind_mark::avatar(ui, kind, name, size, selected),
-    }
+    };
+    kit::avatar::paint(ui.painter(), rect, &look, 12);
 }
 
 /// **Design 2b's list header strip**: a white tile the full width of the
