@@ -2958,7 +2958,9 @@ mod tests {
             .map(|i| login(&format!("id{i}"), &format!("Item {i}"), Some(STRONG_A)))
             .collect();
         let icons = item_list::IconCache::default();
-        let (mut search, mut selected, mut visible) = (String::new(), None, Vec::new());
+        // The first row selected: a v2 row paints its box only when it is
+        // selected (or hovered), so that is the row whose span is read.
+        let (mut search, mut selected, mut visible) = (String::new(), Some("id0".to_string()), Vec::new());
         let mut spans = Vec::new();
         for frame in 0..3 {
             let output = ctx.run_ui(column_input(pointer_inside), |ui| {
@@ -2979,6 +2981,8 @@ mod tests {
                     &mut false,
                         &std::collections::HashSet::new(),
                         &item_list::RowPeople::default(),
+                        "All items",
+                        false,
                     );
             });
             if frame == 2 {

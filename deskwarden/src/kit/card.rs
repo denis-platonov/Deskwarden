@@ -1,7 +1,7 @@
 //! Cards, the rules between their rows, field and section labels, and the
 //! App / 2FA / Shared tags.
 
-use eframe::egui::{Color32, CornerRadius, Margin, Response, Sense, Ui, Vec2};
+use eframe::egui::{Color32, CornerRadius, Margin, Painter, Pos2, Rect, Response, Sense, Ui, Vec2};
 
 use crate::kit::tokens::{self, card_frame, palette, Role, LABEL, SECTION, TAG_DETAIL, TAG_LIST};
 
@@ -38,6 +38,9 @@ pub enum TagKind {
     TwoFa,
     /// The item is shared.
     Shared,
+    /// Someone shares the item with this account and it cannot be changed
+    /// here: 0.15's `view-only` chip, in the neutral tag's colours.
+    ViewOnly,
 }
 
 /// The list's small tags or the detail header's larger ones.
@@ -55,23 +58,51 @@ pub fn tag_role(size: TagSize) -> Role {
     }
 }
 
-/// One tag: padding 2x7 at radius 6 in lists, 3x9 at radius 7 in the detail
-/// header.
-pub fn tag(ui: &mut Ui, kind: TagKind, size: TagSize) -> Response {
-    let p = palette(ui.ctx());
-    let (label, bg, ink) = match kind {
+/// A tag's word and colours.
+fn tag_look(p: &tokens::Palette, kind: TagKind) -> (&'static str, Color32, Color32) {
+    match kind {
         TagKind::App => ("App", p.tag_neutral_bg, p.tag_neutral_ink),
         TagKind::TwoFa => ("2FA", p.tag_2fa_bg, p.done_ink),
         TagKind::Shared => ("Shared", p.blue, Color32::WHITE),
-    };
-    let (pad, radius) = match size {
+        TagKind::ViewOnly => ("View only", p.tag_neutral_bg, p.tag_neutral_ink),
+    }
+}
+
+/// A tag's padding and corner radius at `size`.
+fn tag_box(size: TagSize) -> (Vec2, u8) {
+    match size {
         TagSize::List => (Vec2::new(7.0, 2.0), 6),
         TagSize::Detail => (Vec2::new(9.0, 3.0), 7),
-    };
-    let galley = ui.fonts_mut(|f| f.layout_job(tokens::job(tag_role(size), label, ink)));
-    let (rect, response) = ui.allocate_exact_size(galley.size() + pad * 2.0, Sense::hover());
-    ui.painter().rect_filled(rect, CornerRadius::same(radius), bg);
-    ui.painter().galley(rect.min + pad, galley, ink);
+    }
+}
+
+fn tag_galley(ctx: &eframe::egui::Context, kind: TagKind, size: TagSize) -> std::sync::Arc<eframe::egui::Galley> {
+    let (label, _, ink) = tag_look(&palette(ctx), kind);
+    ctx.fonts_mut(|f| f.layout_job(tokens::job(tag_role(size), label, ink)))
+}
+
+/// How big a tag of `kind` at `size` is, for laying one out by hand.
+pub fn tag_size(ctx: &eframe::egui::Context, kind: TagKind, size: TagSize) -> Vec2 {
+    tag_galley(ctx, kind, size).size() + tag_box(size).0 * 2.0
+}
+
+/// Paints a tag with its top-left at `at`, allocating nothing: for rows that
+/// are painted by hand. Returns where it went.
+pub fn paint_tag(painter: &Painter, at: Pos2, kind: TagKind, size: TagSize) -> Rect {
+    let (_, bg, ink) = tag_look(&palette(painter.ctx()), kind);
+    let (pad, radius) = tag_box(size);
+    let galley = tag_galley(painter.ctx(), kind, size);
+    let rect = Rect::from_min_size(at, galley.size() + pad * 2.0);
+    painter.rect_filled(rect, CornerRadius::same(radius), bg);
+    painter.galley(rect.min + pad, galley, ink);
+    rect
+}
+
+/// One tag: padding 2x7 at radius 6 in lists, 3x9 at radius 7 in the detail
+/// header.
+pub fn tag(ui: &mut Ui, kind: TagKind, size: TagSize) -> Response {
+    let (rect, response) = ui.allocate_exact_size(tag_size(ui.ctx(), kind, size), Sense::hover());
+    paint_tag(ui.painter(), rect.min, kind, size);
     response
 }
 
@@ -106,6 +137,7 @@ mod tests {
             (TagKind::App, "App", P.tag_neutral_bg, P.tag_neutral_ink),
             (TagKind::TwoFa, "2FA", P.tag_2fa_bg, P.done_ink),
             (TagKind::Shared, "Shared", P.blue, Color32::WHITE),
+            (TagKind::ViewOnly, "View only", P.tag_neutral_bg, P.tag_neutral_ink),
         ] {
             for (size, pad_y, radius) in [(TagSize::List, 2.0, 6), (TagSize::Detail, 3.0, 7)] {
                 let mut rect = Rect::NOTHING;
@@ -119,6 +151,20 @@ mod tests {
                 assert!((rect.height() - (text_h + 2.0 * pad_y)).abs() < 0.5, "{label} {size:?}: {rect:?}");
             }
         }
+    }
+
+    #[test]
+    fn a_painted_tag_is_the_allocated_tag_at_a_point() {
+        let ctx = ctx();
+        let mut placed = Rect::NOTHING;
+        let mut painted_at = Rect::NOTHING;
+        frame(&ctx, 0.0, SCREEN, vec![], |ui| placed = tag(ui, TagKind::TwoFa, TagSize::List).rect);
+        let painted = frame(&ctx, 0.1, SCREEN, vec![], |ui| {
+            painted_at = paint_tag(ui.painter(), placed.min, TagKind::TwoFa, TagSize::List)
+        });
+        assert_eq!(painted_at, placed);
+        assert_eq!(tag_size(&ctx, TagKind::TwoFa, TagSize::List), placed.size());
+        assert!(painted.rects.iter().any(|r| r.rect == placed && r.fill == P.tag_2fa_bg));
     }
 
     #[test]

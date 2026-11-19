@@ -512,6 +512,53 @@ pub enum SidebarAction {
 /// a real folder could equally be called, so matching on that would let
 /// someone lock themselves out of a folder they actually named "No
 /// Folder"). Nothing about it can be renamed or deleted.
+/// The list header's name for `filter` (spec 3.1): the row's own label for
+/// the vault's kinds, a folder's or an organisation's own name, and a
+/// collection's. A folder or collection that has gone since it was picked
+/// reads as its kind.
+pub fn scope_title(filter: &SidebarFilter, folders: &[Folder], lists: VaultLists<'_>) -> String {
+    let fixed = match filter {
+        SidebarFilter::All => "All items",
+        SidebarFilter::Favorites => "Favorites",
+        SidebarFilter::Apps => "Apps",
+        SidebarFilter::Logins => "Logins",
+        SidebarFilter::Passkeys => "Passkeys",
+        SidebarFilter::Cards => "Cards",
+        SidebarFilter::Identities => "Identities",
+        SidebarFilter::SecureNotes => "Secure notes",
+        SidebarFilter::SshKeys => "SSH keys",
+        SidebarFilter::Archive => "Archive",
+        SidebarFilter::Trash => "Trash",
+        SidebarFilter::Folder(id) => {
+            return folders.iter().find(|f| &f.id == id).map_or_else(|| "Folder".to_string(), |f| f.name.clone())
+        }
+        SidebarFilter::Unfiled => {
+            return folders
+                .iter()
+                .find(|f| is_virtual_folder(f))
+                .map_or_else(|| "No folder".to_string(), |f| f.name.clone())
+        }
+        SidebarFilter::Organisation(id) => {
+            return lists
+                .sharing
+                .visible_organisations()
+                .into_iter()
+                .find(|o| &o.id == id)
+                .map_or_else(|| "Organisation".to_string(), |o| o.label().to_string())
+        }
+        SidebarFilter::Collection(id) => {
+            return lists
+                .sharing
+                .visible_organisations()
+                .into_iter()
+                .flat_map(|o| lists.sharing.collections_of(&o.id))
+                .find(|c| &c.id == id)
+                .map_or_else(|| "Collection".to_string(), |c| c.label().to_string())
+        }
+    };
+    fixed.to_string()
+}
+
 pub fn is_virtual_folder(folder: &Folder) -> bool {
     folder.id.is_empty()
 }
@@ -2176,6 +2223,8 @@ mod drag_and_drop_tests {
                                 &mut false,
                         &std::collections::HashSet::new(),
                         &crate::vault_window::item_list::RowPeople::default(),
+                        "All items",
+                        false,
                     );
                         },
                     );
@@ -2409,6 +2458,8 @@ mod drag_and_drop_tests {
                                 &mut false,
                         &std::collections::HashSet::new(),
                         &crate::vault_window::item_list::RowPeople::default(),
+                        "All items",
+                        false,
                     );
                         },
                     );
@@ -2583,6 +2634,8 @@ mod drag_and_drop_tests {
                                 &mut false,
                         &std::collections::HashSet::new(),
                         &crate::vault_window::item_list::RowPeople::default(),
+                        "All items",
+                        false,
                     );
                         },
                     );

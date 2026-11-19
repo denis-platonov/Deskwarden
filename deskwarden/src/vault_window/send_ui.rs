@@ -8318,57 +8318,13 @@ mod paint_tests {
         painted
     }
 
-    /// The records list, as the window draws it -- its own panel at the
-    /// column's width, no margin -- with `record` in it and picked.
-    fn paint_records_list(record: &crate::vault_bridge::VaultItem, size: egui::Vec2) -> Painted {
-        let ctx = egui::Context::default();
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            ..Default::default()
-        };
-        let _ = ctx.run_ui(input(), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(input(), |_ui| {});
-        let items = vec![record.clone()];
-        let mut search = String::new();
-        let mut selected = Some(record.id.clone());
-        let mut visible = Vec::new();
-        let mut opened = false;
-        let icons = crate::vault_window::item_list::IconCache::default();
-        let output = ctx.run_ui(input(), |ui| {
-            egui::Panel::left("the-records-list")
-                .exact_size(crate::vault_window::LIST_WIDTH)
-                .resizable(false)
-                .show_separator_line(false)
-                .frame(egui::Frame::new().fill(theme::CANVAS))
-                .show(ui, |ui| {
-                    let _ = crate::vault_window::item_list::draw_item_list(
-                        ui,
-                        Some(&items),
-                        &[],
-                        &crate::vault_window::sidebar::SidebarFilter::All,
-                        &mut search,
-                        &mut selected,
-                        &icons,
-                        false,
-                        &mut visible,
-                        None,
-                        false,
-                        &mut opened,
-                        &std::collections::HashSet::new(),
-                        &crate::vault_window::item_list::RowPeople::default(),
-                    );
-                });
-        });
-        let mut painted = Painted::default();
-        for clipped in &output.shapes {
-            collect(&clipped.shape, &mut painted);
-        }
-        painted
-    }
-
     /// The pieces of a list column's header and first row, **as painted**:
     /// the strip, its hairline, the row's band and its tile.
+    ///
+    /// `strip`, `hairline` and `row_edge` were read by the records-list
+    /// comparison slice 3 retired with the v1 rows; task 5 redraws the Sent
+    /// list in v2 and its tests with it.
+    #[allow(dead_code)]
     struct ListShape {
         strip: egui::Rect,
         hairline: egui::Rect,
@@ -8427,71 +8383,6 @@ mod paint_tests {
             .next()
             .unwrap_or_else(|| panic!("{what}: no square tile inside the row"));
         ListShape { strip, hairline, row, row_edge, tile }
-    }
-
-    /// **The Sent list is drawn to the records list's shape: the same header
-    /// strip and rule, the same row band, the same tile in the same place,
-    /// the same selected edge -- measured off what each list PAINTS.**
-    ///
-    /// The owner put the two side by side: a 56pt strip against a 58pt one,
-    /// a 54pt row with a 32pt tile against a 62pt row with a 40pt one. The
-    /// Sent list now reads the records list's constants and draws through its
-    /// functions, and this is what says the result is the same picture -- not
-    /// a constant compared with itself, but two rendered columns compared
-    /// rect for rect, which catches a shared number used in a different way
-    /// as surely as a different number.
-    #[test]
-    fn the_sent_list_is_drawn_to_the_records_lists_shape() {
-        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
-        let record = a_record("rec-1", "SAP Production");
-        let records_painted = paint_records_list(&record, size);
-        let sent_painted =
-            paint_sent_with(&a_send_made_from(&record), size, |_| (vec![record.clone()], None));
-        let records = list_shape(&records_painted, "the records list");
-        let sent = list_shape(&sent_painted, "the Sent list");
-
-        // The name, where each list sets it: the records row's text gap
-        // beside the tile, and the same line.
-        let name_in = |painted: &Painted, what: &str| {
-            *painted
-                .text_rects
-                .iter()
-                .filter(|(t, r)| t == &record.name && r.center().x < crate::vault_window::LIST_WIDTH)
-                .map(|(_, r)| r)
-                .next()
-                .unwrap_or_else(|| panic!("{what} painted no name in its row"))
-        };
-        let (r_name, s_name) = (name_in(&records_painted, "the records list"), name_in(&sent_painted, "the Sent list"));
-        assert!(
-            (r_name.left() - s_name.left()).abs() < 0.51,
-            "the name starts at {} on the Sent row and {} on the records row",
-            s_name.left(),
-            r_name.left()
-        );
-        assert!(
-            (r_name.top() - s_name.top()).abs() < 1.01,
-            "the name sits at {} on the Sent row and {} on the records row",
-            s_name.top(),
-            r_name.top()
-        );
-
-        let close = |a: egui::Rect, b: egui::Rect| {
-            (a.min - b.min).length() < 0.51 && (a.max - b.max).length() < 0.51
-        };
-        for (part, r, s) in [
-            ("header strip", records.strip, sent.strip),
-            ("strip's hairline", records.hairline, sent.hairline),
-            ("row band", records.row, sent.row),
-            ("row tile", records.tile, sent.tile),
-        ] {
-            assert!(close(r, s), "the {part} is {s:?} on the Sent list and {r:?} on the records list");
-        }
-        assert_eq!(sent.hairline.height(), 1.0, "the strip's rule is not one point");
-        assert_eq!(
-            sent.row_edge, records.row_edge,
-            "a picked Send's row is edged differently from a picked record's"
-        );
-        assert_eq!(sent.row_edge, theme::BLUE, "control: the picked row is not the blue-edged one");
     }
 
     /// **The tile sits in the middle of its row**, one border and one padding
@@ -12547,17 +12438,18 @@ mod source_pins {
         let opener = concat!("(spawn_", "sync)(");
         assert_eq!(
             closure.matches(&call).count(),
-            3,
-            "{call:?} is not written in the frame closure exactly three times. The Sync \
+            4,
+            "{call:?} is not written in the frame closure exactly four times. The Sync \
              call sites are the auto-sync on the window's first real frame, the window's \
-             heartbeat and the status pill's press, and each must hand over the window's \
+             heartbeat, the status pill's press and the list's offline Retry, and each must \
+             hand over the window's \
              own session: a `bw sync` started with an empty `BW_SESSION` is answered \
              `Locked` by a real vault"
         );
         assert_eq!(
             closure.matches(opener).count(),
-            3,
-            "{opener:?} is called from the frame closure {} times, not three -- there is a \
+            4,
+            "{opener:?} is called from the frame closure {} times, not four -- there is a \
              Sync call site spelled some other way, and the frame harness observes only \
              the sites it reaches",
             closure.matches(opener).count()
@@ -12579,9 +12471,9 @@ mod source_pins {
         let name = concat!("spawn_", "sync");
         assert_eq!(
             closure.matches(name).count(),
-            3,
-            "{name:?} is NAMED in the frame closure {} times, not three. The three times it \
-             may be named are the three `(spawn_sync)(` call sites counted just above; any \
+            4,
+            "{name:?} is NAMED in the frame closure {} times, not four. The four times it \
+             may be named are the four `(spawn_sync)(` call sites counted just above; any \
              further mention -- `let sync_now = spawn_sync;`, a struct field, a `match` \
              arm, a closure that forwards to it -- is a third `bw sync` call site whose \
              spelling no literal count reaches, and one written under a per-frame `if` is \
@@ -12619,10 +12511,13 @@ mod source_pins {
         // -- the binding and now THREE calls, the third being
         // `heartbeat_sync_due`'s. See the doc on this test for what bounds
         // it; the count moved with the same kind of reason as `main.rs`'s.
+        //
+        // **Five since the list's offline banner** (spec 3.1): its Retry is
+        // the pill's own sync, called from the same closure, a fourth call.
         for (needle, expected) in [
             (
                 concat!("spawn_", "sync"),
-                vec![("main.rs", 4usize), ("vault_window/mod.rs", 4)],
+                vec![("main.rs", 4usize), ("vault_window/mod.rs", 5)],
             ),
             (concat!("env.", "sync"), vec![("vault_window/mod.rs", 1)]),
             (concat!("spawn_vault_", "sync"), vec![("vault_window/mod.rs", 2)]),
@@ -15118,7 +15013,6 @@ mod frame_promptness {
     /// `draw_item_list` is the only thing in this window that paints. (It was
     /// the search field's hint until the v2 top bar took the search out of
     /// the list.)
-    const ITEM_LIST_ONLY: &str = "+ New";
     /// **The `DetailMode::Edit` arm's control**: the footer's own Save, which
     /// `draw_detail_edit` is the only thing in this crate that draws.
     ///
@@ -15519,6 +15413,9 @@ mod frame_promptness {
         send_list_sessions: Vec<String>,
         /// The session each `bw sync` spawn was handed, in order.
         sync_sessions: Vec<String>,
+        /// The item list's header `+` was drawn on the last frame: the list
+        /// alone draws it, so this is "`draw_item_list` ran".
+        list_drew: bool,
     }
 
     impl Outcome {
@@ -15884,6 +15781,7 @@ mod frame_promptness {
             send_list_spawns: read(&SEND_LIST_SPAWNS),
             send_list_sessions: SEND_LIST_SESSIONS.with(|s| s.borrow().clone()),
             sync_sessions: SYNC_SESSIONS.with(|s| s.borrow().clone()),
+            list_drew: ctx.read_response(crate::vault_window::item_list::new_button_id()).is_some(),
         };
         drop(frame_fn);
         drop(handles);
@@ -16022,7 +15920,7 @@ mod frame_promptness {
     /// Positive controls, one per pane, because "the arm ran" and "both panes
     /// drew" are different claims and only the second is worth having:
     ///
-    ///  * [`ITEM_LIST_ONLY`], the search field's hint -- `draw_item_list` ran.
+    ///  * `Outcome::list_drew`, the list header's `+` -- `draw_item_list` ran.
     ///  * [`detail_pane_only`], the LOGIN CREDENTIALS card's heading -- the
     ///    read detail pane ran.
     ///
@@ -16038,11 +15936,10 @@ mod frame_promptness {
     fn the_loaded_vault_returns_promptly() {
         let outcome = measured("vault", Scenario::new());
         assert_the_body_was_entered("vault", &outcome);
-        outcome.expect_painted(
-            ITEM_LIST_ONLY,
-            "the loaded window painted no search hint, so `draw_item_list` never drew -- and \
-             the hint is the one thing on that half of the screen the detail pane cannot \
-             produce",
+        assert!(
+            outcome.list_drew,
+            "the loaded window drew no list header +, so `draw_item_list` never drew -- the + \
+             is the one thing on that half of the screen the detail pane cannot produce"
         );
         outcome.expect_painted(
             detail_pane_only(),
@@ -16168,10 +16065,10 @@ mod frame_promptness {
             "the tune mark was pressed and the preferences modal is not on screen, so the \
              block at the end of the closure never ran",
         );
-        outcome.expect_painted(
-            ITEM_LIST_ONLY,
+        assert!(
+            outcome.list_drew,
             "the preferences modal is up and the vault window behind it is gone, so this is \
-             not the overlay this test is about",
+             not the overlay this test is about"
         );
     }
 

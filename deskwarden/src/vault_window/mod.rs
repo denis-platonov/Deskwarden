@@ -932,6 +932,9 @@ pub fn build_frame_with_search(
     // second click can't start a second concurrent sync -- same guard
     // `main.rs` uses for its update-apply flow.
     let mut sync_in_progress = false;
+    // Set when the list's offline banner started the sync in flight, so its
+    // failure can say "Still can't reach Bitwarden" (spec 3.1).
+    let mut retry_from_banner = false;
     // **The window's own heartbeat** -- see `heartbeat_sync_due`. When any
     // sync this window started last began, whichever door it came in by, and
     // whether that attempt failed; and whether the window had focus on the
@@ -2513,6 +2516,9 @@ pub fn build_frame_with_search(
             } else if let Err(e) = &result {
                 log::warn!("manual vault sync failed: {e}");
             }
+            if std::mem::take(&mut retry_from_banner) && result.is_err() {
+                crate::kit::toast::show(ui.ctx(), STILL_OFFLINE_TOAST);
+            }
             sync_status = Some(result);
         }
 
@@ -3657,11 +3663,17 @@ pub fn build_frame_with_search(
             // comment between the two lines here would break that guard
             // without any margin having been added.
             let list_width = ui.available_width() - detail_pane_width;
+            let offline = list_offline(
+                cache.loaded_from_disk_at().is_some(),
+                sync_in_progress,
+                sync_status.as_ref(),
+                vault_load_error.as_deref(),
+            );
             let list_pane = egui::Panel::left("vault-item-list")
                 .exact_size(list_width)
                 .resizable(false)
                 .show_separator_line(false)
-                .frame(egui::Frame::new().fill(theme::CANVAS))
+                .frame(egui::Frame::new().fill(crate::kit::tokens::palette(ui.ctx()).list_bg))
                 .show(ui, |ui| {
                     // THE LIST THE SELECTED ROW ACTUALLY READS, which for Trash
                     // and Archive is not `items` at all -- those two rows are
@@ -3676,6 +3688,15 @@ pub fn build_frame_with_search(
                     // beneath the toolbar has to be able to tell "no items" from
                     // "no answer yet" -- see `list_unless_unfetched`.
                     let row_people = item_list::RowPeople::from_view(sharing.view.as_ref());
+                    let list_title = sidebar::scope_title(
+                        &filter,
+                        &folders,
+                        sidebar::VaultLists {
+                            trash: trash_list.items.as_deref(),
+                            archive: archive_list.items.as_deref(),
+                            ..sidebar::VaultLists::live_only(&items)
+                        },
+                    );
                     let shown: Option<&[VaultItem]> = list_unless_unfetched(
                         filter.source(),
                         &items,
@@ -3705,6 +3726,8 @@ pub fn build_frame_with_search(
                         // view: empty until the window holds one, so no row
                         // wears a person or a `view-only` chip before then.
                         &row_people,
+                        &list_title,
+                        offline,
                     ) {
                         // The kind the `+ New` menu was clicked on -- `empty_of`,
                         // not `empty`, which would open a login form whatever row
@@ -3741,6 +3764,16 @@ pub fn build_frame_with_search(
                         // below the reset block.
                         ItemListAction::Row { id, command } => row_command = Some((id, command)),
                         ItemListAction::DismissMoveError => dismiss_move_error = true,
+                        // The banner's Retry is the pill's sync; if it fails
+                        // again, the toast says so (see `retry_from_banner`).
+                        ItemListAction::RetrySync => {
+                            if !sync_in_progress {
+                                sync_in_progress = true;
+                                retry_from_banner = true;
+                                last_sync_attempt = Some(Instant::now());
+                                (spawn_sync)(sync_tx.clone(), session_token.to_string());
+                            }
+                        }
                         ItemListAction::None => {}
                     }
                 });
@@ -14734,6 +14767,16 @@ const VAULT_NOT_REFRESHED_PILL: &str = "Vault not refreshed";
 /// -- so if that condition is ever relaxed, the pill becomes the only thing
 /// the user sees and the distinction collapses SILENTLY. Anyone loosening that
 /// gate owes this function a second label.
+/// The toast after the offline banner's Retry fails again (spec 3.1).
+pub(crate) const STILL_OFFLINE_TOAST: &str = "Still can\u{2019}t reach Bitwarden";
+
+/// Spec 3.1's offline banner condition: the vault on screen is the disk
+/// cache's and the last sync could not refresh it. Not while a sync is in
+/// flight -- that sync may be the answer.
+fn list_offline(from_disk: bool, sync_in_progress: bool, sync_status: Option<&Result<(), String>>, vault_load_error: Option<&str>) -> bool {
+    from_disk && !sync_in_progress && (matches!(sync_status, Some(Err(_))) || vault_load_error.is_some())
+}
+
 fn sync_pill(
     sync_in_progress: bool,
     sync_status: Option<&Result<(), String>>,
@@ -22386,8 +22429,23 @@ mod sync_pill_tests {
     // spelled for the user, and until this function existed the wording was
     // an `if` chain inside a 3000-line `eframe` closure that nothing could
     // call.
-    use super::{cache_age_text, sync_pill, theme, VAULT_NOT_REFRESHED_PILL};
+    use super::{cache_age_text, list_offline, sync_pill, theme, STILL_OFFLINE_TOAST, VAULT_NOT_REFRESHED_PILL};
     use std::time::Duration;
+
+    /// Spec 3.1's offline banner: a vault off the disk cache whose last sync
+    /// could not refresh it -- and not while a sync is still running.
+    #[test]
+    fn the_offline_banner_needs_the_disk_cache_and_a_sync_that_failed() {
+        let failed: Result<(), String> = Err("no network".into());
+        let ok: Result<(), String> = Ok(());
+        assert!(list_offline(true, false, Some(&failed), None));
+        assert!(list_offline(true, false, None, Some("bw serve never became ready")));
+        assert!(!list_offline(false, false, Some(&failed), None), "a live vault is not offline");
+        assert!(!list_offline(true, false, Some(&ok), None), "a cached vault that synced is not offline");
+        assert!(!list_offline(true, false, None, None), "nothing has failed yet");
+        assert!(!list_offline(true, true, Some(&failed), None), "a sync in flight may be the answer");
+        assert_eq!(STILL_OFFLINE_TOAST, "Still can\u{2019}t reach Bitwarden");
+    }
 
     /// Three hours, as a snapshot that came off the encrypted disk cache.
     const THREE_HOURS: Option<Duration> = Some(Duration::from_secs(3 * 3600));
@@ -22665,7 +22723,7 @@ mod item_pane_frame_placement_tests {
     //! split-literal rule, as `reveal_state_placement_tests` -- do not
     //! re-join these.
     const PANE: &str = concat!("egui::Panel::left(\"vault-item", "-list\")");
-    const FRAME: &str = concat!("egui::Frame::new().fill(theme::CANVAS", "))");
+    const FRAME: &str = concat!("egui::Frame::new().fill(crate::kit::tokens::palette(ui.ctx()).list_bg", "))");
 
     /// The two halves of the list's right-hand edge: the panel draws no
     /// separator of its own, and something draws one just outside it.
@@ -31827,7 +31885,11 @@ mod export_wiring {
             "the import form was on screen before anybody opened it: {painted_now:?}"
         );
 
-        let new_at = locate(&output, "+ New");
+        let new_at = ctx
+            .read_response(item_list::new_button_id())
+            .expect("the window drew no list header + to press")
+            .rect
+            .center();
         let menu = click(&ctx, &mut frame_fn, new_at);
 
         // The menu is up and the row is on it. Positive control on the

@@ -8,10 +8,10 @@ use super::detail::{kind_offers_edit, kind_offers_fill};
 use super::detail_edit::assignable_folders;
 use super::sidebar::{FilterSource, OutOfVault, SidebarFilter};
 use crate::card_brand::{brand_for_number, CardBrand};
-use crate::card_mark;
 use crate::kind_mark;
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
+use crate::kit::{self, motion, tokens};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::collections::HashMap;
 
@@ -69,6 +69,8 @@ pub enum ItemListAction {
     ImportFromSend,
     /// The inline "that move did not happen" band was clicked away.
     DismissMoveError,
+    /// The offline banner's Retry: sync now.
+    RetrySync,
     /// An entry of some row's right-click menu was chosen.
     ///
     /// The item's id is carried rather than left to `selected_id`, even
@@ -1086,10 +1088,22 @@ impl ListPlaceholder {
         match self {
             ListPlaceholder::Loading => "Loading…",
             ListPlaceholder::Empty => "Nothing here yet",
-            ListPlaceholder::NoMatches => "No items match your search",
+            ListPlaceholder::NoMatches => NOTHING_MATCHES,
+        }
+    }
+
+    /// The line under the message, where the design draws one.
+    pub fn detail(self) -> Option<&'static str> {
+        match self {
+            ListPlaceholder::NoMatches => Some(NOTHING_MATCHES_DETAIL),
+            ListPlaceholder::Loading | ListPlaceholder::Empty => None,
         }
     }
 }
+
+/// Spec 3.1's no-results title and its line underneath.
+pub const NOTHING_MATCHES: &str = "Nothing matches";
+pub const NOTHING_MATCHES_DETAIL: &str = "Try a site, an app or a username";
 
 /// Decides between the three (see [`ListPlaceholder`]), or `None` when there
 /// are rows to draw and no placeholder belongs on screen at all.
@@ -1147,22 +1161,26 @@ pub fn list_placeholder(
 /// does not animate so much as twitch. It is asked for only in the `Loading`
 /// arm; the other two are static text with nothing to drive.
 fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
-    let available = ui.available_height();
+    let p = tokens::palette(ui.ctx());
     ui.vertical_centered(|ui| {
-        // Roughly half the spinner-plus-label block, so the pair sits centred
-        // rather than the spinner alone -- the same arithmetic the window
-        // body's spinner uses.
-        ui.add_space((available / 2.0 - 30.0).max(0.0));
+        // Spec 3.1: `padding: 48 20`, a centred column with a gap of 8.
+        ui.add_space(48.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
         if placeholder == ListPlaceholder::Loading {
-            ui.add(egui::Spinner::new().size(22.0).color(theme::BLUE));
-            ui.add_space(10.0);
+            ui.add(egui::Spinner::new().size(22.0).color(p.blue));
         }
-        ui.label(theme::semibold(placeholder.message(), 13.0).color(theme::TEXT_SECONDARY));
+        ui.label(tokens::job(PLACEHOLDER_TITLE, placeholder.message(), p.ink));
+        if let Some(detail) = placeholder.detail() {
+            ui.label(tokens::job(tokens::BODY, detail, p.text_faint));
+        }
     });
     if placeholder == ListPlaceholder::Loading {
         ui.ctx().request_repaint_after(super::LOADING_FRAME_INTERVAL);
     }
 }
+
+/// "Nothing matches": 17/700.
+const PLACEHOLDER_TITLE: tokens::Role = tokens::Role { size: 17.0, face: theme::BOLD, tracking_em: 0.0 };
 
 /// The design's avatar/favicon tile: `width: 32px; height: 32px`.
 ///
@@ -1171,157 +1189,7 @@ fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
 /// at one size by the owner's decision, and a number agreed by two private
 /// constants is a number that can quietly stop agreeing. Nothing outside this
 /// module lays anything out with it.
-pub(crate) const AVATAR_SIZE: f32 = 40.0;
-
-/// The network mark's height, in points, on a list row.
-///
-/// [`card_mark::MARK_ROW_HEIGHT`] and not a number of this module's own: that
-/// constant is pinned to the height at which the mark's type comes out at
-/// [`TITLE_SIZE`], the item name's own size, which is what the owner asked
-/// for. A number written here instead would be a second place to change it.
-const NETWORK_MARK_HEIGHT: f32 = card_mark::MARK_ROW_HEIGHT;
-
-/// The narrowest the item name's column may be squeezed to before the network
-/// mark gives up its place on the row.
-///
-/// **Not taste -- the truncation budget.** The mark is allocated out of the
-/// same row width the name and its `(*9988)` suffix are laid into, so on a
-/// pane narrow enough the mark would leave the name a single ellipsis and the
-/// suffix nowhere to go, which is the overflow `theme::truncated_galley` was
-/// added to stop one release ago. 120pt is roughly the suffix (about 47pt at
-/// `TITLE_SIZE`), its gap, and enough name to still be a name.
-///
-/// **The number is unchanged by the move to the trailing edge; the
-/// measurement it is compared against is not** -- see `paint_network_mark`.
-/// 120pt was always a claim about the TITLE, and the title's room is a
-/// property of the row and not of where on it the mark sits. What changed is
-/// that the comparison is now made from inside the trailing run, so it is the
-/// room the title really gets.
-///
-/// At the real pane this never binds: the list is
-/// `Panel::exact_size(LIST_WIDTH).resizable(false)` at 390pt, which leaves the
-/// trailing run 301pt, and the widest mark this app sets is `MASTERCARD` at
-/// 72pt. It binds only under a test pane, and there the answer is the module's
-/// standing one -- draw nothing rather than a mark that costs the row its
-/// name. `the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_both`
-/// holds it, and
-/// `the_network_mark_yields_sooner_when_the_row_also_carries_a_chip` holds the
-/// half that only the move made observable.
-const NETWORK_MARK_MIN_TITLE_ROOM: f32 = 120.0;
-
-/// Allocates and paints the network mark in the row's TRAILING chip run,
-/// innermost of the three; returns the rect it took, or `None` when it stood
-/// aside.
-///
-/// **Never inside the tile, and no longer beside it.** The badge was first
-/// anchored into the tile's lower-right corner, over the bank's own artwork;
-/// the owner asked for it moved out -- "maybe not overlap the icon but place
-/// to the right ... then name with last digits" -- and moving it is what let
-/// the wordmarks become words, since the 32pt tile was the four-character cap
-/// (see `CardBrand::wordmark`). It then sat between the tile and the name, and
-/// the owner asked again: "lets also move pill to the right - similar to our
-/// mfa/app pills". So it is now allocated in the same right-to-left run those
-/// chips are drawn in -- though, as the call site records, it does not share a
-/// row with them on anything a vault produces.
-///
-/// **It is ALLOCATED, which is the whole point.** `allocate_exact_size` in the
-/// trailing run advances that ui's cursor by the mark, and the title column is
-/// then handed whatever `ui.available_width()` is left -- so the `room`
-/// `theme::truncated_galley` truncates the name into is already net of the
-/// mark. Painting it without allocating would have left the name laying out
-/// into room the mark was sitting in.
-///
-/// **It is placed on the NAME's baseline, not on the row's box centre.** The
-/// reported defect -- "feels like image, pill and name are not on the same mid
-/// line" -- is what box centring produces when three things of three different
-/// heights share a line: egui centres each BOX, and a box is ascent plus
-/// descent rather than the ink a reader sees. The 32pt tile, the pill (whose
-/// height follows its type size) and the 13pt name each land a fraction off
-/// the others, differently at every size -- which matters here because this
-/// pill's type size has already moved three times. [`mark_ink_drop`]
-/// derives the correction from the two runs actually laid out.
-fn paint_network_mark(ui: &mut egui::Ui, brand: CardBrand, selected: bool) -> Option<egui::Rect> {
-    let width = card_mark::mark_width(ui, brand, NETWORK_MARK_HEIGHT);
-    // **The room the title column will really be handed, derived rather than
-    // estimated.** This ui is the trailing run and it is walked right to left,
-    // so by the time we are called anything else in that run has already been
-    // allocated and `available_width` is net of it and of the gap beside it.
-    // What this call would then cost the title is the mark itself plus exactly
-    // ONE `ROW_GAP_X`: egui charges `item_spacing` before the NEXT widget, so
-    // any gap to the right of the mark has already come out of
-    // `available_width`, and the one remaining is the gap between the mark and
-    // the title column that follows it. (Measured: at the real pane a card row
-    // sees 301pt here and its title column is handed 262.25 beside a 27.75pt
-    // `VISA` -- one 11pt gap, not two.)
-    //
-    // Two gaps is what the old leading-run version subtracted, and it was
-    // conservative by one of them -- it described a layout where the mark had
-    // the tile on one side and the title on the other, which is not where the
-    // mark is any more. It was also blind to the trailing run, which in the
-    // leading run had not been allocated yet.
-    if ui.available_width() - width - ROW_GAP_X < NETWORK_MARK_MIN_TITLE_ROOM {
-        return None;
-    }
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(width, NETWORK_MARK_HEIGHT), Sense::hover());
-    let drop = mark_ink_drop(ui, brand, selected);
-    Some(card_mark::paint_mark(
-        ui,
-        brand,
-        NETWORK_MARK_HEIGHT,
-        egui::Align2::LEFT_TOP,
-        egui::pos2(rect.left(), rect.top() + drop),
-    ))
-}
-
-/// How far DOWN the pill must move from the box egui centred for it, so that
-/// its word sits on the same line the item name does.
-///
-/// **A pure function of two laid-out runs, and deliberately not a constant.**
-/// `detail`'s `digits_baseline_drop` makes the argument at length and it holds
-/// here twice over: a constant would be one nobody could later justify, and
-/// BOTH of this row's type sizes moved during the work that introduced it.
-///
-/// **Ink centres, not baselines, and not box centres.** Three readings of "the
-/// same mid line" were measured before this one was picked.
-///
-/// * *Box centres* is what egui's `Align::Center` already did, and it is what
-///   was reported as wrong: a box is ascent plus descent, neither of which is
-///   ink.
-/// * *Baselines* is what the runs already shared, exactly -- and it is still
-///   not level, because the name's caps are 9pt tall at 13pt and the word's
-///   are 8pt at 11pt. Two runs of different sizes sitting on one baseline have
-///   their ink centres half a point apart by construction.
-/// * *Ink centres* is what a reader means, and what this returns.
-///
-/// **The name's reference run is a single capital**, not the item's own name,
-/// and that is the load-bearing detail. A name's ink band depends on its
-/// letters -- "Household card" has no descender and "Ledgerline corporate
-/// card" has two -- so aligning to the real string would make the pill sit at
-/// a different height on every row. A capital is the band a reader reads a
-/// title-case run by, it is a property of the face and the size alone, and the
-/// wordmark beside it is all capitals anyway, so this lines cap-height band up
-/// with cap-height band.
-///
-/// Both boxes are centred on the same row centre `C` by the row's
-/// `Align::Center`, and `paint_mark` centres the word's box inside the pill.
-/// So the name's ink sits at `C - name_h/2 + i_name`, the word's at
-/// `C - word_h/2 + i_word`, and the difference is all that is left.
-fn mark_ink_drop(ui: &egui::Ui, brand: CardBrand, selected: bool) -> f32 {
-    let family = if selected { theme::BOLD } else { theme::SEMIBOLD };
-    let name = ui
-        .painter()
-        .layout_job(theme::letterspaced("H", TITLE_SIZE, family, 0.0, theme::INK));
-    let word = card_mark::word_galley(ui, brand, NETWORK_MARK_HEIGHT);
-    let (Some(name_ink), Some(word_ink)) =
-        (theme::ink_center_y(&name), theme::ink_center_y(&word))
-    else {
-        // No glyphs to centre on either side: leave the box where egui put it
-        // rather than move it by a number derived from nothing.
-        return 0.0;
-    };
-    (name_ink - name.size().y / 2.0) - (word_ink - word.size().y / 2.0)
-}
+pub(crate) const AVATAR_SIZE: f32 = 44.0;
 
 /// Design 2b's row box, in full: `padding: 10px 12px` around a 32px avatar,
 /// plus the 1px border every row carries. egui's `Frame` sizes itself
@@ -1340,15 +1208,16 @@ pub(crate) const ROW_TILE_HEIGHT: f32 = AVATAR_SIZE + 2.0 * ROW_PAD_Y + 2.0 * RO
 /// with a 32pt tile beside a 62pt band with a 40pt one, its own padding, its
 /// own radius. `send_ui` reads these rather than spelling its own, so the two
 /// rows cannot drift apart again.
-pub(crate) const ROW_PAD_Y: f32 = 10.0;
+pub(crate) const ROW_PAD_Y: f32 = 12.0;
 pub(crate) const ROW_PAD_X: f32 = 12.0;
-pub(crate) const ROW_BORDER: f32 = 1.0;
+/// v2 rows carry no border; the selected one wears a ring painted outside it.
+pub(crate) const ROW_BORDER: f32 = 0.0;
 /// The row's `gap: 11px`, between the avatar, the title column and the badge.
-pub(crate) const ROW_GAP_X: f32 = 11.0;
+pub(crate) const ROW_GAP_X: f32 = 14.0;
 /// The row's `border-radius: 10px`.
-pub(crate) const ROW_RADIUS: u8 = 10;
+pub(crate) const ROW_RADIUS: u8 = 14;
 /// The list container's `gap: 6px`.
-pub(crate) const ROW_GAP: f32 = 6.0;
+pub(crate) const ROW_GAP: f32 = 4.0;
 /// The list container's `padding: 10px`.
 ///
 /// `pub(crate)` because the **Password health** screen takes this same column
@@ -1356,7 +1225,9 @@ pub(crate) const ROW_GAP: f32 = 6.0;
 /// one column and each spell their own `10.0` are two numbers that must agree,
 /// which is this codebase's standing defect. See
 /// `password_health::PANE_PADDING`.
-pub(crate) const LIST_PADDING: f32 = 10.0;
+pub(crate) const LIST_PADDING: f32 = 14.0;
+/// Spec 3.1's row list padding `4 14 14`: the top is the 4.
+pub(crate) const LIST_PADDING_TOP: f32 = 4.0;
 
 /// The search field's own id.
 ///
@@ -1667,6 +1538,13 @@ pub fn draw_item_list(
     // **Design 6**: which records are shared with people and who shares the
     // received ones. Asked per row by id -- a share IS a record, unlike a Send.
     people: &RowPeople,
+    // The header's name for this scope (`sidebar::scope_title`): the folder's
+    // own name, "All items", "Cards"... -- "Results" replaces it while the
+    // search box has anything in it.
+    scope_title: &str,
+    // The window's vault came from the disk cache and the last sync failed:
+    // spec 3.1's offline banner, with its Retry.
+    offline: bool,
 ) -> ItemListAction {
     let mut action = ItemListAction::None;
     visible_ids.clear();
@@ -1694,82 +1572,20 @@ pub fn draw_item_list(
     // `show_rows` reads it, so the scroll pitch is untouched by this.
     ui.spacing_mut().item_spacing.y = 0.0;
 
-    // Design 4.8/2b's toolbar strip: `padding: 12px; gap: 8px; border-bottom:
-    // 1px solid #eae7e7; background: #ffffff` -- a WHITE tile spanning the
-    // full width of this pane, with the search box and `+ New` on it. This is
-    // the "search field should be on white tile as per design" report: the
-    // search box used to be drawn straight onto the pane's grey canvas with
-    // no strip at all, no border, no icon and no shortcut hint.
-    //
-    // The strip has to reach the pane's own edges to read as a tile rather
-    // than a floating card, which is why `vault_window::mod`'s panel frame
-    // for this pane carries NO inner margin and the padding is applied here
-    // instead -- 12 for this header, 10 for the list below it (design 2b's
-    // two different paddings, which a single panel margin could not express).
-    // The strip, its padding and its hairline are `list_strip`'s, which the
-    // Sent list's header is drawn by too.
-    list_strip(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-            // `+ New` is added FIRST, right-to-left, so the search box
-            // gets `flex: 1`: laid out left-to-right the button would
-            // have to be given a width up front, and the search box the
-            // remainder minus a guess at it -- which is exactly the
-            // `available_width() - 70.0` guess this replaces.
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // ALWAYS opens the menu; the button itself creates
-                // nothing. That is the user's explicit choice over the
-                // alternative ("+ New" makes a login, a separate caret
-                // opens the list), and it is the reason the click is not
-                // also reported as an action here.
-                //
-                // `Popup::menu` draws into its own `Area`, so nothing in
-                // the closure below allocates in this strip -- which is
-                // what keeps the list beneath it in register with the
-                // fixed pitch `show_rows` virtualizes against. Pinned by
-                // `the_new_menu_does_not_change_the_rows_below_it`.
-                let new = theme::primary_button_matching_field(ui, "+ New");
-                egui::Popup::menu(&new).show(|ui| {
-                    // Built FROM `CREATABLE_KINDS`, never from a list
-                    // written out here. That array is one of the three
-                    // doors keeping `ItemKind::Unknown` -- "a type this
-                    // build does not understand" -- unreachable from
-                    // creation, and a hand-written list is precisely the
-                    // door that would leak: it would keep compiling, and
-                    // keep offering whatever it said, after the array
-                    // moved on.
-                    for kind in super::detail_edit::CREATABLE_KINDS {
-                        if ui.button(kind.label()).clicked() {
-                            action = ItemListAction::NewItem(kind);
-                            ui.close();
-                        }
-                    }
-                    // **The import, below a separator, and NOT a row of
-                    // the loop above.** It is not a kind: it makes an
-                    // item whose type comes from the payload, not from
-                    // this menu, so putting it in `CREATABLE_KINDS`
-                    // would have added a fake `ItemKind` to the one
-                    // array three doors depend on for keeping
-                    // `ItemKind::Unknown` out of creation.
-                    //
-                    // Here rather than in the titlebar beside "Send a
-                    // record" -- see `record_ui::IMPORT_FROM_SEND_LABEL`
-                    // for the argument. The short of it: this control is
-                    // "make me a new item", and the import is one, while
-                    // the send narrows an item already selected.
-                    ui.separator();
-                    if ui.button(super::record_ui::IMPORT_FROM_SEND_LABEL).clicked() {
-                        action = ItemListAction::ImportFromSend;
-                        ui.close();
-                    }
-                });
-                // The search field moved to the v2 top bar
-                // (`vault_window::top_bar`), keeping `search_field_id` so
-                // Ctrl+K still finds it; this strip keeps `+ New` until
-                // slice 3 restyles the pane.
-            });
-        });
-    });
+    let search_lower = search.to_lowercase();
+    let searching = !search_lower.trim().is_empty();
+    let filtered: Vec<&VaultItem> = rows
+        .iter()
+        .filter(|item| matches_filter(item, filter, &search_lower))
+        .collect();
+
+    let title = if searching { RESULTS_TITLE } else { scope_title };
+    if let Some(kind) = list_header(ui, title, filtered.len()) {
+        action = kind;
+    }
+    if offline && offline_banner(ui) {
+        action = ItemListAction::RetrySync;
+    }
 
     // A drag-to-folder that did not happen, said out loud. Drawn here --
     // between the toolbar strip and the list -- because this is the pane the
@@ -1786,12 +1602,6 @@ pub fn draw_item_list(
             action = ItemListAction::DismissMoveError;
         }
     }
-
-    let search_lower = search.to_lowercase();
-    let filtered: Vec<&VaultItem> = rows
-        .iter()
-        .filter(|item| matches_filter(item, filter, &search_lower))
-        .collect();
 
     // **The keyboard half of this pane.** Every chord that acts on an item --
     // Ctrl+B, Ctrl+U, Ctrl+T and the four card chords -- acts on the SELECTED
@@ -1832,7 +1642,7 @@ pub fn draw_item_list(
         .inner_margin(Margin {
             left: LIST_PADDING as i8,
             right: 0,
-            top: LIST_PADDING as i8,
+            top: LIST_PADDING_TOP as i8,
             bottom: LIST_PADDING as i8,
         })
         .show(ui, |ui| {
@@ -1853,7 +1663,7 @@ pub fn draw_item_list(
                 items.is_some(),
                 fetch_failed,
                 filtered.len(),
-                !search_lower.trim().is_empty(),
+                searching,
             ) {
                 draw_list_placeholder(ui, placeholder);
                 // No scroll area ran, so the remembered offset would be last
@@ -1971,8 +1781,10 @@ pub fn draw_item_list(
             if let Some(offset) = forced_offset {
                 area = area.vertical_scroll_offset(offset);
             }
+            let list_key = entrance_key(filter, &search_lower);
             let list = area
                 .show_rows(ui, ROW_TILE_HEIGHT, filtered.len(), |ui, row_range| {
+                    let entrance = entrance_for(ui.ctx(), list_key, row_range.clone());
                     for row in row_range {
                         let item = filtered[row];
                         visible_ids.push(item.id.clone());
@@ -2003,6 +1815,7 @@ pub fn draw_item_list(
                                         person: people.shared.contains(&item.id),
                                         from: people.from(&item.id),
                                     },
+                                    entrance.pose(ui.ctx(), row),
                                 )
                             })
                             .inner;
@@ -2035,103 +1848,12 @@ pub fn draw_item_list(
     action
 }
 
-/// Design 2b's trailing row chip: `font-size: 10px; border-radius: 5px;
-/// padding: 2px 6px`, `#605d5d on #f3f2f2` unselected and `#14307a on
-/// #dbe4f7` selected.
-///
-/// Not [`theme::kbd_chip`]: that one is a fixed-height MONOSPACE keyboard
-/// hint (10px in an 18px box, radius 4), which is a different element of the
-/// design that happens to be a similar size. Kept private here rather than
-/// added to `theme` because the badge exists in exactly one place and its
-/// colours all come from constants `theme` already owns.
-fn row_badge(ui: &mut egui::Ui, text: &str, selected: bool) {
-    const PAD_X: f32 = 6.0;
-    const PAD_Y: f32 = 2.0;
-    let (bg, fg) = if selected {
-        // `#dbe4f7`. The design uses one value for the focus halo and for
-        // this chip; see `theme::FOCUS_RING`.
-        (theme::FOCUS_RING, theme::BLUE_DEEP)
-    } else {
-        (theme::CANVAS, theme::TEXT_MUTED)
-    };
-    let galley = ui.painter().layout_no_wrap(
-        text.to_string(),
-        egui::FontId::new(10.0, egui::FontFamily::Proportional),
-        fg,
-    );
-    let (rect, _) = ui.allocate_exact_size(
-        galley.size() + egui::Vec2::new(PAD_X * 2.0, PAD_Y * 2.0),
-        Sense::hover(),
-    );
-    ui.painter().rect_filled(rect, CornerRadius::same(5), bg);
-    ui.painter()
-        .galley(rect.min + egui::Vec2::new(PAD_X, PAD_Y), galley, fg);
-}
+/// The Shared tag's word (`kit::card::TagKind::Shared`).
+pub const SHARED_PILL: &str = "Shared";
 
-/// **Design 5d's `shared` pill.**
-///
-/// Filled, where `app` and `2FA` are outlined greys, and that contrast is the
-/// whole point of the design: "A record with a live Send carries a filled
-/// pill, so sharing is visible from the list -- the same slot as the existing
-/// app and 2FA pills, which stay outlined grey." The other two say what a
-/// record IS; this one says what is happening to it right now.
-///
-/// 5d's own measurements: `background: #1b3fa0; border-radius: 5px; padding:
-/// 2px 7px; gap: 5px`, a 9-point paper plane in white at `stroke-width: 2.6`,
-/// and the word at `font-size: 10px; font-weight: 700` in white. The padding
-/// is a point wider than [`row_badge`]'s because this chip has a mark in it.
-///
-/// **It keeps its fill when the row is selected.** `row_badge` swaps to the
-/// focus halo there, because a grey chip on a blue-tinted row would vanish;
-/// this one is already the strongest thing in the run and a second treatment
-/// would make the pill mean two things.
-///
-/// **`person` swaps the plane for the person mark** (design 6e, LIST CHIPS:
-/// "Same chip, person mark"). One chip with two marks rather than two chips,
-/// because the word is the same promise either way -- someone can open this
-/// record right now -- and a row shared both ways would otherwise carry the
-/// word twice.
-fn shared_pill_marked(ui: &mut egui::Ui, person: bool) {
-    const PAD_X: f32 = 7.0;
-    const PAD_Y: f32 = 2.0;
-    const GAP: f32 = 5.0;
-    const MARK: f32 = 9.0;
-    let galley = ui.painter().layout_no_wrap(
-        SHARED_PILL.to_string(),
-        egui::FontId::new(10.0, egui::FontFamily::Name(theme::BOLD.into())),
-        theme::CARD,
-    );
-    let (rect, _) = ui.allocate_exact_size(
-        galley.size() + egui::Vec2::new(PAD_X * 2.0 + MARK + GAP, PAD_Y * 2.0),
-        Sense::hover(),
-    );
-    ui.painter().rect_filled(rect, CornerRadius::same(5), theme::BLUE);
-    let mark = egui::Rect::from_min_size(
-        egui::pos2(rect.min.x + PAD_X, rect.center().y - MARK / 2.0),
-        egui::Vec2::splat(MARK),
-    );
-    // The plane for a live Send (5d), the person for a person share (6e):
-    // "same chip, person mark. It wins when the record has both."
-    if person {
-        theme::paint_person_mark(ui.painter(), mark, theme::CARD);
-    } else {
-        theme::paint_send_plane(ui.painter(), mark, theme::CARD);
-    }
-    ui.painter().galley(
-        egui::pos2(mark.right() + GAP, rect.min.y + PAD_Y),
-        galley,
-        theme::CARD,
-    );
-}
-
-/// 5d's own word. Lower case, like the two chips beside it.
-pub const SHARED_PILL: &str = "shared";
-
-/// The chip on a row someone shares with this account (mock 6e). Lower case
-/// and drawn by `row_badge`, like `app` and `2FA`: it says what the record IS
-/// on this PC, not what is happening to it, so it is an outlined grey and not
-/// the filled `shared` pill.
-pub const VIEW_ONLY_CHIP: &str = "view-only";
+/// The tag on a row someone shares with this account: v2's neutral tag
+/// (`kit::card::TagKind::ViewOnly`), which reads "View only".
+pub const VIEW_ONLY_CHIP: &str = "View only";
 
 /// **What sharing says about each row**: which records this account shares
 /// with someone who has them now, and who shares each received record. Built
@@ -2198,15 +1920,9 @@ pub struct RowMarks<'a> {
 /// [`text_column_height`] has to measure exactly what [`item_row`] then
 /// draws; a size stated twice would drift. `pub(crate)` for the row geometry's
 /// reason: the Sent list's rows set their two lines in these.
-pub(crate) const TITLE_SIZE: f32 = 13.0;
-pub(crate) const SUBTITLE_SIZE: f32 = 11.0;
-pub(crate) const TITLE_GAP_Y: f32 = 2.0;
-
-/// The space between a card row's name and its `(*4545)` suffix. A word gap,
-/// not a column gap: the suffix qualifies the name it follows, and the row's
-/// own `ROW_GAP_X` (which separates the avatar, the text column and the
-/// chips) would read as a third element on the line.
-const TITLE_SUFFIX_GAP_X: f32 = 4.0;
+pub(crate) const TITLE_SIZE: f32 = 16.0;
+pub(crate) const SUBTITLE_SIZE: f32 = 14.0;
+pub(crate) const TITLE_GAP_Y: f32 = 3.0;
 
 /// The exact height the row's one- or two-line text column will lay out to,
 /// measured from the fonts it is about to be drawn with.
@@ -2231,93 +1947,6 @@ pub(crate) fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) 
         height += TITLE_GAP_Y + ui.ctx().fonts_mut(|f| f.row_height(&subtitle));
     }
     height
-}
-
-/// The y offset that puts `suffix`'s first baseline on `name`'s, measured
-/// from the two galleys rather than written down as a constant.
-///
-/// `detail.rs`'s `digits_baseline_drop` argument, for the one case here: the
-/// name is Archivo (SemiBold or Bold) and the suffix is the subtitle's plain
-/// proportional face, so the two have different ascents at the same 13pt.
-/// Painted at a shared top the suffix would sit visibly high against the name
-/// it qualifies.
-fn suffix_baseline_drop(name: &egui::Galley, suffix: &egui::Galley) -> f32 {
-    first_baseline(name) - first_baseline(suffix)
-}
-
-/// Where a laid-out run's first baseline sits, measured down from the top of
-/// its own box.
-///
-/// Hoisted out of [`suffix_baseline_drop`], which used to own it privately,
-/// when the network mark needed the same fact: three runs share this row's
-/// line now -- the name, its `(*4545)` suffix and the pill's wordmark -- and
-/// they sit together only if all three are placed from a baseline that is
-/// measured rather than assumed.
-fn first_baseline(galley: &egui::Galley) -> f32 {
-    galley
-        .rows
-        .first()
-        .and_then(|row| row.glyphs.first().map(|glyph| row.pos.y + glyph.pos.y))
-        .unwrap_or(0.0)
-}
-
-/// The title line of a CARD row: the item's name, then `(*4545)`.
-///
-/// **Laid and painted by hand rather than as two `Label`s in a
-/// `ui.horizontal`, and both halves of that are load-bearing.**
-///
-/// *The box is exactly the NAME galley's height.* The text column above was
-/// allocated at [`text_column_height`], which measures the title's own font
-/// and nothing else; a line that allocated the taller of two faces would grow
-/// that column for card rows only, un-centre them against the avatar, and red
-/// `the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top`
-/// -- or worse, pass it, since that guard's items are logins. Painting into
-/// the name's own box means a suffix can never change a row's height, which
-/// is also what keeps every row exactly one `ROW_TILE_HEIGHT` tall for
-/// `show_rows` to virtualize against.
-///
-/// *The NAME is truncated and the suffix is not.* The suffix's width is taken
-/// off the available room FIRST and the name is laid into what is left, so a
-/// long name loses its tail and the digits survive. That is the whole point
-/// of the suffix: two cards from the same bank have the same name and are
-/// told apart only by the four digits, so truncating those instead would
-/// leave two identical rows. A single `Label` over one `LayoutJob` of both
-/// runs would have done exactly that -- egui truncates at the END of the
-/// line.
-fn paint_title_with_suffix(ui: &mut egui::Ui, title: RichText, suffix: &str) {
-    // The subtitle's typography, on the title's line: the plain proportional
-    // face at no named weight, in `TEXT_FAINT`. Deliberately NOT
-    // `theme::semibold`/`theme::bold` -- the user asked for the suffix "not
-    // in bold", and secondary text on this row already has an answer, which
-    // is the username line directly below it. Kept at `TITLE_SIZE` rather
-    // than `SUBTITLE_SIZE` because it shares the name's line and its
-    // baseline; the lighter weight and the faint ink are what separate it
-    // from the name, not a second type size on one line.
-    let suffix_galley = egui::WidgetText::from(
-        RichText::new(suffix).size(TITLE_SIZE).color(theme::TEXT_FAINT),
-    )
-    .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Body);
-    // The suffix's width comes off FIRST -- see the doc comment above.
-    // `theme::truncated_galley` is where the `max(1.0)` room clamp and the
-    // choice of `Truncate` over `Wrap` live, shared with the finding rows on
-    // the Password health screen, which paint a name into a fixed tile for
-    // the same reason.
-    let room = ui.available_width() - suffix_galley.size().x - TITLE_SUFFIX_GAP_X;
-    let name_galley = theme::truncated_galley(ui, title, room, egui::TextStyle::Body);
-    let drop = suffix_baseline_drop(&name_galley, &suffix_galley);
-    let width = name_galley.size().x + TITLE_SUFFIX_GAP_X + suffix_galley.size().x;
-    let (rect, _) =
-        ui.allocate_exact_size(egui::vec2(width, name_galley.size().y), Sense::hover());
-    let suffix_x = rect.left() + name_galley.size().x + TITLE_SUFFIX_GAP_X;
-    // The fallback colours are never reached -- both galleys carry their own
-    // section colour -- but they are the right ones if a future `RichText`
-    // here ever drops its `.color()`.
-    ui.painter().galley(rect.left_top(), name_galley, theme::INK);
-    ui.painter().galley(
-        egui::pos2(suffix_x, rect.top() + drop),
-        suffix_galley,
-        theme::TEXT_FAINT,
-    );
 }
 
 /// What one drawn row reports back to [`draw_item_list`].
@@ -2439,196 +2068,13 @@ fn item_row(
     // function runs per visible row per frame -- see `send_ui::shared_names`
     // and `RowPeople`.
     marks: RowMarks<'_>,
+    // Where the row is in its entrance (`Entrance::pose`): at rest, it is
+    // `Pose::REST`.
+    pose: motion::Pose,
 ) -> RowOutcome {
-    let username = item.login.as_ref().and_then(|l| l.username.as_deref()).unwrap_or("");
-    // Design 2b's two trailing chips. Neither is decorative and neither is
-    // invented: "app" is `deskwarden:app-match`, the custom field that makes
-    // an item fillable into a native window, and "2FA" is the item's own TOTP
-    // seed. Both are answered from the item already in hand -- no extra
-    // lookup, and only for the handful of rows `show_rows` hands us.
-    //
-    // BOTH MAY APPEAR AT ONCE. The design never draws two chips on a row and
-    // gives no precedence rule, which is why the "2FA" chip was left out
-    // originally; the user has since decided they may sit side by side, "app"
-    // first. A fixed-size array rather than a `Vec` because this runs per
-    // visible row, per frame.
-    //
-    // Ordered for a RIGHT-TO-LEFT layout below, so the array is walked in
-    // reverse: the last chip pushed is the leftmost drawn, and "app first"
-    // means app is the leftmost of the pair in reading order.
-    let chips: [Option<&str>; 2] = [
-        crate::vault_bridge::extract_app_match(item).is_some().then_some("app"),
-        item.login
-            .as_ref()
-            .and_then(|l| l.totp.as_ref())
-            .is_some()
-            .then_some("2FA"),
-    ];
-    let frame = egui::Frame::new()
-        // Design 2b: EVERY row is `background: #ffffff`, selected or not.
-        // Filling unselected rows with the pane's own `CANVAS` is what made
-        // them read as flat bands instead of tiles -- the reported defect.
-        .fill(theme::CARD)
-        .stroke(Stroke::new(
-            ROW_BORDER,
-            if selected { theme::BLUE } else { theme::HAIRLINE },
-        ))
-        // `box-shadow: 0 1px 2px rgba(45, 43, 43, 0.06)`, selected only.
-        .shadow(if selected { SELECTED_ROW_SHADOW } else { egui::Shadow::NONE })
-        .corner_radius(CornerRadius::same(ROW_RADIUS))
-        .inner_margin(Margin::symmetric(ROW_PAD_X as i8, ROW_PAD_Y as i8))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = ROW_GAP_X;
-                // NOTHING SHARES THE LEADING RUN WITH THE TILE. The tile is
-                // the bank's icon when there is one and the name's monogram
-                // when there is not -- the same two rungs every non-card row
-                // has always had, with no card-shaped third and, since the
-                // mark moved to the trailing edge, no fourth element beside
-                // it either. The row now reads tile, then text, then the
-                // trailing chips, on every row of every kind.
-                row_tile(ui, icon, ItemKind::of(item), &item.name, AVATAR_SIZE, selected);
-                // The design's title column is `flex: 1` with the chips
-                // trailing it. Laid out right-to-left so the chips take their
-                // own width off the right edge and the column gets the
-                // remainder -- the same trick the toolbar strip above uses
-                // for `+ New` and the search field, and the reason neither
-                // needs a guessed width.
-                //
-                // Allocated at EXACTLY the avatar's height, which is what
-                // makes design 2b's `align-items: center` work. Left to take
-                // the row's available height (which `with_layout` does) the
-                // cross-axis extent is unbounded, egui falls back to placing
-                // at the top, and the `Align::Center` below has nothing to
-                // centre within -- the two-line column then hung 2pt high
-                // against the avatar and a single-line row 9pt high. Bounding
-                // it here is also free: `ROW_TILE_HEIGHT` is already defined
-                // as the avatar plus the row's padding, because `show_rows`
-                // has to virtualize against a fixed row height.
-                let column = egui::Vec2::new(ui.available_width(), AVATAR_SIZE);
-                ui.allocate_ui_with_layout(
-                    column,
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                    // Reversed: this ui runs right-to-left, so the FIRST chip
-                    // drawn lands furthest right. Walking the array backwards
-                    // puts "app" to the left of "2FA".
-                    //
-                    // The chips are allocated before the title column, so on a
-                    // pane too narrow for everything they keep their full size
-                    // and the title/subtitle absorb the squeeze by truncating
-                    // (both are `Label::truncate`). That is deliberate: a chip
-                    // that wrapped, or a title that did, would make one row
-                    // taller than `ROW_TILE_HEIGHT` and slide the virtualized
-                    // list out of register with the pitch `show_rows` scrolls
-                    // by. `two_chips_on_a_narrow_pane_stay_inside_the_tile_
-                    // and_squeeze_the_title_instead` pins that at 170pt, a
-                    // pane less than half the real one: both chips still sit
-                    // inside the tile and the row is still exactly one
-                    // `ROW_TILE_HEIGHT` tall. Narrower than the chips plus the
-                    // avatar the chips would start to overlap it, but this
-                    // pane is `Panel::exact_size(LIST_WIDTH).resizable(false)`
-                    // in `vault_window::mod` and cannot get there.
-                    // **5d's pill first**, which in this right-to-left run
-                    // puts it furthest right -- the design's order is `app`,
-                    // `2FA`, `shared` in reading order, so `shared` is the
-                    // last of the three read and the first of the three
-                    // drawn.
-                    if marks.person || marks.send {
-                        shared_pill_marked(ui, marks.person);
-                    }
-                    // **6e's `view-only`**, next in: to the left of where the
-                    // `shared` pill would stand and to the right of `app` and
-                    // `2FA`, which say what the record is and so read first.
-                    // Rarely beside the pill: a record someone shares with
-                    // this account is not one it can share on (the engine
-                    // refuses it, `rest::sharing::OTHER_ORG`), so only a live
-                    // Send of it -- matched by name -- puts the two together.
-                    if marks.from.is_some() {
-                        row_badge(ui, VIEW_ONLY_CHIP, selected);
-                    }
-                    for chip in chips.iter().rev().flatten() {
-                        row_badge(ui, chip, selected);
-                    }
-                    // The network mark shares this trailing run -- "lets also
-                    // move pill to the right - similar to our mfa/app pills".
-                    //
-                    // **It does not share it with the chips, on any row a
-                    // vault produces.** "2FA" is read off `item.login.totp`
-                    // and a card has no login block; `card_network` answers
-                    // for cards alone. So the mark and "2FA" are mutually
-                    // exclusive by the item's KIND, and there is no ordering
-                    // between three trailing things to design, because there
-                    // is never a third. The row shows a mark or it shows
-                    // chips.
-                    //
-                    // The ONE overlap that is reachable is the "app" chip: it
-                    // comes from a `deskwarden:app-match` CUSTOM field, and
-                    // nothing confines a custom field to a login -- see
-                    // `card_bound_to_an_app`. That is why this is drawn after
-                    // the loop rather than before it. Not a precedence rule
-                    // anybody chose: it is where a `card_mark` has to go,
-                    // since it is not a text chip and cannot be an entry in
-                    // `chips`, and the resulting order is the one that costs
-                    // nothing -- the chip keeps the trailing edge it holds on
-                    // every login row, and the mark takes its room from the
-                    // title it qualifies.
-                    if let Some(brand) = card_network(item) {
-                        paint_network_mark(ui, brand, selected);
-                    }
-                    // Sized to its OWN content height, not to the available
-                    // height: `ui.vertical` would take the full 32 and
-                    // top-align inside it, which is the same defect one level
-                    // down. With an exact height the parent's `Align::Center`
-                    // centres the whole column against the avatar.
-                    let text_column = egui::Vec2::new(
-                        ui.available_width(),
-                        text_column_height(ui, username, selected),
-                    );
-                    ui.allocate_ui_with_layout(
-                        text_column,
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                        ui.spacing_mut().item_spacing.y = TITLE_GAP_Y;
-                        let title = if selected {
-                            // `font-weight: 700; color: #14307a`.
-                            theme::bold(&item.name, TITLE_SIZE).color(theme::BLUE_DEEP)
-                        } else {
-                            theme::semibold(&item.name, TITLE_SIZE).color(theme::INK)
-                        };
-                        // Truncated, not wrapped: a name long enough to wrap
-                        // ("Remote Desktop — Bastion" is already close) would
-                        // make one row taller than every other and slide the
-                        // whole virtualized list out of register with the
-                        // fixed pitch `show_rows` scrolls by.
-                        //
-                        // A CARD with four or more digits stored takes the
-                        // other branch, which draws the same name followed by
-                        // `(*4545)`. Every other row -- including a card with
-                        // no number, an empty one, or a fragment shorter than
-                        // four digits -- takes this one and is byte for byte
-                        // the row it was before.
-                        match card_number_suffix(item) {
-                            Some(suffix) => paint_title_with_suffix(ui, title, &suffix),
-                            None => {
-                                ui.add(egui::Label::new(title).truncate());
-                            }
-                        }
-                        if !username.is_empty() {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(username)
-                                        .size(SUBTITLE_SIZE)
-                                        .color(theme::TEXT_FAINT),
-                                )
-                                .truncate(),
-                            );
-                        }
-                    });
-                });
-            });
-        });
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), ROW_TILE_HEIGHT), Sense::click_and_drag());
+    paint_row(ui, rect, item, selected, icon, marks, pose, response.hovered());
     // `click_and_drag`, not `click`: the row is both the selection control it
     // has always been AND the handle for dragging the item onto a folder.
     //
@@ -2647,7 +2093,6 @@ fn item_row(
     // right-click that opens the context menu is untouched -- dragging is
     // primary-button only, and `secondary_clicked()` is read below exactly as
     // before.
-    let response = frame.response.interact(Sense::click_and_drag());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
     }
@@ -2732,6 +2177,327 @@ fn item_row(
         command,
     }
 }
+
+/// The header's title while the search box has anything in it.
+pub const RESULTS_TITLE: &str = "Results";
+
+/// Spec 3.1's header: padding `24 24 14`, the title 26/800 and the count 15
+/// `text_ghost` beside it, and the compact `+` at the right that opens the
+/// New menu. Returns what that menu chose.
+fn list_header(ui: &mut egui::Ui, title: &str, count: usize) -> Option<ItemListAction> {
+    let p = tokens::palette(ui.ctx());
+    let mut chosen = None;
+    egui::Frame::new()
+        .inner_margin(Margin { left: 24, right: 24, top: 24, bottom: 14 })
+        .show(ui, |ui| {
+            // A fixed band: a right-to-left layout left to size itself would
+            // centre in, and claim, the whole pane's height.
+            let band = egui::vec2(
+                ui.available_width(),
+                tokens::font_height(ui.ctx(), tokens::LIST_HEADER).max(NEW_BUTTON_SIZE),
+            );
+            ui.allocate_ui_with_layout(band, egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // ALWAYS opens the menu; the button itself creates nothing.
+                // `Popup::menu` draws into its own `Area`, so nothing in it
+                // allocates here -- which keeps the list beneath in register
+                // (`the_new_menu_does_not_change_the_rows_below_it`).
+                let new = new_button(ui, &p);
+                egui::Popup::menu(&new).show(|ui| {
+                    // From `CREATABLE_KINDS`, never a list written out here:
+                    // that array keeps `ItemKind::Unknown` out of creation.
+                    for kind in super::detail_edit::CREATABLE_KINDS {
+                        if ui.button(kind.label()).clicked() {
+                            chosen = Some(ItemListAction::NewItem(kind));
+                            ui.close();
+                        }
+                    }
+                    // The import is not a kind (its type comes from the
+                    // payload), so it sits below a separator.
+                    ui.separator();
+                    if ui.button(super::record_ui::IMPORT_FROM_SEND_LABEL).clicked() {
+                        chosen = Some(ItemListAction::ImportFromSend);
+                        ui.close();
+                    }
+                });
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Max), |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let count = tokens::job(tokens::BODY, &count.to_string(), p.text_ghost);
+                    let count_width = ui.fonts_mut(|f| f.layout_job(count.clone()).size().x);
+                    let room = (ui.available_width() - count_width - 10.0).max(1.0);
+                    let mut title_job = tokens::job(tokens::LIST_HEADER, title, p.ink);
+                    title_job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+                    ui.label(title_job);
+                    // Nudged down to the title's baseline: the two sizes share
+                    // a bottom edge, not a baseline, in egui's boxes.
+                    ui.add_space(0.0);
+                    ui.label(count);
+                });
+            });
+        });
+    chosen
+}
+
+/// The compact `+` beside the list's title (slice 3, decision 1).
+const NEW_BUTTON_SIZE: f32 = 34.0;
+
+/// The `+`'s own id: it paints no words to be found by, so the window's
+/// tests read its rect back off the context (`ctx.read_response`).
+pub(crate) fn new_button_id() -> egui::Id {
+    egui::Id::new("vault-list-new")
+}
+
+/// The `+`: `kit::controls::icon_button`'s look, under [`new_button_id`].
+fn new_button(ui: &mut egui::Ui, p: &tokens::Palette) -> egui::Response {
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(NEW_BUTTON_SIZE), Sense::hover());
+    let response = ui.interact(rect, new_button_id(), Sense::click());
+    if response.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(11), p.hover);
+    }
+    kit::icon::stroke(
+        ui.painter(),
+        egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(19.0)),
+        kit::icon::glyph::PLUS,
+        2.0,
+        p.text_icon,
+    );
+    response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text(NEW_ITEM_HINT)
+}
+/// What hovering the `+` says.
+pub const NEW_ITEM_HINT: &str = "New item";
+
+/// Spec 3.1's offline banner. Returns whether Retry was clicked.
+fn offline_banner(ui: &mut egui::Ui) -> bool {
+    let p = tokens::palette(ui.ctx());
+    let bold = tokens::Role { size: 14.0, face: theme::BOLD, tracking_em: 0.0 };
+    let line = tokens::Role { size: 13.0, face: theme::REGULAR, tracking_em: 0.0 };
+    let mut retry = false;
+    egui::Frame::new()
+        .outer_margin(Margin { left: 14, right: 14, top: 0, bottom: 10 })
+        .inner_margin(Margin::symmetric(14, 12))
+        .corner_radius(CornerRadius::same(14))
+        .fill(p.caution_wash)
+        .stroke(Stroke::new(1.0, p.caution_edge))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 12.0;
+                let (glyph, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), Sense::hover());
+                kit::icon::stroke(ui.painter(), glyph, kit::icon::glyph::WIFI_OFF, 2.2, p.caution_mark);
+                ui.vertical(|ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.label(tokens::job(bold, OFFLINE_TITLE, p.caution_ink));
+                    ui.label(tokens::job(line, OFFLINE_DETAIL, p.caution_ink));
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let button = ui
+                        .add(egui::Label::new(tokens::job(bold, OFFLINE_RETRY, p.caution_ink)).sense(Sense::click()))
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    retry = button.clicked();
+                });
+            });
+        });
+    retry
+}
+
+/// Spec 3.1's banner copy, the apostrophe straight as the design sets it.
+pub const OFFLINE_TITLE: &str = "You're offline";
+pub const OFFLINE_DETAIL: &str = "Filling still works";
+pub const OFFLINE_RETRY: &str = "Retry";
+
+/// What a list is, for its entrance: the scope and the search. A change in
+/// either is a new list, and a new list enters again.
+fn entrance_key(filter: &SidebarFilter, search_lower: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    format!("{filter:?}").hash(&mut hasher);
+    search_lower.trim().hash(&mut hasher);
+    hasher.finish()
+}
+
+/// One list's entrance: when it started, and the rows that were on screen on
+/// its first frame. Rows scrolled into view later arrive at rest.
+#[derive(Clone)]
+struct Entrance {
+    key: u64,
+    start: f64,
+    rows: std::ops::Range<usize>,
+}
+
+/// Spec 3.1: `dw-up .4s ease-out`, `i * 0.035s` apart.
+const ENTRANCE_DURATION: f32 = 0.4;
+const ENTRANCE_STAGGER: f32 = 0.035;
+
+fn entrance_for(ctx: &egui::Context, key: u64, visible: std::ops::Range<usize>) -> Entrance {
+    let id = egui::Id::new("vault-list-entrance");
+    let now = ctx.input(|i| i.time);
+    ctx.data_mut(|d| {
+        let current: Option<Entrance> = d.get_temp(id);
+        match current {
+            Some(e) if e.key == key => e,
+            // The first list this window shows arrives at rest: the splash
+            // that covers the opening vault is its entrance.
+            None => {
+                let first = Entrance { key, start: now, rows: 0..0 };
+                d.insert_temp(id, first.clone());
+                first
+            }
+            Some(_) => {
+                let fresh = Entrance { key, start: now, rows: visible };
+                d.insert_temp(id, fresh.clone());
+                fresh
+            }
+        }
+    })
+}
+
+impl Entrance {
+    /// Where row `row` is in the entrance, asking for the next frame only
+    /// while some row is still moving.
+    fn pose(&self, ctx: &egui::Context, row: usize) -> motion::Pose {
+        if !self.rows.contains(&row) {
+            return motion::Pose::REST;
+        }
+        let delay = motion::stagger(row - self.rows.start, ENTRANCE_STAGGER);
+        let elapsed = (ctx.input(|i| i.time) - self.start) as f32 - delay;
+        let linear = (elapsed / ENTRANCE_DURATION).clamp(0.0, 1.0);
+        if linear >= 1.0 {
+            return motion::Pose::REST;
+        }
+        ctx.request_repaint();
+        motion::up(motion::EASE_OUT.at(linear))
+    }
+}
+
+/// A row's initials (spec 3.2): two words give their first letters, one word
+/// its first two, nothing a `?`; upper-cased.
+pub fn initials(name: &str) -> String {
+    let mut words = name.split_whitespace();
+    let text: String = match (words.next(), words.next()) {
+        (Some(a), Some(b)) => a.chars().take(1).chain(b.chars().take(1)).collect(),
+        (Some(a), None) => a.chars().take(2).collect(),
+        _ => "?".to_string(),
+    };
+    text.to_uppercase()
+}
+
+/// What a row's 44pt tile shows: a card's network tile, else the site's
+/// favicon, else initials on the name's colour.
+pub(crate) fn row_look(item: &VaultItem, icon: Option<&egui::TextureHandle>) -> kit::avatar::Look {
+    if let Some((label, bg, italic)) = card_network(item).and_then(kit::avatar::network) {
+        return kit::avatar::Look::Brand { label: label.to_string(), bg, italic };
+    }
+    if let Some(texture) = icon {
+        return kit::avatar::Look::Favicon(texture.clone());
+    }
+    let (bg, fg) = kit::avatar::initials_colours(&item.name);
+    kit::avatar::Look::Initials { text: initials(&item.name), bg, fg }
+}
+
+/// A row's subtitle: a card's masked last four, or the login's username.
+pub(crate) fn row_subtitle(item: &VaultItem) -> String {
+    if let Some(last) = card_last_four(item) {
+        return format!("\u{2022}\u{2022}\u{2022}\u{2022} {last}");
+    }
+    item.login.as_ref().and_then(|l| l.username.clone()).unwrap_or_default()
+}
+
+/// A row's tags, in spec 3.1's order: App, 2FA, then View only and Shared.
+pub(crate) fn row_tags(item: &VaultItem, marks: RowMarks<'_>) -> Vec<kit::card::TagKind> {
+    use kit::card::TagKind;
+    let mut tags = Vec::with_capacity(4);
+    if crate::vault_bridge::extract_app_match(item).is_some() {
+        tags.push(TagKind::App);
+    }
+    if item.login.as_ref().and_then(|l| l.totp.as_ref()).is_some() {
+        tags.push(TagKind::TwoFa);
+    }
+    if marks.from.is_some() {
+        tags.push(TagKind::ViewOnly);
+    }
+    if marks.send || marks.person {
+        tags.push(TagKind::Shared);
+    }
+    tags
+}
+
+/// The selected row's lift: `0 2px 8px rgba(32,30,29,.08)`.
+const SELECTED_ROW_SHADOW: egui::Shadow =
+    egui::Shadow { offset: [0, 2], blur: 8, spread: 0, color: egui::Color32::from_rgba_premultiplied(3, 2, 2, 20) };
+
+/// Paints one row into `rect`: spec 3.1's tile, avatar, title and the
+/// subtitle line with its tags. Allocates nothing.
+#[allow(clippy::too_many_arguments)]
+fn paint_row(
+    ui: &egui::Ui,
+    rect: egui::Rect,
+    item: &VaultItem,
+    selected: bool,
+    icon: Option<&egui::TextureHandle>,
+    marks: RowMarks<'_>,
+    pose: motion::Pose,
+    hovered: bool,
+) {
+    use egui::epaint::RectShape;
+    let p = tokens::palette(ui.ctx());
+    let mut painter = ui.painter().clone();
+    painter.multiply_opacity(pose.opacity);
+    let rect = rect.translate(egui::vec2(pose.dx, pose.dy));
+    let radius = CornerRadius::same(ROW_RADIUS);
+    if selected {
+        painter.add(SELECTED_ROW_SHADOW.as_shape(rect, radius));
+        // The ring is painted INSIDE the row: outside it, the scroll area
+        // clips the first row's top edge.
+        painter.add(RectShape::new(rect, radius, p.card, Stroke::new(2.0, p.blue), egui::StrokeKind::Inside));
+    } else if hovered {
+        painter.rect_filled(rect, radius, p.hover);
+    }
+
+    let tile = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + ROW_PAD_X, rect.center().y - AVATAR_SIZE / 2.0),
+        egui::Vec2::splat(AVATAR_SIZE),
+    );
+    kit::avatar::paint(&painter, tile, &row_look(item, icon), 12);
+
+    let left = tile.right() + ROW_GAP_X;
+    let width = (rect.right() - ROW_PAD_X - left).max(1.0);
+    let ctx = ui.ctx();
+    let title_h = tokens::font_height(ctx, tokens::ROW_TITLE);
+    let subtitle = row_subtitle(item);
+    let tags = row_tags(item, marks);
+    let tag_sizes: Vec<egui::Vec2> =
+        tags.iter().map(|t| kit::card::tag_size(ctx, *t, kit::card::TagSize::List)).collect();
+    let second_line = !subtitle.is_empty() || !tags.is_empty();
+    let sub_h = tokens::font_height(ctx, tokens::SUBTITLE);
+    let line_h = tag_sizes.iter().map(|s| s.y).fold(sub_h, f32::max);
+    let column_h = if second_line { title_h + TITLE_GAP_Y + line_h } else { title_h };
+    let top = rect.center().y - column_h / 2.0;
+
+    let mut title = tokens::job(tokens::ROW_TITLE, &item.name, p.ink);
+    title.wrap = egui::text::TextWrapping::truncate_at_width(width);
+    painter.galley(egui::pos2(left, top), painter.layout_job(title), p.ink);
+    if !second_line {
+        return;
+    }
+    let line_top = top + title_h + TITLE_GAP_Y;
+    let tags_width: f32 = tag_sizes.iter().map(|s| s.x).sum::<f32>() + TAG_GAP * tags.len() as f32;
+    let mut x = left;
+    if !subtitle.is_empty() {
+        let room = (width - tags_width).max(1.0);
+        let mut job = tokens::job(tokens::SUBTITLE, &subtitle, p.text_faint);
+        job.wrap = egui::text::TextWrapping::truncate_at_width(room);
+        let galley = painter.layout_job(job);
+        let at = egui::pos2(x, line_top + (line_h - galley.size().y) / 2.0);
+        x += galley.size().x + TAG_GAP;
+        painter.galley(at, galley, p.text_faint);
+    }
+    for (tag, size) in tags.iter().zip(&tag_sizes) {
+        kit::card::paint_tag(&painter, egui::pos2(x, line_top + (line_h - size.y) / 2.0), *tag, kit::card::TagSize::List);
+        x += size.x + TAG_GAP;
+    }
+}
+
+/// Spec 3.1's subtitle row `gap: 6`.
+const TAG_GAP: f32 = 6.0;
 
 /// The inline "that move did not happen" band. Returns whether it was
 /// clicked, which dismisses it.
@@ -2925,8 +2691,6 @@ pub(super) fn menu_command_button(ui: &mut egui::Ui, entry: &MenuCommand) -> egu
 /// hand-rebuilt Send row came out looking like a different application in the
 /// same slot. The name is kept because `item_row` reads far better for it
 /// than for a fully-qualified path in the middle of a `Frame` builder.
-const SELECTED_ROW_SHADOW: egui::Shadow = theme::SELECTED_ROW_SHADOW;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4275,9 +4039,7 @@ mod row_tile_tests {
     //! `RectShape`s and galleys, so fills, stroke colours, corner radii and
     //! geometry are all asserted from what egui actually emitted.
     use super::*;
-    use crate::app_match::{AppMatch, TriggerMode, APP_MATCH_FIELD_NAME};
     use crate::theme;
-    use crate::vault_bridge::VaultField;
     use eframe::egui::epaint::RectShape;
 
     const PANE_WIDTH: f32 = 390.0;
@@ -4293,72 +4055,6 @@ mod row_tile_tests {
     // -----------------------------------------------------------------
     // Design 5d -- the `shared` pill
     // -----------------------------------------------------------------
-
-    /// **The pill is drawn when the record is shared, and not when it is
-    /// not.**
-    ///
-    /// Both halves, because the positive alone passes against a row that
-    /// always draws it -- which is the failure that would matter most here: a
-    /// pill meaning "someone can open this right now" on every record in the
-    /// vault.
-    ///
-    /// This drives `item_row` rather than `draw_item_list`, which is a
-    /// departure from this file's rule ("pressed, not called") and is worth
-    /// naming: the list harness threads eleven arguments through four
-    /// wrappers, and what is being asked here is about one row's trailing
-    /// run. The wiring between the two -- that `draw_item_list` really hands
-    /// each row its own answer -- is asserted separately, below, off the
-    /// source.
-    #[test]
-    fn a_shared_record_wears_the_pill_and_an_unshared_one_does_not() {
-        let item = login("SAP Production", "a.novak@ledgerline.com");
-        let drawn = |shared: bool| -> Vec<String> {
-            let ctx = egui::Context::default();
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(PANE_WIDTH, 400.0),
-                )),
-                ..Default::default()
-            };
-            let _ = ctx.run_ui(input.clone(), |_ui| {});
-            crate::theme::apply(&ctx);
-            let output = ctx.run_ui(input, |ui| {
-                let _ = item_row(
-                    ui,
-                    &item,
-                    &[],
-                    false,
-                    None,
-                    false,
-                    FilterSource::LiveVault,
-                    RowMarks { send: shared, ..RowMarks::default() },
-                );
-            });
-            let mut texts = Vec::new();
-            for clipped in &output.shapes {
-                collect_text(&clipped.shape, &mut texts);
-            }
-            texts
-        };
-
-        let with = drawn(true);
-        assert!(
-            with.iter().any(|t| t == SHARED_PILL),
-            "a shared record has no {SHARED_PILL:?} pill: {with:?}"
-        );
-        let without = drawn(false);
-        assert!(
-            !without.iter().any(|t| t == SHARED_PILL),
-            "an unshared record wears the pill anyway, so it means nothing: {without:?}"
-        );
-        // A control: the row really drew, so the negative above is about the
-        // pill and not about a frame that painted nothing.
-        assert!(
-            without.iter().any(|t| t == "SAP Production"),
-            "the row painted no name, so neither assertion is about anything: {without:?}"
-        );
-    }
 
     /// Every painted run, flattened. The harness above has a richer collector
     /// of its own; this is the one fact this pair of assertions needs.
@@ -4417,60 +4113,14 @@ mod row_tile_tests {
         let output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let icons = IconCache::default();
             item_row(ui, &login("theirs", "u"), &[], false, icons.textures.get("theirs"), false, FilterSource::LiveVault,
-                RowMarks { send: false, person: false, from: people.from("theirs") });
+                RowMarks { send: false, person: false, from: people.from("theirs") },
+                crate::kit::motion::Pose::REST,);
         });
         let mut texts = Vec::new();
         for clipped in &output.shapes {
             collect_text(&clipped.shape, &mut texts);
         }
         assert!(texts.iter().any(|t| t == VIEW_ONLY_CHIP), "{texts:?}");
-    }
-
-    /// **The person mark wins, and the plane is what it replaces** -- read
-    /// off the chip's white strokes. The plane is `paint_send_plane`'s closed
-    /// four-point outline; the person is a ring (the head) and an open path.
-    /// Nothing else on a login row strokes in white, so the counts are the
-    /// chip's alone -- and the no-marks row is the control for that.
-    #[test]
-    fn the_shared_pill_wears_the_person_when_a_person_has_the_record() {
-        fn walk(shape: &egui::Shape, planes: &mut usize, heads: &mut usize) {
-            match shape {
-                egui::Shape::Path(p)
-                    if p.closed
-                        && p.points.len() == 4
-                        && p.stroke.color == egui::epaint::ColorMode::Solid(theme::CARD) =>
-                {
-                    *planes += 1;
-                }
-                egui::Shape::Circle(c) if c.stroke.width > 0.0 && c.stroke.color == theme::CARD => {
-                    *heads += 1;
-                }
-                egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, planes, heads)),
-                _ => {}
-            }
-        }
-        let item = login("Acme VPN", "denis@example.com");
-        let marks_of = |marks: RowMarks<'_>| -> (usize, usize) {
-            let ctx = egui::Context::default();
-            let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
-            crate::theme::apply(&ctx);
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                let _ = item_row(ui, &item, &[], false, None, false, FilterSource::LiveVault, marks);
-            });
-            let (mut planes, mut heads) = (0, 0);
-            for clipped in &output.shapes {
-                walk(&clipped.shape, &mut planes, &mut heads);
-            }
-            (planes, heads)
-        };
-        assert_eq!(marks_of(RowMarks::default()), (0, 0), "control: a plain row strokes something white");
-        assert_eq!(marks_of(RowMarks { send: true, ..RowMarks::default() }), (1, 0), "a live Send wears the plane");
-        assert_eq!(marks_of(RowMarks { person: true, ..RowMarks::default() }), (0, 1), "a person share wears the person");
-        assert_eq!(
-            marks_of(RowMarks { send: true, person: true, from: None }),
-            (0, 1),
-            "one chip, and the person wins over the plane (mock 6e)"
-        );
     }
 
     /// Which row commands write to a record -- the ones a received,
@@ -4508,22 +4158,9 @@ mod row_tile_tests {
         }
     }
 
-    /// The same custom field `app::save_app_match` writes and
-    /// `vault_bridge::extract_app_match` reads -- built through `AppMatch`'s
-    /// own serializer so this cannot drift from the real format.
-    fn with_app_match(mut item: VaultItem) -> VaultItem {
-        item.fields.push(VaultField {
-            name: Some(APP_MATCH_FIELD_NAME.to_string()),
-            value: Some(zeroize::Zeroizing::new(
-                AppMatch::for_process("ledgerline.exe", TriggerMode::Prompt)
-                .to_field_value(),
-            )),
-            other: serde_json::Map::new(),
-        });
-        item
-    }
-
     struct Painted {
+        /// Where the header's `+` is (`new_button_id`).
+        new_button: Option<egui::Rect>,
         rects: Vec<RectShape>,
         /// Every stroked circle, straight run and open path the frame drew.
         ///
@@ -4658,47 +4295,6 @@ mod row_tile_tests {
         paint_core(items, selected, 0, width, |_| IconCache::default(), Menu::none())
     }
 
-    /// One real frame with a favicon TEXTURE loaded for every id in `ids` --
-    /// the branch `IconCache::default()` can never reach, and the one the
-    /// "the favicon fills its tile" report is about.
-    /// Rows with a favicon on each named id, the icon being a 16x16 texture.
-    ///
-    /// **16x16 is not an arbitrary fixture size.** It is the size most sites
-    /// still serve, and under [`theme::avatar_image`]'s never-upscale rule it
-    /// is the case that does NOT fill the 32pt tile -- it draws at 16pt with
-    /// 8pt of margin all round. Tests that want the other case (artwork at
-    /// least as big as the tile, which still goes full bleed) ask for it
-    /// explicitly through [`paint_with_icons_sized`].
-    fn paint_with_icons(items: &[VaultItem], selected: Option<&str>, ids: &[&str]) -> Painted {
-        paint_with_icons_sized(items, selected, ids, 16)
-    }
-
-    /// [`paint_with_icons`] with the texture's own size chosen by the caller,
-    /// so a test can put artwork on either side of the tile's 32pt and get the
-    /// two different behaviours the sizing rule has.
-    fn paint_with_icons_sized(
-        items: &[VaultItem],
-        selected: Option<&str>,
-        ids: &[&str],
-        side: usize,
-    ) -> Painted {
-        let ids: Vec<String> = ids.iter().map(|s| s.to_string()).collect();
-        paint_core(items, selected, 0, PANE_WIDTH, |ctx| {
-            let mut icons = IconCache::default();
-            for id in &ids {
-                icons.textures.insert(
-                    id.clone(),
-                    ctx.load_texture(
-                        format!("favicon-{id}"),
-                        egui::ColorImage::filled([side, side], egui::Color32::RED),
-                        egui::TextureOptions::LINEAR,
-                    ),
-                );
-            }
-            icons
-        }, Menu::none())
-    }
-
     fn paint_core(
         items: &[VaultItem],
         selected: Option<&str>,
@@ -4786,6 +4382,8 @@ mod row_tile_tests {
                     &mut row_opened,
                                 &std::collections::HashSet::new(),
                                 &RowPeople::default(),
+                                "All items",
+                                false,
                             );
             })
         };
@@ -4825,6 +4423,7 @@ mod row_tile_tests {
         );
 
         let mut painted = Painted {
+            new_button: ctx.read_response(new_button_id()).map(|r| r.rect),
             rects: Vec::new(),
             circles: Vec::new(),
             segments: Vec::new(),
@@ -4843,59 +4442,30 @@ mod row_tile_tests {
         painted
     }
 
-    /// The row tiles, in paint order: full-width boxes exactly one row high.
-    /// Deliberately keyed on GEOMETRY rather than on fill, so a test that
-    /// asserts the fill cannot be the thing that found the rect. The
-    /// selected row's drop shadow occupies the same box, so it is excluded by
-    /// its blur -- and asserted on separately.
-    /// [`row_tiles`] at a pane that is not the real one.
-    ///
-    /// `row_tiles` measures against `TILE_WIDTH`, which is derived from the
-    /// real `PANE_WIDTH`; a frame painted narrower has narrower rows and that
-    /// function finds none of them.
-    fn row_tiles_of_width(p: &Painted, pane: f32) -> Vec<RectShape> {
-        let want = pane - 2.0 * LIST_PADDING;
-        p.rects
-            .iter()
-            .filter(|r| {
-                !(r.fill == egui::Color32::TRANSPARENT && r.stroke.width == 0.0)
-                    && r.blur_width == 0.0
-                    && (r.rect.width() - want).abs() < 0.5
-                    && (r.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
-            })
-            .cloned()
-            .collect()
-    }
-
     fn row_tiles(p: &Painted) -> Vec<RectShape> {
+        tiles_of_width(p, TILE_WIDTH)
+    }
+
+    /// Every row, as the box it occupies. A v2 row paints no tile of its own
+    /// until it is hovered or selected, so each is found by the one thing
+    /// every row paints, its 44pt avatar, and boxed around it: the row's
+    /// padding to the left and its fixed height around the avatar's centre.
+    fn tiles_of_width(p: &Painted, width: f32) -> Vec<RectShape> {
         p.rects
             .iter()
             .filter(|r| {
-                // A rect that paints neither a fill nor a stroke is not a
-                // tile -- egui emits one per row for the layout itself.
-                !(r.fill == egui::Color32::TRANSPARENT && r.stroke.width == 0.0)
-                    && r.blur_width == 0.0
-                    && (r.rect.width() - TILE_WIDTH).abs() < 0.5
-                    && (r.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
+                r.blur_width == 0.0
+                    && (r.rect.width() - AVATAR_SIZE).abs() < 0.5
+                    && (r.rect.height() - AVATAR_SIZE).abs() < 0.5
             })
-            .cloned()
+            .map(|avatar| {
+                let row = egui::Rect::from_min_size(
+                    egui::pos2(avatar.rect.left() - ROW_PAD_X, avatar.rect.center().y - ROW_TILE_HEIGHT / 2.0),
+                    egui::vec2(width, ROW_TILE_HEIGHT),
+                );
+                RectShape::filled(row, CornerRadius::same(ROW_RADIUS), avatar.fill)
+            })
             .collect()
-    }
-
-    /// A chip's own filled box, found from the label it contains -- the small
-    /// rect wrapping the text, never the row tile.
-    fn chip_rect(p: &Painted, label: &str) -> egui::Rect {
-        let text = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == label)
-            .unwrap_or_else(|| panic!("the {label:?} chip was never painted; painted: {:?}", p.texts))
-            .1;
-        p.rects
-            .iter()
-            .find(|r| r.rect.contains_rect(text) && r.rect.width() < 60.0)
-            .unwrap_or_else(|| panic!("the {label:?} chip's own filled box was never painted"))
-            .rect
     }
 
     fn one_tile(p: &Painted) -> RectShape {
@@ -4903,17 +4473,7 @@ mod row_tile_tests {
     }
 
     fn one_tile_of_width(p: &Painted, width: f32) -> RectShape {
-        let tiles: Vec<RectShape> = p
-            .rects
-            .iter()
-            .filter(|r| {
-                !(r.fill == egui::Color32::TRANSPARENT && r.stroke.width == 0.0)
-                    && r.blur_width == 0.0
-                    && (r.rect.width() - width).abs() < 0.5
-                    && (r.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5
-            })
-            .cloned()
-            .collect();
+        let tiles = tiles_of_width(p, width);
         assert_eq!(
             tiles.len(),
             1,
@@ -4923,42 +4483,12 @@ mod row_tile_tests {
         tiles[0].clone()
     }
 
-    /// A square of exactly `size`, by geometry alone -- the avatar tile.
-    fn square(p: &Painted, size: f32) -> RectShape {
-        p.rects
-            .iter()
-            .find(|r| {
-                (r.rect.width() - size).abs() < 0.5 && (r.rect.height() - size).abs() < 0.5
-            })
-            .cloned()
-            .unwrap_or_else(|| panic!("no {size}x{size} tile was painted"))
-    }
-
-    fn text_color(p: &Painted, needle: &str) -> egui::Color32 {
-        p.texts
-            .iter()
-            .find(|(t, _, _)| t == needle)
-            .unwrap_or_else(|| panic!("{needle:?} was never painted; painted: {:?}", p.texts))
-            .2
-    }
-
-    /// The `FontId` a painted string was laid out with -- size and family,
-    /// i.e. the design's `font-size` and `font-weight`.
-    fn text_font(p: &Painted, needle: &str) -> egui::FontId {
-        p.fonts
-            .iter()
-            .find(|(t, _)| t == needle)
-            .unwrap_or_else(|| panic!("{needle:?} was never painted; painted: {:?}", p.texts))
-            .1
-            .clone()
-    }
-
     /// Design 2b's header strip: `padding: 12px` around a `height: 34px`
     /// search box, i.e. 12 + 34 + 12. Written out rather than derived from
     /// `theme::SEARCH_FIELD_HEIGHT` so this stays an INDEPENDENT statement of
     /// the geometry -- a test that recomputed the strip from the same
     /// constants the code uses would stay green if both moved together.
-    const STRIP_HEIGHT: f32 = 58.0;
+    const STRIP_HEIGHT: f32 = 72.0;
 
     #[test]
     fn the_first_tile_sits_exactly_the_lists_own_padding_below_the_header_strip() {
@@ -4975,12 +4505,12 @@ mod row_tile_tests {
         let p = paint(&[login("Ledgerline", "a.novak@ledgerline.com")], None);
         let tile = one_tile(&p);
         assert!(
-            (tile.rect.top() - (STRIP_HEIGHT + LIST_PADDING)).abs() < 0.5,
+            (tile.rect.top() - (STRIP_HEIGHT + LIST_PADDING_TOP)).abs() < 0.5,
             "the first row tile's top edge is at y={}, expected {} (the {STRIP_HEIGHT}pt header \
-             strip plus the list's own {LIST_PADDING}pt padding and NOTHING else -- egui's \
-             ambient item_spacing is sitting between the strip and the list)",
+             -- 24 + 34 + 14 -- plus the row list's own {LIST_PADDING_TOP}pt top padding and \
+             NOTHING else: egui's ambient item_spacing is sitting between the two)",
             tile.rect.top(),
-            STRIP_HEIGHT + LIST_PADDING
+            STRIP_HEIGHT + LIST_PADDING_TOP
         );
         assert!(
             (tile.rect.left() - LIST_PADDING).abs() < 0.5,
@@ -5434,65 +4964,6 @@ mod row_tile_tests {
         );
     }
 
-    #[test]
-    fn the_gap_above_the_first_tile_is_the_same_as_the_gap_beside_it() {
-        // THE REPORT, the half nobody had ever measured: "also feels on top
-        // is smaller as well". Two rounds of work went into the side gaps
-        // while the top was only ever asserted as an ABSOLUTE y coordinate
-        // (`STRIP_HEIGHT + LIST_PADDING`), which is a statement about the
-        // layout, not about what the eye compares. If the header strip's own
-        // ink stopped short of `STRIP_HEIGHT`, or something were painted
-        // between the strip and the list, the absolute assertion would stay
-        // green while the visible gap shrank.
-        //
-        // So this measures INK to INK, the same way `clear_space_beside_
-        // tiles` measures the sides: from the bottom of the lowest thing
-        // painted above the first tile down to that tile's top edge, counting
-        // only what actually overlaps the tile's own column. Then it compares
-        // that to the left gap MEASURED IN THE SAME FRAME rather than to
-        // `LIST_PADDING`, so "the top matches the left" cannot pass by both
-        // sides drifting together.
-        //
-        // Run on a list that fits AND on one that overflows, unscrolled --
-        // the vertical gap has nothing to do with the scrollbar, and saying
-        // so is the point: the answer must not depend on the state the side
-        // gaps do.
-        for n in [3usize, 40usize] {
-            let items: Vec<VaultItem> = (0..n)
-                .map(|i| login(&format!("Item {i:04}"), "a@b.c"))
-                .collect();
-            // NOT `SETTLE_FRAMES`: that pumps the wheel, and a scrolled list
-            // has its first tile clipped by the viewport rather than sitting
-            // its padding below the strip.
-            let p = paint(&items, None);
-            let tile = row_tiles(&p)[0].rect;
-
-            let mut gap_above = tile.top();
-            for r in visibly_painted(&p) {
-                let shares_the_column =
-                    r.right() > tile.left() + 0.5 && r.left() < tile.right() - 0.5;
-                if shares_the_column && r.bottom() <= tile.top() + 0.01 {
-                    gap_above = gap_above.min(tile.top() - r.bottom());
-                }
-            }
-            let (gap_left, _) = clear_space_beside_tiles(&p, tile);
-
-            assert!(
-                (gap_above - gap_left).abs() < 0.51,
-                "on a {n}-row list there is {gap_above}pt of clear space above the first \
-                 tile and {gap_left}pt beside it. The reader compares those two directly, \
-                 so they have to be the same number"
-            );
-            assert!(
-                (gap_above - LIST_PADDING).abs() < 0.51,
-                "on a {n}-row list the gap above the first tile is {gap_above}pt, not the \
-                 design's {LIST_PADDING}pt -- the list frame's TOP margin is no longer the \
-                 same padding as its sides, or something is being painted between the \
-                 header strip and the list"
-            );
-        }
-    }
-
     /// The bottom of the list's scrolling viewport, from the PANE's geometry
     /// alone: the list frame is flush to the bottom of the pane and carries
     /// `LIST_PADDING` of its own. Deliberately says nothing about rows, tile
@@ -5595,513 +5066,6 @@ mod row_tile_tests {
         );
     }
 
-    #[test]
-    fn an_unselected_row_is_a_white_tile_with_the_designs_hairline_border() {
-        // THE REPORT, stated as an assertion. `background: #ffffff` on EVERY
-        // row -- the implementation filled unselected rows with `CANVAS`,
-        // the pane's own grey, which is why they did not read as tiles.
-        let p = paint(&[login("Atlas Studio", "a.novak@studio.atlas.com")], None);
-        let tile = one_tile(&p);
-        assert_eq!(
-            tile.fill,
-            theme::CARD,
-            "design 2b fills every row with #ffffff; this row is filled with {:?}",
-            tile.fill
-        );
-        assert_eq!(
-            tile.stroke.color,
-            theme::HAIRLINE,
-            "an unselected row's border is `1px solid #eae7e7`"
-        );
-        assert!(
-            (tile.stroke.width - 1.0).abs() < 0.01,
-            "border width {} , expected 1",
-            tile.stroke.width
-        );
-        assert_eq!(
-            tile.corner_radius,
-            CornerRadius::same(10),
-            "design 2b's rows are `border-radius: 10px`"
-        );
-    }
-
-    #[test]
-    fn a_selected_row_is_white_too_and_differs_only_in_its_blue_border() {
-        // The half of the design that WAS implemented (selected rows were
-        // already white) must survive the fix, and the difference between the
-        // two states must be the border colour -- not the fill.
-        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
-        let selected = one_tile(&paint(&items, Some("Ledgerline")));
-        let unselected = one_tile(&paint(&items, None));
-        assert_eq!(selected.fill, theme::CARD);
-        assert_eq!(unselected.fill, theme::CARD);
-        assert_eq!(
-            selected.stroke.color,
-            theme::BLUE,
-            "a selected row's border is `1px solid #1b3fa0`"
-        );
-        assert_ne!(
-            selected.stroke.color, unselected.stroke.color,
-            "selected and unselected rows must be distinguishable"
-        );
-    }
-
-    #[test]
-    fn the_selected_rows_title_is_the_designs_deep_blue_and_the_unselected_ones_is_ink() {
-        // `font-size: 13px; font-weight: 700; color: #14307a` when selected,
-        // the default ink at 600 otherwise. Absolute on both sides: asserting
-        // only that they differ would stay green if both drifted together.
-        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
-        let selected = paint(&items, Some("Ledgerline"));
-        let unselected = paint(&items, None);
-        assert_eq!(text_color(&selected, "Ledgerline"), theme::BLUE_DEEP);
-        assert_eq!(text_color(&unselected, "Ledgerline"), theme::INK);
-        // ...and the WEIGHT, which the colours alone would not have pinned:
-        // 700 selected, 600 otherwise, both at 13px.
-        for (state, font, family) in [
-            (&selected, text_font(&selected, "Ledgerline"), theme::BOLD),
-            (
-                &unselected,
-                text_font(&unselected, "Ledgerline"),
-                theme::SEMIBOLD,
-            ),
-        ] {
-            let _ = state;
-            assert_eq!(font.size, 13.0, "the design's `font-size: 13px`");
-            assert_eq!(
-                font.family,
-                egui::FontFamily::Name(family.into()),
-                "expected the {family} face"
-            );
-        }
-    }
-
-    #[test]
-    fn the_subtitle_is_the_designs_faint_grey_in_both_states() {
-        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
-        for selected in [None, Some("Ledgerline")] {
-            assert_eq!(
-                text_color(&paint(&items, selected), "a.novak@ledgerline.com"),
-                theme::TEXT_FAINT,
-                "the subtitle is `font-size: 11px; color: #7d7979` regardless of selection"
-            );
-        }
-    }
-
-    #[test]
-    fn the_avatar_tile_is_bordered_and_never_filled_in_either_state() {
-        // **Reversed, and named for it.** This used to pin design 2b's
-        // `background: #f3f2f2` on the monogram box, with `#eef2fc` when
-        // selected. The owner's ruling, on a screenshot of a monogram tile:
-        // "secnote and other icons have gray background - they should not".
-        // The tile is now an EDGE in both states, and the state is carried by
-        // that edge's colour and by the row behind it.
-        let items = [login("Ledgerline", "a.novak@ledgerline.com")];
-        for (selected, edge, what) in [
-            (None, theme::HAIRLINE, "unselected"),
-            (Some("Ledgerline"), theme::BLUE_EDGE, "selected"),
-        ] {
-            let tile = square(&paint(&items, selected), AVATAR_SIZE);
-            assert_eq!(
-                tile.fill,
-                egui::Color32::TRANSPARENT,
-                "the {what} tile is filled, so its letter sits on a grey square inside its own \
-                 tile"
-            );
-            assert_eq!(
-                tile.stroke.color, edge,
-                "the {what} tile lost the edge that is now the only thing distinguishing the two \
-                 states"
-            );
-        }
-    }
-
-    /// The vertical centre of the avatar tile in the FIRST row, absolute at
-    /// this pane: the tile's top edge (68) plus its 1px border and 10px
-    /// padding (79), plus half the avatar.
-    ///
-    /// Derived from [`AVATAR_SIZE`] rather than written out. The tile was
-    /// resized to 28 and back to 32 in one afternoon, and on the way through
-    /// a literal here failed with "the harness's geometry moved" -- which
-    /// reads as a broken test rather than as the deliberate change it was.
-    const FIRST_ROW_AVATAR_CENTRE_Y: f32 = 79.0 + AVATAR_SIZE / 2.0;
-
-    #[test]
-    fn the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top() {
-        // THE REPORT: "title/email are top-aligned against the 32px image".
-        // Design 2b's row is `align-items: center`.
-        //
-        // The two-line column is SHORTER than the 32px avatar (a 13px line, a
-        // 2px gap and an 11px line), so top-aligning it leaves it sitting ~2pt
-        // high. Asserted as the column's own mid-line, which is independent of
-        // the font metrics that set the two line heights -- and against an
-        // ABSOLUTE y, as well as against the avatar's, so this cannot stay
-        // green by both moving together.
-        let p = paint(&[login("Ledgerline", "a.novak@ledgerline.com")], None);
-        let avatar = square(&p, AVATAR_SIZE);
-        assert!(
-            (avatar.rect.center().y - FIRST_ROW_AVATAR_CENTRE_Y).abs() < 0.01,
-            "the harness's geometry moved: the avatar's centre is at y={}, expected \
-             {FIRST_ROW_AVATAR_CENTRE_Y}",
-            avatar.rect.center().y
-        );
-        let title = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == "Ledgerline")
-            .expect("the title")
-            .1;
-        let email = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == "a.novak@ledgerline.com")
-            .expect("the subtitle")
-            .1;
-        let column_centre = (title.top() + email.bottom()) / 2.0;
-        assert!(
-            (column_centre - FIRST_ROW_AVATAR_CENTRE_Y).abs() < 0.51,
-            "the title/subtitle column runs {}..{}, so its centre is at y={column_centre}, but \
-             the avatar's is at y={FIRST_ROW_AVATAR_CENTRE_Y} -- the column is hung from the top \
-             of the avatar rather than centred against it",
-            title.top(),
-            email.bottom()
-        );
-    }
-
-    #[test]
-    fn a_row_with_no_username_centres_its_single_line_too() {
-        // The positive control's other half: one line, not two. A fix that
-        // only centred the two-line case (say, by nudging it down a fixed 2pt)
-        // would push a single-line row 2pt BELOW centre, and the two-line
-        // assertion above could not tell.
-        let mut it = login("Vantage VPN", "");
-        it.login = None;
-        let p = paint(&[it], None);
-        let title = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == "Vantage VPN")
-            .expect("the title")
-            .1;
-        assert!(
-            (title.center().y - FIRST_ROW_AVATAR_CENTRE_Y).abs() < 0.51,
-            "a single-line row's title is centred at y={}, expected the avatar's \
-             {FIRST_ROW_AVATAR_CENTRE_Y}",
-            title.center().y
-        );
-    }
-
-    /// **SEVEN PASSES OVER ONE ROW**, and this test has now been on four
-    /// sides of it. The whole history, because the next person here will be
-    /// holding one of these reports and not the other six:
-    ///
-    /// 1. The favicon was drawn at the full 32pt (`fit_to_exact_size(32)`)
-    ///    and the report was "the favicon fills its tile edge-to-edge and
-    ///    feels too big" -- next to a monogram, whose letters cover about a
-    ///    third of the same tile.
-    /// 2. So it was inset 4pt a side: a 24pt image in a 32pt bordered box.
-    ///    The report on THAT was "icon is not fully taking the rounded
-    ///    rectangle" -- an icon adrift in a frame.
-    /// 3. So it went full bleed, every icon stretched to the tile. This test
-    ///    was named for that, having been renamed from
-    ///    `a_favicon_is_inset_inside_its_tile_instead_of_filling_it_edge_to_
-    ///    edge` -- deliberately reversed, not quietly dropped.
-    /// 4. **The defect was never the margin.** All three passes argued about
-    ///    how much air to leave, when what the owner was seeing was
-    ///    RESAMPLING: a 16x16 favicon -- which is what most sites still serve
-    ///    -- magnified 2x to fill a 32pt tile is soft, and no choice of inset
-    ///    makes a blown-up image sharp. Compared against Keeper: "keeps icons
-    ///    small (maybe original) inside the rounded square with visible
-    ///    paddings, so it never touches the edges and looks clear because
-    ///    never extrapolated." So the rule is now the artwork's OWN size,
-    ///    never magnified, shrunk only as far as it must be to fit, centred --
-    ///    and the margin is not a number anyone picks, it is the leftover.
-    ///
-    /// 5. Then the cap came OFF -- every source magnified to fill the tile --
-    ///    read off Keeper's tiles: "no padding here - as should", "if bigger -
-    ///    fills the whole thing".
-    /// 6. Seen running, that was rejected: "keep the frame as it was but
-    ///    change icons to 100% 16x16 - there will be padding but that's fine".
-    ///    Pass 4's rule exactly, reinstated by revert.
-    /// 7. Which left the LARGE sources still full bleed, since 4's cap only
-    ///    ever stopped growth: "icon touches the edges but should be in the
-    ///    middle with paddings", then "make icon 16px". So the artwork now
-    ///    fits a 16pt box rather than the tile -- a 16x16 at its own size, a
-    ///    64x64 reduced into it -- and the column is one size instead of
-    ///    every size between 16 and 32.
-    ///
-    /// This test is renamed again for that, and it asserts BOTH source sizes,
-    /// because a test that only ever saw the small one could not tell "fit a
-    /// 16pt box" from "never upscale" -- which is the exact pair that passes 4
-    /// and 7 turn on.
-    ///
-    /// **Assert the SIZE, never merely "an image was painted".** The whole
-    /// claim is dimensional: a rect that is textured proves nothing about
-    /// whether the artwork was magnified.
-    #[test]
-    fn every_favicon_is_fitted_into_the_same_box_centred_in_its_tile() {
-        // Every favicon is fitted into this box, centred in the tile.
-        const ARTWORK_PT: f32 = AVATAR_SIZE * theme::ARTWORK_BOX;
-
-        // ---- The small source: 16x16, the common case, must NOT fill ----
-        let p = paint_with_icons(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"]);
-        let tile = square(&p, AVATAR_SIZE);
-        // NOT filled, and this reverses. The tile behind a MONOGRAM is still
-        // `theme::CANVAS` -- a letter needs a ground -- but the owner's ruling
-        // on the tile behind artwork was "no backgound inside of tile", so a
-        // favicon's tile is an edge and nothing else.
-        assert_eq!(
-            tile.fill,
-            egui::Color32::TRANSPARENT,
-            "the tile behind a favicon was filled, so the icon sits on a square of ground \
-             inside its own tile -- which is what the owner asked to remove"
-        );
-        assert!(
-            tile.stroke.width > 0.0 && tile.stroke.color.a() > 0,
-            "dropping the fill must not take the tile's edge with it"
-        );
-        // ...and that edge is drawn INSIDE the tile, which is what makes the
-        // clear space beside the artwork a whole number of pixels. `Middle`
-        // straddles: a 1px border on a tile starting at x=79 covers 78.5 to
-        // 79.5, two half-covered pixels, leaving 5.5px of clear space that
-        // resolves to 5 down one side and 6 down the other. That was the
-        // owner's "5 pixels to the left and 6 to the right" -- the artwork was
-        // centred the whole time and the EDGE they measured from was not.
-        assert_eq!(
-            tile.stroke_kind,
-            egui::StrokeKind::Inside,
-            "the tile's border straddles its own edge, so it renders as two half-covered \
-             pixels and the gap beside the artwork cannot measure equal on both sides"
-        );
-        let (at, image) = p
-            .rects
-            .iter()
-            .enumerate()
-            .find(|(_, r)| r.brush.is_some())
-            .map(|(i, r)| (i, r.clone()))
-            .unwrap_or_else(|| {
-                panic!(
-                    "no textured rect was painted at all, so no favicon was drawn; painted: {:?}",
-                    p.rects.iter().map(|r| r.rect).collect::<Vec<_>>()
-                )
-            });
-
-        // 1. EXACTLY the box -- MAGNIFIED into it, since 16 is smaller than
-        //    24. Asserted as the box, not as "smaller than the tile" (any
-        //    inset satisfies that) and not as the source's own 16, which is
-        //    the rule this replaces.
-        assert!(
-            (image.rect.width() - ARTWORK_PT).abs() < 0.01
-                && (image.rect.height() - ARTWORK_PT).abs() < 0.01,
-            "a 16x16 favicon was painted {}x{} -- every favicon is fitted into the same \
-             {ARTWORK_PT}pt box whatever its source size",
-            image.rect.width(),
-            image.rect.height()
-        );
-        // 2. STRICTLY INSIDE the tile, and CENTRED in it. The margin is the
-        //    leftover, so it is checked as a consequence rather than as a
-        //    number of its own: equal on both axes, and positive.
-        assert!(
-            tile.rect.contains_rect(image.rect),
-            "the favicon at {:?} is not inside its {:?} tile",
-            image.rect,
-            tile.rect
-        );
-        assert!(
-            (image.rect.center() - tile.rect.center()).length() < 0.01,
-            "the favicon is centred at {:?} but its tile's centre is {:?} -- a small icon \
-             must sit in the middle of the tile, not in a corner of it",
-            image.rect.center(),
-            tile.rect.center()
-        );
-        assert!(
-            image.rect.left() - tile.rect.left() > 0.5,
-            "a {ARTWORK_PT}pt image in a {AVATAR_SIZE}pt tile must leave visible padding; \
-             it left {}",
-            image.rect.left() - tile.rect.left()
-        );
-
-        // 3. THE RADIUS TAPERS WITH THE INSET. While the image reached the
-        //    tile's bounds it had to carry the tile's own radius or its four
-        //    corners would poke out past the rounding. Pulled 4pt inside a
-        //    tile whose corner arc is 8pt, it needs only what is left of that
-        //    curve -- rounding it by the tile's full radius would shave a real
-        //    logo's own corners off. `theme::avatar_artwork` is where the
-        //    taper lives; this is the assertion that it ran, computed from the
-        //    inset rather than written out so it survives the next resize.
-        let tapered = theme::avatar_corner_radius(AVATAR_SIZE).nw
-            - ((AVATAR_SIZE - ARTWORK_PT) / 2.0).round() as u8;
-        assert_eq!(
-            image.corner_radius,
-            egui::CornerRadius::same(tapered),
-            "the favicon's corner radius does not follow the tile's curve at its inset, \
-             which either overhangs the rounding or clips the artwork's own corners"
-        );
-
-        // 4. THE BORDER SURVIVES, AND IT IS ON TOP. `StrokeKind::Middle`
-        //    straddles the tile's edge, so a border painted UNDER a full-bleed
-        //    image keeps only its outer half-pixel. The tile's edge is what a
-        //    pale favicon needs in order to read as the same tile the
-        //    monograms beside it have, so it is drawn again over the artwork
-        //    -- unconditionally, which means a 32pt bordered rect must appear
-        //    AFTER the image even in this inset case.
-        let border_over = p.rects.iter().skip(at + 1).find(|r| {
-            (r.rect.width() - AVATAR_SIZE).abs() < 0.5
-                && r.stroke.width > 0.0
-                && r.stroke.color.a() > 0
-        });
-        let border_over = border_over.unwrap_or_else(|| {
-            panic!(
-                "no bordered {AVATAR_SIZE}pt rect was painted after the favicon, so the tile's
-                 edge is buried under it; painted: {:?}",
-                p.rects.iter().map(|r| (r.rect, r.fill, r.stroke)).collect::<Vec<_>>()
-            )
-        });
-        assert_eq!(
-            border_over.stroke.color,
-            theme::HAIRLINE,
-            "the border redrawn over the favicon is not the tile's own unselected border"
-        );
-        assert!(
-            (border_over.rect.min - tile.rect.min).length() < 0.01,
-            "the border over the favicon is at {:?}, not on the {:?} tile",
-            border_over.rect,
-            tile.rect
-        );
-
-        // ---- The control: a source BIGGER than the box is REDUCED into it,
-        // rather than being drawn at its own size or filling the tile. Without
-        // this half the test would pass just as happily against "never
-        // upscale" alone, which is the rule this replaces -- under that rule a
-        // 64x64 landed full bleed and touched the tile's edge, which is what
-        // the owner was looking at when they said "icon touches the edges but
-        // should be in the middle with paddings".
-        let big = paint_with_icons_sized(&[login("Ledgerline", "a@b.c")], None, &["Ledgerline"], 64);
-        let big_tile = square(&big, AVATAR_SIZE);
-        let big_image = big
-            .rects
-            .iter()
-            .find(|r| r.brush.is_some())
-            .cloned()
-            .expect("the 64x64 favicon was drawn");
-        assert!(
-            (big_image.rect.width() - ARTWORK_PT).abs() < 0.01
-                && (big_image.rect.height() - ARTWORK_PT).abs() < 0.01,
-            "a 64x64 source was painted {}x{} -- every favicon is fitted into the same \
-             {ARTWORK_PT}pt box whatever its source size",
-            big_image.rect.width(),
-            big_image.rect.height()
-        );
-        assert!(
-            (big_image.rect.center() - big_tile.rect.center()).length() < 0.01,
-            "the reduced favicon is centred at {:?} but its tile's centre is {:?}",
-            big_image.rect.center(),
-            big_tile.rect.center()
-        );
-        // ...and it carries the same tapered radius the small source does,
-        // because it sits at the same inset. The two differ only in which
-        // direction the source had to be scaled to get here, which is exactly
-        // what "one box for every favicon" is supposed to mean.
-        assert_eq!(
-            big_image.corner_radius, image.corner_radius,
-            "two favicons at the same inset were given different corner radii"
-        );
-    }
-
-    #[test]
-    fn an_item_with_no_favicon_still_gets_the_monogram_and_no_texture() {
-        // The positive control for the test above: `paint_with_icons` really
-        // is the thing that puts a texture on the row, so "a textured rect was
-        // painted, and here is where" is a statement about the favicon branch
-        // and not about something egui draws anyway.
-        let p = paint(&[login("Ledgerline", "a@b.c")], None);
-        assert!(
-            !p.rects.iter().any(|r| r.brush.is_some()),
-            "an item with no cached favicon must paint no texture at all"
-        );
-        assert!(
-            p.texts.iter().any(|(t, _, _)| t == "LE"),
-            "...and must fall back to the monogram; painted: {:?}",
-            p.texts
-        );
-    }
-
-    /// **The monogram, one letter against two**, which the owner asked about
-    /// in the same breath as the favicon: "chars that we use if no icon --
-    /// make sure same size and centered".
-    ///
-    /// `theme::avatar` paints at `Align2::CENTER_CENTER` on `rect.center()`
-    /// with a `FontId` of `size * 0.38` and neither depends on how many
-    /// letters it was handed, so this reads as correct BY CONSTRUCTION -- and
-    /// that is exactly the kind of claim that is worth one cheap assertion
-    /// rather than an argument, because "it cannot drift" is a statement about
-    /// today's code and this file is full of tiles that drifted.
-    ///
-    /// `theme::initials` returns ONE char only for a name that is a single
-    /// character, and two otherwise, so "X" and "Northwind Mail" are the two
-    /// sides of the fence.
-    #[test]
-    fn a_one_letter_monogram_is_the_same_size_and_as_centred_as_a_two_letter_one() {
-        let one = paint(&[login("X", "")], None);
-        let two = paint(&[login("Northwind Mail", "")], None);
-        assert_eq!(theme::initials("X"), "X", "the one-letter case is not one letter");
-        assert_eq!(theme::initials("Northwind Mail"), "NM", "the two-letter case is not two");
-
-        // The rect comes from `texts` and the FONT from `galleys`: `texts`
-        // keeps only the box, and the size is the whole first half of this
-        // test's claim.
-        let read = |p: &Painted, glyphs: &str| {
-            let tile = square(p, AVATAR_SIZE).rect;
-            let rect = p
-                .texts
-                .iter()
-                .find(|(t, _, _)| t == glyphs)
-                .unwrap_or_else(|| panic!("no {glyphs:?} monogram was painted: {:?}", p.texts))
-                .1;
-            let font = p
-                .galleys
-                .iter()
-                .find(|(g, _)| g.job.text == glyphs)
-                .map(|(g, _)| g.job.sections[0].format.font_id.clone())
-                .unwrap_or_else(|| panic!("no {glyphs:?} galley was laid out"));
-            (tile, rect, font)
-        };
-        let (one_tile, one_rect, one_font) = read(&one, "X");
-        let (two_tile, two_rect, two_font) = read(&two, "NM");
-
-        // SAME SIZE: the font is the tile's, not the text's.
-        assert_eq!(
-            one_font.size, two_font.size,
-            "a one-letter monogram is set at {} and a two-letter one at {} -- the monogram's \
-             size must follow the tile, not the number of letters in the name",
-            one_font.size, two_font.size
-        );
-        assert_eq!(
-            one_font.size,
-            (AVATAR_SIZE * theme::MONOGRAM).round(),
-            "the monogram is not `theme::avatar`'s `size * theme::MONOGRAM`"
-        );
-
-        // CENTRED: each on its own tile, both axes. Half a point of tolerance
-        // -- the galley's box is measured from glyph metrics, so an exact
-        // equality here would be asserting the font's bearings and not the
-        // centring.
-        for (label, tile, rect) in
-            [("one-letter", one_tile, one_rect), ("two-letter", two_tile, two_rect)]
-        {
-            assert!(
-                (rect.center() - tile.center()).length() < 0.5,
-                "the {label} monogram is painted centred at {:?} but its tile's centre is \
-                 {:?}",
-                rect.center(),
-                tile.center()
-            );
-            assert!(
-                tile.contains_rect(rect),
-                "the {label} monogram at {rect:?} spills out of its {tile:?} tile"
-            );
-        }
-    }
 
     /// A card carrying a stored `brand`, the way every Bitwarden client
     /// writes it.
@@ -6114,1070 +5078,10 @@ mod row_tile_tests {
         it
     }
 
-    /// Every textured rect a frame painted, in paint order.
-    fn textured(p: &Painted) -> Vec<RectShape> {
-        p.rects.iter().filter(|r| r.brush.is_some()).cloned().collect()
-    }
-
-    /// Every 32px avatar tile a frame painted, top to bottom.
-    ///
-    /// De-duplicated because `theme::avatar_tile` paints its fill and its
-    /// border as two rects over one geometry.
-    fn avatar_tiles(p: &Painted) -> Vec<egui::Rect> {
-        let mut v: Vec<egui::Rect> = p
-            .rects
-            .iter()
-            .filter(|r| {
-                (r.rect.width() - AVATAR_SIZE).abs() < 0.5
-                    && (r.rect.height() - AVATAR_SIZE).abs() < 0.5
-            })
-            .map(|r| r.rect)
-            .collect();
-        v.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        v.dedup();
-        v
-    }
-
-    /// Everything drawn INSIDE `tile` that is not the tile itself, in
-    /// TILE-RELATIVE coordinates: the smaller rects, the circles and the
-    /// straight runs, each with the ink it was drawn in.
-    ///
-    /// This is how one kind's mark is told from another's, and how two rows'
-    /// tiles are compared to each other. Relative coordinates are the whole
-    /// trick: two tiles sit at different y, so absolute geometry would differ
-    /// for two rows that drew exactly the same glyph.
-    ///
-    /// It reads `rects`, `circles` AND `segments`, because the four marks are
-    /// not made of the same shapes as each other -- a probe that looked only
-    /// at rects would find the note and the card and report the identity and
-    /// the key as identically empty.
-    fn tile_glyph_in(
-        p: &Painted,
-        tile: egui::Rect,
-    ) -> Vec<(egui::Vec2, egui::Vec2, egui::Color32)> {
-        let mut out: Vec<(egui::Vec2, egui::Vec2, egui::Color32)> = p
-            .rects
-            .iter()
-            // Not the tile's own fill or border, which are drawn at its full
-            // size; everything smaller that fits inside it is the glyph.
-            .filter(|r| r.rect.width() < tile.width() - 0.5 && tile.contains_rect(r.rect))
-            .map(|r| {
-                let ink = if r.fill == egui::Color32::TRANSPARENT { r.stroke.color } else { r.fill };
-                (r.rect.min - tile.min, r.rect.max - tile.min, ink)
-            })
-            .collect();
-        out.extend(
-            p.circles
-                .iter()
-                .filter(|c| tile.contains(c.center))
-                .map(|c| {
-                    (
-                        c.center - tile.min,
-                        egui::vec2(c.radius, c.radius),
-                        if c.fill == egui::Color32::TRANSPARENT { c.stroke.color } else { c.fill },
-                    )
-                }),
-        );
-        out.extend(
-            p.segments
-                .iter()
-                .filter(|(pts, _)| tile.contains(pts[0]) && tile.contains(pts[1]))
-                .map(|(pts, st)| (pts[0] - tile.min, pts[1] - tile.min, st.color)),
-        );
-        out
-    }
-
-    /// Whether two [`tile_glyph_in`] readings are the SAME glyph.
-    ///
-    /// Compared to a twentieth of a point rather than exactly, because two
-    /// tiles on two rows are allocated at two fractional y offsets: the same
-    /// glyph drawn twice comes back with sub-pixel differences that neither a
-    /// reader nor `Debug`'s own precision can see.
-    fn same_glyph(
-        a: &[(egui::Vec2, egui::Vec2, egui::Color32)],
-        b: &[(egui::Vec2, egui::Vec2, egui::Color32)],
-    ) -> bool {
-        a.len() == b.len()
-            && a.iter().zip(b).all(|((a0, a1, ac), (b0, b1, bc))| {
-                (*a0 - *b0).length() < 0.05 && (*a1 - *b1).length() < 0.05 && ac == bc
-            })
-    }
-
-    /// [`tile_glyph_in`] for a frame with exactly one avatar tile on it.
-    fn tile_glyph(p: &Painted) -> Vec<(egui::Vec2, egui::Vec2, egui::Color32)> {
-        let tiles = avatar_tiles(p);
-        assert_eq!(tiles.len(), 1, "expected one avatar tile, painted {}", tiles.len());
-        tile_glyph_in(p, tiles[0])
-    }
-
-    /// Every network mark painted inside `area`, with the word on it: a
-    /// `theme::BLUE` ground, and whichever painted text sits inside that
-    /// ground. Top to bottom.
-    ///
-    /// **Identified by what a mark IS, not by where it landed.** The marks
-    /// used to be textures and were found by being textured; they are drawn
-    /// type on a drawn ground now, and a test that looked for "a small rect in
-    /// the corner" would pass for any small rect in the corner.
-    ///
-    /// Handed a ROW's rect by most callers now that the mark sits beside the
-    /// avatar tile rather than inside it -- and handed the avatar tile by the
-    /// tests whose claim is that the tile is left alone.
-    fn marks_in(p: &Painted, area: egui::Rect) -> Vec<(egui::Rect, String)> {
-        let mut v: Vec<(egui::Rect, String)> = p
-            .rects
-            .iter()
-            .filter(|r| r.fill == theme::BLUE && area.contains_rect(r.rect))
-            .map(|r| {
-                let word = p
-                    .texts
-                    .iter()
-                    .find(|(_, rect, _)| r.rect.contains_rect(*rect))
-                    .map(|(t, _, _)| t.clone())
-                    .unwrap_or_else(|| {
-                        panic!("a mark ground was painted at {:?} with no word on it", r.rect)
-                    });
-                (r.rect, word)
-            })
-            .collect();
-        v.sort_by(|a, b| a.0.top().total_cmp(&b.0.top()));
-        v
-    }
 
 
-    /// The vertical ink of a painted run: where its glyphs really start and
-    /// stop, as opposed to the box egui laid out for them.
-    ///
-    /// **This is what "the same mid line" means.** A galley's box is ascent
-    /// plus descent, and neither is ink; two runs whose BOXES are centred on
-    /// one another still print visibly apart when their faces or sizes differ.
-    /// Read off `uv_rect`, which is the same thing `theme::ink_offset_x` reads
-    /// for the horizontal case.
-    fn ink_y(galley: &egui::Galley, top: f32) -> Option<(f32, f32)> {
-        let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-        for row in galley.rows.iter() {
-            for glyph in row.glyphs.iter() {
-                let at = top + row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
-                lo = lo.min(at);
-                hi = hi.max(at + glyph.uv_rect.size.y);
-            }
-        }
-        (lo.is_finite()).then_some((lo, hi))
-    }
-
-    /// Every painted run's ink centre, by its text.
-    fn ink_centres(p: &Painted) -> Vec<(String, f32)> {
-        p.galleys
-            .iter()
-            .filter_map(|(g, top)| ink_y(g, *top).map(|(lo, hi)| (g.text().to_string(), (lo + hi) / 2.0)))
-            .collect()
-    }
-
-    fn ink_centre_of(p: &Painted, needle: &str) -> f32 {
-        let hits: Vec<f32> = ink_centres(p)
-            .into_iter()
-            .filter(|(t, _)| t == needle)
-            .map(|(_, c)| c)
-            .collect();
-        assert_eq!(hits.len(), 1, "expected exactly one {needle:?}; painted: {:?}", ink_centres(p));
-        hits[0]
-    }
-
-    /// **The reported defect, as geometry.** "Feels like image, pill and name
-    /// are not on the same mid line."
-    ///
-    /// Optical centres, not box centres -- see [`ink_y`]. The claim is that
-    /// the pill's WORD sits on the item NAME's line, and that both sit on the
-    /// tile's. Asserted at both pane widths and at two name lengths, because a
-    /// coincidence at one width and one string is exactly what box centring
-    /// looks like right up until it does not.
-    #[test]
-    fn the_tile_the_pill_and_the_name_sit_on_one_line() {
-        // The pill against the name: this is the pair the fix places by a
-        // derived baseline, so it is held to half a point.
-        const TOGETHER: f32 = 0.5;
-        // Either of them against the TILE: the tile is a 32pt rect and the
-        // runs are text, and `theme::avatar` puts its own monogram on the same
-        // line the name is on rather than on the rect's arithmetic centre. One
-        // point is that difference and not slack.
-        const AGAINST_TILE: f32 = 1.0;
-        for name in ["Household card", "Bank of America Platinum Rewards Debit"] {
-            for width in [170.0f32, PANE_WIDTH] {
-                let mut item = card_branded(name, "Mastercard");
-                item.card.as_mut().unwrap().number =
-                    Some(zeroize::Zeroizing::new("5555555555554444".to_string()));
-                let p = paint_at_width(&[item], None, width);
-                let tile = square(&p, AVATAR_SIZE).rect;
-                let title = ink_centre_of(&p, name);
-                assert!(
-                    (title - tile.center().y).abs() <= AGAINST_TILE,
-                    "at a {width}pt pane the name sits {}pt off the tile",
-                    (title - tile.center().y).abs()
-                );
-                let row = row_tiles_of_width(&p, width)[0].rect;
-                let ground = p
-                    .rects
-                    .iter()
-                    .find(|r| r.fill == theme::BLUE && row.contains_rect(r.rect))
-                    .map(|r| r.rect.center().y);
-                let Some(ground) = ground else {
-                    // At the narrow pane the pill stands aside entirely (see
-                    // `NETWORK_MARK_MIN_TITLE_ROOM`), and a mark that is not
-                    // drawn cannot be misaligned.
-                    assert!(width < PANE_WIDTH, "the real pane must draw the pill");
-                    continue;
-                };
-                let word = ink_centre_of(&p, CardBrand::Mastercard.wordmark());
-                assert!(
-                    (word - title).abs() <= TOGETHER,
-                    "at a {width}pt pane with {name:?}, the pill's word sits at {word} and the \
-                     name at {title} -- {}pt apart, over the {TOGETHER}pt one line allows",
-                    (word - title).abs()
-                );
-                assert!(
-                    (word - tile.center().y).abs() <= AGAINST_TILE,
-                    "the pill's word sits {}pt off the tile's centre",
-                    (word - tile.center().y).abs()
-                );
-                assert!(
-                    (ground - word).abs() <= 0.51,
-                    "the pill's ground at {ground} is not centred on its word at {word}"
-                );
-            }
-        }
-    }
-
-    /// The negative: the check above can really fail.
-    ///
-    /// A guard over numbers that happen to agree proves nothing unless
-    /// disagreement is visible to it, so this nudges each measured value by
-    /// the smallest amount the tolerance forbids and checks the comparison
-    /// rejects it.
-    #[test]
-    fn the_one_line_check_notices_a_nudge() {
-        const TOGETHER: f32 = 0.5;
-        let mut item = card_branded("Household card", "Mastercard");
-        item.card.as_mut().unwrap().number =
-            Some(zeroize::Zeroizing::new("5555555555554444".to_string()));
-        let p = paint(&[item], None);
-        let word = ink_centre_of(&p, CardBrand::Mastercard.wordmark());
-        let title = ink_centre_of(&p, "Household card");
-        assert!((word - title).abs() <= TOGETHER, "as drawn, the row is aligned");
-        for nudge in [-1.0f32, 1.0] {
-            assert!(
-                (word + nudge - title).abs() > TOGETHER,
-                "a {nudge}pt nudge of the pill still reads as aligned, so the tolerance is \
-                 meaningless"
-            );
-            assert!(
-                (word - (title + nudge)).abs() > TOGETHER,
-                "a {nudge}pt nudge of the name still reads as aligned"
-            );
-        }
-    }
-
-    /// **The pill is centred on its own word**, which is a separate claim from
-    /// the row being aligned: uneven padding above and below the word looks
-    /// off-centre however well the row is lined up, and at these type sizes a
-    /// single point is a large fraction of the pill's height.
-    #[test]
-    fn the_pills_ground_is_centred_on_the_word_it_carries() {
-        for brand in crate::card_brand::CARD_BRANDS {
-            let p = paint(&[card_branded("No Bank", brand.canonical())], None);
-            let row = row_tiles(&p)[0].rect;
-            let ground = p
-                .rects
-                .iter()
-                .find(|r| r.fill == theme::BLUE && row.contains_rect(r.rect))
-                .expect("the pill's ground")
-                .rect;
-            let word = ink_centre_of(&p, brand.wordmark());
-            assert!(
-                (word - ground.center().y).abs() <= 0.51,
-                "{brand:?}'s word sits at {word} in a ground centred at {} -- {}pt of the pill's \
-                 {}pt height is padding on one side only",
-                ground.center().y,
-                (word - ground.center().y).abs(),
-                ground.height()
-            );
-        }
-    }
-
-
-    #[test]
-    fn a_networks_mark_is_the_networks_own_word() {
-        // FIRST, because every badge test below leans on it: the mark really
-        // does track the brand, and it says the brand's NAME.
-        //
-        // THE REPORT this replaced: "VISA icon supposed to be visa and not
-        // some Play sign". The marks were seven abstract glyphs on one blue
-        // square -- a wedge for Visa, a diamond for Mastercard -- which named
-        // no network and did not tell each other apart either. The old version
-        // of this test asserted only that two networks were DIFFERENT
-        // pictures, which those placeholders satisfied perfectly.
-        let p = paint(
-            &[
-                card_branded("Visa One", "Visa"),
-                card_branded("MC One", "Mastercard"),
-                card_branded("Visa Two", "visa"),
-            ],
-            None,
-        );
-        let rows: Vec<egui::Rect> = row_tiles(&p).iter().map(|r| r.rect).collect();
-        assert_eq!(rows.len(), 3, "three card rows");
-        let word = |i: usize| {
-            let marks = marks_in(&p, rows[i]);
-            assert_eq!(marks.len(), 1, "row {i} painted {} marks, expected 1", marks.len());
-            marks[0].1.clone()
-        };
-        // The actual claim, and it is about legible content rather than about
-        // two ids differing: each row says its own network.
-        assert_eq!(word(0), CardBrand::Visa.wordmark());
-        assert_eq!(word(1), CardBrand::Mastercard.wordmark());
-        assert_ne!(
-            word(0),
-            word(1),
-            "Visa and Mastercard drew the same word, so the mark names no network"
-        );
-        // ...and the same network spelled either way is the same word, so the
-        // inequality is about the brand and not about a per-row accident.
-        assert_eq!(word(0), word(2));
-    }
-
-    #[test]
-    fn a_card_with_a_bank_icon_wears_its_network_mark_at_the_trailing_edge_and_not_over_it() {
-        // TWO REPORTS, and this is the arrangement they arrive at, asserted
-        // from painted geometry: tile, then name, then the mark at the
-        // trailing edge. The first was a bank favicon with `VISA` sitting over
-        // the tile's lower-right corner -- "maybe not overlap the icon but
-        // place to the right"; the second, once it stood between tile and
-        // name, was "lets also move pill to the right - similar to our mfa/app
-        // pills".
-        let p = paint_with_icons(&[card_branded("BoA Credit", "Visa")], None, &["BoA Credit"]);
-        let row = row_tiles(&p)[0].rect;
-        let tile = square(&p, AVATAR_SIZE).rect;
-        let marks = marks_in(&p, row);
-        assert_eq!(marks.len(), 1, "expected exactly the mark on the row: {marks:?}");
-        let (mark, word) = marks[0].clone();
-        assert_eq!(word, CardBrand::Visa.wordmark(), "the mark names the wrong network");
-
-        // The favicon is still there and still sits in the tile, so the tile
-        // really is the icon's and this is not the monogram rung.
-        //
-        // INSIDE the tile and centred on it, not equal to it: this fixture's
-        // icon is 16x16 and `theme::avatar_image` no longer magnifies, so the
-        // artwork is 16pt in the middle of a 32pt tile. What this test needs
-        // from the favicon is only that it is there and that it is the TILE's
-        // -- the claim being made is about where the network mark goes -- so
-        // it asks for containment and centring, which is true under the
-        // sizing rule at every source size, rather than for a full bleed that
-        // is now true at only some of them.
-        let art = textured(&p);
-        assert!(
-            art.iter().any(|r| tile.contains_rect(r.rect)
-                && (r.rect.center() - tile.center()).length() < 0.01),
-            "no favicon was painted centred inside the {tile:?} tile: {:?}",
-            art.iter().map(|r| r.rect).collect::<Vec<_>>()
-        );
-
-        // **Nothing is drawn inside the tile any more.** The negative half of
-        // the report, and the one that would silently come back if a future
-        // edit re-added the corner anchor: `marks_in` over the TILE finds
-        // nothing.
-        assert!(
-            marks_in(&p, tile).is_empty(),
-            "a mark is still being painted inside the {tile:?} tile: {:?}",
-            marks_in(&p, tile)
-        );
-
-        // **The trailing edge, one row gap in from the row's own padding** --
-        // the position "app" and "2FA" take on a row that has them, which is
-        // what "similar to our mfa/app pills" asked for. Read as an absolute
-        // distance from the row's right edge, not as "somewhere to the right",
-        // because the second is true of the old arrangement too.
-        // `row` is the tile's OUTER rect, so the content edge is its own 1pt
-        // stroke plus the frame's horizontal padding in from it.
-        assert!(
-            (row.right() - ROW_BORDER - ROW_PAD_X - mark.right()).abs() < 0.51,
-            "the mark at {mark:?} is {}pt in from the {row:?} row's right edge, expected the \
-             row's own {ROW_BORDER}pt border and {ROW_PAD_X}pt padding and nothing else",
-            row.right() - mark.right()
-        );
-        // **And the NAME now comes first**, which is the whole move: the mark
-        // used to start before the name and now ends after it. Both halves
-        // asserted, so a mark that simply vanished could not pass this.
-        let name = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == "BoA Credit")
-            .map(|(_, r, _)| *r)
-            .expect("the item's name was painted");
-        assert!(
-            name.right() <= mark.left(),
-            "the name at {name:?} runs past the mark at {mark:?}, which now follows it"
-        );
-        assert!(
-            name.left() >= tile.right(),
-            "the name at {name:?} overlaps the {tile:?} tile"
-        );
-        // NOTHING now stands between the tile and the name: the leading run is
-        // the tile alone, so the name starts exactly one row gap past it. This
-        // is the negative of the old arrangement, and it is what would fail if
-        // the mark were drawn in both places.
-        assert!(
-            (name.left() - tile.right() - ROW_GAP_X).abs() < 0.51,
-            "the name at {name:?} is {}pt from the tile's right edge, expected the row's \
-             {ROW_GAP_X}pt gap and nothing standing in between",
-            name.left() - tile.right()
-        );
-        // Vertically centred against the tile: the row is `align-items:
-        // center` and a pill hanging off that baseline is the defect the
-        // title column already had to be bounded to avoid.
-        assert!(
-            (mark.center().y - tile.center().y).abs() < 0.51,
-            "the mark at {mark:?} is not centred against the {tile:?} tile"
-        );
-        assert!(
-            (mark.height() - NETWORK_MARK_HEIGHT).abs() < 0.01,
-            "the mark is {}pt tall, expected {NETWORK_MARK_HEIGHT}",
-            mark.height()
-        );
-    }
-
-
-    /// A fixture of any kind, built off [`login`] so only the type number and
-    /// the kind's own payload differ.
-    fn of_kind(name: &str, item_type: i64) -> VaultItem {
-        VaultItem { item_type: Some(item_type), login: None, ..login(name, "") }
-    }
-
-    /// **Every non-login kind draws its OWN mark, and no two are alike.**
-    ///
-    /// The house's defect class is a test that passes because it never
-    /// reached the thing it names, and "a mark was painted" is exactly that
-    /// shape: it would pass with all four glyphs identical, which is the
-    /// defect the owner reported in the first place ("we should also have
-    /// different icons for SSH, notes, IDs" -- they had four rows that all
-    /// looked the same).
-    ///
-    /// So this asserts the discriminating thing directly: each kind's tile is
-    /// compared to every OTHER kind's, and each pair must differ. It is read
-    /// through [`tile_glyph_in`], which sees the circles and the straight runs
-    /// as well as the rects -- a probe that saw only rects would report the
-    /// identity and the key as identically empty and pass.
-    #[test]
-    fn each_non_login_kind_draws_a_mark_of_its_own_and_no_two_are_alike() {
-        // Note, card, identity, SSH key: the four the owner named.
-        let kinds = [(2i64, "note"), (3, "card"), (4, "identity"), (5, "ssh key")];
-        let glyphs: Vec<(&str, Vec<(egui::Vec2, egui::Vec2, egui::Color32)>)> = kinds
-            .iter()
-            .map(|(item_type, label)| {
-                let p = paint(&[of_kind("Anna Novak", *item_type)], None);
-                assert!(
-                    !p.texts.iter().any(|(t, _, _)| t == "AN"),
-                    "the {label} row drew the name's monogram instead of a mark"
-                );
-                assert!(
-                    !p.rects.iter().any(|r| r.brush.is_some()),
-                    "the {label} row drew a texture -- a mark is strokes, not an image"
-                );
-                let glyph = tile_glyph(&p);
-                assert!(!glyph.is_empty(), "the {label} row drew an EMPTY tile");
-                (*label, glyph)
-            })
-            .collect();
-        for (i, (one, a)) in glyphs.iter().enumerate() {
-            for (other, b) in glyphs.iter().skip(i + 1) {
-                assert!(
-                    !same_glyph(a, b),
-                    "the {one} mark and the {other} mark are the same drawing: {a:?}"
-                );
-            }
-        }
-    }
-
-    /// **A login and an unsupported kind keep the monogram**, which is the
-    /// decision `kind_mark::has_mark` makes and the half the test above
-    /// cannot state.
-    #[test]
-    fn a_login_and_an_unknown_kind_still_wear_the_names_monogram() {
-        for item_type in [1i64, 9] {
-            let p = paint(&[of_kind("Anna Novak", item_type)], None);
-            assert!(
-                p.texts.iter().any(|(t, _, _)| t == "AN"),
-                "type {item_type} lost its monogram; painted: {:?}",
-                p.texts
-            );
-            assert!(
-                tile_glyph(&p).is_empty(),
-                "type {item_type} drew a mark in its tile as well as a monogram: {:?}",
-                tile_glyph(&p)
-            );
-        }
-    }
-
-    /// **A selected row's mark inverts with the tile, and does not vanish
-    /// into it.**
-    ///
-    /// The selected treatment paints the tile `theme::BLUE_WASH`, so a mark
-    /// that kept its unselected grey would sink into it and a mark drawn in
-    /// the wash itself would disappear entirely. Asserted for ALL FOUR kinds
-    /// and against the exact pair `theme::avatar`'s monogram uses, so a mark
-    /// cannot be "some other blue" that happens to be visible today.
-    #[test]
-    fn every_kind_mark_inverts_on_the_selected_row_the_way_the_monogram_does() {
-        for item_type in [2i64, 3, 4, 5] {
-            let name = "Anna Novak";
-            for (selected, expected) in
-                [(None, theme::TEXT_MUTED), (Some(name), theme::BLUE)]
-            {
-                let p = paint(&[of_kind(name, item_type)], selected);
-                let glyph = tile_glyph(&p);
-                assert!(!glyph.is_empty(), "type {item_type} drew nothing to colour");
-                for (_, _, ink) in &glyph {
-                    assert_eq!(
-                        *ink, expected,
-                        "type {item_type} drew part of its mark in {ink:?} on a row whose \
-                         monogram would have been {expected:?}"
-                    );
-                }
-                assert_ne!(
-                    expected,
-                    theme::BLUE_WASH,
-                    "the ink and the selected tile's ground must never be the same colour"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_card_with_no_bank_domain_takes_the_kind_tile_and_still_wears_its_mark() {
-        // With the network mark off the tile, a card with no issuer icon is
-        // not a special case any more: the tile answers "what kind of thing is
-        // this" and the pill answers "which network", and neither stands in
-        // for the other.
-        //
-        // **The needle moved, and it moved to assert MORE.** This test used to
-        // finish by asserting the tile drew the name's MONOGRAM. The owner has
-        // since asked for a mark per kind ("we should also have different
-        // icons for SSH, notes, IDs"), so a card's tile is now `kind_mark`'s
-        // card glyph: the monogram claim is a claim about a decision that has
-        // been reversed, and keeping it would have pinned the defect.
-        //
-        // What replaces it says more than it did. The old assertion was that
-        // ONE card drew ONE letter pair. The new one is that a Visa row and a
-        // Mastercard row draw the same tile as each other, shape for shape --
-        // which is what "the tile is not card-special" actually means, and
-        // which the monogram assertion could not have caught: two cards with
-        // different names have different monograms, so it would have passed
-        // just as happily over a tile that varied by brand.
-        let p = paint(
-            &[card_branded("BoA Credit", "Visa"), card_branded("MC Credit", "Mastercard")],
-            None,
-        );
-        let rows: Vec<egui::Rect> = row_tiles(&p).iter().map(|r| r.rect).collect();
-        let tiles = avatar_tiles(&p);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(tiles.len(), 2);
-        let marks: Vec<(egui::Rect, String)> = rows
-            .iter()
-            .map(|r| {
-                let m = marks_in(&p, *r);
-                assert_eq!(m.len(), 1, "exactly one mark belongs on a row");
-                m.into_iter().next().unwrap()
-            })
-            .collect();
-        assert_eq!(marks[0].1, CardBrand::Visa.wordmark());
-        assert_eq!(marks[1].1, CardBrand::Mastercard.wordmark());
-        for (tile, (mark, word)) in tiles.iter().zip(&marks) {
-            assert!(
-                mark.left() >= tile.right(),
-                "{word:?} at {mark:?} overlaps its {tile:?} tile"
-            );
-            assert!(
-                (mark.height() - NETWORK_MARK_HEIGHT).abs() < 0.01,
-                "{word:?} is {}pt tall, expected {NETWORK_MARK_HEIGHT}",
-                mark.height()
-            );
-        }
-        // No letter pair on either row: the tile is the KIND's mark now.
-        for monogram in ["BC", "MC"] {
-            assert!(
-                !p.texts.iter().any(|(t, _, _)| t == monogram),
-                "a card row still drew the {monogram:?} monogram: {:?}",
-                p.texts
-            );
-        }
-        // ...and no texture on either row: nothing in a card's tile is an
-        // image, whether or not this app can name its network.
-        assert!(
-            !p.rects.iter().any(|r| r.brush.is_some()),
-            "a card with no bank domain painted a texture"
-        );
-        let glyphs: Vec<_> = tiles.iter().map(|t| tile_glyph_in(&p, *t)).collect();
-        assert!(
-            !glyphs[0].is_empty(),
-            "nothing was drawn inside the first card's tile, so the comparison below compares \
-             two empty lists"
-        );
-        assert!(
-            same_glyph(&glyphs[0], &glyphs[1]),
-            "a Visa row and a Mastercard row drew different tiles, so the tile is still \
-             card-special: {:?} vs {:?}",
-            glyphs[0],
-            glyphs[1]
-        );
-    }
-
-    /// Every network's mark stays inside its ROW at the real pane width --
-    /// `MASTERCARD`, the widest word this app sets, included.
-    ///
-    /// `card_mark` measures the same seven against an arithmetic budget; this
-    /// is the same claim from painted output, so a change to the row's padding
-    /// or gap that the arithmetic there does not know about still fails.
-    #[test]
-    fn every_networks_mark_stays_inside_its_row_at_the_real_pane_width() {
-        for brand in crate::card_brand::CARD_BRANDS {
-            let p = paint(&[card_branded("No Bank", brand.canonical())], None);
-            let row = row_tiles(&p)[0].rect;
-            let tile = square(&p, AVATAR_SIZE).rect;
-            let marks = marks_in(&p, row);
-            assert_eq!(
-                marks.len(),
-                1,
-                "{brand:?} painted {} marks inside its row -- a mark that escaped the row is \
-                 invisible to `marks_in` and shows up here as zero",
-                marks.len()
-            );
-            assert_eq!(marks[0].1, brand.wordmark());
-            assert!(
-                marks[0].0.left() >= tile.right(),
-                "{brand:?}'s mark at {:?} overlaps its {tile:?} tile",
-                marks[0].0
-            );
-        }
-    }
-
-    /// **The truncation guard, in the form the last release's overflow bug
-    /// took.** The pill is allocated out of the same width the name is laid
-    /// into, so a name long enough to need truncating must truncate SOONER
-    /// with a pill present -- and every glyph of both must still land inside
-    /// the row.
-    #[test]
-    fn a_marked_rows_name_truncates_into_the_room_the_pill_left_it() {
-        const LONG: &str = "Bank of America Platinum Rewards Signature Debit";
-        let mut marked = card_branded(LONG, "Mastercard");
-        marked.card.as_mut().unwrap().number =
-            Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
-        // The control: the same item, on a network this app cannot name, so it
-        // gets no pill and the whole column. Same name, same suffix, same
-        // everything else.
-        let mut unmarked = marked.clone();
-        unmarked.card.as_mut().unwrap().brand = Some("Ledger Coin".to_string());
-
-        let with = paint(&[marked], None);
-        let without = paint(&[unmarked], None);
-        assert_eq!(marks_in(&with, row_tiles(&with)[0].rect).len(), 1);
-        assert!(
-            marks_in(&without, row_tiles(&without)[0].rect).is_empty(),
-            "the control row drew a mark, so it is not a control"
-        );
-
-        let name_of = |p: &Painted| {
-            p.texts
-                .iter()
-                .find(|(t, _, _)| t.starts_with("Bank of"))
-                .map(|(t, r, _)| (t.clone(), *r))
-                .expect("the name was painted")
-        };
-        // A truncated galley keeps its ORIGINAL text (that is what
-        // `Galley::text` returns), so truncation is read off the laid-out
-        // WIDTH rather than off a trailing ellipsis in the string.
-        let (_, marked_rect) = name_of(&with);
-        let (plain_name, plain_rect) = name_of(&without);
-        let full = plain_name.chars().count() as f32;
-        assert!(
-            plain_rect.width() < full * TITLE_SIZE,
-            "the control's name is {}pt wide for {full} characters, which is not truncated at \
-             all -- the fixture name is too short to prove anything",
-            plain_rect.width()
-        );
-        // And the pill really cost the name room, rather than the name
-        // overflowing into the pill's place.
-        let pill = marks_in(&with, row_tiles(&with)[0].rect)[0].0.width();
-        assert!(
-            // Within one glyph: truncation lands on a character boundary, so
-            // the name gives up slightly more or less than the pill took.
-            (plain_rect.width() - marked_rect.width() - pill - ROW_GAP_X).abs() < TITLE_SIZE,
-            "the name is {}pt wide beside a {pill}pt pill and {}pt wide without one -- a \
-             difference of {}pt, where the pill plus the row's {ROW_GAP_X}pt gap is {}. The \
-             pill took the wrong amount off the truncation budget, which is the overflow bug \
-             returning.",
-            marked_rect.width(),
-            plain_rect.width(),
-            plain_rect.width() - marked_rect.width(),
-            pill + ROW_GAP_X
-        );
-    }
 
     // ---- brand logos on the row ----------------------------------------
-
-    /// A directory holding brand logo fixtures, **under the process's temp
-    /// directory and never the real one**: these are files this test wrote,
-    /// and the real `brand-marks` folders -- beside the settings and beside
-    /// the executable -- are not somewhere a test may look.
-    ///
-    /// The guard comes back rather than the path: the marks are read off disk
-    /// at paint time, so the directory has to outlive the paint, and it is the
-    /// caller's binding that decides when it goes.
-    fn marks_dir(files: &[(CardBrand, Vec<u8>)]) -> crate::test_scratch::ScratchDir {
-        let dir = crate::brand_mark::tests::tempdir("item-list");
-        for (brand, bytes) in files {
-            let name = crate::brand_mark::file_name(*brand).expect("a brand with a file name");
-            std::fs::write(dir.join(name), bytes).expect("the fixture was written");
-        }
-        dir
-    }
-
-    fn paint_with_marks(items: &[VaultItem], width: f32, dir: std::path::PathBuf) -> Painted {
-        paint_core_with_marks(
-            items,
-            None,
-            0,
-            width,
-            |_| IconCache::default(),
-            Menu::none(),
-            Some(dir),
-        )
-    }
-
-    /// Every textured shape inside `area` -- an image, as opposed to the
-    /// wordmark's flat blue ground.
-    fn logos_in(p: &Painted, area: egui::Rect) -> Vec<egui::Rect> {
-        p.rects
-            .iter()
-            .filter(|r| r.brush.is_some() && area.contains_rect(r.rect))
-            .map(|r| r.rect)
-            .collect()
-    }
-
-    /// **The mixed vault, which is the state this feature will actually be
-    /// used in**: a user downloads the marks they can find, and the rest of
-    /// their cards keep their words. Both kinds must appear on one list and
-    /// neither may disturb the row around it.
-    #[test]
-    fn a_vault_with_some_marks_supplied_draws_logos_and_words_side_by_side() {
-        let dir = marks_dir(&[
-            // One of each shape a brand centre publishes, because a real
-            // folder will hold both.
-            (CardBrand::Visa, crate::brand_mark::tests::on_ground_png(300, 100, 46)),
-            (CardBrand::Mastercard, crate::brand_mark::tests::isolated_png(96, 60, 40)),
-        ]);
-        let items = [
-            card_branded("Visa card", "Visa"),
-            card_branded("Mastercard card", "Mastercard"),
-            card_branded("Amex card", "Amex"),
-            card_branded("JCB card", "JCB"),
-        ];
-        let p = paint_with_marks(&items, PANE_WIDTH, dir.to_path_buf());
-        let rows: Vec<egui::Rect> = row_tiles(&p).iter().map(|r| r.rect).collect();
-        assert_eq!(rows.len(), 4);
-
-        // The two with files draw an image and NO word...
-        for (row, brand) in rows.iter().zip([CardBrand::Visa, CardBrand::Mastercard]) {
-            assert_eq!(logos_in(&p, *row).len(), 1, "{brand:?} has a file and drew no logo");
-            assert!(
-                marks_in(&p, *row).is_empty(),
-                "{brand:?} drew its logo AND its wordmark pill, stacked on one another"
-            );
-        }
-        // ...and the two without draw their word and no image. This is the
-        // whole claim: some files present is a normal state, not a broken one.
-        for (row, brand) in rows[2..].iter().zip([CardBrand::AmericanExpress, CardBrand::Jcb]) {
-            assert!(
-                logos_in(&p, *row).is_empty(),
-                "{brand:?} has no file and drew an image anyway"
-            );
-            let words = marks_in(&p, *row);
-            assert_eq!(words.len(), 1, "{brand:?} lost its mark entirely");
-            assert_eq!(words[0].1, brand.wordmark());
-        }
-
-        // And the row itself is undisturbed: every mark, of either kind, sits
-        // beside its tile and inside the row.
-        let tiles = avatar_tiles(&p);
-        assert_eq!(tiles.len(), 4);
-        for (i, row) in rows.iter().enumerate() {
-            let mark = logos_in(&p, *row)
-                .into_iter()
-                .chain(marks_in(&p, *row).into_iter().map(|(r, _)| r))
-                .next()
-                .expect("every row here has a mark");
-            assert!(
-                mark.left() >= tiles[i].right(),
-                "row {i}'s mark at {mark:?} overlaps its tile at {:?}",
-                tiles[i]
-            );
-            assert!(row.contains_rect(mark), "row {i}'s mark escaped its row");
-        }
-    }
-
-    /// **A logo lands on the name's optical line, exactly as the word does, at
-    /// both pane widths.** The row's alignment is derived from the WORDMARK's
-    /// galley -- see `mark_ink_drop` -- so a logo drawn into the same box is
-    /// the case where that derivation could silently stop being about what is
-    /// on screen.
-    #[test]
-    fn a_logo_row_keeps_its_ink_on_the_names_line_at_both_pane_widths() {
-        // One point, the tolerance this module's own alignment test allows
-        // between a mark and the 32pt tile: a logo's ink centre is its
-        // rectangle's centre only for a trimmed mark, and a mark on its own
-        // ground is centred on its lettering rather than on its rectangle.
-        const TOGETHER: f32 = 1.0;
-        const NAME: &str = "Household card";
-        for source in [
-            crate::brand_mark::tests::on_ground_png(300, 100, 46),
-            crate::brand_mark::tests::isolated_png(120, 60, 40),
-        ] {
-            for width in [170.0f32, PANE_WIDTH] {
-                let dir = marks_dir(&[(CardBrand::Mastercard, source.clone())]);
-                let mut item = card_branded(NAME, "Mastercard");
-                item.card.as_mut().unwrap().number =
-                    Some(zeroize::Zeroizing::new("5555555555554444".to_string()));
-                let p = paint_with_marks(&[item], width, dir.to_path_buf());
-                let row = row_tiles_of_width(&p, width)[0].rect;
-                let title = ink_centre_of(&p, NAME);
-                let Some(logo) = logos_in(&p, row).first().copied() else {
-                    // At the narrow pane the mark stands aside entirely, the
-                    // same rule the wordmark follows -- and a mark that is not
-                    // drawn cannot be misaligned.
-                    assert!(width < PANE_WIDTH, "the real pane must draw the mark");
-                    continue;
-                };
-                assert!(
-                    (logo.center().y - title).abs() <= TOGETHER,
-                    "at a {width}pt pane the logo is centred at {} and the name's ink at \
-                     {title} -- {}pt apart, over the {TOGETHER}pt one line allows",
-                    logo.center().y,
-                    (logo.center().y - title).abs()
-                );
-                let tile = square(&p, AVATAR_SIZE).rect;
-                assert!(logo.left() >= tile.right(), "the logo overlaps the tile");
-                assert!(row.contains_rect(logo), "the logo escaped its row");
-            }
-        }
-    }
-
-    /// **The truncation budget holds with a logo in the box**, which is the
-    /// property a mark of a different width could quietly break: the name is
-    /// laid into what the mark left, so the room it gives up has to be the
-    /// logo's own width and not the width of the word it replaced.
-    #[test]
-    fn a_logo_row_gives_the_name_the_room_the_logo_took() {
-        const LONG: &str = "Bank of America Platinum Rewards Signature Debit";
-        let mut marked = card_branded(LONG, "Mastercard");
-        marked.card.as_mut().unwrap().number =
-            Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
-        // The control: the same item on a network this app cannot name, so no
-        // mark at all and the whole column.
-        let mut unmarked = marked.clone();
-        unmarked.card.as_mut().unwrap().brand = Some("Ledger Coin".to_string());
-
-        let dir = marks_dir(&[(
-            CardBrand::Mastercard,
-            crate::brand_mark::tests::on_ground_png(300, 100, 46),
-        )]);
-        let with = paint_with_marks(&[marked], PANE_WIDTH, dir.to_path_buf());
-        let without = paint_with_marks(&[unmarked], PANE_WIDTH, dir.to_path_buf());
-        let row = row_tiles(&with)[0].rect;
-        let logo = logos_in(&with, row);
-        assert_eq!(logo.len(), 1, "the premise: this row drew a logo");
-        assert!(
-            marks_in(&with, row).is_empty(),
-            "the premise: the logo replaced the word rather than joining it"
-        );
-
-        let name_of = |p: &Painted| {
-            p.texts
-                .iter()
-                .find(|(t, _, _)| t.starts_with("Bank of"))
-                .map(|(_, r, _)| *r)
-                .expect("the name was painted")
-        };
-        let marked_rect = name_of(&with);
-        let plain_rect = name_of(&without);
-        // The mark's BOX, not the image inside it: the box is what the row
-        // allocated, and `card_mark` pads the image within it. Read off the
-        // painted image plus that padding, so this is measured from the frame
-        // rather than recomputed from the same arithmetic under test.
-        let box_width = logo[0].width() + 2.0 * (NETWORK_MARK_HEIGHT * 0.22).round();
-        assert!(
-            (plain_rect.width() - marked_rect.width() - box_width - ROW_GAP_X).abs() < TITLE_SIZE,
-            "the name is {}pt wide beside a {box_width}pt logo box and {}pt wide with no mark \
-             -- a difference of {}pt against the {}pt the box plus the row's gap took. The logo \
-             took the wrong amount off the truncation budget, which is the overflow bug \
-             returning in a new shape.",
-            marked_rect.width(),
-            plain_rect.width(),
-            plain_rect.width() - marked_rect.width(),
-            box_width + ROW_GAP_X
-        );
-    }
-
-    /// **Ink inside the row, positively and negatively, narrow and wide.**
-    ///
-    /// The pane really is fixed at `LIST_WIDTH`, but a guard that only ever
-    /// sees one width is a guard that pins a coincidence.
-    #[test]
-    fn a_marked_rows_ink_stays_inside_its_row_at_both_pane_widths() {
-        const NARROW: f32 = 170.0;
-        let item = |brand: &str| {
-            let mut it = card_branded("Bank of America Platinum Debit", brand);
-            it.card.as_mut().unwrap().number =
-                Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
-            it
-        };
-        for width in [NARROW, PANE_WIDTH] {
-            let p = paint_at_width(&[item("Mastercard")], None, width);
-            // `row_tiles` is written against the real pane's width, so the
-            // narrow frame's row is found by the width it actually has.
-            let row = one_tile_of_width(&p, width - 2.0 * LIST_PADDING).rect;
-            // Everything painted on the row's own band -- the toolbar above it
-            // is not this claim -- must land inside the row horizontally.
-            let on_row: Vec<&(String, egui::Rect, egui::Color32)> =
-                p.texts.iter().filter(|(_, r, _)| row.y_range().contains(r.center().y)).collect();
-            assert!(!on_row.is_empty(), "at a {width}pt pane the row painted no text at all");
-            for (text, rect, _) in &on_row {
-                assert!(
-                    row.expand(0.51).contains_rect(*rect),
-                    "at a {width}pt pane, {text:?} was painted at {rect:?}, outside the {row:?} row"
-                );
-            }
-            // The row is still exactly one virtualized pitch tall either way.
-            assert!(
-                (row.height() - ROW_TILE_HEIGHT).abs() < 0.51,
-                "at a {width}pt pane the row is {}pt tall, expected {ROW_TILE_HEIGHT}",
-                row.height()
-            );
-        }
-        // The negative: the guard above can actually SEE ink outside a row.
-        // Measured against a row deliberately given a rect one third its own
-        // width -- if `contains_rect` were vacuously true this would pass too.
-        let p = paint_at_width(&[item("Mastercard")], None, PANE_WIDTH);
-        let row = row_tiles(&p)[0].rect;
-        let clipped = egui::Rect::from_min_size(
-            row.min,
-            egui::vec2(row.width() / 3.0, row.height()),
-        );
-        assert!(
-            p.texts
-                .iter()
-                .filter(|(_, r, _)| row.y_range().contains(r.center().y))
-                .any(|(_, rect, _)| !clipped.contains_rect(*rect)),
-            "no text on the row falls outside a third of it, so the containment check above \
-             proves nothing"
-        );
-    }
-
-    /// **The pill yields to the name rather than crushing it.** See
-    /// `NETWORK_MARK_MIN_TITLE_ROOM`: at the real pane this never fires, and a
-    /// pane narrow enough to fire it gets no pill instead of a one-ellipsis
-    /// name.
-    #[test]
-    fn the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_both() {
-        let card = card_branded("BoA Debit", "Mastercard");
-        // Wide: the pill is there.
-        let wide = paint_at_width(std::slice::from_ref(&card), None, PANE_WIDTH);
-        assert_eq!(
-            marks_in(&wide, row_tiles(&wide)[0].rect).len(),
-            1,
-            "the real pane must draw the mark"
-        );
-        // Narrow: it stands aside, and the NAME is what survives.
-        const NARROW: f32 = 170.0;
-        let narrow = paint_at_width(&[card], None, NARROW);
-        let row = one_tile_of_width(&narrow, NARROW - 2.0 * LIST_PADDING).rect;
-        assert!(
-            marks_in(&narrow, row).is_empty(),
-            "a 170pt pane drew a pill it has no room for: {:?}",
-            marks_in(&narrow, row)
-        );
-        assert!(
-            narrow.texts.iter().any(|(t, _, _)| t.starts_with("BoA")),
-            "the name did not survive either: {:?}",
-            narrow.texts
-        );
-    }
-
-    #[test]
-    fn a_brand_this_app_cannot_name_falls_all_the_way_back_to_the_plain_card_tile() {
-        // No network mark, no placeholder, no question mark. The fixture also
-        // carries a Visa NUMBER, so this pins the decision the spec makes: a
-        // card the user labelled "Ledger Coin" is not quietly relabelled a
-        // Visa by its leading digits.
-        //
-        // **The needle moved with the tile, and to assert more.** It read "the
-        // monogram must still be drawn", which was this test's way of saying
-        // "the tile said nothing about the network". A card's tile is now
-        // `kind_mark`'s card glyph, so there is no monogram to assert -- and
-        // the replacement says the stronger thing directly: this row's tile is
-        // drawn identically to that of a card whose brand the app DOES know,
-        // so nothing about an unnameable brand leaks into it.
-        let mut item = card_branded("Bank Coin", "Ledger Coin");
-        item.card.as_mut().unwrap().number =
-            Some(zeroize::Zeroizing::new("4111111111111111".to_string()));
-        let p = paint(&[item], None);
-        assert!(
-            !p.texts.iter().any(|(t, _, _)| t == "BC"),
-            "a card row drew a monogram instead of its kind mark; painted: {:?}",
-            p.texts
-        );
-        let unnameable = tile_glyph(&p);
-        assert!(
-            !unnameable.is_empty(),
-            "no glyph at all was drawn in the tile, so the comparison below is vacuous"
-        );
-        let nameable = tile_glyph(&paint(&[card_branded("Bank Coin", "Visa")], None));
-        assert!(
-            same_glyph(&unnameable, &nameable),
-            "a card whose brand this app cannot name drew a different tile from one it can: \
-             {unnameable:?} vs {nameable:?}"
-        );
-        let row = row_tiles(&p)[0].rect;
-        assert!(
-            marks_in(&p, row).is_empty(),
-            "an unrecognised brand painted a mark: {:?}",
-            marks_in(&p, row)
-        );
-        // Control: the same fixture with a nameable brand DOES paint one, so
-        // the emptiness above is about the brand and not about this harness.
-        let named = paint(&[card_branded("Bank Coin", "Visa")], None);
-        assert_eq!(marks_in(&named, row_tiles(&named)[0].rect).len(), 1);
-    }
-
-    #[test]
-    fn the_mark_costs_the_row_no_height_at_all() {
-        // The mark now takes WIDTH off the row -- that is the point of
-        // allocating it -- but it must still cost no HEIGHT, because
-        // `ScrollArea::show_rows` virtualizes against a fixed
-        // `ROW_TILE_HEIGHT` and one taller row slides the whole list out of
-        // register. The pill is 18pt against the tile's 32, so it fits inside
-        // the height the row already had; this is what says so.
-        let p = paint_with_icons(&[card_branded("BoA Credit", "Visa")], None, &["BoA Credit"]);
-        let row = one_tile_of_width(&p, TILE_WIDTH);
-        assert!(
-            (row.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5,
-            "a marked card's row is {}pt tall, expected {ROW_TILE_HEIGHT}",
-            row.rect.height()
-        );
-        let marks = marks_in(&p, row.rect);
-        assert_eq!(marks.len(), 1, "the mark is drawn: {marks:?}");
-        assert!(
-            marks[0].0.height() < AVATAR_SIZE,
-            "the pill at {:?} is taller than the tile beside it, so it is what sets the row's \
-             height",
-            marks[0].0
-        );
-    }
 
     #[test]
     fn the_network_is_read_from_the_brand_first_and_the_digits_only_after() {
@@ -7247,450 +5151,6 @@ mod row_tile_tests {
                 "consecutive tiles are {gap} apart, expected the design's {ROW_GAP}"
             );
         }
-    }
-
-    #[test]
-    fn the_app_badge_marks_exactly_the_items_that_carry_an_app_match_field() {
-        // The design's trailing "app" chip. Its meaning is not decorative:
-        // it is `deskwarden:app-match`, the field that makes an item fillable
-        // into a native window, which `extract_app_match` answers from the
-        // item already in hand.
-        let with = paint(&[with_app_match(login("Ledgerline", "a@b.c"))], None);
-        assert!(
-            with.texts.iter().any(|(t, _, _)| t == "app"),
-            "an item with a `deskwarden:app-match` field must carry the badge; painted: {:?}",
-            with.texts
-        );
-        let without = paint(&[login("Vantage VPN", "a@b.c")], None);
-        assert!(
-            !without.texts.iter().any(|(t, _, _)| t == "app"),
-            "an item with no app match must NOT be badged -- a badge that means nothing is worse \
-             than no badge; painted: {:?}",
-            without.texts
-        );
-    }
-
-    /// A login carrying a TOTP seed -- design 2b's "2FA" chip.
-    fn with_totp(mut item: VaultItem) -> VaultItem {
-        item.login
-            .as_mut()
-            .expect("with_totp is only meaningful on a login")
-            .totp = Some(zeroize::Zeroizing::new(
-            "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP".to_string(),
-        ));
-        item
-    }
-
-    #[test]
-    fn an_item_with_both_an_app_match_and_a_totp_paints_both_chips_side_by_side() {
-        // The user's decision, recorded: design 2b shows an "app" chip and a
-        // "2FA" chip but never two on one row, and gives no precedence rule.
-        // Both may now appear, "app" first.
-        let items = [with_totp(with_app_match(login("Ledgerline", "a@b.c")))];
-        let p = paint(&items, None);
-        let app = chip_rect(&p, "app");
-        let totp = chip_rect(&p, "2FA");
-        assert!(
-            app.right() <= totp.left() + 0.01,
-            "both chips paint, but \"app\" at {app:?} is not before \"2FA\" at {totp:?}"
-        );
-        // Side by side on ONE line, not stacked: a row is a fixed
-        // `ROW_TILE_HEIGHT` because `show_rows` virtualizes against it, so a
-        // second chip wrapping onto its own line would overflow the tile.
-        assert!(
-            (app.center().y - totp.center().y).abs() < 0.51,
-            "the chips are on different lines: \"app\" at {app:?}, \"2FA\" at {totp:?}"
-        );
-        let tile = one_tile(&p);
-        for (name, chip) in [("app", app), ("2FA", totp)] {
-            assert!(
-                tile.rect.contains_rect(chip),
-                "the {name:?} chip at {chip:?} is outside its row tile {:?}",
-                tile.rect
-            );
-        }
-    }
-
-    #[test]
-    fn each_chip_appears_exactly_when_its_own_condition_holds() {
-        // Four states, all four asserted, so neither chip can be the other's
-        // shadow. Every negative here has its positive control in the same
-        // table -- an "absent" assertion alone would also pass against a row
-        // that painted nothing at all.
-        let plain = login("Vantage VPN", "a@b.c");
-        for (label, item, want_app, want_totp) in [
-            ("neither", plain.clone(), false, false),
-            ("app only", with_app_match(plain.clone()), true, false),
-            ("totp only", with_totp(plain.clone()), false, true),
-            (
-                "both",
-                with_totp(with_app_match(plain.clone())),
-                true,
-                true,
-            ),
-        ] {
-            let p = paint(&[item], None);
-            let has = |needle: &str| p.texts.iter().any(|(t, _, _)| t == needle);
-            assert_eq!(
-                has("app"),
-                want_app,
-                "{label}: expected the \"app\" chip to be present={want_app}; painted: {:?}",
-                p.texts
-            );
-            assert_eq!(
-                has("2FA"),
-                want_totp,
-                "{label}: expected the \"2FA\" chip to be present={want_totp}; painted: {:?}",
-                p.texts
-            );
-        }
-    }
-
-    #[test]
-    fn the_2fa_chip_takes_the_same_two_colour_treatments_the_app_chip_does() {
-        // Design 2b draws the "2FA" chip with the identical metrics and
-        // colours as the "app" one -- `font-size: 10px; border-radius: 5px;
-        // padding: 2px 6px`, `#605d5d on #f3f2f2` unselected.
-        let items = [with_totp(login("Git Host", "anovak"))];
-        let unselected = paint(&items, None);
-        assert_eq!(text_color(&unselected, "2FA"), theme::TEXT_MUTED);
-        assert_eq!(text_font(&unselected, "2FA").size, 10.0);
-        let selected = paint(&items, Some("Git Host"));
-        assert_eq!(text_color(&selected, "2FA"), theme::BLUE_DEEP);
-    }
-
-    #[test]
-    fn two_chips_on_a_narrow_pane_stay_inside_the_tile_and_squeeze_the_title_instead() {
-        // What happens when the row is too tight. The chips are allocated
-        // first (right-to-left), so they keep their full size and the title
-        // column absorbs the squeeze by truncating -- which is the behaviour
-        // that keeps every row exactly `ROW_TILE_HEIGHT` tall and the
-        // virtualized list in register. Asserted at a pane less than half the
-        // real one, where the two chips plus the avatar leave almost nothing.
-        //
-        // **A LOGIN, and two is all this row can ever show.** The network mark
-        // joined this trailing run, but it cannot join THIS row: `card_network`
-        // answers for cards alone, so the mark and the "2FA" chip are mutually
-        // exclusive by the item's kind. The card side of the invariant is
-        // `a_marked_card_on_a_narrow_pane_keeps_its_mark_inside_the_tile_and_
-        // squeezes_the_title_instead`, and the one overlap that is reachable
-        // at all is `a_card_bound_to_an_app_puts_its_mark_inside_the_chip_and_
-        // still_fits_the_row`.
-        let items = [with_totp(with_app_match(login(
-            "A Very Long Item Name Indeed",
-            "someone@example.com",
-        )))];
-        let p = paint_at_width(&items, None, 170.0);
-        let tile = one_tile_of_width(&p, 170.0 - 2.0 * LIST_PADDING);
-        for name in ["app", "2FA"] {
-            let chip = chip_rect(&p, name);
-            assert!(
-                tile.rect.contains_rect(chip),
-                "on a 170pt pane the {name:?} chip at {chip:?} has escaped its row tile {:?}",
-                tile.rect
-            );
-        }
-        assert!(
-            (tile.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5,
-            "the row grew to {} tall on a narrow pane, which would slide the virtualized list \
-             out of register with the pitch `show_rows` scrolls by",
-            tile.rect.height()
-        );
-    }
-
-    /// **The card half of the invariant above**, and the shape the mark's move
-    /// to the trailing edge actually produces: a card row, a long name, and a
-    /// network mark alone in the trailing run.
-    ///
-    /// Run over BOTH kinds of mark, because they are two different risks. The
-    /// word's width is this app's own and bounded by `MASTERCARD`; a logo's is
-    /// a stranger's, read off a file the user dropped into a folder, and the
-    /// fixture here is deliberately 10:1 so `card_mark::LOGO_BOX_ASPECT` is
-    /// the only thing standing between the row and a mark 150pt wide.
-    #[test]
-    fn a_marked_card_on_a_narrow_pane_keeps_its_mark_inside_the_tile_and_squeezes_the_title_instead()
-    {
-        const NARROW: f32 = 170.0;
-        const NAME: &str = "A Very Long Item Name Indeed";
-        let wide_logo = crate::brand_mark::tests::on_ground_png(1000, 100, 46);
-
-        for (label, p) in [
-            ("a word mark", paint_at_width(&[card_branded(NAME, "Mastercard")], None, NARROW)),
-            ("a wide logo", {
-                let dir = marks_dir(&[(CardBrand::Mastercard, wide_logo.clone())]);
-                paint_with_marks(&[card_branded(NAME, "Mastercard")], NARROW, dir.to_path_buf())
-            }),
-        ] {
-            let tile = one_tile_of_width(&p, NARROW - 2.0 * LIST_PADDING);
-            // The mark either fits inside the row or stood aside entirely --
-            // `NETWORK_MARK_MIN_TITLE_ROOM` permits the second and
-            // `the_network_mark_yields_to_the_name_on_a_pane_too_narrow_for_
-            // both` is about it. What it may never do is hang out of the tile.
-            for mark in marks_in(&p, tile.rect)
-                .into_iter()
-                .map(|(r, _)| r)
-                .chain(logos_in(&p, tile.rect))
-            {
-                assert!(
-                    tile.rect.contains_rect(mark),
-                    "with {label}, the network mark at {mark:?} has escaped its row tile {:?}",
-                    tile.rect
-                );
-            }
-            assert!(
-                (tile.rect.height() - ROW_TILE_HEIGHT).abs() < 0.5,
-                "with {label}, the row grew to {} tall on a narrow pane, which would slide the \
-                 virtualized list out of register with the pitch `show_rows` scrolls by",
-                tile.rect.height()
-            );
-            // The squeeze landed on the TITLE: the name is still drawn, and
-            // drawn narrower than the string could possibly need.
-            let name = p
-                .texts
-                .iter()
-                .find(|(t, _, _)| t.starts_with("A Very Long"))
-                .map(|(_, r, _)| *r)
-                .unwrap_or_else(|| panic!("with {label}, the name was not painted at all"));
-            assert!(
-                name.width() < NAME.chars().count() as f32 * TITLE_SIZE * 0.5,
-                "with {label}, the name is {}pt wide, which is not truncated -- the row absorbed \
-                 the squeeze somewhere else",
-                name.width()
-            );
-        }
-
-        // **The wide logo really was capped**, or the case above proves
-        // nothing about `LOGO_BOX_ASPECT`: a 1000x100 file fitted into a
-        // 15pt-tall box would be 150pt wide uncapped, which is most of that
-        // pane. At the REAL pane, where the mark is drawn rather than stood
-        // aside, it comes out no wider than the room every logo shares,
-        // which is under 4x the height.
-        let dir = marks_dir(&[(CardBrand::Mastercard, wide_logo)]);
-        let real = paint_with_marks(&[card_branded(NAME, "Mastercard")], PANE_WIDTH, dir.to_path_buf());
-        let row = row_tiles(&real)[0].rect;
-        let logo = logos_in(&real, row);
-        assert_eq!(logo.len(), 1, "the real pane must draw the logo: {logo:?}");
-        assert!(
-            logo[0].width() <= 4.0 * NETWORK_MARK_HEIGHT + 0.51,
-            "a 10:1 file drew {}pt wide beside a {NETWORK_MARK_HEIGHT}pt-tall box -- \
-             `card_mark::LOGO_BOX_ASPECT` did not cap it, so a user's file can take the row",
-            logo[0].width()
-        );
-        assert!(
-            row.contains_rect(logo[0]),
-            "the capped logo at {:?} still escaped its {row:?} row",
-            logo[0]
-        );
-    }
-
-    /// A card carrying a `deskwarden:app-match` custom field.
-    ///
-    /// **Rare but genuinely reachable, which is why it is a fixture and not a
-    /// fiction.** The field is a custom field, and nothing confines a custom
-    /// field to a login: `extract_app_match` reads `item.fields` for any kind,
-    /// `detail_edit::app_match_edit` has no kind gate, and `detail`'s
-    /// `app_card_visible` was deliberately narrowed to `has_field` alone --
-    /// its comment records that asking the kind "hid the card outright on a
-    /// non-fillable kind", leaving a binding the user could see in every other
-    /// Bitwarden client and not clear from here. So a card can wear the "app"
-    /// chip beside its network mark, and the row must simply cope.
-    ///
-    /// The "2FA" chip is a different matter and is NOT reachable this way: it
-    /// is read off `item.login.totp`, and a card has no login block. A card
-    /// with one is a hand-built item, not a shape the vault produces.
-    fn card_bound_to_an_app(name: &str, brand: &str) -> VaultItem {
-        with_app_match(card_branded(name, brand))
-    }
-
-    /// **The one overlap that is reachable: a mark and the "app" chip.**
-    ///
-    /// Not a design with an ordering to defend -- there is no row on which a
-    /// reader chooses between three trailing things, because the mark is a
-    /// card's and "2FA" is a login's. This is the rare case laid out so that
-    /// it cannot overflow, and it pins the one ordering consequence that does
-    /// follow from drawing the mark after the chip loop: the mark ends up
-    /// INSIDE the chip, nearest the name it qualifies, and the chip keeps the
-    /// trailing edge it has on every other row.
-    #[test]
-    fn a_card_bound_to_an_app_puts_its_mark_inside_the_chip_and_still_fits_the_row() {
-        let p = paint(&[card_bound_to_an_app("BoA Credit", "Visa")], None);
-        let row = row_tiles(&p)[0].rect;
-        let marks = marks_in(&p, row);
-        assert_eq!(marks.len(), 1, "expected one network mark on the row: {marks:?}");
-        let (mark, word) = marks[0].clone();
-        assert_eq!(word, CardBrand::Visa.wordmark(), "the mark names the wrong network");
-        let name = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == "BoA Credit")
-            .map(|(_, r, _)| *r)
-            .expect("the item's name was painted");
-        let app = chip_rect(&p, "app");
-        for (a_name, a, b_name, b) in [
-            ("the name", name, "the mark", mark),
-            ("the mark", mark, "\"app\"", app),
-        ] {
-            assert!(
-                a.right() <= b.left() + 0.01,
-                "{a_name} at {a:?} does not come before {b_name} at {b:?}; the row reads \
-                 name={name:?} mark={mark:?} app={app:?}"
-            );
-        }
-        // On one line and inside the row -- a wrapped mark is a taller row and
-        // a virtualized list out of register.
-        assert!(
-            (mark.center().y - app.center().y).abs() < 1.01,
-            "the mark at {mark:?} is on a different line from \"app\" at {app:?}"
-        );
-        assert!(row.contains_rect(mark), "the mark at {mark:?} escaped its {row:?} row");
-        assert!(row.contains_rect(app), "the \"app\" chip at {app:?} escaped its {row:?} row");
-        // The chip sits exactly where it sits on a login row: the mark took
-        // its room from the TITLE, not from the trailing edge.
-        let bare = chip_rect(&paint(&[with_app_match(login("BoA Credit", "a@b.c"))], None), "app");
-        assert!(
-            (app.left() - bare.left()).abs() < 0.01,
-            "the \"app\" chip moved from {bare:?} to {app:?} when a network mark joined the row"
-        );
-    }
-
-    /// **The re-derived truncation budget, in the one form that can be
-    /// observed.** The guard is now applied inside the trailing run, AFTER
-    /// anything else in it has taken its width, so a card that carries the
-    /// "app" chip yields its mark at a wider pane than a card that does not.
-    ///
-    /// The old leading-run guard ran before the trailing run existed and could
-    /// not see into it, so both rows below would have kept their mark and the
-    /// chipped one's title would have been squeezed by the chip's width on top
-    /// of the mark's. This is the positive and the negative of that at ONE
-    /// pane width, so the difference cannot be a coincidence of two
-    /// thresholds.
-    #[test]
-    fn the_network_mark_yields_sooner_when_the_row_also_carries_a_chip() {
-        // Chosen by measurement, not by argument. A bare card needs about
-        // 292pt of pane for `MASTERCARD` to clear the 120pt title floor; the
-        // "app" chip plus its gap is about 40pt more. 310 is inside that
-        // window, and the two assertions below are what prove it really is --
-        // a width outside it fails one of them rather than passing vacuously.
-        const BETWEEN: f32 = 310.0;
-        let bare = paint_at_width(&[card_branded("BoA Debit", "Mastercard")], None, BETWEEN);
-        let chipped =
-            paint_at_width(&[card_bound_to_an_app("BoA Debit", "Mastercard")], None, BETWEEN);
-        let row = |p: &Painted| one_tile_of_width(p, BETWEEN - 2.0 * LIST_PADDING).rect;
-        assert_eq!(
-            marks_in(&bare, row(&bare)).len(),
-            1,
-            "at a {BETWEEN}pt pane a card with no chip has room for its mark, so this width \
-             says nothing about the chip: {:?}",
-            marks_in(&bare, row(&bare))
-        );
-        assert!(
-            marks_in(&chipped, row(&chipped)).is_empty(),
-            "the same card wearing the \"app\" chip drew its mark anyway at a {BETWEEN}pt pane, \
-             so the guard is still blind to the trailing run: {:?}",
-            marks_in(&chipped, row(&chipped))
-        );
-        // The name is what both were protecting, and the chip is untouched --
-        // yielding is the MARK's job.
-        for p in [&bare, &chipped] {
-            assert!(
-                p.texts.iter().any(|(t, _, _)| t.starts_with("BoA")),
-                "the name did not survive: {:?}",
-                p.texts
-            );
-        }
-        let chip = chip_rect(&chipped, "app");
-        assert!(
-            row(&chipped).contains_rect(chip),
-            "the \"app\" chip at {chip:?} escaped its row when the mark stood aside"
-        );
-    }
-
-    /// **A long card name beside its mark still truncates cleanly and keeps
-    /// its `(*1234)` suffix**, at the narrow pane and at the real one.
-    ///
-    /// The suffix is the point: two cards from one bank differ only by those
-    /// four digits, so a budget that let the suffix be the thing that got cut
-    /// would leave two identical rows. `paint_title_with_suffix` takes the
-    /// suffix's width off first, and this is that promise held against the
-    /// tightest card row this list produces -- which is now a row whose mark
-    /// is on the far side of the name rather than between it and the tile.
-    #[test]
-    fn a_long_card_name_beside_its_mark_still_keeps_its_digits() {
-        const LONG: &str = "Bank of America Platinum Rewards Signature Debit";
-        for width in [170.0f32, PANE_WIDTH] {
-            let mut card = card_branded(LONG, "Mastercard");
-            card.card.as_mut().unwrap().number =
-                Some(zeroize::Zeroizing::new("5555444433332222".to_string()));
-            let p = paint_at_width(&[card], None, width);
-            let row = one_tile_of_width(&p, width - 2.0 * LIST_PADDING).rect;
-            let suffix = p
-                .texts
-                .iter()
-                .find(|(t, _, _)| t == "(*2222)")
-                .map(|(_, r, _)| *r)
-                .unwrap_or_else(|| {
-                    panic!("at a {width}pt pane the suffix was cut: {:?}", p.texts)
-                });
-            assert!(
-                row.expand(0.51).contains_rect(suffix),
-                "at a {width}pt pane the suffix at {suffix:?} spilled out of its {row:?} row"
-            );
-            // Truncated, not wrapped, and the row kept its pitch.
-            assert!(
-                (row.height() - ROW_TILE_HEIGHT).abs() < 0.51,
-                "at a {width}pt pane the row is {}pt tall, expected {ROW_TILE_HEIGHT}",
-                row.height()
-            );
-            let name = p
-                .texts
-                .iter()
-                .find(|(t, _, _)| t.starts_with("Bank of"))
-                .map(|(_, r, _)| *r)
-                .expect("the name was painted");
-            assert!(
-                name.right() <= suffix.left() + 0.01,
-                "at a {width}pt pane the name at {name:?} ran into its suffix at {suffix:?}"
-            );
-            assert!(
-                row.expand(0.51).contains_rect(name),
-                "at a {width}pt pane the name at {name:?} spilled out of its {row:?} row"
-            );
-            // The negative: the name really was cut down, so "it fits" is not
-            // just "the pane was wide enough all along".
-            assert!(
-                name.width() < LONG.chars().count() as f32 * TITLE_SIZE * 0.5,
-                "at a {width}pt pane the name is {}pt wide and was never truncated",
-                name.width()
-            );
-        }
-    }
-
-    #[test]
-    fn the_app_badge_takes_the_designs_two_colour_treatments() {
-        // `color: #605d5d; background: #f3f2f2` unselected;
-        // `color: #14307a; background: #dbe4f7` selected.
-        let items = [with_app_match(login("Ledgerline", "a@b.c"))];
-        let unselected = paint(&items, None);
-        assert_eq!(text_color(&unselected, "app"), theme::TEXT_MUTED);
-        let selected = paint(&items, Some("Ledgerline"));
-        assert_eq!(text_color(&selected, "app"), theme::BLUE_DEEP);
-
-        let badge_of = |p: &Painted| {
-            let label = p
-                .texts
-                .iter()
-                .find(|(t, _, _)| t == "app")
-                .expect("the badge")
-                .1;
-            p.rects
-                .iter()
-                .find(|r| r.rect.contains_rect(label) && r.rect.width() < 60.0)
-                .unwrap_or_else(|| panic!("the badge's own filled chip was never painted"))
-                .clone()
-        };
-        assert_eq!(badge_of(&unselected).fill, theme::CANVAS);
-        assert_eq!(badge_of(&selected).fill, theme::FOCUS_RING);
-        assert_eq!(badge_of(&unselected).corner_radius, CornerRadius::same(5));
     }
 
     /// **The same claim at every width the detail pane's slide sweeps the
@@ -8070,235 +5530,6 @@ mod row_tile_tests {
             ..Default::default()
         });
         it
-    }
-
-    /// The rect and colour of one painted run, by its exact text.
-    fn painted(p: &Painted, text: &str) -> (egui::Rect, egui::Color32) {
-        let run = p
-            .texts
-            .iter()
-            .find(|(t, _, _)| t == text)
-            .unwrap_or_else(|| {
-                panic!(
-                    "{text:?} was never painted; the row painted: {:?}",
-                    p.texts.iter().map(|(t, _, _)| t.clone()).collect::<Vec<_>>()
-                )
-            });
-        (run.1, run.2)
-    }
-
-    /// The font one painted run was laid out in.
-    fn painted_font(p: &Painted, text: &str) -> egui::FontId {
-        p.fonts
-            .iter()
-            .find(|(t, _)| t == text)
-            .unwrap_or_else(|| panic!("{text:?} was never painted"))
-            .1
-            .clone()
-    }
-
-    /// Every painted run that looks like the card suffix. Used to assert its
-    /// ABSENCE without pinning the exact digits a wrong implementation might
-    /// have chosen.
-    fn suffix_runs(p: &Painted) -> Vec<String> {
-        p.texts
-            .iter()
-            .map(|(t, _, _)| t.clone())
-            .filter(|t| t.starts_with("(*"))
-            .collect()
-    }
-
-    #[test]
-    fn a_cards_row_shows_its_last_four_after_the_name() {
-        // The user's request, verbatim: "add *4545 after the name in search
-        // results not in bold like: `BoA Credit (*4545)`".
-        let p = paint(&[card_numbered("BoA Credit", "4242424242424242")], None);
-        let (name, _) = painted(&p, "BoA Credit");
-        let (suffix, _) = painted(&p, "(*4242)");
-        assert!(
-            suffix.left() >= name.right() - 0.01,
-            "the suffix runs {}..{} and the name {}..{} -- the suffix is not AFTER the name",
-            suffix.left(),
-            suffix.right(),
-            name.left(),
-            name.right()
-        );
-        // On the name's own line, not below it: the two boxes overlap in y.
-        assert!(
-            suffix.top() < name.bottom() && name.top() < suffix.bottom(),
-            "the suffix sits at y {}..{} and the name at {}..{} -- they are not on one line",
-            suffix.top(),
-            suffix.bottom(),
-            name.top(),
-            name.bottom()
-        );
-    }
-
-    #[test]
-    fn the_suffix_is_lighter_than_the_name_it_follows() {
-        // "not in bold". The name is Archivo SemiBold in `INK`; the suffix
-        // takes the row's OWN secondary typography -- the plain proportional
-        // face in `TEXT_FAINT`, which is what the username line below it
-        // uses. Asserted against the name in the same frame so this cannot
-        // stay green by both moving together.
-        let p = paint(&[card_numbered("BoA Credit", "4242424242424242")], None);
-        let (_, name_colour) = painted(&p, "BoA Credit");
-        let (_, suffix_colour) = painted(&p, "(*4242)");
-        assert_eq!(name_colour, theme::INK);
-        assert_eq!(suffix_colour, theme::TEXT_FAINT);
-        assert_ne!(suffix_colour, name_colour);
-
-        let name_font = painted_font(&p, "BoA Credit");
-        let suffix_font = painted_font(&p, "(*4242)");
-        assert_eq!(
-            name_font.family,
-            egui::FontFamily::Name(theme::SEMIBOLD.into()),
-            "the name stopped being the design's 600 weight"
-        );
-        assert_eq!(
-            suffix_font.family,
-            egui::FontFamily::Proportional,
-            "the suffix is in a named (bold) Archivo face; it must be the plain proportional one"
-        );
-        // Same size, so the difference the eye reads is weight and ink and
-        // not a second type size on one line.
-        assert!((suffix_font.size - name_font.size).abs() < 0.01);
-    }
-
-    #[test]
-    fn a_selected_cards_suffix_stays_light_while_its_name_goes_bold() {
-        // The branch the test above cannot reach: selected rows draw the name
-        // in Archivo Bold in `BLUE_DEEP`. The suffix must not follow it.
-        let p = paint(&[card_numbered("BoA Credit", "4242424242424242")], Some("BoA Credit"));
-        let (_, name_colour) = painted(&p, "BoA Credit");
-        let (_, suffix_colour) = painted(&p, "(*4242)");
-        assert_eq!(name_colour, theme::BLUE_DEEP);
-        assert_eq!(suffix_colour, theme::TEXT_FAINT);
-        assert_eq!(
-            painted_font(&p, "BoA Credit").family,
-            egui::FontFamily::Name(theme::BOLD.into())
-        );
-        assert_eq!(painted_font(&p, "(*4242)").family, egui::FontFamily::Proportional);
-    }
-
-    #[test]
-    fn a_card_with_three_digits_shows_no_suffix_and_the_row_is_otherwise_itself() {
-        // The card-art spec's floor. The POSITIVE half matters as much as the
-        // negative one: an implementation that painted nothing at all would
-        // satisfy "no suffix" vacuously.
-        let p = paint(&[card_numbered("Partial", "454")], None);
-        painted(&p, "Partial");
-        assert_eq!(one_tile(&p).rect.height(), ROW_TILE_HEIGHT);
-        assert!(
-            suffix_runs(&p).is_empty(),
-            "a three-digit card grew a suffix: {:?}",
-            suffix_runs(&p)
-        );
-    }
-
-    #[test]
-    fn a_card_with_no_number_at_all_looks_exactly_as_it_did() {
-        let p = paint(&[card("Bare")], None);
-        painted(&p, "Bare");
-        assert!(suffix_runs(&p).is_empty(), "a numberless card grew a suffix");
-    }
-
-    #[test]
-    fn a_login_named_like_a_card_number_grows_no_suffix() {
-        // The control that the rule is keyed on KIND and not on text: this
-        // row's whole name is sixteen digits and it is a login.
-        let p = paint(&[login("4242424242424242", "a.novak@ledgerline.com")], None);
-        painted(&p, "4242424242424242");
-        painted(&p, "a.novak@ledgerline.com");
-        assert!(suffix_runs(&p).is_empty(), "a login grew a card suffix");
-    }
-
-    #[test]
-    fn a_long_card_name_truncates_and_the_four_digits_survive() {
-        // The suffix is what tells two cards from the same bank apart, so it
-        // is the NAME that loses its tail. Squeezed at a pane far narrower
-        // than the real one, which is fixed at `LIST_WIDTH`.
-        //
-        // **Measured as painted WIDTH and not as painted text.** A truncated
-        // egui galley still reports the whole string from `Galley::text` --
-        // only its box shrinks -- so a test reading the text back would be
-        // green whatever the row drew.
-        let long = "Bank of America Cash Rewards Signature Visa";
-        let item = card_numbered(long, "4242424242424242");
-        let roomy = paint(std::slice::from_ref(&item), None);
-        let tight = paint_at_width(std::slice::from_ref(&item), None, 240.0);
-
-        let (roomy_name, _) = painted(&roomy, long);
-        let (roomy_suffix, _) = painted(&roomy, "(*4242)");
-        let (tight_name, _) = painted(&tight, long);
-        let (tight_suffix, _) = painted(&tight, "(*4242)");
-
-        assert!(
-            tight_name.width() < roomy_name.width() - 1.0,
-            "the name was not squeezed at all: {} wide on a 240pt pane against {} on a \
-             {PANE_WIDTH}pt one",
-            tight_name.width(),
-            roomy_name.width()
-        );
-        // The suffix is UNTOUCHED: same width on both panes, and still whole.
-        assert!(
-            (tight_suffix.width() - roomy_suffix.width()).abs() < 0.01,
-            "the suffix was squeezed too: {} against {}",
-            tight_suffix.width(),
-            roomy_suffix.width()
-        );
-        // And it is still inside the row it belongs to.
-        let tile = one_tile_of_width(&tight, 240.0 - 2.0 * LIST_PADDING).rect;
-        assert!(
-            tight_suffix.right() <= tile.right() + 0.01,
-            "the suffix runs to x={} but the tile ends at x={}",
-            tight_suffix.right(),
-            tile.right()
-        );
-    }
-
-    #[test]
-    fn a_suffix_never_makes_a_row_taller_than_every_other_row() {
-        // The virtualized list scrolls by a fixed `ROW_TILE_HEIGHT` pitch, so
-        // one taller row slides the whole list out of register. The suffix is
-        // painted into the NAME's own box for exactly this reason.
-        let items = [
-            login("Ledgerline", "a.novak@ledgerline.com"),
-            card_numbered("BoA Credit", "4242424242424242"),
-        ];
-        let p = paint(&items, None);
-        let tiles = row_tiles(&p);
-        assert_eq!(tiles.len(), 2, "expected one tile per row");
-        for tile in &tiles {
-            assert!(
-                (tile.rect.height() - ROW_TILE_HEIGHT).abs() < 0.01,
-                "a row is {} tall, not {ROW_TILE_HEIGHT}",
-                tile.rect.height()
-            );
-        }
-    }
-
-    #[test]
-    fn a_cards_suffix_does_not_move_the_rows_trailing_chips() {
-        // The chips are allocated before the title column, so a longer title
-        // line must be absorbed by the title and never by them.
-        let mut with_2fa = card_numbered("BoA Credit", "4242424242424242");
-        with_2fa.login = Some(crate::vault_bridge::LoginData {
-            username: None,
-            password: None,
-            totp: Some(zeroize::Zeroizing::new("JBSWY3DPEHPK3PXP".into())),
-            uris: vec![],
-            other: serde_json::Map::new(),
-        });
-        let mut without = with_2fa.clone();
-        without.card = None;
-        let with_chip = chip_rect(&paint(&[with_2fa], None), "2FA");
-        let bare = chip_rect(&paint(&[without], None), "2FA");
-        assert!(
-            (with_chip.left() - bare.left()).abs() < 0.01
-                && (with_chip.top() - bare.top()).abs() < 0.01,
-            "the 2FA chip moved from {bare:?} to {with_chip:?} when the card grew a suffix"
-        );
     }
 
     /// The kind whose Edit entry is still greyed -- see
@@ -8819,15 +6050,9 @@ mod row_tile_tests {
     /// an entry) rather than passing quietly in both.
     const NEW_MENU_ROWS: [&str; 5] = ["Login", "Secure note", "Card", "Identity", "SSH key"];
 
-    /// The centre of the `+ New` button, read off a painted frame.
+    /// The centre of the header's `+`, read off a drawn frame.
     fn new_button_centre(items: &[VaultItem]) -> egui::Pos2 {
-        let p = paint(items, None);
-        p.texts
-            .iter()
-            .find(|(text, _, _)| text == "+ New")
-            .expect("the \"+ New\" button was never painted")
-            .1
-            .center()
+        paint(items, None).new_button.expect("the header's + was never drawn").center()
     }
 
     /// Every string painted this frame, in paint order. Used as a
@@ -9348,18 +6573,6 @@ mod toolbar_strip_tests {
         }
     }
 
-    /// One real frame of `draw_item_list` at the item pane's own width.
-    /// `before_frame` runs between the settling frames and the measured one,
-    /// which is how the Ctrl+K test asks for focus the way `vault_window::run`
-    /// does.
-    fn run_item_list(
-        items: &[VaultItem],
-        search: &mut String,
-        before_frame: impl FnOnce(&egui::Context),
-    ) -> (egui::FullOutput, egui::Context) {
-        run_item_list_with_events(items, search, before_frame, Vec::new())
-    }
-
     /// [`run_item_list`], with `events` delivered to the MEASURED frame --
     /// how the Esc hint's click and the Escape key are driven without
     /// reaching into egui's private input state.
@@ -9406,6 +6619,8 @@ mod toolbar_strip_tests {
                     &mut false,
                                 &std::collections::HashSet::new(),
                                 &RowPeople::default(),
+                                "All items",
+                                false,
                             );
             })
         };
@@ -9415,50 +6630,6 @@ mod toolbar_strip_tests {
         raw.events = events;
         let output = draw(&ctx, search, raw);
         (output, ctx)
-    }
-
-    fn collect_text(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
-        match shape {
-            egui::Shape::Text(text) => out.push((
-                text.galley.text().to_string(),
-                egui::Rect::from_min_size(text.pos, text.galley.size()),
-            )),
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_text(shape, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Every filled rectangle painted in `fill`, in paint order.
-    fn collect_fills(shape: &egui::Shape, fill: egui::Color32, out: &mut Vec<egui::Rect>) {
-        match shape {
-            egui::Shape::Rect(rect) if rect.fill == fill => out.push(rect.rect),
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_fills(shape, fill, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn painted(output: &egui::FullOutput) -> Vec<(String, egui::Rect)> {
-        let mut texts = Vec::new();
-        for clipped in &output.shapes {
-            collect_text(&clipped.shape, &mut texts);
-        }
-        texts
-    }
-
-    fn fills(output: &egui::FullOutput, fill: egui::Color32) -> Vec<egui::Rect> {
-        let mut rects = Vec::new();
-        for clipped in &output.shapes {
-            collect_fills(&clipped.shape, fill, &mut rects);
-        }
-        rects
     }
 
 
@@ -9500,28 +6671,6 @@ mod toolbar_strip_tests {
     }
 
 
-    #[test]
-    fn the_item_rows_are_still_below_the_tile_and_not_under_it() {
-        // The strip is drawn before the list and both are in the same pane;
-        // getting the order or the padding wrong hides the first row behind
-        // the tile rather than producing any error.
-        let mut search = String::new();
-        let (output, _) = run_item_list(&[an_item("Ledgerline")], &mut search, |_| {});
-        let texts = painted(&output);
-        let tile = fills(&output, theme::CARD)
-            .into_iter()
-            .find(|r| r.width() >= PANE_WIDTH - 0.5)
-            .expect("the white tile");
-        let row = texts
-            .iter()
-            .find(|(t, _)| t == "Ledgerline")
-            .expect("the item row's name")
-            .1;
-        assert!(
-            row.min.y >= tile.max.y,
-            "the first item row at {row:?} overlaps the toolbar tile {tile:?}"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -9634,6 +6783,8 @@ mod move_error_band_tests {
                     &mut false,
                                 &std::collections::HashSet::new(),
                                 &RowPeople::default(),
+                                "All items",
+                                false,
                             );
             })
         };
@@ -9769,8 +6920,17 @@ mod move_error_band_tests {
         // `show_rows` scrolls by.
         let items: Vec<VaultItem> = (0..100).map(|i| login(&format!("Item {i:03}"))).collect();
         let with_band = paint(&items, Some(MESSAGE), Vec::new());
+        // Each row found by its 44pt avatar and boxed around it: a v2 row
+        // paints no tile of its own until it is hovered or selected.
         let tiles: Vec<egui::Rect> = with_band
             .rects
+            .iter()
+            .filter(|(rect, _)| (rect.width() - AVATAR_SIZE).abs() < 0.5 && (rect.height() - AVATAR_SIZE).abs() < 0.5)
+            .map(|(rect, fill)| {
+                let full = PANE_WIDTH - 2.0 * LIST_PADDING;
+                (egui::Rect::from_center_size(rect.center(), egui::vec2(full, ROW_TILE_HEIGHT)), *fill)
+            })
+            .collect::<Vec<_>>()
             .iter()
             .filter(|(rect, _)| {
                 // THE ONE tile width. This filter used to accept a second,
@@ -9896,7 +7056,7 @@ mod list_placeholder_tests {
         assert_eq!(ListPlaceholder::Empty.message(), "Nothing here yet");
         assert_eq!(
             ListPlaceholder::NoMatches.message(),
-            "No items match your search"
+            super::NOTHING_MATCHES
         );
     }
 }
@@ -10040,6 +7200,8 @@ mod list_placeholder_paint_tests {
                     &mut false,
                                 &std::collections::HashSet::new(),
                                 &RowPeople::default(),
+                                "All items",
+                                false,
                             );
             })
         };
@@ -10398,6 +7560,8 @@ mod keyboard_selection_tests {
                     &mut false,
                                 &std::collections::HashSet::new(),
                                 &RowPeople::default(),
+                                "All items",
+                                false,
                             );
                 // AFTER the pane, where the window really draws them -- so the
                 // gate is being tested through the one-frame-late
@@ -10828,5 +7992,294 @@ mod keyboard_selection_tests {
         // The walk really found something, so an empty `found` cannot make
         // the equality above vacuous on a broken matcher.
         assert!(found.len() >= 5, "the source walk found only {found:?}");
+    }
+}
+
+
+#[cfg(test)]
+mod v2_list_tests {
+    //! Spec 3.1's list pane, as drawn: the header, the rows, their tags, the
+    //! empty and offline states, and the entrance.
+    use super::*;
+    use crate::kit::testing::{self, click_at, Painted};
+    use crate::kit::tokens::Palette;
+    use crate::vault_bridge::{CardData, LoginData};
+    use eframe::egui::{vec2, Color32, Rect};
+    use std::collections::HashSet;
+
+    const P: Palette = Palette::LIGHT;
+    const SCREEN: egui::Vec2 = egui::vec2(390.0, 2000.0);
+
+    fn login(name: &str, username: &str) -> VaultItem {
+        VaultItem {
+            id: name.to_string(),
+            name: name.into(),
+            login: Some(LoginData {
+                username: Some(username.to_string()),
+                password: None,
+                totp: None,
+                uris: vec![],
+                other: serde_json::Map::new(),
+            }),
+            card: None,
+            identity: None,
+            ssh_key: None,
+            notes: None,
+            fields: vec![],
+            item_type: Some(1),
+            folder_id: None,
+            favorite: false,
+            other: serde_json::Map::new(),
+        }
+    }
+
+    fn card(name: &str, number: &str) -> VaultItem {
+        VaultItem {
+            item_type: Some(3),
+            login: None,
+            card: Some(CardData { number: Some(zeroize::Zeroizing::new(number.into())), ..Default::default() }),
+            ..login(name, "")
+        }
+    }
+
+    fn with_app(item: VaultItem) -> VaultItem {
+        let m = crate::app_match::AppMatch {
+            process: "Ledgerline.exe".to_string(),
+            title: String::new(),
+            hosted: false,
+            path: r"C:\Apps\Ledgerline\Ledgerline.exe".to_string(),
+            args: String::new(),
+            sequence: String::new(),
+            trigger: crate::app_match::TriggerMode::Prompt,
+        };
+        crate::vault_bridge::with_app_match(&item, &m)
+    }
+
+    fn with_totp(mut item: VaultItem) -> VaultItem {
+        item.login.as_mut().unwrap().totp = Some(zeroize::Zeroizing::new("JBSWY3DPEHPK3PXP".into()));
+        item
+    }
+
+    /// What one frame of the list is drawn with.
+    struct List<'a> {
+        items: &'a [VaultItem],
+        filter: SidebarFilter,
+        search: &'a str,
+        selected: Option<&'a str>,
+        title: &'a str,
+        offline: bool,
+        shared: HashSet<String>,
+    }
+
+    impl<'a> List<'a> {
+        fn of(items: &'a [VaultItem]) -> Self {
+            Self {
+                items,
+                filter: SidebarFilter::All,
+                search: "",
+                selected: None,
+                title: "All items",
+                offline: false,
+                shared: HashSet::new(),
+            }
+        }
+
+        fn draw(&self, ctx: &egui::Context, time: f64, events: Vec<egui::Event>) -> (Painted, ItemListAction) {
+            let mut action = ItemListAction::None;
+            let mut search = self.search.to_string();
+            let mut selected = self.selected.map(str::to_string);
+            let painted = testing::frame(ctx, time, SCREEN, events, |ui| {
+                action = draw_item_list(
+                    ui,
+                    Some(self.items),
+                    &[],
+                    &self.filter,
+                    &mut search,
+                    &mut selected,
+                    &IconCache::default(),
+                    false,
+                    &mut Vec::new(),
+                    None,
+                    false,
+                    &mut false,
+                    &self.shared,
+                    &RowPeople::default(),
+                    self.title,
+                    self.offline,
+                );
+            });
+            (painted, action)
+        }
+    }
+
+    fn avatars(p: &Painted) -> Vec<Rect> {
+        p.rects
+            .iter()
+            .filter(|r| r.blur_width == 0.0 && (r.rect.width() - 44.0).abs() < 0.5 && (r.rect.height() - 44.0).abs() < 0.5)
+            .map(|r| r.rect)
+            .collect()
+    }
+
+    #[test]
+    fn the_header_names_the_scope_and_counts_it() {
+        let items = [login("Ledgerline", "a"), login("Atlas", "b"), login("Vantage", "c")];
+        let ctx = testing::ctx();
+        let (p, _) = List { title: "Work", ..List::of(&items) }.draw(&ctx, 0.0, vec![]);
+        let (_, ink, title) = p.text("Work").expect("the scope's title");
+        assert_eq!(*ink, P.ink);
+        let (_, count_ink, count) = p.texts.iter().find(|(t, _, _)| t == "3").expect("the count");
+        assert_eq!(*count_ink, P.text_ghost);
+        assert!(count.left() > title.right(), "the count sits after the title");
+        assert!(title.left() >= 24.0 - 0.5 && title.top() >= 24.0 - 6.0, "the header's 24pt padding: {title:?}");
+
+        // The titles themselves, one per scope (spec 3.1's map, and the
+        // folder's own name).
+        let folders = [Folder { id: "f1".into(), name: "Banking".into(), other: Default::default() }];
+        let lists = super::super::sidebar::VaultLists::live_only(&items);
+        for (filter, want) in [
+            (SidebarFilter::All, "All items"),
+            (SidebarFilter::Favorites, "Favorites"),
+            (SidebarFilter::Logins, "Logins"),
+            (SidebarFilter::Cards, "Cards"),
+            (SidebarFilter::SecureNotes, "Secure notes"),
+            (SidebarFilter::Folder("f1".into()), "Banking"),
+        ] {
+            assert_eq!(super::super::sidebar::scope_title(&filter, &folders, lists), want);
+        }
+    }
+
+    #[test]
+    fn searching_retitles_the_header_results() {
+        let items = [login("Ledgerline", "a"), login("Atlas", "b"), login("Ledger two", "c")];
+        let ctx = testing::ctx();
+        let (p, _) = List { title: "Work", search: "ledger", ..List::of(&items) }.draw(&ctx, 0.0, vec![]);
+        assert!(p.text(RESULTS_TITLE).is_some(), "searching titles the list Results");
+        assert!(p.text("Work").is_none(), "the scope's own name gives way to Results");
+        assert!(p.texts.iter().any(|(t, c, _)| t == "2" && *c == P.text_ghost), "Results counts the matches");
+    }
+
+    #[test]
+    fn rows_are_44_avatar_16_title_14_subtitle() {
+        let items = [login("Ledgerline", "a.novak@ledgerline.com"), login("Atlas", "b@atlas")];
+        let ctx = testing::ctx();
+        let (p, _) = List::of(&items).draw(&ctx, 0.0, vec![]);
+        let tiles = avatars(&p);
+        assert_eq!(tiles.len(), 2, "one 44pt avatar per row");
+        assert!((tiles[1].top() - tiles[0].top() - (ROW_TILE_HEIGHT + ROW_GAP)).abs() < 0.5, "pitch is row + 4");
+        assert_eq!(ROW_TILE_HEIGHT, 68.0, "padding 12 around the 44pt avatar");
+        let (_, title_ink, title) = p.text("Ledgerline").unwrap();
+        assert_eq!(*title_ink, P.ink);
+        let (_, sub_ink, sub) = p.text("a.novak@ledgerline.com").unwrap();
+        assert_eq!(*sub_ink, P.text_faint);
+        assert!(sub.top() > title.bottom() - 1.0, "the subtitle is under the title");
+        assert!((title.left() - (tiles[0].right() + 14.0)).abs() < 1.5, "a 14pt gap after the avatar");
+        // The type sizes, from the roles the row is set in.
+        assert_eq!((tokens::ROW_TITLE.size, tokens::SUBTITLE.size), (16.0, 14.0));
+    }
+
+    #[test]
+    fn the_selected_row_is_white_with_a_blue_ring() {
+        let items = [login("Ledgerline", "a"), login("Atlas", "b")];
+        let ctx = testing::ctx();
+        let (p, _) = List { selected: Some("Atlas"), ..List::of(&items) }.draw(&ctx, 0.0, vec![]);
+        let ringed: Vec<_> = p
+            .rects
+            .iter()
+            .filter(|r| r.fill == P.card && r.stroke.width == 2.0 && r.stroke.color == P.blue)
+            .collect();
+        assert_eq!(ringed.len(), 1, "exactly the selected row is white with the ring");
+        let row = ringed[0].rect;
+        assert_eq!(row.height(), ROW_TILE_HEIGHT);
+        assert_eq!(ringed[0].corner_radius, CornerRadius::same(14));
+        let (_, _, atlas) = p.text("Atlas").unwrap();
+        assert!(row.contains(atlas.center()), "the ring is on Atlas's row");
+        assert!(p.rects.iter().any(|r| r.blur_width > 0.0 && (r.rect.center().x - row.center().x).abs() < 0.5), "the lift's shadow");
+    }
+
+    #[test]
+    fn card_rows_wear_their_networks_tile_and_masked_last_four() {
+        let items = [card("Household card", "4111111111114821")];
+        let ctx = testing::ctx();
+        let (p, _) = List::of(&items).draw(&ctx, 0.0, vec![]);
+        let tile = avatars(&p)[0];
+        let visa = p.rects.iter().find(|r| r.rect == tile).unwrap();
+        assert_eq!(visa.fill, Color32::from_rgb(0x1a, 0x1f, 0x71), "Visa's own navy");
+        let (_, ink, label) = p.text("VISA").expect("the network's label on its tile");
+        assert_eq!(*ink, Color32::WHITE);
+        assert!(tile.contains(label.center()));
+        assert!(p.text("\u{2022}\u{2022}\u{2022}\u{2022} 4821").is_some(), "the masked last four");
+    }
+
+    #[test]
+    fn tags_follow_app_2fa_shared_order() {
+        let items = [with_totp(with_app(login("Ledgerline", "a.novak")))];
+        let ctx = testing::ctx();
+        let mut list = List::of(&items);
+        list.shared.insert("Ledgerline".into());
+        let (p, _) = list.draw(&ctx, 0.0, vec![]);
+        let x = |word: &str| p.texts.iter().find(|(t, _, _)| t == word).unwrap_or_else(|| panic!("no {word}")).2.left();
+        assert!(x("a.novak") < x("App") && x("App") < x("2FA") && x("2FA") < x("Shared"), "App, 2FA, Shared after the username");
+        assert_eq!(p.texts.iter().find(|(t, _, _)| t == "Shared").unwrap().1, Color32::WHITE);
+        // And none of them on a plain login.
+        let plain = [login("Atlas", "b")];
+        let (p, _) = List::of(&plain).draw(&testing::ctx(), 0.0, vec![]);
+        for word in ["App", "2FA", "Shared", VIEW_ONLY_CHIP] {
+            assert!(!p.texts.iter().any(|(t, _, _)| t == word), "a plain login wears {word}");
+        }
+    }
+
+    #[test]
+    fn nothing_matches_says_so_in_the_designs_words() {
+        let items = [login("Ledgerline", "a")];
+        let ctx = testing::ctx();
+        let (p, _) = List { search: "zzz", ..List::of(&items) }.draw(&ctx, 0.0, vec![]);
+        let (_, ink, _) = p.text("Nothing matches").expect("the title");
+        assert_eq!(*ink, P.ink);
+        let (_, sub, _) = p.text("Try a site, an app or a username").expect("the line under it");
+        assert_eq!(*sub, P.text_faint);
+    }
+
+    #[test]
+    fn the_offline_banner_offers_retry() {
+        let items = [login("Ledgerline", "a")];
+        let ctx = testing::ctx();
+        let (p, _) = List::of(&items).draw(&ctx, 0.0, vec![]);
+        assert!(p.text(OFFLINE_TITLE).is_none(), "online, no banner");
+
+        let offline = List { offline: true, ..List::of(&items) };
+        let (p, _) = offline.draw(&ctx, 0.1, vec![]);
+        assert_eq!(p.text("You're offline").expect("the banner").1, P.caution_ink);
+        assert!(p.text("Filling still works").is_some());
+        let retry = p.text("Retry").expect("Retry").2;
+        assert!(p.rects.iter().any(|r| r.fill == P.caution_wash && r.stroke.color == P.caution_edge), "the banner's wash");
+        let (_, action) = offline.draw(&ctx, 0.2, click_at(retry.center()));
+        assert!(matches!(action, ItemListAction::RetrySync), "Retry asks for a sync");
+    }
+
+    #[test]
+    fn rows_enter_with_a_stagger_once_per_list_and_then_go_quiet() {
+        let items: Vec<VaultItem> = (0..4).map(|i| login(&format!("Item {i}"), "u")).collect();
+        let ctx = testing::ctx();
+        // The first list is at rest: the splash was its entrance.
+        let (first, _) = List::of(&items).draw(&ctx, 0.0, vec![]);
+        let rest = avatars(&first);
+        let (settled, _) = List::of(&items).draw(&ctx, 0.05, vec![]);
+        assert_eq!(avatars(&settled), rest, "the window's first list does not move");
+
+        // A new scope is a new list: its rows rise and fade in, one after another.
+        let logins = || List { filter: SidebarFilter::Logins, ..List::of(&items) };
+        let (start, _) = logins().draw(&ctx, 1.0, vec![]);
+        let (moving, _) = logins().draw(&ctx, 1.1, vec![]);
+        let alpha = |p: &Painted, i: usize| p.rects.iter().find(|r| r.rect.size() == vec2(44.0, 44.0) && (r.rect.center().y - rest[i].center().y).abs() < 20.0).map_or(0, |r| r.fill.a()); // an invisible row is culled
+        assert!(alpha(&start, 0) < 255, "the first row starts faded");
+        assert!(alpha(&moving, 0) > alpha(&moving, 3), "row 3 is behind row 0: {} vs {}", alpha(&moving, 0), alpha(&moving, 3));
+        assert!(avatars(&moving)[0].top() > rest[0].top(), "rising from below");
+        assert_eq!(moving.repaint_delay, std::time::Duration::ZERO, "moving rows ask for the next frame");
+
+        // Then it stops, and stops asking.
+        let _ = logins().draw(&ctx, 2.0, vec![]);
+        let (done, _) = logins().draw(&ctx, 2.1, vec![]);
+        assert_eq!(avatars(&done), rest, "at rest where the rows belong");
+        assert!(done.repaint_delay > std::time::Duration::from_secs(1), "a settled list asks for nothing: {:?}", done.repaint_delay);
     }
 }

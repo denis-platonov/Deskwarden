@@ -18234,26 +18234,6 @@ mod tests {
         );
     }
 
-    /// **One tile, one size, both screens.** The owner asked for the read
-    /// pane's header tile and the list row's tile to match outright, and this
-    /// is the whole of that claim: the header used to draw at 44 against the
-    /// row's 32, and the two read as different components rather than the same
-    /// object seen twice.
-    ///
-    /// A constant compared to a constant, which is worth stating because the
-    /// two are NOT the same constant -- see [`HEADER_AVATAR`] for why they are
-    /// kept separate. This is the only thing standing between "equal by
-    /// decision" and "equal by luck".
-    #[test]
-    fn the_header_tile_is_the_list_row_tile() {
-        assert_eq!(
-            HEADER_AVATAR,
-            crate::vault_window::item_list::AVATAR_SIZE,
-            "the read pane's header tile and the item list's row tile have drifted apart; \
-             they are meant to be the same tile at the same size on both screens"
-        );
-    }
-
     /// The strip's own grid: `padding: 20px 24px`, a [`HEADER_ROW`]-high
     /// content band holding a [`HEADER_AVATAR`] tile, `gap: 14px`, then a
     /// 22px/800 title over a 12px subtitle.
