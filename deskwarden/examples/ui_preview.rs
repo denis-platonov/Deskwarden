@@ -662,6 +662,11 @@ enum Surface {
     ModalPalette,
     /// The Generator screen (spec C §1).
     ToolGenerator,
+    /// Settings as a screen (spec C §2), one shot per page worth seeing.
+    SettingsGeneral,
+    SettingsSecurity,
+    SettingsVault,
+    SettingsShortcuts,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -911,6 +916,10 @@ const ALL: &[Surface] = &[
     Surface::ModalNewItem,
     Surface::ModalPalette,
     Surface::ToolGenerator,
+    Surface::SettingsGeneral,
+    Surface::SettingsSecurity,
+    Surface::SettingsVault,
+    Surface::SettingsShortcuts,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -1009,6 +1018,10 @@ impl Surface {
             Surface::ModalNewItem => "modal_new_item",
             Surface::ModalPalette => "modal_palette",
             Surface::ToolGenerator => "tool_generator",
+            Surface::SettingsGeneral => "settings_general",
+            Surface::SettingsSecurity => "settings_security",
+            Surface::SettingsVault => "settings_vault",
+            Surface::SettingsShortcuts => "settings_shortcuts",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1188,7 +1201,11 @@ impl Surface {
             | Surface::VaultShellOffline
             | Surface::ModalNewItem
             | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
-            Surface::ToolGenerator => egui::vec2(1280.0 - 252.0, 820.0),
+            Surface::ToolGenerator
+            | Surface::SettingsGeneral
+            | Surface::SettingsSecurity
+            | Surface::SettingsVault
+            | Surface::SettingsShortcuts => egui::vec2(1280.0 - 252.0, 820.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1329,6 +1346,10 @@ fn main() -> eframe::Result {
             Surface::ModalNewItem,
             Surface::ModalPalette,
             Surface::ToolGenerator,
+            Surface::SettingsGeneral,
+            Surface::SettingsSecurity,
+            Surface::SettingsVault,
+            Surface::SettingsShortcuts,
         ]
     } else if list {
         vec![Surface::VaultList]
@@ -1804,6 +1825,20 @@ impl eframe::App for Preview {
             Surface::ToolGenerator => {
                 let mut state = deskwarden::vault_window::generator_screen::GeneratorScreen::new(Default::default());
                 let _ = deskwarden::vault_window::generator_screen::draw(root, &mut state);
+            }
+            Surface::SettingsGeneral
+            | Surface::SettingsSecurity
+            | Surface::SettingsVault
+            | Surface::SettingsShortcuts => {
+                use deskwarden::prefs_ui::settings_v2::{draw, Page};
+                let mut page = match self.current() {
+                    Surface::SettingsSecurity => Page::Security,
+                    Surface::SettingsVault => Page::Vault,
+                    Surface::SettingsShortcuts => Page::Shortcuts,
+                    _ => Page::General,
+                };
+                let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
+                let _ = draw(root, &mut state, &mut page);
             }
             Surface::ModalNewItem => {
                 self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
@@ -2811,7 +2846,7 @@ impl Preview {
                         sidebar::VaultLists { health_findings: 4, ..sidebar::VaultLists::live_only(&fixtures.list) },
                         &fixtures.rail_folders,
                         selected,
-                        sidebar::Screens { sends, health, received, generator: &mut false, scope },
+                        sidebar::Screens { sends, health, received, generator: &mut false, settings: &mut false, scope },
                         "Locks in 11:42",
                         false,
                     );
@@ -2864,7 +2899,7 @@ impl Preview {
                     },
                     &fixtures.rail_folders,
                     selected,
-                    sidebar::Screens { sends, health, received, generator: &mut false, scope },
+                    sidebar::Screens { sends, health, received, generator: &mut false, settings: &mut false, scope },
                     "Locks in 11:42",
                     false,
                 );

@@ -881,6 +881,8 @@ pub struct Screens<'a> {
     pub received: &'a mut bool,
     /// Slice 6: the Generator screen.
     pub generator: &'a mut bool,
+    /// Slice 7: the Settings screen.
+    pub settings: &'a mut bool,
     /// Which SHARING sub-row is in force, meaningful only while `sends` is
     /// true. See [`SendScope`].
     pub scope: &'a mut SendScope,
@@ -896,13 +898,15 @@ pub enum Screen {
     Received,
     /// Slice 6: the Generator screen.
     Generator,
+    /// Slice 7: the Settings screen.
+    Settings,
 }
 
 impl Screens<'_> {
     /// Whether any screen is up -- i.e. whether `selected` is currently
     /// describing a row the user is NOT looking at.
     pub fn any(&self) -> bool {
-        *self.sends || *self.health || *self.received || *self.generator
+        *self.sends || *self.health || *self.received || *self.generator || *self.settings
     }
 
     /// Whether this particular screen is the one that is up.
@@ -912,6 +916,7 @@ impl Screens<'_> {
             Screen::Health => *self.health,
             Screen::Received => *self.received,
             Screen::Generator => *self.generator,
+            Screen::Settings => *self.settings,
         }
     }
 
@@ -946,6 +951,7 @@ impl Screens<'_> {
         *self.health = false;
         *self.received = false;
         *self.generator = false;
+        *self.settings = false;
         // See the type's docs: the scope belongs to the Sends screen, so
         // leaving that screen by ANY door puts it back.
         *self.scope = SendScope::All;
@@ -960,6 +966,7 @@ impl Screens<'_> {
             Screen::Health => *self.health = true,
             Screen::Received => *self.received = true,
             Screen::Generator => *self.generator = true,
+            Screen::Settings => *self.settings = true,
         }
     }
 
@@ -1725,7 +1732,8 @@ fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_
         }
     }
     let width = ui.available_width();
-    let settings = sidebar_row(ui, glyph::SETTINGS, SETTINGS_ROW_LABEL, None, false, width, 0.0, ROW_HEIGHT)
+    let settings_on = screens.is(Screen::Settings);
+    let settings = sidebar_row(ui, glyph::SETTINGS, SETTINGS_ROW_LABEL, None, settings_on, width, 0.0, ROW_HEIGHT)
         .clicked();
     ui.spacing_mut().item_spacing.y = 0.0;
     settings
@@ -2216,6 +2224,7 @@ mod drag_and_drop_tests {
                                     health: &mut false,
                                     received: &mut false,
                                     generator: &mut false,
+                                    settings: &mut false,
                                     scope: &mut SendScope::All,
                                 },
                                 "Locks in 11:42",
@@ -2452,6 +2461,7 @@ mod drag_and_drop_tests {
                                     health,
                                     received: &mut false,
                                     generator: &mut false,
+                                    settings: &mut false,
                                     scope: &mut SendScope::All,
                                 },
                                 countdown,
@@ -2629,6 +2639,7 @@ mod drag_and_drop_tests {
                                     health: &mut false,
                                     received: &mut false,
                                     generator: &mut false,
+                                    settings: &mut false,
                                     scope: &mut SendScope::All,
                                 },
                                 "Locks in 11:42",
@@ -3300,6 +3311,7 @@ mod tests {
                     health: &mut health_selected,
                     received: &mut false,
                     generator: &mut false,
+                    settings: &mut false,
                     scope: &mut SendScope::All,
                 },
                 lock_countdown,
@@ -3970,6 +3982,7 @@ mod tests {
                             health: &mut health,
                             received: &mut false,
                             generator: &mut false,
+                            settings: &mut false,
                             scope: &mut SendScope::All,
                         },
                     "Locks in 11:42",
@@ -4098,6 +4111,7 @@ mod tests {
                     health: &mut health_selected,
                     received: &mut false,
                     generator: &mut false,
+                    settings: &mut false,
                     scope: &mut SendScope::All,
                 },
                     "Locks in 11:42",
@@ -4302,6 +4316,7 @@ mod tests {
                             health: &mut health,
                             received: &mut false,
                             generator: &mut false,
+                            settings: &mut false,
                             scope: &mut SendScope::All,
                         },
                             "Locks in 11:42",
@@ -4466,6 +4481,7 @@ mod tests {
                             health: &mut health,
                             received: &mut false,
                             generator: &mut false,
+                            settings: &mut false,
                             scope: &mut SendScope::All,
                         },
                             COUNTDOWN,
@@ -5171,6 +5187,7 @@ mod v2_rail_tests {
                                 health: &mut self.health,
                                 received: &mut self.received,
                                 generator: &mut false,
+                                settings: &mut false,
                                 scope: &mut self.scope,
                             },
                             countdown,

@@ -14010,7 +14010,7 @@ mod source_pins {
     #[test]
     fn the_item_list_is_drawn_only_inside_the_not_sends_gate() {
         let production = production();
-        let gate = concat!("        if !show_", "sends && !on_health && !editing && !generator_selected {\r\n");
+        let gate = concat!("        if !show_", "sends && !on_health && !editing && !generator_selected && !settings_selected {\r\n");
         assert_eq!(
             production.matches(gate).count(),
             1,
@@ -15108,8 +15108,11 @@ mod frame_promptness {
     // "the shortcut it answers" -- leaving a permanently red test that was
     // about a sentence rather than about the modal it exists to detect.
     // Sourced from `Section::subtitle`, the drift cannot happen again.
-    fn prefs_modal_only() -> &'static str {
-        crate::prefs_ui::Section::General.subtitle()
+    //
+    // Slice 7: Settings is a screen now, so this is the v2 General page's
+    // subtitle (and the old modal's subtitle is no longer on screen at all).
+    fn prefs_modal_only() -> String {
+        crate::prefs_ui::settings_v2::Page::General.subtitle().expect("General has a subtitle")
     }
     /// The one Send [`counted_send_list`] hands back, and the Sends screen's
     /// second positive control: a row with this name on it can only have been
@@ -16092,18 +16095,18 @@ mod frame_promptness {
     ///    than open the modal and this scenario is not measuring an overlay
     ///    at all.
     #[test]
-    fn the_preferences_modal_returns_promptly() {
+    fn the_settings_screen_returns_promptly() {
         let outcome = measured("prefs", Scenario { press_prefs: true, ..Scenario::new() });
         assert_the_body_was_entered("prefs", &outcome);
         outcome.expect_painted(
-            prefs_modal_only(),
-            "the tune mark was pressed and the preferences modal is not on screen, so the \
-             block at the end of the closure never ran",
+            &prefs_modal_only(),
+            "the Settings row was pressed and the Settings screen is not on screen, so the \
+             block that draws it never ran",
         );
         assert!(
-            outcome.list_drew,
-            "the preferences modal is up and the vault window behind it is gone, so this is \
-             not the overlay this test is about"
+            !outcome.list_drew,
+            "the Settings screen is up and the item list is still drawn beside it, so this is \
+             not the screen-in-place-of-the-list this test is about"
         );
     }
 
