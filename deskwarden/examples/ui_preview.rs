@@ -677,6 +677,8 @@ enum Surface {
     ModalForget,
     /// The Add 2FA modal while the screen is being read.
     ModalTotpScanning,
+    /// The Add 2FA modal asking which camera to use.
+    ModalTotpCameras,
     /// The Import wizard's four steps over the shell (spec B §3).
     ModalImportSource,
     ModalImportFile,
@@ -956,6 +958,7 @@ const ALL: &[Surface] = &[
     Surface::ModalEmptyTrash,
     Surface::ModalForget,
     Surface::ModalTotpScanning,
+    Surface::ModalTotpCameras,
     Surface::ModalImportSource,
     Surface::ModalImportFile,
     Surface::ModalImportProgress,
@@ -1075,6 +1078,7 @@ impl Surface {
             Surface::ModalEmptyTrash => "modal_empty_trash",
             Surface::ModalForget => "modal_forget",
             Surface::ModalTotpScanning => "totp_add_scanning",
+            Surface::ModalTotpCameras => "totp_add_cameras",
             Surface::ModalImportSource => "modal_import_source",
             Surface::ModalImportFile => "modal_import_file",
             Surface::ModalImportProgress => "modal_import_progress",
@@ -1285,6 +1289,7 @@ impl Surface {
             | Surface::ModalEmptyTrash
             | Surface::ModalForget
             | Surface::ModalTotpScanning
+            | Surface::ModalTotpCameras
             | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
             Surface::ToolGenerator
             | Surface::SettingsGeneral
@@ -1442,6 +1447,7 @@ fn main() -> eframe::Result {
             Surface::ModalEmptyTrash,
             Surface::ModalForget,
             Surface::ModalTotpScanning,
+            Surface::ModalTotpCameras,
             Surface::ModalImportSource,
             Surface::ModalImportFile,
             Surface::ModalImportProgress,
@@ -2009,7 +2015,8 @@ impl eframe::App for Preview {
             | Surface::ModalIcon
             | Surface::ModalEmptyTrash
             | Surface::ModalForget
-            | Surface::ModalTotpScanning) => {
+            | Surface::ModalTotpScanning
+            | Surface::ModalTotpCameras) => {
                 use deskwarden::vault_window::{delete_modal, folder_modal, icon_modal, record_ui, trash_modal};
                 self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
@@ -2033,6 +2040,19 @@ impl eframe::App for Preview {
                     Surface::ModalForget => {
                         let names = vec!["Ledgerline".to_string(), "Northwind Mail".to_string()];
                         let _ = record_ui::draw_forget_confirm(&ctx, "anna@northwind.example", &names);
+                    }
+                    Surface::ModalTotpCameras => {
+                        let mut state = TotpAdd::opening("1", "Ledgerline", false);
+                        state.stage = totp_add::Stage::Webcam;
+                        let camera = |name: &str| deskwarden::webcam::Device { name: name.into(), id: name.into() };
+                        state.webcam = Some(totp_add::WebcamStage {
+                            devices: vec![camera("Integrated Camera"), camera("Logitech BRIO")],
+                            chosen: None,
+                            session: None,
+                            size: None,
+                            texture: None,
+                        });
+                        let _ = totp_add::draw_add_modal(&ctx, &mut state, PREVIEW_UNIX);
                     }
                     _ => {
                         let mut state = TotpAdd::opening("1", "Ledgerline", false);
