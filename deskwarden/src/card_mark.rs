@@ -582,6 +582,13 @@ fn size_px(size: egui::Vec2, pixels_per_point: f32) -> [usize; 2] {
     [axis(size.x), axis(size.y)]
 }
 
+/// Whether the user has supplied a picture for `brand` that will be drawn (the
+/// preference is on and a usable file is in a `brand-marks` folder). The card
+/// face asks, so that their image wins over the bundled mark.
+pub fn has_logo(ui: &egui::Ui, brand: CardBrand) -> bool {
+    logo(ui, brand).is_some()
+}
+
 /// How wide the mark for `brand` is when drawn `height` tall.
 ///
 /// Measured off the same galley -- or, when there is one, the same logo --

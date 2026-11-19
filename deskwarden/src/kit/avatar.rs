@@ -1,11 +1,12 @@
 //! Item avatars in the v2 design (spec part A section 3.2): a brand tile for
 //! a card, a favicon on white, or initials on a colour.
 
+use super::logos::{self, Label, Mark, Net};
 use crate::card_brand::CardBrand;
 use crate::theme::{BOLD, EXTRABOLD};
 use eframe::egui::{
-    self, epaint::RectShape, pos2, Align2, Color32, CornerRadius, FontFamily, FontId, Painter, Rect, Stroke,
-    StrokeKind, TextureHandle, Vec2,
+    epaint::RectShape, pos2, Align2, Color32, CornerRadius, FontFamily, FontId, Painter, Rect, Stroke,
+    StrokeKind, TextureHandle, Vec2, vec2,
 };
 
 /// What an avatar tile shows.
@@ -15,8 +16,10 @@ pub enum Look {
     Initials { text: String, bg: Color32, fg: Color32 },
     /// A site's favicon, on white.
     Favicon(TextureHandle),
-    /// A card network's tile: its short label in white on its colour.
-    Brand { label: String, bg: Color32, italic: bool },
+    /// A network's or bank's tile (design 1e): its mark in white on its colour,
+    /// or its short label when it has no bundled mark. A bank's tile carries
+    /// the card's network as a small chip over its bottom-right corner.
+    Brand { mark: Mark, chip: Option<Net> },
 }
 
 const fn rgb(hex: u32) -> Color32 {
@@ -70,26 +73,34 @@ pub fn paint(painter: &Painter, rect: Rect, look: &Look, radius: u8) {
                     .with_texture(texture.id(), Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0))),
             );
         }
-        Look::Brand { label, bg, italic } => {
-            painter.add(RectShape::filled(rect, corner, *bg));
-            let size = at(h, 13.0, 19.0);
-            let mut job = egui::text::LayoutJob::default();
-            job.append(
-                label,
-                0.0,
-                egui::TextFormat {
-                    font_id: FontId::new(size, FontFamily::Name(EXTRABOLD.into())),
-                    color: Color32::WHITE,
-                    italics: *italic,
-                    extra_letter_spacing: size * 0.02,
-                    ..Default::default()
-                },
-            );
-            let galley = painter.layout_job(job);
-            let at = rect.center() - galley.size() / 2.0;
-            painter.galley(at, galley, Color32::WHITE);
+        Look::Brand { mark, chip } => {
+            painter.add(RectShape::filled(rect, corner, mark.colour()));
+            // The design's slots (spec D 4.6): the list tile's mark box is
+            // 36 x 14 and the detail's 57 x 22, never wider than 86% of the tile.
+            let image = vec2(at(h, 36.0, 57.0).min(h * 0.86), at(h, 14.0, 22.0));
+            logos::paint(painter, rect.center(), image, at(h, 13.0, 19.0), *mark, Label::Short);
+            if let Some(net) = chip {
+                paint_chip(painter, rect, *net);
+            }
         }
     }
+}
+
+/// The network chip over a bank tile's bottom-right corner: 30 x 20 with a
+/// white 2 border in the list, 42 x 28 with a 3 border in the detail header.
+fn paint_chip(painter: &Painter, tile: Rect, net: Net) {
+    let h = tile.height();
+    let detail = h >= 60.0;
+    let (size, radius, border, ring, out, mark_box, text) = if detail {
+        (vec2(42.0, 28.0), 8u8, 3.0, rgb(0xf5f4f2), vec2(9.0, 7.0), vec2(34.0, 13.0), 9.0)
+    } else {
+        (vec2(30.0, 20.0), 6u8, 2.0, Color32::WHITE, vec2(7.0, 6.0), vec2(26.0, 10.0), 7.0)
+    };
+    let chip = Rect::from_min_size(tile.right_bottom() + out - size, size);
+    painter.add(RectShape::filled(chip, CornerRadius::same(radius), ring));
+    let inner = chip.shrink(border);
+    painter.add(RectShape::filled(inner, CornerRadius::same(radius.saturating_sub(border as u8)), net.colour()));
+    logos::paint(painter, inner.center(), mark_box.min(inner.size()), text, Mark::Net(net), Label::Short);
 }
 
 /// The palette pair for an item named `name`: an FNV-1a hash of its bytes,
@@ -106,25 +117,14 @@ pub fn initials_colours(name: &str) -> (Color32, Color32) {
 /// A card network's tile (spec 3.2): short label, colour, and whether the
 /// label is set italic. [`CardBrand::Other`] names no network and has none.
 pub fn network(brand: CardBrand) -> Option<(&'static str, Color32, bool)> {
-    Some(match brand {
-        CardBrand::Visa => ("VISA", rgb(0x1a1f71), true),
-        CardBrand::Mastercard => ("MC", rgb(0x201e1d), false),
-        CardBrand::AmericanExpress => ("AMEX", rgb(0x2e77bc), false),
-        CardBrand::Discover => ("DISC", rgb(0xe65c1f), false),
-        CardBrand::DinersClub => ("DC", rgb(0x0079be), false),
-        CardBrand::Jcb => ("JCB", rgb(0x0b4ea2), false),
-        CardBrand::Maestro => ("MAE", rgb(0x0a3a82), false),
-        CardBrand::UnionPay => ("UP", rgb(0xd7001f), false),
-        // Not in the design's table: RuPay's own navy, in the same style.
-        CardBrand::RuPay => ("RUPAY", rgb(0x0f3c7b), false),
-        CardBrand::Other => return None,
-    })
+    Net::from_brand(brand).map(|n| (n.short(), n.colour(), n.italic()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::card_brand::CardBrand;
+    use crate::kit::logos::{Bank, Mark, Net};
     use crate::kit::testing::{self, Painted};
     use eframe::egui::{self, pos2, vec2, Color32, Rect};
 
@@ -156,10 +156,44 @@ mod tests {
         assert_eq!((label, bg, italic), ("VISA", rgb(0x1a1f71), true));
         assert_eq!(network(CardBrand::AmericanExpress).unwrap().1, rgb(0x2e77bc));
         assert!(network(CardBrand::Other).is_none());
-        let look = Look::Brand { label: label.into(), bg, italic };
+        // Mir has no bundled glyph, so its tile is its label.
+        let look = Look::Brand { mark: Mark::Net(Net::Mir), chip: None };
         let (p, rect) = painted(&look, 44.0);
-        assert!(p.rects.iter().any(|r| r.rect == rect && r.fill == bg));
-        assert_eq!(p.text("VISA").unwrap().1, Color32::WHITE);
+        assert!(p.rects.iter().any(|r| r.rect == rect && r.fill == rgb(0x0f754e)));
+        assert_eq!(p.text("MIR").unwrap().1, Color32::WHITE);
+    }
+
+    #[test]
+    fn a_network_with_a_glyph_draws_it_inside_the_tile_and_no_label() {
+        let look = Look::Brand { mark: Mark::Net(Net::Visa), chip: None };
+        let (p, rect) = painted(&look, 44.0);
+        assert!(p.rects.iter().any(|r| r.rect == rect && r.fill == rgb(0x1a1f71)));
+        assert!(p.text("VISA").is_none());
+        let glyph = p.rects.iter().find(|r| r.rect != rect && rect.contains_rect(r.rect)).expect("the glyph");
+        assert!(glyph.rect.width() <= 36.0 + 0.01 && glyph.rect.height() <= 14.0 + 0.01);
+    }
+
+    #[test]
+    fn a_bank_tile_carries_the_network_chip_over_its_corner_and_a_lone_network_does_not() {
+        let with = Look::Brand { mark: Mark::Bank(Bank::Chase), chip: Some(Net::Visa) };
+        let (p, rect) = painted(&with, 44.0);
+        assert!(p.rects.iter().any(|r| r.rect == rect && r.fill == rgb(0x117aca)));
+        let ring = p.rects.iter().find(|r| r.rect.size() == vec2(30.0, 20.0)).expect("the chip");
+        assert_eq!(ring.fill, Color32::WHITE);
+        assert_eq!(ring.rect.max, rect.right_bottom() + vec2(7.0, 6.0));
+        assert!(p.rects.iter().any(|r| r.rect == ring.rect.shrink(2.0) && r.fill == rgb(0x1a1f71)));
+        let without = Look::Brand { mark: Mark::Bank(Bank::Chase), chip: None };
+        let (p, _) = painted(&without, 44.0);
+        assert!(p.rects.iter().all(|r| r.rect.size() != vec2(30.0, 20.0)));
+    }
+
+    #[test]
+    fn the_detail_tile_draws_the_larger_chip_on_the_panes_ground() {
+        let look = Look::Brand { mark: Mark::Bank(Bank::Revolut), chip: Some(Net::Mastercard) };
+        let (p, rect) = painted(&look, 72.0);
+        let ring = p.rects.iter().find(|r| r.rect.size() == vec2(42.0, 28.0)).expect("the chip");
+        assert_eq!(ring.fill, rgb(0xf5f4f2));
+        assert_eq!(ring.rect.max, rect.right_bottom() + vec2(9.0, 7.0));
     }
 
     #[test]

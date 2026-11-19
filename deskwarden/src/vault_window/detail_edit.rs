@@ -7962,6 +7962,27 @@ fn field_with_remove(ui: &mut egui::Ui, field: impl FnOnce(&mut egui::Ui, f32)) 
 /// `Show`, at the row's own type size.
 const CARD_NUMBER_FLOOR: f32 = 180.0;
 
+/// The live network badge's size beside the card-number box (design 1e).
+pub(crate) const NUMBER_BADGE: egui::Vec2 = egui::vec2(38.0, 24.0);
+
+/// The network to badge while the number is typed: what the digits name
+/// (Mir included, which no Bitwarden brand does), else what the brand box
+/// holds. Nothing for no digits and no brand.
+pub(crate) fn live_network(card: &CardDraft) -> Option<crate::kit::logos::Net> {
+    use crate::kit::logos::Net;
+    Net::for_number(&card.number).or_else(|| {
+        crate::card_brand::CardBrand::from_canonical(card.brand.trim()).and_then(Net::from_brand)
+    })
+}
+
+/// Draws the live badge: the network's mark in white on its colour.
+fn number_badge(ui: &mut egui::Ui, net: crate::kit::logos::Net) {
+    use crate::kit::logos::{paint, Label, Mark};
+    let (rect, _) = ui.allocate_exact_size(NUMBER_BADGE, egui::Sense::hover());
+    ui.painter().rect_filled(rect, egui::CornerRadius::same(7), net.colour());
+    paint(ui.painter(), rect.center(), egui::vec2(30.0, 11.0), 11.0, Mark::Net(net), Label::Short);
+}
+
 /// The card's brand chooser, at its own width, **in front of the number** on
 /// the Card row. Answers with the width it took, so the number box can take
 /// the rest.
@@ -12568,6 +12589,13 @@ pub fn draw_detail_edit(
                             if offers_clear { &[SLOT_REMOVE_BUTTON] } else { &[] };
                         row_with_buttons(ui, buttons, |ui, room| {
                             let brand = brand_combo(ui, card);
+                            // Design 1e: the network the digits so far (else
+                            // the chosen brand) name, as a live badge.
+                            let live = live_network(card);
+                            let badge = live.map_or(0.0, |_| NUMBER_BADGE.x + theme::ROW_BUTTON_GAP);
+                            if let Some(net) = live {
+                                number_badge(ui, net);
+                            }
                             // The number takes what is LEFT of the row's
                             // field room once the chooser is on it -- or,
                             // when that is too narrow to type a card number
@@ -12576,7 +12604,7 @@ pub fn draw_detail_edit(
                             // on the same line: that wrapped the number short
                             // and left its Remove stopping well inside the
                             // right edge every other row's button ends at.
-                            let beside = room - brand - theme::ROW_BUTTON_GAP;
+                            let beside = room - brand - theme::ROW_BUTTON_GAP - badge;
                             let number_room = if beside >= CARD_NUMBER_FLOOR {
                                 beside
                             } else {
@@ -13934,6 +13962,42 @@ const DISCARD_CONFIRM: &str = "Discard changes";
 
 #[cfg(test)]
 mod tests {
+    // ---- design 1e: the live network badge beside the card number -------
+
+    #[test]
+    fn the_live_badge_follows_the_digits_then_the_chosen_brand() {
+        use crate::kit::logos::Net;
+        let mut card = CardDraft::default();
+        assert_eq!(live_network(&card), None);
+        card.number = "4".into();
+        assert_eq!(live_network(&card), Some(Net::Visa));
+        card.number = "2200 12".into();
+        assert_eq!(live_network(&card), Some(Net::Mir));
+        card.number = "5412".into();
+        assert_eq!(live_network(&card), Some(Net::Mastercard));
+        card.number.clear();
+        card.pick_brand("Amex");
+        assert_eq!(live_network(&card), Some(Net::Amex));
+        card.pick_brand("Other");
+        assert_eq!(live_network(&card), None);
+    }
+
+    #[test]
+    fn the_live_badge_paints_the_networks_colour_and_a_mark() {
+        use crate::kit::logos::Net;
+        let ctx = crate::kit::testing::ctx();
+        let p = crate::kit::testing::frame(&ctx, 0.0, egui::vec2(300.0, 100.0), vec![], |ui| {
+            number_badge(ui, Net::Mir);
+            number_badge(ui, Net::Visa);
+        });
+        let tiles: Vec<_> = p.rects.iter().filter(|r| r.rect.size() == NUMBER_BADGE).collect();
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(tiles[0].fill, Net::Mir.colour());
+        assert_eq!(tiles[1].fill, Net::Visa.colour());
+        assert!(p.text("MIR").is_some(), "no bundled Mir mark, so its label");
+        assert!(p.text("VISA").is_none(), "Visa has a mark");
+    }
+
     use super::*;
 
     fn item() -> VaultItem {
