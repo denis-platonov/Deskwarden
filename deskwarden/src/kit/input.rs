@@ -140,7 +140,7 @@ pub fn secret(
             .password(!*revealed)
             .frame(egui::Frame::NONE)
             .font(FontId::proportional(look.font_px))
-            .hint_text(placeholder)
+            .hint_text(egui::RichText::new(placeholder).font(FontId::proportional(look.font_px)))
             .desired_width(inner.width())
             .vertical_align(egui::Align::Center),
     );

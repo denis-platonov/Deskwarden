@@ -523,9 +523,7 @@ pub fn draw(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
 
 /// The two steps, in the sign-in split screen's form column.
 fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
-    use crate::kit::auth::{self, FORM_GAP, LABEL_GAP};
-    use crate::kit::controls::ButtonKind;
-    use crate::kit::input;
+    use crate::kit::auth::{self, FIELD_LABEL_GAP, FORM_GAP};
     let mut asked = None;
     let width = ui.available_width();
     ui.spacing_mut().item_spacing.y = 0.0;
@@ -536,52 +534,54 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
     // Whether the secret field shows what is typed: per window, not stored.
     let reveal_id = egui::Id::new("auth-api-key-reveal");
     let mut revealed = ui.data(|d| d.get_temp::<bool>(reveal_id)).unwrap_or(false);
+    let bad = form.error.is_some();
+
+    // The stage's head, in the sign-in gallery's measure: the title 30, its line
+    // 16 under it, 18 before the fields.
+    let (title, hint) = match form.step {
+        ApiKeyStep::KeyPair => (KEY_PAIR_TITLE, KEY_PAIR_HINT),
+        ApiKeyStep::MasterPassword => (PASSWORD_TITLE, PASSWORD_HINT),
+    };
+    auth::stage_title(ui, title);
+    ui.add_space(6.0);
+    auth::subtitle(ui, hint);
+    ui.add_space(FORM_GAP);
 
     match form.step {
         ApiKeyStep::KeyPair => {
-            auth::title(ui, KEY_PAIR_TITLE);
-            ui.add_space(12.0);
-            auth::explain(ui, KEY_PAIR_HINT);
-            ui.add_space(FORM_GAP);
-
             auth::label(ui, CLIENT_ID_LABEL);
-            ui.add_space(LABEL_GAP);
+            ui.add_space(FIELD_LABEL_GAP);
             ui.add_enabled_ui(!form.busy, |ui| {
-                input::text(ui, egui::Id::new("auth-api-client-id"), &mut form.client_id, "", false, width);
+                auth::field_text(ui, egui::Id::new("auth-api-client-id"), &mut form.client_id, "", width, bad, None);
             });
             ui.add_space(FORM_GAP);
 
             auth::label(ui, CLIENT_SECRET_LABEL);
-            ui.add_space(LABEL_GAP);
+            ui.add_space(FIELD_LABEL_GAP);
             ui.add_enabled_ui(!form.busy, |ui| {
-                input::secret(
+                auth::field_secret(
                     ui,
                     egui::Id::new("auth-api-client-secret"),
                     &mut form.secret,
                     &mut revealed,
                     "",
                     width,
-                    input::SIGN_IN,
+                    bad,
                 );
             });
         }
         ApiKeyStep::MasterPassword => {
-            auth::title(ui, PASSWORD_TITLE);
-            ui.add_space(12.0);
-            auth::explain(ui, PASSWORD_HINT);
-            ui.add_space(FORM_GAP);
-
             auth::label(ui, PASSWORD_LABEL);
-            ui.add_space(LABEL_GAP);
+            ui.add_space(FIELD_LABEL_GAP);
             ui.add_enabled_ui(!form.busy, |ui| {
-                input::secret(
+                auth::field_secret(
                     ui,
                     egui::Id::new("auth-api-master-password"),
                     &mut form.password,
                     &mut revealed,
                     "",
                     width,
-                    input::SIGN_IN,
+                    bad,
                 );
             });
         }
@@ -589,21 +589,18 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
     ui.data_mut(|d| d.insert_temp(reveal_id, revealed));
 
     if let Some(error) = form.error.as_deref() {
-        ui.add_space(FORM_GAP);
-        auth::error_line(ui, error);
+        ui.add_space(FIELD_LABEL_GAP);
+        auth::field_error(ui, error);
     }
 
     ui.add_space(FORM_GAP);
-    let go = ui
-        .add_enabled_ui(!form.busy && ready, |ui| {
-            auth::wide_button(ui, ButtonKind::Primary, 56.0, 16, 17.0, CONTINUE_LABEL, None, width)
-        })
-        .inner;
-    if go.clicked() {
+    let label = if form.busy { crate::login_ui::CHECKING_LABEL } else { CONTINUE_LABEL };
+    let go = auth::submit_button(ui, label, form.busy, width);
+    if go.clicked() && !form.busy && ready {
         asked = Some(ApiKeyAction::Submit);
     }
-    ui.add_space(12.0);
-    if auth::wide_button(ui, ButtonKind::Outline, 52.0, 14, 16.0, BACK_LABEL, None, width).clicked() {
+    ui.add_space(FORM_GAP);
+    if auth::link_big(ui, BACK_LABEL).clicked() {
         asked = Some(ApiKeyAction::Back);
     }
 

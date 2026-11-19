@@ -473,6 +473,369 @@ pub fn lock_quiet(ui: &mut Ui, text: &str) {
     ui.painter().galley(rect.min, g, p.blue_soft);
 }
 
+// ------------------------------------------------- the sign-in gallery's parts
+
+/// `circle-alert`: the mark in front of a field's error line.
+const ALERT_CIRCLE: &str = "M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20zM12 8v4M12 16h.01";
+/// A phone with its home dot, and with two lines on its screen (the code).
+pub const PHONE_CODE: &str = "M7 2h10a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2zM12 18h.01M9 7h6M9 11h6";
+/// `triangle-alert`: the server banner's mark.
+const TRIANGLE_ALERT: &str = "M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z";
+/// `lock`, with the rounded body the stage tiles use.
+pub const LOCK_TILE: &str = "M6 11h12a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-6a2 2 0 0 1 2-2zM8 11V7a4 4 0 0 1 8 0v4";
+/// The done stage's tick.
+const DONE_TICK: &str = "M5 12.5 10 17 19 7";
+
+/// Between a label and its field on the white half (spec gallery: gap 7).
+pub const FIELD_LABEL_GAP: f32 = 7.0;
+/// A field's border (the design's `1.5px`).
+const FIELD_EDGE: f32 = 1.5;
+/// How tall the in-button bar is, and how wide.
+const BUTTON_BAR: Vec2 = vec2(120.0, 3.0);
+
+/// The sub line under a form's title (16, grey).
+pub fn subtitle(ui: &mut Ui, text: &str) {
+    let p = palette(ui.ctx());
+    let role = Role { size: 16.0, face: theme::REGULAR, tracking_em: 0.0 };
+    let g = galley(ui.ctx(), role, text, p.text_faint, Some(ui.available_width()), Some(16.0 * 1.45));
+    let (rect, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+    ui.painter().galley(rect.min, g, p.text_faint);
+}
+
+/// The title of a stage that follows the form (2FA, too many tries, done):
+/// 30, extra bold.
+pub fn stage_title(ui: &mut Ui, text: &str) {
+    let p = palette(ui.ctx());
+    let role = Role { size: 30.0, face: EXTRABOLD, tracking_em: -0.03 };
+    let g = galley(ui.ctx(), role, text, p.ink, Some(ui.available_width()), None);
+    let (rect, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+    ui.painter().galley(rect.min, g, p.ink);
+}
+
+/// The wash an errored field sits on (the design's `#fff8f7`).
+fn error_wash(ctx: &egui::Context) -> Color32 {
+    if ctx.global_style().visuals.dark_mode {
+        palette(ctx).danger_wash
+    } else {
+        Color32::from_rgb(0xff, 0xf8, 0xf7)
+    }
+}
+
+/// A field's box: `1.5` border, red and washed while `error`, blue while it
+/// has the keyboard.
+fn field_box(ui: &Ui, rect: Rect, radius: u8, focused: bool, error: bool) {
+    let p = palette(ui.ctx());
+    let (edge, fill) = if error {
+        (p.error, error_wash(ui.ctx()))
+    } else if focused {
+        (p.blue, p.card)
+    } else {
+        (p.border, p.card)
+    };
+    ui.painter().rect(rect, CornerRadius::same(radius), fill, Stroke::new(FIELD_EDGE, edge), egui::StrokeKind::Inside);
+}
+
+/// A text field on the sign-in screen: 50 high, radius 14, `error` paints it
+/// red. `prefix` is the grey word in front of the typing (`https://`).
+pub fn field_text(
+    ui: &mut Ui,
+    id: egui::Id,
+    value: &mut String,
+    placeholder: &str,
+    width: f32,
+    error: bool,
+    prefix: Option<&str>,
+) -> egui::Response {
+    let p = palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 50.0), Sense::hover());
+    field_box(ui, rect, 14, ui.memory(|m| m.has_focus(id)), error);
+    let mut left = rect.left() + 16.0;
+    if let Some(prefix) = prefix {
+        let role = Role { size: 16.0, face: theme::REGULAR, tracking_em: 0.0 };
+        let g = galley(ui.ctx(), role, prefix, p.text_ghost, None, None);
+        let at = pos2(left, rect.center().y - g.size().y / 2.0);
+        left += g.size().x + 4.0;
+        ui.painter().galley(at, g, p.text_ghost);
+    }
+    let inner = Rect::from_min_max(pos2(left, rect.top()), pos2(rect.right() - 16.0, rect.bottom()));
+    let response = ui.put(
+        inner,
+        egui::TextEdit::singleline(value)
+            .id(id)
+            .frame(egui::Frame::NONE)
+            .font(egui::FontId::proportional(16.0))
+            .hint_text(egui::RichText::new(placeholder).font(egui::FontId::proportional(16.0)))
+            .desired_width(inner.width())
+            .vertical_align(egui::Align::Center),
+    );
+    ui.advance_cursor_after_rect(rect);
+    response
+}
+
+/// The sign-in screen's master-password field: [`field_text`] hidden unless
+/// `revealed`, with the eye (38 square, radius 11) at its right.
+pub fn field_secret(
+    ui: &mut Ui,
+    id: egui::Id,
+    value: &mut String,
+    revealed: &mut bool,
+    placeholder: &str,
+    width: f32,
+    error: bool,
+) -> egui::Response {
+    let p = palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 50.0), Sense::hover());
+    field_box(ui, rect, 14, ui.memory(|m| m.has_focus(id)), error);
+    let eye = Rect::from_center_size(pos2(rect.right() - 6.0 - 19.0, rect.center().y), Vec2::splat(38.0));
+    let eye_response = ui.interact(eye, id.with("eye"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if eye_response.hovered() {
+        ui.painter().rect_filled(eye, CornerRadius::same(11), p.hover);
+    }
+    let d = if *revealed { glyph::EYE_OFF } else { glyph::EYE };
+    icon::stroke(ui.painter(), Rect::from_center_size(eye.center(), Vec2::splat(19.0)), d, 2.0, p.text_muted);
+    crate::kit::tips::hint(ui, &eye_response, if *revealed { "Hide password" } else { "Show password" }, &[]);
+    if eye_response.clicked() {
+        *revealed = !*revealed;
+    }
+    let inner = Rect::from_min_max(pos2(rect.left() + 16.0, rect.top()), pos2(eye.left() - 6.0, rect.bottom()));
+    let response = ui.put(
+        inner,
+        egui::TextEdit::singleline(value)
+            .id(id)
+            .password(!*revealed)
+            .frame(egui::Frame::NONE)
+            .font(egui::FontId::proportional(16.0))
+            .hint_text(egui::RichText::new(placeholder).font(egui::FontId::proportional(16.0)))
+            .desired_width(inner.width())
+            .vertical_align(egui::Align::Center),
+    );
+    ui.advance_cursor_after_rect(rect);
+    response
+}
+
+/// The line under an errored field: the alert mark and the message in `ERROR`,
+/// 14 semibold, wrapped.
+pub fn field_error(ui: &mut Ui, text: &str) {
+    let p = palette(ui.ctx());
+    let role = Role { size: 14.0, face: SEMIBOLD, tracking_em: 0.0 };
+    let width = ui.available_width();
+    let g = galley(ui.ctx(), role, text, p.error, Some(width - 23.0), Some(14.0 * 1.4));
+    let (rect, _) = ui.allocate_exact_size(vec2(width, g.size().y.max(18.0)), Sense::hover());
+    icon::stroke(ui.painter(), Rect::from_min_size(pos2(rect.left(), rect.top() + 1.0), Vec2::splat(16.0)), ALERT_CIRCLE, 2.2, p.error);
+    ui.painter().galley(pos2(rect.left() + 23.0, rect.top()), g, p.error);
+}
+
+/// Which of the two banners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BannerTone {
+    /// Amber: "You're offline".
+    Caution,
+    /// Red: "Can't reach your server".
+    Danger,
+}
+
+/// The banner's background, its type and its button's ring.
+fn banner_colours(ctx: &egui::Context, tone: BannerTone) -> (Color32, Color32, Color32) {
+    let p = palette(ctx);
+    match (tone, ctx.global_style().visuals.dark_mode) {
+        (BannerTone::Caution, _) => (p.caution_wash, p.caution_mark, p.caution_edge),
+        (BannerTone::Danger, false) => (Color32::from_rgb(0xfd, 0xec, 0xea), Color32::from_rgb(0x8f, 0x1d, 0x13), Color32::from_rgb(0xf4, 0xc7, 0xc1)),
+        (BannerTone::Danger, true) => (p.danger_wash, p.error, p.danger_edge),
+    }
+}
+
+/// The banner above the form when the server could not be reached: mark,
+/// title, a line, and one button (`label`) on the right. True when the
+/// button was pressed.
+pub fn banner(ui: &mut Ui, tone: BannerTone, title: &str, text: &str, label: &str) -> bool {
+    let ctx = ui.ctx().clone();
+    let (bg, fg, ring) = banner_colours(&ctx, tone);
+    let width = ui.available_width();
+    let button_role = Role { size: 14.0, face: BOLD, tracking_em: 0.0 };
+    let button = galley(&ctx, button_role, label, fg, None, None);
+    let button_w = button.size().x + 28.0;
+    let copy_w = (width - 16.0 - 14.0 - 22.0 - 12.0 - 12.0 - button_w).max(40.0);
+    let head = galley(&ctx, Role { size: 15.0, face: EXTRABOLD, tracking_em: 0.0 }, title, fg, Some(copy_w), None);
+    let body = galley(&ctx, Role { size: 14.0, face: theme::REGULAR, tracking_em: 0.0 }, text, fg.gamma_multiply(0.9), Some(copy_w), Some(14.0 * 1.45));
+    let copy_h = head.size().y + 3.0 + body.size().y;
+    let height = copy_h.max(36.0) + 28.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(16), bg);
+    let mark = if tone == BannerTone::Caution { glyph::WIFI_OFF } else { TRIANGLE_ALERT };
+    icon::stroke(ui.painter(), Rect::from_min_size(pos2(rect.left() + 16.0, rect.top() + 15.0), Vec2::splat(22.0)), mark, 2.0, fg);
+    let copy_x = rect.left() + 16.0 + 22.0 + 12.0;
+    let copy_y = rect.center().y - copy_h / 2.0;
+    let head_h = head.size().y;
+    ui.painter().galley(pos2(copy_x, copy_y), head, fg);
+    ui.painter().galley(pos2(copy_x, copy_y + head_h + 3.0), body, fg);
+    let slot = Rect::from_min_size(pos2(rect.right() - 14.0 - button_w, rect.center().y - 18.0), vec2(button_w, 36.0));
+    let response = ui.interact(slot, ui.id().with(("auth-banner", label)), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    let face = if response.hovered() { Color32::from_rgb(0xfb, 0xfa, 0xf9) } else { Color32::WHITE };
+    ui.painter().rect(slot, CornerRadius::same(11), face, Stroke::new(1.0, ring), egui::StrokeKind::Inside);
+    ui.painter().galley(slot.center() - button.size() / 2.0, button, fg);
+    response.clicked()
+}
+
+/// A bar of `fraction` of `track`'s width sliding along it (`dw-line`).
+fn slide_bar(ui: &Ui, track: Rect, back: Color32, fore: Color32, fraction: f32) {
+    let radius = CornerRadius::same((track.height() / 2.0).ceil() as u8);
+    ui.painter().rect_filled(track, radius, back);
+    let bar = track.width() * fraction;
+    let t = ui.input(|i| i.time);
+    let rect = Rect::from_min_size(pos2(track.left() + motion::line(t) * bar, track.top()), vec2(bar, track.height())).intersect(track);
+    if rect.width() > 0.0 {
+        ui.painter().rect_filled(rect, radius, fore);
+    }
+    ui.ctx().request_repaint();
+}
+
+/// The sign-in screen's big blue button: 56 high, radius 16. While `busy` it
+/// reads `label` over a 120 by 3 bar and sits at 85%.
+pub fn submit_button(ui: &mut Ui, label: &str, busy: bool, width: f32) -> egui::Response {
+    let ctx = ui.ctx().clone();
+    let p = palette(&ctx);
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 56.0), Sense::click());
+    let radius = CornerRadius::same(16);
+    let alpha = if busy { 0.85 } else { 1.0 };
+    let hovered = response.hovered() && !busy;
+    let shadow = Shadow { offset: [0, 8], blur: 20, spread: 0, color: Color32::from_rgba_unmultiplied(27, 63, 160, 77) };
+    ui.painter().add(shadow.as_shape(rect, radius));
+    ui.painter().rect_filled(rect, radius, (if hovered { p.blue_deep } else { p.blue }).gamma_multiply(alpha));
+    let role = Role { size: 17.0, face: BOLD, tracking_em: 0.0 };
+    let g = galley(&ctx, role, label, Color32::WHITE, None, None);
+    if busy {
+        let block = g.size().y + 8.0 + BUTTON_BAR.y;
+        let top = rect.center().y - block / 2.0;
+        let label_h = g.size().y;
+        ui.painter().galley_with_override_text_color(pos2(rect.center().x - g.size().x / 2.0, top), g, Color32::WHITE.gamma_multiply(alpha));
+        let track = Rect::from_min_size(pos2(rect.center().x - BUTTON_BAR.x / 2.0, top + label_h + 8.0), BUTTON_BAR);
+        slide_bar(ui, track, Color32::from_white_alpha(56), Color32::WHITE, 0.3);
+    } else {
+        ui.painter().galley_with_override_text_color(rect.center() - g.size() / 2.0, g, Color32::WHITE);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A text link at the larger size the 2FA and device stages use (15).
+pub fn link_big(ui: &mut Ui, text: &str) -> egui::Response {
+    let ctx = ui.ctx().clone();
+    let p = palette(&ctx);
+    let role = Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 };
+    let g = galley(&ctx, role, text, p.blue, None, None);
+    let (rect, response) = ui.allocate_exact_size(g.size() + vec2(0.0, 8.0), Sense::click());
+    let colour = if response.hovered() { p.blue_deep } else { p.blue };
+    ui.painter().galley_with_override_text_color(pos2(rect.left(), rect.center().y - g.size().y / 2.0), g, colour);
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A row of [`link_big`]s, 22 apart. Returns the index of the one pressed.
+pub fn link_row(ui: &mut Ui, labels: &[&str]) -> Option<usize> {
+    let mut pressed = None;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 22.0;
+        for (i, label) in labels.iter().enumerate() {
+            if link_big(ui, label).clicked() {
+                pressed = Some(i);
+            }
+        }
+    });
+    pressed
+}
+
+/// The 56 square tile that heads a stage: `d` in blue on blue wash, or in red
+/// on a red wash when `danger`.
+pub fn stage_tile(ui: &mut Ui, d: &str, danger: bool) {
+    let p = palette(ui.ctx());
+    let (bg, fg) = if danger { (banner_colours(ui.ctx(), BannerTone::Danger).0, p.error) } else { (p.blue_wash, p.blue) };
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(16), bg);
+    icon::stroke(ui.painter(), Rect::from_center_size(rect.center(), Vec2::splat(28.0)), d, 2.0, fg);
+}
+
+/// The six boxes of a one-time code (64 high, radius 14, mono 26). `code`
+/// takes only digits, at most six; the box the next digit goes into is blue
+/// and an `error` paints all six red. One invisible text field lies over them
+/// so typing, pasting and an authenticator's autofill all land in `code`.
+pub fn code_boxes(ui: &mut Ui, id: egui::Id, code: &mut String, error: bool, width: f32, enabled: bool) -> egui::Response {
+    let p = palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(vec2(width, 64.0), Sense::hover());
+    let cell = (width - 8.0 * 5.0) / 6.0;
+    let digits: Vec<char> = code.chars().collect();
+    for i in 0..6 {
+        let slot = Rect::from_min_size(pos2(rect.left() + i as f32 * (cell + 8.0), rect.top()), vec2(cell, 64.0));
+        let next = enabled && i == digits.len();
+        let (edge, fill) = if error {
+            (p.error, error_wash(ui.ctx()))
+        } else if next {
+            (p.blue, p.card)
+        } else {
+            (p.border, p.card)
+        };
+        ui.painter().rect(slot, CornerRadius::same(14), fill, Stroke::new(FIELD_EDGE, edge), egui::StrokeKind::Inside);
+        if let Some(ch) = digits.get(i) {
+            let font = egui::FontId::new(26.0, egui::FontFamily::Monospace);
+            ui.painter().text(slot.center() + vec2(0.0, 2.0), egui::Align2::CENTER_CENTER, ch, font, p.ink);
+        }
+    }
+    // A child at the boxes' rectangle, so the field lies over them without
+    // taking room of its own.
+    let mut over = ui.new_child(UiBuilder::new().max_rect(rect));
+    let visuals = over.visuals_mut();
+    visuals.text_cursor.stroke = Stroke::NONE;
+    visuals.selection.bg_fill = Color32::TRANSPARENT;
+    visuals.selection.stroke = Stroke::NONE;
+    let response = over.add_enabled(
+        enabled,
+        egui::TextEdit::singleline(code)
+            .id(id)
+            .frame(egui::Frame::NONE)
+            .text_color(Color32::TRANSPARENT)
+            .desired_width(rect.width()),
+    );
+    code.retain(|c| c.is_ascii_digit());
+    if code.len() > 6 {
+        code.truncate(6);
+    }
+    response
+}
+
+/// The stage shown for the moment between a sign-in that worked and the
+/// window that follows it: a green ring with a tick, "You're in", and the bar.
+pub fn done_stage(ui: &mut Ui) {
+    let p = palette(ui.ctx());
+    ui.spacing_mut().item_spacing.y = 16.0;
+    let (ring, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
+    ui.painter().circle_filled(ring.center(), 32.0, p.done_wash);
+    icon::stroke(ui.painter(), Rect::from_center_size(ring.center(), Vec2::splat(30.0)), DONE_TICK, 2.6, p.done_ink);
+    stage_title(ui, "You're in");
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 14.0;
+        let (track, _) = ui.allocate_exact_size(BUTTON_BAR, Sense::hover());
+        slide_bar(ui, track, Color32::from_rgb(0xe3, 0xe8, 0xf6), p.blue, 0.3);
+        let role = Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 };
+        let g = galley(ui.ctx(), role, "Opening your vault", p.text_muted, None, None);
+        let (rect, _) = ui.allocate_exact_size(g.size(), Sense::hover());
+        ui.painter().galley(rect.min, g, p.text_muted);
+    });
+}
+
+/// The panel in the too-many-tries stage: a grey card with a `label` and the
+/// `value` beside it.
+pub fn wait_panel(ui: &mut Ui, label: &str, value: &str) {
+    let p = palette(ui.ctx());
+    let width = ui.available_width();
+    let l = galley(ui.ctx(), Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 }, label, p.text_muted, None, None);
+    let v = galley(ui.ctx(), Role { size: 24.0, face: EXTRABOLD, tracking_em: 0.0 }, value, p.ink, Some(width - 40.0 - l.size().x - 10.0), None);
+    let height = v.size().y + 36.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
+    ui.painter().rect_filled(rect, CornerRadius::same(16), p.window_bg);
+    let base = rect.bottom() - 18.0;
+    let label_x = rect.left() + 20.0;
+    let value_x = label_x + l.size().x + 10.0;
+    ui.painter().galley(pos2(label_x, base - l.size().y - 2.0), l, p.text_muted);
+    ui.painter().galley(pos2(value_x, base - v.size().y), v, p.ink);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -629,5 +992,147 @@ mod tests {
         let text = p.text("master password").expect("the message");
         assert_eq!(text.1, palette(&ctx).error);
         assert!(p.rects.iter().any(|r| r.fill == palette(&ctx).card && r.rect.contains_rect(text.2)));
+    }
+
+    // ---- the sign-in gallery's parts (slice 15a) ---------------------------
+
+    fn one(ctx: &egui::Context, time: f64, events: Vec<egui::Event>, add: impl FnMut(&mut Ui)) -> testing::Painted {
+        testing::frame(ctx, time, vec2(420.0, 600.0), events, add)
+    }
+
+    #[test]
+    fn a_field_error_is_the_error_colour_with_the_alert_mark_in_front() {
+        let ctx = testing::ctx();
+        let p = one(&ctx, 1.0, vec![], |ui| field_error(ui, "Enter your email."));
+        let text = p.text("Enter your email.").expect("the message");
+        assert_eq!(text.1, palette(&ctx).error);
+        assert!(text.2.left() >= 23.0, "the message starts after the 16 mark and its 7 gap");
+    }
+
+    #[test]
+    fn an_errored_field_is_red_on_a_wash_and_a_good_one_is_neither() {
+        let ctx = testing::ctx();
+        let mut value = String::new();
+        let bad = one(&ctx, 1.0, vec![], |ui| {
+            field_text(ui, egui::Id::new("f"), &mut value, "you@company.com", 420.0, true, None);
+        });
+        let red = bad.rects.iter().find(|r| r.stroke.color == palette(&ctx).error).expect("a red box");
+        assert_eq!(red.stroke.width, 1.5);
+        assert_eq!(red.rect.height(), 50.0);
+        assert_ne!(red.fill, palette(&ctx).card);
+        let good = one(&ctx, 2.0, vec![], |ui| {
+            field_text(ui, egui::Id::new("f"), &mut value, "you@company.com", 420.0, false, None);
+        });
+        assert!(good.rects.iter().all(|r| r.stroke.color != palette(&ctx).error));
+    }
+
+    #[test]
+    fn a_field_can_carry_a_grey_prefix() {
+        let ctx = testing::ctx();
+        let mut value = "vault.example.com".to_string();
+        let p = one(&ctx, 1.0, vec![], |ui| {
+            field_text(ui, egui::Id::new("u"), &mut value, "", 420.0, false, Some("https://"));
+        });
+        let prefix = p.text("https://").expect("the prefix");
+        assert_eq!(prefix.1, palette(&ctx).text_ghost);
+        assert!(p.text("vault.example.com").unwrap().2.left() > prefix.2.right());
+    }
+
+    #[test]
+    fn the_banner_has_its_words_and_one_button_that_answers() {
+        let ctx = testing::ctx();
+        let p = one(&ctx, 1.0, vec![], |ui| {
+            banner(ui, BannerTone::Caution, "You're offline", "Connect to the internet.", "Try again");
+        });
+        for word in ["You're offline", "Connect to the internet.", "Try again"] {
+            assert!(p.text(word).is_some(), "{word}");
+        }
+        let at = p.text("Try again").unwrap().2.center();
+        let mut pressed = false;
+        one(&ctx, 2.0, click_at(at), |ui| {
+            pressed = banner(ui, BannerTone::Caution, "You're offline", "Connect to the internet.", "Try again");
+        });
+        assert!(pressed);
+    }
+
+    #[test]
+    fn the_big_button_shows_a_bar_inside_it_only_while_busy() {
+        let ctx = testing::ctx();
+        let idle = one(&ctx, 1.0, vec![], |ui| {
+            submit_button(ui, "Log in", false, 420.0);
+        });
+        let busy = one(&ctx, 2.0, vec![], |ui| {
+            submit_button(ui, "Checking", true, 420.0);
+        });
+        let bars = |p: &testing::Painted| p.rects.iter().filter(|r| r.rect.height() == 3.0).count();
+        assert_eq!(bars(&idle), 0);
+        assert!(bars(&busy) >= 1, "the 3 high track");
+        assert!(busy.text("Checking").is_some());
+        assert!(busy.repaint_delay < std::time::Duration::from_secs(1), "the bar keeps moving");
+    }
+
+    #[test]
+    fn the_code_boxes_take_digits_only_and_at_most_six() {
+        let ctx = testing::ctx();
+        let mut code = "12a3 456789".to_string();
+        let mut painted = testing::Painted::default();
+        for i in 0..4 {
+            painted = one(&ctx, 1.0 + f64::from(i) * 0.1, vec![], |ui| {
+                code_boxes(ui, egui::Id::new("c"), &mut code, false, 420.0, true);
+            });
+        }
+        assert_eq!(code, "123456");
+        let boxes = painted.rects.iter().filter(|r| r.rect.height() == 64.0).count();
+        assert_eq!(boxes, 6);
+        for digit in ["1", "2", "3", "4", "5", "6"] {
+            assert!(painted.text(digit).is_some(), "{digit}");
+        }
+    }
+
+    #[test]
+    fn the_next_box_is_blue_and_an_error_makes_all_six_red() {
+        let ctx = testing::ctx();
+        let p = palette(&ctx);
+        let mut code = "48".to_string();
+        let painted = one(&ctx, 1.0, vec![], |ui| {
+            code_boxes(ui, egui::Id::new("c"), &mut code, false, 420.0, true);
+        });
+        let blue = painted.rects.iter().filter(|r| r.rect.height() == 64.0 && r.stroke.color == p.blue).count();
+        assert_eq!(blue, 1);
+        let painted = one(&ctx, 2.0, vec![], |ui| {
+            code_boxes(ui, egui::Id::new("c"), &mut code, true, 420.0, true);
+        });
+        let red = painted.rects.iter().filter(|r| r.rect.height() == 64.0 && r.stroke.color == p.error).count();
+        assert_eq!(red, 6);
+    }
+
+    #[test]
+    fn the_done_stage_says_you_are_in_and_what_is_next() {
+        let ctx = testing::ctx();
+        let p = one(&ctx, 1.0, vec![], done_stage);
+        assert!(p.text("You're in").is_some());
+        assert!(p.text("Opening your vault").is_some());
+        assert!(p.circles.iter().any(|c| c.radius == 32.0 && c.fill == palette(&ctx).done_wash));
+    }
+
+    #[test]
+    fn the_wait_panel_sets_its_label_and_value_on_one_grey_card() {
+        let ctx = testing::ctx();
+        let p = one(&ctx, 1.0, vec![], |ui| wait_panel(ui, "Try again in", "a few minutes"));
+        let label = p.text("Try again in").unwrap().2;
+        let value = p.text("a few minutes").unwrap().2;
+        assert!(value.left() > label.right());
+        assert!(p.rects.iter().any(|r| r.fill == palette(&ctx).window_bg && r.rect.contains_rect(value)));
+    }
+
+    #[test]
+    fn every_new_glyph_parses() {
+        let ctx = testing::ctx();
+        one(&ctx, 1.0, vec![], |ui| {
+            for d in [ALERT_CIRCLE, PHONE_CODE, TRIANGLE_ALERT, DONE_TICK, LOCK_TILE] {
+                let (rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
+                icon::stroke(ui.painter(), rect, d, 2.0, Color32::BLACK);
+            }
+        });
     }
 }

@@ -739,10 +739,10 @@ pub fn missing_credential_message(
     email: &str,
     password: &str,
 ) -> Option<&'static str> {
-    if status == BwStatus::Unauthenticated && email.trim().is_empty() {
-        Some("Enter your email address first.")
+    if status == BwStatus::Unauthenticated && (email.trim().is_empty() || !email.contains('@')) {
+        Some(if email.trim().is_empty() { ENTER_EMAIL } else { BAD_EMAIL })
     } else if password.is_empty() {
-        Some("Enter your master password first.")
+        Some(ENTER_PASSWORD)
     } else {
         None
     }
@@ -1585,6 +1585,10 @@ pub struct LoginForm {
     /// stage can be skipped; with Hello off or unavailable the password stage
     /// is the only one whatever this says.
     pub lock_stage: LockStage,
+    /// The sign-in worked and the window is about to give way to the next
+    /// stage: the form column shows "You're in" until it does. Set by
+    /// [`apply_auth_result`], never by anything the user does.
+    pub signed_in: bool,
 }
 
 /// The lock screen's two stages.
@@ -1684,6 +1688,7 @@ pub fn apply_auth_result(result: Result<String, String>, form: &mut LoginForm) -
     match result {
         Ok(session_token) => {
             form.error = None;
+            form.signed_in = true;
             // **After the token is out of `result` and before anything else.**
             // The session token is what this attempt was for; the master
             // password has no further reader on any path -- the worker got its
@@ -1702,6 +1707,7 @@ pub fn apply_auth_result(result: Result<String, String>, form: &mut LoginForm) -
             // The retype the user has to do anyway, and the one moment where
             // emptying the buffer costs them nothing they still wanted.
             form.password.zeroize();
+            form.signed_in = false;
             AuthOutcome::Failed
         }
     }
@@ -1724,6 +1730,9 @@ pub enum LoginAction {
     /// A button in the CLI-setup modal. See
     /// [`crate::bw_acquire::CliSetupState`].
     CliModal(crate::bw_acquire::CliModalAction),
+    /// "Forgot?" was clicked: open the web vault's hint page
+    /// ([`forgot_password_url`]) in the browser.
+    ForgotPassword,
 }
 
 /// Draws the CLI-setup modal over the card, and returns the button pressed.
@@ -1753,7 +1762,7 @@ fn draw_cli_setup_modal(
             ui.label(theme::bold(state.title(), 18.0).color(p.ink));
             ui.add_space(10.0);
             for line in state.body() {
-                ui.label(theme::regular(line, 14.0).color(p.text_muted));
+                ui.label(theme::regular(line, 14.0).color(p.text_muted).line_height(Some(14.0 * 1.45)));
                 ui.add_space(8.0);
             }
             // The bar: filled to the fraction where one is known, and the
@@ -1876,16 +1885,6 @@ const SERVER_TIP: &str = "Most people use bitwarden.com. Pick EU if your account
 const PASSWORD_PLACEHOLDER: &str = "Your Bitwarden master password";
 const LOCK_PLACEHOLDER: &str = "Master password";
 
-/// A label over a field, and the gap under the pair. The label greys with
-/// its field while `dim`: "gray out the whole user/pass zone" is not met by a
-/// pale box under a dark label.
-fn group(ui: &mut egui::Ui, label: &str, dim: bool, field: impl FnOnce(&mut egui::Ui)) {
-    crate::kit::auth::label_dim(ui, label, dim);
-    ui.add_space(crate::kit::auth::LABEL_GAP);
-    field(ui);
-    ui.add_space(crate::kit::auth::FORM_GAP);
-}
-
 /// Draws the login/unlock body: the sign-in form for an account that is not
 /// signed in (spec C 5.2), the lock stage for one that is (spec C 5.3). Pure
 /// view -- the caller owns the state and performs the `bw` side effects for
@@ -1948,9 +1947,134 @@ pub fn draw_login_window(
     action
 }
 
-/// The signed-out form (spec C 5.2): the title, the email and master
-/// password, the server choice, Log in, and the ways in that are not a
-/// password.
+/// What the email box says when it is empty (the sign-in gallery's words).
+pub const ENTER_EMAIL: &str = "Enter your email.";
+/// What it says when there is no `@` in it.
+pub const BAD_EMAIL: &str = "That doesn't look like an email address.";
+/// What the master-password box says when it is empty.
+pub const ENTER_PASSWORD: &str = "Enter your master password.";
+/// What the Self-hosted address box says when it is empty.
+pub const ENTER_SERVER: &str = "Enter your server's address.";
+
+/// Which part of the sign-in form a message is about, so it is drawn where
+/// the design draws it: under the field, as a banner, or as a stage of its
+/// own. The form carries one message string (`LoginForm::error`); this reads
+/// where it belongs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorSpot {
+    /// Under the email box.
+    Email,
+    /// Under the master-password box.
+    Password,
+    /// Under the Self-hosted address box.
+    ServerUrl,
+    /// The banner above the form: the server did not answer.
+    Unreachable,
+    /// The "Too many tries" stage.
+    TooMany,
+    /// Anything else, under the Log in button.
+    General,
+}
+
+/// Reads where `message` belongs. Matching is on the opening words of the
+/// messages this file and [`friendly_auth_error`] write.
+pub fn error_spot(message: &str) -> ErrorSpot {
+    let m = message.trim().to_ascii_lowercase();
+    if m.starts_with("enter your email") || m.contains("look like an email") {
+        ErrorSpot::Email
+    } else if m.starts_with("enter your server") {
+        ErrorSpot::ServerUrl
+    } else if m.starts_with("enter your master password")
+        || m.starts_with("type your master password")
+        || m.contains("master password didn't work")
+        || m.contains("master password is not right")
+    {
+        ErrorSpot::Password
+    } else if m.starts_with("couldn't reach the server") {
+        ErrorSpot::Unreachable
+    } else if m.starts_with("too many failed attempts") {
+        ErrorSpot::TooMany
+    } else {
+        ErrorSpot::General
+    }
+}
+
+/// The web vault's page for a forgotten master password hint, on the server
+/// this sign-in is for. Every Bitwarden client sends "Forgot?" here: the
+/// server mails the hint, and nothing in Deskwarden ever sees it.
+pub fn forgot_password_url(choice: ServerChoice, server_url: &str) -> String {
+    let base = match choice {
+        ServerChoice::UsCloud => "https://vault.bitwarden.com".to_string(),
+        ServerChoice::EuCloud => "https://vault.bitwarden.eu".to_string(),
+        ServerChoice::SelfHosted => {
+            let typed = server_url.trim().trim_end_matches('/');
+            if typed.is_empty() {
+                "https://vault.bitwarden.com".to_string()
+            } else {
+                typed.to_string()
+            }
+        }
+    };
+    format!("{base}/#/hint")
+}
+
+/// The scheme and the rest of a Self-hosted address, `https://` assumed.
+fn url_parts(url: &str) -> (&'static str, &str) {
+    if let Some(rest) = url.strip_prefix("http://") {
+        ("http://", rest)
+    } else if let Some(rest) = url.strip_prefix("https://") {
+        ("https://", rest)
+    } else {
+        ("https://", url)
+    }
+}
+
+/// A label over a field, an optional error line, and the gap under the lot.
+/// The label greys with its field while `dim`: "gray out the whole user/pass
+/// zone" is not met by a pale box under a dark label.
+fn group(
+    ui: &mut egui::Ui,
+    label: &str,
+    dim: bool,
+    error: Option<&str>,
+    field: impl FnOnce(&mut egui::Ui, bool),
+) {
+    crate::kit::auth::label_dim(ui, label, dim);
+    ui.add_space(crate::kit::auth::FIELD_LABEL_GAP);
+    field(ui, error.is_some());
+    if let Some(error) = error {
+        ui.add_space(crate::kit::auth::FIELD_LABEL_GAP);
+        crate::kit::auth::field_error(ui, error);
+    }
+    ui.add_space(crate::kit::auth::FORM_GAP);
+}
+
+/// The server banner's words: amber and "offline" for the cloud, red and
+/// about the address for a server somebody runs.
+fn unreachable_banner(choice: ServerChoice) -> (crate::kit::auth::BannerTone, &'static str, &'static str, &'static str) {
+    use crate::kit::auth::BannerTone;
+    if choice == ServerChoice::SelfHosted {
+        (
+            BannerTone::Danger,
+            "Can't reach your server",
+            "Check the address, or connect to your company VPN.",
+            "Retry",
+        )
+    } else {
+        (
+            BannerTone::Caution,
+            "You're offline",
+            "Connect to the internet to log in. Once you have, your vault also opens offline.",
+            "Try again",
+        )
+    }
+}
+
+/// The signed-out form (spec C 5.2 and the sign-in gallery): the title and its
+/// line, the email and master password, the server choice, Log in, and the
+/// ways in that are not a password. Errors sit where the gallery puts them --
+/// under their field, in a banner, or as the "Too many tries" stage -- see
+/// [`ErrorSpot`].
 fn draw_sign_in_form(
     ui: &mut egui::Ui,
     hello: HelloState,
@@ -1960,12 +2084,37 @@ fn draw_sign_in_form(
 ) -> Option<LoginAction> {
     use crate::kit::auth::{self, FORM_GAP};
     use crate::kit::controls::{self, ButtonKind};
-    use crate::kit::input;
     let mut action = None;
     let width = ui.available_width();
     ui.spacing_mut().item_spacing.y = 0.0;
 
+    if form.signed_in {
+        auth::done_stage(ui);
+        return None;
+    }
+    let spot = form.error.as_deref().map(error_spot);
+    if spot == Some(ErrorSpot::TooMany) {
+        return draw_too_many(ui, form);
+    }
+    let message = form.error.clone();
+    let under = |wanted: ErrorSpot| if spot == Some(wanted) { message.as_deref() } else { None };
+
+    // The server did not answer: a banner above the form, whose button
+    // dismisses it and, with the password still typed, tries again.
+    if spot == Some(ErrorSpot::Unreachable) {
+        let (tone, title, text, label) = unreachable_banner(form.server_choice);
+        if auth::banner(ui, tone, title, text, label) {
+            form.error = None;
+            if !form.password.is_empty() && !auth_in_progress {
+                action = Some(LoginAction::Submit);
+            }
+        }
+        ui.add_space(FORM_GAP);
+    }
+
     auth::title(ui, SIGN_IN_TITLE);
+    ui.add_space(6.0);
+    auth::subtitle(ui, SIGN_IN_SUBTITLE);
     ui.add_space(FORM_GAP);
 
     let needs_setup = !hello.enrolled;
@@ -1989,52 +2138,61 @@ fn draw_sign_in_form(
     // `input::secret_disabled` paint the box and a galley with no `TextEdit`
     // in it at all -- see their docs for why a read-only `TextEdit` is not the
     // same thing.
-    if form.server_choice == ServerChoice::SelfHosted {
-        group(ui, "Server URL", auth_in_progress, |ui| {
-            if auth_in_progress {
-                input::text_disabled(ui, &form.server_url, width, input::SIGN_IN);
-            } else {
-                input::text(
-                    ui,
-                    egui::Id::new("auth-server-url"),
-                    &mut form.server_url,
-                    "https://vault.example.com",
-                    false,
-                    width,
-                );
-            }
-        });
-    }
-    group(ui, "Email", auth_in_progress, |ui| {
+    use crate::kit::input;
+    group(ui, "Email", auth_in_progress, under(ErrorSpot::Email), |ui, bad| {
         if auth_in_progress {
             input::text_disabled(ui, &form.email, width, input::SIGN_IN);
         } else {
-            input::text(ui, egui::Id::new("auth-email"), &mut form.email, "you@company.com", false, width);
-        }
-    });
-    group(ui, "Master password", auth_in_progress, |ui| {
-        if auth_in_progress {
-            // **Takes no value**, so the bullets cannot track the buffer --
-            // see `theme::MASKED_BULLETS`. A mask that shortened as the field
-            // emptied would announce the emptying, which is the one thing it
-            // is here to avoid.
-            input::secret_disabled(ui, width, input::SIGN_IN);
-        } else {
-            input::secret(
-                ui,
-                egui::Id::new("auth-password"),
-                &mut form.password,
-                &mut form.reveal_password,
-                PASSWORD_PLACEHOLDER,
-                width,
-                input::SIGN_IN,
-            );
+            auth::field_text(ui, egui::Id::new("auth-email"), &mut form.email, "you@company.com", width, bad, None);
         }
     });
 
-    // The server: a segmented choice, and for Self-hosted the URL field above.
+    // The password's label row carries "Forgot?" at its right.
+    let password_error = under(ErrorSpot::Password);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 25.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            auth::label_dim(ui, "Master password", auth_in_progress);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !auth_in_progress {
+                    let forgot = auth::link(ui, FORGOT_LABEL);
+                    crate::kit::tips::hint(ui, &forgot, FORGOT_HINT, &[]);
+                    if forgot.clicked() {
+                        action = Some(LoginAction::ForgotPassword);
+                    }
+                }
+            });
+        },
+    );
+    ui.add_space(auth::FIELD_LABEL_GAP - 4.0);
+    if auth_in_progress {
+        // **Takes no value**, so the bullets cannot track the buffer --
+        // see `theme::MASKED_BULLETS`. A mask that shortened as the field
+        // emptied would announce the emptying, which is the one thing it
+        // is here to avoid.
+        input::secret_disabled(ui, width, input::SIGN_IN);
+    } else {
+        auth::field_secret(
+            ui,
+            egui::Id::new("auth-password"),
+            &mut form.password,
+            &mut form.reveal_password,
+            PASSWORD_PLACEHOLDER,
+            width,
+            password_error.is_some(),
+        );
+    }
+    if let Some(error) = password_error {
+        ui.add_space(auth::FIELD_LABEL_GAP);
+        auth::field_error(ui, error);
+    }
+    ui.add_space(FORM_GAP);
+
+    // The server: a segmented choice, and for Self-hosted the address field
+    // under it.
     ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 6.0;
+        ui.spacing_mut().item_spacing.x = 8.0;
         auth::label(ui, SERVER_LABEL);
         crate::kit::tips::help_dot(
             ui,
@@ -2044,7 +2202,7 @@ fn draw_sign_in_form(
             crate::kit::tips::Placement::Above,
         );
     });
-    ui.add_space(auth::LABEL_GAP);
+    ui.add_space(auth::FIELD_LABEL_GAP);
     ui.add_enabled_ui(!auth_in_progress, |ui| {
         let options = ServerChoice::SEGMENTS;
         if let Some(index) =
@@ -2053,28 +2211,53 @@ fn draw_sign_in_form(
             form.server_choice = ServerChoice::from_segment(index);
         }
     });
+    if form.server_choice == ServerChoice::SelfHosted {
+        ui.add_space(auth::FIELD_LABEL_GAP);
+        let url_error = under(ErrorSpot::ServerUrl);
+        let (scheme, rest) = url_parts(&form.server_url);
+        let mut typed = rest.to_string();
+        if auth_in_progress {
+            input::text_disabled(ui, &form.server_url, width, input::SIGN_IN);
+        } else {
+            auth::field_text(
+                ui,
+                egui::Id::new("auth-server-url"),
+                &mut typed,
+                "vault.yourcompany.com",
+                width,
+                url_error.is_some(),
+                Some(scheme),
+            );
+            if typed != rest {
+                // A pasted scheme takes over the prefix; typing never shows two.
+                let (scheme, body) = if typed.starts_with("http://") || typed.starts_with("https://") {
+                    url_parts(&typed)
+                } else {
+                    (scheme, typed.as_str())
+                };
+                form.server_url = if body.is_empty() { String::new() } else { format!("{scheme}{body}") };
+            }
+        }
+        if let Some(error) = url_error {
+            ui.add_space(auth::FIELD_LABEL_GAP);
+            auth::field_error(ui, error);
+        }
+    }
     ui.add_space(FORM_GAP);
 
-    // While the credentials are with the server, Log in is disabled and a bar
-    // slides under it. Disabling matters beyond looks: a second submit would
-    // spawn another `bw login` against the same account while the first is
-    // still running.
-    let log_in = ui
-        .add_enabled_ui(!auth_in_progress, |ui| {
-            auth::wide_button(ui, ButtonKind::Primary, 56.0, 16, 17.0, LOG_IN_LABEL, None, width)
-        })
-        .inner;
-    if log_in.clicked() {
+    // While the credentials are with the server, Log in reads "Checking" over a
+    // bar inside the button. A second submit would spawn another `bw login`
+    // against the same account while the first is still running, so the press
+    // is ignored rather than the button greyed (the design keeps it at 85%).
+    let label = if auth_in_progress { CHECKING_LABEL } else { LOG_IN_LABEL };
+    let log_in = auth::submit_button(ui, label, auth_in_progress, width);
+    if log_in.clicked() && !auth_in_progress {
         action = Some(LoginAction::Submit);
     }
-    if auth_in_progress {
-        ui.add_space(12.0);
-        auth::progress(ui, width, false);
-    }
 
-    if let Some(err) = &form.error {
+    if let Some(err) = under(ErrorSpot::General) {
         ui.add_space(FORM_GAP);
-        auth::error_line(ui, err);
+        auth::field_error(ui, err);
     }
 
     // The Hello opt-in: with the master password typed, clicking unlocks with
@@ -2129,6 +2312,47 @@ fn draw_sign_in_form(
     }
     action
 }
+
+/// The "Too many tries" stage: the server has paused sign-ins from this
+/// machine. It names no time, so the panel says so rather than counting down
+/// a figure nobody was given; "Try again" puts the form back.
+fn draw_too_many(ui: &mut egui::Ui, form: &mut LoginForm) -> Option<LoginAction> {
+    use crate::kit::auth::{self, FORM_GAP};
+    use crate::kit::controls::ButtonKind;
+    let mut action = None;
+    let width = ui.available_width();
+    auth::stage_tile(ui, auth::LOCK_TILE, true);
+    ui.add_space(20.0);
+    auth::stage_title(ui, TOO_MANY_TITLE);
+    ui.add_space(6.0);
+    auth::subtitle(ui, TOO_MANY_LINE);
+    ui.add_space(20.0);
+    auth::wait_panel(ui, "Try again in", TOO_MANY_WAIT);
+    ui.add_space(20.0);
+    if auth::wide_button(ui, ButtonKind::Outline, 52.0, 14, 16.0, TRY_AGAIN_LABEL, None, width).clicked() {
+        form.error = None;
+    }
+    ui.add_space(FORM_GAP);
+    if auth::link_big(ui, FORGOT_LONG_LABEL).clicked() {
+        action = Some(LoginAction::ForgotPassword);
+    }
+    action
+}
+
+/// The sign-in screen's line under its title.
+pub const SIGN_IN_SUBTITLE: &str = "Use your Bitwarden account";
+/// The link on the master-password label row, and what it says on hover.
+const FORGOT_LABEL: &str = "Forgot?";
+const FORGOT_HINT: &str = "Bitwarden can't see or reset it";
+/// The same link under the "Too many tries" panel.
+const FORGOT_LONG_LABEL: &str = "Forgot master password?";
+/// The "Too many tries" stage.
+pub const TOO_MANY_TITLE: &str = "Too many tries";
+pub const TOO_MANY_LINE: &str = "To keep your vault safe, logging in is paused on this PC.";
+pub const TOO_MANY_WAIT: &str = "a few minutes";
+pub const TRY_AGAIN_LABEL: &str = "Try again";
+/// The button's word while the server is answering.
+pub const CHECKING_LABEL: &str = "Checking";
 
 /// The sign-in button's word.
 const LOG_IN_LABEL: &str = "Log in";
@@ -3626,7 +3850,7 @@ pub fn build_login_frame(
                                     let url = form.server_url.trim().to_string();
                                     if url.is_empty() {
                                         form.error =
-                                            Some("Enter your server's URL first.".to_string());
+                                            Some(ENTER_SERVER.to_string());
                                         None
                                     } else {
                                         Some(url)
@@ -3860,6 +4084,12 @@ pub fn build_login_frame(
                     // and this closure is one of the things it draws.
                     Some(LoginAction::UseApiKey) => {
                         *api_key_asked_for_closure.borrow_mut() = true;
+                    }
+                    Some(LoginAction::ForgotPassword) => {
+                        crate::vault_window::webbrowser_open(&forgot_password_url(
+                            form.server_choice,
+                            &form.server_url,
+                        ));
                     }
                     // **The modal's three states, driven from one arm.**
                     Some(LoginAction::CliModal(what)) => match what {
@@ -5065,7 +5295,7 @@ Cryptography error, The decryption operation failed";
         ] {
             assert_eq!(
                 missing_credential_message(status, "a@b.c", ""),
-                Some("Enter your master password first."),
+                Some(ENTER_PASSWORD),
                 "{status:?} let an empty password through"
             );
         }
@@ -5076,7 +5306,7 @@ Cryptography error, The decryption operation failed";
         // Signing in needs one...
         assert_eq!(
             missing_credential_message(BwStatus::Unauthenticated, "   ", "pw"),
-            Some("Enter your email address first.")
+            Some(ENTER_EMAIL)
         );
         // ...whereas unlocking already knows whose vault this is, so a blank
         // email is irrelevant and must not block the unlock.
@@ -6072,7 +6302,7 @@ mod first_run_notice_tests {
             assert!(has(&painted, wanted), "{wanted:?} is missing; painted {painted:?}");
         }
         assert!(!has(&painted, "Log in with another device"), "a control with nothing behind it");
-        assert!(!has(&painted, "Server URL"), "the URL field is for Self-hosted only");
+        assert!(!has(&painted, "https://"), "the address field is for Self-hosted only");
         // The form is in the right half.
         assert!(at(&painted, "Email").left() > 640.0);
         assert!(at(&painted, "Uses your existing Bitwarden account").right() < 640.0);
@@ -6080,7 +6310,7 @@ mod first_run_notice_tests {
         form.server_choice = ServerChoice::SelfHosted;
         let (painted, _) =
             screen(&ctx, BwStatus::Unauthenticated, NOT_ENROLLED, &mut form, false, None);
-        assert!(has(&painted, "Server URL"), "Self-hosted shows the URL field");
+        assert!(has(&painted, "https://"), "Self-hosted shows the address field");
     }
 
     #[test]
@@ -6186,6 +6416,216 @@ mod first_run_notice_tests {
         let (_, action) =
             screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, Some(logout));
         assert_eq!(action, Some(LoginAction::LogOut));
+    }
+
+    // ---- the sign-in gallery's states (slice 15a) --------------------------
+    //
+    // Each state is drawn through the real split screen and read back off the
+    // painted frame: where a message is drawn is the whole of what they check.
+
+    const GALLERY: Vec2 = egui::vec2(1280.0, 820.0);
+
+    fn gallery_frames(
+        status: BwStatus,
+        form: &mut LoginForm,
+        busy: bool,
+        hello: HelloState,
+    ) -> crate::kit::testing::Painted {
+        let ctx = crate::kit::testing::ctx();
+        let mut painted = crate::kit::testing::Painted::default();
+        for i in 0..8 {
+            painted = crate::kit::testing::frame(&ctx, f64::from(i) * 0.2, GALLERY, vec![], |ui| {
+                let full = ui.max_rect();
+                let _ = crate::kit::auth::split(ui, full, CloseControl::Active, |ui| {
+                    let mut bottom = 0.0;
+                    let _ = draw_login_window(
+                        ui,
+                        status,
+                        None,
+                        "bitwarden.com",
+                        hello,
+                        form,
+                        &mut bottom,
+                        busy,
+                        false,
+                        None,
+                    );
+                });
+            });
+        }
+        painted
+    }
+
+    fn login_form(set: impl FnOnce(&mut LoginForm)) -> LoginForm {
+        let mut form = LoginForm::default();
+        set(&mut form);
+        form
+    }
+
+    const NO_HELLO: HelloState = HelloState { available: false, enrolled: false };
+
+    fn y_of(painted: &crate::kit::testing::Painted, needle: &str) -> f32 {
+        painted.text(needle).unwrap_or_else(|| panic!("{needle} is not on the screen")).2.center().y
+    }
+
+    #[test]
+    fn a_message_is_drawn_where_it_belongs() {
+        assert_eq!(error_spot(ENTER_EMAIL), ErrorSpot::Email);
+        assert_eq!(error_spot(BAD_EMAIL), ErrorSpot::Email);
+        assert_eq!(error_spot(ENTER_PASSWORD), ErrorSpot::Password);
+        assert_eq!(error_spot(HELLO_SETUP_NEEDS_PASSWORD), ErrorSpot::Password);
+        assert_eq!(error_spot(&friendly_auth_error("Invalid username or password")), ErrorSpot::Password);
+        assert_eq!(error_spot(&friendly_auth_error("decryption operation failed")), ErrorSpot::Password);
+        assert_eq!(error_spot(ENTER_SERVER), ErrorSpot::ServerUrl);
+        assert_eq!(error_spot(&friendly_auth_error("getaddrinfo ENOTFOUND")), ErrorSpot::Unreachable);
+        assert_eq!(error_spot(&friendly_auth_error("Too many requests")), ErrorSpot::TooMany);
+        assert_eq!(error_spot("something nobody planned for"), ErrorSpot::General);
+    }
+
+    #[test]
+    fn forgot_goes_to_the_hint_page_of_the_server_the_sign_in_is_for() {
+        assert_eq!(forgot_password_url(ServerChoice::UsCloud, ""), "https://vault.bitwarden.com/#/hint");
+        assert_eq!(forgot_password_url(ServerChoice::EuCloud, "ignored"), "https://vault.bitwarden.eu/#/hint");
+        assert_eq!(
+            forgot_password_url(ServerChoice::SelfHosted, " https://vault.example.com/ "),
+            "https://vault.example.com/#/hint"
+        );
+        assert_eq!(forgot_password_url(ServerChoice::SelfHosted, ""), "https://vault.bitwarden.com/#/hint");
+    }
+
+    #[test]
+    fn the_email_check_has_the_two_words_the_gallery_has() {
+        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "", "pw"), Some(ENTER_EMAIL));
+        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "nobody", "pw"), Some(BAD_EMAIL));
+        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "a@b.c", ""), Some(ENTER_PASSWORD));
+        assert_eq!(missing_credential_message(BwStatus::Locked, "", ""), Some(ENTER_PASSWORD));
+    }
+
+    #[test]
+    fn the_form_has_a_title_a_line_and_forgot() {
+        let mut form = LoginForm::default();
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        for word in [SIGN_IN_TITLE, SIGN_IN_SUBTITLE, "Email", "Master password", "Forgot?", "Server"] {
+            assert!(painted.text(word).is_some(), "{word} is missing");
+        }
+    }
+
+    #[test]
+    fn an_email_error_sits_under_the_email_box_and_not_at_the_foot() {
+        let mut form = login_form(|form| { form.error = Some(ENTER_EMAIL.to_string()); });
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        let message = y_of(&painted, ENTER_EMAIL);
+        assert!(message > y_of(&painted, "Email"), "under the Email label");
+        assert!(message < y_of(&painted, "Master password"), "above the next field");
+        let p = crate::kit::tokens::palette(&crate::kit::testing::ctx());
+        assert!(
+            painted.rects.iter().any(|r| r.stroke.color == p.error && r.stroke.width == 1.5),
+            "the box turns red"
+        );
+    }
+
+    #[test]
+    fn a_password_error_sits_under_the_password_box() {
+        let mut form = login_form(|form| { form.error = Some("That email or master password didn't work. Check them and try again.".to_string()); });
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        let message = y_of(&painted, "didn't work");
+        assert!(message > y_of(&painted, "Master password"));
+        assert!(message < y_of(&painted, "Server"));
+    }
+
+    #[test]
+    fn an_unreachable_server_is_a_banner_and_the_form_stays() {
+        let down = friendly_auth_error("getaddrinfo ENOTFOUND vault.example.com");
+        let mut form = login_form(|form| { form.error = Some(down.clone()); });
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        assert!(painted.text("You're offline").is_some());
+        assert!(painted.text("Try again").is_some());
+        assert!(painted.text(&down).is_none(), "the sentence is the banner's, not a second line");
+        assert!(y_of(&painted, "You're offline") < y_of(&painted, SIGN_IN_TITLE), "above the title");
+        assert!(painted.text("Master password").is_some(), "the form is still there");
+
+        let mut form = login_form(|form| { form.error = Some(down); form.server_choice = ServerChoice::SelfHosted; });
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        assert!(painted.text("Can't reach your server").is_some());
+        assert!(painted.text("Retry").is_some());
+    }
+
+    #[test]
+    fn self_hosted_puts_its_address_box_under_the_segments() {
+        let mut form = login_form(|form| { form.server_choice = ServerChoice::SelfHosted; form.server_url = "https://vault.example.com".to_string(); });
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        assert!(y_of(&painted, "https://") > y_of(&painted, "Self-hosted"), "under the segmented control");
+        assert!(painted.text("vault.example.com").is_some(), "the scheme is the prefix, the rest is typed");
+        assert!(y_of(&painted, "https://") < y_of(&painted, crate::api_key_ui::USE_API_KEY_LABEL), "above the links");
+    }
+
+    #[test]
+    fn a_missing_address_is_red_under_its_own_box() {
+        let mut form = login_form(|form| { form.server_choice = ServerChoice::SelfHosted; form.error = Some(ENTER_SERVER.to_string()); });
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        assert!(y_of(&painted, ENTER_SERVER) > y_of(&painted, "https://"));
+    }
+
+    #[test]
+    fn the_button_reads_checking_while_the_server_answers() {
+        let mut form = LoginForm::default();
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, true, NO_HELLO);
+        assert!(painted.text(CHECKING_LABEL).is_some());
+        assert!(painted.text("Forgot?").is_none(), "no link into the web vault while credentials are out");
+    }
+
+    #[test]
+    fn too_many_tries_replaces_the_form_and_try_again_puts_it_back() {
+        let mut form = login_form(|form| { form.error = Some(friendly_auth_error("Too many requests from your network")); });
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        for word in [TOO_MANY_TITLE, TOO_MANY_LINE, "Try again in", TOO_MANY_WAIT, "Forgot master password?"] {
+            assert!(painted.text(word).is_some(), "{word} is missing");
+        }
+        assert!(painted.text("Master password").is_none(), "the form is gone");
+
+        // Pressing "Try again" clears the message and the form returns.
+        let ctx = crate::kit::testing::ctx();
+        let draw = |ui: &mut egui::Ui, form: &mut LoginForm| {
+            let full = ui.max_rect();
+            let _ = crate::kit::auth::split(ui, full, CloseControl::Active, |ui| {
+                let mut bottom = 0.0;
+                let _ = draw_login_window(
+                    ui,
+                    BwStatus::Unauthenticated,
+                    None,
+                    "bitwarden.com",
+                    NO_HELLO,
+                    form,
+                    &mut bottom,
+                    false,
+                    false,
+                    None,
+                );
+            });
+        };
+        let mut painted = crate::kit::testing::Painted::default();
+        for i in 0..8 {
+            painted = crate::kit::testing::frame(&ctx, f64::from(i) * 0.2, GALLERY, vec![], |ui| draw(ui, &mut form));
+        }
+        let at = painted.texts.iter().find(|t| t.0 == TRY_AGAIN_LABEL).expect("the button").2.center();
+        crate::kit::testing::frame(&ctx, 1.6, GALLERY, crate::kit::testing::click_at(at), |ui| draw(ui, &mut form));
+        assert_eq!(form.error, None);
+    }
+
+    #[test]
+    fn a_sign_in_that_worked_shows_you_are_in() {
+        let mut form = login_form(|form| form.password = "hunter2 hunter2".to_string());
+        let outcome = apply_auth_result(Ok("token".to_string()), &mut form);
+        assert!(matches!(outcome, AuthOutcome::Succeeded(_)));
+        assert!(form.signed_in);
+        let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
+        assert!(painted.text("You're in").is_some());
+        assert!(painted.text("Opening your vault").is_some());
+        assert!(painted.text("Master password").is_none(), "no form under it");
+
+        let mut form = LoginForm::default();
+        let _ = apply_auth_result(Err("Invalid username or password".to_string()), &mut form);
+        assert!(!form.signed_in);
     }
 }
 
@@ -10970,6 +11410,7 @@ pub(crate) mod password_lifetime_tests {
             enable_hello: false,
             error: Some(probe_password()),
             lock_stage: LockStage::default(),
+            signed_in: false,
         }
     }
 
@@ -11546,6 +11987,8 @@ pub(crate) mod password_lifetime_tests {
             error: _,
             // Not a String: the lock screen's stage holds no secret.
             lock_stage: _,
+            // Not a String either: one flag.
+            signed_in: _,
         } = &form;
         let stolen = [
             std::mem::take(&mut form.password),
