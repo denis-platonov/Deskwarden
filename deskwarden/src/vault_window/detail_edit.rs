@@ -4693,6 +4693,9 @@ pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved
 /// drawing `kind_mark` refuses elsewhere; the word says the whole thing.
 pub const TOTP_REPLACE_BUTTON: &str = "Replace";
 pub const TOTP_ADD_BUTTON: &str = "Add 2FA code";
+/// The empty 2FA row's one button (spec B 1.4 B): 50 high, radius 14, 16 bold.
+const TOTP_ROW_BUTTON: crate::kit::controls::ButtonSize =
+    crate::kit::controls::ButtonSize { height: 50.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
 
 /// Spec B 1.4 C: the toast after Remove.
 pub const TOTP_REMOVED_TOAST: &str = "2FA code removed";
@@ -7184,13 +7187,6 @@ pub fn sequence_warning(sequence: &str, source: &ResolveSource<'_>) -> Option<St
 //   Windows would not name.
 // ---------------------------------------------------------------------------
 
-/// 8b's card: `border-radius: 12px` over `1px solid #d7d3d3`.
-///
-/// Twelve, which is neither `theme::SECTION_CARD_RADIUS`'s 10 nor the modal's:
-/// this is the one surface the form draws ON TOP of its own section cards, and
-/// 8b says 12.
-const PICKER_CARD_RADIUS: u8 = 12;
-
 /// 8b's `1px` borders -- the card's `#d7d3d3` and the washed row's `#b8c7ea`.
 ///
 /// Named because it is real geometry rather than decoration: egui's `Frame`
@@ -7200,25 +7196,9 @@ const PICKER_CARD_RADIUS: u8 = 12;
 /// measure it as one.
 const PICKER_BORDER: f32 = 1.0;
 
-/// 8b's `box-shadow: 0 14px 34px rgba(45, 43, 43, 0.18)`.
-///
-/// `0.18` of 255 is 45.9, so 46 -- the same alpha `theme::MODAL_SHADOW`
-/// carries for the same `rgba(45,43,43,.18)`, at 8b's own deeper offset and
-/// blur. Not `MODAL_SHADOW` itself: that constant is private to `theme` and
-/// is the *modal's* lift (`0 6px 20px`), and borrowing it would make this card
-/// claim a measurement it does not have.
-const PICKER_CARD_SHADOW: egui::Shadow = egui::Shadow {
-    offset: [0, 14],
-    blur: 34,
-    spread: 0,
-    color: egui::Color32::from_rgba_unmultiplied_const(45, 43, 43, 46),
-};
-
 /// The header band's and the footer's `padding: 14px 18px` / `12px 18px`.
 const PICKER_BAND_PAD_X: i8 = 18;
 const PICKER_BAND_PAD_Y: i8 = 14;
-const PICKER_FOOTER_PAD_Y: i8 = 12;
-
 /// 8b's card heading, at its `font-size: 15px; font-weight: 800`.
 ///
 /// **`Add a native app` verbatim, although this card is also reached to
@@ -7226,8 +7206,6 @@ const PICKER_FOOTER_PAD_Y: i8 = 12;
 /// the card performs -- this item gains a target -- and the alternative was a
 /// caption that changed under the user between two openings of one card.
 const PICKER_TITLE: &str = "Add a native app";
-const PICKER_TITLE_PX: f32 = 15.0;
-
 /// The header band's right-hand readout: `font-size: 12px; color: #9b9797`.
 const PICKER_COUNT_PX: f32 = 12.0;
 
@@ -7309,14 +7287,6 @@ fn picker_card_width(ctx: &egui::Context) -> f32 {
     PICKER_CARD_WIDTH.min((ctx.content_rect().width() - 2.0 * GUTTER).max(240.0))
 }
 
-/// The height of the header band the card is dragged by -- its padding above
-/// and below the title, and the title.
-///
-/// Deliberately a little SHORT of the band rather than a little over: a handle
-/// that reached past the seam would swallow presses on the first row of the
-/// list, and the rows are what this card is for.
-const PICKER_HEADER_HEIGHT: f32 = 2.0 * PICKER_BAND_PAD_Y as f32 + PICKER_TITLE_PX;
-
 /// **8b's card, floating over the window** -- centred, on top, and over a
 /// scrim, which is what every other card in this app that asks a question
 /// does.
@@ -7340,28 +7310,34 @@ fn app_window_overlay(
     app: &mut AppMatchDraft,
     apps: &mut AppIdentityCache,
 ) {
-    // **The scrim's id is a LITERAL and not a constant**, and that is not
-    // style: `item_list::MODAL_SCRIM_AREAS` is kept honest by a walk over this
-    // crate's sources looking for exactly this declaration, and that list is
-    // what answers "is a modal up" -- which keeps the item list's arrow keys
-    // from steering the selection behind an open card, and keeps the read pane
-    // from painting a second copy of the copy toast over one. A scrim spelled
-    // through a constant is one the walk cannot see.
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("app-window-picker-scrim")));
+    // A v2 dialog (`kit::modal::Dialog`): its scrim is named
+    // `"app-window-picker-scrim"` from [`PICKER_ID`], which
+    // `item_list::MODAL_SCRIM_AREAS` lists so the arrow keys and the read
+    // pane's toast know a modal is up. The card has no padding of its own: the
+    // title and the footer carry theirs and the bands between run flush.
+    // Escape is the picker's own (read below, and only when no text box has the
+    // keyboard), so the kit's is off.
     let width = picker_card_width(ctx);
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("app-window-picker"))).show(ctx, |ui| {
-        // **First, before the header draws.** egui hit-tests clicks and drags
-        // separately but not independently: registered after the band, the
-        // drag strip would lie over the dismiss mark and swallow its click.
-        // See `theme::modal_drag_handle`.
-        theme::modal_drag_handle(ui, PICKER_HEADER_HEIGHT);
-        // An `Area` has no width of its own, so the card is given one here
-        // rather than reading `available_width` -- which is infinite in a
-        // floating layer, and would lay every band of the card against
-        // infinity.
-        ui.set_width(width);
+    let (outcome, ()) = crate::kit::modal::Dialog::new(PICKER_ID, width).padding(0).esc_closes(false).show(ctx, |ui| {
         app_window_picker(ui, app, apps);
     });
+    if outcome == crate::kit::modal::ModalOutcome::Closed {
+        app.close_picker();
+    }
+}
+
+/// The picker dialog's id; its scrim is `"app-window-picker-scrim"`.
+const PICKER_ID: &str = "app-window-picker";
+
+/// The running-window picker over the current frame, for the UI preview, with
+/// `picked` staged. Nothing it reports goes anywhere.
+pub fn preview_app_window_picker(ctx: &egui::Context, windows: Vec<AppWindowRow>, picked: Option<isize>) {
+    let mut app = AppMatchDraft::unbound();
+    app.picking = true;
+    app.windows = windows;
+    app.picked = picked;
+    let mut apps = AppIdentityCache::default();
+    app_window_overlay(ctx, &mut app, &mut apps);
 }
 
 /// 8b's `Match this window by`, `text-transform: uppercase` already applied,
@@ -7405,8 +7381,6 @@ const PICKER_RULE_HOSTED_NOTE: &str = "a Store app has no other name to match";
 const PICKER_ADD: &str = "Add target";
 const PICKER_CANCEL: &str = "Cancel";
 const PICKER_REFRESH: &str = "Refresh";
-const PICKER_FOOTER_GAP: f32 = 9.0;
-
 /// What the list says when the desktop offered nothing.
 const PICKER_EMPTY: &str = "No open windows to choose from.";
 
@@ -7465,34 +7439,18 @@ fn app_window_picker(
     let escaped = ui.input(|i| i.key_pressed(egui::Key::Escape))
         && ui.memory(|m| m.focused().is_none());
 
-    let mut add = false;
-    let mut cancel = false;
-    let mut refresh = false;
-
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(Stroke::new(PICKER_BORDER, theme::BORDER_STRONG))
-        .corner_radius(CornerRadius::same(PICKER_CARD_RADIUS))
-        .shadow(PICKER_CARD_SHADOW)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // The bands butt against their hairlines; every gap on this card
-            // is a padding one of them owns.
-            ui.spacing_mut().item_spacing.y = 0.0;
-
-            let dismissed = picker_header(ui);
-            picker_rule(ui);
-            picker_rows(ui, app, apps);
-            picker_rule(ui);
-            picker_match_band(ui, app);
-            picker_rule(ui);
-            let pressed = picker_footer(ui, app.picked_row().is_some(), app.windows.len());
-            add = pressed.0;
-            // The header's mark and the footer's button are one act: both
-            // leave the card with nothing bound.
-            cancel = dismissed || pressed.1;
-            refresh = pressed.2;
-        });
+    ui.set_width(ui.available_width());
+    // The bands butt against their hairlines; every gap on this card is a
+    // padding one of them owns.
+    ui.spacing_mut().item_spacing.y = 0.0;
+    picker_header(ui);
+    picker_rows(ui, app, apps);
+    picker_rule(ui);
+    picker_match_band(ui, app);
+    let pressed = picker_footer(ui, app.picked_row().is_some(), app.windows.len());
+    let (add, cancel, refresh) = pressed;
+    // (The dialog's own mark and scrim, and the footer's button, are one act:
+    // all leave the card with nothing bound.)
 
     if refresh {
         app.windows = running_app_rows();
@@ -7517,21 +7475,11 @@ fn app_window_picker(
 /// the control the number is actually about. What takes its place is the
 /// dismiss mark, because the card had no \u{2715} at all ("no X button") and
 /// the header's right-hand end is where every other card in this app puts one.
-fn picker_header(ui: &mut egui::Ui) -> bool {
-    let band = egui::Frame::new()
-        .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_BAND_PAD_Y))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(theme::extrabold(PICKER_TITLE, PICKER_TITLE_PX).color(theme::INK));
-            });
-        })
-        .response
-        .rect;
-    // Pinned to the band rather than added to the row, so the title's line is
-    // laid out exactly as it was -- see `theme::modal_dismiss_mark`, which
-    // does not allocate.
-    theme::modal_dismiss_mark(ui, band, theme::CloseInk::OnCard).clicked()
+fn picker_header(ui: &mut egui::Ui) {
+    egui::Frame::new().inner_margin(Margin { left: 30, right: 70, top: 28, bottom: 20 }).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.label(theme::extrabold(PICKER_TITLE, 26.0).color(theme::INK));
+    });
 }
 
 /// One of the card's `1px solid #eae7e7` seams, drawn full-bleed.
@@ -7869,75 +7817,40 @@ fn picker_match_band(ui: &mut egui::Ui, app: &AppMatchDraft) {
 
 /// 8b's footer. Answers `(add, cancel, refresh)`.
 fn picker_footer(ui: &mut egui::Ui, staged: bool, count: usize) -> (bool, bool, bool) {
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
     let mut pressed = (false, false, false);
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(PICKER_BAND_PAD_X, PICKER_FOOTER_PAD_Y))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // The band's own right edge, read before anything is in it.
-            // `set_width` above sets the max as well as the min, so this is the
-            // line the count is pushed to -- and NOT `available_width` measured
-            // inside the row below, which in a wrapping layout answers the wrap
-            // width rather than what is left of the current line: pushed by
-            // that, the count claimed 380 points of nothing and took the card
-            // out to 1072 on a 690-point pane.
-            let line_right = ui.max_rect().right();
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = PICKER_FOOTER_GAP;
-                // `primary_button_enabled`, because there is a state in which
-                // this card has no answer to give: nothing is staged, and a
-                // filled blue button that does nothing is the drawn-and-dead
-                // control this file refuses everywhere else.
-                pressed.0 = theme::primary_button_enabled(ui, PICKER_ADD, None, staged).clicked();
-                pressed.1 = theme::secondary_button(ui, PICKER_CANCEL).clicked();
-                pressed.2 = theme::secondary_button(ui, PICKER_REFRESH).clicked();
-                // **The count, at the band's far right** -- 8b's header number,
-                // moved here at the owner's word ("17 windows open message move
-                // to the bottom right corner"). It belongs beside `Refresh`
-                // anyway: the number is what that button changes.
-                //
-                // Pushed with a measured space rather than a `right_to_left`
-                // layout, because this row WRAPS -- on a narrow card the three
-                // buttons and the note already take two lines, and a
-                // right-aligned child inside a wrapping row is laid against the
-                // row's full width rather than the line's, which puts it back
-                // on line one over whatever is there. Measured against what is
-                // left of the current line, the count goes flush right when
-                // there is room and simply follows the note when there is not.
-                //
-                // **Laid, allocated and painted here rather than added as a
-                // label**, because a label in a wrapping row is re-laid against
-                // the row's own wrap width: pushed with `add_space` it came out
-                // as a galley 645 points wide starting back at the band's left
-                // edge, which is neither where the arithmetic put it nor
-                // anything a test can read. A finished galley painted into a
-                // rectangle this row allocated is exactly as wide as its text
-                // and sits where it is put.
-                let run = picker_count(count);
-                let galley = ui.painter().layout_no_wrap(
-                    run,
-                    egui::FontId::new(PICKER_COUNT_PX, egui::FontFamily::Proportional),
-                    theme::TEXT_GHOST,
-                );
-                // The cursor is already past the gap egui puts between two
-                // widgets, so the gap is not subtracted a second time.
-                let room = line_right - ui.cursor().min.x;
-                let size = galley.size();
-                // The whole of what is left of the line when the count fits on
-                // it, so the run lands against the band's right-hand end; just
-                // the run when it does not, so a narrow card wraps it under the
-                // note instead of reserving a lane it cannot fill.
-                let (cell, _) = ui.allocate_exact_size(
-                    egui::vec2(if room > size.x { room } else { size.x }, size.y),
-                    egui::Sense::hover(),
-                );
-                ui.painter().galley(
-                    egui::pos2(cell.right() - size.x, cell.top()),
-                    galley,
-                    theme::TEXT_GHOST,
-                );
-            });
+    egui::Frame::new().inner_margin(Margin::symmetric(30, 22)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        // `Refresh`, and the count it changes ("17 windows open", moved to
+        // the bottom right at the owner's word), over the two answers.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 12.0;
+            pressed.2 = controls::button(ui, ButtonKind::Outline, controls::SMALL, PICKER_REFRESH, None).clicked();
+            // The count sits at the line's right end: pushed by a measured
+            // space (a right-to-left layout nested in a horizontal one is laid
+            // against whatever the row had before it, and in a wrapping parent
+            // that put it back at the left).
+            let p = crate::kit::tokens::palette(ui.ctx());
+            let text = picker_count(count);
+            let galley = ui.painter().layout_no_wrap(text.clone(), egui::FontId::proportional(14.0), p.text_faint);
+            let slack = ui.available_width() - galley.size().x;
+            ui.add_space(slack.max(0.0));
+            ui.label(RichText::new(text).size(14.0).color(p.text_faint));
         });
+        ui.add_space(16.0);
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.columns(2, |columns| {
+            // Greyed while nothing is staged: a filled blue button that does
+            // nothing is the drawn-and-dead control this file refuses
+            // everywhere else.
+            pressed.0 = columns[0]
+                .add_enabled_ui(staged, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, PICKER_ADD))
+                .inner
+                .clicked();
+            pressed.1 = controls::button_filling(&mut columns[1], ButtonKind::Outline, ANSWER, PICKER_CANCEL).clicked();
+        });
+    });
     pressed
 }
 
@@ -12906,13 +12819,29 @@ pub fn draw_detail_edit(
                                 // something to the right" -- and is what the
                                 // measurement does with no field to share the
                                 // line with.
-                                let width = theme::row_button_width(ui, TOTP_ADD_BUTTON);
+                                let width = crate::kit::controls::button_width(
+                                    ui.ctx(),
+                                    crate::kit::controls::ButtonKind::Tinted,
+                                    TOTP_ROW_BUTTON,
+                                    TOTP_ADD_BUTTON,
+                                    true,
+                                );
                                 let slack = ui.available_width() - width;
                                 ui.horizontal(|ui| {
                                     if slack > 0.0 {
                                         ui.add_space(slack);
                                     }
-                                    if theme::row_button(ui, TOTP_ADD_BUTTON).clicked() {
+                                    // Spec B 1.4 B: the tinted blue button with the
+                                    // scan frame, 16 bold.
+                                    if crate::kit::controls::button(
+                                        ui,
+                                        crate::kit::controls::ButtonKind::Tinted,
+                                        TOTP_ROW_BUTTON,
+                                        TOTP_ADD_BUTTON,
+                                        Some(crate::kit::icon::glyph::SCAN),
+                                    )
+                                    .clicked()
+                                    {
                                         action = EditAction::AddTotp;
                                     }
                                 });
@@ -12924,30 +12853,33 @@ pub fn draw_detail_edit(
                                 // plain `text_field` here is the mutation
                                 // `the_totp_seed_is_masked_and_never_painted_in_the_clear`
                                 // exists to catch.
-                                row_with_buttons(
-                                    ui,
-                                    &[TOTP_REPLACE_BUTTON, SLOT_REMOVE_BUTTON],
-                                    |ui, room| {
-                                        theme::section_password_field_within(
-                                            ui,
-                                            &mut draft.totp,
-                                            &mut draft.reveal_totp,
-                                            room,
-                                        );
-                                        if theme::row_button(ui, TOTP_REPLACE_BUTTON).clicked() {
-                                            action = EditAction::AddTotp;
-                                        }
-                                        // 8a's `color: #8c3c33` on this one
-                                        // and this one only -- see
-                                        // `theme::row_button_danger`.
-                                        if theme::row_button_danger(ui, SLOT_REMOVE_BUTTON)
-                                            .clicked()
-                                        {
-                                            hide = Some(Slot::Totp);
-                                            crate::kit::toast::show(ui.ctx(), TOTP_REMOVED_TOAST);
-                                        }
-                                    },
-                                );
+                                // **Replace and Remove are the kit's small buttons**
+                                // (spec B 0.6: 40 high, radius 11, 14 bold): the
+                                // quiet outline for Replace and the red-edged
+                                // one for Remove, the only destructive press on
+                                // this card.
+                                use crate::kit::controls::{self, ButtonKind};
+                                let reserved: f32 = [(ButtonKind::Outline, TOTP_REPLACE_BUTTON), (ButtonKind::Danger, SLOT_REMOVE_BUTTON)]
+                                    .iter()
+                                    .map(|(kind, label)| controls::button_width(ui.ctx(), *kind, controls::SMALL, label, false) + theme::ROW_BUTTON_GAP)
+                                    .sum();
+                                let room = (ui.available_width() - reserved).max(FIELD_FLOOR);
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing.x = theme::ROW_BUTTON_GAP;
+                                    theme::section_password_field_within(
+                                        ui,
+                                        &mut draft.totp,
+                                        &mut draft.reveal_totp,
+                                        room,
+                                    );
+                                    if controls::button(ui, ButtonKind::Outline, controls::SMALL, TOTP_REPLACE_BUTTON, None).clicked() {
+                                        action = EditAction::AddTotp;
+                                    }
+                                    if controls::button(ui, ButtonKind::Danger, controls::SMALL, SLOT_REMOVE_BUTTON, None).clicked() {
+                                        hide = Some(Slot::Totp);
+                                        crate::kit::toast::show(ui.ctx(), TOTP_REMOVED_TOAST);
+                                    }
+                                });
                             }
                             // **The sentence explains a BOX**, so it is
                             // drawn where there is one. On an empty row it
@@ -13432,13 +13364,10 @@ const GENERATOR_CAPTION_TRACKING: f32 = 1.1;
 
 /// 3d's value: `font-size: 17px`, `letter-spacing: 0.02em` (0.34pt at 17),
 /// `line-height: 1.35` (22.95pt).
-const GENERATOR_PREVIEW_PX: f32 = 17.0;
+const GENERATOR_PREVIEW_PX: f32 = 21.0;
 const GENERATOR_PREVIEW_TRACKING: f32 = 0.34;
-const GENERATOR_PREVIEW_LINE: f32 = 22.95;
+const GENERATOR_PREVIEW_LINE: f32 = 28.0;
 
-/// 3d's `gap: 12px` down the card's body, and its `gap: 10px` across the
-/// control row.
-const GENERATOR_BODY_GAP: f32 = 12.0;
 const GENERATOR_ROW_GAP: f32 = 10.0;
 
 /// The card's width: 3d's own, derived above.
@@ -13460,7 +13389,7 @@ const GENERATOR_ROW_GAP: f32 = 10.0;
 /// at 298), and that is correct rather than a mistake to be measured away: a
 /// modal is a WINDOW-level surface, centred over the whole vault window,
 /// which `crate::settings::MIN_VAULT_WINDOW_SIZE` floors at 900 across.
-const GENERATOR_CARD_WIDTH: f32 = 424.0;
+const GENERATOR_CARD_WIDTH: f32 = 520.0;
 
 /// What the card shows in the value's place before the first candidate has
 /// arrived -- one frame on a healthy backend, and indefinitely after a
@@ -13491,8 +13420,6 @@ const GENERATOR_CANCEL: &str = "Cancel";
 /// drove there with the keyboard, and not enough on a card opened by a
 /// pointer.
 const GENERATOR_REROLL: &str = "New";
-const GENERATOR_REROLL_CHORD: &str = "CTRL+R";
-
 /// The segmented selector's two cells, in 3d's reading order (its own run puts
 /// the wordier choice first too).
 const GENERATOR_KIND_PASSWORD: &str = "Password";
@@ -13538,18 +13465,12 @@ enum GeneratorAnswer {
 /// that a change with no effect on the wire (opening the options disclosure)
 /// costs nothing.
 fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> GeneratorAnswer {
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    use crate::kit::modal::{Dialog, ModalOutcome};
     let mut answer = GeneratorAnswer::None;
 
-    // The `Area` is declared HERE and its id is a literal, for the reason
-    // `icon_modal` gives: `item_list::MODAL_SCRIM_AREAS` is walked for exactly
-    // this declaration, and a scrim that walk cannot see is a modal the item
-    // list's arrow keys steer straight through.
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("password-generator-scrim")));
-
     // Read before the body draws, because the body borrows the draft mutably
-    // and the footer's closure cannot borrow it again -- `theme::modal_card`'s
-    // own doc records that rule and `icon_modal` follows it for the same
-    // reason.
+    // and the footer must not borrow it again.
     let ready = !draft.generator.preview.is_empty();
     // **Whether a gesture is still in progress**, which is what holds a
     // recipe change back until the user lets go. See [`GeneratorDraft::asked`]
@@ -13558,44 +13479,40 @@ fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> Generator
     // release has been consumed by a button.
     let settling = ctx.input(|i| i.pointer.any_down());
     let mut rerolled = false;
+    let (mut used, mut cancelled) = (false, false);
 
-    let press = theme::modal_card(
-        ctx,
-        egui::Area::new(egui::Id::new("password-generator-modal")),
-        theme::ModalCard {
-            // Blue, not `ERROR`: this is an ordinary question. `icon_modal`
-            // argues the colour out in full.
-            accent: theme::BLUE,
-            glyph: theme::ModalGlyph::None,
-            title: GENERATOR_TITLE,
-            width: GENERATOR_CARD_WIDTH,
-            dismiss: GENERATOR_CANCEL,
-            body: theme::ModalBody::Padded,
-        },
-        |ui| rerolled = generator_card_body(ui, &mut draft.generator),
-        // **Greyed while there is no candidate**, rather than refusing on the
-        // click: an empty card is not a wrong answer, it is a request that has
-        // not come back (or one the backend refused), and a button that looked
-        // live and did nothing would be indistinguishable from a broken one.
-        // `EditDraft::use_generated_password` refuses the empty case anyway.
-        |ui| theme::primary_button_enabled(ui, GENERATOR_USE, None, ready),
-    );
+    // **A v2 dialog** (the scrim, the corner mark and Escape are the kit's):
+    // the old card's coloured header band and tinted footer are gone. Escape,
+    // the mark and the scrim all mean Cancel, which is also the SAFE answer by
+    // construction -- the card's other outcome overwrites a password the user
+    // may have typed by hand.
+    let (outcome, ()) = Dialog::new(GENERATOR_ID, GENERATOR_CARD_WIDTH).title(GENERATOR_TITLE).show(ctx, |ui| {
+        rerolled = generator_card_body(ui, &mut draft.generator);
+        ui.add_space(22.0);
+        const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.columns(2, |columns| {
+            // **Greyed while there is no candidate**, rather than refusing on
+            // the click: an empty card is not a wrong answer, it is a request
+            // that has not come back (or one the backend refused), and a
+            // button that looked live and did nothing would be
+            // indistinguishable from a broken one.
+            // `EditDraft::use_generated_password` refuses the empty case
+            // anyway.
+            used = columns[0]
+                .add_enabled_ui(ready, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, GENERATOR_USE))
+                .inner
+                .clicked();
+            cancelled = controls::button_filling(&mut columns[1], ButtonKind::Outline, ANSWER, GENERATOR_CANCEL).clicked();
+        });
+    });
 
-    // Confirm first and dismiss second, so that a frame somehow reporting both
-    // resolves to the answer that changes nothing -- the ordering
-    // `delete_modal` argues for its own pair.
-    if press.confirmed {
+    // Use first and Cancel second, so that a frame somehow reporting both
+    // resolves to the answer that changes nothing.
+    if used {
         answer = GeneratorAnswer::Use;
     }
-    if press.dismissed {
-        answer = GeneratorAnswer::Cancel;
-    }
-    // Esc cancels, same as every other transient overlay in this app -- and
-    // here it is also the SAFE answer by construction, because the card's
-    // other outcome overwrites a password the user may have typed by hand.
-    // The `None` guard is what stops an Escape arriving in the same frame as a
-    // click from throwing that click away.
-    if answer == GeneratorAnswer::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    if cancelled || outcome == ModalOutcome::Closed {
         answer = GeneratorAnswer::Cancel;
     }
     // Last, and only if nothing above answered: a card that is closing has
@@ -13617,6 +13534,19 @@ fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> Generator
     answer
 }
 
+/// The generator dialog's id; its scrim is `"password-generator-scrim"`.
+const GENERATOR_ID: &str = "password-generator";
+
+/// The generator dialog over the current frame with `candidate` in it, for the
+/// UI preview. Nothing it reports goes anywhere.
+pub fn preview_generator_modal(ctx: &egui::Context, candidate: &str, options_open: bool) {
+    let mut draft = EditDraft::empty_of(crate::vault_bridge::ItemKind::Login);
+    draft.open_generator();
+    draft.set_generated_candidate(candidate);
+    draft.generator.options_open = options_open;
+    let _ = draw_generator_modal(ctx, &mut draft);
+}
+
 /// 3d's card body: the caption line, the value, and the control row -- plus
 /// the options disclosure's block when it is open. Answers whether the re-roll
 /// was asked for.
@@ -13625,61 +13555,36 @@ fn draw_generator_modal(ctx: &egui::Context, draft: &mut EditDraft) -> Generator
 /// [`generator_options`] is and for the same reason: it needs no other part of
 /// the draft, so its layout can be exercised against a `GeneratorDraft` alone.
 fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> bool {
+    use crate::kit::controls::{self, ButtonKind};
     let mut reroll = false;
+    ui.spacing_mut().item_spacing.y = 0.0;
 
     generator_caption_row(ui, &generator.preview);
-    ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
+    ui.add_space(10.0);
     generator_preview(ui, &generator.preview);
-    ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
+    ui.add_space(18.0);
 
-    // **Wrapped, not `horizontal`**, for the reason the row this replaces was
-    // wrapped: its content has a FLOOR rather than a share -- a two-cell
-    // segmented run, a spinner wide enough for " chars", a keycap and a button
-    // -- and an unwrapped row does not shrink to fit, it pushes its container
-    // out and inflates every `available_width()` measured after it. Inside a
-    // card of a FIXED width that means contents drawn past the card's own
-    // edge. Wrapping spends a second line instead, which is the only one of
-    // the two failures the user can still click.
-    //
-    // 3d puts its re-roll at the far right, behind a spacer. There is no
-    // spacer here: a `horizontal_wrapped` has no right-hand end to align to
-    // once the row may become two.
+    // **Wrapped, not `horizontal`**: the row's content has a FLOOR rather
+    // than a share -- a two-cell segmented run, a spinner wide enough for
+    // " chars", a keycap and a button -- and an unwrapped row does not shrink
+    // to fit, it pushes its container out. Wrapping spends a second line
+    // instead, which is the only one of the two failures the user can still
+    // click.
     ui.horizontal_wrapped(|ui| {
-        // The one dial the segmented run, the size spinner, the keycap and the
-        // re-roll button all read, set to the run's own height so the row
-        // agrees by CONSTRUCTION rather than by four literals kept in step.
-        // `row_button` is already `theme::ROW_BUTTON_HEIGHT_2B`, which is the
-        // same 28.
         ui.spacing_mut().interact_size.y = theme::SEGMENT_HEIGHT;
-        ui.spacing_mut().item_spacing.x = GENERATOR_ROW_GAP;
+        ui.spacing_mut().item_spacing = egui::vec2(GENERATOR_ROW_GAP, 10.0);
         // **`Extend`, and without it the wrap above is decoration.** A
         // `horizontal_wrapped` sets `Ui::wrap_mode` to `Wrap`, so a button
         // whose turn comes with seven points of room left lays its label out
-        // INTO those seven points -- one letter per line -- reports a desired
-        // size that fits, and is never wrapped to the next row at all. What
-        // the eye sees is a stub of a control and a card that grew by the
-        // button's padding anyway. Measured: `New` came out 8.8 points wide on
-        // a card that went from 426 to 459. Extending makes every item ask for
-        // its natural width, which is the number egui's wrap test needs to be
-        // given before it can decide anything.
+        // INTO those seven points -- one letter per line.
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
-        // 3d's joined run. `theme::segmented_control` reports the cell that
-        // was pressed even when it is the cell already in force, so the
-        // assignment below is deliberately unconditional -- setting a bool to
-        // what it already holds is the no-op the control expects its callers
-        // to make of that.
-        let picked = theme::segmented_control(
+        // 3d's joined run, in the kit's segmented control. It reports the
+        // cell pressed only when it is not already in force.
+        let picked = controls::segmented(
             ui,
-            &[
-                theme::Segment {
-                    label: GENERATOR_KIND_PASSWORD,
-                    selected: !generator.passphrase,
-                },
-                theme::Segment {
-                    label: GENERATOR_KIND_PASSPHRASE,
-                    selected: generator.passphrase,
-                },
-            ],
+            &[GENERATOR_KIND_PASSWORD, GENERATOR_KIND_PASSPHRASE],
+            usize::from(generator.passphrase),
+            controls::SEG_SETTINGS,
         );
         match picked {
             Some(0) => generator.passphrase = false,
@@ -13706,29 +13611,26 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
                     .suffix(" chars"),
             );
         }
-        // 3d's `CTRL+R NEW`, at the end of the row 3d puts it at.
-        theme::kbd_chip_on_card(ui, GENERATOR_REROLL_CHORD);
-        if theme::row_button(ui, GENERATOR_REROLL).clicked() {
+        // 3d's `CTRL+R NEW`, at the end of the row 3d puts it at: the verb on
+        // the button, the chord in its hint.
+        let new = controls::button(ui, ButtonKind::Tinted, controls::SMALL, GENERATOR_REROLL, Some(crate::kit::icon::glyph::GEN));
+        crate::kit::tips::hint(ui, &new, "Roll a new one", &["Ctrl", "R"]);
+        if new.clicked() {
             reroll = true;
         }
     });
-    // **A disclosure, not seven more controls on the row above, and on a line
-    // of its own rather than at the end of that one.**
-    //
-    // Every control in the block it opens is a chip, a combo or a spinner in a
-    // `horizontal_wrapped` of its own, so the block's width floor is one
-    // widest chip rather than a sum -- it cannot push the card's contents past
-    // its edge however many options it grows, which is the property the row
-    // above does not have and the reason it is not the place to put them. See
+    // **A disclosure on a line of its own**, directly above the thing it
+    // discloses: every control in the block it opens is a chip, a combo or a
+    // spinner in a `horizontal_wrapped` of its own, so the block's width floor
+    // is one widest chip rather than a sum -- it cannot push the card's
+    // contents past its edge however many options it grows. See
     // `the_generator_options_stay_inside_the_modal_card`.
-    //
-    // The line of its own is the row's width talking (see
-    // [`GENERATOR_CARD_WIDTH`]), and it is also where a disclosure belongs:
-    // directly above the thing it discloses.
-    ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
-    if ui.selectable_label(generator.options_open, GENERATOR_OPTIONS).clicked() {
-        generator.options_open = !generator.options_open;
-    }
+    ui.add_space(14.0);
+    ui.horizontal(|ui| {
+        if controls::button(ui, ButtonKind::Outline, controls::SMALL, GENERATOR_OPTIONS, None).clicked() {
+            generator.options_open = !generator.options_open;
+        }
+    });
     // The chord the keycap beside the button advertises. `consume_shortcut`
     // compares the WHOLE modifier set, so this is CTRL+R and not CTRL+SHIFT+R
     // -- and nothing else in this crate binds either.
@@ -13737,7 +13639,7 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
         reroll = true;
     }
     if generator.options_open {
-        ui.add_space(GENERATOR_BODY_GAP - ui.spacing().item_spacing.y);
+        ui.add_space(14.0);
         generator_options(ui, generator);
     }
 
@@ -13767,46 +13669,43 @@ fn generator_card_body(ui: &mut egui::Ui, generator: &mut GeneratorDraft) -> boo
 /// password that does not exist yet weak would be scolding the user for a
 /// request still in flight.
 fn generator_caption_row(ui: &mut egui::Ui, preview: &str) {
-    let (row, _) = ui.allocate_exact_size(
-        egui::Vec2::new(ui.available_width(), theme::PILL_HEIGHT),
-        egui::Sense::hover(),
-    );
+    let p = crate::kit::tokens::palette(ui.ctx());
+    let (row, _) = ui.allocate_exact_size(egui::Vec2::new(ui.available_width(), 26.0), egui::Sense::hover());
     let painter = ui.painter();
     let galley = painter.layout_job(theme::letterspaced(
         GENERATOR_CAPTION,
         GENERATOR_CAPTION_PX,
         theme::BOLD,
         GENERATOR_CAPTION_TRACKING,
-        theme::TEXT_FAINT,
+        p.text_ghost,
     ));
     painter.galley(
         egui::Pos2::new(row.left(), row.center().y - galley.size().y / 2.0),
         galley,
-        theme::TEXT_FAINT,
+        p.text_ghost,
     );
     if preview.is_empty() {
         return;
     }
     let rating = password_strength::rate(preview);
+    // **The pill is only green when the rating earns it.** The candidate is
+    // rated whatever the backend sent, and a `Weak` badge in the affirmative
+    // colour would be telling the user the opposite of what it says. Anything
+    // short of `Strong` gets the quiet pair. Nothing at all while there is no
+    // candidate: rating the empty string answers `Weak`, and a card that
+    // opened by calling a password that does not exist yet weak would be
+    // scolding the user for a request still in flight.
     let strong = rating == password_strength::Strength::Strong;
-    let tone = theme::PillTone {
-        fill: if strong { theme::BLUE_WASH } else { theme::CANVAS },
-        // 3d's badge has no border at all; `state_pill` always strokes one, so
-        // the edge is the fill and the pill reads as the flat lozenge 3d draws.
-        edge: if strong { theme::BLUE_WASH } else { theme::CANVAS },
-        ink: if strong { theme::BLUE_DEEP } else { theme::TEXT_FAINT },
-        mark: theme::PillMark::None,
-    };
-    let width = theme::state_pill_width(painter, tone, rating.label());
-    theme::state_pill(
-        painter,
-        egui::Pos2::new(row.right() - width, row.center().y),
-        tone,
-        rating.label(),
-    );
+    let (fill, ink) = if strong { (p.done_wash, p.done_ink) } else { (p.hover, p.text_faint) };
+    let font = egui::FontId::new(13.0, egui::FontFamily::Name(theme::BOLD.into()));
+    let text = painter.layout_no_wrap(rating.label().to_string(), font, ink);
+    let size = egui::vec2(text.size().x + 22.0, text.size().y + 10.0);
+    let rect = egui::Rect::from_center_size(egui::pos2(row.right() - size.x / 2.0, row.center().y), size);
+    painter.rect_filled(rect, egui::CornerRadius::same(255), fill);
+    painter.galley(rect.min + egui::vec2(11.0, 5.0), text, ink);
 }
 
-/// The candidate itself, in 3d's 17px monospace.
+/// The candidate itself, in a v2 value box in monospace.
 ///
 /// **`break_anywhere`, which is 3d's `word-break: break-all`.** A generated
 /// password has no spaces to break at, so egui's default word wrapping would
@@ -13820,26 +13719,22 @@ fn generator_caption_row(ui: &mut egui::Ui, preview: &str) {
 /// on purpose, and a generator whose output is bulleted out cannot be read,
 /// judged or re-rolled.
 fn generator_preview(ui: &mut egui::Ui, preview: &str) {
-    let mut job = if preview.is_empty() {
-        theme::letterspaced_mono_in(
-            GENERATOR_PENDING,
-            GENERATOR_PREVIEW_PX,
-            0.0,
-            theme::TEXT_GHOST,
-            GENERATOR_PREVIEW_LINE,
-        )
-    } else {
-        theme::letterspaced_mono_in(
-            preview,
-            GENERATOR_PREVIEW_PX,
-            GENERATOR_PREVIEW_TRACKING,
-            theme::INK,
-            GENERATOR_PREVIEW_LINE,
-        )
-    };
-    job.wrap.max_width = ui.available_width();
-    job.wrap.break_anywhere = true;
-    ui.add(egui::Label::new(job));
+    let p = crate::kit::tokens::palette(ui.ctx());
+    egui::Frame::new()
+        .fill(p.secondary_hover)
+        .corner_radius(egui::CornerRadius::same(14))
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            let mut job = if preview.is_empty() {
+                theme::letterspaced_mono_in(GENERATOR_PENDING, GENERATOR_PREVIEW_PX, 0.0, p.text_ghost, GENERATOR_PREVIEW_LINE)
+            } else {
+                theme::letterspaced_mono_in(preview, GENERATOR_PREVIEW_PX, GENERATOR_PREVIEW_TRACKING, p.ink, GENERATOR_PREVIEW_LINE)
+            };
+            job.wrap.max_width = ui.available_width();
+            job.wrap.break_anywhere = true;
+            ui.add(egui::Label::new(job));
+        });
 }
 
 /// What the discard confirmation came back with, or nothing if it is still
@@ -17053,7 +16948,7 @@ mod generator_row_tests {
 
     /// The rectangle egui really laid the generator card's `Area` out in.
     fn card_rect(ctx: &egui::Context) -> Rect {
-        egui::AreaState::load(ctx, egui::Id::new("password-generator-modal"))
+        egui::AreaState::load(ctx, crate::kit::modal::card_id(GENERATOR_ID))
             .expect("the generator card has never been drawn")
             .rect()
     }
@@ -17265,8 +17160,10 @@ mod generator_row_tests {
 
         let away = Pos2::new(card.center().x, card.top() - 40.0);
         let (action, _) = frame(&ctx, &mut draft, &click(away));
-        assert_eq!(action, EditAction::None, "a click on the scrim answered the card");
-        assert!(draft.generator.modal_open, "a click on the scrim closed the card");
+        // Spec B 2: the scrim closes the dialog -- as Cancel, which is the safe
+        // answer (the card's other outcome overwrites a typed password).
+        assert_eq!(action, EditAction::None, "a click on the scrim answered the card with something");
+        assert!(!draft.generator.modal_open, "a click on the scrim did not close the card");
         assert_eq!(draft.password, "typed-by-hand", "a click on the scrim wrote the box");
     }
 
@@ -18928,8 +18825,9 @@ mod generator_row_tests {
         let mut draft = card_on(&ctx, vec![listed_window("Ledgerline - Invoices", "Ledgerline.exe")]);
 
         let (_, listed) = frame(&ctx, &mut draft, &[]);
-        let row = listed.rect_of("Ledgerline - Invoices");
-        let miss = Pos2::new(row.center().x, row.top() - 200.0);
+        // Inside the card and on none of its rows: its title. (A click on the
+        // scrim outside the card closes the dialog -- spec B 2.)
+        let miss = listed.rect_of(PICKER_TITLE).center();
         let _ = frame(&ctx, &mut draft, &click(miss));
 
         let app = draft.app.as_ref().unwrap();
@@ -21546,23 +21444,22 @@ mod sequence_builder_tests {
         }
     }
 
-    /// The card's own outline: white, `1px #d7d3d3`, radius 12. Asserts it is
-    /// the ONLY such box, so the rows below can be found by "inside it".
+    /// The dialog's card: white, radius 24. Asserts it is the ONLY such box,
+    /// so the rows below can be found by "inside it".
     fn picker_card(painted: &Painted) -> PaintedRect {
         let found: Vec<PaintedRect> = painted
             .rects
             .iter()
             .copied()
             .filter(|r| {
-                r.fill == theme::CARD
-                    && r.stroke == theme::BORDER_STRONG
-                    && r.radius == egui::CornerRadius::same(PICKER_CARD_RADIUS)
+                r.fill == theme::CARD && r.radius == egui::CornerRadius::same(crate::kit::modal::RADIUS)
             })
             .collect();
         assert_eq!(
             found.len(),
             1,
-            "expected exactly one 8b card (white, #d7d3d3, radius {PICKER_CARD_RADIUS}), found {}",
+            "expected exactly one dialog card (white, radius {}), found {}",
+            crate::kit::modal::RADIUS,
             found.len()
         );
         found[0]
@@ -21664,7 +21561,12 @@ mod sequence_builder_tests {
                 painted
             };
             let _ = run();
-            heights.push((viewport, picker_card(&run()).rect.height()));
+            let painted = run();
+            // The dialog's own card is not painted when the picker is drawn
+            // bare: its height is the title's top to the footer's foot.
+            let top = painted.rect_of(PICKER_TITLE).top();
+            let foot = painted.rect_of(PICKER_ADD).bottom();
+            heights.push((viewport, foot - top));
         }
         let (_, roomy) = *heights.last().expect("three viewports were measured");
         for (viewport, height) in &heights {
@@ -21811,11 +21713,11 @@ mod sequence_builder_tests {
             "the count is still on the header's line, at {count:?} against a title at {title:?}"
         );
         assert!(
-            (card.right() - f32::from(PICKER_BAND_PAD_X) - count.right()).abs() <= 2.0,
+            (card.right() - 30.0 - count.right()).abs() <= 2.0,
             "the count ends at {} and the footer band's right-hand end is at {} -- it is \
              sitting after the note rather than pushed to the corner",
             count.right(),
-            card.right() - f32::from(PICKER_BAND_PAD_X)
+            card.right() - 30.0
         );
     }
 
@@ -21864,13 +21766,13 @@ mod sequence_builder_tests {
         // measured to the text's own left edge, so the horizontal claim is
         // exact and the vertical one is asserted as a floor.
         assert!(
-            (title.left() - card.rect.left() - f32::from(PICKER_BAND_PAD_X)).abs() <= 1.0,
-            "the header's title starts {} in from the card, not 8b's {PICKER_BAND_PAD_X}",
+            (title.left() - card.rect.left() - 30.0).abs() <= 1.0,
+            "the header's title starts {} in from the card, not the dialog's 30",
             title.left() - card.rect.left()
         );
         assert!(
-            title.top() - card.rect.top() >= f32::from(PICKER_BAND_PAD_Y) - 1.0,
-            "the header band is tighter than 8b's {PICKER_BAND_PAD_Y}px"
+            title.top() - card.rect.top() >= 28.0 - 1.0,
+            "the title is tighter than the dialog's 28 down"
         );
 
         // Three seams: header/list, list/`Match this window by`, and
@@ -21887,9 +21789,9 @@ mod sequence_builder_tests {
             .collect();
         assert_eq!(
             seams.len(),
-            3,
-            "8b's card has three `1px #eae7e7` seams (under the header, over the match band, \
-             over the footer); this one painted {}",
+            1,
+            "the card has one `1px #eae7e7` seam (over the match band: the title and the \
+             footer are the dialog's, with no rule); this one painted {}",
             seams.len()
         );
         for seam in &seams {
@@ -24090,7 +23992,7 @@ mod edit_pane_layout_tests {
 
     /// The rectangle egui really laid the generator card's `Area` out in.
     fn generator_card_rect(ctx: &egui::Context) -> Rect {
-        egui::AreaState::load(ctx, egui::Id::new("password-generator-modal"))
+        egui::AreaState::load(ctx, crate::kit::modal::card_id(GENERATOR_ID))
             .expect("the generator card has never been drawn")
             .rect()
     }
@@ -24207,33 +24109,13 @@ mod edit_pane_layout_tests {
                      control that size is not a control"
                 );
             }
-            // One row, so one top and one height; the bottoms then follow.
-            // Half a point of slack for the sub-pixel positions egui lays
-            // rows out at, and no more: the defect was 7pt of it.
+            // The v2 kit's segmented run is taller than the size spinner, so
+            // the row's controls agree on a centre line rather than on a top.
             assert!(
-                (spinner.top() - cell.top()).abs() <= 0.5,
-                "the size spinner is painted at top {} while the kind selector beside it \
-                 starts at {} -- the row does not sit on one line in the \
-                 passphrase={passphrase} state",
-                spinner.top(),
-                cell.top()
-            );
-            assert!(
-                (spinner.height() - cell.height()).abs() <= 0.5,
-                "the size spinner is {}pt tall against the selector's {}pt in the \
-                 passphrase={passphrase} state -- the row's controls are different sizes",
-                spinner.height(),
-                cell.height()
-            );
-            // And the height is the segmented run's own by construction, not
-            // whatever the two happened to agree on: a row where both
-            // collapsed to egui's 26pt default would satisfy everything above.
-            assert!(
-                (cell.height() - theme::SEGMENT_HEIGHT).abs() <= 0.5,
-                "the generator row is {}pt tall in the passphrase={passphrase} state, not \
-                 theme::SEGMENT_HEIGHT ({})",
-                cell.height(),
-                theme::SEGMENT_HEIGHT
+                (spinner.center().y - cell.center().y).abs() <= 1.0,
+                "the size spinner is centred at {} while the kind selector beside it is                  centred at {} -- the row does not sit on one line in the                  passphrase={passphrase} state",
+                spinner.center().y,
+                cell.center().y
             );
         }
     }

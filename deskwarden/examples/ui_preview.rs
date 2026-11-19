@@ -684,6 +684,20 @@ enum Surface {
     ModalEmptyTrash,
     /// The forget-a-person confirmation over the shell.
     ModalForget,
+    /// The people-sharing dialog (design 6a), asking, invited, and asking
+    /// the organisation question.
+    ModalShare,
+    ModalShareInvited,
+    ModalShareQuestion,
+    /// The record import form, fetched and asking about a name collision.
+    ModalRecordImport,
+    /// The in-form password generator, and with its options open.
+    ModalGenerator,
+    ModalGeneratorOptions,
+    /// The running-window picker, one row staged.
+    ModalAppPicker,
+    /// The fill-rule (sequence) builder.
+    ModalSequence,
     /// The Add 2FA modal while the screen is being read.
     ModalTotpScanning,
     /// The Add 2FA modal asking which camera to use.
@@ -996,6 +1010,14 @@ const ALL: &[Surface] = &[
     Surface::ModalIcon,
     Surface::ModalEmptyTrash,
     Surface::ModalForget,
+    Surface::ModalShare,
+    Surface::ModalShareInvited,
+    Surface::ModalShareQuestion,
+    Surface::ModalRecordImport,
+    Surface::ModalGenerator,
+    Surface::ModalGeneratorOptions,
+    Surface::ModalAppPicker,
+    Surface::ModalSequence,
     Surface::ModalTotpScanning,
     Surface::ModalTotpCameras,
     Surface::ModalImportSource,
@@ -1135,6 +1157,14 @@ impl Surface {
             Surface::ModalIcon => "modal_icon_pick",
             Surface::ModalEmptyTrash => "modal_empty_trash",
             Surface::ModalForget => "modal_forget",
+            Surface::ModalShare => "modal_share",
+            Surface::ModalShareInvited => "modal_share_invited",
+            Surface::ModalShareQuestion => "modal_share_question",
+            Surface::ModalRecordImport => "modal_record_import",
+            Surface::ModalGenerator => "modal_password_generator",
+            Surface::ModalGeneratorOptions => "modal_password_generator_options",
+            Surface::ModalAppPicker => "modal_app_window_picker",
+            Surface::ModalSequence => "modal_sequence_builder",
             Surface::ModalTotpScanning => "totp_add_scanning",
             Surface::ModalTotpCameras => "totp_add_cameras",
             Surface::ModalImportSource => "modal_import_source",
@@ -1380,6 +1410,14 @@ impl Surface {
             | Surface::ModalIcon
             | Surface::ModalEmptyTrash
             | Surface::ModalForget
+            | Surface::ModalShare
+            | Surface::ModalShareInvited
+            | Surface::ModalShareQuestion
+            | Surface::ModalRecordImport
+            | Surface::ModalGenerator
+            | Surface::ModalGeneratorOptions
+            | Surface::ModalAppPicker
+            | Surface::ModalSequence
             | Surface::ModalTotpScanning
             | Surface::ModalTotpCameras
             | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
@@ -1567,6 +1605,14 @@ fn main() -> eframe::Result {
             Surface::ModalIcon,
             Surface::ModalEmptyTrash,
             Surface::ModalForget,
+            Surface::ModalShare,
+            Surface::ModalShareInvited,
+            Surface::ModalShareQuestion,
+            Surface::ModalRecordImport,
+            Surface::ModalGenerator,
+            Surface::ModalGeneratorOptions,
+            Surface::ModalAppPicker,
+            Surface::ModalSequence,
             Surface::ModalTotpScanning,
             Surface::ModalTotpCameras,
             Surface::ModalImportSource,
@@ -2187,6 +2233,14 @@ impl eframe::App for Preview {
             | Surface::ModalIcon
             | Surface::ModalEmptyTrash
             | Surface::ModalForget
+            | Surface::ModalShare
+            | Surface::ModalShareInvited
+            | Surface::ModalShareQuestion
+            | Surface::ModalRecordImport
+            | Surface::ModalGenerator
+            | Surface::ModalGeneratorOptions
+            | Surface::ModalAppPicker
+            | Surface::ModalSequence
             | Surface::ModalTotpScanning
             | Surface::ModalTotpCameras) => {
                 use deskwarden::vault_window::{delete_modal, folder_modal, icon_modal, record_ui, trash_modal};
@@ -2212,6 +2266,75 @@ impl eframe::App for Preview {
                     Surface::ModalForget => {
                         let names = vec!["Ledgerline".to_string(), "Northwind Mail".to_string()];
                         let _ = record_ui::draw_forget_confirm(&ctx, "anna@northwind.example", &names);
+                    }
+                    Surface::ModalShare | Surface::ModalShareInvited | Surface::ModalShareQuestion => {
+                        use deskwarden::vault_window::share_ui::{SharePreview, SharePreviewStage};
+                        let stage = match surface {
+                            Surface::ModalShare => SharePreviewStage::Asking,
+                            Surface::ModalShareInvited => SharePreviewStage::Invited,
+                            _ => SharePreviewStage::Question,
+                        };
+                        SharePreview::new(stage).draw(&ctx);
+                    }
+                    Surface::ModalRecordImport => {
+                        let mut state = record_ui::RecordImport::opening();
+                        state.draft.link = "https://vault.northwind.example/#/send/Q2x1/ZkxN".to_string();
+                        state.fetched = Some(Ok(deskwarden::record::Record {
+                            name: "Ledgerline".to_string(),
+                            username: Some("a.novak@ledgerline.com".to_string()),
+                            password: Some(zeroize::Zeroizing::new("hunter2".to_string())),
+                            uri: Some("https://app.ledgerline.eu".to_string()),
+                            notes: None,
+                            totp_sealed: None,
+                            not_after: None,
+                        }));
+                        let collision = deskwarden::record::import::Collision::SameName { existing_id: "list-0001".to_string() };
+                        let now = send::FixedClock(PREVIEW_MILLIS);
+                        let _ = record_ui::draw_import_modal(&ctx, &mut state, &collision, &now);
+                    }
+                    Surface::ModalGenerator | Surface::ModalGeneratorOptions => {
+                        detail_edit::preview_generator_modal(
+                            &ctx,
+                            "k7#Qm2vP9xL!tR4wZb8",
+                            matches!(surface, Surface::ModalGeneratorOptions),
+                        );
+                    }
+                    Surface::ModalAppPicker => {
+                        let row = |title: &str, exe: &str, hwnd: isize| detail_edit::AppWindowRow {
+                            title: title.to_string(),
+                            exe_name: exe.to_string(),
+                            exe_path: format!("C:\\Program Files\\{exe}"),
+                            hosted: false,
+                            pid: 100 + hwnd as u32,
+                            hwnd,
+                        };
+                        let windows = vec![
+                            row("SAP Logon 760", "saplogon.exe", 1),
+                            row("Remote Desktop Connection", "mstsc.exe", 2),
+                            row("Ledgerline Desktop", "ledgerline.exe", 3),
+                            row("Postgres admin", "pgadmin4.exe", 4),
+                            row("Notepad", "notepad.exe", 5),
+                        ];
+                        detail_edit::preview_app_window_picker(&ctx, windows, Some(2));
+                    }
+                    Surface::ModalSequence => {
+                        use deskwarden::vault_window::sequence_builder;
+                        let edit_login = item(EDIT_LOGIN_JSON);
+                        let mut draft = sequence_builder::SequenceDraft::for_item(&edit_login, "Work", "SAP GUI for Windows")
+                            .expect("the 8a fixture carries an app binding");
+                        let palette = vec![
+                            deskwarden::key_sequence::FieldRef::Username,
+                            deskwarden::key_sequence::FieldRef::Password,
+                        ];
+                        let totp = deskwarden::vault_window::detail::TotpState::NoSecret;
+                        let source = deskwarden::key_sequence::ResolveSource {
+                            username: "a.novak@ledgerline.com",
+                            password: "correct-horse-battery",
+                            custom: Vec::new(),
+                            totp: &totp,
+                        };
+                        let mut apps = deskwarden::app_identity::AppIdentityCache::default();
+                        let _ = sequence_builder::draw_sequence_builder(root, &mut draft, &palette, &source, None, &mut apps);
                     }
                     Surface::ModalTotpCameras => {
                         let mut state = TotpAdd::opening("1", "Ledgerline", false);

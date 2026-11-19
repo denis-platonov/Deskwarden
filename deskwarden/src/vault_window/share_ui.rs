@@ -1367,10 +1367,6 @@ const MODAL_WIDTH: f32 = 560.0;
 /// 1px`, and the `gap: 10px` after it.
 const ACCESS_EYE: f32 = 16.0;
 const ACCESS_EYE_GAP: f32 = 10.0;
-/// 6a's `.mband`: `padding: 12px 18px`, a 15-point info mark with `gap: 9px`.
-const BAND_PAD_Y: i8 = 12;
-const BAND_MARK: f32 = 15.0;
-const BAND_MARK_GAP: f32 = 9.0;
 /// The password box beside Create an invite code.
 const PASSWORD_BOX_WIDTH: f32 = 220.0;
 /// The scrim of the forget question, which can stand over this dialog (a
@@ -1381,15 +1377,16 @@ const FORGET_SCRIM: &str = "record-forget-scrim";
 /// `<b>` gives it, wrapped at `width`. 12px at a 1.5 line height, the
 /// mock's `.access .t`.
 fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
+    let p = crate::kit::tokens::Palette::LIGHT;
     let plain = egui::TextFormat {
-        font_id: egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        color: theme::TEXT_SECONDARY,
-        line_height: Some(18.0),
+        font_id: egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        color: p.text_nav,
+        line_height: Some(20.0),
         ..Default::default()
     };
     let strong = egui::TextFormat {
-        font_id: egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-        color: theme::INK,
+        font_id: egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())),
+        color: p.ink,
         ..plain.clone()
     };
     let mut job = egui::text::LayoutJob::default();
@@ -1483,168 +1480,243 @@ pub(crate) fn draw_share_modal(
     history: &SentHistory,
     view: Option<&SharingView>,
 ) -> ShareDialogAction {
+    use crate::kit::modal::{Dialog, ModalOutcome};
     let mut action = ShareDialogAction::None;
     let busy = dialog.in_flight || dialog.minting;
     let admin = view.is_some_and(|v| v.can_mint_invites);
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-share-scrim")));
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-share-modal"))).show(ctx, |ui| {
-        // Before the card, not after: a drag strip laid over the card's
-        // controls would swallow their clicks (`theme::modal_drag_handle`).
-        theme::modal_drag_handle(ui, theme::FORM_CARD_HEADER_HEIGHT);
-        ui.set_max_width(MODAL_WIDTH);
-        let (card, title) = theme::form_card(ui, |ui| {
-            let title = theme::form_card_header_share(ui, &format!("Share {}", dialog.item_name));
-            theme::form_card_body(ui, |ui| {
-                ui.set_width(ui.available_width());
-                theme::eyebrow(ui, RECORD_EYEBROW);
-                ui.add_space(theme::EYEBROW_GAP);
-                super::record_ui::record_chip(ui, &dialog.item_name, &super::record_ui::chip_subtitle(item, folder));
-                ui.add_space(theme::BLOCK_GAP);
-
-                // **The WITH box** -- read-only once the share has left an
-                // invitation (6a's fourth state draws the address greyed):
-                // the answer on the band is about that address, and editing
-                // it under the band would make the two disagree.
-                theme::eyebrow(ui, WITH_EYEBROW);
-                ui.add_space(theme::EYEBROW_GAP);
-                let editable = !busy && dialog.invited.is_none() && dialog.adopt.is_none();
-                let width = ui.available_width();
-                let field = ui
-                    .add_enabled_ui(editable, |ui| theme::inline_field(ui, &mut dialog.email, WITH_HINT, width, false))
-                    .inner;
-                if editable && !dialog.focused {
-                    field.request_focus();
-                    dialog.focused = true;
-                }
-                if let Some(email) = super::send_ui::draw_people_suggestions(
-                    ui,
-                    egui::Id::new("record-share-suggestions"),
-                    &field,
-                    &mut dialog.email,
-                    history,
-                    editable,
-                    SUGGESTIONS_EYEBROW,
-                    &person_count_words,
-                ) {
-                    action = ShareDialogAction::Forget(email);
-                }
-                // The ↵ on the Share button is a promise: Enter in the box
-                // shares. A single-line box gives up the keyboard on Enter,
-                // which is how the press is seen here.
-                if editable
-                    && field.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && !dialog.email.trim().is_empty()
-                {
-                    action = ShareDialogAction::Submit;
-                }
-                ui.add_space(theme::BLOCK_GAP);
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-                    let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(ACCESS_EYE), egui::Sense::hover());
-                    theme::paint_view_eye(ui.painter(), mark.translate(egui::vec2(0.0, 1.0)), theme::TEXT_MUTED);
-                    ui.add_space(ACCESS_EYE_GAP);
-                    let width = ui.available_width();
-                    ui.add(egui::Label::new(access_job(&dialog.item_name, width)).wrap());
-                });
-                // **The roster-visibility warning** (official-path spec §3.4):
-                // where members may read the roster, everyone a record is
-                // shared with can list everyone else, and no request this app
-                // makes can stop it. Decided by the server's own name
-                // (`SharingView::roster_visible_to_recipients`).
-                if view.is_some_and(|v| v.roster_visible_to_recipients) {
-                    ui.add_space(10.0);
-                    ui.add(egui::Label::new(egui::RichText::new(ROSTER_VISIBLE_WARNING).size(12.0).color(theme::TEXT_MUTED)).wrap());
-                }
-                // The last attempt's sentence -- the engine's refusal (a
-                // record with attachments, in the trash, in another
-                // organisation, waiting to come home), a refused request, a
-                // forget that did not finish. Shown here and never logged.
-                if let Some(error) = &dialog.error {
-                    ui.add_space(10.0);
-                    ui.add(egui::Label::new(egui::RichText::new(error).size(12.0).color(theme::ERROR)).wrap());
-                }
-            });
-            if let Some(email) = dialog.invited.clone() {
-                if let Some(asked) = invited_block(ui, dialog, &email, admin) {
-                    action = asked;
-                }
-            }
-            if let Some(question) = &dialog.adopt {
-                question_band(ui, &question.sentence(), ADOPT_BODY);
-            }
-            // **5a's footer, answers left and a standing note right** --
-            // and the note says what is running while something is.
-            theme::form_card_footer(ui, |ui| {
-                let note = if dialog.in_flight {
-                    SHARING_NOW
-                } else if dialog.minting {
-                    MAKING_CODE
-                } else {
-                    APPEARS_IN_SENT
-                };
-                ui.horizontal(|ui| {
-                    if dialog.invited.is_some() {
-                        if theme::primary_button_enabled(ui, DONE_BUTTON, None, !busy).clicked() {
-                            action = ShareDialogAction::Done;
-                        }
-                    } else if dialog.adopt.is_some() {
-                        // The question's answers stand where Share and Cancel
-                        // stood; the ✕ and Escape still close the dialog,
-                        // answering nothing.
-                        if theme::primary_button_enabled(ui, ADOPT_YES, None, !busy).clicked() {
-                            action = ShareDialogAction::Adopt;
-                        }
-                        ui.add_space(theme::FORM_FOOTER_GAP);
-                        if ui.add_enabled_ui(!busy, |ui| theme::secondary_button(ui, ADOPT_NO)).inner.clicked() {
-                            action = ShareDialogAction::NewOrganization;
-                        }
-                    } else {
-                        let ready = !busy && !dialog.email.trim().is_empty();
-                        if theme::primary_button_enabled(ui, SHARE_BUTTON, Some("\u{21b5}"), ready).clicked() {
-                            action = ShareDialogAction::Submit;
-                        }
-                        ui.add_space(theme::FORM_FOOTER_GAP);
-                        if ui.add_enabled_ui(!busy, |ui| theme::secondary_button(ui, CANCEL_BUTTON)).inner.clicked() {
-                            action = ShareDialogAction::Cancel;
-                        }
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        theme::form_footer_note(ui, note);
-                    });
-                });
-            });
-            title
-        });
-        // 6a's `.mhead .x`: the ✕ answers what Cancel answers, gated by
-        // what gates it -- `record_ui::draw_export_form`'s rule.
-        if theme::modal_corner_mark_gated(ui, card, title, !busy) {
-            action = ShareDialogAction::Cancel;
-        }
-        // **The app's own copy confirmation, over this card** -- the invite
-        // code's Copy says "Invite code copied" the way every copy in this
-        // window does. Drawn inside the modal's area, on its layer, for
-        // `totp_add`'s reason: the read pane's toast would be painted under
-        // this card (and stands down while a modal is up).
-        // The copy's confirmation is the window's one toast (`kit::toast`),
-        // painted above every modal at the end of the frame.
-    });
     // Escape is Cancel -- unless the forget question is standing over this
     // dialog, where Escape is that question's "No" and must not also close
-    // the dialog underneath it.
+    // the dialog underneath it. The scrim, the corner mark and Escape are all
+    // refused while a share or a mint is out.
     let forget_up = ctx.memory(|m| {
         m.areas().is_visible(&egui::LayerId::new(theme::SCRIM_ORDER, egui::Id::new(FORGET_SCRIM)))
     });
-    if action == ShareDialogAction::None && !busy && !forget_up && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+    let title = format!("Share {}", dialog.item_name);
+    let (outcome, ()) = Dialog::new(SHARE_ID, MODAL_WIDTH).title(&title).esc_closes(!busy && !forget_up).show(ctx, |ui| {
+        let p = crate::kit::tokens::palette(ui.ctx());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        crate::kit::card::section_label(ui, RECORD_EYEBROW, p.text_ghost);
+        ui.add_space(8.0);
+        super::record_ui::record_chip(ui, &dialog.item_name, &super::record_ui::chip_subtitle(item, folder));
+        ui.add_space(22.0);
+
+        // **The WITH box** -- read-only once the share has left an
+        // invitation (6a's fourth state draws the address greyed): the answer
+        // on the band is about that address, and editing it under the band
+        // would make the two disagree.
+        crate::kit::card::section_label(ui, WITH_EYEBROW, p.text_ghost);
+        ui.add_space(8.0);
+        let editable = !busy && dialog.invited.is_none() && dialog.adopt.is_none();
+        let width = ui.available_width();
+        let field_id = egui::Id::new((SHARE_ID, "with"));
+        let field = if editable {
+            crate::kit::input::text(ui, field_id, &mut dialog.email, WITH_HINT, false, width)
+        } else {
+            let rect = crate::kit::input::text_disabled(ui, &dialog.email, width, crate::kit::input::SIGN_IN);
+            ui.interact(rect, field_id, egui::Sense::hover())
+        };
+        if editable && !dialog.focused {
+            field.request_focus();
+            dialog.focused = true;
+        }
+        if let Some(email) = super::send_ui::draw_people_suggestions(
+            ui,
+            egui::Id::new("record-share-suggestions"),
+            &field,
+            &mut dialog.email,
+            history,
+            editable,
+            SUGGESTIONS_EYEBROW,
+            &person_count_words,
+        ) {
+            action = ShareDialogAction::Forget(email);
+        }
+        // The Enter on the Share button is a promise: Enter in the box shares.
+        // A single-line box gives up the keyboard on Enter, which is how the
+        // press is seen here.
+        if editable
+            && field.lost_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && !dialog.email.trim().is_empty()
+        {
+            action = ShareDialogAction::Submit;
+        }
+        ui.add_space(18.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+            let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(ACCESS_EYE), egui::Sense::hover());
+            crate::kit::icon::stroke(ui.painter(), mark.translate(egui::vec2(0.0, 2.0)), crate::kit::icon::glyph::EYE, 1.8, p.text_icon);
+            ui.add_space(ACCESS_EYE_GAP);
+            let width = ui.available_width();
+            ui.add(egui::Label::new(access_job(&dialog.item_name, width)).wrap());
+        });
+        // **The roster-visibility warning** (official-path spec §3.4): where
+        // members may read the roster, everyone a record is shared with can
+        // list everyone else, and no request this app makes can stop it.
+        // Decided by the server's own name
+        // (`SharingView::roster_visible_to_recipients`).
+        if view.is_some_and(|v| v.roster_visible_to_recipients) {
+            ui.add_space(14.0);
+            crate::kit::modal::note(ui, crate::kit::modal::Tone::Caution, ROSTER_VISIBLE_WARNING);
+        }
+        // The last attempt's sentence -- the engine's refusal (a record with
+        // attachments, in the trash, in another organisation, waiting to come
+        // home), a refused request, a forget that did not finish. Shown here
+        // and never logged.
+        if let Some(error) = &dialog.error {
+            ui.add_space(14.0);
+            crate::kit::modal::note(ui, crate::kit::modal::Tone::Danger, error);
+        }
+        if let Some(email) = dialog.invited.clone() {
+            ui.add_space(18.0);
+            if let Some(asked) = invited_block(ui, dialog, &email, admin) {
+                action = asked;
+            }
+        }
+        if let Some(question) = &dialog.adopt {
+            ui.add_space(18.0);
+            question_band(ui, &question.sentence(), ADOPT_BODY);
+        }
+
+        // **The answers, then a standing note** -- and the note says what is
+        // running while something is.
+        ui.add_space(22.0);
+        let note = if dialog.in_flight {
+            SHARING_NOW
+        } else if dialog.minting {
+            MAKING_CODE
+        } else {
+            APPEARS_IN_SENT
+        };
+        use crate::kit::controls::{self, ButtonKind, ButtonSize};
+        const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        // Primary on the left, the quieter answer beside it, each half the
+        // width (6a's `flex: 1` pair); Done stands alone.
+        let answer = |ui: &mut egui::Ui, enabled: bool, kind: ButtonKind, label: &str| -> bool {
+            ui.add_enabled_ui(enabled, |ui| controls::button_filling(ui, kind, ANSWER, label)).inner.clicked()
+        };
+        if dialog.invited.is_some() {
+            if answer(ui, !busy, ButtonKind::Primary, DONE_BUTTON) {
+                action = ShareDialogAction::Done;
+            }
+        } else {
+            let (first, second) = if dialog.adopt.is_some() {
+                (ADOPT_YES, ADOPT_NO)
+            } else {
+                (SHARE_BUTTON, CANCEL_BUTTON)
+            };
+            let ready = if dialog.adopt.is_some() { !busy } else { !busy && !dialog.email.trim().is_empty() };
+            ui.spacing_mut().item_spacing.x = 10.0;
+            ui.columns(2, |columns| {
+                if answer(&mut columns[0], ready, ButtonKind::Primary, first) {
+                    action = if dialog.adopt.is_some() { ShareDialogAction::Adopt } else { ShareDialogAction::Submit };
+                }
+                if answer(&mut columns[1], !busy, ButtonKind::Outline, second) {
+                    action = if dialog.adopt.is_some() { ShareDialogAction::NewOrganization } else { ShareDialogAction::Cancel };
+                }
+            });
+        }
+        ui.add_space(12.0);
+        ui.vertical_centered(|ui| {
+            ui.label(egui::RichText::new(note).size(14.0).color(p.text_faint));
+        });
+        // The copy's confirmation is the window's one toast (`kit::toast`),
+        // painted above every modal at the end of the frame.
+    });
+    // The scrim, the corner mark and Escape answer what Cancel answers, gated
+    // by what gates it (`record_ui::draw_export_form`'s rule).
+    if action == ShareDialogAction::None && outcome == ModalOutcome::Closed && !busy && !forget_up {
         action = ShareDialogAction::Cancel;
     }
     action
 }
 
-/// **The invited band** (6a's fourth state), between the body and the footer:
-/// the amber of `totp_add`'s 6c band rather than `theme::form_card_caution`'s
-/// red, and an info mark rather than a warning, because nothing went wrong --
-/// the share went through and is waiting for the person to accept.
+/// The share dialog's id; its scrim is `"record-share-scrim"`.
+pub(crate) const SHARE_ID: &str = "record-share";
+
+/// The Share dialog's three looks, for the UI preview.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SharePreviewStage {
+    /// An address typed, Share and Cancel.
+    Asking,
+    /// The share left an invitation; an administrator may make a code.
+    Invited,
+    /// The organisation question, Yes and No.
+    Question,
+}
+
+/// A Share dialog the UI preview can draw with no window and no daemon
+/// behind it. Nothing it reports goes anywhere.
+pub struct SharePreview {
+    dialog: ShareDialog,
+    stage: SharePreviewStage,
+}
+
+impl SharePreview {
+    #[must_use]
+    pub fn new(stage: SharePreviewStage) -> Self {
+        let mut dialog = ShareDialog::opening("rec-1", "Ledgerline");
+        dialog.email = "anna@northwind.example".to_string();
+        match stage {
+            SharePreviewStage::Asking => {}
+            SharePreviewStage::Invited => dialog.invited = Some("carol@northwind.example".to_string()),
+            SharePreviewStage::Question => {
+                dialog.adopt = Some(crate::rest::sharing::AdoptionQuestion {
+                    organization_id: "0f1e2d3c-4b5a-6978-8796-a5b4c3d2e1f0".to_string(),
+                    name: "Shared by me@northwind.example".to_string(),
+                });
+            }
+        }
+        Self { dialog, stage }
+    }
+
+    /// Draws the dialog over the window's current frame.
+    pub fn draw(&mut self, ctx: &egui::Context) {
+        let view = SharingView {
+            available: true,
+            can_mint_invites: self.stage == SharePreviewStage::Invited,
+            ..SharingView::default()
+        };
+        let item: Option<VaultItem> =
+            serde_json::from_value(serde_json::json!({ "id": "rec-1", "name": "Ledgerline", "type": 1 })).ok();
+        let _ = draw_share_modal(ctx, &mut self.dialog, item.as_ref(), Some("Work"), &SentHistory::default(), Some(&view));
+    }
+}
+
+/// A caution-toned block -- the amber of the Send detail's seen-password band
+/// -- with an info mark: `head` in bold, `body` under it, and whatever `more`
+/// adds below. For a pause, not a failure: the share went through (or has not
+/// been decided) and nothing was lost.
+fn caution_block<R>(ui: &mut egui::Ui, head: &str, body: &str, more: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    let p = crate::kit::tokens::palette(ui.ctx());
+    egui::Frame::new()
+        .fill(p.caution_wash)
+        .stroke(egui::Stroke::new(1.0, p.caution_edge))
+        .corner_radius(egui::CornerRadius::same(16))
+        .inner_margin(egui::Margin::symmetric(16, 14))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(20.0), egui::Sense::hover());
+                theme::paint_info_mark(ui.painter(), mark, p.caution_mark);
+                ui.add_space(14.0);
+                ui.vertical(|ui| {
+                    let width = ui.available_width();
+                    ui.add(egui::Label::new(band_job(head, body, width)).wrap());
+                    more(ui)
+                })
+                .inner
+            })
+            .inner
+        })
+        .inner
+}
+
+/// **The invited band** (6a's fourth state), under the body: the amber of the
+/// seen-password band, with an info mark rather than a warning, because
+/// nothing went wrong -- the share went through and is waiting for the person
+/// to accept.
 ///
 /// An administrator also gets the invite code here: a master-password box and
 /// Create an invite code, then the code with a Copy. Only an administrator
@@ -1657,109 +1729,86 @@ fn invited_block(
     email: &str,
     admin: bool,
 ) -> Option<ShareDialogAction> {
+    use crate::kit::controls::{self, ButtonKind};
     let mut asked = None;
     let (head, body) = invited_band(email, &dialog.item_name, admin);
-    // 6a's `border-top: 1px solid var(--caution-edge)`.
-    let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().rect_filled(rule, egui::CornerRadius::ZERO, theme::CAUTION_EDGE);
-    egui::Frame::new()
-        .fill(theme::CAUTION_WASH)
-        .inner_margin(egui::Margin::symmetric(theme::form_card_pad_x(ui.available_width()), BAND_PAD_Y))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(BAND_MARK), egui::Sense::hover());
-                theme::paint_info_mark(ui.painter(), mark.translate(egui::vec2(0.0, 1.0)), theme::CAUTION_MARK);
-                ui.add_space(BAND_MARK_GAP);
-                ui.vertical(|ui| {
-                    let width = ui.available_width();
-                    ui.add(egui::Label::new(band_job(&head, &body, width)).wrap());
-                    if !admin {
-                        return;
-                    }
-                    ui.add_space(10.0);
-                    match &dialog.invite_code {
-                        Some(code) => {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = theme::FORM_FOOTER_GAP;
-                                ui.label(
-                                    egui::RichText::new(invite_text(code))
-                                        .size(13.0)
-                                        .monospace()
-                                        .color(theme::INK),
-                                );
-                                if theme::row_button(ui, COPY_CODE_BUTTON).clicked() {
-                                    asked = Some(ShareDialogAction::CopyCode);
-                                }
-                            });
-                            ui.add_space(4.0);
-                            ui.label(
-                                egui::RichText::new(format!("Give it to {email}. They enter it when they sign up."))
-                                    .size(12.0)
-                                    .color(theme::CAUTION_INK),
-                            );
-                        }
-                        None => {
-                            ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = theme::FORM_FOOTER_GAP;
-                                let field = ui
-                                    .add_enabled_ui(!dialog.minting, |ui| {
-                                        theme::inline_field(ui, &mut dialog.password, PASSWORD_HINT, PASSWORD_BOX_WIDTH, true)
-                                    })
-                                    .inner;
-                                let can = !dialog.minting && !dialog.password.is_empty();
-                                let pressed = ui
-                                    .add_enabled_ui(can, |ui| theme::secondary_button(ui, MAKE_CODE_BUTTON))
-                                    .inner
-                                    .clicked();
-                                let entered = can && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                if pressed || entered {
-                                    asked = Some(ShareDialogAction::MintCode);
-                                }
-                            });
-                        }
+    let p = crate::kit::tokens::palette(ui.ctx());
+    caution_block(ui, &head, &body, |ui| {
+        if !admin {
+            return;
+        }
+        ui.add_space(12.0);
+        match &dialog.invite_code {
+            Some(code) => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    ui.label(egui::RichText::new(invite_text(code)).size(14.0).monospace().color(p.ink));
+                    if controls::button(ui, ButtonKind::Outline, controls::SMALL, COPY_CODE_BUTTON, None).clicked() {
+                        asked = Some(ShareDialogAction::CopyCode);
                     }
                 });
-            });
-        });
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(format!("Give it to {email}. They enter it when they sign up."))
+                        .size(14.0)
+                        .color(p.caution_ink),
+                );
+            }
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    let id = egui::Id::new((SHARE_ID, "master-password"));
+                    let reveal_id = id.with("reveal");
+                    let mut revealed = ui.data(|d| d.get_temp::<bool>(reveal_id)).unwrap_or(false);
+                    let field = ui
+                        .add_enabled_ui(!dialog.minting, |ui| {
+                            crate::kit::input::secret(
+                                ui,
+                                id,
+                                &mut dialog.password,
+                                &mut revealed,
+                                PASSWORD_HINT,
+                                PASSWORD_BOX_WIDTH,
+                                crate::kit::input::SIGN_IN,
+                            )
+                        })
+                        .inner;
+                    ui.data_mut(|d| d.insert_temp(reveal_id, revealed));
+                    let can = !dialog.minting && !dialog.password.is_empty();
+                    let pressed = ui
+                        .add_enabled_ui(can, |ui| controls::button(ui, ButtonKind::Outline, controls::SMALL, MAKE_CODE_BUTTON, None))
+                        .inner
+                        .clicked();
+                    let entered = can && field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if pressed || entered {
+                        asked = Some(ShareDialogAction::MintCode);
+                    }
+                });
+            }
+        }
+    });
     asked
 }
 
-/// **The organisation question's band** (fix round 1), between the body and
-/// the footer: the no-account band's amber, rule and info mark, because it
-/// too is a pause and not a failure -- nothing was written, and the share
-/// goes on whichever way it is answered.
+/// **The organisation question's band** (fix round 1), under the body: the
+/// invited band's amber, because it too is a pause and not a failure --
+/// nothing was written, and the share goes on whichever way it is answered.
 fn question_band(ui: &mut egui::Ui, head: &str, body: &str) {
-    let (rule, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
-    ui.painter().rect_filled(rule, egui::CornerRadius::ZERO, theme::CAUTION_EDGE);
-    egui::Frame::new()
-        .fill(theme::CAUTION_WASH)
-        .inner_margin(egui::Margin::symmetric(theme::form_card_pad_x(ui.available_width()), BAND_PAD_Y))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal_top(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                let (mark, _) = ui.allocate_exact_size(egui::Vec2::splat(BAND_MARK), egui::Sense::hover());
-                theme::paint_info_mark(ui.painter(), mark.translate(egui::vec2(0.0, 1.0)), theme::CAUTION_MARK);
-                ui.add_space(BAND_MARK_GAP);
-                let width = ui.available_width();
-                ui.add(egui::Label::new(band_job(head, body, width)).wrap());
-            });
-        });
+    caution_block(ui, head, body, |_| {});
 }
 
-/// The band's paragraph: the bold line, a break, the plain one -- 6a's
-/// `<b>…</b><br>…` at 12px and a 1.5 line height, in the caution ink.
+/// The band's paragraph: the bold line, a break, the plain one -- at 14px and
+/// a 1.5 line height, in the caution ink.
 fn band_job(head: &str, body: &str, width: f32) -> egui::text::LayoutJob {
+    let p = crate::kit::tokens::Palette::LIGHT;
     let plain = egui::TextFormat {
-        font_id: egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        color: theme::CAUTION_INK,
-        line_height: Some(18.0),
+        font_id: egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        color: p.caution_ink,
+        line_height: Some(20.0),
         ..Default::default()
     };
     let strong = egui::TextFormat {
-        font_id: egui::FontId::new(12.0, egui::FontFamily::Name(theme::BOLD.into())),
+        font_id: egui::FontId::new(15.0, egui::FontFamily::Name(theme::BOLD.into())),
         ..plain.clone()
     };
     let mut job = egui::text::LayoutJob::default();

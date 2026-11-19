@@ -50,6 +50,7 @@
 
 use crate::app_identity::AppIdentityCache;
 use crate::key_sequence::{self, FieldRef, ResolveSource, Token};
+use crate::kit::modal::{Dialog, ModalOutcome};
 use crate::theme;
 use crate::vault_window::detail_edit::{
     self, sequence_tally, step_rows, StepKind, StepRow,
@@ -923,6 +924,8 @@ pub const SCREEN_TITLE: &str = "Fill rule";
 pub const SAVE_LABEL: &str = "Save rule";
 pub const SAVE_BLOCKED_LABEL: &str = "Save (fix the template)";
 pub const DISCARD_LABEL: &str = "Discard";
+/// The builder's dialog id; its scrim is `"sequence-builder-scrim"`.
+pub const BUILDER_ID: &str = "sequence-builder";
 pub const VAULT_ITEM_HEADING: &str = "Vault item";
 pub const SENDS_TO_HEADING: &str = "Sends only to";
 pub const SEQUENCE_HEADING: &str = "Sequence";
@@ -983,12 +986,10 @@ pub fn draw_sequence_builder(
         }
         label.icon.cloned()
     };
-    // **The scrim's id is a LITERAL**, and `item_list::MODAL_SCRIM_AREAS` is
-    // kept honest by a walk over this crate's sources looking for exactly this
-    // declaration. That list answers "is a modal up" for the item list's arrow
-    // keys and the read pane's toast, so a scrim it cannot see is a modal
-    // those two do not know about.
-    theme::modal_scrim(&ctx, egui::Area::new(egui::Id::new("sequence-builder-scrim")));
+    // The scrim is the dialog's own (`kit::modal::Dialog`), named
+    // `"sequence-builder-scrim"` from [`BUILDER_ID`], which
+    // `item_list::MODAL_SCRIM_AREAS` lists so the arrow keys and the read
+    // pane's toast know a modal is up.
 
     // **Read before the body draws**, so a press cannot be swallowed by a text
     // box that happens to have focus: the box takes a bare `s`, never the
@@ -1027,72 +1028,76 @@ pub fn draw_sequence_builder(
         && !draft.discard_prompt
         && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
 
-    // Read before the card, because `modal_card` takes the body and the
-    // confirm as two closures that must not both borrow the draft.
+    // Read before the card, because the body and the footer must not both
+    // borrow the draft.
     let blocked = draft.fault().is_some();
     let saveable = draft.saveable();
     let label = if blocked { SAVE_BLOCKED_LABEL } else { SAVE_LABEL };
     let height = body_height(&ctx);
 
-    let press = theme::modal_card(
-        &ctx,
-        egui::Area::new(egui::Id::new("sequence-builder")),
-        theme::ModalCard {
-            accent: theme::BLUE,
-            // No mark: this is a form, not a question about a consequence.
-            glyph: theme::ModalGlyph::None,
-            title: SCREEN_TITLE,
-            width: card_width(&ctx),
-            dismiss: DISCARD_LABEL,
-            // **The bands are the body.** Each carries 4a's own
-            // `padding: 16px 20px`, so the card's margin would inset them
-            // twice over -- see [`theme::ModalBody`].
-            body: theme::ModalBody::Flush,
-        },
-        |ui| {
+    // **A v2 dialog with no padding of its own**: the title and the footer
+    // carry theirs, and the bands between them run flush, each with 4a's own
+    // `padding: 16px 20px`. The scrim, the corner mark and the card's shadow
+    // are the kit's; Escape is read above (a card with an add menu open or a
+    // discard question up has its own), so the kit's is off.
+    let (outcome, (confirmed, discarded)) = Dialog::new(BUILDER_ID, card_width(&ctx))
+        .padding(0)
+        .esc_closes(false)
+        .show(&ctx, |ui| {
+            // The title, clear of the corner mark.
+            egui::Frame::new().inner_margin(Margin { left: 30, right: 70, top: 28, bottom: 20 }).show(ui, |ui| {
+                ui.label(theme::extrabold(SCREEN_TITLE, 26.0).color(theme::INK));
+            });
             // **The card is as tall as its content, and no taller than the
             // window.** `auto_shrink` on the y means "be as tall as your
-            // content" -- which is what the owner asked for ("make height
-            // dynamic, so it adjusts based on the content of the modal") --
-            // and `max_height` is what keeps a twenty-step sequence from
-            // making a card taller than the window it floats over: past
-            // that the body scrolls. Both are needed. On the x it stays
-            // off, because the card's width is the card's, not its widest
-            // row's.
+            // content", and `max_height` is what keeps a twenty-step sequence
+            // from making a card taller than the window it floats over: past
+            // that the body scrolls. Both are needed. On the x it stays off,
+            // because the card's width is the card's, not its widest row's.
             egui::ScrollArea::vertical()
                 .max_height(height)
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     // **The ground under the rows is the window's grey.** 4a
-                    // draws its card on `#f7f6f5` and lays white step rows
-                    // on it; the two bands above paint their own fills over
-                    // that ground (white, then the tint). Painted as the
-                    // BODY's ground rather than as the step block's fill, so
-                    // the grey reaches the footer on a sequence of two steps
-                    // as well as one of twenty -- the owner: "background
-                    // under sequence should be gray as per design".
+                    // draws its card on `#f7f6f5` and lays white step rows on
+                    // it; the two bands above paint their own fills over that
+                    // ground (white, then the tint). Painted as the BODY's
+                    // ground rather than as the step block's fill, so the grey
+                    // reaches the footer on a sequence of two steps as well as
+                    // one of twenty.
                     egui::Frame::new().fill(theme::WINDOW_BG).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         // **The bands butt, and their rules are the joins.**
-                        // 4a stacks them with no gap at all: the destination
-                        // band's `border-bottom` IS the top of the SEQUENCE
-                        // band, and the SEQUENCE band's is the top of the
-                        // rows. egui puts `item_spacing` between two stacked
-                        // children, so four of those joins came out as eight
-                        // points of white -- the owner, of the two above and
-                        // below the tint: "white spaces on top and below
-                        // Sequnce". Zeroed for the STACK and handed back
-                        // inside each band's own frame, which is
-                        // `theme::modal_card`'s trick one level up.
+                        // 4a stacks them with no gap at all: egui puts
+                        // `item_spacing` between two stacked children, so
+                        // four of those joins came out as eight points of
+                        // white. Zeroed for the STACK and handed back inside
+                        // each band's own frame.
                         ui.spacing_mut().item_spacing.y = 0.0;
                         destination_band(ui, draft, item_icon, app_icon.as_ref());
                         steps_column(ui, draft, palette, source);
                     });
                 });
-        },
-        |ui| theme::primary_button_enabled(ui, label, Some("CTRL+S"), saveable),
-    );
+            // The two answers: the way out on the left (the quieter of the
+            // two), Save on the right.
+            let mut answers = (false, false);
+            egui::Frame::new().inner_margin(Margin::symmetric(30, 22)).show(ui, |ui| {
+                use crate::kit::controls::{self, ButtonKind, ButtonSize};
+                const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+                ui.spacing_mut().item_spacing.x = 10.0;
+                ui.columns(2, |columns| {
+                    answers.1 = controls::button_filling(&mut columns[0], ButtonKind::Outline, ANSWER, DISCARD_LABEL).clicked();
+                    answers.0 = columns[1]
+                        .add_enabled_ui(saveable, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, label))
+                        .inner
+                        .on_hover_text("Ctrl+S")
+                        .clicked();
+                });
+            });
+            answers
+        });
+    let press = (confirmed, discarded || outcome == ModalOutcome::Closed);
 
     // **The question, over the card it is about**, and drawn last so its
     // scrim covers the rule it is asking about. Only the two ways out can
@@ -1109,9 +1114,9 @@ pub fn draw_sequence_builder(
         return BuilderAction::None;
     }
 
-    if chorded || press.confirmed {
+    if chorded || press.0 {
         BuilderAction::Save
-    } else if escaped || press.dismissed {
+    } else if escaped || press.1 {
         // **An edited rule asks first.** Untouched, the card just closes:
         // there is nothing to lose and a question about nothing is a
         // question a reader learns to click through. `changed` is the same
@@ -3414,29 +3419,16 @@ mod tests {
             found[0]
         }
 
-        /// The card's own frame: the one filled rectangle stroked in the
-        /// card's accent. `modal_card` strokes the same rect twice -- once
-        /// through the `Frame`, once over the bands -- and the second has no
-        /// fill, which is what tells them apart.
+        /// The card's own frame: the one white rectangle with the dialog's
+        /// radius (`kit::modal::RADIUS`), which is what tells it from every
+        /// band and row inside it.
         fn card(&self) -> egui::Rect {
             let found: Vec<&PaintedRect> = self
                 .rects
                 .iter()
-                .filter(|r| r.fill == theme::CARD && r.stroke == theme::BLUE)
+                .filter(|r| r.fill == theme::CARD && r.corners.nw == crate::kit::modal::RADIUS)
                 .collect();
             assert_eq!(found.len(), 1, "expected one card frame, found {}", found.len());
-            found[0].rect
-        }
-
-        /// The header band: the accent fill whose top corners are rounded
-        /// and whose bottom corners are not. See `theme::modal_header_band`.
-        fn header_band(&self) -> egui::Rect {
-            let found: Vec<&PaintedRect> = self
-                .rects
-                .iter()
-                .filter(|r| r.fill == theme::BLUE && r.corners.nw > 0 && r.corners.sw == 0)
-                .collect();
-            assert_eq!(found.len(), 1, "expected one header band, found {}", found.len());
             found[0].rect
         }
 
@@ -3772,22 +3764,18 @@ mod tests {
             let modal = Modal::over(window);
             let painted = modal.frame(&mut draft());
             let card = painted.card();
-            let band = painted.header_band();
+            let title = painted.rect_of(SCREEN_TITLE);
+            let asked = CARD_WIDTH.min((window.x - 2.0 * CARD_GUTTER).max(320.0));
             assert!(
-                (card.width() - (CARD_WIDTH + 2.0 * theme::MODAL_BAND_BLEED)).abs() <= 0.5,
-                "in a {}-point window the card is {} wide, not the {} it was asked for",
+                (card.width() - asked).abs() <= 0.5,
+                "in a {}-point window the card is {} wide, not the {asked} it was asked for",
                 window.x,
                 card.width(),
-                CARD_WIDTH
             );
             assert!(
-                (band.left() - card.left()).abs() <= 0.5 && (band.right() - card.right()).abs() <= 0.5,
-                "in a {}-point window the header band runs {}..{} over a card running {}..{}",
-                window.x,
-                band.left(),
-                band.right(),
-                card.left(),
-                card.right()
+                (title.left() - card.left() - 30.0).abs() <= 1.0 && title.top() - card.top() >= 27.0,
+                "in a {}-point window the title starts at {title:?} in a card at {card:?}, not 30 in and 28 down",
+                window.x
             );
             for (text, rect) in &painted.texts {
                 assert!(
