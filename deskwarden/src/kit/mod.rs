@@ -6,8 +6,10 @@
 //! `docs/superpowers/specs/2026-11-18-deskwarden-1-0-redesign-design.md`).
 //! The spec these values come from is `docs/design/deskwarden-v2-design-spec.md`.
 
+pub mod avatar;
 pub mod card;
 pub mod controls;
+pub mod field;
 pub mod icon;
 pub mod motion;
 #[cfg(test)]
