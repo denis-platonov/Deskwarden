@@ -545,6 +545,37 @@ impl ButtonSkin {
         }
     }
 
+    /// The v2 panel's primary button (design 1b): brand blue, hover deep blue.
+    pub fn panel_primary() -> Self {
+        Self {
+            fill: rgb(crate::theme::BLUE),
+            text: rgb(crate::theme::CARD),
+            border: None,
+            hover_fill: rgb(crate::theme::BLUE_DEEP),
+        }
+    }
+
+    /// The v2 panel's outline button: a 1 px edge, hover on the soft ground.
+    pub fn panel_outline() -> Self {
+        Self {
+            fill: rgb(crate::theme::CARD),
+            text: rgb(crate::theme::INK),
+            border: Some(rgb(crate::theme::BORDER)),
+            hover_fill: rgb(crate::theme::WINDOW_BG),
+        }
+    }
+
+    /// The Locked panel's deep-blue button: hover goes the other way, to brand
+    /// blue.
+    pub fn panel_deep() -> Self {
+        Self {
+            fill: rgb(crate::theme::BLUE_DEEP),
+            text: rgb(crate::theme::CARD),
+            border: None,
+            hover_fill: rgb(crate::theme::BLUE),
+        }
+    }
+
     /// Greyed, derived rather than hand-picked, so a palette change cannot
     /// leave the disabled variant behind.
     pub fn disabled(self) -> Self {

@@ -116,6 +116,7 @@ pub mod otpauth;
 /// every backend that is not `bw serve` needs it. Passphrases are refused by
 /// name until a wordlist is a decision the owner has taken.
 pub mod password_gen;
+pub mod panel_draw;
 pub mod password_strength;
 pub mod picker_prompt;
 pub mod picker_ui;
