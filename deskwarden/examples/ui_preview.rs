@@ -1728,7 +1728,7 @@ impl eframe::App for Preview {
             Surface::EditStepsTesting => {
                 let sequence = self.fixtures.clean_draft.app.as_ref().map(|a| a.sequence.clone()).unwrap_or_default();
                 if !root.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("preview-steps-started")).unwrap_or(false)) {
-                    deskwarden::vault_window::sign_in_steps::play_test_from(root.ctx(), &sequence, 1.4);
+                    deskwarden::vault_window::sign_in_steps::play_test_from(root.ctx(), &sequence, 1.4, self.fixtures.clean_draft.session);
                     root.ctx().data_mut(|d| d.insert_temp(egui::Id::new("preview-steps-started"), true));
                 }
                 self.draw_pane(root, PaneKind::EditLogin(false))

@@ -1965,6 +1965,12 @@ pub struct EditDraft {
     /// three rows of it under the password box spends the card's best space on
     /// the past. See [`history_block`].
     pub history_open: bool,
+    /// What is typed in Fills in's "Add an app or website" box and not yet
+    /// added. Counts as an unsaved change, and Save adds it.
+    pub website_typed: String,
+    /// This editor session, for view state kept outside the draft (the
+    /// sign-in steps' menu and test run).
+    pub session: u64,
     /// Which of the open list's rows have had their eye clicked -- **one flag
     /// per row**.
     ///
@@ -2402,6 +2408,8 @@ impl Default for EditDraft {
             add_menu_open: false,
             history_open: false,
             history_reveal: [false; detail::MAX_HISTORY_ROWS],
+            website_typed: String::new(),
+            session: next_session(),
         }
         // A blank form has nothing to lose, and `is_dirty` has to say so from
         // the first frame. Every other constructor routes through this one or
@@ -2629,6 +2637,8 @@ impl EditDraft {
             revealed: std::collections::BTreeSet::new(),
             add_menu_open: false,
             history_open: false,
+            website_typed: String::new(),
+            session: next_session(),
             // **Every row masked, whatever the item carries.** The read pane
             // opens the same rows masked (`RevealState::default()`), and a
             // form that opened with every previous password of the item in the
@@ -2648,6 +2658,7 @@ impl EditDraft {
     pub fn empty() -> Self {
         Self::default()
     }
+
 
     /// A blank draft of a **chosen** kind, for the "+ New" type menu.
     ///
@@ -3070,6 +3081,8 @@ impl EditDraft {
             revealed: _,
             add_menu_open: _,
             history_open: _,
+            website_typed: _,
+            session: _,
             // View state too, and the clearest case of it on the struct: the
             // form never writes the password history, so a row the user
             // revealed cannot be a change to the item under any reading.
@@ -3255,7 +3268,18 @@ impl EditDraft {
     /// This is the gate on the Cancel confirmation: a draft nobody has
     /// touched closes immediately.
     pub fn is_dirty(&self) -> bool {
-        self.content_digest() != self.opened_digest
+        self.content_digest() != self.opened_digest || !self.website_typed.trim().is_empty()
+    }
+
+    /// Save takes a website still sitting in the add box (it was typed to be
+    /// kept).
+    pub fn commit_typed_website(&mut self) {
+        let typed = std::mem::take(&mut self.website_typed);
+        if !typed.trim().is_empty() {
+            let mut entry = UriDraft::new();
+            entry.uri = typed.trim().to_string();
+            self.uris.push(entry);
+        }
     }
 
     /// Wipes every secret this draft holds, in place.
@@ -4561,6 +4585,8 @@ pub fn swatch_choice(index: usize) -> crate::item_icon::IconChoice {
     crate::item_icon::IconChoice::Colour { bg: bg.into(), fg: fg.into() }
 }
 
+pub const AVATAR_REFRESH: &str = "Refresh icon";
+pub const AVATAR_REFRESH_SUB: &str = "Fetch the website's icon again";
 pub const AVATAR_UPLOAD: &str = "Upload image";
 pub const AVATAR_UPLOAD_SUB: &str = "PNG, JPG or SVG";
 pub const AVATAR_APP: &str = "Use the app's icon";
@@ -4571,6 +4597,7 @@ pub const AVATAR_REMOVE: &str = "Remove image";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AvatarRow {
+    Refresh,
     Upload,
     App,
     Swatch(usize),
@@ -5382,7 +5409,7 @@ fn website_match_combo(ui: &mut egui::Ui, row_id: u64, choice: &mut UriMatchChoi
         });
 }
 
-fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
+fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut String, creating: bool) {
     if creating {
         // Through `theme::section_row`, with the caption in the label column
         // at its ordinary weight and only the BOX greyed -- which is exactly
@@ -5481,7 +5508,6 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     // Spec B 1.4 D: a box and Add. What is typed becomes the new website;
     // Add on an empty box gives an empty row to type into, as 0.15's link did.
     let typed_id = fills_in_add_id();
-    let mut typed: String = ui.data(|d| d.get_temp(typed_id.with("text"))).unwrap_or_default();
     let mut add = false;
     // Content, not a row: the app row after it still owes its rule.
     theme::section_row_seen(ui);
@@ -5495,7 +5521,7 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
             false,
         );
         let width = (ui.available_width() - button - ui.spacing().item_spacing.x).max(120.0);
-        let field = crate::kit::input::text(ui, typed_id, &mut typed, FILLS_IN_ADD_PLACEHOLDER, false, width);
+        let field = crate::kit::input::text(ui, typed_id, typed, FILLS_IN_ADD_PLACEHOLDER, false, width);
         let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         let clicked = crate::kit::controls::button(
             ui,
@@ -5509,10 +5535,9 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     });
     if add {
         let mut entry = UriDraft::new();
-        entry.uri = std::mem::take(&mut typed).trim().to_string();
+        entry.uri = std::mem::take(typed).trim().to_string();
         uris.push(entry);
     }
-    ui.data_mut(|d| d.insert_temp(typed_id.with("text"), typed));
     ui.add_space(4.0);
 }
 
@@ -5523,6 +5548,7 @@ fn avatar_menu(
     app: Option<&str>,
     colour: Option<(egui::Color32, egui::Color32)>,
     removable: bool,
+    refreshable: bool,
 ) -> Option<AvatarRow> {
     let p = crate::kit::tokens::palette(ui.ctx());
     ui.set_width(300.0);
@@ -5552,6 +5578,11 @@ fn avatar_menu(
         }
         response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
     };
+    if refreshable
+        && row(ui, AvatarRow::Refresh, AVATAR_REFRESH, Some(AVATAR_REFRESH_SUB), crate::kit::icon::glyph::GEN, egui::Color32::from_rgb(0xf1, 0xf0, 0xee), egui::Color32::from_rgb(0x4a, 0x47, 0x45))
+    {
+        picked = Some(AvatarRow::Refresh);
+    }
     if row(ui, AvatarRow::Upload, AVATAR_UPLOAD, Some(AVATAR_UPLOAD_SUB), crate::kit::icon::glyph::CAMERA, theme::BLUE_WASH, theme::BLUE) {
         picked = Some(AvatarRow::Upload);
     }
@@ -8513,6 +8544,7 @@ fn sequence_preview(ui: &mut egui::Ui, parts: &[PreviewPart]) {
 /// left in this function is which button was pressed.
 fn app_sequence_block(
     ui: &mut egui::Ui,
+    session: u64,
     app: &mut AppMatchDraft,
     creating: bool,
     palette: &[FieldRef],
@@ -8552,7 +8584,7 @@ fn app_sequence_block(
     // a test; anything else keeps 0.15's row and its template editor.
     if !app.sequence_open && super::sign_in_steps::parse(&app.sequence).is_some() {
         let name = if app.title.is_empty() { app.process.clone() } else { app.title.clone() };
-        if super::sign_in_steps::draw(ui, &mut app.sequence, &name) {
+        if super::sign_in_steps::draw(ui, &mut app.sequence, &name, session) {
             if creating {
                 app.sequence_open = true;
             } else {
@@ -10638,11 +10670,18 @@ fn edit_header(
         });
         let removable = crate::item_icon::has_icon_field(saved) && crate::item_icon::chosen_icon(saved).is_some();
         let colour = crate::item_icon::chosen_colours(saved);
+        // 0.15's rule for when a refresh means anything: a chosen icon URL,
+        // or no choice and a site to take the icon from.
+        let refreshable = match crate::item_icon::chosen_icon(saved) {
+            Some(choice) => choice.url().is_some(),
+            None => !crate::favicon::icon_authorities_for(saved).is_empty(),
+        };
         egui::Popup::menu(&avatar_response)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                if let Some(picked) = avatar_menu(ui, app.as_deref(), colour, removable) {
+                if let Some(picked) = avatar_menu(ui, app.as_deref(), colour, removable, refreshable) {
                     match picked {
+                        AvatarRow::Refresh => action = EditAction::RefreshIcon,
                         AvatarRow::Upload => action = EditAction::SelectIcon,
                         AvatarRow::App if app.is_some() => action = EditAction::UseAppIcon,
                         AvatarRow::App => kit::toast::show(ui.ctx(), AVATAR_APP_FIRST_TOAST),
@@ -10656,7 +10695,10 @@ fn edit_header(
 
     // Save and Cancel at the right.
     let ctx = ui.ctx().clone();
-    let save_w = controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, save_label(draft), false);
+    // The header's Save is always "Save": the longer labels ("Save (needs a
+    // name)") squeezed the title to nothing on a narrow editor. The reason
+    // is the button's hint, and the footer sentence still says it.
+    let save_w = controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, SAVE_BUTTON, false);
     let cancel_w = controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, CANCEL_BUTTON, false);
     let save_rect = egui::Rect::from_min_size(egui::pos2(row.right() - save_w, row.center().y - 24.0), egui::vec2(save_w, 48.0));
     let cancel_rect = if show_cancel {
@@ -10679,9 +10721,9 @@ fn edit_header(
     if !draft.name.trim().is_empty() && !(draft.is_saveable() && creatable) {
         save_ui.disable();
     }
-    let save = controls::button(&mut save_ui, controls::ButtonKind::Primary, controls::LARGE, save_label(draft), None);
+    let save = controls::button(&mut save_ui, controls::ButtonKind::Primary, controls::LARGE, SAVE_BUTTON, None);
     let _ = ui.interact(save.rect, edit_control_id(EditControl::Save), egui::Sense::hover());
-    kit::tips::hint(ui, &save, "Save", &["Mod", "S"]);
+    kit::tips::hint(ui, &save, save_label(draft), &["Mod", "S"]);
 
     if back.clicked() || cancel_clicked {
         // Not `Cancel` outright: a changed draft asks first.
@@ -11355,7 +11397,11 @@ fn folder_combo(
     // which is at least a state the sidebar agrees exists.
     let assignable = assignable_folders(folders);
     let options = folder_options(folders, may_unfile);
-    if !options.is_empty() {
+    let labels_fit = {
+        let labels: Vec<&str> = options.iter().map(String::as_str).collect();
+        crate::kit::controls::segmented_width(ui.ctx(), &labels, crate::kit::controls::SEG_SETTINGS) <= ui.available_width()
+    };
+    if !options.is_empty() && labels_fit {
         let offset = usize::from(may_unfile);
         let selected = match draft.folder_id.as_deref() {
             None => 0,
@@ -11401,6 +11447,13 @@ fn folder_combo(
 
 /// What the folder cell says for an item that is in none.
 const NO_FOLDER_LABEL: &str = "No folder";
+
+static NEXT_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// A number no other editor session in this process has.
+fn next_session() -> u64 {
+    NEXT_SESSION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Spec B 1.4 D: the Fills in card's add box.
 pub(crate) const FILLS_IN_ADD_PLACEHOLDER: &str = "Add an app or website";
@@ -12297,16 +12350,13 @@ pub fn draw_detail_edit(
                         row_with_buttons(ui, &[COPY_LABEL], |ui, room| {
                             // Spec B 1.4 A: hidden until the eye shows it,
                             // with Generate inside the field.
-                            let reveal_id = ui.id().with("edit-password-revealed");
-                            let mut revealed = ui.data(|d| d.get_temp::<bool>(reveal_id).unwrap_or(false));
                             let field = crate::kit::input::password(
                                 ui,
                                 ui.id().with("edit-password"),
                                 &mut draft.password,
-                                &mut revealed,
+                                &mut draft.reveal_password,
                                 room,
                             );
-                            ui.data_mut(|d| d.insert_temp(reveal_id, revealed));
                             if field.generate_clicked {
                                 draft.open_generator();
                                 action = EditAction::GeneratePassword;
@@ -12939,7 +12989,7 @@ pub fn draw_detail_edit(
                     // fields -- a note holding a licence key, bound to the program
                     // that asks for it, is the case.
                     if kind == ItemKind::Login {
-                        websites_block(ui, &mut draft.uris, creating);
+                        websites_block(ui, &mut draft.uris, &mut draft.website_typed, creating);
                     }
                     // **8a's one hairline on this card falls out of the rows**,
                     // between the websites group and the native-apps group: the
@@ -13004,11 +13054,12 @@ pub fn draw_detail_edit(
             // `offers_autofill` as well as the binding: the card it belongs
             // beside is not drawn for a secure note, and a `Fill rule` standing
             // alone would be a card about a rule with no target.
+            let session = draft.session;
             if offers_autofill(kind) && draft.app.as_ref().is_some_and(|app| app.bound) {
                 section(ui, kind, Section::FillRule, changed(Section::FillRule), wanted, |ui| {
                     if let Some(app) = draft.app.as_mut() {
                         if let Some(requested) =
-                            app_sequence_block(ui, app, creating, &palette, &source)
+                            app_sequence_block(ui, session, app, creating, &palette, &source)
                         {
                             action = requested;
                         }
@@ -13200,6 +13251,10 @@ pub fn draw_detail_edit(
             Some(DiscardAnswer::KeepEditing) => draft.discard_prompt = false,
             None => {}
         }
+    }
+
+    if action == EditAction::Save {
+        draft.commit_typed_website();
     }
 
     if action == EditAction::None && escape_cancels(ui, card_up) {
@@ -21368,11 +21423,8 @@ mod sequence_builder_tests {
         // buttons is new this one, so the strip is a frame behind.
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
         let painted = frame(&ctx, PANE, &mut draft, &item, &live_code(), &[]);
-        assert!(
-            painted.strings().contains(&SAVE_TEMPLATE_BLOCKED),
-            "Save does not say the template is what is wrong: {:?}",
-            painted.strings()
-        );
+        // v2: the header says "Save"; the reason is its hint.
+        assert_eq!(save_label(&draft), SAVE_TEMPLATE_BLOCKED, "{:?}", painted.strings());
         assert!(
             painted.strings().contains(&TEMPLATE_UNPARSED),
             "the refusal itself is not on screen: {:?}",
@@ -23318,7 +23370,8 @@ mod edit_pane_layout_tests {
         let painted = full_card_frame(&[], &mut draft);
         let refusals = painted.rects_of(PIN_NAME_REFUSAL);
         assert_eq!(refusals.len(), 2, "the refusal is not said under the field and beside Save");
-        assert!(painted.strings().contains(&SAVE_PIN_NAME_BLOCKED), "{:?}", painted.strings());
+        // v2: the header says "Save"; the reason is its hint.
+        assert_eq!(save_label(&draft), SAVE_PIN_NAME_BLOCKED);
         assert!(!draft.is_saveable());
 
         draft.fields.last_mut().unwrap().name = "PIN hint".to_string();
@@ -23926,7 +23979,8 @@ mod edit_pane_layout_tests {
     }
 
     /// The label the disabled Save wears while the name is empty.
-    const SAVE: &str = "Save (needs a name)";
+    // v2: the header's Save keeps its label; the reason is its hint.
+    const SAVE: &str = SAVE_BUTTON;
 
     /// The title of the last card design 8a's grid draws on a login --
     /// `Notes` -- which is what "the bottom of the form" means now.
@@ -31966,6 +32020,96 @@ mod v2_editor_tests {
         assert_eq!(action, EditAction::Delete);
     }
 
+    /// Review I1: the eye is the draft's, so the next item opens masked.
+    #[test]
+    fn a_revealed_password_stays_with_its_own_draft() {
+        let ctx = testing::ctx();
+        let mut first = EditDraft::from_item(&a_login());
+        first.reveal_password = true;
+        let (_, p) = draw(&ctx, 0.0, &mut first, false, vec![]);
+        assert!(exact(&p, "hunter2").is_some(), "the revealed password is drawn");
+        let mut other = a_login();
+        other.id = "id-2".into();
+        other.login.as_mut().unwrap().password = Some("s3cret-two".to_string().into());
+        let mut second = EditDraft::from_item(&other);
+        let _ = draw(&ctx, 0.1, &mut second, false, vec![]);
+        let (_, p) = draw(&ctx, 0.2, &mut second, false, vec![]);
+        assert!(exact(&p, "s3cret-two").is_none(), "the next item's password opened in the clear");
+    }
+
+    /// Review I2: what is typed in the add box is the draft's: it makes the
+    /// draft dirty, Save keeps it, and the next item's box is empty.
+    #[test]
+    fn a_typed_website_is_an_unsaved_change_that_save_keeps() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let _ = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        ctx.memory_mut(|m| m.request_focus(fills_in_add_id()));
+        let _ = draw(&ctx, 0.1, &mut draft, false, vec![]);
+        let _ = draw(&ctx, 0.2, &mut draft, false, vec![egui::Event::Text("a.example".into())]);
+        assert!(draft.is_dirty(), "typed text is an unsaved change");
+        let fresh = EditDraft::from_item(&a_login());
+        assert!(fresh.website_typed.is_empty(), "the next draft starts with an empty box");
+        draft.commit_typed_website();
+        assert_eq!(draft.uris.iter().map(|u| u.uri.as_str()).collect::<Vec<_>>(), vec!["a.example"]);
+    }
+
+    /// Review I4: three folders whose names do not fit are a dropdown.
+    #[test]
+    fn folders_too_wide_for_the_cell_keep_the_dropdown() {
+        let folder = |id: &str, name: &str| Folder { id: id.into(), name: name.into(), other: Default::default() };
+        let long = vec![
+            folder("f1", "Quarterly finance and payroll"),
+            folder("f2", "Household utilities and insurance"),
+        ];
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let mut apps = AppIdentityCache::default();
+        let narrow = egui::vec2(678.0, 1400.0);
+        let p = testing::frame(&ctx, 0.0, narrow, vec![], |ui| {
+            let _ = draw_detail_edit(ui, &mut draft, &long, false, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
+        });
+        assert!(exact(&p, "Household utilities and insurance").is_none(), "a segment ran past its cell");
+    }
+
+    /// Review I5: the header's Save keeps its short label whatever is wrong.
+    #[test]
+    fn the_header_save_is_always_save() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::empty_of(ItemKind::Login);
+        draft.name.clear();
+        let (_, p) = draw(&ctx, 0.0, &mut draft, true, vec![]);
+        let save = control(&ctx, EditControl::Save);
+        let label = p.texts.iter().find(|(_, _, r)| save.contains(r.center())).map(|(t, _, _)| t.clone());
+        assert_eq!(label.as_deref(), Some(SAVE_BUTTON));
+    }
+
+    /// Review I6: a chosen colour wins over a card's network tile too.
+    #[test]
+    fn a_chosen_colour_wins_over_the_card_network() {
+        let mut card = an_item(Some(3));
+        card.card = Some(crate::vault_bridge::CardData {
+            number: Some("4111111111111111".to_string().into()),
+            ..Default::default()
+        });
+        let card = crate::vault_bridge::with_custom_field(&card, crate::item_icon::ICON_FIELD_NAME, &swatch_choice(0).to_field_value());
+        match super::super::item_list::row_look(&card, None) {
+            crate::kit::avatar::Look::Initials { bg, .. } => assert_eq!(bg, egui::Color32::from_rgb(0x1b, 0x3f, 0xa0)),
+            _ => panic!("the network tile beat the chosen colour"),
+        }
+    }
+
+    /// Review: Refresh icon stays reachable from the avatar menu.
+    #[test]
+    fn refresh_is_on_the_avatar_menu_for_an_item_with_a_website() {
+        let mut item = a_saved_login();
+        item.login.as_mut().unwrap().uris = vec![crate::vault_bridge::UriEntry { uri: Some("https://ledgerline.example".into()), other: serde_json::Map::new() }];
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&item);
+        open_avatar_menu(&ctx, &mut draft, &item);
+        assert_eq!(pick_avatar_row(&ctx, &mut draft, &item, AvatarRow::Refresh), EditAction::RefreshIcon);
+    }
+
     /// Spec B 1.3: Custom fields, Sharing and History are a 320 column
     /// beside the item's own cards; on a narrow editor they stack under them.
     #[test]
@@ -32159,7 +32303,7 @@ mod v2_editor_tests {
         let mut draft = EditDraft::from_item(&a_login());
         let mut apps = AppIdentityCache::default();
         let mut paint = |time: f64, events: Vec<egui::Event>, draft: &mut EditDraft| {
-            testing::frame(&ctx, time, SCREEN, events, |ui| {
+            testing::frame(&ctx, time, egui::vec2(2200.0, 1200.0), events, |ui| {
                 let _ = draw_detail_edit(ui, draft, &few, false, &mut apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
             })
         };

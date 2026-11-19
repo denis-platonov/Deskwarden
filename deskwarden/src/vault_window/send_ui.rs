@@ -15019,7 +15019,9 @@ mod frame_promptness {
     /// the two panes apart became a string they share. `Save changes` is the
     /// better sentinel anyway: it is the control that makes this an editor,
     /// and the read pane has no button by that name.
-    const EDITOR_EDIT_TITLE: &str = "Save changes";
+    // v2: both forms' Save says "Save changes"; the header's kind line
+    // tells an edit from a create.
+    const EDITOR_EDIT_TITLE: &str = "Editing login";
     /// **The `DetailMode::Create` arm's control.**
     ///
     /// It was `detail_edit::form_title`'s `New login`, drawn under the name

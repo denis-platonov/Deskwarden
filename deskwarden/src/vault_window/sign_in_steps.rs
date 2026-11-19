@@ -164,7 +164,8 @@ struct Run {
 
 /// Starts a test of `sequence` as if Test was pressed `elapsed` seconds ago
 /// (for previews: a shot of the test mid-run).
-pub fn play_test_from(ctx: &egui::Context, sequence: &str, elapsed: f64) {
+pub fn play_test_from(ctx: &egui::Context, sequence: &str, elapsed: f64, session: u64) {
+    SESSION.with(|s| s.set(session));
     if let Some(steps) = parse(sequence) {
         let now = ctx.input(|i| i.time);
         ctx.data_mut(|d| d.insert_temp(run_id(), Run { started: now - elapsed, steps, done: false }));
@@ -187,12 +188,18 @@ pub fn test_button_id() -> egui::Id {
     egui::Id::new("sign-in-steps-test")
 }
 
+thread_local! {
+    /// The editor session being drawn (see `detail_edit::EditDraft::session`):
+    /// the menu and the test run belong to it and to nothing else.
+    static SESSION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn run_id() -> egui::Id {
-    egui::Id::new("sign-in-steps-run")
+    egui::Id::new(("sign-in-steps-run", SESSION.with(|s| s.get())))
 }
 
 fn menu_id() -> egui::Id {
-    egui::Id::new("sign-in-steps-menu-open")
+    egui::Id::new(("sign-in-steps-menu-open", SESSION.with(|s| s.get())))
 }
 
 const SECRET_EDGE: Color32 = Color32::from_rgb(0xf0, 0xcf, 0xca);
@@ -216,7 +223,8 @@ pub(crate) fn chip_colours(step: Step, live: bool) -> (Color32, Color32, Color32
 
 /// The card's body. `sequence` is the item's stored template; returns true
 /// when the person asked for 0.15's template editor.
-pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str) -> bool {
+pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -> bool {
+    SESSION.with(|s| s.set(session));
     let Some(mut steps) = parse(sequence) else {
         return false;
     };
@@ -274,9 +282,14 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str) -> bool {
         }
     }
 
-    // The add menu.
+    // The add menu. Esc closes it (and only it); so does a click outside it.
+    if ui.data(|d| d.get_temp::<bool>(menu_id())).unwrap_or(false)
+        && ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+    {
+        ui.data_mut(|d| d.insert_temp(menu_id(), false));
+    }
     if ui.data(|d| d.get_temp::<bool>(menu_id())).unwrap_or(false) {
-        let picked = egui::Area::new(menu_id().with("area"))
+        let shown = egui::Area::new(menu_id().with("area"))
             .order(egui::Order::Foreground)
             .fixed_pos(add_rect.left_bottom() + Vec2::new(0.0, 8.0))
             .show(ui.ctx(), |ui| {
@@ -310,8 +323,15 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str) -> bool {
                         }
                     });
                 picked
-            })
-            .inner;
+            });
+        let picked = shown.inner;
+        let outside = ui.input(|i| {
+            i.pointer.any_click()
+                && i.pointer.interact_pos().is_some_and(|at| !shown.response.rect.contains(at) && !add_rect.contains(at))
+        });
+        if outside && picked.is_none() {
+            ui.data_mut(|d| d.insert_temp(menu_id(), false));
+        }
         if let Some(step) = picked {
             steps.push(step);
             ui.data_mut(|d| d.insert_temp(menu_id(), false));
@@ -442,7 +462,7 @@ mod tests {
 
     fn paint(ctx: &egui::Context, time: f64, sequence: &mut String, events: Vec<egui::Event>) -> Painted {
         testing::frame(ctx, time, SCREEN, events, |ui| {
-            let _ = draw(ui, sequence, "Ledgerline");
+            let _ = draw(ui, sequence, "Ledgerline", 7);
         })
     }
 
@@ -536,6 +556,46 @@ mod tests {
         let p = paint(&ctx, 0.0, &mut sequence, vec![]);
         assert!(p.rects.iter().any(|r| r.fill == theme::DANGER_WASH && r.stroke.color == SECRET_EDGE && r.rect.height() == CHIP_HEIGHT));
         assert_eq!(ink_of(&p, Step::Pw.label()), theme::DANGER_INK);
+    }
+
+    /// Review I3: the menu and the test run belong to one editor session.
+    #[test]
+    fn the_menu_and_the_test_belong_to_their_session() {
+        let ctx = testing::ctx();
+        let mut sequence = render(PRESETS[0].1);
+        let paint_in = |time: f64, seq: &mut String, session: u64, events: Vec<egui::Event>| {
+            testing::frame(&ctx, time, SCREEN, events, |ui| {
+                let _ = draw(ui, seq, "Ledgerline", session);
+            })
+        };
+        let _ = paint_in(0.0, &mut sequence, 1, vec![]);
+        let add = rect_of(&ctx, add_button_id());
+        let _ = paint_in(0.1, &mut sequence, 1, click_at(add.center()));
+        play_test_from(&ctx, &sequence, 1.0, 1);
+        let mut other = render(PRESETS[0].1);
+        let p = paint_in(0.2, &mut other, 2, vec![]);
+        let p2 = paint_in(0.3, &mut other, 2, vec![]);
+        for p in [&p, &p2] {
+            assert!(!p.texts.iter().any(|(t, _, _)| t == Step::Totp.label()), "another session's menu is open");
+            assert!(p.texts.iter().any(|(t, _, _)| t == TEST_EMPTY), "another session's test is playing");
+        }
+    }
+
+    #[test]
+    fn esc_closes_the_add_menu_and_only_it() {
+        let ctx = testing::ctx();
+        let mut sequence = render(PRESETS[0].1);
+        let _ = paint(&ctx, 0.0, &mut sequence, vec![]);
+        let add = rect_of(&ctx, add_button_id());
+        let _ = paint(&ctx, 0.1, &mut sequence, click_at(add.center()));
+        let esc = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::default() };
+        let mut leaked = true;
+        let _ = testing::frame(&ctx, 0.2, SCREEN, vec![esc], |ui| {
+            let _ = draw(ui, &mut sequence, "Ledgerline", 7);
+            leaked = ui.input(|i| i.key_pressed(egui::Key::Escape));
+        });
+        assert!(!leaked, "Esc reached the editor behind the menu");
+        assert_eq!(ctx.data(|d| d.get_temp::<bool>(menu_id())), Some(false));
     }
 
     #[test]

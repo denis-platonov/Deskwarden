@@ -65,6 +65,17 @@ pub const SEG_GENERATOR: SegmentStyle =
 pub const SEG_EXPIRY: SegmentStyle =
     SegmentStyle { pad: Vec2::new(0.0, 10.0), font_px: 15.0, cell_radius: 11, track_radius: 14, full_width: true };
 
+/// The width [`segmented`] takes for `options` (not full-width styles).
+pub fn segmented_width(ctx: &egui::Context, options: &[&str], style: SegmentStyle) -> f32 {
+    let role = Role { size: style.font_px, face: BOLD, tracking_em: 0.0 };
+    let p = palette(ctx);
+    let inner: f32 = options
+        .iter()
+        .map(|label| ctx.fonts_mut(|f| f.layout_job(tokens::job(role, label, p.ink))).size().x + style.pad.x * 2.0)
+        .sum();
+    inner + 8.0
+}
+
 /// A grey track of options with the selected one lifted onto a white cell.
 /// Returns the index clicked this frame, if any.
 pub fn segmented(ui: &mut Ui, options: &[&str], selected: usize, style: SegmentStyle) -> Option<usize> {

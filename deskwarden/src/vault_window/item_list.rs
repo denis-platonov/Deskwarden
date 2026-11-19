@@ -2262,12 +2262,13 @@ pub fn initials(name: &str) -> String {
 /// What a row's 44pt tile shows: a card's network tile, else the site's
 /// favicon, else initials on the name's colour.
 pub(crate) fn row_look(item: &VaultItem, icon: Option<&egui::TextureHandle>) -> kit::avatar::Look {
-    if let Some((label, bg, italic)) = card_network(item).and_then(kit::avatar::network) {
-        return kit::avatar::Look::Brand { label: label.to_string(), bg, italic };
-    }
-    // Spec B 1.2: a chosen colour wins over the website's icon.
+    // Spec B 1.2: a chosen colour wins over everything automatic -- the
+    // card's network tile and the website's icon -- as it does in the editor.
     if let Some((bg, fg)) = crate::item_icon::chosen_colours(item) {
         return kit::avatar::Look::Initials { text: initials(&item.name), bg, fg };
+    }
+    if let Some((label, bg, italic)) = card_network(item).and_then(kit::avatar::network) {
+        return kit::avatar::Look::Brand { label: label.to_string(), bg, italic };
     }
     if let Some(texture) = icon {
         return kit::avatar::Look::Favicon(texture.clone());
