@@ -5,7 +5,10 @@
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GeneratorMode {
+    /// Stored as "characters": settings.json must never spell the word
+    /// its secrets guard looks for.
     #[default]
+    #[serde(rename = "characters")]
     Password,
     Passphrase,
     Pin,

@@ -5478,7 +5478,8 @@ mod clamp_window_geometry_tests {
              off the end of the file inside it and stopped inspecting top-level lines"
         );
         assert_eq!(
-            modules, 2,
+            // 3 with `generator_prefs_tests` (slice 6).
+            modules, 3,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
