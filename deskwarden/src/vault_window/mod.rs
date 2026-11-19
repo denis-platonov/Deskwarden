@@ -3070,6 +3070,11 @@ pub fn build_frame_with_search(
             matches!(body, VaultBodyState::Loading),
             cache.loaded_from_disk_at().is_some(),
         );
+        // The toast any screen queued with `kit::toast::show`, on its own
+        // layer above the panes; and the kit's palette, set here once a frame
+        // so a theme setting (slice 8) has one place to change it.
+        crate::kit::toast::paint(ui.ctx());
+        crate::kit::tokens::set_palette(ui.ctx(), crate::kit::tokens::Palette::LIGHT);
         match body {
             VaultBodyState::Loading => {
                 top_bar_band(ui);
@@ -15916,6 +15921,26 @@ mod hide_shape_tests {
 #[cfg(test)]
 mod v2_window_size_tests {
     use super::*;
+
+    fn production() -> &'static str {
+        let source = include_str!("mod.rs");
+        &source[..source.find(concat!("#[cfg(", "test)]")).expect("a test marker")]
+    }
+
+    /// **The window paints the toast**, once a frame: `kit::toast::show` from
+    /// any screen (the rail's "Folder created", the copies of slice 3) only
+    /// queues one, and a queue nothing paints is a confirmation nobody sees.
+    #[test]
+    fn a_toast_shown_by_any_screen_is_painted_by_the_window() {
+        assert_eq!(production().matches(concat!("kit::toast::", "paint(ui.ctx())")).count(), 1);
+    }
+
+    /// The palette is set where dark mode will set it: once a frame, at the
+    /// window's own level.
+    #[test]
+    fn the_window_sets_the_kit_palette() {
+        assert_eq!(production().matches(concat!("kit::tokens::set_", "palette(")).count(), 1);
+    }
 
     #[test]
     fn the_window_opens_at_the_designs_size_and_keeps_room_for_the_narrow_detail() {
