@@ -23,13 +23,12 @@ pub mod share_ui;
 pub mod sequence_builder;
 pub mod sidebar;
 pub mod totp_add;
+pub mod top_bar;
 
 use crate::bw_serve::{self, readiness_schedule, wait_for_vault_ready, READINESS_DEADLINE};
 use crate::clipboard::ClearTrigger;
 use crate::fill_stats::FillStats;
-use crate::login_ui::{
-    draw_window_chrome_with_extra, round_window_corners, ChromeAction, ChromeMetrics, CloseControl,
-};
+use crate::login_ui::round_window_corners;
 use crate::settings::AutoLock;
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultError, VaultItem};
@@ -2712,214 +2711,105 @@ pub fn build_frame_with_search(
         // paints `totp_add::ADD_TOTP_SHORTCUT`, so the chord below and the
         // button advertise one string and set one flag.
         let mut add_totp_asked = false;
-        let saved_item_spacing_y = ui.spacing().item_spacing.y;
-        ui.spacing_mut().item_spacing.y = 0.0;
-        match draw_window_chrome_with_extra(
-            ui,
-            WINDOW_TITLE,
-            ChromeMetrics::VAULT,
-            true,
-            // The vault's ✕ is always live: this window owns nothing that a
-            // close would strand. (The startup window's spinner stage does,
-            // and disables it -- see `loading_ui::draw_spinner_body`.)
-            CloseControl::Active,
-            |ui| {
-                // Right-to-left, so this reads left-to-right (nearest the title,
-                // furthest from the window controls, first) as: Sync status
-                // pill, avatar, account-menu chevron, settings gear.
-                // Added here in the
-                // opposite order (the gear closest to the window controls, sync
-                // pill furthest) since `right_to_left` packs each new widget
-                // just to the left of the previous one.
-                //
-                // The gear is therefore added FIRST precisely because it is
-                // asked to sit to the RIGHT of the avatar -- in this layout,
-                // earlier is further right. `the_settings_gear_sits_to_the_right_
-                // of_the_avatar` asserts the painted rects rather than this
-                // order, because reasoning about it is exactly how it would end
-                // up on the wrong side.
-                //
-                // Design 2b specifies no settings affordance at all (there is no
-                // gear, cog or "Settings" anywhere in `Deskwarden.dc.html`), so
-                // this is the user's direction rather than the design's, the
-                // same way the detail pane's star, kebab and eye were. What it
-                // does take from 2b is its metrics: `theme::tune_button` is 28px
-                // square, matching the Lock pill's height and the avatar's
-                // diameter beside it.
-                if theme::tune_button(ui).clicked()
-                    || sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenSettings)
-                {
-                    // **NOT the two-step dance Lock does immediately below.**
-                    // This window stays exactly where it is; the form is drawn
-                    // over it, dimmed, by the block at the very end of this
-                    // closure. Closing here is what the gear used to do, back
-                    // when `prefs_ui::run` was a native window of its own and
-                    // eframe could not nest its event loop inside this one --
-                    // and a window that vanished and came back somewhere else
-                    // on a large screen is precisely the complaint this
-                    // replaces.
-                    //
-                    // Seeded from whatever the modal was last left holding, and
-                    // only from disk on the first open -- see
-                    // `edited_settings`. A re-click that re-read `settings.json`
-                    // would show values the user has already changed away from,
-                    // because nothing is written until this window closes.
-                    let seed = prefs_seed(
+        // **Design 1a's top bar**, over the main column only: the sidebar
+        // runs the window's full height, so the bar starts where it ends.
+        // Drawn here, before the panels, because the blocks below read what
+        // it decided (the account menu's request, a sync it started); drawn
+        // into its own rect WITHOUT moving this ui's cursor, so the sidebar's
+        // panel still starts at the window's top and the main column reserves
+        // the bar's band itself (see `vault-top-bar-band` below).
+        let window_rect = ui.max_rect();
+        let bar_rect = egui::Rect::from_min_max(
+            egui::pos2(window_rect.left() + SIDEBAR_WIDTH, window_rect.top()),
+            egui::pos2(window_rect.right(), window_rect.top() + top_bar::HEIGHT),
+        );
+        // The preferences, which the titlebar gear used to open, are now the
+        // rail's Settings row; it asks for them here.
+        if sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenSettings) {
+            let seed = prefs_seed(
                         edited_settings_for_closure.borrow().clone(),
                         settings_path_for_prefs.as_deref(),
                         accounts.as_ref(),
                     );
                     prefs = Some(crate::prefs_ui::PrefsState::with_scan_history(seed));
-                }
-                // **The avatar, the chevron beside it, and the menu they open
-                // together**, all inside one call -- see `account_menu`, which
-                // owns both marks so that "an app with no account list draws no
-                // menu control" is a decision a test can reach rather than an
-                // `if` in this closure, which nothing can.
-                //
-                // Design 2b's avatar is a 28px *circle* -- `theme::avatar`
-                // draws a rounded square (used elsewhere: item-list rows,
-                // the detail pane header, neither of which were asked to
-                // change), so it is painted directly rather than by changing
-                // that shared helper's shape for every caller. 2b has no
-                // switcher and no menu (it has one account), so those are the
-                // user's direction the way the gear is; what they take from 2b
-                // is its metrics, 28px square to match the gear and the avatar,
-                // and the kebab menu in the detail pane for the rows.
-                //
-                // **Design 2b's "Lock CTRL+L" pill used to sit here and is
-                // gone**, at the user's direction, now that Lock is a row in
-                // this menu. `CTRL+L` still works -- it is handled by the key
-                // check a few lines below, which never went through the pill --
-                // and its hint rides the menu row so it stays discoverable.
-                // **Recorded rather than matched here.** The Export row's
-                // decision is `apply_export_action`, called at the frame
-                // closure's own top level -- see that function's doc for the
-                // measured defeat that shape exists to answer. The four rows
-                // below still end in this closure because each of them writes
-                // a `RefCell` this closure owns and then closes the window.
-                account_action = account_menu(
-                    ui,
-                    accounts.as_ref(),
-                    // Empty until the details land, and empty rather than
-                    // `theme::initials("")`'s "?" placeholder: a question mark
-                    // reads as an answer ("this account has no name"), and the
-                    // truthful state here is that nothing has been said yet.
-                    // The circle itself is drawn either way, so nothing left of
-                    // it shifts sideways when the email arrives.
-                    &avatar_initials(account_email.as_deref()),
-                    account_email.as_deref(),
-                    server_url.as_deref(),
-                    // **The same fact the favicons wait on**, asked once. "No
-                    // server URL" means Bitwarden's own cloud once `bw status`
-                    // has answered and means nothing at all before it has, and
-                    // this window already has exactly one name for that
-                    // distinction.
-                    icon_base_known,
-                );
-                match &account_action {
-                    // The gear's two-step dance, for the same reason and one more:
-                    // `main` cannot tear this account's backend down and bring the
-                    // other one up while this window owns the event loop, and the
-                    // master-password prompt the switch may raise is itself
-                    // another eframe window on this same thread.
-                    Some(AccountAction::Switch(picked)) => {
-                        *switch_to_for_closure.borrow_mut() = Some(picked.clone());
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    // **The `locked` flag the pill used to set**, not a path of
-                    // its own: locking from the menu has to end exactly where
-                    // locking from the pill and from `CTRL+L` end, which is the
-                    // caller's one lock recovery -- sign-in for the account that
-                    // was locked, and no switch anywhere else.
-                    Some(AccountAction::Lock) => {
-                        *locked_for_closure.borrow_mut() = true;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    // Both open a window of their own on this same thread -- a
-                    // sign-in for the add, a confirmation for the remove -- and
-                    // both then run the switch sequence, so both leave this
-                    // window exactly the way Preferences and a switch do.
-                    Some(AccountAction::Add) => {
-                        *add_account_for_closure.borrow_mut() = true;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    Some(AccountAction::Remove) => {
-                        *remove_account_for_closure.borrow_mut() = true;
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                    // **The Export row has no arm here, and that is the whole
-                    // point.** It is the one row that starts work rather than
-                    // recording a request, and a `match` arm is precisely what
-                    // a guard arm inserted above it can silently disable with
-                    // no compiler warning and a green suite. The decision is
-                    // `apply_export_action`, below, and there is no arm here to
-                    // shadow.
-                    Some(AccountAction::Export) | None => {}
-                }
-                // **The `Send a record  CTRL+⇧+S` pill USED TO SIT HERE**,
-                // where design 5b draws it, and it was removed at the user's
-                // direction: "remove huge button Send a record on top --
-                // those are global things to the details like email icon
-                // after Fav".
-                //
-                // The user is right, and this reverses a placement that was
-                // approved once. Everything else in this titlebar acts on the
-                // *window* or the *account* -- the sync pill, the avatar, the
-                // account menu, the settings gear. This one acted on the
-                // selected ITEM, and the tell was that it needed
-                // `add_enabled(can_send_record, ..)` plus
-                // `record_ui::NO_ITEM_SELECTED` on its disabled hover to say
-                // so: a control that must explain "there is nothing for me to
-                // act on" is a control filed under the wrong noun.
-                //
-                // It is now `theme::send_record_button` in the detail pane's
-                // own header strip, beside the star -- where there is always
-                // an item, so it has no disabled state and needs no
-                // explanation. `can_send_record` went with it.
-                //
-                // **Nothing about the gating moved.** That control reports
-                // `DetailAction::SendRecord`, which sets the same
-                // `send_record_asked` flag this button set and the chord
-                // below still sets, and `permit_record_send` is still the one
-                // line in the frame that turns it into a composer.
-                // Manual sync: this app has nowhere that auto-syncs on a timer
-                // (see `main()`'s own single startup-time `bw sync` -- everything
-                // after that only re-reads whatever's already local). A change
-                // made on another device otherwise wouldn't show up here until
-                // the whole app restarts, so the sync status readout itself is
-                // also the sync button -- clicking "● Synced 2m ago" (design
-                // 4.8's pill) starts a fresh sync rather than needing a separate
-                // "Sync" button beside it. Blue for success (there's no
-                // dedicated "success" green in this app's palette -- see
-                // `theme.rs`'s module doc on "one blue hue... red reserved for
-                // actual errors" -- so blue is the existing color that reads as
-                // "good" here), the design's error red for failure, and a
-                // neutral ghost dot both while in flight and before the first
-                // sync has reported anything.
-                //
-                // The wording decision itself lives in `sync_pill` so it can be
-                // asserted (review 29's Minor 3) -- this pill is the only place
-                // any of these states is spelled for the user.
-                let (dot, label) = sync_pill(
-                    sync_in_progress,
-                    sync_status.as_ref(),
-                    vault_load_error.as_deref(),
-                    last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()),
-                    // The snapshot's age when it came off disk, and `None`
-                    // the moment a populate in THIS session replaced it --
-                    // `VaultCache` clears it there, so the pill cannot go on
-                    // dating a snapshot that has since been refreshed.
-                    cache.loaded_from_disk_at().and_then(|t| t.elapsed().ok()),
-                );
-                if theme::status_pill_button(ui, dot, &label).clicked() && !sync_in_progress {
-                    sync_in_progress = true;
-                    last_sync_attempt = Some(Instant::now());
-                    (spawn_sync)(sync_tx.clone(), session_token.to_string());
-                }
-            },
-        ) {
-            ChromeAction::Close => close_or_hide(
+        }
+        let (dot, label) = sync_pill(
+            sync_in_progress,
+            sync_status.as_ref(),
+            vault_load_error.as_deref(),
+            last_sync_at.map_or(Duration::ZERO, |t| t.elapsed()),
+            cache.loaded_from_disk_at().and_then(|t| t.elapsed().ok()),
+        );
+        let pill = top_bar::SyncPill::from_v1(dot, &label);
+        // Ctrl+Shift+Y does what a click on the pill does (design 1a's hint).
+        // `matches_exact`, so no other chord on Y can be dragged in by it.
+        let sync_chord = keyboard_shortcuts_enabled(prefs.is_some())
+            && ui.ctx().input(|i| {
+                i.modifiers.matches_exact(egui::Modifiers::CTRL | egui::Modifiers::SHIFT)
+                    && i.key_pressed(egui::Key::Y)
+            });
+        let maximized = ui.ctx().input(|i| i.viewport().maximized.unwrap_or(false));
+        // "Search 180 logins": the scope's own count, as 0.15's list header
+        // said it, until slice 3's list header carries it.
+        let search_placeholder =
+            item_list::search_hint(Some(sidebar::count_for(&items, &filter)), &filter);
+        let bar_action = top_bar::draw(ui, bar_rect, &mut search, &search_placeholder, &pill, maximized, |ui| {
+            account_action = account_menu(
+                ui,
+                accounts.as_ref(),
+                &avatar_initials(account_email.as_deref()),
+                account_email.as_deref(),
+                server_url.as_deref(),
+                icon_base_known,
+            );
+        });
+        match &account_action {
+            // The gear's two-step dance, for the same reason and one more:
+            // `main` cannot tear this account's backend down and bring the
+            // other one up while this window owns the event loop, and the
+            // master-password prompt the switch may raise is itself
+            // another eframe window on this same thread.
+            Some(AccountAction::Switch(picked)) => {
+                *switch_to_for_closure.borrow_mut() = Some(picked.clone());
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            // **The `locked` flag the pill used to set**, not a path of
+            // its own: locking from the menu has to end exactly where
+            // locking from the pill and from `CTRL+L` end, which is the
+            // caller's one lock recovery -- sign-in for the account that
+            // was locked, and no switch anywhere else.
+            Some(AccountAction::Lock) => {
+                *locked_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            // Both open a window of their own on this same thread -- a
+            // sign-in for the add, a confirmation for the remove -- and
+            // both then run the switch sequence, so both leave this
+            // window exactly the way Preferences and a switch do.
+            Some(AccountAction::Add) => {
+                *add_account_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Some(AccountAction::Remove) => {
+                *remove_account_for_closure.borrow_mut() = true;
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            // **The Export row has no arm here, and that is the whole
+            // point.** It is the one row that starts work rather than
+            // recording a request, and a `match` arm is precisely what
+            // a guard arm inserted above it can silently disable with
+            // no compiler warning and a green suite. The decision is
+            // `apply_export_action`, below, and there is no arm here to
+            // shadow.
+            Some(AccountAction::Export) | None => {}
+        }
+        if (bar_action == top_bar::TopBarAction::Sync || sync_chord) && !sync_in_progress {
+            sync_in_progress = true;
+            last_sync_attempt = Some(Instant::now());
+            (spawn_sync)(sync_tx.clone(), session_token.to_string());
+        }
+        match bar_action {
+            top_bar::TopBarAction::Close => close_or_hide(
                 ui.ctx(),
                 hide_hooks.as_ref(),
                 &hidden,
@@ -2937,37 +2827,14 @@ pub fn build_frame_with_search(
                 &add_account_for_closure,
                 &remove_account_for_closure,
             ),
-            // **Minimize is not a hide, and must not become one.**
-            //
-            // It sends the viewport command and nothing else: no
-            // `close_or_hide`, no hide rule, no hook. A minimized window
-            // is still IN USE -- it has a taskbar button, the user
-            // restores it with one click and no daemon involvement, and it
-            // is holding a decrypted vault on a machine its owner is
-            // sitting at. So it keeps the visibility name (`vault_is_in_use`
-            // must go on answering `true`, or save-memory would stop
-            // `bw serve` under a window one click from the foreground) and
-            // it keeps its vault-service attachment.
-            //
-            // A hide is the opposite on every count: no taskbar button, no
-            // way back except the daemon's named event, attachment dropped
-            // precisely so the backend may stop.
-            //
-            // **And it is deliberately NOT gated on `keep_ui_loaded`.**
-            // Gating it would make that setting change what the minimize
-            // button does, and would leave a window with the setting off
-            // unminimizable. The reported defect's "only goes on minimize"
-            // was this path being the one that happened to keep the
-            // process -- the fix is that a close keeps it too, not that a
-            // minimize stops.
-            //
-            // `the_minimize_arm_does_not_go_through_the_hide_rule` pins it.
-            ChromeAction::Minimize => {
+            top_bar::TopBarAction::Minimize => {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Minimized(true))
             }
-            ChromeAction::None => {}
+            top_bar::TopBarAction::ToggleMaximize => {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized))
+            }
+            top_bar::TopBarAction::Sync | top_bar::TopBarAction::None => {}
         }
-        ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
 
         // Spec section 5's keyboard model for this window: Ctrl+K focuses
         // search, Ctrl+L locks, Ctrl+N opens the new-item form. There used to
@@ -3195,6 +3062,7 @@ pub fn build_frame_with_search(
         // clear, no park, nothing.
         match body {
             VaultBodyState::Loading => {
+                top_bar_band(ui);
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme::CANVAS))
                     .show(ui, |ui| {
@@ -3256,6 +3124,7 @@ pub fn build_frame_with_search(
             // them here -- a second wording would be a second thing to keep
             // true.
             VaultBodyState::Unavailable(reason) => {
+                top_bar_band(ui);
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(theme::CANVAS))
                     .show(ui, |ui| {
@@ -3537,6 +3406,11 @@ pub fn build_frame_with_search(
                     SidebarAction::None => {}
                 }
             });
+
+        // The top bar's band, over the main column: the bar itself was drawn
+        // at the top of the frame (see `top_bar::draw` above), so this panel
+        // only keeps the list and the detail out from under it.
+        top_bar_band(ui);
 
         // **Read AFTER the rail, not before it.** `on_sends` above is read
         // before `draw_sidebar` because `vault_body_state` -- which decides
@@ -14369,6 +14243,17 @@ fn spawn_vault_sync(tx: mpsc::Sender<Result<(), String>>, session_token: String)
 /// both with a glyph that reads as a value the app is asserting about the
 /// account. An empty circle asserts nothing, holds the toolbar's layout
 /// still, and is replaced by the real initials in one step rather than two.
+/// The top bar's band: an empty, frameless panel the height of the bar, so
+/// the panels laid out after it start below the bar `top_bar::draw` already
+/// painted at the top of the frame.
+fn top_bar_band(ui: &mut egui::Ui) {
+    egui::Panel::top("vault-top-bar-band")
+        .exact_size(top_bar::HEIGHT)
+        .resizable(false)
+        .frame(egui::Frame::NONE)
+        .show(ui, |_ui| {});
+}
+
 fn avatar_initials(email: Option<&str>) -> String {
     match email {
         Some(email) => theme::initials(email),
@@ -14383,7 +14268,8 @@ fn avatar_initials(email: Option<&str>) -> String {
 /// union of this and the chevron — one popup with two hit areas, rather than
 /// two popups that could both be open.
 fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) -> egui::Response {
-    const SIZE: f32 = 28.0;
+    // Design 1a's avatar: a 38pt ink circle, initials 14 Bold.
+    const SIZE: f32 = top_bar::AVATAR;
     let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(SIZE), egui::Sense::click());
     if response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -14393,7 +14279,7 @@ fn draw_circle_avatar(ui: &mut egui::Ui, text: &str) -> egui::Response {
         rect.center(),
         egui::Align2::CENTER_CENTER,
         text,
-        egui::FontId::new(11.0, egui::FontFamily::Name(theme::BOLD.into())),
+        egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())),
         egui::Color32::WHITE,
     );
     response
@@ -14676,13 +14562,13 @@ fn account_menu(
     // `the_switcher_paints_between_the_avatar_and_the_gear` measures the
     // painted rects rather than trusting this ordering, which is inverted and
     // is exactly the kind of thing reasoning gets backwards.
-    let chevron = accounts.map(|_| theme::account_switcher_button(ui));
+    // Design 1a: the avatar alone opens the menu -- no chevron beside it.
     let avatar = draw_circle_avatar(ui, initials);
-    let (state, chevron) = (accounts?, chevron?);
+    let state = accounts?;
     let plan = account_menu_plan(state, email, server_url, server_known);
 
     let mut action = None;
-    egui::Popup::menu(&(chevron | avatar)).show(|ui| {
+    egui::Popup::menu(&avatar).show(|ui| {
         ui.set_max_width(SWITCHER_MENU_WIDTH);
         // Whose vault am I looking at? -- the menu's first job, and the one the
         // avatar's two initials can only hint at. Labels, not buttons: there is
@@ -16369,10 +16255,10 @@ mod hide_delivery_tests {
     fn the_minimize_arm_does_not_go_through_the_hide_rule() {
         let source = include_str!("mod.rs");
         let arm = source
-            .split(concat!("ChromeAction::Min", "imize =>"))
+            .split(concat!("top_bar::TopBarAction::Min", "imize =>"))
             .nth(1)
             .expect("the Minimize arm")
-            .split(concat!("ChromeAction::N", "one"))
+            .split(concat!("top_bar::TopBarAction::Toggle", "Maximize"))
             .next()
             .expect("the arm ends before the None arm");
         assert!(
@@ -23906,53 +23792,12 @@ mod settings_gear_placement_tests {
     }
 
     fn gear_needle() -> String {
-        concat!("theme::tune_", "button(ui).clicked()").to_string()
+        // The v2 rail's Settings row, which replaced the titlebar gear: the
+        // window answers its request in the same block the gear's click had.
+        concat!("sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::Open", "Settings)").to_string()
     }
 
-    /// **The strip's call, not the avatar's own definition.** The avatar used
-    /// to be drawn by `run` itself, so `draw_circle_avatar(ui,` located it in
-    /// the strip; it is drawn by `account_menu` now, and that call sits several
-    /// thousand lines BELOW the strip in this file -- so the old needle would
-    /// have gone on comparing `gear_at < avatar_at` and passing however the
-    /// strip was reordered. What is in the strip is the `account_menu` call,
-    /// which draws the chevron and then the avatar.
-    fn account_menu_needle() -> String {
-        concat!("account_action = account_", "menu(").to_string()
-    }
 
-    /// **The gear must be added BEFORE the account menu**, because the strip
-    /// packs right-to-left: `right_to_left` puts each new widget just to the
-    /// LEFT of the previous one, so the widget added earlier ends up further
-    /// right. The user asked for the gear to the right of the avatar, and
-    /// reasoning about that inversion is precisely how it lands on the wrong
-    /// side -- so it is pinned rather than argued.
-    #[test]
-    fn the_settings_gear_sits_to_the_right_of_the_avatar() {
-        let production = production();
-        let gear = gear_needle();
-        let menu = account_menu_needle();
-
-        // Positive controls. Without these, a rename of either call would
-        // leave both `find`s returning `None` and the ordering assertion
-        // below comparing nothing at all.
-        let gear_at = production
-            .find(&gear)
-            .unwrap_or_else(|| panic!("no {gear:?} in production code -- the gear is gone"));
-        let menu_at = production.find(&menu).unwrap_or_else(|| {
-            panic!("no {menu:?} in production code -- the titlebar account menu is gone")
-        });
-        assert_eq!(
-            production.matches(&gear).count(),
-            1,
-            "expected exactly one titlebar gear; more than one and this ordering says nothing"
-        );
-
-        assert!(
-            gear_at < menu_at,
-            "the settings gear is added AFTER the account menu, so the right-to-left strip \
-             paints it to the LEFT of the avatar -- the opposite of what was asked for"
-        );
-    }
 
     /// **The whole point of the modal: the vault window stays put.**
     ///
@@ -24837,16 +24682,6 @@ mod account_switcher_tests {
             found[0]
         }
 
-        fn chevron(&self) -> egui::Rect {
-            assert_eq!(
-                self.chevrons.len(),
-                1,
-                "expected exactly one switcher chevron, found {}; painted: {:?}",
-                self.chevrons.len(),
-                self.strings()
-            );
-            self.chevrons[0]
-        }
 
         /// The avatar circle, located by the initials painted in the middle of
         /// it -- the real drawn position, not the rect the harness asked for.
@@ -24943,7 +24778,8 @@ mod account_switcher_tests {
         /// Click the chevron, then let the popup paint. Returns the frame the
         /// open menu is on -- the click's own frame never has it.
         fn open(&mut self, accounts: Option<&AccountsState>) -> Frame {
-            let chevron = self.idle(accounts).chevron();
+            // Design 1a: the avatar opens the menu (there is no chevron).
+            let chevron = self.idle(accounts).avatar();
             let _ = self.click(accounts, chevron.center());
             self.idle(accounts)
         }
@@ -25241,12 +25077,12 @@ mod account_switcher_tests {
             "a menu opened for an app that has no accounts: {:?}",
             switcher.idle(None).strings()
         );
-        // The positive control: the same harness, the same frame, one
-        // difference.
-        assert_eq!(
-            switcher.idle(Some(&available_state())).chevrons.len(),
-            1,
-            "the harness draws no chevron even WITH accounts, so the assertions above are \
+        // The positive control: the same harness, one difference -- with
+        // accounts, the same avatar opens the menu.
+        let mut with_accounts = Switcher::new();
+        assert!(
+            with_accounts.open(Some(&available_state())).painted(LOCK_LABEL),
+            "the harness opens no menu even WITH accounts, so the assertions above are \
              about the harness rather than about the menu"
         );
     }
@@ -25577,282 +25413,6 @@ mod account_switcher_tests {
     }
 }
 
-/// **Where the switcher sits in the titlebar, and whether its clicks survive
-/// the drag zone.**
-///
-/// `draw_window_chrome_with_extra` narrows the window's drag zone to stop
-/// where the extra controls start, and registers that zone AFTER them -- so a
-/// control whose rect the zone still covers is a control whose clicks the drag
-/// swallows, which presents as a button that does nothing. This runs the real
-/// chrome function with the real switcher inside it and presses it.
-///
-/// The three controls are drawn here in the order
-/// `the_switcher_is_added_between_the_gear_and_the_avatar` pins `run`'s own
-/// strip to. That guard and this measurement are two halves: no harness in
-/// this crate can call `run` (it is the eframe application itself), so the
-/// ordering is pinned by source and its CONSEQUENCE is measured here rather
-/// than argued.
-#[cfg(test)]
-mod titlebar_switcher_placement_tests {
-    use super::*;
-    use crate::accounts::{Account, AccountId, AccountsState};
-    use crate::login_ui::ChromeMetrics;
-
-    const A: &str = "0123456789abcdef0123456789abcdef";
-    const B: &str = "fedcba9876543210fedcba9876543210";
-    /// Design 2b's own window size, which is what the titlebar's controls pack
-    /// against the right-hand end of.
-    const WINDOW_W: f32 = 1240.0;
-    const WINDOW_H: f32 = 740.0;
-    /// The email the switcher's one row is drawn from, and the string every
-    /// "did the menu open?" assertion below looks for.
-    const OTHER: &str = "bruno@example.com";
-
-    fn account(id: &str, email: &str) -> Account {
-        Account {
-            id: AccountId::parse(id).expect("a 32-char lowercase hex id"),
-            email: email.to_string(),
-            server_url: None,
-            use_official_bw_crypto: true,
-        }
-    }
-
-    fn state() -> AccountsState {
-        let active = account(A, "ana@example.com");
-        AccountsState::from_blocked_reason(
-            vec![active.clone(), account(B, OTHER)],
-            active.id,
-            None,
-        )
-        .expect("these accounts are not empty")
-    }
-
-    struct Strip {
-        ctx: egui::Context,
-    }
-
-    /// One frame of the real titlebar chrome: what the gear allocated, where
-    /// the chevron landed, where the avatar's initials landed, what strings
-    /// were painted, and what the frame asked the window to do.
-    struct Bar {
-        gear: egui::Rect,
-        chevron: egui::Rect,
-        initials: egui::Rect,
-        texts: Vec<String>,
-        started_drag: bool,
-    }
-
-    impl Bar {
-        /// Whether the switcher's menu is on this frame.
-        fn menu_is_open(&self) -> bool {
-            self.texts.iter().any(|t| t == OTHER)
-        }
-    }
-
-    impl Strip {
-        fn new() -> Self {
-            let ctx = egui::Context::default();
-            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
-            theme::apply(&ctx);
-            let _ = ctx.run_ui(Self::input(Vec::new()), |_ui| {});
-            Self { ctx }
-        }
-
-        fn input(events: Vec<egui::Event>) -> egui::RawInput {
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(WINDOW_W, WINDOW_H),
-                )),
-                events,
-                ..Default::default()
-            }
-        }
-
-        fn frame(&mut self, events: Vec<egui::Event>) -> Bar {
-            let state = state();
-            let mut gear = egui::Rect::NOTHING;
-            let output = self.ctx.run_ui(Self::input(events), |ui| {
-                let _ = draw_window_chrome_with_extra(
-                    ui,
-                    WINDOW_TITLE,
-                    ChromeMetrics::VAULT,
-                    true,
-                    CloseControl::Active,
-                    |ui| {
-                        // The gear FIRST, then `account_menu`, which draws the
-                        // chevron and then the avatar itself: right-to-left
-                        // packing means earlier is further right, so this lands
-                        // as avatar, chevron, gear from the left.
-                        gear = theme::tune_button(ui).rect;
-                        let _ = account_menu(ui, Some(&state), "AN", None, None, false);
-                    },
-                );
-            });
-
-            let all = egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect());
-            let chevrons = theme::icon_probe::chevrons(&all);
-            assert_eq!(
-                chevrons.len(),
-                1,
-                "expected exactly one chevron in the titlebar, found {}",
-                chevrons.len()
-            );
-            let mut texts = Vec::new();
-            let mut initials = None;
-            collect_titlebar_text(&all, &mut texts, &mut initials);
-            let started_drag = output.viewport_output.values().any(|viewport| {
-                viewport
-                    .commands
-                    .iter()
-                    .any(|c| matches!(c, egui::ViewportCommand::StartDrag))
-            });
-            Bar {
-                gear,
-                chevron: chevrons[0],
-                initials: initials.expect("the titlebar painted no avatar initials"),
-                texts,
-                started_drag,
-            }
-        }
-
-        fn idle(&mut self) -> Bar {
-            self.frame(Vec::new())
-        }
-
-        fn click(&mut self, pos: egui::Pos2) -> Bar {
-            self.frame(vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                },
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ])
-        }
-
-        /// A press held down, then one frame of dragging -- which is what
-        /// actually starts a window drag. A press and release inside one frame
-        /// never reports `drag_started`.
-        fn drag_from(&mut self, pos: egui::Pos2) -> Bar {
-            let _ = self.frame(vec![egui::Event::PointerMoved(pos)]);
-            let _ = self.frame(vec![egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            }]);
-            self.frame(vec![egui::Event::PointerMoved(pos + egui::vec2(12.0, 4.0))])
-        }
-    }
-
-    fn collect_titlebar_text(
-        shape: &egui::Shape,
-        texts: &mut Vec<String>,
-        initials: &mut Option<egui::Rect>,
-    ) {
-        match shape {
-            egui::Shape::Text(text) => {
-                let source = text.galley.text().to_string();
-                if source == "AN" {
-                    *initials = Some(egui::Rect::from_min_size(text.pos, text.galley.size()));
-                }
-                texts.push(source);
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_titlebar_text(shape, texts, initials);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// **Measured rects, not source order.** The user asked for the gear to
-    /// the right of the avatar; the switcher goes between them, which is where
-    /// a disclosure chevron belongs -- against the thing it discloses.
-    #[test]
-    fn the_switcher_paints_between_the_avatar_and_the_gear() {
-        let bar = Strip::new().idle();
-        assert!(
-            bar.initials.center().x < bar.chevron.center().x,
-            "the switcher paints to the LEFT of the avatar (avatar at {:?}, chevron at \
-             {:?}) -- the right-to-left strip inverts the order it is written in, which is \
-             exactly how this lands on the wrong side",
-            bar.initials.center(),
-            bar.chevron.center()
-        );
-        assert!(
-            bar.chevron.center().x < bar.gear.center().x,
-            "the switcher paints to the RIGHT of the gear (chevron at {:?}, gear at {:?})",
-            bar.chevron.center(),
-            bar.gear.center()
-        );
-        // The controls really are packed against the window controls rather
-        // than floating in the middle of a 1240px bar, which is what makes
-        // "between" a statement about the group the user sees.
-        assert!(
-            bar.chevron.center().x > WINDOW_W - 300.0,
-            "the titlebar controls are not against the right-hand end of the bar at all; \
-             the chevron is at {:?}",
-            bar.chevron.center()
-        );
-    }
-
-    /// **The drag zone stops where the switcher starts.**
-    /// `draw_window_chrome_with_extra` registers the drag interaction AFTER
-    /// the extra controls and over everything left of them, so a zone that
-    /// still covered this control would take its clicks -- and the switcher
-    /// would be a chevron that does nothing, with no error anywhere.
-    #[test]
-    fn the_drag_zone_does_not_swallow_the_switchers_clicks() {
-        let mut strip = Strip::new();
-        let chevron = strip.idle().chevron;
-
-        let clicked = strip.click(chevron.center());
-        assert!(
-            !clicked.menu_is_open(),
-            "control: a popup paints on the frame AFTER the click that opened it, so this \
-             one must not have it yet"
-        );
-        assert!(
-            strip.idle().menu_is_open(),
-            "clicking the chevron opened no menu, so the click never reached it -- the drag \
-             zone took it"
-        );
-    }
-
-    /// The positive control for the test above, and the other half of the same
-    /// property: a press on the titlebar BESIDE the switcher still drags the
-    /// window. Without this, a drag zone shrunk to nothing would pass the test
-    /// above while making the window unmovable.
-    #[test]
-    fn the_titlebar_left_of_the_switcher_still_drags_the_window() {
-        let mut strip = Strip::new();
-        let chevron = strip.idle().chevron;
-        let beside = egui::pos2(chevron.left() - 60.0, chevron.center().y);
-
-        let dragged = strip.drag_from(beside);
-        assert!(
-            dragged.started_drag,
-            "a press at {beside:?} -- on the titlebar, 60px left of the switcher -- started \
-             no window drag, so the drag zone has been shrunk to nothing"
-        );
-        // And the same press does NOT open the switcher's menu, which is what
-        // makes the two zones distinct rather than overlapping.
-        assert!(
-            !strip.idle().menu_is_open(),
-            "a press in the drag zone opened the account menu"
-        );
-    }
-}
 
 /// The two halves of the switcher no harness can reach: that `run`'s titlebar
 /// strip calls it at all, and where in that strip. Source guards for
@@ -25877,9 +25437,6 @@ mod switcher_wiring_tests {
         concat!("account_action = account_", "menu(").to_string()
     }
 
-    fn gear_needle() -> String {
-        concat!("theme::tune_", "button(ui).clicked()").to_string()
-    }
 
     /// The strip packs right-to-left, so the widget added EARLIER ends up
     /// further right: the gear first, then `account_menu`, which draws the
@@ -25888,16 +25445,10 @@ mod switcher_wiring_tests {
     /// `the_switcher_paints_between_the_avatar_and_the_gear` measures the
     /// consequence; this is what ties that measurement to `run`.
     #[test]
-    fn the_account_menu_is_added_after_the_gear_and_exactly_once() {
+    fn the_account_menu_is_added_exactly_once() {
         let production = production();
-        let (gear, switcher) = (gear_needle(), switcher_needle());
-
-        // Positive controls. Without these, a rename of either would leave the
-        // `find`s returning `None` and the ordering below comparing nothing.
-        let gear_at = production
-            .find(&gear)
-            .unwrap_or_else(|| panic!("no {gear:?} in production code -- the gear is gone"));
-        let switcher_at = production.find(&switcher).unwrap_or_else(|| {
+        let switcher = switcher_needle();
+        let _switcher_at = production.find(&switcher).unwrap_or_else(|| {
             panic!(
                 "no {switcher:?} in production code -- the titlebar account menu is gone, so \
                  every click test over it is testing a function nothing calls"
@@ -25910,11 +25461,6 @@ mod switcher_wiring_tests {
              nothing"
         );
 
-        assert!(
-            gear_at < switcher_at,
-            "the account menu is added BEFORE the gear, so the right-to-left strip paints the \
-             avatar to the RIGHT of the gear rather than to its left"
-        );
     }
 
     /// **Every row of the menu has to REACH `main`.** This feature set has
@@ -29356,7 +28902,10 @@ mod preferences_modal_wiring_tests {
             // independently (top-level `mod` lines under `#[cfg(test)]`).
             // 70 as of the v2 shell, which added `mod v2_window_size_tests`
             // -- the design's 1280 by 820 and the 298pt narrow-detail budget.
-            modules, 70,
+            // 69 again when the v2 top bar retired
+            // `mod titlebar_switcher_placement_tests`, which measured the v1
+            // chrome's gear, chevron and drag zone.
+            modules, 69,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"

@@ -372,8 +372,10 @@ pub mod glyph {
     pub const RECEIVED: &str = "M22 12h-6l-2 3h-4l-2-3H2M5.5 5h13L22 12v7H2v-7z";
     pub const ORG: &str = "M4 21V4h10v17M14 9h6v12M8 8h2M8 12h2M8 16h2M3 21h18";
     pub const PENCIL: &str = "M4 20h4L19 9l-4-4L4 16z";
+    /// The search field's magnifier.
+    pub const SEARCH: &str = "M11 18a7 7 0 1 0 0-14 7 7 0 0 0 0 14zM21 21l-5-5";
     /// Every glyph, named, for tests and the kit sheet.
-    pub const ALL_GLYPHS: [(&str, &str); 24] = [
+    pub const ALL_GLYPHS: [(&str, &str); 25] = [
         ("all", ALL),
         ("fav", FAV),
         ("login", LOGIN),
@@ -398,6 +400,7 @@ pub mod glyph {
         ("received", RECEIVED),
         ("org", ORG),
         ("pencil", PENCIL),
+        ("search", SEARCH),
     ];
 }
 

@@ -15114,11 +15114,11 @@ mod frame_promptness {
             super::super::detail::CopyShortcut::Username,
         )
     }
-    /// **The item list's control**: its search field's hint, which
-    /// `item_list::search_hint` produces and `draw_item_list` is the sole
-    /// caller of. The count is the fixture's own two items, so a list that
-    /// drew its chrome over an empty vault does not satisfy it either.
-    const ITEM_LIST_ONLY: &str = "Search 2 items";
+    /// **The item list's control**: its header's `+ New`, which
+    /// `draw_item_list` is the only thing in this window that paints. (It was
+    /// the search field's hint until the v2 top bar took the search out of
+    /// the list.)
+    const ITEM_LIST_ONLY: &str = "+ New";
     /// **The `DetailMode::Edit` arm's control**: the footer's own Save, which
     /// `draw_detail_edit` is the only thing in this crate that draws.
     ///
@@ -15854,21 +15854,24 @@ mod frame_promptness {
             output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }
         if scenario.press_prefs {
-            // The tune mark paints no text, so it cannot be found the way
-            // every other control here is. `theme::icon_probe::tune_icons` is
-            // the crate's existing answer to "where is that mark" -- it finds
-            // the knobs by the radius that draws them, which is the same two
-            // numbers `tune_button` uses, so a retuned mark moves this
-            // scenario with it instead of stranding it.
-            let marks = crate::theme::icon_probe::tune_icons(&all_shapes(&output));
-            let (rect, _) = *marks.first().unwrap_or_else(|| {
-                panic!(
-                    "the titlebar painted no tune mark to press, so this scenario cannot open \
-                     the preferences modal at all. What was painted: {:?}",
-                    labels_of(&output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
-                )
-            });
+            // The v2 rail's Settings row, which replaced the titlebar gear:
+            // found by its label like every other control here. Its click is
+            // answered on the next frame (a shell request), hence the extra
+            // frame below.
+            let label = crate::vault_window::sidebar::SETTINGS_ROW_LABEL;
+            let rect = labels_of(&output)
+                .into_iter()
+                .find(|(text, _)| text == label)
+                .map(|(_, rect)| rect)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "the rail painted no {label:?} row to press, so this scenario cannot \
+                         open the preferences modal at all. What was painted: {:?}",
+                        labels_of(&output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
+                    )
+                });
             click(&ctx, &mut *frame_fn, rect.center());
+            let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
             let _ = ctx.run_ui(input(), |ui| frame_fn(ui));
             output = ctx.run_ui(input(), |ui| frame_fn(ui));
         }

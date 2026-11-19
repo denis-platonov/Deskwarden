@@ -13,6 +13,8 @@ pub struct Painted {
     /// what of it a person can actually see is `rect.intersect(clip)`.
     pub text_clips: Vec<Rect>,
     pub repaint_delay: std::time::Duration,
+    /// What the frame asked the window to do (drag, maximise, close...).
+    pub commands: Vec<egui::ViewportCommand>,
 }
 
 impl Painted {
@@ -70,6 +72,7 @@ pub fn frame(
     );
     let mut painted = Painted {
         repaint_delay: output.viewport_output[&egui::ViewportId::ROOT].repaint_delay,
+        commands: output.viewport_output[&egui::ViewportId::ROOT].commands.clone(),
         ..Default::default()
     };
     for clipped in &output.shapes {

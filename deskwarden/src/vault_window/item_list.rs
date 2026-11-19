@@ -1368,7 +1368,7 @@ pub(crate) const LIST_PADDING: f32 = 10.0;
 /// other reading a dead id that would simply never match.
 /// `ctrl_k_still_focuses_the_search_field_after_the_move` is what says the
 /// field really carries it.
-fn search_field_id() -> egui::Id {
+pub(crate) fn search_field_id() -> egui::Id {
     egui::Id::new("vault-search")
 }
 
@@ -1755,26 +1755,10 @@ pub fn draw_item_list(
                         ui.close();
                     }
                 });
-                // "Search 180 logins" -- see `search_hint`, which owns
-                // both the count's source and the per-filter noun.
-                let hint = search_hint(
-                    items.map(|items| super::sidebar::count_for(items, filter)),
-                    filter,
-                );
-                theme::search_field(
-                    ui,
-                    search,
-                    &hint,
-                    "CTRL+K",
-                    // Stable id so `Ctrl+K` (wired in
-                    // `vault_window::mod`) can request focus on this
-                    // field from outside this function. MUST NOT CHANGE.
-                    // Spelled once, in `search_field_id` -- the arrow-key
-                    // block below has to ask about this same field's
-                    // focus, and two literals would be two things to
-                    // rename.
-                    search_field_id(),
-                );
+                // The search field moved to the v2 top bar
+                // (`vault_window::top_bar`), keeping `search_field_id` so
+                // Ctrl+K still finds it; this strip keeps `+ New` until
+                // slice 3 restyles the pane.
             });
         });
     });
@@ -9469,122 +9453,11 @@ mod toolbar_strip_tests {
         rects
     }
 
-    #[test]
-    fn the_search_box_and_new_button_sit_on_a_white_tile_spanning_the_pane() {
-        // The report, stated as an assertion. Two things have to be true and
-        // neither was: there IS a white tile, and it reaches BOTH edges of
-        // the pane. A tile inset by a panel margin reads as a card floating
-        // on grey, which is what the design does not draw.
-        let mut search = String::new();
-        let (output, _) = run_item_list(&[an_item("Ledgerline")], &mut search, |_| {});
-        let texts = painted(&output);
 
-        let new_button = texts
-            .iter()
-            .find(|(t, _)| t.contains("New"))
-            .unwrap_or_else(|| panic!("nothing resembling a New button was painted: {texts:?}"));
-        let shortcut = texts
-            .iter()
-            .find(|(t, _)| t == "CTRL+K")
-            .unwrap_or_else(|| panic!("no CTRL+K hint in the search box: {texts:?}"));
 
-        let tile = fills(&output, theme::CARD)
-            .into_iter()
-            // The search box's own interior is also `CARD`; the strip is the
-            // one that spans the pane.
-            .find(|r| r.width() >= PANE_WIDTH - 0.5)
-            .unwrap_or_else(|| {
-                panic!("no white fill spans the pane -- the search field is not on a tile")
-            });
-        assert!(tile.min.y <= 0.5, "the tile must start at the top of the pane, not float: {tile:?}");
-        for (label, rect) in [("+ New", new_button.1), ("CTRL+K", shortcut.1)] {
-            assert!(
-                tile.contains_rect(rect),
-                "{label} at {rect:?} is outside the white tile {tile:?} -- it is being drawn on \
-                 the pane's grey canvas, which is the reported defect"
-            );
-        }
-    }
 
-    #[test]
-    fn the_search_box_shows_the_designs_hint_and_shortcut() {
-        // The two things the old bare `TextEdit` had no way to show. The
-        // count is the design's ("Search 180 logins"), taken from the filter's
-        // own scope so it cannot drift from the sidebar's badge.
-        let mut search = String::new();
-        let (output, _) = run_item_list(
-            &[an_item("Ledgerline"), an_item("Atlas"), an_item("Vantage")],
-            &mut search,
-            |_| {},
-        );
-        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(
-            texts.iter().any(|t| t == "Search 3 items"),
-            "the hint must count what is in scope; painted: {texts:?}"
-        );
-        assert!(texts.iter().any(|t| t == "CTRL+K"), "painted: {texts:?}");
-    }
 
-    #[test]
-    fn a_single_item_in_scope_is_not_described_as_1_items() {
-        let mut search = String::new();
-        let (output, _) = run_item_list(&[an_item("Ledgerline")], &mut search, |_| {});
-        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(texts.iter().any(|t| t == "Search 1 item"), "painted: {texts:?}");
-    }
 
-    #[test]
-    fn a_typed_query_replaces_the_hint_rather_than_sitting_beside_it() {
-        // `hint_text` only shows while the field is empty; this is what says
-        // the string above really is the hint and not a label painted next
-        // to the box forever.
-        let mut search = "ledger".to_string();
-        let (output, _) = run_item_list(&[an_item("Ledgerline")], &mut search, |_| {});
-        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(texts.iter().any(|t| t == "ledger"), "painted: {texts:?}");
-        assert!(!texts.iter().any(|t| t.starts_with("Search ")), "painted: {texts:?}");
-    }
-
-    #[test]
-    fn ctrl_k_still_focuses_the_search_field_after_the_move() {
-        // THE ONE THING THE REDESIGN COULD BREAK SILENTLY. `vault_window::run`
-        // focuses this field by id, from outside this function, with exactly
-        // the call below. Moving the field into a new `Frame`, a new layout,
-        // and a hand-painted box would compile and look right while the
-        // shortcut quietly stopped working -- the id is now handed to
-        // `theme::search_field`, which passes it to the `TextEdit`, and
-        // nothing but this test says it arrives.
-        let mut search = String::new();
-        let id = egui::Id::new("vault-search");
-        let (_, ctx) = run_item_list(&[an_item("Ledgerline")], &mut search, |ctx| {
-            ctx.memory_mut(|m| m.request_focus(id));
-        });
-        assert!(
-            ctx.memory(|m| m.has_focus(id)),
-            "Ctrl+K's `request_focus(Id::new(\"vault-search\"))` no longer lands on the search \
-             field -- the id was renamed, or it is no longer the TextEdit's own id"
-        );
-    }
-
-    /// A left click at `pos`: the move, the press and the release, which is
-    /// the whole sequence egui needs to report `clicked()`.
-    fn click_at(pos: egui::Pos2) -> Vec<egui::Event> {
-        vec![
-            egui::Event::PointerMoved(pos),
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            },
-            egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            },
-        ]
-    }
 
     fn escape_key() -> Vec<egui::Event> {
         vec![egui::Event::Key {
@@ -9596,105 +9469,10 @@ mod toolbar_strip_tests {
         }]
     }
 
-    #[test]
-    fn the_shortcut_slot_shows_ctrl_k_while_empty_and_esc_once_something_is_typed() {
-        // THE REPORT: the search field's `CTRL+K` hint should become an "Esc"
-        // that clears the field, in the same slot, once there is anything to
-        // clear. Both directions asserted, so neither "absent" claim can pass
-        // against a field that renders no hint at all.
-        let items = [an_item("Ledgerline")];
 
-        let mut empty = String::new();
-        let (output, _) = run_item_list(&items, &mut empty, |_| {});
-        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(texts.iter().any(|t| t == "CTRL+K"), "painted: {texts:?}");
-        assert!(!texts.iter().any(|t| t == "Esc"), "painted: {texts:?}");
 
-        let mut typed = "ledger".to_string();
-        let (output, _) = run_item_list(&items, &mut typed, |_| {});
-        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(texts.iter().any(|t| t == "Esc"), "painted: {texts:?}");
-        assert!(
-            !texts.iter().any(|t| t == "CTRL+K"),
-            "the focus shortcut and the clear affordance share ONE slot; both are showing: \
-             {texts:?}"
-        );
-    }
 
-    #[test]
-    fn the_esc_hint_lands_in_exactly_the_slot_ctrl_k_occupied() {
-        // "Same slot, no layout shift". The two strings are different widths,
-        // so the slot is sized to the WIDER of them and both are right-aligned
-        // in it -- the right edge and the vertical centre are asserted equal
-        // to the pt, absolutely, between the two states.
-        let items = [an_item("Ledgerline")];
-        let mut empty = String::new();
-        let (a, _) = run_item_list(&items, &mut empty, |_| {});
-        let ctrl_k = painted(&a).into_iter().find(|(t, _)| t == "CTRL+K").expect("CTRL+K").1;
 
-        let mut typed = "ledger".to_string();
-        let (b, _) = run_item_list(&items, &mut typed, |_| {});
-        let esc = painted(&b).into_iter().find(|(t, _)| t == "Esc").expect("Esc").1;
-
-        assert!(
-            (ctrl_k.right() - esc.right()).abs() < 0.01,
-            "the hint's right edge moved from x={} to x={} when the field filled",
-            ctrl_k.right(),
-            esc.right()
-        );
-        assert!(
-            (ctrl_k.center().y - esc.center().y).abs() < 0.01,
-            "the hint's baseline moved from y={} to y={}",
-            ctrl_k.center().y,
-            esc.center().y
-        );
-    }
-
-    #[test]
-    fn clicking_the_esc_hint_clears_the_search() {
-        let items = [an_item("Ledgerline")];
-        // Where the hint is, measured from a first run rather than guessed.
-        let mut probe = "ledger".to_string();
-        let (output, _) = run_item_list(&items, &mut probe, |_| {});
-        let esc = painted(&output).into_iter().find(|(t, _)| t == "Esc").expect("Esc").1;
-
-        let mut search = "ledger".to_string();
-        let (_, _) = run_item_list_with_events(&items, &mut search, |_| {}, click_at(esc.center()));
-        assert_eq!(search, "", "clicking the Esc hint must clear the search field");
-    }
-
-    #[test]
-    fn clicking_where_the_hint_is_does_not_clear_anything_while_it_reads_ctrl_k() {
-        // The positive control's mirror: the slot is only an affordance when
-        // there is something to clear, so a click in the same place with an
-        // empty field must not be wired to anything. Without this, "the click
-        // cleared it" could just be "any click anywhere clears it".
-        let items = [an_item("Ledgerline")];
-        let mut probe = String::new();
-        let (output, _) = run_item_list(&items, &mut probe, |_| {});
-        let slot = painted(&output).into_iter().find(|(t, _)| t == "CTRL+K").expect("CTRL+K").1;
-
-        // Same click, but the field starts empty and the caller then types --
-        // i.e. the click must not have consumed or armed anything.
-        let mut search = String::new();
-        let (_, ctx) = run_item_list_with_events(&items, &mut search, |_| {}, click_at(slot.center()));
-        assert_eq!(search, "");
-        let _ = ctx;
-    }
-
-    #[test]
-    fn escape_clears_the_search_while_the_field_has_focus() {
-        let items = [an_item("Ledgerline")];
-        let mut search = "ledger".to_string();
-        let id = egui::Id::new("vault-search");
-        let (_, _) = run_item_list_with_events(
-            &items,
-            &mut search,
-            |ctx| ctx.memory_mut(|m| m.request_focus(id)),
-            escape_key(),
-        );
-        assert_eq!(search, "", "Escape must clear the search field while it has focus");
-    }
 
     #[test]
     fn escape_is_ignored_when_the_search_field_never_had_focus() {
@@ -9713,23 +9491,6 @@ mod toolbar_strip_tests {
         );
     }
 
-    #[test]
-    fn escape_on_an_empty_focused_field_is_left_alone_too() {
-        // The other half of the gate: nothing to clear, nothing to claim.
-        let items = [an_item("Ledgerline")];
-        let mut search = String::new();
-        let id = egui::Id::new("vault-search");
-        let (output, _) = run_item_list_with_events(
-            &items,
-            &mut search,
-            |ctx| ctx.memory_mut(|m| m.request_focus(id)),
-            escape_key(),
-        );
-        assert_eq!(search, "");
-        // ...and the slot is still the focus shortcut, not a clear button.
-        let texts: Vec<String> = painted(&output).into_iter().map(|(t, _)| t).collect();
-        assert!(texts.iter().any(|t| t == "CTRL+K"), "painted: {texts:?}");
-    }
 
     #[test]
     fn the_item_rows_are_still_below_the_tile_and_not_under_it() {
@@ -10585,6 +10346,24 @@ mod keyboard_selection_tests {
             let selected = &mut self.selected;
             let modal = self.modal;
             let _ = ctx.run_ui(raw(events), |ui| {
+                // The search field lives in the v2 top bar now, drawn by the
+                // window above the panes; so does it here, with the same
+                // `search` string, so focus and typing reach it as they do in
+                // the app.
+                let bar = egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(PANE_WIDTH, crate::vault_window::top_bar::HEIGHT),
+                );
+                let pill = crate::vault_window::top_bar::SyncPill::from_v1(theme::TEXT_GHOST, "Sync");
+                crate::vault_window::top_bar::draw(
+                    ui,
+                    bar,
+                    search,
+                    crate::vault_window::top_bar::SEARCH_PLACEHOLDER,
+                    &pill,
+                    false,
+                    |_| {},
+                );
                 draw_item_list(
                     ui,
                     Some(items),
