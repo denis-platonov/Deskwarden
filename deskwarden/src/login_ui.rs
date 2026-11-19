@@ -9971,7 +9971,7 @@ pub(crate) mod password_lifetime_tests {
             let fields = match fields.split_last() {
                 // `-z` terminates every field, so the split leaves one
                 // trailing empty piece; an empty answer is just that piece.
-                Some((last, rest)) if last.is_empty() => rest.to_vec(),
+                Some(([], rest)) => rest.to_vec(),
                 _ => fields,
             };
             assert!(

@@ -1957,9 +1957,7 @@ pub fn advance_webcam(
 ) -> Option<crate::webcam::Frame> {
     use crate::webcam::Verdict;
 
-    let Some(stage) = state.webcam.as_mut() else {
-        return None;
-    };
+    let stage = state.webcam.as_mut()?;
     let Some(session) = stage.session.as_mut() else {
         // The device picker is up. Nothing is open, so there is nothing to
         // ask.

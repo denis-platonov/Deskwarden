@@ -211,7 +211,7 @@ fn draw_page(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
         .auto_shrink([false, false])
         .show(ui, |ui| {
             let available = ui.available_width();
-            let column = (available - 80.0).min(COLUMN_MAX).max(320.0);
+            let column = (available - 80.0).clamp(320.0, COLUMN_MAX);
             let side = ((available - column) / 2.0).max(24.0);
             ui.add_space(32.0);
             ui.horizontal_top(|ui| {
@@ -845,7 +845,7 @@ mod tests {
     fn copying_the_logs_says_whether_it_had_a_file_to_name() {
         let mut fixture = Fixture::new(Page::About);
         let painted = fixture.settle();
-        let copy = painted.texts.iter().filter(|(t, _, _)| t == "Copy").next_back().expect("a Copy button").2.center();
+        let copy = painted.texts.iter().rfind(|(t, _, _)| t == "Copy").expect("a Copy button").2.center();
         fixture.frame(click_at(copy));
         let toast = crate::kit::toast::current(&fixture.ctx).expect("a toast");
         assert!(toast == LOGS_COPIED_TOAST || toast == LOGS_MISSING_TOAST, "{toast}");

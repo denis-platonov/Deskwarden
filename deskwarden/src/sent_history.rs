@@ -170,7 +170,7 @@ impl SentHistory {
                 }),
             }
         }
-        people.sort_by(|a, b| b.last_sent_unix_millis.cmp(&a.last_sent_unix_millis));
+        people.sort_by_key(|a| std::cmp::Reverse(a.last_sent_unix_millis));
         people
     }
 

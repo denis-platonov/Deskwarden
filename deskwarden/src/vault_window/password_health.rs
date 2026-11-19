@@ -547,7 +547,7 @@ pub fn report_with_scan(
     }
     // Worst first. A list in vault order buries the 40,000-hit password under
     // three that were seen twice.
-    by_count.sort_by(|a, b| b.0.cmp(&a.0));
+    by_count.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     // **Whether a group really is one password, from the reuse digests rather
     // than from the count.** See `BreachGroup`: the count alone cannot tell

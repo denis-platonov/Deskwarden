@@ -1397,7 +1397,7 @@ impl BandSubject<'_> {
         let caption = ui.ctx().fonts_mut(|f| f.layout_job(self.caption_job())).size();
         let name = run_size(ui, self.name, Self::name_font());
         let (beside, under) = match (&self.beside, go) {
-            (BandBeside::Folder(folder), _) if folder.is_empty() => (egui::Vec2::ZERO, egui::Vec2::ZERO),
+            (BandBeside::Folder(""), _) => (egui::Vec2::ZERO, egui::Vec2::ZERO),
             (BandBeside::Folder(folder), _) => {
                 let folder = run_size(ui, folder, egui::FontId::proportional(BAND_FOLDER_PX));
                 (egui::vec2(BAND_NAME_GAP + folder.x, folder.y), egui::Vec2::ZERO)
@@ -2031,7 +2031,7 @@ const STEP_DROP_LINE: f32 = 2.0;
 /// move it, and Up and Down move the selection. Read after the rows have
 /// drawn, so the edit lands on the next frame the way a drop does.
 fn step_keys(ui: &egui::Ui, count: usize, selected: &mut Option<usize>) -> Option<StepEdit> {
-    let Some(index) = *selected else { return None };
+    let index = (*selected)?;
     if index >= count {
         *selected = None;
         return None;

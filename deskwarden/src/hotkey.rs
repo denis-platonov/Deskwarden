@@ -739,7 +739,7 @@ fn register_all(fh: &mut FillHotkeys, now: Instant, wanted: impl Fn(HotkeyStatus
             Some(chord) => {
                 let (manager, outcome) = (fh.attempt)(fh.manager.take(), chord.to_hotkey());
                 fh.manager = manager;
-                let status = classify(outcome.as_ref().map(|_| ()).map_err(|e| e));
+                let status = classify(outcome.as_ref().map(|_| ()));
                 if let Err(e) = &outcome {
                     // **Written when it is news, not when it happens.** See
                     // [`REMIND_EVERY`]: the attempt repeats every

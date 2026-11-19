@@ -454,7 +454,7 @@ pub struct Layout {
 /// credential row it has always painted -- and a zero-row height would clip
 /// that row off a window the user cannot scroll.
 pub fn layout(rows: usize) -> Layout {
-    let rows = rows.max(1).min(ROW_CAP) as i32;
+    let rows = rows.clamp(1, ROW_CAP) as i32;
 
     let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
