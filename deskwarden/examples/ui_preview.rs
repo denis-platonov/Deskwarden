@@ -677,6 +677,18 @@ enum Surface {
     SettingsSecurity,
     SettingsVault,
     SettingsShortcuts,
+    SettingsAutofill,
+    SettingsApps,
+    SettingsAppsKeys,
+    SettingsGenerator,
+    SettingsNotifications,
+    SettingsImportExport,
+    SettingsDevices,
+    SettingsAccount,
+    SettingsAbout,
+    SettingsSecurityPrivacy,
+    SettingsSecurityBreaches,
+    SettingsVaultBackend,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -947,6 +959,18 @@ const ALL: &[Surface] = &[
     Surface::SettingsSecurity,
     Surface::SettingsVault,
     Surface::SettingsShortcuts,
+    Surface::SettingsAutofill,
+    Surface::SettingsApps,
+    Surface::SettingsAppsKeys,
+    Surface::SettingsGenerator,
+    Surface::SettingsNotifications,
+    Surface::SettingsImportExport,
+    Surface::SettingsDevices,
+    Surface::SettingsAccount,
+    Surface::SettingsAbout,
+    Surface::SettingsSecurityPrivacy,
+    Surface::SettingsSecurityBreaches,
+    Surface::SettingsVaultBackend,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -1060,6 +1084,18 @@ impl Surface {
             Surface::SettingsSecurity => "settings_security",
             Surface::SettingsVault => "settings_vault",
             Surface::SettingsShortcuts => "settings_shortcuts",
+            Surface::SettingsAutofill => "settings_autofill",
+            Surface::SettingsApps => "settings_apps",
+            Surface::SettingsAppsKeys => "settings_apps_keys",
+            Surface::SettingsGenerator => "settings_generator",
+            Surface::SettingsNotifications => "settings_notifications",
+            Surface::SettingsImportExport => "settings_import_export",
+            Surface::SettingsDevices => "settings_devices",
+            Surface::SettingsAccount => "settings_account",
+            Surface::SettingsAbout => "settings_about",
+            Surface::SettingsSecurityPrivacy => "settings_security_privacy",
+            Surface::SettingsSecurityBreaches => "settings_security_breaches",
+            Surface::SettingsVaultBackend => "settings_vault_backend",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1260,7 +1296,19 @@ impl Surface {
             | Surface::SettingsGeneral
             | Surface::SettingsSecurity
             | Surface::SettingsVault
-            | Surface::SettingsShortcuts => egui::vec2(1280.0 - 252.0, 820.0),
+            | Surface::SettingsShortcuts
+            | Surface::SettingsAutofill
+            | Surface::SettingsApps
+            | Surface::SettingsAppsKeys
+            | Surface::SettingsGenerator
+            | Surface::SettingsNotifications
+            | Surface::SettingsImportExport
+            | Surface::SettingsDevices
+            | Surface::SettingsAccount
+            | Surface::SettingsAbout
+            | Surface::SettingsSecurityPrivacy
+            | Surface::SettingsSecurityBreaches
+            | Surface::SettingsVaultBackend => egui::vec2(1280.0 - 252.0, 820.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1415,6 +1463,18 @@ fn main() -> eframe::Result {
             Surface::SettingsSecurity,
             Surface::SettingsVault,
             Surface::SettingsShortcuts,
+            Surface::SettingsAutofill,
+            Surface::SettingsApps,
+            Surface::SettingsAppsKeys,
+            Surface::SettingsGenerator,
+            Surface::SettingsNotifications,
+            Surface::SettingsImportExport,
+            Surface::SettingsDevices,
+            Surface::SettingsAccount,
+            Surface::SettingsAbout,
+            Surface::SettingsSecurityPrivacy,
+            Surface::SettingsSecurityBreaches,
+            Surface::SettingsVaultBackend,
         ]
     } else if list {
         vec![Surface::VaultList]
@@ -1932,36 +1992,23 @@ impl eframe::App for Preview {
                 let mut state = deskwarden::vault_window::generator_screen::GeneratorScreen::new(Default::default());
                 let _ = deskwarden::vault_window::generator_screen::draw(root, &mut state);
             }
-            Surface::SettingsGeneral
+            surface @ (Surface::SettingsGeneral
             | Surface::SettingsSecurity
             | Surface::SettingsVault
-            | Surface::SettingsShortcuts => {
-                use deskwarden::prefs_ui::settings_v2::{draw, Page};
-                let mut page = match self.current() {
-                    Surface::SettingsSecurity => Page::Security,
-                    Surface::SettingsVault => Page::Vault,
-                    Surface::SettingsShortcuts => Page::Shortcuts,
-                    _ => Page::General,
-                };
-                let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
-                if page == Page::Security {
-                    // The score card needs the numbers the window offers it.
-                    use deskwarden::vault_window::password_health::{FoundItem, HealthReport, OldItem, ReuseGroup, WeakItem};
-                    let found = |id: &str| FoundItem { id: id.into(), name: id.into() };
-                    let weak = |id: &str| WeakItem {
-                        item: found(id),
-                        chars: 4,
-                        classes: deskwarden::password_strength::CharClasses::of("abcd"),
-                    };
-                    let report = HealthReport {
-                        weak: vec![weak("a"), weak("b")],
-                        reused: vec![ReuseGroup { items: vec![found("c"), found("d")] }],
-                        old: (0..3).map(|i| OldItem { item: found(&format!("o{i}")), days: 400 }).collect(),
-                        ..Default::default()
-                    };
-                    prefs_ui::security_score::offer(root.ctx(), &report);
-                }
-                let _ = draw(root, &mut state, &mut page);
+            | Surface::SettingsShortcuts
+            | Surface::SettingsAutofill
+            | Surface::SettingsApps
+            | Surface::SettingsAppsKeys
+            | Surface::SettingsGenerator
+            | Surface::SettingsNotifications
+            | Surface::SettingsImportExport
+            | Surface::SettingsDevices
+            | Surface::SettingsAccount
+            | Surface::SettingsAbout
+            | Surface::SettingsSecurityPrivacy
+            | Surface::SettingsSecurityBreaches
+            | Surface::SettingsVaultBackend) => {
+                self.draw_settings_page(root, surface);
             }
             Surface::ModalNewItem => {
                 self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
@@ -2409,6 +2456,86 @@ impl Preview {
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
+    }
+
+    /// One page of the Settings screen, the way the vault window draws it and
+    /// the tray's Preferences window now does too. The state is rebuilt each
+    /// frame; nothing here reads a file, the registry or the network.
+    fn draw_settings_page(&mut self, root: &mut egui::Ui, surface: Surface) {
+        use deskwarden::prefs_ui::settings_v2::{draw, Page};
+        use deskwarden::service_keys::{Access, KeyRecord, Scope, Subject};
+        fn self_hosted() -> Option<prefs_ui::AccountStatus> {
+            Some(prefs_ui::AccountStatus::SignedIn {
+                email: Some("someone@example.com".to_string()),
+                server: Some("https://vault.example.com".to_string()),
+            })
+        }
+        fn now() -> u64 {
+            1_800_000_000
+        }
+        let (mut page, scroll) = match surface {
+            Surface::SettingsSecurity => (Page::Security, None),
+            Surface::SettingsSecurityPrivacy => (Page::Security, Some(470.0)),
+            Surface::SettingsSecurityBreaches => (Page::Security, Some(1250.0)),
+            Surface::SettingsVault => (Page::Vault, None),
+            Surface::SettingsVaultBackend => (Page::Vault, Some(720.0)),
+            Surface::SettingsShortcuts => (Page::Shortcuts, None),
+            Surface::SettingsAutofill => (Page::Autofill, None),
+            Surface::SettingsApps | Surface::SettingsAppsKeys => (Page::Apps, None),
+            Surface::SettingsGenerator => (Page::Generator, None),
+            Surface::SettingsNotifications => (Page::Notifications, None),
+            Surface::SettingsImportExport => (Page::ImportExport, None),
+            Surface::SettingsDevices => (Page::Devices, None),
+            Surface::SettingsAccount => (Page::Account, None),
+            Surface::SettingsAbout => (Page::About, None),
+            _ => (Page::General, None),
+        };
+        let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings {
+            use_official_bw_crypto: Some(false),
+            service_enabled: matches!(surface, Surface::SettingsAppsKeys),
+            ..deskwarden::settings::Settings::default()
+        });
+        state.show_account_source(self_hosted);
+        state.show_key_clock(now);
+        if matches!(surface, Surface::SettingsAppsKeys) {
+            state.show_service_keys(vec![
+                KeyRecord {
+                    name: "Backup script".into(),
+                    hash: "00".into(),
+                    created_unix: now() - 86_400 * 12,
+                    expires_unix: None,
+                    scopes: vec![Scope { access: Access::Read, subject: Subject::All }],
+                },
+                KeyRecord {
+                    name: "Old CI job".into(),
+                    hash: "01".into(),
+                    created_unix: now() - 86_400 * 90,
+                    expires_unix: Some(now() - 86_400),
+                    scopes: vec![Scope { access: Access::Write, subject: Subject::All }],
+                },
+            ]);
+        }
+        if let Some(y) = scroll {
+            state.show_scrolled(y);
+        }
+        if page == Page::Security {
+            // The score card needs the numbers the window offers it.
+            use deskwarden::vault_window::password_health::{FoundItem, HealthReport, OldItem, ReuseGroup, WeakItem};
+            let found = |id: &str| FoundItem { id: id.into(), name: id.into() };
+            let weak = |id: &str| WeakItem {
+                item: found(id),
+                chars: 4,
+                classes: deskwarden::password_strength::CharClasses::of("abcd"),
+            };
+            let report = HealthReport {
+                weak: vec![weak("a"), weak("b")],
+                reused: vec![ReuseGroup { items: vec![found("c"), found("d")] }],
+                old: (0..3).map(|i| OldItem { item: found(&format!("o{i}")), days: 400 }).collect(),
+                ..Default::default()
+            };
+            prefs_ui::security_score::offer(root.ctx(), &report);
+        }
+        let _ = draw(root, &mut state, &mut page);
     }
 
     fn draw_prefs_window(&mut self, root: &mut egui::Ui) {
