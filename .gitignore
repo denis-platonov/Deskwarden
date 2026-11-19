@@ -41,3 +41,6 @@ docs/brands/
 
 # A master password lives here during REST probing. Never committed.
 .env
+
+# Microsoft Store package output (scripts/store/build-msix.ps1)
+/store-package/
