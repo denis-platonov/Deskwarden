@@ -1776,6 +1776,59 @@ pub struct Settings {
     /// fix is still there to be fixed.
     #[serde(skip)]
     pub accounts_unreadable: bool,
+    /// The Generator screen's remembered options (slice 6). Local to this
+    /// machine; nothing is stored on any item.
+    pub generator: GeneratorPrefs,
+}
+
+/// The Generator screen's options (spec C §1), remembered between runs.
+/// A file without them, or with values out of range, gets the spec's
+/// defaults or the nearest value in range -- see [`Self::clamped`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GeneratorPrefs {
+    pub mode: crate::generator_mode::GeneratorMode,
+    /// Password length, 8..=64.
+    pub length: u32,
+    /// Passphrase words, 3..=10.
+    pub words: u32,
+    /// PIN digits, 4..=12.
+    pub pin_length: u32,
+    pub uppercase: bool,
+    pub lowercase: bool,
+    pub numbers: bool,
+    pub symbols: bool,
+    pub avoid_lookalikes: bool,
+}
+
+impl Default for GeneratorPrefs {
+    fn default() -> Self {
+        Self {
+            mode: crate::generator_mode::GeneratorMode::Password,
+            length: 20,
+            words: 5,
+            pin_length: 6,
+            uppercase: true,
+            lowercase: true,
+            numbers: true,
+            symbols: true,
+            avoid_lookalikes: false,
+        }
+    }
+}
+
+impl GeneratorPrefs {
+    /// The same options with every number in its range, and at least one
+    /// character class on.
+    pub fn clamped(mut self) -> Self {
+        self.length = self.length.clamp(8, 64);
+        self.words = self.words.clamp(3, 10);
+        self.pin_length = self.pin_length.clamp(4, 12);
+        if !(self.uppercase || self.lowercase || self.numbers || self.symbols) {
+            self.lowercase = true;
+        }
+        self
+    }
 }
 
 impl Default for Settings {
@@ -1816,6 +1869,7 @@ impl Default for Settings {
             accounts: Vec::new(),
             active_account: None,
             accounts_unreadable: false,
+            generator: GeneratorPrefs::default(),
         }
     }
 }
@@ -1978,6 +2032,9 @@ impl Settings {
             // that produced `self`, and the copy this function writes is the
             // one `Self::load` just made below, which carries its own.
             accounts_unreadable: _,
+            // Owned by the Generator screen, which writes it through
+            // `persist_generator`; the preferences window never edits it.
+            generator: _,
         } = self;
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
@@ -2010,6 +2067,15 @@ impl Settings {
         on_disk.cache_vault_to_disk = *cache_vault_to_disk;
         on_disk.read_through_cache = *read_through_cache;
         on_disk.service_enabled = *service_enabled;
+        on_disk.save(path)
+    }
+
+    /// Writes the Generator screen's options back, without disturbing
+    /// anything else in the file (the same read-modify-write as
+    /// [`Self::persist_preferences`]).
+    pub fn persist_generator(path: &Path, generator: &GeneratorPrefs) -> std::io::Result<()> {
+        let mut on_disk = Self::load(path);
+        on_disk.generator = generator.clone().clamped();
         on_disk.save(path)
     }
 
@@ -2538,6 +2604,7 @@ mod tests {
     fn settings_round_trip_through_disk() {
         let path = temp_path("round-trip");
         let written = Settings {
+            generator: GeneratorPrefs::default(),
             read_through_cache: false,
             // Opposite of the default, like every field here: a save that
             // dropped it would show up as a mismatch rather than as a pass.
@@ -2892,6 +2959,7 @@ mod tests {
         // renamed on one side only) would look fine in memory.
         let path = temp_path("auto-lock-round-trip");
         let written = Settings {
+            generator: GeneratorPrefs::default(),
             read_through_cache: false,
             // Opposite of the default, like every field here: a save that
             // dropped it would show up as a mismatch rather than as a pass.
@@ -3641,6 +3709,7 @@ mod tests {
     fn a_geometry_round_trips_through_disk_with_the_rest_of_the_file() {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
+            generator: GeneratorPrefs::default(),
             read_through_cache: false,
             // Opposite of the default, like every field here: a save that
             // dropped it would show up as a mismatch rather than as a pass.
@@ -5543,5 +5612,44 @@ mod clamp_window_geometry_tests {
                  once, so it is stale and is widening this check for nothing"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod generator_prefs_tests {
+    use super::*;
+
+    #[test]
+    fn an_old_settings_file_gets_the_spec_defaults() {
+        let parsed: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.generator, GeneratorPrefs::default());
+        assert_eq!((parsed.generator.length, parsed.generator.words, parsed.generator.pin_length), (20, 5, 6));
+        let partial: Settings = serde_json::from_str(r#"{"generator":{"mode":"pin"}}"#).unwrap();
+        assert_eq!(partial.generator.mode, crate::generator_mode::GeneratorMode::Pin);
+        assert_eq!(partial.generator.length, 20, "the rest keep their defaults");
+    }
+
+    #[test]
+    fn out_of_range_values_are_clamped() {
+        let wild = GeneratorPrefs { length: 500, words: 1, pin_length: 0, uppercase: false, lowercase: false, numbers: false, symbols: false, ..GeneratorPrefs::default() };
+        let tame = wild.clamped();
+        assert_eq!((tame.length, tame.words, tame.pin_length), (64, 3, 4));
+        assert!(tame.lowercase, "a password needs at least one class");
+    }
+
+    #[test]
+    fn the_generator_is_written_without_touching_the_rest() {
+        let dir = std::env::temp_dir().join(format!("dw-genprefs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut first = Settings::default();
+        first.check_breaches = true;
+        first.save(&path).unwrap();
+        let prefs = GeneratorPrefs { mode: crate::generator_mode::GeneratorMode::Passphrase, words: 7, ..GeneratorPrefs::default() };
+        Settings::persist_generator(&path, &prefs).unwrap();
+        let back = Settings::load(&path);
+        assert_eq!(back.generator, prefs);
+        assert!(back.check_breaches, "another preference was lost");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
