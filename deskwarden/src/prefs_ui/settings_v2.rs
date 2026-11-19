@@ -362,10 +362,8 @@ fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
     });
     group(ui, Some("Shortcut"), |ui| {
         card(ui, |ui| {
-            let chord = match state.settings.shortcuts.picker {
-                Some(chord) => chord.to_string(),
-                None => prefs::SHORTCUT_NOT_SET.to_string(),
-            };
+            // The spec's wording: the keys joined by a space (`Ctrl Alt B`).
+            let chord = prefs::chord_keys(false, state.settings.shortcuts.picker).join(" ");
             if button_row(ui, FILL_SHORTCUT_LABEL, FILL_SHORTCUT_SUB, &chord, false) {
                 *page = Page::Shortcuts;
             }
@@ -782,7 +780,7 @@ mod tests {
     fn the_fill_shortcut_row_goes_to_the_shortcuts_page() {
         let mut fixture = Fixture::new(Page::Autofill);
         let painted = fixture.settle();
-        let chord = fixture.state.settings.shortcuts.picker.map(|c| c.to_string()).unwrap_or_else(|| prefs::SHORTCUT_NOT_SET.into());
+        let chord = prefs::chord_keys(false, fixture.state.settings.shortcuts.picker).join(" ");
         let at = painted.texts.iter().filter(|(t, _, _)| *t == chord).map(|(_, _, r)| r.center()).next().expect("the chord button");
         fixture.frame(click_at(at));
         assert_eq!(fixture.page, Page::Shortcuts);

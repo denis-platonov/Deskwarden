@@ -2334,6 +2334,7 @@ impl Preview {
             ..deskwarden::settings::Settings::default()
         });
         state.show(prefs_ui::Section::Clipboard);
+        state.show_scrolled(470.0);
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
             .show(root, |ui| prefs_ui::draw_prefs_body(ui, &mut state));
@@ -2401,6 +2402,7 @@ impl Preview {
             ..deskwarden::settings::Settings::default()
         });
         state.show(prefs_ui::Section::Vault);
+        state.show_scrolled(720.0);
         state.show_account_source(self_hosted);
         egui::CentralPanel::default()
             .frame(egui::Frame::new())
@@ -2451,6 +2453,7 @@ impl Preview {
         theme::paint_window_background(root);
         let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
         state.show(prefs_ui::Section::Breaches);
+        state.show_scrolled(1330.0);
         state.show_scan_stage(stage);
         state.show_scan_history(ScanHistory { entries: history });
         egui::CentralPanel::default()
@@ -2476,12 +2479,13 @@ impl Preview {
         let (mut page, scroll) = match surface {
             Surface::SettingsSecurity => (Page::Security, None),
             Surface::SettingsSecurityPrivacy => (Page::Security, Some(470.0)),
-            Surface::SettingsSecurityBreaches => (Page::Security, Some(1250.0)),
+            Surface::SettingsSecurityBreaches => (Page::Security, Some(1330.0)),
             Surface::SettingsVault => (Page::Vault, None),
             Surface::SettingsVaultBackend => (Page::Vault, Some(720.0)),
             Surface::SettingsShortcuts => (Page::Shortcuts, None),
             Surface::SettingsAutofill => (Page::Autofill, None),
-            Surface::SettingsApps | Surface::SettingsAppsKeys => (Page::Apps, None),
+            Surface::SettingsApps => (Page::Apps, None),
+            Surface::SettingsAppsKeys => (Page::Apps, Some(560.0)),
             Surface::SettingsGenerator => (Page::Generator, None),
             Surface::SettingsNotifications => (Page::Notifications, None),
             Surface::SettingsImportExport => (Page::ImportExport, None),

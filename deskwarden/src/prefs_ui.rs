@@ -2327,7 +2327,12 @@ fn status_row(ui: &mut Ui, status: &str, control_w: f32, control: impl FnOnce(&m
     control_row_of(
         ui,
         |ui| {
-            let text = egui::WidgetText::from(tokens::job(ROW_TITLE, status, ink));
+            let role = tokens::Role { size: 15.0, face: theme::REGULAR, tracking_em: 0.0 };
+            let mut job = tokens::job(role, status, ink);
+            for section in &mut job.sections {
+                section.format.line_height = Some(24.0);
+            }
+            let text = egui::WidgetText::from(job);
             let galley = text.into_galley(
                 ui,
                 Some(egui::TextWrapMode::Wrap),
@@ -2433,17 +2438,6 @@ fn child_toggle_row(
     value
 }
 
-/// [`control_row`] with the text column ghosted -- the disabled twin, sharing
-/// its layout exactly rather than approximating it.
-fn control_row_ghosted(
-    ui: &mut Ui,
-    label: &str,
-    description: &str,
-    control: impl FnOnce(&mut Ui),
-) {
-    control_row_w(ui, label, description, true, CONTROL_COLUMN_WIDTH, control);
-}
-
 /// A row with no control at all: a statement, not a setting.
 ///
 /// Used for `CLIPBOARD_HISTORY_NOTE`, and shaped exactly like About's account
@@ -2520,31 +2514,16 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
             ScanStage::NothingToScan => SCAN_NOTHING_DESCRIPTION.to_string(),
             ScanStage::Unavailable => SCAN_UNAVAILABLE_DESCRIPTION.to_string(),
         };
-        control_row(ui, SCAN_SECTION_LABEL, &description, |_ui| {});
-
-        row_separator(ui);
-        // **The button is on its own row, left-aligned**, rather than in the
-        // trailing control column every other row on this window uses. Its
-        // label is wider than `CONTROL_COLUMN_WIDTH`, and widening that
-        // column would move the control on every row of every page to make
-        // room for one button.
-        //
         // A running scan still draws a button -- disabled, and labelled with
         // what is happening -- rather than drawing nothing: a control that
-        // vanishes mid-action reflows the card under the cursor.
-        //
-        // **Driven by the STAGE, not by `is_busy`.** They agree in the
-        // shipped app, and they must not be used interchangeably: `is_busy`
-        // asks whether a channel is still open, which is a fact about this
-        // process, while `Running` is what the page is claiming. The
-        // screenshot example parks a panel in `Running` with no channel
-        // behind it, and a button keyed on `is_busy` drew that surface with
-        // an idle, clickable button on it -- a picture of a state the app
-        // cannot be in.
+        // vanishes mid-action reflows the card under the cursor. Driven by the
+        // STAGE, not by `is_busy`: the screenshot example parks a panel in
+        // `Running` with no channel behind it.
         let running = matches!(stage, ScanStage::Running { .. });
+        let label = if running { SCAN_RUNNING_BUTTON } else { SCAN_BUTTON };
         let mut clicked = false;
-        card_row(ui, |ui| {
-            let label = if running { SCAN_RUNNING_BUTTON } else { SCAN_BUTTON };
+        let width = outline_button_width(ui, label);
+        control_row_w(ui, SCAN_SECTION_LABEL, &description, false, width, |ui| {
             clicked = scan_button(ui, label, !running);
         });
         if let ScanStage::Running { done, total, .. } = &stage {
@@ -3486,7 +3465,7 @@ fn draw_sync_poll_card(ui: &mut Ui, state: &mut PrefsState) {
         );
         row_separator(ui);
         let enabled = state.settings.sync_polling;
-        control_row(ui, SYNC_POLL_LABEL, SYNC_POLL_DESCRIPTION, |ui| {
+        control_row_w(ui, SYNC_POLL_LABEL, SYNC_POLL_DESCRIPTION, false, STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH, |ui| {
             state.settings.sync_poll_minutes = minutes_stepper_with(
                 ui,
                 state.settings.sync_poll_minutes,
@@ -4045,7 +4024,8 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         // and changed their mind wants, and a reset button that greyed out
         // with the thing it resets would be unreachable from the state you
         // most want to leave.
-        control_row(ui, CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_DESCRIPTION, |ui| {
+        let reset_w = outline_button_width(ui, CLIPBOARD_RESET_BUTTON);
+        control_row_w(ui, CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_DESCRIPTION, false, reset_w, |ui| {
             if reset_button(ui) {
                 // The whole of the button's behaviour is one pure function on
                 // `Settings`, so "this resets the section and nothing else" is
@@ -4079,11 +4059,11 @@ fn interval_row(ui: &mut Ui, state: &mut PrefsState, enabled: bool) {
     // { control_row_ghosted }` cannot be given a type general enough over
     // the closure's lifetime.
     if enabled {
-        control_row(ui, CLIPBOARD_INTERVAL_LABEL, description, |ui| {
+        control_row_w(ui, CLIPBOARD_INTERVAL_LABEL, description, false, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
             interval_field(ui, state, true);
         });
     } else {
-        control_row_ghosted(ui, CLIPBOARD_INTERVAL_LABEL, description, |ui| {
+        control_row_w(ui, CLIPBOARD_INTERVAL_LABEL, description, true, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
             interval_field(ui, state, false);
         });
     }
@@ -4978,10 +4958,14 @@ fn release_notes(ui: &mut Ui, body: &str) {
         ui.spacing_mut().scroll.bar_width = UPDATE_NOTES_BAR_WIDTH;
         ui.spacing_mut().scroll.bar_inner_margin = UPDATE_NOTES_BAR_MARGIN;
         ui.spacing_mut().scroll.bar_outer_margin = 0.0;
-        ui.visuals_mut().widgets.inactive.bg_fill = theme::BORDER_STRONG;
-        ui.visuals_mut().widgets.hovered.bg_fill = theme::TEXT_SECONDARY;
-        ui.visuals_mut().widgets.active.bg_fill = theme::TEXT_SECONDARY;
-        ui.visuals_mut().extreme_bg_color = theme::CANVAS;
+        let p = palette(ui.ctx());
+        ui.visuals_mut().widgets.inactive.bg_fill = p.border;
+        ui.visuals_mut().widgets.inactive.fg_stroke.color = p.border;
+        ui.visuals_mut().widgets.hovered.bg_fill = p.text_icon;
+        ui.visuals_mut().widgets.hovered.fg_stroke.color = p.text_icon;
+        ui.visuals_mut().widgets.active.bg_fill = p.text_icon;
+        ui.visuals_mut().widgets.active.fg_stroke.color = p.text_icon;
+        ui.visuals_mut().extreme_bg_color = p.list_bg;
         if notes_fit(ui) {
             // Notes that fit paint no bar at all: a line down the side of a
             // region with nothing to scroll points at nothing. Only the PAINT
@@ -5392,13 +5376,13 @@ fn progress_track(ui: &mut Ui, fraction: f32) {
         Vec2::new(ui.available_width(), UPDATE_BAR_HEIGHT),
         Sense::hover(),
     );
-    ui.painter().rect_filled(rect, CornerRadius::same(UPDATE_BAR_RADIUS), theme::CANVAS);
+    ui.painter().rect_filled(rect, CornerRadius::same(UPDATE_BAR_RADIUS), palette(ui.ctx()).meter_track);
     let filled =
         Rect::from_min_size(rect.min, Vec2::new(rect.width() * fraction, rect.height()));
     ui.painter().rect_filled(
         filled,
         CornerRadius::same(UPDATE_BAR_RADIUS),
-        theme::TEXT_SECONDARY,
+        palette(ui.ctx()).blue,
     );
 }
 
@@ -7963,6 +7947,138 @@ mod tests {
         // exists; Clipboard is the nearest surviving row to where it sat.
         let painted = paint(Section::Clipboard);
         assert_eq!(painted.count_filled(theme::BLUE_WASH), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Slice 15b: one Settings, in one style
+    // -----------------------------------------------------------------------
+
+    /// The panes (clipboard, breaches, backend, sync, ...) are drawn by this
+    /// file's primitives and the pages' own rows by `settings_v2`; a row of
+    /// either must be the same row. Measured on the title ink: a pane row and
+    /// a page row set their titles at the same size.
+    #[test]
+    fn a_pane_row_and_a_page_row_are_the_same_row() {
+        let pane = paint(Section::Clipboard).ink_of(CLIPBOARD_MASTER_LABEL).rect.height();
+        let page = paint(Section::General).ink_of(PROMPT_LABEL).rect.height();
+        assert!(
+            (pane - page).abs() < 0.5,
+            "a pane row's title is {pane} points tall and a page row's is {page}: two row styles"
+        );
+        // And the same 50x30 switch, on both.
+        assert!(!paint(Section::Clipboard).pills_of(Section::Clipboard).is_empty());
+        assert!(!paint(Section::General).pills_of(Section::General).is_empty());
+    }
+
+    /// **The 3e drawing is gone from the production half of this file.** The
+    /// pill, the joined segmented run and the hairline-bordered card are the
+    /// pieces that made the panes look like another app; a guard so none of
+    /// them comes back through a copied snippet.
+    #[test]
+    fn the_3e_controls_are_not_drawn_by_the_panes_any_more() {
+        let source = include_str!("prefs_ui.rs").replace("\r\n", "\n");
+        let production = &source[..source.find(concat!("#[cfg(test)]\n", "mod tests {")).expect("the test cut")];
+        for needle in [
+            concat!("theme::toggle_", "pill("),
+            concat!("theme::toggle_pill_", "disabled("),
+            concat!("theme::segmented_", "control("),
+            concat!("theme::segmented_control_", "disabled("),
+            concat!("theme::Seg", "ment {"),
+            concat!("theme::HAIR", "LINE)"),
+        ] {
+            assert!(!production.contains(needle), "{needle:?} is drawn by a pane again");
+        }
+    }
+
+    /// Every section the 3e nav listed opens the v2 page that now holds its
+    /// rows, and that page paints a row of the section's.
+    #[test]
+    fn every_section_opens_the_page_that_holds_its_rows() {
+        let wanted: [(Section, settings_v2::Page, &str); 12] = [
+            (Section::General, settings_v2::Page::Autofill, PROMPT_LABEL),
+            (Section::Shortcuts, settings_v2::Page::Shortcuts, "Type the username"),
+            (Section::View, settings_v2::Page::Vault, FETCH_ICONS_LABEL),
+            (Section::Lock, settings_v2::Page::Security, AUTO_LOCK_ENABLED_LABEL),
+            (Section::Breaches, settings_v2::Page::Security, BREACH_LABEL),
+            (Section::Vault, settings_v2::Page::Vault, BACKEND_CHOICE_LABEL),
+            (Section::Sync, settings_v2::Page::Account, SYNC_PUSH_LABEL),
+            (Section::Sharing, settings_v2::Page::Account, ADVANCED_SHARING_LABEL),
+            (Section::Api, settings_v2::Page::Apps, SERVICE_LABEL),
+            (Section::Clipboard, settings_v2::Page::Security, CLIPBOARD_MASTER_LABEL),
+            (Section::Updates, settings_v2::Page::About, UPDATE_CHECK_LABEL),
+            (Section::About, settings_v2::Page::About, "Version"),
+        ];
+        for (section, page, label) in wanted {
+            assert_eq!(section.page(), page, "{section:?} opens the wrong page");
+            let mut state = PrefsState::new(Settings::default());
+            state.show_account_source(|| {
+                Some(AccountStatus::SignedIn { email: None, server: Some("https://vault.example.com".into()) })
+            });
+            state.show(section);
+            let painted = tall_frame(&tall_context(), &mut state, &[]);
+            assert!(painted.any_containing(label), "{section:?}: {label:?} is not on the {page:?} page");
+        }
+    }
+
+    /// The tray's Preferences window draws the Settings screen -- the nav of
+    /// twelve pages -- not a second layout, and its Back row closes it.
+    #[test]
+    fn the_tray_window_is_the_settings_screen_and_back_closes_it() {
+        let ctx = styled_context();
+        let mut state = PrefsState::new(Settings::default());
+        let run = |events: &[egui::Event], state: &mut PrefsState| {
+            let mut action = ChromeAction::None;
+            let output = ctx.run_ui(raw_input(events), |ui| {
+                action = draw_prefs_window(ui, state);
+            });
+            let mut painted = Painted::default();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut painted);
+            }
+            (painted, action)
+        };
+        run(&[], &mut state);
+        let (painted, _) = run(&[], &mut state);
+        for page in settings_v2::Page::ALL {
+            assert!(painted.contains(page.label()), "the tray window's nav has no {:?}", page.label());
+        }
+        let back = painted.rect_of(settings_v2::BACK_LABEL).center();
+        let (_, action) = run(&click(back), &mut state);
+        assert_eq!(action, ChromeAction::Close, "Back did not close the tray window");
+    }
+
+    /// A chord is painted as the key chips of spec C 2.7.
+    #[test]
+    fn a_chord_is_said_as_key_chips() {
+        let chord = crate::hotkey::Chord::parse("CTRL+SHIFT+F9");
+        assert_eq!(chord_keys(false, chord), ["Ctrl", "Shift", "F9"]);
+        assert_eq!(chord_keys(false, None), [SHORTCUT_NOT_SET]);
+        assert_eq!(chord_keys(true, chord), [SHORTCUT_CAPTURING]);
+    }
+
+    /// The v2 run answers a press on a lit cell too (the read/write pair needs
+    /// it), and answers nothing while inert.
+    #[test]
+    fn the_segmented_run_reports_presses_and_is_silent_when_inert() {
+        for (enabled, expected) in [(true, Some(0)), (false, None)] {
+            let ctx = styled_context();
+            let mut picked = None;
+            let mut draw = |events: &[egui::Event]| {
+                let output = ctx.run_ui(raw_input(events), |ui| {
+                    picked = segmented_flags(ui, &["Read", "Write"], &[true, false], enabled);
+                });
+                let mut painted = Painted::default();
+                for clipped in &output.shapes {
+                    walk(&clipped.shape, &mut painted);
+                }
+                painted
+            };
+            draw(&[]);
+            let painted = draw(&[]);
+            let at = painted.rect_of("Read").center();
+            draw(&click(at));
+            assert_eq!(picked, expected, "enabled={enabled}");
+        }
     }
 
     #[test]
