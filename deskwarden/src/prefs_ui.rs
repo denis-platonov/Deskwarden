@@ -2210,6 +2210,12 @@ fn row_text_ink(ui: &mut Ui, label: &str, description: &str, tip: &str, ghost: b
     let (ink, sub_ink) = if ghost { (p.text_ghost, p.text_ghost) } else { (p.ink, p.text_label) };
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
+        if description.is_empty() {
+            // **Most rows have no sub in the design**, and a lone title sits
+            // level with its control rather than at the row's top edge.
+            let title_h = ui.fonts_mut(|f| f.layout_job(tokens::job(ROW_TITLE, label, ink))).size().y;
+            ui.add_space(((CONTROL_MIN_HEIGHT - title_h) / 2.0).max(0.0));
+        }
         if tip.is_empty() {
             ui.label(tokens::job(ROW_TITLE, label, ink));
         } else {

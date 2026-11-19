@@ -703,7 +703,7 @@ enum Surface {
     SettingsSecurityPrivacy,
     SettingsSecurityBreaches,
     SettingsVaultBackend,
-    /// Settings > Vault with the `?` tip of the direct-icons row open, the way
+    /// Settings > Vault with the `?` tip of the TOTP-secrets row open, the way
     /// the design shows it on hover.
     SettingsVaultTip,
     /// **The read pane's header WITH a favicon**, which no shot has ever
@@ -2821,7 +2821,9 @@ impl Preview {
             Surface::SettingsSecurityBreaches => (Page::Security, Some(1330.0)),
             Surface::SettingsVault => (Page::Vault, None),
             Surface::SettingsVaultBackend => (Page::Vault, Some(720.0)),
-            Surface::SettingsVaultTip => (Page::Vault, None),
+            // From the top: the scroll offset of the shot before it is
+            // remembered by egui, so say where this one starts.
+            Surface::SettingsVaultTip => (Page::Vault, Some(0.0)),
             Surface::SettingsShortcuts => (Page::Shortcuts, None),
             Surface::SettingsAutofill => (Page::Autofill, None),
             Surface::SettingsApps => (Page::Apps, None),
@@ -2882,7 +2884,7 @@ impl Preview {
         if matches!(surface, Surface::SettingsVaultTip) {
             // No pointer to hover with: hold the bubble open on the row the
             // design would be hovered on.
-            prefs_ui::pin_row_tip(root.ctx(), "Fetch site icons from the sites themselves");
+            prefs_ui::pin_row_tip(root.ctx(), "Show TOTP secrets on the details screen");
         }
         let _ = draw(root, &mut state, &mut page);
     }
