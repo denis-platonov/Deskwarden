@@ -1353,7 +1353,7 @@ const WITH_HINT: &str = "Their email address";
 const SUGGESTIONS_EYEBROW: &str = "SHARED WITH BEFORE";
 /// 6a's footer note. `Sent` is the rail's own word for the list a share is
 /// filed in (`sidebar::SENDS_ROW_LABEL`).
-const APPEARS_IN_SENT: &str = "Appears in Sent";
+const APPEARS_IN_SENT: &str = "Appears in Shared";
 /// The footer note while a share is out -- mock 6e's `Stopping…` idiom.
 const SHARING_NOW: &str = "Sharing\u{2026}";
 /// The footer note while a code is being made.
@@ -3698,7 +3698,7 @@ mod tests {
         assert!(has("RECORD") && has("WITH"));
         assert!(has("They get view-only access"));
         assert!(has(SHARE_BUTTON) && has(CANCEL_BUTTON));
-        assert!(has("Appears in Sent"), "6a's footer note: {texts:?}");
+        assert!(has("Appears in Shared"), "6a's footer note: {texts:?}");
         assert!(!texts.iter().any(|(t, _)| t.to_lowercase().contains("organi")), "the dialog names an organisation: {texts:?}");
     }
 

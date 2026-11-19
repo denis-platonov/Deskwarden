@@ -162,7 +162,7 @@ fn main() {
     // and is a pure function of them, so the daemon's behaviour on this line
     // is to fall through -- deliberately, so that the daemon's startup reads
     // exactly as it did before this branch existed.
-    match launch_intent(std::env::args().skip(1)) {
+    match launch_intent(process_args()) {
         // The daemon, either flavour. Falls through into every line below.
         Ok(LaunchIntent::UserLaunch) | Ok(LaunchIntent::LoginAutostart) => {}
         // A window, and nothing else. It never takes the mutex, never asks
@@ -1500,7 +1500,7 @@ fn main() {
     // Exit 2 rather than 1: 1 is already "another Deskwarden is running and
     // would not stand down", and a bad command line is a different failure
     // that a script driving this binary has to be able to tell apart.
-    let launch = match launch_intent(std::env::args().skip(1)) {
+    let launch = match launch_intent(process_args()) {
         Ok(launch) => launch,
         Err(refusal) => {
             let message = refusal.message();
@@ -11667,6 +11667,16 @@ fn launch_intent<S: AsRef<str>>(
     } else {
         LaunchIntent::UserLaunch
     })
+}
+
+/// This process's command line, as the launch decision reads it: the real
+/// arguments, plus `--autostart` when the Store package's startup task started
+/// us (a task passes no arguments; see `autostart_repair::args_with_activation`).
+fn process_args() -> Vec<String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Asked only of a bare launch, so a child process never queries WinRT.
+    let by_task = args.is_empty() && deskwarden::autostart_repair::launched_by_startup_task();
+    deskwarden::autostart_repair::args_with_activation(args, by_task)
 }
 
 /// What a launch refused over its `DESKWARDEN_PROFILE` exits with: the same

@@ -1274,7 +1274,7 @@ pub const SECRET_FIELD_TONE: theme::PillTone = theme::PillTone {
 /// the witness cannot quietly degenerate back into the rail row by somebody
 /// making them match again. See
 /// `vault_window::send_delete_wiring::drive_the_sends_screen_in`.
-pub const SENDS_HEADING: &str = "SENT";
+pub const SENDS_HEADING: &str = "SHARED";
 
 // ---------------------------------------------------------------------------
 // Design 5d -- which record a live Send belongs to
