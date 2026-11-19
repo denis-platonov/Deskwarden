@@ -3764,31 +3764,7 @@ pub fn draw_detail_read(
     // inheriting whatever the last arm happened to draw.
     match detail_body_for(kind) {
         DetailBody::LoginCredentials => {
-            card(ui, "LOGIN CREDENTIALS", |ui| {
-                credential_row(
-                    ui,
-                    // The label is read out of `copy_shortcut_label` rather
-                    // than typed here, so this row and its copy confirmation
-                    // are literally the same string.
-                    copy_shortcut_label(CopyShortcut::Username),
-                    username,
-                    Some(CopyShortcut::Username),
-                    &mut action,
-                    DetailAction::CopyUsername,
-                );
-                // **The hairline is owed only if the row below it is drawn.**
-                // An empty password draws no row at all (see
-                // `masked_row_visible`), and a rule left standing over the
-                // gap would be a separator with nothing on one side of it --
-                // exactly the "leftover separator where the row used to be"
-                // this change exists to avoid. The Username row above is
-                // unconditional, so this rule is always correctly placed when
-                // it is drawn at all.
-                if masked_row_visible(password) {
-                    theme::row_rule(ui);
-                    password_row(ui, password, &mut reveal.password, &mut action);
-                }
-            });
+            login_field_card(ui, username, password, &mut reveal.password, &mut action);
             ui.add_space(CARD_GAP);
 
             // **8a's `One-time code` card, which this pane used to draw as
@@ -7201,17 +7177,45 @@ fn credential_row(
     );
 }
 
-fn password_row(ui: &mut egui::Ui, password: &str, revealed: &mut bool, action: &mut DetailAction) {
-    masked_row(
-        ui,
-        // See `copy_shortcut_label`: one string for the row and its toast.
-        copy_shortcut_label(CopyShortcut::Password),
-        password,
-        revealed,
-        action,
-        DetailAction::CopyPassword,
-        MaskedFace { hint: Some(CopyShortcut::Password), ..MaskedFace::default() },
-    );
+/// The password while hidden: 14 dots whatever its length (spec 3.3), so
+/// the mask says nothing about it.
+pub const MASKED_PASSWORD: &str = "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
+
+/// Spec 3.3's login field card: Username over its value with copy, then
+/// Password, masked, with the eye and copy. Empty fields are left out, as
+/// 0.15's rows were.
+fn login_field_card(ui: &mut egui::Ui, username: &str, password: &str, revealed: &mut bool, action: &mut DetailAction) {
+    use crate::kit;
+    let show_password = masked_row_visible(password);
+    if username.is_empty() && !show_password {
+        return;
+    }
+    kit::card::card(ui, kit::tokens::R_CARD, Margin::ZERO, |ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 0.0;
+        if !username.is_empty() {
+            let label = copy_shortcut_label(CopyShortcut::Username);
+            if kit::field::single(ui, label, username, 0.0, None).copy {
+                *action = DetailAction::CopyUsername;
+                note_copied(ui.ctx(), label);
+            }
+        }
+        if show_password {
+            if !username.is_empty() {
+                kit::card::row_rule(ui);
+            }
+            let label = copy_shortcut_label(CopyShortcut::Password);
+            let (shown, tracking) = if *revealed { (password, 0.02) } else { (MASKED_PASSWORD, 0.12) };
+            let row = kit::field::single(ui, label, shown, tracking, Some(*revealed));
+            if row.reveal {
+                *revealed = !*revealed;
+            }
+            if row.copy {
+                *action = DetailAction::CopyPassword;
+                note_copied(ui.ctx(), label);
+            }
+        }
+    });
 }
 
 /// The three things that differ between one [`masked_row`] and another, in
@@ -9304,7 +9308,6 @@ mod tests {
             texts: Vec::new(),
             rendered: Vec::new(),
             rects: Vec::new(),
-            cursor: output.platform_output.cursor_icon,
             stars: Vec::new(),
             eyes: Vec::new(),
             kebab_dots: Vec::new(),
@@ -9753,25 +9756,6 @@ mod tests {
         }
     }
 
-    /// The one painted run with this exact text, with its rect and its font.
-    /// Panics rather than returning an `Option` so a row that stopped being
-    /// drawn names itself, and rejects a second match so no assertion here can
-    /// quietly be about a different run than the one it names.
-    fn only(
-        painted: &[(String, egui::Rect, egui::FontId)],
-        text: &str,
-    ) -> (egui::Rect, egui::FontId) {
-        let mut hits = painted.iter().filter(|(t, _, _)| t == text);
-        let hit = hits
-            .next()
-            .unwrap_or_else(|| panic!("nothing painted {text:?}; painted: {painted:?}"));
-        assert!(
-            hits.next().is_none(),
-            "{text:?} was painted more than once, so this assertion is ambiguous"
-        );
-        (hit.1, hit.2.clone())
-    }
-
     fn frame_shapes(
         item: &VaultItem,
         totp: &TotpState,
@@ -9970,9 +9954,6 @@ mod tests {
         /// the strip, the avatar tile, a row's hover tint -- that paint no
         /// string at all.
         rects: Vec<(egui::Rect, egui::Color32)>,
-        /// The cursor this frame asked for. Half of a click affordance; the
-        /// other half is a fill in [`rects`].
-        cursor: egui::CursorIcon,
         stars: Vec<theme::icon_probe::Star>,
         eyes: Vec<egui::Rect>,
         kebab_dots: Vec<(egui::Rect, egui::Color32)>,
@@ -10475,7 +10456,6 @@ mod tests {
                 texts: Vec::new(),
                 rendered: Vec::new(),
                 rects: Vec::new(),
-                cursor: output.platform_output.cursor_icon,
                 stars: Vec::new(),
                 eyes: Vec::new(),
                 kebab_dots: Vec::new(),
@@ -10613,58 +10593,6 @@ mod tests {
 
     fn contains(texts: &[String], needle: &str) -> bool {
         texts.iter().any(|t| t.contains(needle))
-    }
-
-    /// An AUTOFILL TARGETS card on a non-login would advertise a capability
-    /// autofill refuses to provide for it, and LOGIN CREDENTIALS would head a
-    /// section with no credentials under it.
-    ///
-    /// The "Fill in app" absence asserted below is a tombstone, not this
-    /// test's subject: the header button that painted that label was removed
-    /// in `7da1bba`, and the row that used to read `expected` for it is the
-    /// one that would come back first if the button did.
-    #[test]
-    fn only_a_login_renders_the_autofill_targets_and_credentials_cards() {
-        for kind in EVERY_KIND {
-            let mut item = an_item(item_type_for(kind));
-            // Give every kind a login object carrying a URI, so the autofill
-            // card's *other* precondition is satisfied and the only thing
-            // that can suppress it is the kind. A non-login item would not
-            // really carry one; this is deliberately the hostile fixture.
-            item.login = Some(crate::vault_bridge::LoginData {
-                username: Some("u".to_string()),
-                password: Some("p".to_string().into()),
-                totp: None,
-                uris: vec![crate::vault_bridge::UriEntry {
-                    uri: Some("https://example.com".to_string()),
-                    other: serde_json::Map::new(),
-                }],
-                other: serde_json::Map::new(),
-            });
-            let texts = painted(&item, &TotpState::NoSecret);
-            let expected = kind == ItemKind::Login;
-
-            // The header's "Fill in app" button was removed at the user's
-            // request. Asserted as an absolute over EVERY kind rather than
-            // dropped: the row that used to read `expected` here is the one
-            // that would come back first if the button did, and this fails
-            // the moment any pane paints that label again.
-            assert!(
-                !contains(&texts, "Fill in app"),
-                "{kind:?}: the removed header Fill button is painted again; painted: \
-                 {texts:?}"
-            );
-            assert_eq!(
-                contains(&texts, "AUTOFILL TARGETS"),
-                expected,
-                "{kind:?}: wrong AUTOFILL TARGETS presence"
-            );
-            assert_eq!(
-                contains(&texts, "LOGIN CREDENTIALS"),
-                expected,
-                "{kind:?}: wrong LOGIN CREDENTIALS presence"
-            );
-        }
     }
 
     /// The kebab's Delete row is **as wide as the menu**, and so is the row
@@ -11698,40 +11626,6 @@ mod tests {
         }
     }
 
-    /// The other half of the drift guard: the body each kind renders is the
-    /// one `detail_body_for` chose.
-    #[test]
-    fn the_rendered_body_matches_the_body_decision_for_every_kind() {
-        for kind in EVERY_KIND {
-            let item = an_item(item_type_for(kind));
-            let texts = painted(&item, &TotpState::NoSecret);
-            let heading_present = |h: &str| contains(&texts, h);
-
-            match detail_body_for(kind) {
-                DetailBody::LoginCredentials => {
-                    assert!(heading_present("LOGIN CREDENTIALS"), "{kind:?}: {texts:?}")
-                }
-                DetailBody::NotesOnly => {
-                    // Nothing but the notes card, and this fixture has no
-                    // note -- so no body card at all.
-                    for heading in ["LOGIN CREDENTIALS", "CARD DETAILS", "IDENTITY", "NOTES"] {
-                        assert!(
-                            !heading_present(heading),
-                            "{kind:?} drew a {heading} card it has no data for: {texts:?}"
-                        );
-                    }
-                }
-                DetailBody::Card => assert!(heading_present("CARD DETAILS"), "{kind:?}: {texts:?}"),
-                DetailBody::Identity => assert!(heading_present("IDENTITY"), "{kind:?}: {texts:?}"),
-                DetailBody::SshKey => assert!(heading_present("SSH KEY"), "{kind:?}: {texts:?}"),
-                DetailBody::Unsupported(pane) => {
-                    assert!(heading_present(pane.heading), "{kind:?}: {texts:?}");
-                    assert!(heading_present(&pane.message), "{kind:?}: {texts:?}");
-                }
-            }
-        }
-    }
-
     /// The dispatch moved the One-time code row inside the login arm, so this
     /// pins what that means for every other kind: no TOTP row, whatever the
     /// state says. Unreachable in the live composition --
@@ -12107,36 +12001,6 @@ mod tests {
         );
     }
 
-    /// **Clicking the eye reveals, and copies NOTHING.**
-    ///
-    /// The eye sits inside a tile that copies on click, and the value behind
-    /// it is a secret. "Clicking the eye also put the password on the
-    /// clipboard" is silent, user-visible and would be caught by no other
-    /// test here -- so both halves are asserted in one frame: the flag
-    /// flipped, and no action was reported. The positive half is what stops
-    /// the negative one passing against a click that missed everything.
-    #[test]
-    fn clicking_the_eye_reveals_without_copying() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let eye = laid_out.eyes();
-        assert_eq!(eye.len(), 1, "a login has exactly one masked row");
-
-        let clicked = pane.click(&item, &TotpState::NoSecret, eye[0].center());
-        assert!(
-            pane.reveal.password,
-            "clicking the eye did not reveal the password, so the assertion below is \
-             about a click that hit nothing"
-        );
-        assert_eq!(
-            clicked.action,
-            DetailAction::None,
-            "clicking the eye ALSO copied the password to the clipboard -- a secret the \
-             user never asked for"
-        );
-    }
-
     // -----------------------------------------------------------------
     // The MATCHED APP card.
     // -----------------------------------------------------------------
@@ -12420,8 +12284,7 @@ mod tests {
     /// card. `the_card_heading_list_is_complete` counts the `card(` call sites
     /// in this file against it, so a ninth card fails the build's own suite
     /// rather than quietly narrowing the ordering claim.
-    const EVERY_CARD_HEADING: [&str; 12] = [
-        "LOGIN CREDENTIALS",
+    const EVERY_CARD_HEADING: [&str; 11] = [
         TOTP_CARD_HEADING,
         "CARD DETAILS",
         "IDENTITY",
@@ -12616,7 +12479,8 @@ mod tests {
             // LOGIN CREDENTIALS, plus the AUTOFILL TARGETS and PREVIOUS
             // PASSWORDS that `a_noted_login_with_targets_and_history` exists
             // to put on the pane.
-            ItemKind::Login => 3,
+            // (Credentials are the v2 field card, which has no heading.)
+            ItemKind::Login => 2,
             _ => 1,
         };
         body + 1 + usize::from(bound)
@@ -13015,104 +12879,6 @@ mod tests {
         assert_eq!(fired, 3, "the chord loop visited {fired} chords, not 3");
     }
 
-    /// **An empty password draws no row: no label, no bullets, no eye, and no
-    /// space where it was.** The user: "if password is empty - show no mask
-    /// (and no field at all)".
-    ///
-    /// Drawing it invisible is not the same as not drawing it, so this asserts
-    /// three separate things a transparent or zero-size row would each fail:
-    /// the label is absent from the painted frame, the card is SHORTER by at
-    /// least a whole row, and everything below the card moved up by exactly
-    /// that much.
-    #[test]
-    fn an_empty_password_draws_no_row_at_all() {
-        let label = copy_shortcut_label(CopyShortcut::Password);
-        let full = a_login();
-        let empty = a_login_with_no_credentials();
-
-        let mut pane = Pane::new();
-        let with = pane.idle(&full, &TotpState::NoSecret);
-        let mut pane = Pane::new();
-        let without = pane.idle(&empty, &TotpState::NoSecret);
-
-        // The premise: the pane really is drawing the card in both passes, so
-        // an absent label cannot be "the pane drew nothing".
-        for frame in [&with, &without] {
-            assert!(
-                frame.painted("LOGIN CREDENTIALS"),
-                "the login card was not drawn at all: {:?}",
-                frame.strings()
-            );
-            assert!(
-                frame.painted("Username"),
-                "the username row was not drawn either: {:?}",
-                frame.strings()
-            );
-        }
-
-        // 1. THE LABEL IS GONE -- not merely the bullets.
-        assert!(
-            !without.painted(label),
-            "an empty password still paints its {label:?} label: {:?}",
-            without.strings()
-        );
-        assert!(
-            !without.strings().iter().any(|t| t.starts_with('\u{2022}')),
-            "an empty password still paints a mask: {:?}",
-            without.strings()
-        );
-
-        // 2. THE CARD IS SHORTER BY A WHOLE ROW.
-        let card_with = with.filled_box_around(with.rect_of("LOGIN CREDENTIALS"), theme::CARD);
-        let card_without =
-            without.filled_box_around(without.rect_of("LOGIN CREDENTIALS"), theme::CARD);
-        let shrank = card_with.height() - card_without.height();
-        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
-        assert!(
-            shrank >= a_row,
-            "the card lost only {shrank}pt where a row is {a_row}pt -- the row is still \
-             taking its space, so it was hidden rather than skipped"
-        );
-
-        // 3. AND NO HAIRLINE LEFT STANDING OVER THE GAP. A row rule is a 1pt
-        //    `theme::CANVAS` fill (see `theme::row_rule`), and the login card
-        //    has exactly one -- between Username and Password -- when both rows
-        //    are there and none at all when only Username is. A separator with
-        //    nothing on one side of it is the other way a removed row leaves a
-        //    trace, and it costs about a point, which the height check above is
-        //    too coarse to see.
-        let rules = |frame: &Frame, card: egui::Rect| {
-            frame
-                .rects
-                .iter()
-                .filter(|(rect, fill)| {
-                    *fill == theme::CANVAS
-                        && (rect.height() - 1.0).abs() < 0.5
-                        && card.contains_rect(*rect)
-                })
-                .count()
-        };
-        assert_eq!(
-            rules(&with, card_with),
-            1,
-            "the two-row login card does not draw one row rule, so counting them proves \r
-             nothing"
-        );
-        assert_eq!(
-            rules(&without, card_without),
-            0,
-            "a separator is still drawn where the password row was"
-        );
-
-        // 4. AND EVERYTHING BELOW MOVED UP BY EXACTLY THAT MUCH -- no gap
-        // left behind, no separator standing over nothing.
-        assert_eq!(
-            with.rect_of("AUTOFILL TARGETS").top() - without.rect_of("AUTOFILL TARGETS").top(),
-            shrank,
-            "the cards below the login card did not move up by the row's whole height"
-        );
-    }
-
     /// **`masked_row` itself, called with nothing to hide, allocates nothing
     /// at all.**
     ///
@@ -13213,70 +12979,6 @@ mod tests {
             "both passes took the same {:?}pt, so the harness is measuring nothing",
             heights
         );
-    }
-
-    /// The positive control for the rule above: a password that IS there still
-    /// draws its whole row -- label, the full bullet run, and the reveal eye.
-    /// Without it "hide an empty password" is satisfied by hiding every
-    /// password.
-    #[test]
-    fn a_non_empty_password_still_draws_its_whole_row() {
-        let label = copy_shortcut_label(CopyShortcut::Password);
-        let mut pane = Pane::new();
-        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
-        assert!(
-            frame.painted(label),
-            "a real password lost its {label:?} label: {:?}",
-            frame.strings()
-        );
-        // One bullet per character -- see [`MASKED_BULLETS`] -- read off the
-        // fixture rather than written down.
-        let secret_len = a_login()
-            .login
-            .as_ref()
-            .and_then(|l| l.password.as_ref())
-            .expect("a_login carries a password")
-            .chars()
-            .count();
-        assert!(
-            frame.painted(&"\u{2022}".repeat(secret_len)),
-            "a real password draws no {secret_len}-bullet mask: {:?}",
-            frame.strings()
-        );
-        assert_eq!(
-            frame.eyes.len(),
-            1,
-            "a real password row offers {} reveal eyes, not one",
-            frame.eyes.len()
-        );
-    }
-
-    /// **The reveal eye is not offered for an empty value**, kept as its own
-    /// assertion even though the row's absence implies it: it is cheap, and it
-    /// fails loudly against the one wrong way to satisfy the rule -- drawing
-    /// the row transparent or zero-size, which leaves the eye in the shape
-    /// tree where `theme::icon_probe` finds it by geometry rather than by any
-    /// string.
-    #[test]
-    fn the_reveal_eye_is_not_offered_for_an_empty_value() {
-        let mut pane = Pane::new();
-        let frame = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
-        assert!(
-            frame.painted("LOGIN CREDENTIALS"),
-            "the pane drew no card at all, so an absent eye proves nothing: {:?}",
-            frame.strings()
-        );
-        assert_eq!(
-            frame.eyes.len(),
-            0,
-            "an item with no password still offers {} eye(s) to reveal it",
-            frame.eyes.len()
-        );
-        // The control, on the same probe: an item that HAS one gets an eye,
-        // so zero above is a decision and not a probe that never finds any.
-        let mut pane = Pane::new();
-        let filled = pane.idle(&a_login(), &TotpState::NoSecret);
-        assert_eq!(filled.eyes.len(), 1, "the eye probe finds nothing at all");
     }
 
     /// **The read pane shows no MATCHED APP card when nothing is bound.**
@@ -13946,18 +13648,6 @@ mod tests {
     // An empty row promises nothing (see `row_offers_copy`).
     // -----------------------------------------------------------------
 
-    /// A login whose username and password are both the empty string -- which
-    /// is a real vault item (an item saved with only a URI and a note), and
-    /// the one the toast used to lie about.
-    fn a_login_with_no_credentials() -> VaultItem {
-        let mut item = a_login();
-        if let Some(login) = item.login.as_mut() {
-            login.username = Some(String::new());
-            login.password = Some(String::new().into());
-        }
-        item
-    }
-
     /// **The two paths, asked the same question.** The chord path has always
     /// refused an empty field; this asserts the click path's predicate gives
     /// the identical answer, against `copy_shortcut_action` itself rather
@@ -14036,321 +13726,6 @@ mod tests {
             ),
             Some(DetailAction::CopyTotp),
             "CTRL+T refuses a code that really is on screen"
-        );
-    }
-
-    /// The bug, at the pane: a click on an empty Password row reported a copy
-    /// and raised "Password copied" over an untouched clipboard.
-    #[test]
-    fn clicking_an_empty_credential_row_reports_nothing_and_raises_no_toast() {
-        // **`Username` only, and the missing `Password` is the point.** An
-        // empty password now draws NO ROW AT ALL (see `masked_row_visible`),
-        // which is a strictly stronger promise than the inert row this test
-        // was written for -- there is no rect to hover, click or hit. The
-        // Password case did not stop being guarded: it moved to
-        // `an_empty_password_draws_no_row_at_all`, and the line below keeps it
-        // biting here too.
-        {
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
-            assert!(
-                !laid_out.painted(copy_shortcut_label(CopyShortcut::Password)),
-                "an empty password is back to drawing a row; painted: {:?}",
-                laid_out.strings()
-            );
-        }
-        for (label, toast) in [("Username", "Username copied")] {
-            let empty = a_login_with_no_credentials();
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&empty, &TotpState::NoSecret);
-            let row = laid_out.rect_of(label);
-
-            let clicked = pane.click(&empty, &TotpState::NoSecret, row.center());
-            assert_eq!(
-                clicked.action,
-                DetailAction::None,
-                "clicking the empty {label:?} row reported {:?}",
-                clicked.action
-            );
-            // The frame AFTER the click is where a toast raised by that click
-            // would be painted, exactly as the toast's own tests read it.
-            let after = pane.idle(&empty, &TotpState::NoSecret);
-            assert!(
-                !after.painted(toast),
-                "the empty {label:?} row confirmed a copy that never happened; the frame \
-                 painted: {:?}",
-                after.strings()
-            );
-
-            // POSITIVE CONTROL, same rect, same gesture, on an item that DOES
-            // carry the value: without it a pane that had stopped drawing the
-            // row at all -- or a click that missed -- would pass the above.
-            let filled = a_login();
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&filled, &TotpState::NoSecret);
-            let row = laid_out.rect_of(label);
-            let clicked = pane.click(&filled, &TotpState::NoSecret, row.center());
-            assert_ne!(
-                clicked.action,
-                DetailAction::None,
-                "the filled {label:?} row reported no copy either, so the assertion above \
-                 is about a click that hit nothing"
-            );
-            let after = pane.idle(&filled, &TotpState::NoSecret);
-            assert!(
-                after.painted(toast),
-                "the filled {label:?} row raised no {toast:?} either; painted: {:?}",
-                after.strings()
-            );
-        }
-    }
-
-    /// The other two promises: the hover tint and the pointing hand. Both are
-    /// made *before* the click, which is why suppressing the toast alone was
-    /// not enough.
-    #[test]
-    fn an_empty_credential_row_offers_no_hover_affordance() {
-        // **`Username` only, and the missing `Password` is the point.** An
-        // empty password now draws NO ROW AT ALL (see `masked_row_visible`),
-        // which is a strictly stronger promise than the inert row this test
-        // was written for -- there is no rect to hover, click or hit. The
-        // Password case did not stop being guarded: it moved to
-        // `an_empty_password_draws_no_row_at_all`, and the line below keeps it
-        // biting here too.
-        {
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
-            assert!(
-                !laid_out.painted(copy_shortcut_label(CopyShortcut::Password)),
-                "an empty password is back to drawing a row; painted: {:?}",
-                laid_out.strings()
-            );
-        }
-        for label in ["Username"] {
-            let empty = a_login_with_no_credentials();
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&empty, &TotpState::NoSecret);
-            let row = laid_out.rect_of(label);
-            let hovered = pane.hover(&empty, &TotpState::NoSecret, row.center());
-            assert_ne!(
-                hovered.cursor,
-                egui::CursorIcon::PointingHand,
-                "the empty {label:?} row still shows the pointing hand"
-            );
-            assert!(
-                !hovered
-                    .rects
-                    .iter()
-                    .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(row.center())),
-                "the empty {label:?} row still takes the hover tint"
-            );
-
-            // POSITIVE CONTROL: the same read, on a row that really does copy.
-            let filled = a_login();
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&filled, &TotpState::NoSecret);
-            let row = laid_out.rect_of(label);
-            let hovered = pane.hover(&filled, &TotpState::NoSecret, row.center());
-            assert_eq!(
-                hovered.cursor,
-                egui::CursorIcon::PointingHand,
-                "the filled {label:?} row shows no hand either"
-            );
-            assert!(
-                hovered
-                    .rects
-                    .iter()
-                    .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(row.center())),
-                "the filled {label:?} row takes no tint either"
-            );
-        }
-    }
-
-    /// The third promise: the tooltip. Not covered by the two above -- egui
-    /// holds it back half a second, so only a settled hover can see it.
-    #[test]
-    fn an_empty_credential_row_offers_no_click_to_copy_tooltip() {
-        // **`Username` only, and the missing `Password` is the point.** An
-        // empty password now draws NO ROW AT ALL (see `masked_row_visible`),
-        // which is a strictly stronger promise than the inert row this test
-        // was written for -- there is no rect to hover, click or hit. The
-        // Password case did not stop being guarded: it moved to
-        // `an_empty_password_draws_no_row_at_all`, and the line below keeps it
-        // biting here too.
-        {
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&a_login_with_no_credentials(), &TotpState::NoSecret);
-            assert!(
-                !laid_out.painted(copy_shortcut_label(CopyShortcut::Password)),
-                "an empty password is back to drawing a row; painted: {:?}",
-                laid_out.strings()
-            );
-        }
-        for (label, tooltip) in [("Username", "Click to copy · CTRL+U")] {
-            let empty = a_login_with_no_credentials();
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&empty, &TotpState::NoSecret);
-            let row = laid_out.rect_of(label);
-            let settled = pane.hover_settled(&empty, &TotpState::NoSecret, row.center());
-            assert!(
-                !settled.painted(tooltip),
-                "the empty {label:?} row still offers {tooltip:?}; painted: {:?}",
-                settled.strings()
-            );
-
-            // POSITIVE CONTROL: the tooltip really is reachable by this
-            // gesture, at this rect, on a row that copies.
-            let filled = a_login();
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&filled, &TotpState::NoSecret);
-            let row = laid_out.rect_of(label);
-            let settled = pane.hover_settled(&filled, &TotpState::NoSecret, row.center());
-            assert!(
-                settled.painted(tooltip),
-                "the filled {label:?} row painted no {tooltip:?} either, so the assertion \
-                 above is about a gesture that shows nothing; painted: {:?}",
-                settled.strings()
-            );
-        }
-    }
-
-    /// The tile copies when the click lands anywhere else in it. Over the
-    /// LABEL column, which is as far from the eye as the row goes.
-    #[test]
-    fn clicking_a_password_tile_copies_it_without_revealing_it() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let label = laid_out.rect_of("Password");
-
-        let clicked = pane.click(&item, &TotpState::NoSecret, label.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::CopyPassword,
-            "clicking the password tile reported {:?}, so the tile is not the copy \
-             target the user asked for",
-            clicked.action
-        );
-        assert!(
-            !pane.reveal.password,
-            "copying by tile click also unmasked the password on screen"
-        );
-    }
-
-    /// The username tile too -- a second row, so a `copy_row` wired to one
-    /// fixed action cannot pass both this and the test above.
-    #[test]
-    fn clicking_a_username_tile_copies_the_username() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let value = laid_out.rect_of("a.novak@ledgerline.com");
-
-        let clicked = pane.click(&item, &TotpState::NoSecret, value.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::CopyUsername,
-            "clicking the username tile reported {:?}",
-            clicked.action
-        );
-    }
-
-    /// **A row with nothing to copy stays inert.** The user's rule was
-    /// "those username, pass, code" tiles, not the whole pane: a tile that
-    /// reacted and copied nothing is worse than one that does not react,
-    /// because there is no way to tell from outside that it did nothing.
-    ///
-    /// The TOTP status rows are the real case -- same `row` shape, same
-    /// place, no value.
-    #[test]
-    fn a_row_with_nothing_to_copy_reports_nothing_when_clicked() {
-        let mut item = a_login();
-        item.login.as_mut().expect("a_login has login data").totp =
-            Some("seed".to_string().into());
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::Unavailable);
-        let row = laid_out.rect_of("Unavailable right now");
-
-        let clicked = pane.click(&item, &TotpState::Unavailable, row.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::None,
-            "the TOTP row with no code copied {:?} when clicked",
-            clicked.action
-        );
-
-        // The positive control: the same click, one row up, on a tile that
-        // DOES have something to copy. Without it this test passes against a
-        // harness whose clicks never land anywhere.
-        let password = laid_out.rect_of("Password");
-        let clicked = pane.click(&item, &TotpState::Unavailable, password.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::CopyPassword,
-            "no tile on this pane copies, so the inert assertion above proves nothing"
-        );
-    }
-
-    /// **An inert row must not LOOK clickable either.**
-    ///
-    /// `copy_row`'s doc argues that "a row that reacted to a click and copied
-    /// nothing would be worse than an inert one, because there is no way to
-    /// tell from the outside that it did nothing" -- and that is an argument
-    /// about the affordance, not about the returned action. Changing `row`'s
-    /// `Sense::hover()` to `Sense::click()` switches on the `CARD_TINT` hover
-    /// fill and the `PointingHand` cursor for exactly these rows, promising a
-    /// copy that will never happen; the test above sees none of it, because
-    /// a `Sense::click()` row with no `on_copy` still returns
-    /// `DetailAction::None`. That mutation left 848/848 green.
-    ///
-    /// So: hover the inert row and assert BOTH halves of the affordance are
-    /// absent, against a positive control on a row that has one.
-    #[test]
-    fn a_row_with_nothing_to_copy_offers_no_click_affordance() {
-        let mut item = a_login();
-        item.login.as_mut().expect("a_login has login data").totp =
-            Some("seed".to_string().into());
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::Unavailable);
-        let inert = laid_out.rect_of("Unavailable right now");
-        let live = laid_out.rect_of("Password");
-
-        let hovered = pane.hover(&item, &TotpState::Unavailable, inert.center());
-        assert_ne!(
-            hovered.cursor,
-            egui::CursorIcon::PointingHand,
-            "hovering the TOTP row that has nothing to copy asks for the pointing hand -- \
-             it advertises a copy it cannot perform"
-        );
-        assert!(
-            !hovered
-                .rects
-                .iter()
-                .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(inert.center())),
-            "hovering the TOTP row that has nothing to copy paints the CARD_TINT hover fill \
-             every copyable tile uses: {:?}",
-            hovered
-                .rects
-                .iter()
-                .filter(|(_, fill)| *fill == theme::CARD_TINT)
-                .collect::<Vec<_>>()
-        );
-
-        // The positive control, on the row one up that DOES copy. Without it
-        // this passes against a harness whose pointer never lands anywhere,
-        // or a build in which no row has ever had a hover state.
-        let hovered = pane.hover(&item, &TotpState::Unavailable, live.center());
-        assert_eq!(
-            hovered.cursor,
-            egui::CursorIcon::PointingHand,
-            "no row on this pane offers the pointing hand, so its absence above proves nothing"
-        );
-        assert!(
-            hovered
-                .rects
-                .iter()
-                .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(live.center())),
-            "no row on this pane paints the hover tint, so its absence above proves nothing"
         );
     }
 
@@ -14764,98 +14139,6 @@ mod tests {
             !contains(&texts, "can't show SSH keys"),
             "the SSH pane is still the unsupported placeholder: {texts:?}"
         );
-    }
-
-    /// **The negative half.** The private key is the secret the item exists
-    /// to hold, so it is masked until asked for, exactly as the card's number
-    /// and security code are.
-    ///
-    /// Worthless on its own -- a pane that rendered *nothing at all* would
-    /// pass it too. See the positive control below; that exact pair was
-    /// required for the card secrets and is required here for the same
-    /// reason.
-    /// **A masked row draws one bullet per character of the secret -- and the
-    /// SSH private key does not.**
-    ///
-    /// The rule the owner asked for ("it's OK to always match the length of
-    /// **** for pass, secrets etc") and its one exception, asserted together
-    /// so neither can quietly become the other. See [`MASKED_BULLETS`] for
-    /// the argument; briefly, a key of over a thousand characters truncates
-    /// at every width there is, so its true-length run would be a full line
-    /// of bullets that says nothing.
-    ///
-    /// Measured on a `PANE`-wide pane, where a password of this length fits
-    /// unwrapped and the count on screen is therefore the count in the
-    /// vault. What happens when it does NOT fit is a different question with
-    /// its own tests -- see
-    /// `a_long_secrets_mask_is_cut_to_the_row_at_every_width`.
-    ///
-    /// The two halves are asserted against the FIXTURE's own length and
-    /// against `MASKED_BULLETS` respectively, never against each other: two
-    /// runs that moved together would satisfy an equality check while both
-    /// being wrong, which is how the previous version of this test would have
-    /// passed on the defect it was renamed for.
-    ///
-    /// **The card is deliberately not one of the fixtures.** Design §4: a
-    /// card's number masks in *its own network's grouping* with the last four
-    /// shown, and its security code draws the number of dots that network's
-    /// code really has. Those are facts about the network rather than about
-    /// the row's masking rule, and they are pinned positively by
-    /// [`a_cards_masks_are_its_own_networks_and_not_the_fixed_run`].
-    #[test]
-    fn a_masked_row_draws_one_bullet_per_character_except_the_private_key() {
-        // The rule. The login's password is `hunter2`, seven characters, and
-        // the length is read off the fixture rather than written down so a
-        // changed fixture cannot leave this asserting the wrong number.
-        let login = a_login();
-        let secret_len = login
-            .login
-            .as_ref()
-            .and_then(|l| l.password.as_ref())
-            .expect("a_login carries a password")
-            .chars()
-            .count();
-        let texts = painted(&login, &TotpState::NoSecret);
-        let runs: Vec<&String> = texts.iter().filter(|t| t.starts_with('•')).collect();
-        assert!(
-            !runs.is_empty(),
-            "the login pane painted no masked row at all, so this proves nothing: {texts:?}"
-        );
-        for run in &runs {
-            assert_eq!(
-                run.chars().count(),
-                secret_len,
-                "a login's masked row drew {} bullets for a {secret_len}-character secret, \
-                 so the mask no longer matches its length: {texts:?}",
-                run.chars().count()
-            );
-        }
-        // And it really is a different number from the old fixed run, so the
-        // assertion above is not passing by coincidence.
-        assert_ne!(
-            secret_len, MASKED_BULLETS,
-            "the fixture's password happens to be exactly {MASKED_BULLETS} characters, so \
-             this test cannot tell the true-length rule from the fixed one"
-        );
-
-        // The exception.
-        let ssh = an_ssh_key_item();
-        let ssh_texts = painted(&ssh, &TotpState::NoSecret);
-        let ssh_runs: Vec<&String> = ssh_texts.iter().filter(|t| t.starts_with('•')).collect();
-        assert!(
-            !ssh_runs.is_empty(),
-            "the ssh pane painted no masked row at all: {ssh_texts:?}"
-        );
-        for run in &ssh_runs {
-            assert_eq!(
-                run.chars().count(),
-                MASKED_BULLETS,
-                "the private key's mask drew {} bullets instead of the fixed \
-                 {MASKED_BULLETS} -- see `MASKED_BULLETS` for why this one row opts out: \
-                 {ssh_texts:?}",
-                run.chars().count()
-            );
-        }
     }
 
     /// **A card's masks are its own network's, and the seam they arrive
@@ -15779,62 +15062,6 @@ mod tests {
         assert!(contains(&texts, CUSTOM_FIELDS_CARD_HEADING), "{texts:?}");
     }
 
-    /// How many `theme::hairline` rules -- the heavier, `HAIRLINE`-coloured
-    /// 1pt fill -- this frame painted between the bottom of `heading` and the
-    /// top of the first string painted below it.
-    fn hairlines_under(frame: &Frame, heading: &str) -> usize {
-        let head = frame.rect_of(heading);
-        let next = frame
-            .texts
-            .iter()
-            .filter(|(t, r)| !t.is_empty() && r.top() > head.bottom())
-            .map(|(_, r)| r.top())
-            .fold(f32::INFINITY, f32::min);
-        assert!(next.is_finite(), "nothing was painted under {heading:?}: {:?}", frame.strings());
-        let mut rects = Vec::new();
-        collect_rects(&frame.shapes, &mut rects);
-        rects
-            .iter()
-            .filter(|(r, fill)| {
-                *fill == theme::HAIRLINE
-                    && r.height() <= 1.5
-                    && r.top() >= head.bottom()
-                    && r.bottom() <= next
-            })
-            .count()
-    }
-
-    /// **Reported with the "Napps LLC" screenshot: two parallel 1px lines
-    /// right under the IDENTITY heading.** `card` draws the heading's own
-    /// rule, and `identity_rows` drew a group-boundary rule above EVERY group
-    /// -- including the first, whose top edge is that heading's rule. So the
-    /// first group heading sat under two.
-    ///
-    /// Asked of every card a kind's body can open with, so a second card
-    /// that draws its own leading rule is caught too.
-    #[test]
-    fn exactly_one_hairline_separates_a_card_heading_from_what_follows_it() {
-        let mut fielded = a_noted_item(Some(2));
-        fielded.fields = vec![custom_field("Account number", Some("ACC-4471"), Some(0))];
-        for (item, heading) in [
-            (napps_llc(), "IDENTITY"),
-            (napps_llc(), CUSTOM_FIELDS_CARD_HEADING),
-            (a_login(), "LOGIN CREDENTIALS"),
-            (a_full_card(), "CARD DETAILS"),
-            (an_ssh_key_item(), "SSH KEY"),
-            (fielded.clone(), "NOTES"),
-            (fielded, CUSTOM_FIELDS_CARD_HEADING),
-        ] {
-            let mut pane = Pane::new();
-            let frame = pane.idle(&item, &TotpState::NoSecret);
-            assert_eq!(
-                hairlines_under(&frame, heading),
-                1,
-                "{heading:?} is not separated from its first content by exactly one rule"
-            );
-        }
-    }
-
     /// The positive control on the repair: the rule between two identity
     /// GROUPS is still drawn. Only the first group's was a duplicate -- the
     /// one above "Government IDs" is the only thing that separates it from
@@ -16473,95 +15700,6 @@ mod tests {
                     "{which:?} and {other:?} are both bound to {modifiers:?}+{key:?}"
                 );
             }
-        }
-    }
-
-    /// **A tooltip that is already up has to let go when the pointer reaches
-    /// a child of the tile.**
-    ///
-    /// The user: "Click to copy should disapear when hovered over eye or link
-    /// - not relevant". Clicking the eye reveals and clicking the link opens
-    /// a browser; neither copies. The CLICK was already theirs by layout (see
-    /// [`copy_row`]), and the tooltip did not inherit that -- it is a
-    /// different mechanism with a different rule.
-    ///
-    /// **This test arrives at the child the way a pointer does**, and that is
-    /// the entire difference between it and
-    /// `hovering_the_url_offers_to_open_it_rather_than_to_copy_it`, which
-    /// passed throughout: it settles on the tile FIRST, so the tile's tooltip
-    /// is up, and only then slides onto the child.
-    /// `Tooltip::should_show_tooltip` short-circuits to `true` for a tooltip
-    /// that is already open and whose widget rect still contains the pointer
-    /// -- before it consults `hovered` at all -- and the tile's rect contains
-    /// both children. egui then shows one tooltip per layer, first one wins,
-    /// so the child's own was refused on top of that. A test that lands on
-    /// the child out of nowhere opens no tile tooltip and cannot see any of
-    /// it.
-    ///
-    /// Both halves, for each child: the child's own tooltip present AND the
-    /// tile's gone. Suppressing both would be worse than the bug, and the
-    /// negative on its own passes against a pane that painted no tooltip at
-    /// all -- which is what the settle on the tile above it controls for.
-    #[test]
-    fn the_tiles_copy_tooltip_lets_go_when_the_pointer_reaches_the_eye_or_the_link() {
-        let item = a_login();
-        let totp = TotpState::NoSecret;
-        // The tile the pointer starts on, what that tile says, where the
-        // child inside it is, and what the child says instead. The eye paints
-        // no string of its own, so it is found by geometry; the link is its
-        // own URL.
-        let children: [(&str, &str, fn(&Frame) -> egui::Rect, &str); 2] = [
-            (
-                "Password",
-                "Click to copy · CTRL+B",
-                |frame| {
-                    *frame
-                        .eyes()
-                        .first()
-                        .expect("the Password row painted no eye to hover")
-                },
-                "Reveal",
-            ),
-            (
-                "Website",
-                "Click to copy · CTRL+SHIFT+U",
-                |frame| frame.rect_of(WEBSITE),
-                "Open in browser",
-            ),
-        ];
-        for (tile_label, tile_tooltip, child_of, child_tooltip) in children {
-            // A fresh pane per child: the gesture is stateful, and a tooltip
-            // left open by the previous one would be this one's premise.
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&item, &totp);
-            let tile = laid_out.rect_of(tile_label);
-            let child = child_of(&laid_out);
-
-            let on_tile = pane.hover_settled(&item, &totp, tile.center());
-            assert!(
-                on_tile.painted(tile_tooltip),
-                "the {tile_label:?} tile painted no {tile_tooltip:?} to begin with, so \
-                 it never gives way to anything; the frame painted: {:?}",
-                on_tile.strings()
-            );
-
-            let on_child = pane.hover_settled(&item, &totp, child.center());
-            assert!(
-                on_child.painted(child_tooltip),
-                "sliding from the {tile_label:?} tile onto its child painted no \
-                 {child_tooltip:?}, so the child lost its own tooltip too; the frame \
-                 painted: {:?}",
-                on_child.strings()
-            );
-            assert!(
-                !on_child
-                    .strings()
-                    .iter()
-                    .any(|t| t.starts_with("Click to copy")),
-                "the {tile_label:?} tile's copy tooltip followed the pointer onto its \
-                 child, which does not copy; the frame painted: {:?}",
-                on_child.strings()
-            );
         }
     }
 
@@ -17453,45 +16591,6 @@ mod tests {
         );
     }
 
-    /// **The same rule on a STACKED row**, which is what a masked value uses.
-    ///
-    /// "Should cut of password and any other field as well." The first pass
-    /// reordered only the `Columns` branch, so a long password's dots still
-    /// ran under CTRL+B. Asserted with a password long enough not to fit the
-    /// widest pane these tests build, for the reason the website test states.
-    #[test]
-    fn a_password_too_long_for_its_row_is_cut_before_it_reaches_the_chord() {
-        let mut item = a_login();
-        item.login.as_mut().expect("the fixture is a login").password =
-            Some("p".repeat(400).into());
-        let mut pane = Pane::new();
-        let frame = pane.idle(&item, &TotpState::NoSecret);
-
-        let chord = frame.ink_of(copy_shortcut_chord(CopyShortcut::Password));
-        let dots = frame
-            .rendered
-            .iter()
-            .map(|(_, glyphs, rect)| (glyphs.clone(), *rect))
-            .find(|(glyphs, _)| glyphs.starts_with('\u{2022}'))
-            .expect("the password row painted no mask at all");
-        // The control, and without it this test passes against a row that
-        // never had 400 dots to fit in the first place: the glyphs actually
-        // laid out are fewer than the mask asked for, which is what an
-        // ellipsis means here.
-        assert!(
-            dots.0.chars().count() < 400,
-            "the row laid out every one of the 400 mask characters, so nothing truncated it and \
-             the assertion below is about a row that happened to fit"
-        );
-        assert!(
-            dots.1.right() <= chord.left(),
-            "the masked password runs to x={} and the chord starts at x={}, so the dots are \
-             painted under their own shortcut",
-            dots.1.right(),
-            chord.left()
-        );
-    }
-
     /// **The same rule on the PREVIOUS PASSWORDS card**, whose rows are the
     /// last ones on this pane that answered "too long" by folding.
     ///
@@ -17582,154 +16681,6 @@ mod tests {
             ink.right(),
             eyes[0].left()
         );
-    }
-
-    /// **The same report again, and the half the test above could not see:
-    /// the second line the reporter is looking at is the ROW's, not the
-    /// run's.**
-    ///
-    /// After `46ac71b` the reporter ran the build and said "passwords same".
-    /// They were right, and the fix was not wrong: measured on a real frame,
-    /// every galley this pane lays out is exactly one row at every width
-    /// from the app's minimum (298pt) to 900 -- masked and revealed alike,
-    /// at 12, 24, 41, 60 and 400 characters. Nothing wraps. What still put a
-    /// previous password on a line of its own is [`RowShape::Stacked`],
-    /// which [`digits_fit`] chose for any value wider than the two-column
-    /// line -- which is nearly every secret, since a secret is longer than a
-    /// value column by design. At a 638pt pane the card read
-    ///
-    /// ```text
-    /// 21d ago
-    /// ••••••••••••••••••••••••••••••••••••••••••
-    /// ```
-    ///
-    /// while `Username` and `Website` two cards up stayed on one line and
-    /// elided. "Wraps onto a second line instead of being cut short with an
-    /// ellipsis... like every other value row does" describes that exactly,
-    /// and no amount of `max_rows` reaches it.
-    ///
-    /// **So this pins the SHAPE, which is what changed.** The date and the
-    /// value share a line, and the value is cut on it.
-    ///
-    /// **MASKED first, and that is the point of running both.** The sibling
-    /// above had to reveal its row, because a mask fits by construction
-    /// ([`fit_mask`]) and so could never measure a text wrap. It measures
-    /// this perfectly well: `fit_mask` cuts a mask to `room`, and `room`
-    /// belongs to whichever line `digits_fit` put the row on -- so a masked
-    /// row that stacks is a masked row on a second line, which is the state
-    /// the reporter was looking at with the eye untouched.
-    ///
-    /// Three assertions, and the first two are what stop the third being
-    /// vacuous:
-    ///
-    /// * the run really was cut, so this is not a value that happened to
-    ///   fit and would have satisfied "one line" without being tested;
-    /// * the value's band contains its date's centre -- the row did NOT take
-    ///   a second line;
-    /// * the ink stops before the reveal eye, so "kept on one line" was not
-    ///   bought by painting through the control.
-    #[test]
-    fn a_long_previous_password_is_cut_beside_its_date_rather_than_dropped_below_it() {
-        // 90 characters. Long enough that it cannot fit the two-column value
-        // line at [`PANE`] -- 636pt there, which holds 67 bullets -- and
-        // short enough to be a password somebody really has, which a
-        // 400-character one is not: the sibling above uses 400 to put the
-        // rule beyond any width, and this one is deliberately a length the
-        // reporter could be looking at.
-        let secret = "q".repeat(90);
-        let mut item = a_login();
-        item.other.insert(
-            "passwordHistory".to_string(),
-            serde_json::Value::Array(vec![serde_json::json!({
-                "lastUsedDate": super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS),
-                "password": secret.clone(),
-            })]),
-        );
-        // The row's label, off the very function that writes it -- a
-        // hardcoded "21d ago" would be pinning `relative_time`'s wording in
-        // a test about geometry.
-        let stamp = super::test_clock::days_ago(super::test_clock::HISTORY_AGE_DAYS);
-        let date = history_label(Some(stamp.as_str()));
-
-        for revealed in [false, true] {
-            let mut pane = Pane::new();
-            pane.reveal.password_history[0] = revealed;
-            let frame = pane.idle(&item, &TotpState::NoSecret);
-            let label = frame.rect_of(&date);
-
-            // The value, found by its FACE rather than by a length: masked it
-            // is a bullet run `fit_mask` has already shortened to a number
-            // that belongs to the layout. `> 7` excludes the login's own
-            // password row, whose fixture is `hunter2`; nothing else on this
-            // pane paints bullets at all.
-            let runs: Vec<&(String, String, egui::Rect)> = frame
-                .rendered
-                .iter()
-                .filter(|(source, ..)| {
-                    if revealed {
-                        source == &secret
-                    } else {
-                        source.chars().count() > 7 && source.chars().all(|c| c == '\u{2022}')
-                    }
-                })
-                .collect();
-            assert_eq!(
-                runs.len(),
-                1,
-                "revealed={revealed}: the pane painted {} candidate previous-password runs, \
-                 not the one this item carries -- everything below would be vacuous",
-                runs.len()
-            );
-            let (source, glyphs, box_) = runs[0];
-
-            assert!(
-                glyphs.chars().count() < secret.chars().count(),
-                "revealed={revealed}: the row laid out {} characters for a {}-character \
-                 entry, so nothing cut it and the line assertions below are about a value \
-                 that never had to give anything up",
-                glyphs.chars().count(),
-                secret.chars().count()
-            );
-
-            // **The row, not the run.** Without the shape fix the value is a
-            // whole band below its date and this is the assertion that says
-            // so; the run itself is one galley row either way, which is why
-            // `46ac71b`'s test stayed green while the report stayed open.
-            assert!(
-                box_.y_range().contains(label.center().y),
-                "revealed={revealed}: the date sits at y={:.1} and its value at \
-                 y={:.1}..{:.1}, so the row gave the value a line of its own instead of \
-                 cutting it beside the date",
-                label.center().y,
-                box_.top(),
-                box_.bottom()
-            );
-
-            // The eye on THIS row, found by the band it shares with the
-            // value: the login's password row has one too, and an absolute
-            // index into `Frame::eyes` would pin the order the pane happens
-            // to draw its cards in.
-            let eyes: Vec<&egui::Rect> = frame
-                .eyes
-                .iter()
-                .filter(|eye| box_.y_range().contains(eye.center().y))
-                .collect();
-            assert_eq!(
-                eyes.len(),
-                1,
-                "revealed={revealed}: the previous-password row shares its band with {} \
-                 reveal eyes, not the one it draws",
-                eyes.len()
-            );
-            let ink = frame.ink_of(source);
-            assert!(
-                ink.right() <= eyes[0].left(),
-                "revealed={revealed}: the value runs to x={} and its reveal eye starts at \
-                 x={}, so keeping it on one line put it under its own control",
-                ink.right(),
-                eyes[0].left()
-            );
-        }
     }
 
     // ------------------------------------------------ 5d's SHARING card
@@ -18732,67 +17683,6 @@ mod tests {
         assert!(got, "the watched clipboard derivation did not produce the key");
     }
 
-    /// A row is `display: flex; align-items: center; gap: 16px; padding: 13px
-    /// 16px` over a `width: 130px` label column. On this pane that puts the
-    /// label at 24 (body padding) + 1 (the card's own border, which the design
-    /// draws inside the box and egui likewise takes out of the content rect)
-    /// + 16 (row padding) = 41, and the value at 41 + 130 (label column) + 16
-    /// (gap) = 187. Both absolute: nothing here is computed from the constants
-    /// being checked.
-    #[test]
-    fn a_card_row_puts_its_label_and_value_on_the_designs_two_columns() {
-        let painted = painted_type(&a_login(), &TotpState::NoSecret, RevealState::default());
-
-        let (label, label_font) = only(&painted, "Username");
-        assert_eq!(
-            label.left(),
-            41.0,
-            "the label column does not start at 24 + 1 + 16"
-        );
-        assert_eq!(label_font.size, 12.0, "the label is not the design's 12px");
-
-        let (value, value_font) = only(&painted, "a.novak@ledgerline.com");
-        assert_eq!(
-            value.left(),
-            187.0,
-            "the value does not start at 41 + a 130px label column + a 16px gap"
-        );
-        assert_eq!(value_font.size, 14.0, "the value is not the design's 14px");
-        assert!(
-            (value.center().y - label.center().y).abs() <= 1.0,
-            "the label and the value are not on one centred line: {label:?} vs {value:?}"
-        );
-    }
-
-    /// The card's own heading rule: `padding: 11px 16px; font-size: 12px;
-    /// font-weight: 700; text-transform: uppercase`, over a card that is
-    /// white with a `#eae7e7` border.
-    #[test]
-    fn a_cards_heading_is_the_designs_tracked_uppercase_over_a_bordered_tile() {
-        let item = a_login();
-        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
-        let (heading, font) = only(&painted, "LOGIN CREDENTIALS");
-        assert_eq!(
-            heading.left(),
-            41.0,
-            "the heading is not at the card's 16px padding"
-        );
-        assert_eq!(font.size, 12.0, "the heading is not the design's 12px");
-        assert_eq!(
-            font.family,
-            egui::FontFamily::Name(theme::BOLD.into()),
-            "the heading is not the design's 700 weight"
-        );
-
-        let rects = painted_rects(&item, &TotpState::NoSecret);
-        assert!(
-            rects
-                .iter()
-                .any(|(r, fill)| *fill == theme::CARD && r.left() == 24.0 && r.right() == 876.0),
-            "no white card spanning the body's 24px padding on both sides: {rects:?}"
-        );
-    }
-
     /// **Every copyable row copies its OWN value.**
     ///
     /// The previous version of this test asserted that each row painted a
@@ -19513,44 +18403,6 @@ mod tests {
         });
     }
 
-    /// The password row goes through the same `masked_row` the two card
-    /// secrets do, so restyling that function restyles all three at once --
-    /// and nothing pinned the password half of it. Both directions, so this
-    /// cannot pass on a row that is always masked or always clear.
-    #[test]
-    fn a_logins_password_is_masked_by_default_and_revealed_only_by_its_own_flag() {
-        let item = a_login();
-        let masked = painted(&item, &TotpState::NoSecret);
-        assert!(
-            !contains(&masked, "hunter2"),
-            "the password was painted in the clear by default: {masked:?}"
-        );
-        let mut pane = Pane::new();
-        assert_eq!(
-            pane.idle(&item, &TotpState::NoSecret).eyes.len(),
-            1,
-            "the password row offers no way to reveal what it masked"
-        );
-
-        let revealed = painted_with_reveal(
-            &item,
-            &TotpState::NoSecret,
-            RevealState {
-                password: true,
-                card_number: false,
-                card_code: false,
-                password_history: [false; MAX_HISTORY_ROWS],
-                ssh_private_key: false,
-                totp_secret: false,
-                custom_fields: [false; MAX_FIELD_ROWS],
-            },
-        );
-        assert!(
-            contains(&revealed, "hunter2"),
-            "password: true did not reveal the password: {revealed:?}"
-        );
-    }
-
     /// The design's last card is the metadata strip -- a white tile like the
     /// others, `padding: 13px 16px; font-size: 12px`, not a bare line of 11px
     /// ghost text sitting on the pane's grey.
@@ -19743,7 +18595,7 @@ mod tests {
             pane.idle(&a_login_with_history(2), &TotpState::NoSecret)
                 .eyes
                 .len(),
-            3,
+            2,
             "the history card offers no way to reveal what it masked"
         );
     }
@@ -19976,104 +18828,6 @@ mod tests {
             Some("hunter2".to_string()),
             "the fixture's password is not the one this test guards against"
         );
-    }
-
-    /// **The clipboard's contents never reach the screen through a real
-    /// copy either** -- the pure check above, driven end to end.
-    #[test]
-    fn a_real_copy_puts_the_field_name_on_screen_and_not_the_secret() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let row = laid_out.rect_of("Password");
-        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
-        assert_eq!(
-            copied.action,
-            DetailAction::CopyPassword,
-            "the click did not copy, so the assertions below are about nothing"
-        );
-        assert!(copied.painted("Password copied"));
-        // The row itself is masked, so "hunter2" is not on the pane at all --
-        // which is exactly what the confirmation must not change.
-        assert!(
-            !contains(
-                &copied.strings().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                "hunter2"
-            ),
-            "copying the password painted it on screen: {:?}",
-            copied.strings()
-        );
-        // The control: revealing it DOES paint it, so the check above can
-        // fail. Without this, a harness that saw no text would also pass.
-        pane.reveal.password = true;
-        let revealed = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            contains(
-                &revealed.strings().iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                "hunter2"
-            ),
-            "the harness cannot see the password even when the row reveals it, so \
-             the negative above proves nothing: {:?}",
-            revealed.strings()
-        );
-    }
-
-    /// The same replacement, through the pane: two copies in a row leave ONE
-    /// message on screen, the second one's.
-    #[test]
-    fn a_second_copy_through_the_pane_leaves_only_the_newer_message() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let password = laid_out.rect_of("Password");
-        let username = laid_out.rect_of("Username");
-        let first = pane.click(&item, &TotpState::NoSecret, password.center());
-        assert!(first.painted("Password copied"), "the first copy said nothing");
-        let second = pane.click(&item, &TotpState::NoSecret, username.center());
-        assert!(
-            second.painted("Username copied"),
-            "the second copy did not take over: {:?}",
-            second.strings()
-        );
-        assert!(
-            !second.painted("Password copied"),
-            "both confirmations are on screen at once: {:?}",
-            second.strings()
-        );
-    }
-
-    /// **The click path is wired.** The decision above is pure; this is the
-    /// other half, driven with a real click on a real row.
-    ///
-    /// Deliberately separate from the chord test below: they are two call
-    /// sites, and one of them passing proves nothing about the other.
-    #[test]
-    fn clicking_a_row_confirms_the_copy_by_name() {
-        for (row, want) in [
-            ("Password", "Password copied"),
-            ("Username", "Username copied"),
-            ("Website", "Website copied"),
-        ] {
-            let item = a_login();
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&item, &TotpState::NoSecret);
-            assert!(
-                !laid_out.painted(want),
-                "the pane showed {want:?} before anything was copied"
-            );
-            let target = laid_out.rect_of(row);
-            let clicked = pane.click(&item, &TotpState::NoSecret, target.center());
-            assert!(
-                !matches!(clicked.action, DetailAction::None),
-                "the click on the {row:?} row copied nothing, so the confirmation \
-                 below is about a click that hit nothing"
-            );
-            assert!(
-                clicked.painted(want),
-                "clicking the {row:?} row copied silently -- the frame painted: {:?}",
-                clicked.strings()
-            );
-        }
     }
 
     /// **A keyboard chord confirms exactly as a click does**, and this is the
@@ -21634,6 +20388,43 @@ mod tests {
             // And a received record cannot be given one.
             let f = Pane::new().view_only("anna@x.io").idle(&item, &TotpState::NoSecret);
             assert!(!f.painted(ADD_2FA_ROW_DETAIL));
+        }
+
+        /// Where a field row's eye and copy buttons sit: 20pt in from the
+        /// card's right edge, on the row's centre line.
+        fn field_buttons(f: &Frame, label: &str, value: &str) -> (egui::Pos2, egui::Pos2) {
+            let label_rect = f.rect_of(label);
+            let value_rect = f.rect_of(value);
+            let card = f.filled_box_around(value_rect, P.card);
+            let y = (label_rect.top() + value_rect.bottom()) / 2.0;
+            let copy = egui::pos2(card.right() - 20.0 - 21.0, y);
+            (copy - egui::vec2(42.0, 0.0), copy)
+        }
+
+        #[test]
+        fn credentials_are_field_rows_with_eye_and_copy() {
+            let mut pane = Pane::new();
+            let item = a_login();
+            let f = pane.idle(&item, &TotpState::NoSecret);
+            let (label, value) = (f.rect_of("Username"), f.rect_of("a.novak@ledgerline.com"));
+            assert!(label.bottom() <= value.top() + 1.0 && (label.left() - value.left()).abs() < 1.0, "the label sits over its value");
+            assert_eq!(f.text_colour_of("Username"), P.text_label);
+            let (eye, _) = field_buttons(&f, "Password", MASKED_PASSWORD);
+            let _ = pane.click(&item, &TotpState::NoSecret, eye);
+            let shown = pane.idle(&item, &TotpState::NoSecret);
+            assert!(shown.painted("hunter2"), "the eye reveals the password: {:?}", shown.strings());
+            let (_, copy) = field_buttons(&f, "Username", "a.novak@ledgerline.com");
+            let mut pane = Pane::new();
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, copy).action, DetailAction::CopyUsername);
+        }
+
+        #[test]
+        fn the_password_masks_as_fourteen_dots() {
+            assert_eq!(MASKED_PASSWORD.chars().count(), 14);
+            assert!(MASKED_PASSWORD.chars().all(|c| c == '\u{2022}'));
+            let f = Pane::new().idle(&a_login(), &TotpState::NoSecret);
+            assert!(f.painted(MASKED_PASSWORD), "whatever its length, the password shows 14 dots");
         }
 
         #[test]

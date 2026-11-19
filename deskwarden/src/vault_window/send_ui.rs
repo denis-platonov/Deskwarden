@@ -15005,9 +15005,9 @@ mod frame_promptness {
     /// and `detail::copy_shortcut_label` is the only thing in this window
     /// that produces it.
     fn detail_pane_only() -> &'static str {
-        super::super::detail::copy_shortcut_chord(
-            super::super::detail::CopyShortcut::Username,
-        )
+        // v2: the field card's 14-dot password mask, which neither the list
+        // nor the edit form paints.
+        super::super::detail::MASKED_PASSWORD
     }
     /// **The item list's control**: its header's `+ New`, which
     /// `draw_item_list` is the only thing in this window that paints. (It was
