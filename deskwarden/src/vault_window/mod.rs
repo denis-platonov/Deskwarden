@@ -1138,6 +1138,11 @@ pub fn build_frame_with_search(
     // Slice 6: the Generator screen, and its state while it is open.
     let mut generator_selected = false;
     let mut generator: Option<generator_screen::GeneratorScreen> = None;
+    // Slice 7: Settings as a screen. `prefs` below is its state (Some exactly
+    // while the screen is up); this is the rail's highlight and the way every
+    // other screen's selection ends it, and the page the nav is on.
+    let mut settings_selected = false;
+    let mut settings_page = crate::prefs_ui::settings_v2::Page::default();
     // Which of design 5b's three SHARING sub-filters is in force. A THIRD
     // axis, orthogonal to both `filter` and the screen flags, and `Screens`
     // is the one place it is written -- see `sidebar::SendScope`, which
@@ -2760,13 +2765,23 @@ pub fn build_frame_with_search(
         );
         // The preferences, which the titlebar gear used to open, are now the
         // rail's Settings row; it asks for them here.
-        if sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenSettings) {
+        let open_settings = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenSettings);
+        if open_settings && prefs.is_none() {
             let seed = prefs_seed(
                         edited_settings_for_closure.borrow().clone(),
                         settings_path_for_prefs.as_deref(),
                         accounts.as_ref(),
                     );
                     prefs = Some(crate::prefs_ui::PrefsState::with_scan_history(seed));
+        }
+        if open_settings {
+            // Settings is a screen now: it takes the list's and the pane's place,
+            // and any other screen steps aside.
+            sends_selected = false;
+            received_selected = false;
+            health_selected = false;
+            generator_selected = false;
+            settings_selected = true;
         }
         let (dot, label) = sync_pill(
             sync_in_progress,
@@ -2778,7 +2793,10 @@ pub fn build_frame_with_search(
         let pill = top_bar::SyncPill::from_v1(dot, &label);
         // Ctrl+Shift+Y does what a click on the pill does (design 1a's hint).
         // `matches_exact`, so no other chord on Y can be dragged in by it.
-        let sync_chord = keyboard_shortcuts_enabled(prefs.is_some())
+        // Slice 7: the window's chords stay live on the Settings screen; only a
+        // shortcut row that is listening for its new chord silences them.
+        let recording_a_shortcut = prefs.as_ref().is_some_and(|p| p.is_capturing());
+        let sync_chord = keyboard_shortcuts_enabled(recording_a_shortcut)
             && ui.ctx().input(|i| {
                 i.modifiers.matches_exact(egui::Modifiers::CTRL | egui::Modifiers::SHIFT)
                     && i.key_pressed(egui::Key::Y)
@@ -2926,7 +2944,7 @@ pub fn build_frame_with_search(
                 }
             }
         }
-        let shortcuts = keyboard_shortcuts_enabled(prefs.is_some());
+        let shortcuts = keyboard_shortcuts_enabled(recording_a_shortcut);
         // Review (slice 5): Ctrl+K/N/F and the record and 2FA chords never act
         // behind a modal (one Esc would then close two) nor before the vault
         // is on screen. Ctrl+L still locks from anywhere.
@@ -2997,6 +3015,11 @@ pub fn build_frame_with_search(
         }
         if ctrl_n {
             mode = DetailMode::Create(EditDraft::empty());
+        }
+        // A draft is a page of the vault, not of Settings: starting one (Ctrl+N,
+        // the chooser, the palette) leaves the screen.
+        if settings_selected && matches!(mode, DetailMode::Edit(_) | DetailMode::Create(_)) {
+            settings_selected = false;
         }
 
         // Until the vault arrives, the whole body is one centred spinner --
@@ -3434,6 +3457,7 @@ pub fn build_frame_with_search(
                         health: &mut health_selected,
                         received: &mut received_selected,
                         generator: &mut generator_selected,
+                        settings: &mut settings_selected,
                         scope: &mut send_scope,
                     },
                     &lock_countdown,
@@ -3603,7 +3627,7 @@ pub fn build_frame_with_search(
         // appear exactly once in this file. Two panels sharing an id would
         // make that guard unable to tell an item list drawn here from one
         // drawn on the Sends screen.
-        if !show_sends && on_health && !generator_selected {
+        if !show_sends && on_health && !generator_selected && !settings_selected {
             egui::Panel::left("vault-password-health")
                 .exact_size(LIST_WIDTH)
                 .resizable(false)
@@ -3680,7 +3704,7 @@ pub fn build_frame_with_search(
         // Spec B 1: the editor is a page of its own -- the list column steps
         // aside while a draft is open.
         let editing = matches!(mode, DetailMode::Edit(_) | DetailMode::Create(_));
-        let detail_pane_width = if show_sends || on_health || generator_selected {
+        let detail_pane_width = if show_sends || on_health || generator_selected || settings_selected {
             0.0
         } else if editing {
             ui.available_width()
@@ -3688,7 +3712,7 @@ pub fn build_frame_with_search(
             let full = (ui.available_width() - LIST_WIDTH).max(0.0);
             detail_slide.width(ui.ctx(), full, selected_id.is_some())
         };
-        if !show_sends && !on_health && !editing && !generator_selected {
+        if !show_sends && !on_health && !editing && !generator_selected && !settings_selected {
             // **Whether a detail pane is on screen RIGHT NOW**, read before
             // the list is drawn, because the list is what changes it. This is
             // the "with no details panel" half of the owner's second gesture:
@@ -4583,6 +4607,32 @@ pub fn build_frame_with_search(
                 // account" and "a failed fetch" become three different
                 // things -- see `send_ui::pane_state`, where that decision
                 // is tested.
+                // Slice 7: Settings takes the list's and the pane's place. Its
+                // edits go into the same cell the modal wrote, every frame, so
+                // a change the user can see is never the one that gets lost.
+                if settings_selected && !show_sends {
+                    if let Some(state) = prefs.as_mut() {
+                        let before = state.settings.generator.clone();
+                        let action = crate::prefs_ui::settings_v2::draw(ui, state, &mut settings_page);
+                        *edited_settings_for_closure.borrow_mut() = Some(state.settings.clone());
+                        delivered.set(false);
+                        if state.settings.generator != before {
+                            // The Generator screen owns `generator`'s file entry
+                            // (`persist_generator`); a default changed here goes
+                            // through the same writer and the screen re-reads it.
+                            if let Some(path) = generator_settings_path.as_deref() {
+                                if let Err(e) = crate::settings::Settings::persist_generator(path, &state.settings.generator) {
+                                    log::warn!("the generator's defaults could not be saved: {e:?}");
+                                }
+                            }
+                            generator = None;
+                        }
+                        if action == crate::prefs_ui::settings_v2::ScreenAction::Back {
+                            settings_selected = false;
+                        }
+                    }
+                    return send_ui::no_sends_screen_this_frame();
+                }
                 // Slice 6: the Generator takes the list's and the pane's place.
                 if generator_selected && !show_sends {
                     let state = generator.get_or_insert_with(|| {
@@ -7219,6 +7269,7 @@ pub fn build_frame_with_search(
                             sends_selected = false;
                             received_selected = false;
                             health_selected = false;
+                            settings_selected = false;
                             generator_selected = true;
                         }
                         palette::PaletteAction::Settings => {
@@ -8378,36 +8429,17 @@ pub fn build_frame_with_search(
         //
         // NOTHING HERE TOUCHES DISK. The caller compares against its own copy
         // and calls `persist_preferences`; see `VaultWindowResult::edited_settings`.
-        if let Some(state) = prefs.as_mut() {
-            let action = crate::prefs_ui::draw_prefs_modal(ui.ctx(), state);
-            *edited_settings_for_closure.borrow_mut() = Some(state.settings.clone());
-            // **Every frame the modal is up, the delivery is owed again.**
-            // The cell above is rewritten every frame, so a second visit to
-            // the gear that changes something must be re-delivered on its own
-            // dismissal and on the close. Over-delivering costs one file write
-            // and one `SetEvent` -- the daemon's write-back is guarded by
-            // `edited != settings` -- while under-delivering loses a setting.
-            //
-            // The RESET is per frame; the DELIVERY is on dismissal and on
-            // close. If a future change ever moves the delivery into this
-            // block unconditionally, it becomes a write per frame and has to
-            // be debounced.
-            delivered.set(false);
-            if action == crate::prefs_ui::PrefsAction::Close {
-                prefs = None;
-                // **Hand it to the daemon now, not at the close.** The
-                // window is staying open, and a preference the user just
-                // changed should bind now -- which is what the tray's
-                // Preferences item has always done. Before this, a
-                // `keep_backend_running` change made here did nothing
-                // until the window closed.
-                //
-                // A `None` hook set is a window with `keep_ui_loaded`
-                // off, which has no channel and does not need one: it
-                // will exit and the result file will carry this.
-                if let Some(hooks) = hide_hooks.as_ref() {
-                    let _ = deliver_if_needed(hooks, &edited_settings_for_closure, &delivered);
-                }
+        // Slice 7: leaving the Settings screen -- Back, another rail row, a
+        // draft -- is what the modal's Close was. The state goes and the
+        // edited settings are handed to the daemon now, not at the window's
+        // close, so a preference the user just changed binds at once (the
+        // tray's Preferences item has always done this). A `None` hook set is
+        // a window with `keep_ui_loaded` off: it will exit and the result file
+        // carries the answer.
+        if !settings_selected && prefs.is_some() {
+            prefs = None;
+            if let Some(hooks) = hide_hooks.as_ref() {
+                let _ = deliver_if_needed(hooks, &edited_settings_for_closure, &delivered);
             }
         }
 
@@ -9101,10 +9133,13 @@ pub fn prefs_seed(
     settings_path: Option<&std::path::Path>,
     accounts: Option<&crate::accounts::AccountsState>,
 ) -> crate::settings::Settings {
-    if let Some(in_flight) = in_flight {
-        return in_flight;
-    }
     let on_disk = settings_path.map(crate::settings::Settings::load).unwrap_or_default();
+    if let Some(in_flight) = in_flight {
+        // The Generator screen writes its options straight to the file
+        // (`persist_generator`), so the in-flight copy's `generator` can be
+        // stale: the file's is the one on screen elsewhere.
+        return crate::settings::Settings { generator: on_disk.generator, ..in_flight };
+    }
     crate::settings::Settings {
         // **`map`, not `is_none_or`, and that one word is the defect.** With
         // no account list this used to answer `true` -- "the official CLI" --
@@ -15128,6 +15163,11 @@ pub(crate) fn cache_age_text(age: Duration) -> String {
 
 /// Whether this window's Ctrl+K / Ctrl+L / Ctrl+N are live on this frame.
 ///
+/// **Slice 7:** Settings is a screen, not a modal, so its being open no longer
+/// silences anything; the one state that does is a shortcut row listening for
+/// its new chord (the next keystroke is the chord, not a command). The
+/// argument is that, and the text below describes the modal it was written for.
+///
 /// One argument, and a function rather than an inline `&&`, because it is the
 /// half of "the vault is inert while Preferences is up" that a scrim cannot
 /// enforce. A modal's scrim intercepts *pointer* input by sitting on a higher
@@ -15140,8 +15180,8 @@ pub(crate) fn cache_age_text(age: Duration) -> String {
 /// launch confirmation are reachable only from controls the modal covers, so
 /// neither can be up at the same time as this one, and adding them here would
 /// be guarding against a state that cannot occur.
-fn keyboard_shortcuts_enabled(preferences_open: bool) -> bool {
-    !preferences_open
+fn keyboard_shortcuts_enabled(recording_a_shortcut: bool) -> bool {
+    !recording_a_shortcut
 }
 
 /// What the window body shows this frame.
@@ -24904,6 +24944,7 @@ mod the_idle_timer_follows_the_edited_setting {
                     health: &mut false,
                     received: &mut false,
                     generator: &mut false,
+                    settings: &mut false,
                     scope: &mut sidebar::SendScope::All,
                 },
                 lock_countdown,
@@ -28876,17 +28917,18 @@ mod preferences_modal_wiring_tests {
         source().match_indices(needle).count()
     }
 
-    /// The decision itself, asked directly.
+    /// The decision itself, asked directly. Slice 7 retargeted it: Settings is a
+    /// screen, so its being open does not matter; a shortcut row recording does.
     #[test]
-    fn the_shortcuts_are_dead_while_preferences_is_up() {
+    fn the_shortcuts_are_dead_only_while_a_shortcut_is_being_recorded() {
         assert!(
             keyboard_shortcuts_enabled(false),
-            "Ctrl+K/L/N are off with no modal open, so this window has no keyboard at all"
+            "Ctrl+K/L/N are off on the Settings screen, so this window has no keyboard there"
         );
         assert!(
             !keyboard_shortcuts_enabled(true),
-            "Ctrl+L still locks the vault from behind the preferences modal -- it tears the \
-             session down under a dialog that is supposed to be blocking it"
+            "Ctrl+L still locks the vault while a row is recording its chord -- the keystroke \
+             meant to be the new shortcut tears the session down instead"
         );
     }
 
@@ -28894,7 +28936,7 @@ mod preferences_modal_wiring_tests {
     /// decision above is a function nothing calls.
     #[test]
     fn the_shortcut_block_asks_that_question_about_every_one_of_the_three() {
-        let asks = concat!("let shortcuts = keyboard_shortcuts_", "enabled(prefs.is_some());");
+        let asks = concat!("let shortcuts = keyboard_shortcuts_", "enabled(recording_a_shortcut);");
         assert_eq!(
             occurrences(asks),
             1,
@@ -28917,39 +28959,38 @@ mod preferences_modal_wiring_tests {
         );
     }
 
-    /// **Delete the draw call and this fails.** The gear sets `prefs`, and one
-    /// block draws it; with that block gone the click would silently do
-    /// nothing at all, which is indistinguishable from the button being inert.
+    /// **Delete the draw call and this fails.** The rail's Settings row sets
+    /// `prefs` and `settings_selected`, and one block draws the screen; with
+    /// that block gone the click would silently do nothing at all, which is
+    /// indistinguishable from the row being inert.
+    ///
+    /// Slice 7 retired `exactly_one_block_draws_the_preferences_modal` for this:
+    /// the modal is no longer drawn by the vault window at all (the tray's
+    /// standalone window still draws the old body), so the old "drawn LAST so its
+    /// scrim covers the other modals" ordering has nothing to order.
     #[test]
-    fn exactly_one_block_draws_the_preferences_modal() {
-        let draws = concat!("crate::prefs_ui::draw_prefs_", "modal(ui.ctx(), state)");
+    fn exactly_one_block_draws_the_settings_screen() {
+        let draws = concat!("crate::prefs_ui::settings_v2::", "draw(ui, state, &mut settings_page)");
         assert_eq!(
             occurrences(draws),
             1,
-            "expected {draws:?} exactly once -- zero means the gear opens nothing, and two \
-             means two scrims stacked over one window"
+            "expected {draws:?} exactly once -- zero means Settings opens nothing, and two \
+             means two screens fighting for one panel"
         );
-        // And it is the LAST thing the frame closure draws, after the folder
-        // editor and the launch confirmation: an earlier scrim would sit
-        // *under* whichever of those was drawn after it, and under the
-        // titlebar the gear itself lives in.
-        let at = source().find(draws).expect("the draw call is there");
-        for (later, what) in [
-            (concat!("draw_folder_edit_", "modal(ui.ctx()"), "the folder editor"),
-            // Added with "Select icon...". Its scrim is on the same
-            // `Foreground` layer as the two beside it, so it belongs on this
-            // list for the identical reason: a modal drawn AFTER the
-            // preferences panel puts its scrim over the panel, and the gear
-            // the user just pressed stops working.
-            (concat!("draw_icon_", "modal(ui.ctx()"), "the icon picker"),
-            (concat!("draw_launch_confirm_", "modal(ui.ctx()"), "the launch confirmation"),
-        ] {
-            let other = source().find(later).expect("that modal is drawn too");
-            assert!(
-                other < at,
-                "the preferences modal is drawn BEFORE {what}, so its scrim sits under it"
-            );
-        }
+        assert_eq!(
+            occurrences(concat!("draw_prefs_", "modal(")),
+            0,
+            "the vault window draws the old preferences modal again, over the Settings screen"
+        );
+    }
+
+    /// The Settings screen takes the list's and the detail pane's place: both
+    /// panels are gated on it, as they are on the Generator. Dropping one gate
+    /// draws a list column beside the screen.
+    #[test]
+    fn the_list_and_the_detail_step_aside_for_the_settings_screen() {
+        assert_eq!(occurrences(concat!("&& !settings_", "selected {")), 2, "the health panel and the list");
+        assert_eq!(occurrences(concat!("|| settings_", "selected {")), 1, "the detail pane's width");
     }
 
     /// **Nothing in this window writes the settings to disk.** The write-back
@@ -38200,11 +38241,12 @@ mod send_delete_wiring {
             "the frame draws the Sends pane {} times, not once",
             code.matches(concat!("draw_send_", "pane(")).count()
         );
-        // Two: the detail pane's, and the Generator screen's (slice 6) --
-        // neither is the Sends screen, and both are the panel's only answer.
+        // Three: the detail pane's, the Generator screen's (slice 6) and the
+        // Settings screen's (slice 7) -- none is the Sends screen, and each is
+        // the panel's only answer.
         assert_eq!(
             code.matches(concat!("no_sends_screen_this_", "frame()")).count(),
-            2,
+            3,
             "the one verdict this module may mint without drawing the pane is written {} \
              times, not once. Each extra one is a place the real verdict can be dropped \
              for an inert one",

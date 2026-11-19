@@ -48,6 +48,9 @@ use eframe::egui::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// Slice 7: Settings as a screen of the vault window.
+pub mod settings_v2;
+
 const WINDOW_TITLE: &str = "Deskwarden Preferences";
 
 /// 3e's window card measures 1000x780, and a seven-row nav plus a content pane
@@ -1858,6 +1861,13 @@ impl PrefsState {
             key_random: crate::service_token::os_random,
             key_copy: |_| {},
         }
+    }
+
+    /// Whether a shortcut row is listening for keys right now. The Settings
+    /// screen turns the window's own chords off while this is true: the user's
+    /// next keystroke is the new chord, not a command.
+    pub fn is_capturing(&self) -> bool {
+        self.capturing.is_some()
     }
 
     /// Which page is open. Used by the screenshot job (`examples/ui_preview`),
