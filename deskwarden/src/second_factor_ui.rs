@@ -7,7 +7,7 @@
 
 use crate::rest::api::SecondFactor;
 use crate::theme;
-use eframe::egui::{self, RichText};
+use eframe::egui;
 use zeroize::Zeroize;
 
 /// Bitwarden's own priority order, restricted to what this app can complete.
@@ -345,55 +345,100 @@ pub enum PromptAction {
     UseApiKey,
 }
 
-/// Draws the code stage. Pure view: the caller owns the [`Prompt`] and
-/// performs the channel sends for whatever comes back, exactly as
-/// `login_ui::draw_login_window` and its caller are split.
+/// Draws the code stage on the sign-in split screen (spec C 5.2): the brand
+/// half, and the prompt in the form column. Pure view: the caller owns the
+/// [`Prompt`] and performs the channel sends for whatever comes back, exactly
+/// as `login_ui::draw_login_window` and its caller are split.
+///
+/// It also draws the window's caption buttons, because this stage has no title
+/// bar of its own and the design has none on this screen.
 pub fn draw(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
+    let full = ui.max_rect();
+    let mut asked = None;
+    let caption = crate::kit::auth::split(ui, full, crate::login_ui::CloseControl::Active, |ui| {
+        asked = draw_form(ui, prompt);
+    });
+    crate::kit::auth::apply_caption(ui.ctx(), caption);
+    asked
+}
+
+/// The prompt itself, in the form column.
+fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
+    use crate::kit::auth::{self, FORM_GAP};
+    use crate::kit::controls::ButtonKind;
+    let width = ui.available_width();
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let button = |ui: &mut egui::Ui, kind: ButtonKind, label: &str| match kind {
+        ButtonKind::Primary => {
+            auth::wide_button(ui, kind, 56.0, 16, 17.0, label, None, width).clicked()
+        }
+        _ => auth::wide_button(ui, kind, 52.0, 14, 16.0, label, None, width).clicked(),
+    };
+
     if let Some(message) = unsupported_only_message(prompt.offered()) {
-        ui.label(RichText::new(factor_title(&SecondFactor::Unsupported(0))).size(17.0));
-        ui.add_space(8.0);
-        ui.label(RichText::new(message).size(12.0).color(theme::TEXT_MUTED));
-        ui.add_space(16.0);
+        auth::title(ui, factor_title(&SecondFactor::Unsupported(0)));
+        ui.add_space(FORM_GAP);
+        auth::explain(ui, &message);
+        ui.add_space(FORM_GAP);
         // The message above names the API key and where to create it. This is
         // the button that makes it true.
-        if ui.button(crate::api_key_ui::USE_API_KEY_LABEL).clicked() {
+        if button(ui, ButtonKind::Primary, crate::api_key_ui::USE_API_KEY_LABEL) {
             return Some(PromptAction::UseApiKey);
         }
-        return ui.button(BACK_LABEL).clicked().then_some(PromptAction::Back);
+        ui.add_space(12.0);
+        return button(ui, ButtonKind::Outline, BACK_LABEL).then_some(PromptAction::Back);
     }
 
     let Some(chosen) = prompt.chosen() else {
         // An empty provider list. Nothing to ask for, and nothing to
         // apologise for either -- `unsupported_only_message` answers `None`
         // for the empty offer, so this arm exists and must say something.
-        ui.label(RichText::new(message_for(Trouble::Unreachable)).size(12.0));
-        return ui.button(BACK_LABEL).clicked().then_some(PromptAction::Back);
+        auth::error_line(ui, message_for(Trouble::Unreachable));
+        ui.add_space(FORM_GAP);
+        return button(ui, ButtonKind::Outline, BACK_LABEL).then_some(PromptAction::Back);
     };
 
-    ui.label(RichText::new(factor_title(&chosen)).size(17.0));
-    ui.add_space(6.0);
-    ui.label(RichText::new(factor_hint(&chosen)).size(12.0).color(theme::TEXT_MUTED));
-    ui.add_space(14.0);
+    auth::title(ui, factor_title(&chosen));
+    ui.add_space(12.0);
+    auth::explain(ui, &factor_hint(&chosen));
+    ui.add_space(FORM_GAP);
 
     let mut asked = None;
 
     if prompt.wants_send_button() {
+        let busy = prompt.busy;
         ui.horizontal(|ui| {
-            if ui.add_enabled(!prompt.busy, egui::Button::new(SEND_CODE_LABEL)).clicked() {
+            let send = ui
+                .add_enabled_ui(!busy, |ui| {
+                    crate::kit::controls::button(
+                        ui,
+                        ButtonKind::Outline,
+                        crate::kit::controls::ROW,
+                        SEND_CODE_LABEL,
+                        None,
+                    )
+                })
+                .inner;
+            if send.clicked() {
                 asked = Some(PromptAction::Send);
             }
             if prompt.email_sent {
-                ui.label(RichText::new(CODE_SENT_NOTICE).size(11.0).color(theme::TEXT_MUTED));
+                ui.add_space(12.0);
+                let p = crate::kit::tokens::palette(ui.ctx());
+                ui.label(theme::regular(CODE_SENT_NOTICE, 14.0).color(p.text_muted));
             }
         });
-        ui.add_space(10.0);
+        ui.add_space(FORM_GAP);
     }
 
-    ui.label(RichText::new(CODE_LABEL).size(12.0));
-    let entry = ui.add_enabled(
-        !prompt.busy,
-        egui::TextEdit::singleline(&mut prompt.code).desired_width(f32::INFINITY),
-    );
+    auth::label(ui, CODE_LABEL);
+    ui.add_space(auth::LABEL_GAP);
+    let entry_id = egui::Id::new("auth-second-factor-code");
+    let entry = ui
+        .add_enabled_ui(!prompt.busy, |ui| {
+            crate::kit::input::text(ui, entry_id, &mut prompt.code, "", true, width)
+        })
+        .inner;
     // A YubiKey types its code and presses Enter itself, which is why the
     // focus goes here on entry and why Enter submits.
     if !prompt.busy {
@@ -402,36 +447,34 @@ pub fn draw(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
     let entered = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
     if let Some(error) = prompt.error.as_deref() {
-        ui.add_space(6.0);
-        ui.label(RichText::new(error).size(11.0).color(theme::ERROR));
+        ui.add_space(FORM_GAP);
+        auth::error_line(ui, error);
     }
 
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        let ready = !prompt.busy && !prompt.code.trim().is_empty();
-        if (ui.add_enabled(ready, egui::Button::new(CONTINUE_LABEL)).clicked()
-            || (entered && ready))
-            && asked.is_none()
-        {
-            asked = Some(PromptAction::Submit(crate::rest::api::SecondFactorAnswer::new(
-                chosen.clone(),
-                prompt.code.trim(),
-            )));
-        }
-        if ui.button(BACK_LABEL).clicked() {
-            asked = Some(PromptAction::Back);
-        }
-    });
+    ui.add_space(FORM_GAP);
+    let ready = !prompt.busy && !prompt.code.trim().is_empty();
+    let go = ui.add_enabled_ui(ready, |ui| button(ui, ButtonKind::Primary, CONTINUE_LABEL)).inner;
+    if (go || (entered && ready)) && asked.is_none() {
+        asked = Some(PromptAction::Submit(crate::rest::api::SecondFactorAnswer::new(
+            chosen.clone(),
+            prompt.code.trim(),
+        )));
+    }
+    ui.add_space(12.0);
+    if button(ui, ButtonKind::Outline, BACK_LABEL) {
+        asked = Some(PromptAction::Back);
+    }
 
     // Only the factors the user could switch TO, so a one-factor account is
     // not offered a choice between one thing and itself.
     let alternatives: Vec<SecondFactor> =
         prompt.supported().into_iter().filter(|factor| *factor != chosen).collect();
     if !alternatives.is_empty() {
-        ui.add_space(10.0);
-        ui.label(RichText::new(SWITCH_LABEL).size(11.0).color(theme::TEXT_MUTED));
+        ui.add_space(FORM_GAP);
+        auth::label(ui, SWITCH_LABEL);
         for factor in alternatives {
-            if ui.link(factor_title(&factor)).clicked() {
+            ui.add_space(6.0);
+            if auth::link(ui, factor_title(&factor)).clicked() {
                 prompt.choose(factor);
             }
         }
@@ -815,15 +858,23 @@ mod tests {
         }
     }
 
-    /// Every string the card paints in one frame.
+    /// Every string the card paints once it has risen into place: the screen
+    /// fades in over half a second, and a fully transparent frame paints
+    /// nothing at all, so the harness runs a dozen frames 0.1 s apart and
+    /// reads the last.
     fn painted(prompt: &mut Prompt) -> Vec<String> {
         let ctx = styled_context();
-        let output = ctx.run_ui(raw_input(), |ui| {
-            let _ = draw(ui, prompt);
-        });
         let mut texts = Vec::new();
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut texts);
+        for i in 0..12 {
+            let mut input = raw_input();
+            input.time = Some(i as f64 * 0.1);
+            let output = ctx.run_ui(input, |ui| {
+                let _ = draw(ui, prompt);
+            });
+            texts.clear();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut texts);
+            }
         }
         texts
     }

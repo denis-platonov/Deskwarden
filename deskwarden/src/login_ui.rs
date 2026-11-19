@@ -7,7 +7,7 @@ use crate::accounts::{Account, AccountId};
 use crate::hello::{self, HelloState};
 use crate::rest::api::Authenticated;
 use crate::theme;
-use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, RichText, Sense, Stroke, Vec2};
+use eframe::egui::{self, Color32, CornerRadius, Margin, Pos2, Sense, Stroke, Vec2};
 // For `SignedInIdentity` alone, which is the one type in this file that
 // crosses a process boundary -- see its doc. Nothing else here is serialised,
 // and nothing here that holds a password ever may be.
@@ -748,264 +748,6 @@ pub fn missing_credential_message(
     }
 }
 
-/// **Whether this Submit is the one that gets to ask which client opens the
-/// vault.**
-///
-/// The owner's rule is "always either notify (if bw.com) or prompt which one
-/// to use (self-hosted) when login", and the word that decides this function
-/// is `login`. An UNLOCK is not a login. The account that is being unlocked
-/// signed in once already; the backend was settled then, is recorded on the
-/// [`Account`], and is the only backend that has a key for the vault about to
-/// be opened. Asking again puts a modal in front of a master-password box and
-/// offers, as one of its two answers, a client that cannot read this vault.
-///
-/// # `status` is the whole of the sign-in/unlock distinction, on both backends
-///
-/// [`build_login_frame`] reads `status` everywhere as `== Unauthenticated` or
-/// its negation -- see [`LoginCardSource`] -- and that is exactly the line
-/// wanted here:
-///
-/// * **`Unauthenticated`** draws the email box and the server dropdown and
-///   runs `bw login`. Nothing is established yet, the user is free to retype
-///   the server, and the answer to "which client" is genuinely open.
-/// * **`Locked`** is a `bw serve` account whose CLI profile is logged in and
-///   locked. `bw unlock`, no email box, no dropdown.
-/// * **`Unlocked`** is the direct-REST case, and it is the one that bit the
-///   owner. That account never reaches `bw status` at all --
-///   [`login_card_source`] routes it to [`account_details_for`], which reads
-///   `Unlocked` off a non-empty `Account::email` -- so the built-in client's
-///   own locked/unlocked notion (the stored `userkey.bin`) never enters this
-///   decision, and it does not need to: an account with a recorded address is
-///   an account that has signed in, whichever client holds the key.
-///
-/// # Re-authentication lands on the unlock side, and not by guessing
-///
-/// A session expiry or an in-window lock does not clear the record; it puts
-/// the same card back up needing the master password again. On the built-in
-/// client that reads `Unlocked` (the address is still on the account), and on
-/// `bw serve` it reads `Locked` (the CLI profile is still logged in). Both are
-/// the negation of `Unauthenticated`, so neither asks. The one way an
-/// ESTABLISHED account reads `Unauthenticated` here is a `bw logout` that
-/// really did destroy the CLI's login, and that Submit really is a `bw login`
-/// with a live email box and a live server dropdown -- a sign-in, drawn as
-/// one. So the distinction this function needs is not "re-auth versus new
-/// account", which the record alone could not settle; it is "is there a
-/// sign-in form on screen", which `status` answers exactly.
-///
-/// The other three conditions are unchanged and are not about this at all.
-/// `credentials_are_complete` and `resuming_after_setup` are the CLI gate's
-/// own circumstances, shared so the two gates cannot disagree about whether
-/// this Submit is a real one; `backend_already_chosen` makes the question once
-/// per WINDOW rather than once per Continue, so a mistyped password is not
-/// re-litigated as a backend question.
-/// The footer's server picker: a button that opens a three-item popup.
-///
-/// **Hand-built rather than `egui::ComboBox`, and the reason is one word from
-/// the owner: "scroll not needed here".** `ComboBox` wraps whatever it is
-/// given in a `ScrollArea` -- unconditionally, with no way to turn it off --
-/// and hands that scroll area whatever vertical room the popup ends up with.
-/// This picker sits in the card's footer, at the bottom of the window, so
-/// the popup opens upward into a squeeze and the scroll area does what a
-/// scroll area does: it grows a bar. Three fixed items can never need one.
-///
-/// So the scroll area is simply not there. The popup is the three rows and
-/// nothing else, which is also why this cannot regress quietly --
-/// `the_server_picker_has_no_scroll_area` reads this function's source.
-///
-/// The button keeps the combo's look deliberately: the same 12pt
-/// `TEXT_MUTED` label it had, and a chevron drawn to egui's own proportions,
-/// so moving off `ComboBox` changes what the popup does and not what the
-/// footer looks like.
-/// The height the server picker's button comes out at.
-///
-/// Named because the API key link beside it is sized to this: the two share
-/// the footer's row, and a link left to its own 12pt height hangs from the top
-/// of a row this tall. Derived from the same three numbers the button is built
-/// from rather than written out, so the two cannot drift.
-fn server_picker_height() -> f32 {
-    // 12pt text's line height, near enough for a row whose height is padding
-    // plus a line: the button takes `galley.height().max(CHEVRON)`, and at
-    // 12pt the galley is the taller of the two.
-    const LINE: f32 = 14.0;
-    PICKER_PAD_Y * 2.0 + LINE
-}
-
-/// The server picker's vertical padding, shared with [`server_picker_height`].
-const PICKER_PAD_Y: f32 = 7.0;
-
-fn server_choice_dropdown(ui: &mut egui::Ui, choice: &mut ServerChoice) {
-    // **The label and the chevron are laid out, not painted on top of each
-    // other.** The first pass called `ui.button(label)` and then drew the
-    // chevron at the button's right edge, which is the report "make dropdown
-    // bigger": nothing had reserved room for the arrow, so a wide name ran
-    // straight under it. The button is measured here instead -- text, a gap,
-    // the arrow -- the way egui measures the widget this replaced.
-    const CHEVRON: f32 = 8.0;
-    const CHEVRON_GAP: f32 = 8.0;
-    const PAD_X: f32 = 10.0;
-    const PAD_Y: f32 = PICKER_PAD_Y;
-    /// A popup row's height.
-    ///
-    /// 28, up from 24: at 24 the band was barely taller than the 12pt line
-    /// inside it and the owner read the list as "too skinny". The extra four
-    /// points are all margin around the text, which is what makes a row read
-    /// as a row rather than as a label with a colour behind it.
-    const ROW_HEIGHT: f32 = 28.0;
-    /// The three servers, in the order they are offered.
-    ///
-    /// Named once because the button and the popup must agree about them: the
-    /// button is sized to the widest of these, and a list holding a fourth
-    /// option the button had never measured would be wider than the control it
-    /// drops out of.
-    const SERVER_OPTIONS: [ServerChoice; 3] =
-        [ServerChoice::UsCloud, ServerChoice::EuCloud, ServerChoice::SelfHosted];
-
-    let font = egui::FontId::proportional(12.0);
-    let lay = |text: String| ui.painter().layout_no_wrap(text, font.clone(), theme::TEXT_MUTED);
-    let galley = lay(choice.label().to_owned());
-
-    // **Measured against the WIDEST option, not the current one**, which is
-    // what "make dropdown menu same width" asks for. `Popup::menu` takes the
-    // popup's width from the button, and the button was as wide as whatever
-    // happened to be selected -- so picking `bitwarden.eu` gave a button
-    // narrower than the list that drops out of it, and every change of
-    // selection moved the footer. Sized to the longest label, the button is
-    // one width for the life of the window and the list matches it exactly.
-    let widest = SERVER_OPTIONS
-        .iter()
-        .map(|option| lay(option.label().to_owned()).size().x)
-        .fold(galley.size().x, f32::max);
-    let size = Vec2::new(
-        PAD_X * 2.0 + widest + CHEVRON_GAP + CHEVRON,
-        PAD_Y * 2.0 + galley.size().y.max(CHEVRON),
-    );
-    let (rect, button) = ui.allocate_exact_size(size, egui::Sense::click());
-
-    // The frame egui would have drawn, asked for by the same route a real
-    // button asks: the interaction decides which of the widget visuals is
-    // used, so hover and press still read as they did.
-    let visuals = ui.style().interact(&button);
-    ui.painter().rect(
-        rect,
-        visuals.corner_radius,
-        visuals.weak_bg_fill,
-        visuals.bg_stroke,
-        egui::StrokeKind::Inside,
-    );
-    ui.painter().galley(
-        Pos2::new(rect.left() + PAD_X, rect.center().y - galley.size().y / 2.0),
-        galley,
-        theme::TEXT_MUTED,
-    );
-    let arrow = {
-        // **Centred on the arrow's own BOX, not on its top edge.** The first
-        // pass put the flat side a quarter of the glyph above the button's
-        // centre and the point half a glyph below it, so the triangle's box
-        // sat a pixel low and the owner read it as "text and arrow feel on
-        // diff level". Equal halves either side of the centre line put the
-        // arrow's middle where the text's middle is.
-        let centre = Pos2::new(rect.right() - PAD_X - CHEVRON / 2.0, rect.center().y);
-        let half_height = CHEVRON * 0.3;
-        [
-            Pos2::new(centre.x - CHEVRON / 2.0, centre.y - half_height),
-            Pos2::new(centre.x + CHEVRON / 2.0, centre.y - half_height),
-            Pos2::new(centre.x, centre.y + half_height),
-        ]
-    };
-    ui.painter().add(egui::Shape::convex_polygon(
-        arrow.to_vec(),
-        theme::TEXT_MUTED,
-        Stroke::NONE,
-    ));
-
-    let field_width = rect.width();
-    let _popup = egui::Popup::menu(&button)
-        .id(egui::Id::new("server-choice"))
-        // **The button's exact width, said out loud.** `Popup::menu` does not
-        // set one -- the widget this replaced was setting it, from its own
-        // button, and moving off that widget left this unset. The popup then
-        // sized itself to its content: the longest label, with none of the
-        // button's chevron or its gap, so the list and the field it drops out
-        // of were two different widths. "Make popup width same as dropdown
-        // field."
-        .width(rect.width())
-        // **A frame with no inner margin, which is what "edge to edge" needs.**
-        // A full-width row is only as wide as the frame lets it be, and the
-        // menu frame egui supplies pads its contents -- so the selection band
-        // stopped short of the popup's own edges however wide the row was
-        // asked to be. The frame keeps its fill, its border and its rounding
-        // and gives up only the padding.
-        .frame(egui::Frame::menu(ui.style()).inner_margin(egui::Margin::ZERO))
-        .show(|ui| {
-            // No scrolling container of any kind here, which is the whole
-            // point of this function -- see its docs, and the guard that
-            // reads this body to keep one from coming back.
-            // **Full width, so the selected row is a band and not a badge.**
-            // `ui.selectable_value` sizes its widget to the text it holds, so
-            // the highlight stopped where the word did -- "make selected item
-            // in dropdown full filled edge to edge in blue not just around
-            // text". Every row is given the popup's whole width instead, which
-            // also makes the three rows one column of hit targets rather than
-            // three ragged ones.
-            // **`set_width`, and rows measured from the SAME number.**
-            // `Popup::width` only feeds `Area::default_width`, which is a
-            // default: an area still grows to whatever its content asks for,
-            // and rows asking for `available_width` inside an area sized to
-            // its content is a loop that settles wider than the field. Both
-            // ends are pinned to the button's own width instead, so the list
-            // cannot come out any other size.
-            ui.set_width(field_width);
-            // **The row's own padding decides where its label sits.**
-            // `add_sized` gives the button a 28pt box, but a `Button` lays its
-            // text out at `spacing.button_padding` from its top-left and then
-            // the justified layout stretches the FRAME around that -- so the
-            // text kept egui's default 2pt top padding inside a box more than
-            // twice that tall and sat high. "Dropdown text like Self-hosted
-            // feels not centered vertically."
-            //
-            // Half the leftover, so the text is centred by construction at
-            // whatever `ROW_HEIGHT` is set to next.
-            let line = ui
-                .painter()
-                .layout_no_wrap(
-                    ServerChoice::SelfHosted.label().to_string(),
-                    egui::FontId::proportional(12.0),
-                    theme::TEXT_MUTED,
-                )
-                .size()
-                .y;
-            ui.spacing_mut().button_padding =
-                egui::vec2(PAD_X, ((ROW_HEIGHT - line) / 2.0).max(0.0));
-            // No gap between rows either: `item_spacing` leaves a stripe of
-            // frame between two bands, which is the same defect vertically.
-            ui.spacing_mut().item_spacing.y = 0.0;
-            let width = field_width;
-            for option in SERVER_OPTIONS {
-                // `Button::selected`, which is what `Ui::selectable_label`
-                // builds for itself in this version of egui -- reached
-                // directly here only so the row can be given a size.
-                let row = ui.add_sized(
-                    [width, ROW_HEIGHT],
-                    egui::Button::new(option.label())
-                        .selected(*choice == option)
-                        // Square, because the band now reaches the popup's own
-                        // rounded edge: a rounded row inside a rounded frame
-                        // leaves four crescents of frame showing at the
-                        // corners, which is "not edge to edge" one step
-                        // smaller.
-                        .corner_radius(egui::CornerRadius::ZERO),
-                );
-                if row.clicked() {
-                    *choice = option;
-                    ui.close();
-                }
-            }
-        });
-    // The popup's own response is not read: the picker's whole output is the
-    // `choice` it writes through, and returning the response would make every
-    // call site decide what to do with a value that says nothing.
-}
-
 #[must_use]
 pub fn should_ask_which_client(
     status: BwStatus,
@@ -1123,6 +865,28 @@ impl ServerChoice {
         }
     }
 
+    /// The sign-in screen's segmented control, in the design's words
+    /// (spec C 5.2): bitwarden.com, EU, Self-hosted.
+    pub const SEGMENTS: [&'static str; 3] = ["bitwarden.com", "EU", "Self-hosted"];
+
+    /// Which of [`Self::SEGMENTS`] this choice is.
+    pub fn segment(self) -> usize {
+        match self {
+            Self::UsCloud => 0,
+            Self::EuCloud => 1,
+            Self::SelfHosted => 2,
+        }
+    }
+
+    /// The choice a segment stands for; anything past the last is Self-hosted.
+    pub fn from_segment(index: usize) -> Self {
+        match index {
+            0 => Self::UsCloud,
+            1 => Self::EuCloud,
+            _ => Self::SelfHosted,
+        }
+    }
+
     /// The URL `bw config server` gets for the cloud choices; `None` for
     /// self-hosted (the form's URL field supplies it).
     pub fn config_url(self) -> Option<&'static str> {
@@ -1144,10 +908,6 @@ impl ServerChoice {
         }
     }
 }
-
-/// Space the window keeps below the flowing content: the pinned footer row
-/// plus the body's bottom margin.
-pub const FOOTER_RESERVE: f32 = 62.0;
 
 // --- The login card on the empty app --------------------------------------
 //
@@ -1172,140 +932,6 @@ pub const FOOTER_RESERVE: f32 = 62.0;
 /// taskbar and `round_window_corners` see, and it is what tells the two
 /// windows apart to everything outside this process.
 const WINDOW_TITLE: &str = "Log in to Deskwarden";
-const VAULT_WINDOW_TITLE: &str = crate::vault_window::WINDOW_TITLE;
-
-/// The login card's width -- unchanged. The card's composition is the design's
-/// 3h and was not asked to change; only where it sits did.
-const LOGIN_CARD_WIDTH: f32 = 470.0;
-
-/// The card's height before the first frame has measured its content.
-///
-/// The window used to BE the card, at 470x588 with a 40px `ChromeMetrics::LOGIN`
-/// bar above the body; 588 - 40 is what that composition measured. Any wrong
-/// value here would settle within one frame (see `login_card_height`), but
-/// the frame it is wrong on is the first one the user sees.
-const LOGIN_CARD_INITIAL_HEIGHT: f32 = 548.0;
-
-/// The card's own padding: 3h's body margins, kept exactly.
-const CARD_MARGIN_X: f32 = 26.0;
-const CARD_MARGIN_TOP: f32 = 24.0;
-/// Deeper than the top: the footer row's dropdown otherwise sits too close to
-/// the card's edge. Note this is ALREADY counted inside [`FOOTER_RESERVE`],
-/// which is why `login_card_height` does not add it twice.
-const CARD_MARGIN_BOTTOM: f32 = 30.0;
-
-/// What is painted over the empty panes so the card reads as blocking them.
-///
-/// Over the body only, NOT over the titlebar. The bar carries the live
-/// ✕ and — controls, and dimming a control the user is still expected to be
-/// able to find and hit says the opposite of what a scrim is for. The panes
-/// underneath are the part that is inert.
-const SCRIM: Color32 = Color32::from_black_alpha(56);
-
-/// The vault window's layout, as empty regions: the titlebar, and the three
-/// panes at the widths `vault_window` really uses.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct VaultSkeleton {
-    pub bar: egui::Rect,
-    /// Everything under the bar: one flat region, and what [`SCRIM`] covers.
-    ///
-    /// This used to be divided into the vault window's three panes, painted
-    /// in their real fills with the hairlines between them. It read as a
-    /// mock of the app rather than as the app waiting, and the user asked
-    /// for the divisions gone. The bar stays -- it is the same bar the vault
-    /// window keeps, so it is continuity rather than decoration.
-    pub body: egui::Rect,
-}
-
-/// Divides `full` the way `vault_window::run` divides its window.
-///
-/// The widths come from `vault_window`'s own constants and the bar height from
-/// [`ChromeMetrics::VAULT`], because the whole point of this shape is that it
-/// is the app the user is about to be looking at. Numbers copied over here
-/// would be numbers that drift, and a placeholder whose panes are the wrong
-/// widths is worse than no placeholder: the window would visibly re-flow at
-/// the moment of sign-in, which is the jump this exists to remove.
-pub fn vault_skeleton(full: egui::Rect) -> VaultSkeleton {
-    let bar = egui::Rect::from_min_max(
-        full.min,
-        Pos2::new(full.max.x, full.min.y + ChromeMetrics::VAULT.bar_height),
-    );
-    let body = egui::Rect::from_min_max(Pos2::new(full.min.x, bar.max.y), full.max);
-    VaultSkeleton { bar, body }
-}
-
-/// Paints the body behind the card: one flat [`theme::CANVAS`] region under
-/// the scrim, and nothing else.
-///
-/// It was the vault window's three panes in their own fills with the
-/// hairlines between them. That drew a picture *of* the app, and a picture of
-/// an app with nothing in it is a mock -- the divisions promise a sidebar and
-/// a list that are not there and cannot be interacted with. One region
-/// promises nothing and simply gets out of the card's way.
-///
-/// The bar above it is still painted (by the caller): that one is not
-/// decoration, it is the same titlebar the vault window keeps afterwards, so
-/// it is the part that makes this window and the next one feel continuous.
-pub fn paint_vault_skeleton(painter: &egui::Painter, skeleton: &VaultSkeleton) {
-    painter.rect_filled(skeleton.body, CornerRadius::ZERO, theme::CANVAS);
-    painter.rect_filled(skeleton.body, CornerRadius::ZERO, SCRIM);
-}
-
-/// Where the card sits: centred in the empty app's BODY, not in the whole
-/// window -- the titlebar is chrome, and a card centred against it sits
-/// visibly high in the region it is blocking.
-pub fn login_card_rect(skeleton: &VaultSkeleton, card_height: f32) -> egui::Rect {
-    egui::Rect::from_center_size(
-        skeleton.body.center(),
-        Vec2::new(LOGIN_CARD_WIDTH, card_height),
-    )
-}
-
-/// The card's content area: the card less 3h's own margins.
-pub fn login_card_content_rect(card: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_max(
-        Pos2::new(card.min.x + CARD_MARGIN_X, card.min.y + CARD_MARGIN_TOP),
-        Pos2::new(card.max.x - CARD_MARGIN_X, card.max.y - CARD_MARGIN_BOTTOM),
-    )
-}
-
-/// The height the card wants, given where `draw_login_window`'s flowing
-/// content ended and where its content area began.
-///
-/// The window used to send itself a `ViewportCommand::InnerSize` from exactly
-/// this measurement (`flow_bottom + FOOTER_RESERVE`); it now sizes the card
-/// instead and leaves the window alone. [`CARD_MARGIN_BOTTOM`] is not added:
-/// [`FOOTER_RESERVE`] is the footer row PLUS that margin, which is why the
-/// two numbers do not both appear here.
-pub fn login_card_height(flow_bottom: f32, content_top: f32) -> f32 {
-    (CARD_MARGIN_TOP + (flow_bottom - content_top) + FOOTER_RESERVE).ceil()
-}
-
-/// Gap between a field's label and the field itself.
-const LABEL_GAP: f32 = 7.0;
-/// Gap between one label+field group and the next (and before the action
-/// button). Deliberately much larger than [`LABEL_GAP`] -- roughly 3x -- so
-/// each label reads as bound to the field under it rather than floating
-/// between two of them.
-const GROUP_GAP: f32 = 22.0;
-
-/// Track width of the in-flight bar beside Continue.
-///
-/// **This was a 20px rotating disc**, and design turn 7 retires the disc from
-/// every surface a user meets before the vault — the sign-in card included.
-/// The owner's instruction was "it should always be one screen with line
-/// spinner as per design", and the card is the first of the screens that one
-/// window shows.
-///
-/// Narrower than the waiting bodies' 260/200px tracks because this one sits
-/// INSIDE a row beside a button rather than centred in an empty frame; the
-/// proportions it is drawn with (32% knob, 3px, 1.4s) are
-/// [`theme::progress_bar`]'s and are the same here as there.
-/// `ui.horizontal`'s `Align::Center` keeps it centred on the taller button,
-/// and the row's height is still the button's, so nothing reflows when it
-/// appears — which is what the disc's own note was protecting and is only
-/// more true of something 3px tall.
-const AUTH_BAR_WIDTH: f32 = 96.0;
 
 /// What the custom titlebar asked for this frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1955,6 +1581,20 @@ pub struct LoginForm {
     /// The opt-in for Windows Hello quick unlock (see `hello::enroll`).
     pub enable_hello: bool,
     pub error: Option<String>,
+    /// Which stage of the lock screen is up (spec C 5.3). Only the Hello
+    /// stage can be skipped; with Hello off or unavailable the password stage
+    /// is the only one whatever this says.
+    pub lock_stage: LockStage,
+}
+
+/// The lock screen's two stages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LockStage {
+    /// The Windows Hello button, and a link to the password.
+    #[default]
+    Hello,
+    /// The master-password row, and a link back to Hello.
+    Password,
 }
 
 /// **The backstop: no `LoginForm` is released to the allocator holding a
@@ -2100,78 +1740,70 @@ fn draw_cli_setup_modal(
     ui: &mut egui::Ui,
     state: &crate::bw_acquire::CliSetupState,
 ) -> Option<crate::bw_acquire::CliModalAction> {
+    use crate::kit::controls::{self, ButtonKind};
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut action = None;
     egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, theme::HAIRLINE))
-        .inner_margin(Margin::same(16))
+        .fill(p.card)
+        .corner_radius(CornerRadius::same(18))
+        .stroke(Stroke::new(1.0, p.border))
+        .inner_margin(Margin::same(22))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(theme::bold(state.title(), 15.0).color(theme::INK));
-            ui.add_space(8.0);
+            ui.label(theme::bold(state.title(), 18.0).color(p.ink));
+            ui.add_space(10.0);
             for line in state.body() {
-                ui.label(RichText::new(line).size(12.0).color(theme::TEXT_MUTED));
-                ui.add_space(6.0);
+                ui.label(theme::regular(line, 14.0).color(p.text_muted));
+                ui.add_space(8.0);
             }
-            // The bar. `ProgressBar` with an explicit fraction where one is
-            // known, and egui's own animated indeterminate bar where it is
-            // not -- which happens only while the release listing is being
-            // fetched, a step with no byte count to report.
+            // The bar: filled to the fraction where one is known, and the
+            // sliding indeterminate one where it is not -- which happens
+            // only while the release listing is being fetched, a step with
+            // no byte count to report.
             if matches!(state, crate::bw_acquire::CliSetupState::Working { .. }) {
                 ui.add_space(2.0);
-                let bar = match state.progress() {
-                    Some(fraction) => egui::ProgressBar::new(fraction),
-                    None => egui::ProgressBar::new(0.0).animate(true),
-                };
-                ui.add(bar.desired_width(ui.available_width()).desired_height(6.0));
-                ui.add_space(6.0);
+                match state.progress() {
+                    Some(fraction) => {
+                        let (track, _) = ui.allocate_exact_size(
+                            Vec2::new(ui.available_width(), 6.0),
+                            Sense::hover(),
+                        );
+                        ui.painter().rect_filled(track, CornerRadius::same(3), p.meter_track);
+                        let mut fill = track;
+                        fill.set_width(track.width() * fraction.clamp(0.0, 1.0));
+                        ui.painter().rect_filled(fill, CornerRadius::same(3), p.blue);
+                    }
+                    None => crate::kit::auth::progress(ui, ui.available_width(), false),
+                }
+                ui.add_space(8.0);
                 // A window that is doing network work must keep painting, or
                 // the bar stops moving while the transfer does not.
                 ui.ctx().request_repaint();
             }
             let buttons = state.buttons();
             if !buttons.is_empty() {
-                ui.add_space(6.0);
+                ui.add_space(8.0);
                 // **Allocated one row tall.** A bare
                 // `with_layout(right_to_left)` inherits the parent's whole
                 // remaining rect, and in a `Ui` whose height is itself
                 // derived from where this content ends, that is a feedback
                 // loop rather than a cosmetic slip -- the button row claimed
-                // every pixel the card had, the card grew to hold it, and
-                // the row claimed those too. `allocate_ui_with_layout` fixes
-                // the row at one interactive row, which is all a button row
-                // was ever asking for.
-                // **`BUTTON_HEIGHT`, not `interact_size.y`.** The row now
-                // holds a `theme::primary_button`, which is 32px tall by
-                // design and taller than egui's 18px interact size; a row
-                // allocated shorter than its tallest child is a row that
-                // overflows into whatever the card measures next. A constant
-                // either way, so the feedback loop this allocation exists to
-                // break stays broken.
+                // every pixel the card had, and the card grew to hold it.
+                // `allocate_ui_with_layout` fixes the row at one button's
+                // height, which is all a button row was ever asking for.
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), theme::BUTTON_HEIGHT),
+                    Vec2::new(ui.available_width(), controls::ROW.height),
                     egui::Layout::right_to_left(egui::Align::Center),
                     |ui| {
                         // Reversed, because a right-to-left layout places
                         // the first thing added at the RIGHT edge -- and the
                         // affirmative button belongs there. `buttons()`
                         // lists them left to right, which is how they read.
-                        //
-                        // **The primary is the app's blue button**, not a
-                        // fill chosen here: `theme::primary_button` is the
-                        // same control the login card's Continue is, so the
-                        // one answer this modal leans toward is painted in
-                        // the same blue as every other affirmative action in
-                        // the app. `CliSetupState::buttons` decides WHICH,
+                        // `CliSetupState::buttons` decides WHICH is primary,
                         // and only the choice state names one.
                         for (label, what, primary) in buttons.iter().rev() {
-                            let clicked = if *primary {
-                                theme::primary_button(ui, label, None).clicked()
-                            } else {
-                                theme::secondary_button(ui, label).clicked()
-                            };
-                            if clicked {
+                            let kind = if *primary { ButtonKind::Primary } else { ButtonKind::Outline };
+                            if controls::button(ui, kind, controls::ROW, label, None).clicked() {
                                 action = Some(*what);
                             }
                         }
@@ -2182,20 +1814,6 @@ fn draw_cli_setup_modal(
     action
 }
 
-/// Draws the login/unlock window body (design 3h): brand lockup, title
-/// block, credential card with the account email and in-field reveal toggle,
-/// and the bottom account/server footer. Pure view -- the caller owns the
-/// state and performs the `bw` side effects for whatever action comes back.
-///
-/// Public (rather than folded into `run_login_flow`'s closure) so the
-/// `ui_preview` example renders the exact window the app ships, same as
-/// `overlay_ui::draw_overlay_card`.
-///
-/// Deviations from the 3h mock, backend-gated: "Forgot it?" (the CLI has no
-/// password-hint API) and "Switch account" ("Log out" is the same
-/// primitive). The Hello panel appears once quick unlock is enrolled
-/// (`hello.enrolled`); the mock's static "Bitwarden · EU" footer is a live
-/// server dropdown while signing in.
 /// What the window says the first time it asks for a master password against
 /// a freshly minted account.
 ///
@@ -2220,17 +1838,68 @@ pub const FIRST_RUN_NOTICE: &str = "Deskwarden now keeps each account in its own
      in once to set this one up. Windows Hello quick unlock has to be set up again too.";
 
 /// Paints [`FIRST_RUN_NOTICE`]. One definition, two call sites (with the Hello
-/// panel, and standing alone when there is no panel), so the two cannot drift
-/// into saying different things.
-fn draw_first_run_notice(ui: &mut egui::Ui) {
-    ui.label(
-        RichText::new(FIRST_RUN_NOTICE)
-            .size(11.0)
-            .color(theme::TEXT_MUTED),
-    );
-    ui.add_space(8.0);
+/// button, and standing alone when there is none), so the two cannot drift
+/// into saying different things. On the sign-in screen it is a blue-washed
+/// card; on the navy lock screen it is a centred note.
+fn draw_first_run_notice(ui: &mut egui::Ui, on_lock_screen: bool) {
+    if on_lock_screen {
+        let width = ui.available_width().min(crate::kit::auth::LOCK_ROW_WIDTH);
+        crate::kit::auth::lock_note(ui, FIRST_RUN_NOTICE, width);
+        return;
+    }
+    let p = crate::kit::tokens::palette(ui.ctx());
+    egui::Frame::new()
+        .fill(p.blue_wash)
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(Margin::symmetric(16, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(theme::regular(FIRST_RUN_NOTICE, 13.0).color(p.text_muted));
+        });
 }
 
+/// What the window says after a first-use Hello click with no password typed.
+const HELLO_SETUP_NEEDS_PASSWORD: &str = "Type your master password first \u{2014} Windows Hello is set up right \
+     after it unlocks the vault.";
+/// The button the sign-in screen offers when Windows Hello can be set up.
+const HELLO_SETUP_LABEL: &str = "Log in and set up Windows Hello";
+/// The same, as the link under the lock screen's password row.
+const HELLO_SETUP_LINK: &str = "Unlock and set up Windows Hello";
+/// What sits under [`HELLO_SETUP_LABEL`].
+const HELLO_SETUP_HINT: &str = "First use: enter your master password, then click here";
+/// The sign-in screen's title.
+pub const SIGN_IN_TITLE: &str = "Log in";
+/// The server row's label and the help bubble behind its `?` (spec C 5.2).
+const SERVER_LABEL: &str = "Server";
+const SERVER_TIP: &str = "Most people use bitwarden.com. Pick EU if your account was made there, or Self-hosted if your company runs its own.";
+/// The password fields' placeholders.
+const PASSWORD_PLACEHOLDER: &str = "Your Bitwarden master password";
+const LOCK_PLACEHOLDER: &str = "Master password";
+
+/// A label over a field, and the gap under the pair. The label greys with
+/// its field while `dim`: "gray out the whole user/pass zone" is not met by a
+/// pale box under a dark label.
+fn group(ui: &mut egui::Ui, label: &str, dim: bool, field: impl FnOnce(&mut egui::Ui)) {
+    crate::kit::auth::label_dim(ui, label, dim);
+    ui.add_space(crate::kit::auth::LABEL_GAP);
+    field(ui);
+    ui.add_space(crate::kit::auth::FORM_GAP);
+}
+
+/// Draws the login/unlock body: the sign-in form for an account that is not
+/// signed in (spec C 5.2), the lock stage for one that is (spec C 5.3). Pure
+/// view -- the caller owns the state and performs the `bw` side effects for
+/// whatever action comes back, and positions it: the form goes in the split
+/// screen's 420-wide column, the stage in the lock screen's.
+///
+/// Public (rather than folded into `run_login_flow`'s closure) so the
+/// `ui_preview` example renders the exact window the app ships.
+///
+/// Deviations from the design, backend-gated: "Log in with another device"
+/// has no flow behind it and is not drawn; "Forgot it?" and "Switch account"
+/// are not drawn either (the CLI has no password-hint API, and "Log out" is
+/// the same primitive). The Hello stage appears once quick unlock is enrolled
+/// (`hello.enrolled`).
 pub fn draw_login_window(
     ui: &mut egui::Ui,
     status: BwStatus,
@@ -2241,7 +1910,7 @@ pub fn draw_login_window(
     flow_bottom: &mut f32,
     // True from the moment credentials are handed to the `bw` CLI until it
     // answers. Disables every control that could start a second sign-in and
-    // shows the spinner beside Continue.
+    // shows the bar under the button.
     auth_in_progress: bool,
     // This account was minted by THIS launch and has never been signed in
     // to. Draws [`FIRST_RUN_NOTICE`]. Not something the window infers: the
@@ -2250,496 +1919,338 @@ pub fn draw_login_window(
     // in on with nothing to say why.
     first_run: bool,
     // `Some` while the CLI-setup modal is open. It REPLACES the credential
-    // card, so nothing can be typed or submitted until it is answered -- see
+    // form, so nothing can be typed or submitted until it is answered -- see
     // [`draw_cli_setup_modal`].
     cli_setup: Option<&crate::bw_acquire::CliSetupState>,
 ) -> Option<LoginAction> {
-    let mut action = None;
-
-    draw_brand_lockup(ui);
-
-    ui.add_space(14.0);
-
-    // **The modal takes the card.** Everything below this point -- the title
-    // block, the fields, the Hello panel, Continue, Enter, and the server
-    // dropdown -- is not drawn while it is open.
+    // **The modal takes the form.** Everything below this point -- the
+    // fields, the Hello controls, the buttons, Enter, and the server choice
+    // -- is not drawn while it is open.
     if let Some(state) = cli_setup {
-        ui.label(theme::bold("Sign in to your vault", 19.0).color(theme::INK));
-        ui.label(
-            RichText::new("Works with bitwarden.com and self-hosted servers.")
-                .size(13.0)
-                .color(theme::TEXT_FAINT),
-        );
-        ui.add_space(14.0);
+        if status == BwStatus::Unauthenticated {
+            crate::kit::auth::title(ui, SIGN_IN_TITLE);
+            ui.add_space(crate::kit::auth::FORM_GAP);
+        }
         let pressed = draw_cli_setup_modal(ui, state);
-        // **Where the content ENDED**, which is the same measurement the
-        // main path takes at the bottom of this function rather than a
-        // second way of asking.
-        //
-        // The blank modal of 0.15.2 was not caused here -- it was the
-        // unconstrained button row in `draw_cli_setup_modal`, which claimed
-        // the card's whole remaining height and so made every "how tall is
-        // the content" question answer "as tall as the card", which
-        // `login_card_height` then grew the card to match. But
-        // `min_rect().bottom()` is the bottom of the region this `Ui` was
-        // GIVEN, and this arm's caller computes that region from this very
-        // number; the cursor is a reading of what was painted instead, so it
-        // cannot close that loop a second time however the modal's insides
-        // are rearranged later.
+        // **Where the content ENDED**: a reading of what was painted rather
+        // than of the region this `Ui` was given.
         *flow_bottom = ui.next_widget_position().y;
         return pressed.map(LoginAction::CliModal);
     }
-
-    // 3b/3h language: matches are counted but never named until the vault
-    // opens -- unlocking is what this window is for.
-    let (title, subtitle) = if status == BwStatus::Unauthenticated {
-        (
-            "Sign in to your vault",
-            "Works with bitwarden.com and self-hosted servers.",
-        )
+    let action = if status == BwStatus::Unauthenticated {
+        draw_sign_in_form(ui, hello, form, auth_in_progress, first_run)
     } else {
-        (
-            "Unlock your vault",
-            "Matches stay hidden until the vault opens.",
-        )
+        draw_lock_stage(ui, account_email, server_host, hello, form, auth_in_progress, first_run)
     };
-    ui.label(theme::bold(title, 19.0).color(theme::INK));
-    ui.label(RichText::new(subtitle).size(13.0).color(theme::TEXT_FAINT));
+    *flow_bottom = ui.next_widget_position().y;
+    action
+}
 
-    ui.add_space(14.0);
+/// The signed-out form (spec C 5.2): the title, the email and master
+/// password, the server choice, Log in, and the ways in that are not a
+/// password.
+fn draw_sign_in_form(
+    ui: &mut egui::Ui,
+    hello: HelloState,
+    form: &mut LoginForm,
+    auth_in_progress: bool,
+    first_run: bool,
+) -> Option<LoginAction> {
+    use crate::kit::auth::{self, FORM_GAP};
+    use crate::kit::controls::{self, ButtonKind};
+    use crate::kit::input;
+    let mut action = None;
+    let width = ui.available_width();
+    ui.spacing_mut().item_spacing.y = 0.0;
 
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, theme::HAIRLINE))
-        .inner_margin(Margin::same(16))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            // Spacing is explicit per gap, not one uniform value: a label
-            // must sit closer to *its* field (LABEL_GAP) than one field
-            // group does to the next (GROUP_GAP), or the rows read as an
-            // undifferentiated stack.
-            ui.spacing_mut().item_spacing.y = 0.0;
+    auth::title(ui, SIGN_IN_TITLE);
+    ui.add_space(FORM_GAP);
 
-            // **While an attempt is in flight the whole credential zone is
-            // greyed and inert**, at the user's direction: the credentials
-            // are with the CLI, and a field that still takes typing during
-            // that is a field whose contents cannot affect the answer coming
-            // back. `theme::disabled_text_field` and
-            // `theme::disabled_password_field` paint the box and a galley
-            // with no `TextEdit` in it at all -- see their docs for why a
-            // read-only `TextEdit` is not the same thing.
-            //
-            // Continue is disabled by `add_enabled_ui` further down and Enter
-            // and the Hello panel are gated below that. This is the third
-            // door, and the one the user actually named.
-            let label = if auth_in_progress {
-                theme::disabled_field_label
-            } else {
-                theme::field_label
-            };
-            if status == BwStatus::Unauthenticated {
-                if form.server_choice == ServerChoice::SelfHosted {
-                    label(ui, "Server URL");
-                    ui.add_space(LABEL_GAP);
-                    if auth_in_progress {
-                        theme::disabled_text_field(ui, &form.server_url);
-                    } else {
-                        theme::text_field(ui, &mut form.server_url, false);
-                    }
-                    ui.add_space(GROUP_GAP);
-                }
-                label(ui, "Email");
-                ui.add_space(LABEL_GAP);
-                if auth_in_progress {
-                    theme::disabled_text_field(ui, &form.email);
-                } else {
-                    theme::text_field(ui, &mut form.email, false);
-                }
-                ui.add_space(GROUP_GAP);
-            }
-
-            // 3h's label row: field name left, account email right, so the
-            // user can see whose vault they're about to open.
-            ui.horizontal(|ui| {
-                label(ui, "Master password");
-                if let Some(email) = account_email {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(RichText::new(email).size(11.0).color(theme::TEXT_GHOST));
-                    });
-                }
-            });
-            ui.add_space(LABEL_GAP);
-            if auth_in_progress {
-                // **Takes no value**, so the bullets cannot track the buffer
-                // -- see `theme::MASKED_BULLETS`. The user's words were "keep
-                // showing masked password (even if there is nothing
-                // already)": a mask that shortened as the field emptied would
-                // announce the emptying, which is the one thing it is here to
-                // avoid.
-                theme::disabled_password_field(ui);
-            } else {
-                theme::password_field(ui, &mut form.password, &mut form.reveal_password);
-            }
-            ui.add_space(GROUP_GAP);
-
-            // While the credentials are with the server, Continue is
-            // disabled and a spinner sits beside it, sized to the button so
-            // the two read as one control. Disabling matters beyond looks:
-            // a second submit would spawn another `bw login` against the
-            // same account while the first is still running.
-            ui.horizontal(|ui| {
-                let continue_button = ui
-                    .add_enabled_ui(!auth_in_progress, |ui| {
-                        theme::primary_button(ui, "Continue", Some("↵"))
-                    })
-                    .inner;
-                if continue_button.clicked() {
-                    action = Some(LoginAction::Submit);
-                }
-                if auth_in_progress {
-                    ui.add_space(10.0);
-                    theme::progress_bar(ui, AUTH_BAR_WIDTH);
-                }
-            });
-        });
-
-    if let Some(err) = &form.error {
-        ui.add_space(6.0);
-        ui.label(RichText::new(err).size(12.0).color(theme::ERROR));
+    let needs_setup = !hello.enrolled;
+    let show_hello = hello.available && needs_setup;
+    // Deliberately NOT nested inside `show_hello`. If Hello has since been
+    // turned off on this machine there is no button to hang the notice from,
+    // and the notice is then the only thing that says why the app is asking
+    // for a master password at all. `needs_setup` because an account that has
+    // already enrolled on this layout has nothing left to be told -- which is
+    // also what stops the notice reappearing after the first sign-in within
+    // one launch.
+    if first_run && needs_setup {
+        draw_first_run_notice(ui, false);
+        ui.add_space(FORM_GAP);
     }
 
-    // 3h's alternative path: the "or" divider and the Windows Hello panel.
-    // Enrolled: click (or Ctrl+H) unlocks via Hello. Not yet enrolled: the
-    // same panel is the opt-in — its toggle arms enrollment, which then
-    // happens on the next successful password unlock, so the password
-    // being sealed is one that provably works.
-    // 3h's alternative path: the Hello panel is a *button* — click it (or
-    // Ctrl+H) to unlock with Windows Hello. Before enrollment it is the
-    // same button with a first-use twist: with the master password typed,
-    // clicking unlocks with it AND seals it for Hello, so every later visit
-    // is one click.
-    let needs_setup = !hello.enrolled;
-    let show_panel = hello.available && (needs_setup || status != BwStatus::Unauthenticated);
-    // Deliberately NOT nested inside `show_panel`. If Hello has since been
-    // turned off on this machine there is no panel to hang the line from,
-    // and the line is then the only thing that says why the app is asking
-    // for a master password at all. `needs_setup` because an account that
-    // has already enrolled on this layout has nothing left to be told --
-    // which is also what stops the notice reappearing after the first
-    // sign-in within one launch.
-    let show_first_run_notice = first_run && needs_setup;
-    if show_panel {
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            let half = (ui.available_width() - 30.0) / 2.0;
-            hairline_segment(ui, half);
-            ui.label(RichText::new("or").size(11.0).color(theme::TEXT_GHOST));
-            hairline_segment(ui, half);
-        });
-        ui.add_space(10.0);
-
-        if show_first_run_notice {
-            draw_first_run_notice(ui);
-        }
-
-        let subtitle = if needs_setup {
-            "First use: enter your master password, then click here"
-        } else {
-            "Face, fingerprint, or PIN"
-        };
-        // Gated like Continue and Enter: this is the third way to start a
-        // sign-in, and it must not fire a second one over an in-flight
-        // first.
-        let clicked = !auth_in_progress
-            && (hello_panel(ui, subtitle)
-                || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)));
-        if clicked {
-            if !needs_setup {
-                action = Some(LoginAction::HelloUnlock);
-            } else if form.password.is_empty() {
-                form.error = Some(
-                    "Type your master password first — Windows Hello is set up right \
-                     after it unlocks the vault."
-                        .to_string(),
+    // **While an attempt is in flight the whole credential zone is greyed and
+    // inert**, at the user's direction: the credentials are with the CLI, and
+    // a field that still takes typing during that is a field whose contents
+    // cannot affect the answer coming back. `input::text_disabled` and
+    // `input::secret_disabled` paint the box and a galley with no `TextEdit`
+    // in it at all -- see their docs for why a read-only `TextEdit` is not the
+    // same thing.
+    if form.server_choice == ServerChoice::SelfHosted {
+        group(ui, "Server URL", auth_in_progress, |ui| {
+            if auth_in_progress {
+                input::text_disabled(ui, &form.server_url, width, input::SIGN_IN);
+            } else {
+                input::text(
+                    ui,
+                    egui::Id::new("auth-server-url"),
+                    &mut form.server_url,
+                    "https://vault.example.com",
+                    false,
+                    width,
                 );
+            }
+        });
+    }
+    group(ui, "Email", auth_in_progress, |ui| {
+        if auth_in_progress {
+            input::text_disabled(ui, &form.email, width, input::SIGN_IN);
+        } else {
+            input::text(ui, egui::Id::new("auth-email"), &mut form.email, "you@company.com", false, width);
+        }
+    });
+    group(ui, "Master password", auth_in_progress, |ui| {
+        if auth_in_progress {
+            // **Takes no value**, so the bullets cannot track the buffer --
+            // see `theme::MASKED_BULLETS`. A mask that shortened as the field
+            // emptied would announce the emptying, which is the one thing it
+            // is here to avoid.
+            input::secret_disabled(ui, width, input::SIGN_IN);
+        } else {
+            input::secret(
+                ui,
+                egui::Id::new("auth-password"),
+                &mut form.password,
+                &mut form.reveal_password,
+                PASSWORD_PLACEHOLDER,
+                width,
+                input::SIGN_IN,
+            );
+        }
+    });
+
+    // The server: a segmented choice, and for Self-hosted the URL field above.
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 6.0;
+        auth::label(ui, SERVER_LABEL);
+        crate::kit::tips::help_dot(
+            ui,
+            egui::Id::new("auth-server-tip"),
+            SERVER_TIP,
+            260.0,
+            crate::kit::tips::Placement::Above,
+        );
+    });
+    ui.add_space(auth::LABEL_GAP);
+    ui.add_enabled_ui(!auth_in_progress, |ui| {
+        let options = ServerChoice::SEGMENTS;
+        if let Some(index) =
+            controls::segmented(ui, &options, form.server_choice.segment(), controls::SEG_TABS)
+        {
+            form.server_choice = ServerChoice::from_segment(index);
+        }
+    });
+    ui.add_space(FORM_GAP);
+
+    // While the credentials are with the server, Log in is disabled and a bar
+    // slides under it. Disabling matters beyond looks: a second submit would
+    // spawn another `bw login` against the same account while the first is
+    // still running.
+    let log_in = ui
+        .add_enabled_ui(!auth_in_progress, |ui| {
+            auth::wide_button(ui, ButtonKind::Primary, 56.0, 16, 17.0, LOG_IN_LABEL, None, width)
+        })
+        .inner;
+    if log_in.clicked() {
+        action = Some(LoginAction::Submit);
+    }
+    if auth_in_progress {
+        ui.add_space(12.0);
+        auth::progress(ui, width, false);
+    }
+
+    if let Some(err) = &form.error {
+        ui.add_space(FORM_GAP);
+        auth::error_line(ui, err);
+    }
+
+    // The Hello opt-in: with the master password typed, clicking unlocks with
+    // it AND seals it for Hello, so every later visit is one click. Gated like
+    // Log in and Enter: this is the third way to start a sign-in, and it must
+    // not fire a second one over an in-flight first.
+    if show_hello {
+        ui.add_space(FORM_GAP);
+        let pressed = ui
+            .add_enabled_ui(!auth_in_progress, |ui| {
+                auth::wide_button(
+                    ui,
+                    ButtonKind::Outline,
+                    52.0,
+                    14,
+                    16.0,
+                    HELLO_SETUP_LABEL,
+                    Some(crate::kit::icon::glyph::FINGERPRINT),
+                    width,
+                )
+            })
+            .inner
+            .clicked();
+        ui.add_space(8.0);
+        let p = crate::kit::tokens::palette(ui.ctx());
+        ui.label(theme::regular(HELLO_SETUP_HINT, 13.0).color(p.text_faint));
+        let clicked = !auth_in_progress
+            && (pressed || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)));
+        if clicked {
+            if form.password.is_empty() {
+                form.error = Some(HELLO_SETUP_NEEDS_PASSWORD.to_string());
             } else {
                 form.enable_hello = true;
                 action = Some(LoginAction::Submit);
             }
         }
-    } else if show_first_run_notice {
-        ui.add_space(10.0);
-        draw_first_run_notice(ui);
     }
 
-    // Enter submits from anywhere in the form, same as clicking Continue --
-    // 3h's Continue carries the ↵ affordance. Gated on `auth_in_progress`
-    // for the same reason the button itself is: Enter is the *easier* way
-    // to fire a second login while the first is still in flight.
+    // The API key is the way in for an account whose second factor this app
+    // cannot complete -- Duo and WebAuthn are not reachable from `bw login`
+    // either -- so it is kept, as a link under the form.
+    ui.add_space(FORM_GAP);
+    if auth::link(ui, crate::api_key_ui::USE_API_KEY_LABEL).clicked() {
+        action = Some(LoginAction::UseApiKey);
+    }
+
+    // Enter submits from anywhere in the form, same as clicking Log in. Gated
+    // on `auth_in_progress` for the same reason the button itself is: Enter is
+    // the *easier* way to fire a second login while the first is in flight.
     if !auth_in_progress && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
         action = Some(LoginAction::Submit);
     }
-
-    // **The escape hatch used to sit HERE, in the flowing content**, on the
-    // reasoning that `flow_bottom` would then measure it and the window would
-    // grow to fit. The owner moved it: "move to the same line as Logging in
-    // on". It is now the left half of the footer row below -- the slot "Log
-    // out" occupies once an account is attached, which is empty in exactly
-    // the state this link is shown in. One line instead of two, and the
-    // window is shorter by the space this took.
-
-    // Where the flowing content ends, in window coordinates. The caller
-    // resizes the window from this: the content stack varies per state
-    // (self-hosted URL field, Hello panel, wrapped error text), and a fixed
-    // height either wastes space or overflows.
-    *flow_bottom = ui.next_widget_position().y;
-
-    // Footer pinned to the window bottom (3h): account action left; on the
-    // right, the server — a live dropdown while signing in (the native
-    // client's "Logging in on"), static text once an account is attached.
-    ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-        // **`ui.horizontal`, and the vertical centring done by SIZING the
-        // link rather than by the layout.**
-        //
-        // This was `with_layout(left_to_right(Align::Center))` for one pass,
-        // to stop `ui.horizontal` inheriting the footer's `Align::Min` and
-        // hanging the link from the top of a row as tall as the server
-        // picker. It centred the text and cost the click: "Sign in with API
-        // does nothing on click". `ui.horizontal` is the shape every other
-        // control in this footer has always used and is the one known to
-        // take a click here, so the alignment is bought a different way --
-        // the link is given the picker's own height and centres itself
-        // inside it.
-        ui.horizontal(|ui| {
-            // **The API key link, on the "Logging in on:" line.** The two are
-            // never shown together -- this one only while signing in, "Log
-            // out" only once an account is attached -- so they share the
-            // footer's left slot rather than competing for it.
-            if status == BwStatus::Unauthenticated {
-                let text = RichText::new(crate::api_key_ui::USE_API_KEY_LABEL).size(12.0);
-                // Its own width, measured, so the picker beside it keeps the
-                // rest of the row: `available_width` here would take all of
-                // it and push the picker out of the footer.
-                let width = ui
-                    .painter()
-                    .layout_no_wrap(
-                        crate::api_key_ui::USE_API_KEY_LABEL.to_string(),
-                        egui::FontId::proportional(12.0),
-                        theme::TEXT_MUTED,
-                    )
-                    .size()
-                    .x;
-                if ui
-                    .add_sized([width, server_picker_height()], egui::Link::new(text))
-                    .clicked()
-                {
-                    action = Some(LoginAction::UseApiKey);
-                }
-            }
-            if status != BwStatus::Unauthenticated {
-                let log_out = ui.add(
-                    egui::Button::new(RichText::new("Log out").size(12.0).color(theme::TEXT_FAINT))
-                        .fill(egui::Color32::TRANSPARENT)
-                        .stroke(Stroke::NONE),
-                );
-                if log_out.clicked() {
-                    action = Some(LoginAction::LogOut);
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if status == BwStatus::Unauthenticated {
-                    server_choice_dropdown(ui, &mut form.server_choice);
-                    ui.label(
-                        RichText::new("Logging in on:")
-                            .size(12.0)
-                            .color(theme::TEXT_GHOST),
-                    );
-                } else {
-                    ui.label(
-                        RichText::new(server_host)
-                            .size(12.0)
-                            .color(theme::TEXT_GHOST),
-                    );
-                }
-            });
-        });
-    });
-
     action
 }
 
-// --- Brand lockup (design 3h) -----------------------------------------------
-//
-// `display: flex; align-items: center; gap: 13px` of a 38×44 mark box and a
-// two-line text column (`gap: 2px`): the 25px/800 wordmark over the 10px/700
-// tracked tag.
+/// The sign-in button's word.
+const LOG_IN_LABEL: &str = "Log in";
 
-/// The mark's box in the lockup. The design sizes it 38×44, *not* square —
-/// which is what the mark's own 24:28 artboard scales to at 44 tall. Passing
-/// `theme::mark` a single 44 (as this used to) allocates 44×44 and leaves
-/// ~6px of dead space around a mark drawn at the same visual size, pushing
-/// the wordmark right and widening the whole lockup.
-const LOCKUP_MARK_SIZE: Vec2 = Vec2::new(38.0, 44.0);
-/// Design: `gap: 13px` between the mark box and the text column.
-const LOCKUP_GAP_X: f32 = 13.0;
-/// Design: `gap: 2px` between the wordmark and the tag under it.
-const LOCKUP_GAP_Y: f32 = 2.0;
-/// The wordmark's line box. The design sets `font-size: 25px` with
-/// `line-height: 1`, so its box is exactly the font size — whereas the
-/// galley egui lays out is the font's natural ascent + descent, which
-/// measures 27px for Archivo ExtraBold at this size. Using the galley's own
-/// height dropped the tag 2px below where the design puts it and made the
-/// whole lockup read taller.
-const LOCKUP_WORDMARK_LINE_BOX: f32 = 25.0;
-
-/// Draws the brand lockup by painting into one explicitly-allocated band
-/// rather than nesting a `horizontal` around a `vertical` around two
-/// labels.
+/// The lock stage (spec C 5.3): the shield, the heading, then either the
+/// Windows Hello button or the master-password row, with Log out and the
+/// server under it.
 ///
-/// Layout containers were giving away control of exactly the things the
-/// design pins down here: an `egui` label's box is the font's full ascent +
-/// descent, whereas the design sets `line-height: 1` on the wordmark, so the
-/// text column came out taller than 25 + 2 + tag and centred differently
-/// against the mark. Painting positions both runs directly, so the gaps and
-/// the vertical centring are the design's numbers rather than a byproduct of
-/// font metrics.
-fn draw_brand_lockup(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(
-        Vec2::new(ui.available_width(), LOCKUP_MARK_SIZE.y),
-        Sense::hover(),
-    );
+/// The Hello stage is shown only when Hello is available and enrolled and the
+/// user has not chosen the password; with Hello off, unavailable or gone
+/// (a failed open deletes the blob) the password stage is the only one.
+fn draw_lock_stage(
+    ui: &mut egui::Ui,
+    account_email: Option<&str>,
+    server_host: &str,
+    hello: HelloState,
+    form: &mut LoginForm,
+    auth_in_progress: bool,
+    first_run: bool,
+) -> Option<LoginAction> {
+    use crate::kit::auth;
+    use crate::kit::input;
+    let mut action = None;
+    let enrolled = hello.available && hello.enrolled;
+    let needs_setup = !hello.enrolled;
+    let hello_stage = enrolled && form.lock_stage == LockStage::Hello;
+    let width = ui.available_width().min(auth::LOCK_ROW_WIDTH);
 
-    // Shift the whole lockup left by the shield's own artboard padding, so
-    // what lines up with the window's content edge is the shield's *visible*
-    // edge rather than its invisible 24×28 artboard. Every heading and card
-    // below starts at that edge, and against them a mathematically-flush
-    // artboard reads as an indented logo (the padding measures 3.3px here).
-    // Shifting the whole lockup keeps the design's mark-to-text gap intact.
-    let nominal = egui::Rect::from_min_size(rect.min, LOCKUP_MARK_SIZE);
-    let artboard_inset = theme::mark_ink_rect(nominal).left() - nominal.left();
-    let mark_rect = nominal.translate(Vec2::new(-artboard_inset, 0.0));
-    theme::paint_mark(ui.painter(), mark_rect);
+    ui.vertical_centered(|ui| {
+        ui.spacing_mut().item_spacing.y = auth::LOCK_GAP;
+        auth::lock_header(ui, auth::LOCK_HEADING, auth::LOCK_SUB);
+        if let Some(email) = account_email {
+            auth::lock_quiet(ui, email);
+        }
+        if first_run && needs_setup {
+            draw_first_run_notice(ui, true);
+        }
 
-    // The design tracks the wordmark tight (-0.03em at 25px = -0.75pt) and
-    // sets it in weight 800 (`theme::EXTRABOLD`); the tag is tracked wide
-    // (0.15em at 10px = 1.5pt) in weight 700 — Bold, not SemiBold, which is
-    // what this drew before.
-    let wordmark = ui.painter().layout_job(theme::letterspaced(
-        "Deskwarden",
-        25.0,
-        theme::EXTRABOLD,
-        -0.75,
-        theme::INK,
-    ));
-    let tag = ui.painter().layout_job(theme::letterspaced(
-        "FILLS NATIVE WINDOWS",
-        10.0,
-        theme::BOLD,
-        1.5,
-        theme::TEXT_FAINT,
-    ));
+        if hello_stage {
+            let label = if auth_in_progress { auth::HELLO_CHECKING } else { auth::HELLO_LABEL };
+            // Ignored while a check is under way: a second click would start a
+            // second `bw unlock` over the first.
+            let pressed = auth::hello_button(ui, label, auth_in_progress).clicked();
+            if !auth_in_progress
+                && (pressed || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)))
+            {
+                action = Some(LoginAction::HelloUnlock);
+            }
+            if !auth_in_progress && auth::lock_link(ui, auth::USE_PASSWORD_LABEL).clicked() {
+                form.lock_stage = LockStage::Password;
+            }
+        } else {
+            let unlock_width = auth::lock_button_width(ui.ctx(), UNLOCK_LABEL);
+            let field_width = (width - 10.0 - unlock_width).max(120.0);
+            let mut unlock = false;
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, input::LOCK.height),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 10.0;
+                    if auth_in_progress {
+                        input::secret_disabled(ui, field_width, input::LOCK);
+                    } else {
+                        input::secret(
+                            ui,
+                            egui::Id::new("auth-lock-password"),
+                            &mut form.password,
+                            &mut form.reveal_password,
+                            LOCK_PLACEHOLDER,
+                            field_width,
+                            input::LOCK,
+                        );
+                    }
+                    let button = ui
+                        .add_enabled_ui(!auth_in_progress, |ui| auth::lock_button(ui, UNLOCK_LABEL))
+                        .inner;
+                    unlock = button.clicked();
+                },
+            );
+            if auth_in_progress {
+                auth::progress(ui, 220.0, true);
+            }
+            if unlock || (!auth_in_progress && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                action = Some(LoginAction::Submit);
+            }
+            // The way to the other stage: Hello when it is enrolled, or the
+            // opt-in that seals the typed password for it when it is not --
+            // with the password typed, one click unlocks AND enrols.
+            if hello.available && !auth_in_progress {
+                if enrolled {
+                    if auth::lock_link(ui, auth::HELLO_LABEL).clicked() {
+                        form.lock_stage = LockStage::Hello;
+                    }
+                } else {
+                    let clicked = auth::lock_link(ui, HELLO_SETUP_LINK).clicked()
+                        || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H));
+                    if clicked {
+                        if form.password.is_empty() {
+                            form.error = Some(HELLO_SETUP_NEEDS_PASSWORD.to_string());
+                        } else {
+                            form.enable_hello = true;
+                            action = Some(LoginAction::Submit);
+                        }
+                    }
+                }
+            }
+        }
 
-    let column_x = mark_rect.right() + LOCKUP_GAP_X;
-    let column_height = LOCKUP_WORDMARK_LINE_BOX + LOCKUP_GAP_Y + tag.size().y;
-    let column_top = rect.center().y - column_height / 2.0;
+        if let Some(err) = &form.error {
+            auth::error_chip(ui, err, width);
+        }
 
-    // Positioned by ink, not by galley origin: the two runs are different
-    // sizes, so their glyphs' left side bearings differ (1.0px vs 0.0px
-    // here) and painting both at `column_x` leaves the tag visibly hanging
-    // a pixel further left than the wordmark above it.
-    let wordmark_height = wordmark.size().y;
-    let wordmark_x = column_x - theme::ink_offset_x(&wordmark);
-    let tag_x = column_x - theme::ink_offset_x(&tag);
-
-    ui.painter().galley(
-        Pos2::new(
-            wordmark_x,
-            // Centre the glyphs in the design's 25px line box; since the
-            // galley is taller than that box, this lifts it slightly, which
-            // is exactly what `line-height: 1` does in the design.
-            column_top + (LOCKUP_WORDMARK_LINE_BOX - wordmark_height) / 2.0,
-        ),
-        wordmark,
-        theme::INK,
-    );
-    ui.painter().galley(
-        Pos2::new(tag_x, column_top + LOCKUP_WORDMARK_LINE_BOX + LOCKUP_GAP_Y),
-        tag,
-        theme::TEXT_FAINT,
-    );
+        // The foot: which server this vault is on, and the way out.
+        auth::lock_quiet(ui, server_host);
+        if auth::lock_link(ui, LOG_OUT_LABEL).clicked() {
+            action = Some(LoginAction::LogOut);
+        }
+    });
+    action
 }
 
-/// A fixed-width horizontal hairline, for the "or" divider.
-fn hairline_segment(ui: &mut egui::Ui, width: f32) {
-    let (rect, _) =
-        ui.allocate_exact_size(egui::Vec2::new(width.max(0.0), 1.0), egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, CornerRadius::ZERO, theme::HAIRLINE);
-}
-
-/// The 3h Windows Hello panel: a blue-washed button row with a padlock
-/// tile, "Use Windows Hello", the given subtitle, and the CTRL+H chip.
-/// Returns true when clicked.
-fn hello_panel(ui: &mut egui::Ui, subtitle: &str) -> bool {
-    let panel = egui::Frame::new()
-        .fill(theme::BLUE_WASH)
-        .stroke(Stroke::new(1.0, theme::FOCUS_RING))
-        .corner_radius(CornerRadius::same(10))
-        .inner_margin(Margin::symmetric(14, 13))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                // The white padlock tile.
-                let (tile, _) =
-                    ui.allocate_exact_size(egui::Vec2::splat(30.0), egui::Sense::hover());
-                ui.painter()
-                    .rect_filled(tile, CornerRadius::same(8), theme::CARD);
-                ui.painter().rect_stroke(
-                    tile,
-                    CornerRadius::same(8),
-                    Stroke::new(1.0, theme::BLUE_EDGE),
-                    egui::StrokeKind::Middle,
-                );
-                paint_padlock(ui.painter(), tile.shrink(7.5), theme::BLUE);
-
-                ui.add_space(3.0);
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 1.0;
-                    ui.label(theme::semibold("Use Windows Hello", 13.0).color(theme::BLUE_DEEP));
-                    ui.label(RichText::new(subtitle).size(11.0).color(theme::TEXT_MUTED));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::kbd_chip_on_card(ui, "CTRL+H");
-                });
-            });
-        });
-    panel
-        .response
-        .interact(egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
-}
-
-/// A minimal padlock glyph: shackle (upper circle stroke, lower half masked)
-/// over a filled, rounded body. Drawn rather than typed because the bundled
-/// fonts have no padlock glyph at this size.
-fn paint_padlock(painter: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let stroke_width = 1.6;
-    let shackle_center = egui::Pos2::new(rect.center().x, rect.top() + rect.height() * 0.32);
-    let shackle_radius = rect.width() * 0.30;
-    painter.circle_stroke(
-        shackle_center,
-        shackle_radius,
-        Stroke::new(stroke_width, color),
-    );
-
-    let body = egui::Rect::from_min_max(
-        egui::Pos2::new(rect.left(), rect.top() + rect.height() * 0.42),
-        rect.max,
-    );
-    painter.rect_filled(body, CornerRadius::same(2), color);
-}
+/// The lock screen's Unlock button and the way out under it.
+const UNLOCK_LABEL: &str = "Unlock";
+const LOG_OUT_LABEL: &str = "Log out";
 
 /// Runs a `bw login`/`bw unlock` on a one-shot background thread and reports
 /// the result over `tx`.
@@ -3606,13 +3117,6 @@ pub fn build_login_frame(
     // changes only through the actions handled below.
     let mut hello_state = probe_hello(&hello_scope);
 
-    // Remeasured every frame and applied when it changes: the content
-    // stack differs per state (self-hosted URL field, Hello panel, wrapped
-    // error text), so any fixed height either clips or leaves a gap. It sizes
-    // the CARD now, not the window -- the window is the vault window's size
-    // and does not move.
-    let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
-
     // Outcome of an in-flight `bw login`/`bw unlock` (see `spawn_auth`),
     // polled non-blockingly each frame. `auth_in_progress` gates every
     // control that could start a second one and drives the spinner beside
@@ -3813,49 +3317,15 @@ pub fn build_login_frame(
             let _ = crate::foreground::raise_window(WINDOW_TITLE);
         }
 
-        // **The vault window's own titlebar, not this window's.** Same
-        // metrics (`ChromeMetrics::VAULT`) and the same wordmark, because the
-        // point is that the bar the user is looking at now is the bar that
-        // will still be there afterwards. `maximizable: false` for the reason
-        // the viewport is not resizable, above.
+        // **The v2 sign-in surfaces, painted across the whole window** (spec C
+        // 5.2 and 5.3): the split screen while signed out, the navy lock
+        // screen while locked. They draw their own caption buttons -- the
+        // design has no title bar here -- and the form or stage they are
+        // handed lands in the column they place. `maximizable` stays off for
+        // the reason the viewport is not resizable, above.
         let full = ui.max_rect();
-        match draw_window_chrome_with_extra(
-            ui,
-            VAULT_WINDOW_TITLE,
-            ChromeMetrics::VAULT,
-            false,
-            CloseControl::Active,
-            |_ui| {},
-        ) {
-            ChromeAction::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
-            ChromeAction::Minimize => ui
-                .ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
-            ChromeAction::None => {}
-        }
-
-        // The empty app behind the card, at the real pane widths, dimmed.
-        let skeleton = vault_skeleton(full);
-        paint_vault_skeleton(ui.painter(), &skeleton);
-
-        // The card: the unchanged 3h composition, floated in the middle of
-        // the body on its own surface so it reads as sitting ON the blocked
-        // app rather than as part of it.
-        let card = login_card_rect(&skeleton, card_height);
-        ui.painter().rect(
-            card,
-            CornerRadius::same(12),
-            theme::WINDOW_BG,
-            Stroke::new(1.0, theme::BORDER),
-            egui::StrokeKind::Inside,
-        );
-        let content = login_card_content_rect(card);
-
-        ui.scope_builder(
-            egui::UiBuilder::new()
-                .max_rect(content)
-                .layout(egui::Layout::top_down(egui::Align::Min)),
-            |ui| {
+        let signed_out = status == BwStatus::Unauthenticated;
+        let mut body = |ui: &mut egui::Ui| {
                 ui.set_min_width(ui.available_width());
 
                 // Non-blocking: the worker reports here and the window keeps
@@ -3987,22 +3457,6 @@ pub fn build_login_frame(
                 // the modal has just closed, so the frame cannot have
                 // produced anything but `None`.
                 let action = action_after_setup.take().or(action);
-
-                // Content height + the footer row and the bottom margin the
-                // footer is pinned above. This used to resize the WINDOW from
-                // exactly this measurement; it now sizes the card and leaves
-                // the window at the vault window's geometry. Rounded up to
-                // whole pixels (inside `login_card_height`) so a sub-pixel
-                // wobble can't ping-pong the card's size frame after frame.
-                let wanted = login_card_height(flow_bottom, content.min.y);
-                if (wanted - card_height).abs() > 0.5 {
-                    card_height = wanted;
-                    // The card is painted before its content is measured, so
-                    // the new height first appears on the next frame -- which
-                    // will not happen on its own in a window nobody is
-                    // touching.
-                    ui.ctx().request_repaint();
-                }
 
                 match action {
                     Some(LoginAction::Submit) => {
@@ -4535,8 +3989,13 @@ pub fn build_login_frame(
                     action_after_setup = Some(LoginAction::Submit);
                     ui.ctx().request_repaint();
                 }
-            },
-        );
+        };
+        let caption = if signed_out {
+            crate::kit::auth::split(ui, full, CloseControl::Active, &mut body)
+        } else {
+            crate::kit::auth::lock_surface(ui, full, CloseControl::Active, &mut body)
+        };
+        crate::kit::auth::apply_caption(ui.ctx(), caption);
     };
 
     (options, Box::new(login_frame_fn), LoginFrameHandles { token, api_key_asked, identity })
@@ -4686,7 +4145,8 @@ pub fn run_login_flow(account: Option<(&Path, &Account)>, first_run: bool) -> St
 
 #[cfg(test)]
 mod round_window_corners_stays_inside_this_process {
-    use super::{round_window_corners, VAULT_WINDOW_TITLE, WINDOW_TITLE};
+    use super::{round_window_corners, WINDOW_TITLE};
+    use crate::vault_window::WINDOW_TITLE as VAULT_WINDOW_TITLE;
 
     /// **This process's window lookup answers `None` in a test process, for
     /// every title this crate rounds the corners of.**
@@ -5291,18 +4751,6 @@ mod draw_resize_handles_tests {
 
 #[cfg(test)]
 mod tests {
-    /// **THE REPORT: "scroll not needed here", against a three-item dropdown
-    /// wearing a scrollbar.**
-    ///
-    /// `egui::ComboBox` wraps its items in a `ScrollArea` and offers no way to
-    /// decline one. That scroll area gets whatever vertical room the popup ends
-    /// up with, and this picker sits at the bottom of the card's footer, so the
-    /// popup opens into a squeeze and grows a bar over three fixed rows.
-    ///
-    /// A SOURCE GUARD, because the popup only exists on a frame where it has been
-    /// clicked open and a test that never opens it would pass against a
-    /// `ComboBox` put straight back. It reads the picker's own body and holds
-    /// that neither a scroll area nor a combo box is in it.
     /// **A sign-in with NO account record still re-settles the backend.**
     ///
     /// The report: a clean install, the choice modal, "use the built-in
@@ -5350,37 +4798,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_server_picker_has_no_scroll_area() {
-        let source = include_str!("login_ui.rs");
-        let body = source
-            .split_once("fn server_choice_dropdown(")
-            .expect("the server picker was renamed")
-            .1;
-        // The NEAREST following item, not the first pattern that happens to
-        // match: "\nfn " occurs far below this function, and taking it would
-        // hand the assertions half the file -- which holds scroll areas that
-        // are nobody's defect.
-        let end = ["\nfn ", "\npub fn ", "\n#[must_use]"]
-            .iter()
-            .filter_map(|needle| body.find(needle))
-            .min()
-            .expect("the picker is the last item in the file, so its end cannot be found");
-        let body = &body[..end];
-        for banned in [concat!("Scroll", "Area"), concat!("Combo", "Box")] {
-            assert!(
-                !body.contains(banned),
-                "the server picker uses `{banned}` again, which is what put a scrollbar on \
-                 a three-item list: a scroll area handed a squeezed popup grows a bar \
-                 whatever it holds"
-            );
-        }
-        assert!(
-            body.contains(concat!("Popup::", "menu(")),
-            "control: the picker no longer opens a popup at all, so the assertions above \
-             are about a widget that does not exist"
-        );
-    }
     use super::*;
 
     /// **`bw logout` has to run in the doomed account's OWN directory.**
@@ -6297,7 +5714,7 @@ mod first_run_notice_tests {
     /// every "the notice is absent" assertion below. Without it, a window that
     /// painted nothing at all would pass them.
     fn shows_the_hello_panel(texts: &[String]) -> bool {
-        texts.iter().any(|t| t.contains("First use"))
+        texts.iter().any(|t| t.contains("set up Windows Hello"))
     }
 
     /// Every string the login window paints with the CLI-setup modal open.
@@ -6345,7 +5762,7 @@ mod first_run_notice_tests {
             "the modal painted nothing about the CLI; got {with:?}"
         );
         assert!(
-            with.iter().any(|t| t.contains("Sign in to your vault")),
+            with.iter().any(|t| t == SIGN_IN_TITLE),
             "control: this is not the login window at all; got {with:?}"
         );
 
@@ -6542,376 +5959,6 @@ mod first_run_notice_tests {
 }
 
 #[cfg(test)]
-mod empty_app_behind_the_card_tests {
-    //! **The login window is now the app it is about to become, with nothing
-    //! in it.**
-    //!
-    //! The user's words: "pre-load the big screen with the position and size
-    //! etc as it will be after log-in but empty kinda of and then login on top
-    //! blocking it". What can go wrong is geometry -- panes at the wrong
-    //! widths, a card centred against the wrong rect, a card that does not fit
-    //! the smallest window the vault is allowed to be -- so most of this is
-    //! measured. The two halves no harness can reach (the viewport builder and
-    //! the frame closure both need a live eframe event loop) are source
-    //! guards, in the house shape.
-
-    use super::*;
-    use egui::Rect;
-
-    /// A window the size design 2b draws.
-    fn full(width: f32, height: f32) -> Rect {
-        Rect::from_min_size(Pos2::new(40.0, 30.0), Vec2::new(width, height))
-    }
-
-    /// **The bar is the vault window's own, not a number written out again.**
-    /// It is the one piece of the next window this one still shows, so a
-    /// different height here is a visible jump at the instant of sign-in --
-    /// which is the whole reason this window borrows the vault window's
-    /// placement in the first place.
-    ///
-    /// The panes this used to check are gone: the body is one flat region
-    /// now, because a drawn sidebar and item list promise controls that are
-    /// not there.
-    #[test]
-    fn the_placeholder_bar_is_the_vault_windows_own_height() {
-        let skeleton = vault_skeleton(full(1240.0, 740.0));
-        assert_eq!(
-            skeleton.bar.height(),
-            ChromeMetrics::VAULT.bar_height,
-            "the placeholder titlebar is {}px against the vault window's {}px",
-            skeleton.bar.height(),
-            ChromeMetrics::VAULT.bar_height
-        );
-    }
-
-    /// The bar and the body tile the window with no seam and no overlap. A
-    /// gap here paints the window background through the middle of the app,
-    /// which is the one way a single flat region can still look wrong.
-    #[test]
-    fn the_bar_and_the_body_tile_the_window() {
-        let window = full(1240.0, 740.0);
-        let skeleton = vault_skeleton(window);
-
-        assert_eq!(skeleton.bar.min, window.min, "the titlebar is not at the window's top");
-        assert_eq!(
-            skeleton.body.min.y, skeleton.bar.max.y,
-            "the body does not begin where the titlebar ends"
-        );
-        assert_eq!(skeleton.body.min.x, window.min.x, "the body does not reach the left edge");
-        assert_eq!(skeleton.body.max, window.max, "the body does not reach the window's edges");
-        assert!(
-            skeleton.body.height() > 0.0,
-            "the body has no height, so every assertion about what is painted in it is vacuous"
-        );
-    }
-
-    /// **The card is centred in the BODY**, not in the whole window. Centred
-    /// against the window it sits half a titlebar high in the region it is
-    /// blocking, which is visible and is the kind of thing that gets
-    /// "simplified" back.
-    #[test]
-    fn the_card_is_centred_in_the_body_and_keeps_its_own_width() {
-        let window = full(1240.0, 740.0);
-        let skeleton = vault_skeleton(window);
-        let card = login_card_rect(&skeleton, LOGIN_CARD_INITIAL_HEIGHT);
-
-        assert_eq!(card.center(), skeleton.body.center());
-        // The positive control: the body's centre and the window's really are
-        // different points here, so the assertion above is a choice between
-        // two answers rather than one restated.
-        assert_ne!(
-            skeleton.body.center(),
-            window.center(),
-            "the body and the window share a centre, so centring on either is the same test"
-        );
-        assert_eq!(
-            card.width(),
-            LOGIN_CARD_WIDTH,
-            "the card is no longer the width the 3h composition is drawn at"
-        );
-    }
-
-    /// **The card fits the smallest window the vault is allowed to open at.**
-    /// The login window borrows the vault window's geometry, and
-    /// `settings::MIN_VAULT_WINDOW_SIZE` is the floor that geometry is clamped
-    /// to -- so this is a real reachable state, not a hypothetical one.
-    #[test]
-    fn the_card_fits_inside_the_smallest_vault_window() {
-        let (min_w, min_h) = crate::settings::MIN_VAULT_WINDOW_SIZE;
-        let skeleton = vault_skeleton(full(min_w as f32, min_h as f32));
-        let card = login_card_rect(&skeleton, LOGIN_CARD_INITIAL_HEIGHT);
-        assert!(
-            skeleton.body.contains_rect(card),
-            "at the smallest window the vault may open at ({min_w}x{min_h}) the {}x{} card \
-             overhangs the {}x{} body it is supposed to float in",
-            card.width(),
-            card.height(),
-            skeleton.body.width(),
-            skeleton.body.height()
-        );
-    }
-
-    /// **The measured height round-trips.** `login_card_height` answers with a
-    /// card size; `login_card_content_rect` carves the content area back out
-    /// of it. The content area has to come out tall enough for the run that
-    /// was measured PLUS the footer row pinned under it -- otherwise the card
-    /// clips its own footer, which is the failure the old
-    /// `ViewportCommand::InnerSize` version could not have (it sized the
-    /// window, and the window had no margins of its own).
-    #[test]
-    fn a_card_sized_from_a_measured_run_has_room_for_that_run_and_its_footer() {
-        for flow in [180.0f32, 462.0, 700.0] {
-            let content_top = 137.0f32;
-            let height = login_card_height(content_top + flow, content_top);
-            let card =
-                Rect::from_min_size(Pos2::new(0.0, 0.0), Vec2::new(LOGIN_CARD_WIDTH, height));
-            let content = login_card_content_rect(card);
-            let needed = flow + FOOTER_RESERVE - CARD_MARGIN_BOTTOM;
-            assert!(
-                content.height() >= needed - 0.01,
-                "a run of {flow}px produced a {height}px card whose content area is only {}px, \
-                 which is less than the {needed}px that run plus its pinned footer needs",
-                content.height()
-            );
-            // The other side of it: not wildly oversized either, or the card
-            // grows a band of dead space under the footer on every state.
-            assert!(
-                content.height() <= needed + 1.0,
-                "a run of {flow}px produced a content area of {}px against the {needed}px it \
-                 needs -- the card is padded with dead space",
-                content.height()
-            );
-        }
-    }
-
-    /// The default the first frame paints at, before anything has been
-    /// measured, is the height the window's own composition used to be: this
-    /// window WAS 470x588 with a 40px `ChromeMetrics::LOGIN` bar over the same
-    /// body. Anything else and the first frame the user ever sees is a card of
-    /// the wrong size that then resettles.
-    #[test]
-    fn the_cards_starting_height_is_the_composition_it_replaced() {
-        assert_eq!(
-            LOGIN_CARD_INITIAL_HEIGHT,
-            588.0 - ChromeMetrics::LOGIN.bar_height,
-            "the card's starting height is no longer the body of the 470x588 window this \
-             composition used to be, so the first frame resettles in front of the user"
-        );
-    }
-
-    /// What `paint_vault_skeleton` actually puts on screen: the vault window's
-    /// own fills, and a scrim over the whole body.
-    ///
-    /// The fills are read back off the painter rather than argued about --
-    /// "the sidebar is CARD and the panes are CANVAS" is the entire difference
-    /// between this reading as the app with nothing in it and reading as a
-    /// blank rectangle.
-    #[test]
-    fn the_empty_app_is_painted_in_the_vault_windows_own_fills_under_a_scrim() {
-        let ctx = egui::Context::default();
-        let window = full(1240.0, 740.0);
-        let skeleton = vault_skeleton(window);
-        let output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1400.0, 900.0))),
-                ..Default::default()
-            },
-            |ui| paint_vault_skeleton(ui.painter(), &skeleton),
-        );
-
-        let mut rects: Vec<(Rect, Color32)> = Vec::new();
-        fn walk(shape: &egui::Shape, out: &mut Vec<(Rect, Color32)>) {
-            match shape {
-                egui::Shape::Rect(r) => out.push((r.rect, r.fill)),
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut rects);
-        }
-
-        let painted = |rect: Rect, fill: Color32| {
-            rects
-                .iter()
-                .any(|(r, f)| *f == fill && (r.width() - rect.width()).abs() < 0.01
-                    && (r.height() - rect.height()).abs() < 0.01
-                    && (r.min.x - rect.min.x).abs() < 0.01
-                    && (r.min.y - rect.min.y).abs() < 0.01)
-        };
-
-        assert!(
-            painted(skeleton.body, theme::CANVAS),
-            "the body behind the card is not one flat CANVAS region; painted: {rects:?}"
-        );
-        // The divisions are gone and must stay gone: a CARD-filled rect in
-        // the body is the old sidebar coming back, and it promises a control
-        // that is not there.
-        assert!(
-            !rects.iter().any(|(r, f)| *f == theme::CARD && skeleton.body.contains(r.center())),
-            "something is painted as a pane inside the body again; painted: {rects:?}"
-        );
-        assert!(
-            painted(skeleton.body, SCRIM),
-            "nothing dims the empty app, so the card does not read as blocking it"
-        );
-        // ...and the scrim stops at the titlebar, which carries the live
-        // window controls the user still has to be able to find. `>=` rather
-        // than `intersects`, which counts two rects sharing one edge -- and
-        // the bar's bottom edge IS the body's top one.
-        for (rect, fill) in &rects {
-            if *fill == SCRIM {
-                assert!(
-                    rect.min.y >= skeleton.bar.max.y - 0.01,
-                    "a scrim rect reaches up to {} , above the titlebar's bottom at {} -- it \
-                     is dimming the ✕ and — the user is still expected to be able to hit",
-                    rect.min.y,
-                    skeleton.bar.max.y
-                );
-            }
-        }
-    }
-
-    /// The halves no harness can reach: the viewport is built before any frame
-    /// exists, and the frame closure runs only inside a live eframe event
-    /// loop. Both are pinned at the source, with `concat!`-split single-line
-    /// needles -- a needle written as one literal matches its own declaration,
-    /// and one carrying a newline passes on LF and fails on CRLF.
-    #[test]
-    fn the_window_opens_at_the_vault_windows_placement_and_paints_its_empty_panes() {
-        let source = include_str!("login_ui.rs");
-        let body = source
-            .split_once(concat!("pub fn build_login", "_frame("))
-            .expect("`build_login_frame` is gone")
-            .1
-            .split_once(concat!("pub fn run_login", "_flow("))
-            .expect("`run_login_flow` no longer follows it, so this slice is unbounded")
-            .0;
-
-        for (needle, what) in [
-            (
-                concat!("vault_window::initial_", "placement("),
-                "the login window no longer derives its placement from the vault window's own, \
-                 so the two can disagree and the window jumps at sign-in after all",
-            ),
-            (
-                concat!("Settings::load(path)", ".vault_window"),
-                "the login window reads no saved vault geometry, so it opens wherever the OS \
-                 puts it",
-            ),
-            (
-                concat!("with_inner_size([placement", ".width as f32"),
-                "the window is not sized from the placement it just computed",
-            ),
-            (
-                concat!("viewport.with_", "position([x as f32"),
-                "the window is not positioned from the placement it just computed, so it opens \
-                 at the right size in the wrong place",
-            ),
-            (
-                concat!("paint_vault_", "skeleton(ui.painter()"),
-                "nothing paints the empty app behind the card",
-            ),
-            (
-                concat!("login_card_", "rect(&skeleton, card_height)"),
-                "the card is not placed against the empty app's own body",
-            ),
-            // The trailing comma is what makes this the CALL rather than the
-            // prose above it: the comment explaining why the window stays
-            // fixed-size names the same constant, and a bare needle counts
-            // two.
-            (
-                concat!("ChromeMetrics::VAULT", ","),
-                "the placeholder titlebar is not drawn at the vault window's metrics",
-            ),
-        ] {
-            assert_eq!(
-                body.matches(needle).count(),
-                1,
-                "expected exactly one {needle:?} in `build_login_frame`: {what}"
-            );
-        }
-
-        // ...and the two things it must NOT do any more. The old window resized
-        // ITSELF from the measured content; doing that now would drag the
-        // borrowed vault geometry around under the user.
-        let resizes = concat!("ViewportCommand::", "InnerSize");
-        assert!(
-            !body.contains(resizes),
-            "the login window still resizes itself from its measured content, so it no longer \
-             stays at the geometry the vault window will restore to"
-        );
-        // Positive control for that absence: the needle is one this crate
-        // really does spell this way, so its absence here means something.
-        assert!(
-            source.contains(concat!("ViewportCommand::", "Close")),
-            "no ViewportCommand at all is spelled this way any more -- the needle has drifted \
-             and the assertion above proves nothing"
-        );
-
-        // **And the hazard the paragraph above actually names: writing the
-        // borrowed geometry back.** Forbidding `InnerSize` forbids this window
-        // RESIZING itself; it says nothing about this window SAVING. The
-        // geometry on disk belongs to the vault window, and a login window
-        // that persisted anything -- its own position after the user dragged
-        // it, or the placement it merely borrowed -- would silently re-home the
-        // vault window from a sign-in the user then abandoned. Nothing writes
-        // it today; this is what keeps it that way.
-        // **`settings.rs`'s PRODUCTION half only.** Read whole -- which it was
-        // -- these controls could be satisfied by an occurrence in that file's
-        // own test module: production could rename or drop its writer and the
-        // needle would go on matching a fixture, leaving the absence
-        // assertions above facts about a string that names nothing shipping.
-        // The cut is the same one `settings.rs`'s own guards take, and what
-        // keeps it where it is lives over there, in
-        // `nothing_but_gated_test_modules_lives_below_the_guards_cut`.
-        let settings_source = include_str!("settings.rs");
-        let settings = settings_source
-            .split_once(concat!("#[cfg(", "test)]"))
-            .map_or(settings_source, |(production, _)| production);
-        assert!(
-            settings.len() < settings_source.len(),
-            "control: the test gate was not found in settings.rs, so these controls are \
-             reading that whole file, fixtures included"
-        );
-        for (needle, control, what) in [
-            (
-                concat!("persist_vault_window_", "geometry("),
-                concat!("pub fn persist_vault_window_", "geometry("),
-                "the login window writes the vault window's saved geometry, so an abandoned \
-                 sign-in re-homes the vault window it only borrowed the placement of",
-            ),
-            // Belt and braces. `Settings::save` is private to the settings
-            // module today, so this route does not compile from here at all --
-            // which was verified by trying it. The needle is here for the day
-            // somebody makes it `pub`, because the whole-struct save carries
-            // `vault_window` and is the same hazard by a longer road.
-            (
-                concat!(".save", "("),
-                concat!("on_disk.save", "(path)"),
-                "the login window saves a whole `Settings` -- which carries `vault_window` -- so \
-                 an abandoned sign-in can rewrite the vault window's geometry the long way round",
-            ),
-        ] {
-            assert!(!body.contains(needle), "{what}");
-            // Paired positive control, cross-file: the needle is one the
-            // settings module really does spell this way, so counting zero in
-            // `build_login_frame` is a fact about this function rather than
-            // about a string nothing anywhere matches.
-            assert!(
-                settings.contains(control),
-                "the settings writer is no longer spelled {control:?} -- the assertion above \
-                 proves nothing"
-            );
-        }
-    }
-}
-
-#[cfg(test)]
 mod auth_in_flight_tests {
     //! **The credential zone while a sign-in is with the CLI.**
     //!
@@ -6977,16 +6024,21 @@ mod auth_in_flight_tests {
         )
     }
 
-    /// Every 38px input box the frame painted, in top-to-bottom order, with
+    /// Every 50px input box the frame painted, in top-to-bottom order, with
     /// the fill and border colour each was painted in.
     ///
-    /// Found by [`theme::FIELD_HEIGHT`] -- the one measurement a live field
+    /// Found by `kit::input::SIGN_IN.height` -- the one measurement a live field
     /// and a greyed one still share -- so the greyed treatment cannot make
     /// these invisible to a test by changing what it is looking for.
     fn field_boxes(output: &egui::FullOutput) -> Vec<(Rect, Color32, Color32)> {
         fn walk(shape: &egui::Shape, out: &mut Vec<(Rect, Color32, Color32)>) {
             match shape {
-                egui::Shape::Rect(r) if (r.rect.height() - theme::FIELD_HEIGHT).abs() < 0.01 => {
+                egui::Shape::Rect(r)
+                    // A `TextEdit` with no frame still paints a transparent rect of
+                    // its own at this height; the box is the one with a fill.
+                    if (r.rect.height() - crate::kit::input::SIGN_IN.height).abs() < 0.01
+                        && r.fill != Color32::TRANSPARENT =>
+                {
                     out.push((r.rect, r.fill, r.stroke.color));
                 }
                 egui::Shape::Vec(shapes) => {
@@ -7212,7 +6264,7 @@ mod auth_in_flight_tests {
         for (fill, stroke) in &live {
             assert_eq!(
                 (*fill, *stroke),
-                (theme::CARD, theme::BORDER_STRONG),
+                (crate::kit::tokens::Palette::LIGHT.card, crate::kit::tokens::Palette::LIGHT.border),
                 "a resting field is not painted in the live treatment, so the comparison \
                  below says nothing"
             );
@@ -7220,7 +6272,7 @@ mod auth_in_flight_tests {
         for (fill, stroke) in &in_flight {
             assert_eq!(
                 (*fill, *stroke),
-                (theme::CANVAS, theme::BORDER),
+                (crate::kit::tokens::Palette::LIGHT.field_bg, crate::kit::tokens::Palette::LIGHT.border),
                 "a field in flight is still painted in the live treatment -- it reads as a \
                  field that can be typed into"
             );
@@ -7266,8 +6318,8 @@ mod auth_in_flight_tests {
         };
 
         for (auth_in_progress, expected, described) in [
-            (false, theme::TEXT_MUTED, "resting"),
-            (true, theme::TEXT_GHOST, "in flight"),
+            (false, crate::kit::tokens::Palette::LIGHT.text_nav, "resting"),
+            (true, crate::kit::tokens::Palette::LIGHT.text_ghost, "in flight"),
         ] {
             let found = label_colors(auth_in_progress);
             for wanted in ["Email", "Master password"] {
@@ -11686,6 +10738,7 @@ pub(crate) mod password_lifetime_tests {
             reveal_password: false,
             enable_hello: false,
             error: Some(probe_password()),
+            lock_stage: LockStage::default(),
         }
     }
 
@@ -12260,6 +11313,8 @@ pub(crate) mod password_lifetime_tests {
             reveal_password: _,
             enable_hello: _,
             error: _,
+            // Not a String: the lock screen's stage holds no secret.
+            lock_stage: _,
         } = &form;
         let stolen = [
             std::mem::take(&mut form.password),
@@ -13611,7 +12666,7 @@ mod identity_without_a_spawn_tests {
         // `unlocking_is_not_signing_in_tests` holds the choice modal off
         // every Submit that is an unlock rather than a login.
         assert_eq!(
-            modules, 19,
+            modules, 18,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -14263,7 +13318,7 @@ mod two_step_message_tests {
 
 #[cfg(test)]
 mod cli_setup_modal_layout_tests {
-    //! **The CLI-setup modal has to fit in the card it is measured into.**
+    //! **The CLI-setup modal has to be on screen.**
     //!
     //! 0.15.2 shipped this modal rendering as an empty white panel with a
     //! Cancel and an OK on it and no text whatever. Every test the modal had
@@ -14272,29 +13327,24 @@ mod cli_setup_modal_layout_tests {
     //! blank. That is this project's own defect class: a test that passes
     //! because it never reached the thing it names.
     //!
-    //! What was actually wrong was a layout loop. `draw_cli_setup_modal`
-    //! ended in a bare `with_layout(right_to_left)`, which inherits its
-    //! parent's whole remaining rect rather than the one row a button row
-    //! needs. `draw_login_window` then reported the bottom of that expanded
-    //! content as `flow_bottom`, and `run_login_flow` computed the CARD's
-    //! height from it -- so the row claimed the card's space, the card grew
-    //! to hold the row, and the row claimed the new space too. Measured, it
-    //! gained exactly `FOOTER_RESERVE - CARD_MARGIN_BOTTOM` (32px) every
-    //! frame, without limit. `login_card_rect` centres the card, so the
-    //! heading and the body were pushed off the top of the window while the
-    //! card's own fill covered it: the text was always drawn, and drawn out
-    //! of sight.
-    //!
-    //! So these tests drive the real frame loop -- the same feedback the
-    //! window runs -- rather than asking the state for its strings.
+    //! The cause then was a layout loop: the button row inherited its
+    //! parent's whole remaining rect, the parent was sized from the row, and
+    //! the card grew a frame at a time until the text was above the window.
+    //! The card is gone (the v2 form column takes the modal), but the same
+    //! feedback is still possible in the column's measured height, so these
+    //! tests drive the real surface -- `kit::auth::split` with
+    //! `draw_login_window` in it -- over many frames and read where each
+    //! string was painted, rather than asking the state for its strings.
 
     use super::*;
+    use crate::kit::auth;
 
     const WINDOW: Vec2 = egui::vec2(1100.0, 760.0);
 
-    fn raw_input() -> egui::RawInput {
+    fn raw_input(time: f64) -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, WINDOW)),
+            time: Some(time),
             ..Default::default()
         }
     }
@@ -14305,20 +13355,18 @@ mod cli_setup_modal_layout_tests {
     /// is measured against the wrong metrics.
     fn styled_context() -> egui::Context {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        let _ = ctx.run_ui(raw_input(0.0), |_ui| {});
         theme::apply(&ctx);
-        let _ = ctx.run_ui(raw_input(), |_ui| {});
+        let _ = ctx.run_ui(raw_input(0.0), |_ui| {});
         ctx
     }
 
     /// Each painted string **with the rect it was painted into**.
     ///
-    /// The position is the whole point here, and collecting the strings alone
-    /// is the mistake this module exists to stop repeating. egui emits a
-    /// `Shape::Text` whether or not the galley lands anywhere a person could
-    /// see it, so a walk that kept only `galley.text()` finds every line of
-    /// the modal present and correct in the exact frame whose panel is blank
-    /// on screen.
+    /// The position is the whole point here: egui emits a `Shape::Text`
+    /// whether or not the galley lands anywhere a person could see it, so a
+    /// walk that kept only `galley.text()` finds every line of the modal
+    /// present and correct in the exact frame whose panel is blank on screen.
     fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
         match shape {
             egui::Shape::Text(text) => out.push((
@@ -14330,135 +13378,109 @@ mod cli_setup_modal_layout_tests {
                     walk(shape, out);
                 }
             }
-            // Everything else is geometry this module does not assert on.
             _ => {}
         }
     }
 
-    /// One frame of the modal, drawn into the card geometry a given card
-    /// height produces, answering the height the window would ask for next
-    /// and every string it painted.
-    ///
-    /// **This is `run_login_flow`'s loop and not a model of it**: the same
-    /// `vault_skeleton` -> `login_card_rect` -> `login_card_content_rect` ->
-    /// `draw_login_window` -> `login_card_height` chain, reached through the
-    /// same helpers, so a change to any link is a change this test sees.
+    /// One frame of the modal on the real sign-in surface at `time`, answering
+    /// the form column's height and every string painted.
     fn one_frame(
         ctx: &egui::Context,
         state: &crate::bw_acquire::CliSetupState,
-        card_height: f32,
+        time: f64,
     ) -> (f32, Vec<(String, egui::Rect)>) {
         let mut form = LoginForm::default();
         let mut flow_bottom = 0.0f32;
-        let mut content_top = 0.0f32;
-        let output = ctx.run_ui(raw_input(), |ui| {
-            let skeleton = vault_skeleton(ui.max_rect());
-            let card = login_card_rect(&skeleton, card_height);
-            let content = login_card_content_rect(card);
-            content_top = content.min.y;
-            ui.scope_builder(
-                egui::UiBuilder::new()
-                    .max_rect(content)
-                    .layout(egui::Layout::top_down(egui::Align::Min)),
-                |ui| {
-                    ui.set_min_width(ui.available_width());
-                    let _ = draw_login_window(
-                        ui,
-                        BwStatus::Unauthenticated,
-                        None,
-                        "vault.example.eu",
-                        HelloState { available: false, enrolled: false },
-                        &mut form,
-                        &mut flow_bottom,
-                        false,
-                        false,
-                        Some(state),
-                    );
-                },
-            );
+        let mut flow_top = 0.0f32;
+        let output = ctx.run_ui(raw_input(time), |ui| {
+            let full = ui.max_rect();
+            let _ = auth::split(ui, full, CloseControl::Active, |ui| {
+                flow_top = ui.next_widget_position().y;
+                let _ = draw_login_window(
+                    ui,
+                    BwStatus::Unauthenticated,
+                    None,
+                    "vault.example.eu",
+                    HelloState { available: false, enrolled: false },
+                    &mut form,
+                    &mut flow_bottom,
+                    false,
+                    false,
+                    Some(state),
+                );
+            });
         });
         let mut painted = Vec::new();
         for shape in output.shapes.iter().map(|clipped| &clipped.shape) {
             walk(shape, &mut painted);
         }
-        (login_card_height(flow_bottom, content_top), painted)
+        (flow_bottom - flow_top, painted)
     }
 
-    /// **Every shape the CHOICE modal has**, which is now one.
-    ///
-    /// It was four -- two clients in use, times told-and-not-told which was
-    /// in use -- because those two flags varied a sentence of the body and
-    /// the widths of the buttons, and so varied whether the card fitted. The
-    /// state carries neither any more, so four cases would be four runs of
-    /// the same layout. Kept as a function, and the loop below kept, so that
-    /// a state that regains a field is covered by widening this alone.
-    fn every_choosing_state() -> Vec<crate::bw_acquire::CliSetupState> {
-        vec![crate::bw_acquire::CliSetupState::Choosing]
-    }
-
-    /// The choice modal settles and paints, held to the same two assertions
-    /// as its sibling and by the same means -- `one_frame`, which is
-    /// `run_login_flow`'s real loop.
-    ///
-    /// **It is the state most likely to overflow**, which is why it gets its
-    /// own test rather than a mention: three paragraphs of prose and two
-    /// buttons whose labels are sentences rather than "OK" and "Cancel", one
-    /// of them a 32px `theme::primary_button` in a row that used to be
-    /// allocated 18px. If any card in this app is going to be too tall for
-    /// the window, it is this one.
-    #[test]
-    fn the_choice_modal_settles_and_paints_inside_the_window() {
+    /// Runs `frames` frames 0.1 s apart and answers the heights seen and the
+    /// last frame's strings.
+    fn settle(
+        state: &crate::bw_acquire::CliSetupState,
+        frames: usize,
+    ) -> (Vec<f32>, Vec<(String, egui::Rect)>) {
         let ctx = styled_context();
+        let mut heights = Vec::new();
+        let mut painted = Vec::new();
+        for i in 0..frames {
+            let (height, shapes) = one_frame(&ctx, state, 1.0 + i as f64 * 0.1);
+            heights.push(height);
+            painted = shapes;
+        }
+        (heights, painted)
+    }
+
+    fn find(painted: &[(String, egui::Rect)], needle: &str) -> egui::Rect {
+        painted
+            .iter()
+            .find(|(text, _)| text == needle)
+            .unwrap_or_else(|| {
+                let all: Vec<&str> = painted.iter().map(|(t, _)| t.as_str()).collect();
+                panic!("the modal never painted {needle:?}. Painted: {all:?}")
+            })
+            .1
+    }
+
+    /// Every state the modal can be in.
+    fn every_state() -> Vec<crate::bw_acquire::CliSetupState> {
+        vec![
+            crate::bw_acquire::CliSetupState::Choosing,
+            crate::bw_acquire::CliSetupState::Asking,
+        ]
+    }
+
+    /// **The modal settles and its text and buttons are inside the window.**
+    /// The 0.15.2 failure, stated as the thing it did: the text was in the
+    /// frame, above the top of the window.
+    #[test]
+    fn each_modal_state_settles_and_paints_its_text_and_buttons_inside_the_window() {
         let window = egui::Rect::from_min_size(Pos2::ZERO, WINDOW);
-        for state in every_choosing_state() {
-            let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
-            let mut painted = Vec::new();
-            let mut seen = Vec::new();
-            // The sibling's two hundred, for the sibling's reason: the
-            // runaway was 32px a frame, which a short loop cannot tell from
-            // a settled layout.
-            for _ in 0..200 {
-                let (height, shapes) = one_frame(&ctx, &state, card_height);
-                card_height = height;
-                painted = shapes;
-                seen.push(height);
-            }
-            let settled = *seen.last().expect("two hundred frames were run");
+        for state in every_state() {
+            let (heights, painted) = settle(&state, 60);
+            let settled = *heights.last().expect("frames were run");
             assert!(
-                (settled - seen[seen.len() - 2]).abs() <= 0.5,
-                "{state:?}: the card height is still moving after 200 frames \
-                 ({:?}...)",
-                &seen[..4]
+                (settled - heights[heights.len() - 2]).abs() <= 0.5,
+                "{state:?}: the column height is still moving after 60 frames ({:?}...)",
+                &heights[..4]
             );
-            assert!(
-                settled < WINDOW.y,
-                "{state:?}: the modal's card wants {settled}px in a {}px window, so it \
-                 cannot be centred in it and still be visible. This state's body is the \
-                 longest this window paints",
-                WINDOW.y
-            );
-            let find = |needle: &str| -> egui::Rect {
-                let (_, rect) = painted
-                    .iter()
-                    .find(|(text, _)| text == needle)
-                    .unwrap_or_else(|| {
-                        let all: Vec<&str> = painted.iter().map(|(t, _)| t.as_str()).collect();
-                        panic!("{state:?} never painted {needle:?}. Painted: {all:?}")
-                    });
-                *rect
-            };
+            assert!(settled > 100.0, "{state:?}: the modal measured {settled}px, which is blank");
+            assert!(settled < WINDOW.y, "{state:?}: the modal wants {settled}px in a {}px window", WINDOW.y);
             for needle in std::iter::once(state.title().to_string()).chain(state.body()) {
-                let rect = find(&needle);
+                let rect = find(&painted, &needle);
                 assert!(
                     window.contains_rect(rect),
-                    "{state:?} painted {needle:?} at {rect:?}, outside the {window:?} the \
-                     user can see -- the 0.15.2 failure, in the modal that replaced it"
+                    "{state:?} painted {needle:?} at {rect:?}, outside the {window:?} the user \
+                     can see -- the 0.15.2 failure, in the modal that replaced it"
                 );
             }
             // Both answers, and their presence is the positive control: a
             // blank panel WITH its buttons is the exact shape the bug had.
             for (label, _, _) in state.buttons() {
-                let rect = find(label);
+                let rect = find(&painted, label);
                 assert!(
                     window.contains_rect(rect),
                     "{state:?} painted its {label:?} button at {rect:?}, outside {window:?}"
@@ -14467,107 +13489,19 @@ mod cli_setup_modal_layout_tests {
         }
     }
 
-    /// **The card height settles.** The bug, stated as the thing it did.
+    /// The modal takes the form: while it is up, no field and no Log in.
     #[test]
-    fn the_modals_measured_height_does_not_run_away() {
-        let ctx = styled_context();
-        let state = crate::bw_acquire::CliSetupState::Asking;
-
-        let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
-        let mut seen = Vec::new();
-        for _ in 0..12 {
-            card_height = one_frame(&ctx, &state, card_height).0;
-            seen.push(card_height);
-        }
-
-        let settled = *seen.last().expect("twelve frames were run");
-        let earlier = seen[seen.len() - 2];
-        assert!(
-            (settled - earlier).abs() <= 0.5,
-            "the card height is still moving after twelve frames ({seen:?}). Each frame \
-             measures content whose size was derived from the previous frame's measurement, \
-             so a height that has not settled never will -- it grew 32px per frame in 0.15.2 \
-             until the card was so tall that `login_card_rect`, which centres it, held the \
-             modal's text above the top of the window"
-        );
-        assert!(
-            settled < WINDOW.y,
-            "the modal's card wants {settled}px in a {}px window, so it cannot be centred in \
-             it and still be visible",
-            WINDOW.y
-        );
-    }
-
-    /// **And the text is actually on screen**, which is what the owner did
-    /// not see.
-    ///
-    /// Asserted on the painted galleys of a settled frame rather than on
-    /// `state.body()`: the strings were always correct, and reading them back
-    /// out of the state is precisely the test that stayed green through the
-    /// blank panel.
-    #[test]
-    fn the_settled_modal_paints_its_heading_and_body_inside_the_window() {
-        let ctx = styled_context();
-        let state = crate::bw_acquire::CliSetupState::Asking;
-
-        // Settle first, then look: the frame worth asserting on is the one
-        // the user would be looking at.
-        //
-        // **Two hundred frames, not a dozen**, and the number is doing work.
-        // A settled layout reaches its fixed point on the first frame and
-        // every frame after it is the same, so the count costs nothing when
-        // the modal is right. When it is wrong the growth is only 32px a
-        // frame -- a dozen frames of it still leaves the text roughly where
-        // it started, which is how a shorter loop here watched the runaway
-        // happen and called it fine. Two hundred frames is a few seconds of
-        // a real window, which is how long the owner looked at the blank
-        // panel before screenshotting it.
-        let mut card_height = LOGIN_CARD_INITIAL_HEIGHT;
-        let mut painted = Vec::new();
-        for _ in 0..200 {
-            let (height, shapes) = one_frame(&ctx, &state, card_height);
-            card_height = height;
-            painted = shapes;
-        }
-
-        // The window the user is looking at. A galley outside it was painted
-        // and cannot be read, which is the entire complaint.
-        let window = egui::Rect::from_min_size(Pos2::ZERO, WINDOW);
-        let find = |needle: &str| -> egui::Rect {
-            let (_, rect) = painted
-                .iter()
-                .find(|(text, _)| text == needle)
-                .unwrap_or_else(|| {
-                    let all: Vec<&str> = painted.iter().map(|(t, _)| t.as_str()).collect();
-                    panic!("the settled modal never painted {needle:?}. Painted: {all:?}")
-                });
-            *rect
-        };
-
-        for needle in std::iter::once(state.title().to_string()).chain(state.body()) {
-            let rect = find(&needle);
+    fn the_modal_replaces_the_credential_form() {
+        let (_, painted) = settle(&crate::bw_acquire::CliSetupState::Asking, 12);
+        for gone in ["Email", "Master password"] {
             assert!(
-                window.contains_rect(rect),
-                "the settled modal painted {needle:?} at {rect:?}, which is outside the \
-                 {window:?} the user can see. This is the 0.15.2 failure exactly: the text \
-                 was never missing from the frame, it was above the top of the window, \
-                 because the card it is centred in had grown without bound"
-            );
-        }
-        // The buttons too -- and their presence is the positive control for
-        // the assertions above: a blank panel WITH its buttons is exactly the
-        // shape the bug had, so a test that only found the buttons would have
-        // passed against it.
-        for (label, _, _) in state.buttons() {
-            let rect = find(label);
-            assert!(
-                window.contains_rect(rect),
-                "the settled modal painted its {label:?} button at {rect:?}, outside {window:?}"
+                !painted.iter().any(|(text, _)| text == gone),
+                "{gone:?} is still painted under the modal, where it could be typed into"
             );
         }
     }
 
-    /// The button row is allocated, not left to inherit the card.
+    /// The button row is allocated, not left to inherit the column.
     ///
     /// A source guard beside the behavioural ones, because what it protects
     /// reads as entirely ordinary: a bare `with_layout(right_to_left)` here
@@ -14593,28 +13527,25 @@ mod cli_setup_modal_layout_tests {
         assert!(
             modal.contains(concat!("allocate_ui_with", "_layout(")),
             "the modal's button row no longer allocates its own rect. A bare `with_layout` \
-             takes the parent's whole remaining space, and this modal's parent is sized FROM \
-             this modal's content -- which is the loop that shipped a blank panel in 0.15.2"
+             takes the parent's whole remaining space, and this modal's parent is measured \
+             FROM this modal's content -- which is the loop that shipped a blank panel in 0.15.2"
         );
-        // **And the blue button is the app's**, not one minted here. The
+        // **And the blue button is the kit's**, not one minted here. The
         // choice modal leans toward the built-in client with colour rather
         // than with the word "recommended" (`bw_acquire`'s
         // `the_choice_names_both_costs_and_recommends_neither` still bans
         // that word), so the colour has to be the one the rest of the app
-        // means by "the affirmative action": `theme::primary_button`, which
-        // is what the login card's Continue is. A local `Button::fill(...)`
-        // would read identically at a glance and drift at the next palette
-        // change.
+        // means by "the affirmative action": `ButtonKind::Primary`.
         assert!(
-            modal.contains(concat!("theme::primary", "_button(")),
-            "the modal no longer paints its primary answer with the app's blue button. A \
+            modal.contains(concat!("ButtonKind::", "Primary")),
+            "the modal no longer paints its primary answer with the kit's primary button. A \
              hand-rolled fill here is a second definition of the app's affirmative colour"
         );
         assert!(
             !modal.contains("theme::BLUE"),
             "the modal names a palette colour directly. The blue belongs to \
-             `theme::primary_button`, which owns the fill, the radius, the height and the \
-             disabled fade together"
+             `kit::controls::button`, which owns the fill, the radius, the height and the \
+             shadow together"
         );
     }
 }

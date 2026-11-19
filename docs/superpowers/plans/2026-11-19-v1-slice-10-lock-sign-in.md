@@ -36,4 +36,15 @@ Account switching has no surface in these windows (it is the sidebar account men
 
 ## Rulings
 
-(filled in as the slice lands)
+Ruling: "Log in with another device" is not drawn -- the design gives it the same handler as Log in and Deskwarden has no device flow; the Bitwarden API has none for a desktop client either -- cost: none, a button that could not be honoured is absent.
+Ruling: the sign-in screen keeps "Sign in with an API key" as a link under the form -- nothing 0.15 does may be dropped and Duo/WebAuthn accounts have no other door -- cost: one extra line the design lacks.
+Ruling: the Hello opt-in on sign-in is an outline button "Log in and set up Windows Hello" (fingerprint glyph where the design's phone icon sits) with 0.15's "First use" line under it -- it has real behaviour (seals the typed password) -- cost: low.
+Ruling: the lock heading reads "Welcome back" and the account email sits under the sub line, not "Welcome back, Alex" -- the app knows the email, not a first name (`bw status` carries none) -- cost: copy differs from the mock by the name.
+Ruling: the lock screen shows the Hello stage only when Hello is available and enrolled; with it off, unavailable or deleted after a failed open the password stage is the only one (spec C 5.3 says the app should) -- cost: none.
+Ruling: errors on the navy lock screen sit on a white chip in `ERROR` -- red on navy is unreadable and the spec says errors use `ERROR` -- cost: a chip the design lacks.
+Ruling: the server choice is a segmented control bitwarden.com / EU / Self-hosted with a URL field above Email for Self-hosted, as the spec asks; the old footer dropdown and its scroll-area guard are gone -- cost: none.
+Ruling: below 760 px wide the split drops its brand half and the form takes the window -- the design is drawn at 1280 and the sign-in window opens at the vault window's saved size, which can be smaller -- cost: a narrow window shows no brand copy.
+Ruling: the vault skeleton, the card geometry and the brand lockup are deleted with their tests; `cli_setup_modal_layout_tests` is rewritten to drive the split surface (its card-growth loop no longer exists) and a source guard on the old server picker is removed; the module-count guard drops from 19 to 18 -- cost: those guards' history is gone, their intent is kept.
+Ruling: the second-factor and API-key stages now draw their own split screen and caption buttons -- they had no backdrop and no window controls, so the window could not be minimised or closed there -- cost: Close is live on those stages (it was unreachable before), and nothing in `app_window` changed.
+Ruling: sign-in and lock parts rise and fade in (`dw-up`, `dw-fade`); a fully transparent first frame paints nothing, so the tests of the second-factor and API-key cards now run a dozen frames before reading -- cost: none at runtime.
+Ruling: the Slow and Unreachable first-window bodies are restyled with kit buttons and caution tokens but keep 0.15's layout, frame and footer -- the design has no screen for them -- cost: they are not full-bleed.

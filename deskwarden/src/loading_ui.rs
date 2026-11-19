@@ -1059,15 +1059,15 @@ mod spinner_body_tests {
                     "the waiting stack draws the track {} times, not once: {drawn:?}",
                     drawn.len()
                 ),
-                // **The sign-in card's own bar**, which is a different screen:
-                // it is waiting on an AUTHENTICATION and has no vault to name.
-                // Named here so it is an exception on the record rather than a
-                // hole in the count.
-                "login_ui" => assert_eq!(
-                    drawn.len(),
-                    1,
-                    "login_ui draws the track {} times: {drawn:?}",
-                    drawn.len()
+                // **The sign-in screen's own bar** is a different screen: it is
+                // waiting on an AUTHENTICATION and has no vault to name. It is
+                // `kit::auth::progress` now (blue on the white half, white on
+                // the navy lock screen), so this file draws design 7's track
+                // not at all; the pin holds that, so a second copy of the v1
+                // bar cannot come back unseen.
+                "login_ui" => assert!(
+                    drawn.is_empty(),
+                    "login_ui draws the v1 track itself: {drawn:?}",
                 ),
                 // And the vault window draws none of its own: it calls
                 // `waiting_stack`, which is the whole point of this pin.
