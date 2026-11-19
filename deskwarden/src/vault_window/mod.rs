@@ -3051,6 +3051,15 @@ pub fn build_frame_with_search(
         if sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenImport) && import_wizard.is_none() {
             import_wizard = Some(import_ui::Wizard::default());
         }
+        // The Settings score card's "Fix N items" and its tiles: the Password
+        // health screen, as the rail's own row would open it.
+        if sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenHealth) {
+            sends_selected = false;
+            received_selected = false;
+            generator_selected = false;
+            settings_selected = false;
+            health_selected = true;
+        }
         if chords && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
         }
@@ -4696,6 +4705,7 @@ pub fn build_frame_with_search(
                 if settings_selected && !show_sends {
                     if let Some(state) = prefs.as_mut() {
                         let before = state.settings.generator.clone();
+                        crate::prefs_ui::security_score::offer(ui.ctx(), &health);
                         let action = crate::prefs_ui::settings_v2::draw(ui, state, &mut settings_page);
                         *edited_settings_for_closure.borrow_mut() = Some(state.settings.clone());
                         delivered.set(false);

@@ -1,0 +1,23 @@
+# Slice 8b: Settings, the rest
+
+**Goal:** the Settings rows slice 8 left out, in priority order. Spec: Part C 2.4-2.8; decisions D4, D7, D8.
+
+## Tasks
+1. Security score card (D4): `prefs_ui::security_score` (a pure score over `HealthReport`), the window offers the report to the screen each frame, the card draws the ring, three tiles and "Fix N items"; those ask the window for the Health screen through `ShellRequest::OpenHealth`. Tests: the score arithmetic, the floor, the request and the filter on click, the window's wiring pinned.
+2. About rows: Help center, Send feedback (the crate's `webbrowser_open`), Diagnostic logs (copies the log file's PATH, never its contents). Tests: rows drawn, URLs, the toast says what happened.
+3. Autofill options: audit of the fill path; one honest row (Default sign-in steps), the rest as Rulings.
+4. Devices / Account plan and delete / Notifications: audit of the transport; Rulings, rows stay disabled.
+
+Not reached: see the Rulings (panel position, auto sign-in, 2FA, match mode, early updates, Devices, plan, delete account, Notifications).
+
+## Rulings
+Ruling: score weights are breached 8, weak 4, reused 4, old 2 points per item (an item with two findings pays twice), floored at 0; "Fix N items" is `HealthReport::flagged_items` (distinct items, including unknown breach checks, which are not weighted) -- why: D4 gives no numbers -- cost if wrong: change the four `WEIGHT_*` constants.
+Ruling: the window hands the report's numbers to the Settings screen through a one-frame egui temp slot (`security_score::offer`), not through `PrefsState` -- why: `PrefsState` is also the tray's standalone Preferences state and must not hold report data -- cost if wrong: the card is absent in a context that never offers.
+Ruling: "Fix N items" and the three tiles ask the window through `ShellRequest::OpenHealth`, with the tile's `HealthFilter` written by `password_health::show_filter` first -- why: the rail's pattern, and the filter slot is the pane's own -- cost if wrong: none.
+Ruling: the score card has no breached tile (the spec shows three: weak, reused, older than a year); breached items still cost points and still count in "Fix N items" -- why: spec -- cost if wrong: add a fourth tile.
+Ruling: About > Diagnostic logs copies the log file's PATH, not its contents or tail -- why: `deskwarden.log` is written by hundreds of `log::` call sites across the app and this slice cannot vouch for every line; a location lets the user read before sharing -- cost if wrong: the spec's toast says "Logs copied" and the user opens the file themselves.
+Ruling: Help center opens the project's README and Send feedback its new-issue page on GitHub -- why: the only public pages the project has; both go through `webbrowser_open` (ShellExecuteW, http/https only) -- cost if wrong: change the two consts.
+Ruling: "Get early updates" is not drawn -- why: `updater.rs` filters prereleases out and has no channel concept; a switch connected to nothing reads as broken -- cost if wrong: add a `beta` setting and a channel argument to `check_for_update`.
+Ruling: Autofill's panel position, sign in automatically, type 2FA codes and match apps by are not drawn -- why: the default fill is UI Automation's named-field fill (`FillAction::Default`) with a `SendInput` fallback, so "press Enter afterwards" and "type the code after" would be new steps in `injector`/`app.rs`, and "match by" would change `match_engine`'s lookup for every stored `deskwarden:app-match`; each changes a heavily source-pinned path and none can be exercised on this locked desktop -- cost if wrong: four spec rows missing.
+Ruling: Autofill > "Default sign-in steps" is a read-only button row ("Standard", sub "Username, Tab, password") whose click toasts the spec's "Change steps for one login from its Edit page" -- why: the spec's sub says "...Enter" but `key_sequence::DEFAULT_SEQUENCE` has none, and the row must describe what the code does -- cost if wrong: none.
+Ruling: Devices, Account plan, Delete account and Notifications stay as slice 7 left them (Devices and Notifications are one disabled "later release" row; the Account page has no Plan group) -- why: the Settings screen runs in the vault window process, which holds no REST session (`RestApi` and `Session` live with the daemon; `bw serve`'s CLI routes have no devices, profile or delete-account call), `rest::sync::Profile` does not parse `premium`, and `DELETE /api/accounts` needs the master-password hash computed in this process, an irreversible call that cannot be exercised here; D7's toasts need pollers and a Windows toast API that exist nowhere in the tree -- cost if wrong: three spec pages stay empty; the daemon needs new `daemon_link` requests first.

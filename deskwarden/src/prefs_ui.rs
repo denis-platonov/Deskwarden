@@ -49,6 +49,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 /// Slice 7: Settings as a screen of the vault window.
+pub mod security_score;
 pub mod settings_v2;
 
 const WINDOW_TITLE: &str = "Deskwarden Preferences";

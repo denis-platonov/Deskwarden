@@ -1929,6 +1929,23 @@ impl eframe::App for Preview {
                     _ => Page::General,
                 };
                 let mut state = prefs_ui::PrefsState::new(deskwarden::settings::Settings::default());
+                if page == Page::Security {
+                    // The score card needs the numbers the window offers it.
+                    use deskwarden::vault_window::password_health::{FoundItem, HealthReport, OldItem, ReuseGroup, WeakItem};
+                    let found = |id: &str| FoundItem { id: id.into(), name: id.into() };
+                    let weak = |id: &str| WeakItem {
+                        item: found(id),
+                        chars: 4,
+                        classes: deskwarden::password_strength::CharClasses::of("abcd"),
+                    };
+                    let report = HealthReport {
+                        weak: vec![weak("a"), weak("b")],
+                        reused: vec![ReuseGroup { items: vec![found("c"), found("d")] }],
+                        old: (0..3).map(|i| OldItem { item: found(&format!("o{i}")), days: 400 }).collect(),
+                        ..Default::default()
+                    };
+                    prefs_ui::security_score::offer(root.ctx(), &report);
+                }
                 let _ = draw(root, &mut state, &mut page);
             }
             Surface::ModalNewItem => {
