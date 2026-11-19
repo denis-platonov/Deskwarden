@@ -736,7 +736,7 @@ pub const DONE_RING_MS: u32 = 400;
 pub const DONE_DRAW_DELAY_MS: u32 = 200;
 pub const DONE_DRAW_MS: u32 = 500;
 /// How long the card stays up once the check has finished drawing.
-pub const DONE_HOLD_MS: u32 = 900;
+pub const DONE_HOLD_MS: u32 = 700;
 /// The whole card's life.
 pub const DONE_TOTAL_MS: u32 = DONE_DRAW_DELAY_MS + DONE_DRAW_MS + DONE_HOLD_MS;
 
