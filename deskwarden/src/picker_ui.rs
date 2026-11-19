@@ -506,7 +506,7 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
     std::thread::spawn(move || {
         let _ = tx.send(load_items_for_picker(&cache_for_thread, era));
     });
-    let result = loading_ui::show_while("Loading your vault...", rx);
+    let result = loading_ui::show_while(crate::i18n::t("picker_ui.loading"), rx);
 
     // The user closed the spinner (title-bar X or Alt+F4) before the
     // populate finished, rather than waiting it out -- review 11's Critical.
@@ -527,10 +527,9 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
                 MessageBoxW(
                     None,
                     &HSTRING::from(
-                        "Your Bitwarden vault doesn\u{2019}t have any items yet.\n\nAdd an item \
-                         from the vault window, then use \u{201c}Add app\u{2026}\u{201d} again.",
+                        crate::i18n::t("picker_ui.empty_vault_body"),
                     ),
-                    &HSTRING::from("Deskwarden: vault is empty"),
+                    &HSTRING::from(crate::i18n::t("picker_ui.empty_vault_title")),
                     MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
                 );
             }
@@ -545,12 +544,9 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
                 MessageBoxW(
                     None,
                     &HSTRING::from(
-                        "\u{201c}Add app\u{2026}\u{201d} can only fill from a login, and your \
-                         Bitwarden vault doesn\u{2019}t have any login items yet \u{2014} only \
-                         other kinds, like secure notes or cards.\n\nAdd a login from the vault \
-                         window, then use \u{201c}Add app\u{2026}\u{201d} again.",
+                        crate::i18n::t("picker_ui.no_logins_body"),
                     ),
-                    &HSTRING::from("Deskwarden: no logins to choose from"),
+                    &HSTRING::from(crate::i18n::t("picker_ui.no_logins_title")),
                     MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
                 );
             }
@@ -561,13 +557,11 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             unsafe {
                 MessageBoxW(
                     None,
-                    &HSTRING::from(format!(
-                        "Deskwarden could not load your vault items because its Bitwarden \
-                         backend isn\u{2019}t reachable right now.\n\nOpen the vault (which \
-                         starts it) or try Sync from the tray menu, then use \u{201c}Add \
-                         app\u{2026}\u{201d} again.\n\n{reason}"
+                    &HSTRING::from(crate::i18n::tf(
+                        "picker_ui.unreachable_body",
+                        &[("reason", &reason)],
                     )),
-                    &HSTRING::from("Deskwarden: could not load vault"),
+                    &HSTRING::from(crate::i18n::t("picker_ui.unreachable_title")),
                     MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
                 );
             }
@@ -581,11 +575,9 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
                 MessageBoxW(
                     None,
                     &HSTRING::from(
-                        "Deskwarden\u{2019}s vault was locked while it was loading your \
-                         items.\n\nOpen the vault window and unlock it, then use \u{201c}Add \
-                         app\u{2026}\u{201d} again.",
+                        crate::i18n::t("picker_ui.locked_body"),
                     ),
-                    &HSTRING::from("Deskwarden: vault is locked"),
+                    &HSTRING::from(crate::i18n::t("picker_ui.locked_title")),
                     MB_ICONWARNING | MB_OK | MB_SETFOREGROUND,
                 );
             }
@@ -655,15 +647,15 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
             .show(ui, |ui| {
                 let mut done = false;
 
-                theme::card_header(ui, "Add app");
+                theme::card_header(ui, crate::i18n::t("picker_ui.add_app"));
                 ui.add_space(10.0);
                 title_block(
                     ui,
-                    "Which vault item should this app fill from?",
-                    "Create an item that fills here from now on.",
+                    crate::i18n::t("picker_ui.which_item"),
+                    crate::i18n::t("picker_ui.create_item"),
                 );
                 ui.add_space(8.0);
-                search_field(ui, &mut filter, "Search vault");
+                search_field(ui, &mut filter, crate::i18n::t("picker_ui.search_vault"));
                 ui.add_space(8.0);
 
                 // Filter lowered once per frame, not once per item inside
@@ -704,7 +696,7 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
                     // earlier in the same "Add app..." flow.
                     let next_clicked = ui
                         .add_enabled_ui(can_pick_next(&selected_id), |ui| {
-                            theme::primary_button(ui, "Next", None)
+                            theme::primary_button(ui, crate::i18n::t("picker_ui.next"), None)
                         })
                         .inner
                         .clicked();
@@ -716,7 +708,7 @@ pub fn pick_vault_item(cache: &Arc<VaultCache>) -> Option<VaultItem> {
                             }
                         }
                     }
-                    if theme::secondary_button(ui, "Cancel").clicked() {
+                    if theme::secondary_button(ui, crate::i18n::t("picker_ui.cancel")).clicked() {
                         done = true;
                     }
                 });
@@ -1270,15 +1262,15 @@ pub fn run_picker(
             .show(ui, |ui| {
                 let mut done = false;
 
-                theme::card_header(ui, "Add app");
+                theme::card_header(ui, crate::i18n::t("picker_ui.add_app"));
                 ui.add_space(10.0);
                 title_block(
                     ui,
-                    &format!("Match a process to \u{201c}{}\u{201d}", target_item.name),
-                    "The chosen process fills from this item from now on.",
+                    &crate::i18n::tf("picker_ui.match_process", &[("name", &target_item.name)]),
+                    crate::i18n::t("picker_ui.process_sub"),
                 );
                 ui.add_space(8.0);
-                search_field(ui, &mut filter, "Search open windows");
+                search_field(ui, &mut filter, crate::i18n::t("picker_ui.search_windows"));
                 ui.add_space(8.0);
 
                 // Matches against the window title (what's shown as the
@@ -1339,7 +1331,7 @@ pub fn run_picker(
                             ui.add(egui::Spinner::new().size(12.0).color(theme::TEXT_FAINT));
                             ui.add_space(6.0);
                             ui.label(
-                                RichText::new("Preparing your Bitwarden backend\u{2026}")
+                                RichText::new(crate::i18n::t("picker_ui.preparing_backend"))
                                     .size(11.0)
                                     .color(theme::TEXT_FAINT),
                             );
@@ -1365,7 +1357,7 @@ pub fn run_picker(
                             .color(theme::ERROR),
                         );
                         ui.add_space(4.0);
-                        if theme::secondary_button(ui, "Retry").clicked() {
+                        if theme::secondary_button(ui, crate::i18n::t("picker_ui.retry")).clicked() {
                             // Not terminal (review 11's Important 2): a
                             // save-memory start can still land after this
                             // probe's own deadline, so give the user a way
@@ -1431,7 +1423,7 @@ pub fn run_picker(
                     let can_save =
                         can_save_app_match_now(selected_process, &backend_ready, already_saved);
                     let save_clicked = ui
-                        .add_enabled_ui(can_save, |ui| theme::primary_button(ui, "Save", None))
+                        .add_enabled_ui(can_save, |ui| theme::primary_button(ui, crate::i18n::t("picker_ui.save"), None))
                         .inner
                         .clicked();
                     if save_clicked {
@@ -1532,9 +1524,9 @@ pub fn run_picker(
                     // longer cancels anything and labelling it as though it
                     // did would suggest clicking it undoes the save.
                     let dismiss = if save_notice.is_some() {
-                        "Close"
+                        crate::i18n::t("picker_ui.close")
                     } else {
-                        "Cancel"
+                        crate::i18n::t("picker_ui.cancel")
                     };
                     if theme::secondary_button(ui, dismiss).clicked() {
                         done = true;

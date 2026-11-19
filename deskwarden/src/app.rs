@@ -3808,7 +3808,7 @@ pub fn handle_no_match(
             // `VaultBridge::generate` the edit form's own generator calls.
             cache.bridge().generate(request).map_err(|e| {
                 log::warn!("the overlay could not generate a password: {e:?}");
-                crate::generate_prompt::GENERATE_FAILED_TEXT.to_string()
+                crate::generate_prompt::generate_failed_text().to_string()
             })
         }),
         // **The one item-creating route in this app**, the same
@@ -9098,7 +9098,7 @@ mod save_login_tests {
                 assert_eq!(
                     folder_id, None,
                     "the new login is filed somewhere, and the card offers no folder to file \
-                     it in -- see `save_login_card::FOLDER_ROW_TEXT`"
+                     it in -- see `save_login_card::folder_row_text()`"
                 );
             }
             other => panic!("3c created something other than a login: {other:?}"),

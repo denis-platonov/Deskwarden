@@ -158,6 +158,9 @@ pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) 
 /// after the startup window hands it the frame, and a second wording there
 /// would be a second thing to keep true. Its old copy read "Loading your
 /// vault…" with an ellipsis this one has not got.
+// Phase 2 of the translation work removes this constant: the vault window and
+// Preferences still read it, and their sites move to `i18n::t("loading.heading")`. Every
+// other site already does.
 pub const LOADING_HEADING: &str = "Loading your vault";
 
 /// **Design turn 7's waiting stack: the bar, the heading, and what is under
@@ -491,23 +494,23 @@ pub fn waiting_body(elapsed: Duration, local: LocalCopy) -> FirstWindowBody {
 pub fn hotkey_footnote(status: crate::hotkey::HotkeyStatus, chord: &str) -> String {
     use crate::hotkey::{HotkeyStatus, Unavailable};
     match status {
-        HotkeyStatus::Armed => format!("Autofill is listening · {chord}"),
+        HotkeyStatus::Armed => crate::i18n::tf("loading.hotkey_armed", &[("chord", chord)]),
         HotkeyStatus::Unavailable(Unavailable::NotYetAttempted) => {
-            format!("Autofill starts when your vault opens · {chord}")
+            crate::i18n::tf("loading.hotkey_pending", &[("chord", chord)])
         }
         HotkeyStatus::Unavailable(Unavailable::TakenByAnotherProgram) => {
-            format!("Another program is using {chord}, so autofill has no shortcut")
+            crate::i18n::tf("loading.hotkey_taken", &[("chord", chord)])
         }
         HotkeyStatus::Unavailable(Unavailable::NoManager)
         | HotkeyStatus::Unavailable(Unavailable::Refused) => {
-            format!("Windows refused {chord}, so autofill has no shortcut")
+            crate::i18n::tf("loading.hotkey_refused", &[("chord", chord)])
         }
         // **Names no chord, because there is none.** The user cleared this
         // shortcut on the Shortcuts page; a line that printed the combination
         // anyway would be teaching them one that does nothing, and a line that
         // blamed Windows or another program would be blaming somebody for
         // their own decision.
-        HotkeyStatus::Unbound => "Autofill has no keyboard shortcut set".to_string(),
+        HotkeyStatus::Unbound => crate::i18n::t("loading.hotkey_unbound").to_string(),
     }
 }
 
@@ -573,18 +576,21 @@ pub struct FirstWindowOutcome {
 /// rule: it is drawn only where it would really work, and where it would not
 /// there is still nothing at all. See [`LocalCopy`], which is the whole of
 /// that decision, and [`offline_line`], which is the "last synced" half.
-const UNREACHABLE_TITLE: &str = "Couldn't reach Bitwarden";
-const UNREACHABLE_OFFERED: &str =
-    "Deskwarden can't open your vault until Bitwarden answers. Nothing has been lost — your \
-     items are still in your account.";
-const UNREACHABLE_SPENT: &str =
-    "Bitwarden still isn't answering. Closing this window leaves your vault locked; nothing \
-     has been lost, and opening Deskwarden again once you're back online picks up where this \
-     left off.";
+fn unreachable_title() -> &'static str {
+    crate::i18n::t("loading.unreachable_title")
+}
+fn unreachable_offered() -> &'static str {
+    crate::i18n::t("loading.unreachable_offered")
+}
+fn unreachable_spent() -> &'static str {
+    crate::i18n::t("loading.unreachable_spent")
+}
 
 /// The label on the slow body's way out: design 7b's own *Open the local
 /// copy*.
-const OPEN_LOCAL_LABEL: &str = "Open the local copy";
+fn open_local_label() -> &'static str {
+    crate::i18n::t("loading.open_local")
+}
 
 /// The label on the unreachable body's: design 7b's own *Continue offline*.
 ///
@@ -593,7 +599,9 @@ const OPEN_LOCAL_LABEL: &str = "Open the local copy";
 /// answers a wait that has failed. Both report through
 /// [`FirstWindowOutcome::open_local_copy`], which is the one field the host
 /// acts on.
-const CONTINUE_OFFLINE_LABEL: &str = "Continue offline";
+fn continue_offline_label() -> &'static str {
+    crate::i18n::t("loading.continue_offline")
+}
 
 /// **"last synced 2 h ago"** -- design 7b's line about the local copy, with
 /// this app's own words for the age.
@@ -610,11 +618,11 @@ const CONTINUE_OFFLINE_LABEL: &str = "Continue offline";
 /// again. See [`LocalCopy`] on why that is not filled in with a placeholder.
 fn offline_line(synced: Option<Duration>) -> String {
     match synced {
-        Some(age) => format!(
-            "Your copy on this machine · {}",
-            crate::vault_window::cache_age_text(age)
+        Some(age) => crate::i18n::tf(
+            "loading.offline_copy_age",
+            &[("age", &crate::vault_window::cache_age_text(age))],
         ),
-        None => "There's a copy on this machine. Opening it asks Windows Hello again.".to_string(),
+        None => crate::i18n::t("loading.offline_copy_no_age").to_string(),
     }
 }
 
@@ -743,15 +751,15 @@ pub fn draw_first_window_body(
                     waiting_stack(
                         ui,
                         WIDE_BAR,
-                        LOADING_HEADING,
-                        Some("This stays on your machine"),
+                        crate::i18n::t("loading.heading"),
+                        Some(crate::i18n::t("loading.stays_local")),
                     );
                 }
                 FirstWindowBody::Slow { seconds, local } => {
                     waiting_stack(
                         ui,
                         WIDE_BAR,
-                        "Still syncing with Bitwarden",
+                        crate::i18n::t("loading.still_syncing"),
                         Some(&slow_line(seconds)),
                     );
                     // **Secondary here and primary on the failure body**, and
@@ -762,17 +770,17 @@ pub fn draw_first_window_body(
                         ui.add_space(TITLE_TO_SUB);
                         ui.label(theme::regular(offline_line(synced), SUB_SIZE).color(theme::TEXT_GHOST));
                         ui.add_space(BLOCK_GAP);
-                        open_local_copy |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, OPEN_LOCAL_LABEL, None).clicked();
+                        open_local_copy |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, open_local_label(), None).clicked();
                     }
                 }
                 FirstWindowBody::Unreachable { retry: offer, local } => {
                     draw_warning_badge(ui);
                     ui.add_space(BADGE_TO_LABEL);
-                    ui.label(theme::bold(UNREACHABLE_TITLE, TITLE_SIZE).color(theme::INK));
+                    ui.label(theme::bold(unreachable_title(), TITLE_SIZE).color(theme::INK));
                     ui.add_space(TITLE_TO_SUB);
                     let copy = match offer {
-                        RetryOffer::Offered => UNREACHABLE_OFFERED,
-                        RetryOffer::Spent => UNREACHABLE_SPENT,
+                        RetryOffer::Offered => unreachable_offered(),
+                        RetryOffer::Spent => unreachable_spent(),
                     };
                     // Bounded, so the sentence wraps into the design's own
                     // measure rather than running the full width of a 1240px
@@ -793,7 +801,7 @@ pub fn draw_first_window_body(
                     }
                     if offer == RetryOffer::Offered {
                         ui.add_space(BLOCK_GAP);
-                        retry = crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, crate::kit::controls::ROW, "Retry", None).clicked();
+                        retry = crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, crate::kit::controls::ROW, crate::i18n::t("loading.retry"), None).clicked();
                     }
                     if let LocalCopy::Here { .. } = local {
                         // Stacked under the Retry when there is one -- a
@@ -813,10 +821,10 @@ pub fn draw_first_window_body(
                         // action left.
                         let pressed = match offer {
                             RetryOffer::Offered => {
-                                crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, CONTINUE_OFFLINE_LABEL, None).clicked()
+                                crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, continue_offline_label(), None).clicked()
                             }
                             RetryOffer::Spent => {
-                                crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, crate::kit::controls::ROW, CONTINUE_OFFLINE_LABEL, None).clicked()
+                                crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, crate::kit::controls::ROW, continue_offline_label(), None).clicked()
                             }
                         };
                         open_local_copy |= pressed;
@@ -836,7 +844,7 @@ pub fn draw_first_window_body(
 /// decorative: a formatter with its own test, fed from a real `Instant`, is how
 /// "the elapsed time is real" stops being a claim in a comment.
 pub fn slow_line(seconds: u64) -> String {
-    format!("Taking longer than usual — {seconds} s")
+    crate::i18n::tf("loading.slow", &[("seconds", &seconds.to_string())])
 }
 
 /// What the stack in the middle occupies, summed from its own pieces rather
@@ -916,7 +924,7 @@ fn draw_footer(ui: &mut egui::Ui, full: egui::Rect, footer: &FirstWindowFooter<'
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         left.label(
-            theme::regular(format!("Signed in as {account}"), FOOT_SIZE).color(theme::TEXT_FAINT),
+            theme::regular(crate::i18n::tf("loading.signed_in_as", &[("account", account)]), FOOT_SIZE).color(theme::TEXT_FAINT),
         );
     }
 
@@ -1700,7 +1708,7 @@ mod first_window_body_tests {
             "the slow body was handed a different local-copy answer than it was given"
         );
         let painted = rendered(&frame(FirstWindowBody::Loading));
-        for absent in [OPEN_LOCAL_LABEL, CONTINUE_OFFLINE_LABEL] {
+        for absent in [open_local_label(), continue_offline_label()] {
             assert!(
                 !painted.contains(absent),
                 "the ordinary loading body offers {absent:?} on its first frame: {painted:?}"
@@ -1873,7 +1881,7 @@ mod first_window_body_tests {
             "the unreachable body has no Retry, which is the only thing this screen can \
              actually do about the failure it is reporting: {painted:?}"
         );
-        for absent in [CONTINUE_OFFLINE_LABEL, OPEN_LOCAL_LABEL, "this machine"] {
+        for absent in [continue_offline_label(), open_local_label(), "this machine"] {
             assert!(
                 !painted.contains(absent),
                 "the unreachable body says {absent:?} with no copy on this machine to open. \
@@ -1896,7 +1904,7 @@ mod first_window_body_tests {
             local: COPY_HERE,
         }));
         assert!(
-            painted.contains(CONTINUE_OFFLINE_LABEL),
+            painted.contains(continue_offline_label()),
             "there is a readable copy on this machine and the failure body does not offer it, \
              which is the whole of what the disk cache bought this screen: {painted:?}"
         );
@@ -1927,7 +1935,7 @@ mod first_window_body_tests {
             local: LocalCopy::Here { synced: None },
         }));
         assert!(
-            painted.contains(CONTINUE_OFFLINE_LABEL),
+            painted.contains(continue_offline_label()),
             "a dismissed fingerprint prompt hid the local copy the user still has, which is \
              the accident this state exists for: {painted:?}"
         );
@@ -1980,7 +1988,7 @@ mod first_window_body_tests {
             "a spent Retry came back because a copy was on the disk: {painted:?}"
         );
         assert!(
-            painted.contains(CONTINUE_OFFLINE_LABEL),
+            painted.contains(continue_offline_label()),
             "every attempt is spent and there is a readable copy on this machine, and the \
              screen's only advice is to close the window: {painted:?}"
         );
@@ -1996,7 +2004,7 @@ mod first_window_body_tests {
     fn the_slow_body_offers_the_copy_only_when_there_is_one() {
         let with = rendered(&frame(FirstWindowBody::Slow { seconds: 12, local: COPY_HERE }));
         assert!(
-            with.contains(OPEN_LOCAL_LABEL),
+            with.contains(open_local_label()),
             "a wait that has been going twelve seconds over a readable local copy offers no \
              way into it: {with:?}"
         );
@@ -2007,7 +2015,7 @@ mod first_window_body_tests {
         let without =
             rendered(&frame(FirstWindowBody::Slow { seconds: 12, local: LocalCopy::None }));
         assert!(
-            !without.contains(OPEN_LOCAL_LABEL),
+            !without.contains(open_local_label()),
             "the slow body offers a local copy that is not on this machine: {without:?}"
         );
     }

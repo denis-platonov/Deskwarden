@@ -191,15 +191,21 @@ pub const REGION_TITLE: &str = "Deskwarden \u{2014} scan a region";
 /// that no state removes, because the sentence beside it is the one that says
 /// nothing has been saved, and a user mid-drag is exactly the user who wants
 /// to read that.
-pub const DRAG_TITLE: &str = "Drag a box around the QR code";
+pub fn drag_title() -> &'static str {
+    crate::i18n::t("region.drag_title")
+}
 
 /// 6b's sub-line. **"Nothing is saved yet" has to stay true of the code**:
 /// this module writes nothing anywhere, and the confirmation screen is what
 /// saves.
-pub const DRAG_HINT: &str = "Deskwarden reads it the moment you let go. Nothing is saved yet.";
+pub fn drag_hint() -> &'static str {
+    crate::i18n::t("region.drag_hint")
+}
 
 /// 6b's lock-on badge, shown **while the button is still down**.
-pub const LOCKED_ON: &str = "Code found \u{b7} release to read";
+pub fn locked_on() -> &'static str {
+    crate::i18n::t("region.locked_on")
+}
 
 /// **The reveal's badge**: what the overlay says on the half-second it spends
 /// showing the user the code its scan just read.
@@ -218,7 +224,9 @@ pub const LOCKED_ON: &str = "Code found \u{b7} release to read";
 /// instead of two. It is also the shortest true sentence available, which
 /// matters on a badge that is on screen for less time than it takes to read a
 /// long one.
-pub const SCAN_FOUND: &str = "Code read";
+pub fn scan_found() -> &'static str {
+    crate::i18n::t("region.scan_found")
+}
 
 /// 6b's two shortcut affordances, at the right-hand end of the bottom bar.
 /// Each is a bordered chip carrying its label and, in the design's monospace,
@@ -252,12 +260,16 @@ pub const SCAN_FOUND: &str = "Code read";
 /// A code the scan cannot see on another monitor -- one it misses twice -- is
 /// a residual gap, and the honest fix for it is to move the code onto the
 /// screen the user is working on, which is what they would do anyway.
-pub const WHOLE_SCREEN_HINT: &str = "All screens";
+pub fn whole_screen_hint() -> &'static str {
+    crate::i18n::t("region.all_screens")
+}
 /// See [`WHOLE_SCREEN_HINT`]. The key printed inside that chip, and the key
 /// the callback really matches on -- [`egui::Key::A`].
 pub const WHOLE_SCREEN_KEY: &str = "A";
 /// See [`WHOLE_SCREEN_HINT`].
-pub const CANCEL_HINT: &str = "Cancel";
+pub fn cancel_hint() -> &'static str {
+    crate::i18n::t("region.cancel")
+}
 /// See [`WHOLE_SCREEN_HINT`]. Matched as [`egui::Key::Escape`].
 pub const CANCEL_KEY: &str = "ESC";
 
@@ -289,17 +301,22 @@ pub const CHIP_CANCEL: usize = 1;
 /// between and wrong when there were none to find, and a single sentence
 /// stretched to cover both would be the generic refusal
 /// `totp_add::PickerRefusal` already refuses to write.
-pub const SCAN_NO_CODE: &str = "No QR code found on your screen. Drag a box around it instead.";
+pub fn scan_no_code() -> &'static str {
+    crate::i18n::t("region.scan_no_code")
+}
 /// See [`SCAN_NO_CODE`]. The case the owner was explicit about: **do not
 /// guess.** Two codes on a desktop are two secrets, and there is no tie-break
 /// this app is entitled to invent -- so this is the one sentence here that
 /// asks the user to choose, because they are the only one who can.
-pub const SCAN_SEVERAL: &str =
-    "More than one QR code is on your screen. Drag a box around the one you want.";
+pub fn scan_several() -> &'static str {
+    crate::i18n::t("region.scan_several")
+}
 /// See [`SCAN_NO_CODE`]. A refusal's second clause. It says "the code"
 /// because a screen that could not be read tells us nothing about how many
 /// codes are on it.
-pub const SCAN_REFUSED_ADVICE: &str = "Drag a box around the code instead.";
+pub fn scan_refused_advice() -> &'static str {
+    crate::i18n::t("region.scan_refused_advice")
+}
 
 /// The bar's reason line, from what the scan came back with.
 ///
@@ -310,9 +327,9 @@ pub const SCAN_REFUSED_ADVICE: &str = "Drag a box around the code instead.";
 /// one.
 pub fn scan_miss_line(miss: ScanMiss) -> String {
     match miss {
-        ScanMiss::NoCode => SCAN_NO_CODE.to_string(),
-        ScanMiss::Several => SCAN_SEVERAL.to_string(),
-        ScanMiss::Refused(why) => format!("{}. {SCAN_REFUSED_ADVICE}", why.title()),
+        ScanMiss::NoCode => scan_no_code().to_string(),
+        ScanMiss::Several => scan_several().to_string(),
+        ScanMiss::Refused(why) => format!("{}. {}", why.title(), scan_refused_advice()),
     }
 }
 
@@ -619,7 +636,7 @@ pub fn to_screen(origin: (i32, i32), points_per_pixel: f32, at: (f32, f32)) -> (
 /// in the bottom bar, where 6b keeps it whatever the drag is doing.
 pub fn lockon_badge(found: bool) -> Option<&'static str> {
     if found {
-        Some(LOCKED_ON)
+        Some(locked_on())
     } else {
         None
     }
@@ -3179,7 +3196,7 @@ pub fn draw(ui: &mut egui::Ui, view: &RegionView) -> ([egui::Rect; 2], bool) {
                 paint_size_readout(&painter, sel, w, h);
             }
             if lockon_badge(view.found).is_some() {
-                paint_badge(&painter, full, sel, LOCKED_ON);
+                paint_badge(&painter, full, sel, locked_on());
             }
             washed
         }
@@ -3307,7 +3324,7 @@ fn paint_reveal(painter: &egui::Painter, full: egui::Rect, found: egui::Rect) ->
     let lit = found.intersect(full);
     let washed = paint_dim_around(painter, full, lit);
     paint_selection_edge(painter, lit);
-    paint_badge(painter, full, lit, SCAN_FOUND);
+    paint_badge(painter, full, lit, scan_found());
     washed
 }
 
@@ -3581,12 +3598,12 @@ fn paint_bar(
         )
     });
     let title = painter.layout_no_wrap(
-        DRAG_TITLE.to_owned(),
+        drag_title().to_owned(),
         egui::FontId::new(BAR_TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
         theme::CARD,
     );
     let hint = painter.layout_no_wrap(
-        DRAG_HINT.to_owned(),
+        drag_hint().to_owned(),
         egui::FontId::proportional(BAR_HINT_PX),
         BAR_HINT_INK,
     );
@@ -3627,8 +3644,8 @@ fn paint_bar(
     // travels to. That order is also `CHIP_WHOLE_SCREEN` and `CHIP_CANCEL`,
     // which is what the returned rectangles are indexed by.
     let faces = [
-        (WHOLE_SCREEN_HINT, WHOLE_SCREEN_KEY),
-        (CANCEL_HINT, CANCEL_KEY),
+        (whole_screen_hint(), WHOLE_SCREEN_KEY),
+        (cancel_hint(), CANCEL_KEY),
     ];
     let total: f32 = faces
         .iter()
@@ -4589,7 +4606,7 @@ mod tests {
         );
         // And the chip that runs it is named for that, rather than for the
         // surface it sits on. See `WHOLE_SCREEN_HINT`.
-        assert_eq!(WHOLE_SCREEN_HINT, "All screens");
+        assert_eq!(whole_screen_hint(), "All screens");
     }
 
     /// No monitors -- and a degenerate one -- give no overlay rather than a
@@ -4643,10 +4660,10 @@ mod tests {
         // The constant really is the design's sentence, separator included --
         // so a `LOCKED_ON` edited to something else fails here rather than
         // shipping.
-        assert_eq!(LOCKED_ON, "Code found · release to read");
-        assert_eq!(DRAG_TITLE, "Drag a box around the QR code");
+        assert_eq!(locked_on(), "Code found · release to read");
+        assert_eq!(drag_title(), "Drag a box around the QR code");
         assert_eq!(
-            DRAG_HINT,
+            drag_hint(),
             "Deskwarden reads it the moment you let go. Nothing is saved yet."
         );
     }
@@ -4874,7 +4891,7 @@ mod tests {
         let view = overlay.view();
         assert!(view.found, "the drag decoded and the badge did not lock on");
         assert_eq!(view.size, Some((300, 300)));
-        assert_eq!(lockon_badge(view.found), Some(LOCKED_ON));
+        assert_eq!(lockon_badge(view.found), Some(locked_on()));
         // Still down: the overlay has not answered yet.
         assert!(overlay.is_open());
         assert!(overlay.take_outcome().is_none());
@@ -5110,9 +5127,9 @@ mod tests {
         // scan it runs, which walks every monitor, and no longer for the
         // surface it sits on, which now covers one. See `WHOLE_SCREEN_HINT`
         // for the argument, and `RegionOverlay::open` for what narrowed.
-        assert_eq!(WHOLE_SCREEN_HINT, "All screens");
+        assert_eq!(whole_screen_hint(), "All screens");
         assert_eq!(WHOLE_SCREEN_KEY, "A");
-        assert_eq!(CANCEL_HINT, "Cancel");
+        assert_eq!(cancel_hint(), "Cancel");
         assert_eq!(CANCEL_KEY, "ESC");
 
         // And the callback really watches those two, which is only assertable
@@ -5146,8 +5163,8 @@ mod tests {
             .nth(1)
             .expect("`paint_bar` no longer builds its chips from one array");
         let faces = faces.split("];").next().unwrap();
-        let whole = faces.find("WHOLE_SCREEN_HINT").expect("no whole-screen chip");
-        let cancel = faces.find("CANCEL_HINT").expect("no cancel chip");
+        let whole = faces.find("whole_screen_hint()").expect("no whole-screen chip");
+        let cancel = faces.find("cancel_hint()").expect("no cancel chip");
         assert!(whole < cancel, "the chips are no longer in the design's order");
         assert_eq!(CHIP_WHOLE_SCREEN, 0);
         assert_eq!(CHIP_CANCEL, 1);
@@ -5575,7 +5592,7 @@ mod tests {
         ] {
             let line = scan_miss_line(ScanMiss::Refused(why));
             assert!(line.starts_with(why.title()), "{line}");
-            assert!(line.ends_with(SCAN_REFUSED_ADVICE), "{line}");
+            assert!(line.ends_with(scan_refused_advice()), "{line}");
         }
         // Each of the three says the drag, and only the one with a choice in
         // it offers one.
@@ -6659,9 +6676,9 @@ mod tests {
         assert!(REVEAL_DWELL < Duration::from_millis(500));
         // The badge it carries is 6c's own words and is NOT the drag's, which
         // ends in an instruction for a gesture the reveal does not have.
-        assert_eq!(SCAN_FOUND, "Code read");
-        assert_ne!(SCAN_FOUND, LOCKED_ON);
-        assert!(!SCAN_FOUND.contains("release"));
+        assert_eq!(scan_found(), "Code read");
+        assert_ne!(scan_found(), locked_on());
+        assert!(!scan_found().contains("release"));
     }
 
     /// **The reveal's clock starts on the first painted frame once the window

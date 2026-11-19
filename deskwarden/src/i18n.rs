@@ -585,6 +585,46 @@ mod tests {
         assert_eq!(current().tag, "en");
     }
 
+    /// **English is what the screens always said.** Each line pairs what the converted code
+    /// answers now with the literal the code held before the catalog existed. The catalog
+    /// text itself is checked against the original sources by `scripts/i18n/verify_english.py`;
+    /// this is the same fact asked of the running functions, on the screens people see first.
+    #[test]
+    fn english_is_what_the_screens_always_said() {
+        use crate::{kit::auth, login_ui, second_factor_ui as sf, tray, tray_popup};
+        let pins: Vec<(String, &str)> = vec![
+            (auth::headline().into(), "Your Bitwarden vault, in every app."),
+            (auth::brand_foot().into(), "Uses your existing Bitwarden account"),
+            (auth::hello_label().into(), "Unlock with Windows Hello"),
+            (auth::hello_checking().into(), "Checking\u{2026}"),
+            (auth::use_password_label().into(), "Use master password instead"),
+            (auth::lock_heading().into(), "Welcome back"),
+            (auth::lock_sub().into(), "Your vault is locked"),
+            (login_ui::enter_email().into(), "Enter your email."),
+            (login_ui::bad_email().into(), "That doesn't look like an email address."),
+            (login_ui::enter_password().into(), "Enter your master password."),
+            (login_ui::too_many_title().into(), "Too many tries"),
+            (login_ui::sign_in_title().into(), "Log in"),
+            (login_ui::friendly_auth_error("invalid master password"), "That master password didn't work. Check it and try again."),
+            (login_ui::friendly_auth_error("rate limit"), "Too many failed attempts. Wait a few minutes, then try again."),
+            (sf::factor_title(&crate::rest::api::SecondFactor::Authenticator).into(), "Authenticator app"),
+            (sf::provider_name(7), "a security key (WebAuthn)"),
+            (sf::provider_name(9), "an unrecognised two-step method (9)"),
+            (sf::send_code_label().into(), "Send code"),
+            (sf::message_for(sf::Trouble::CodeRejected).into(), "That code didn't work. Check it and try again \u{2014} codes change every 30 seconds."),
+            (tray::fill_hint(&crate::hotkey::HotkeyStatus::Armed, "Ctrl+Alt+B"), "Fill:  Ctrl+Alt+B"),
+            (tray_popup::label_for(true, 0, 0), "RECENT"),
+            (tray_popup::label_for(false, 3, 9), "TOP 3 OF 9 MATCHES"),
+            (tray_popup::toast_for(tray_popup::Field::Password, tray_popup::CopyResult::Copied).into(), "Password copied"),
+        ];
+        for (actual, english) in pins {
+            assert_eq!(actual, english);
+        }
+        // And the same screens in another language fall back to those words while its
+        // catalog is empty, so a half-translated build never shows a key.
+        with_language("de", || assert_eq!(auth::lock_heading(), "Welcome back"));
+    }
+
     #[test]
     fn a_missing_key_reads_as_the_key_and_never_panics() {
         assert_eq!(t("no.such.key"), "no.such.key");

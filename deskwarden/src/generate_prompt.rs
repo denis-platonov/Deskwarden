@@ -207,8 +207,8 @@ impl GeneratedKind {
     /// The cell's label, as the newer image prints it.
     pub fn label(self) -> &'static str {
         match self {
-            Self::Characters => "Password",
-            Self::Words => "Passphrase",
+            Self::Characters => crate::i18n::t("generate.kind_password"),
+            Self::Words => crate::i18n::t("generate.kind_passphrase"),
             Self::Pin => "PIN",
         }
     }
@@ -229,8 +229,8 @@ impl GeneratedKind {
     /// longer a `20 chars` run for anything to be a unit of.
     pub fn size_label(self) -> &'static str {
         match self {
-            Self::Characters | Self::Pin => "Length",
-            Self::Words => "Words",
+            Self::Characters | Self::Pin => crate::i18n::t("generate.length"),
+            Self::Words => crate::i18n::t("generate.words"),
         }
     }
 
@@ -1000,14 +1000,18 @@ pub const GENERATE_PROMPT_TITLE: &str = "Deskwarden password generator";
 /// against. That field is the application's and is not this card's to draw (see
 /// the module doc), but its caption is what the card is FOR, so the caption is
 /// the card's title.
-pub const GENERATE_LABEL: &str = "New password";
+pub fn generate_label() -> &'static str {
+    crate::i18n::t("generate.new_password")
+}
 
 /// 3d's eyebrow over the value: `GENERATED`, `font-size: 11px; font-weight:
 /// 700; letter-spacing: 0.1em; text-transform: uppercase`.
 ///
 /// Upper case in the constant rather than upper-cased at the paint site,
 /// because `text-transform` is a rendering instruction and this is the word.
-pub const GENERATE_CAPTION: &str = "Suggested password";
+pub fn generate_caption() -> &'static str {
+    crate::i18n::t("generate.suggested")
+}
 
 /// 3d's primary button.
 ///
@@ -1022,11 +1026,15 @@ pub const GENERATE_CAPTION: &str = "Suggested password";
 /// vault`, and kept.** Nothing about the path changed: `handle_no_match` still
 /// holds no injector, so the missing word is still the difference between a
 /// button that describes what happens and one that does not.
-pub const GENERATE_SAVE_LABEL: &str = "Save to vault";
+pub fn generate_save_label() -> &'static str {
+    crate::i18n::t("generate.save_to_vault")
+}
 
 /// 3d's clipboard button -- the one control here that gets the password into
 /// the app the user is actually looking at.
-pub const GENERATE_COPY_LABEL: &str = "Copy";
+pub fn generate_copy_label() -> &'static str {
+    crate::i18n::t("generate.copy")
+}
 
 /// 3d's regenerate control, at the right-hand end of the control row.
 ///
@@ -1041,7 +1049,9 @@ pub const GENERATE_COPY_LABEL: &str = "Copy";
 /// The older pass noted that making the run a control cost the design nothing.
 /// The newer image makes it a control outright, so the note is now simply what
 /// the design says.
-pub const GENERATE_REGENERATE_LABEL: &str = "Regenerate";
+pub fn generate_regenerate_label() -> &'static str {
+    crate::i18n::t("generate.regenerate")
+}
 
 /// The chord, drawn as its own boxed chip inside the *Regenerate* button
 /// through [`crate::win32_draw::draw_hint_chip`] -- the crate's one keyboard
@@ -1055,10 +1065,14 @@ pub const REGENERATE_SHORTCUT: &str = "CTRL+R";
 /// This one does not vary -- the tiles are the password's alphabet whatever
 /// else is selected, and are drawn dead rather than relabelled when they are
 /// not in play.
-pub const GENERATE_CLASSES_CAPTION: &str = "Characters";
+pub fn generate_classes_caption() -> &'static str {
+    crate::i18n::t("generate.characters")
+}
 
 /// The minimum-digits row's question, as the newer image words it.
-pub const GENERATE_MIN_NUMBER_LABEL: &str = "At least this many digits";
+pub fn generate_min_number_label() -> &'static str {
+    crate::i18n::t("generate.min_digits")
+}
 
 /// The look-alikes row's label and the sample under it.
 ///
@@ -1066,7 +1080,9 @@ pub const GENERATE_MIN_NUMBER_LABEL: &str = "At least this many digits";
 /// route's `ambiguous` flag actually removes, shown as the pairs they are
 /// confused with rather than described in a sentence. `\u{b7}` is the middle
 /// dot the image sets between the two pairs.
-pub const GENERATE_AVOID_LABEL: &str = "Avoid look-alikes";
+pub fn generate_avoid_label() -> &'static str {
+    crate::i18n::t("generate.avoid_lookalikes")
+}
 pub const GENERATE_AVOID_SAMPLE: &str = "0 O \u{b7} 1 l I";
 
 /// What the value line says while the round-trip is outstanding.
@@ -1074,7 +1090,9 @@ pub const GENERATE_AVOID_SAMPLE: &str = "0 O \u{b7} 1 l I";
 /// In the value's own 17px monospace rather than a smaller note, which is what
 /// the vault window's copy of this card does with its own pending line and for
 /// the same reason: the card is exactly one line tall either way.
-pub const GENERATE_WORKING_TEXT: &str = "Generating\u{2026}";
+pub fn generate_working_text() -> &'static str {
+    crate::i18n::t("generate.working")
+}
 
 /// What the value line says when the generator could not be reached.
 ///
@@ -1088,7 +1106,9 @@ pub const GENERATE_WORKING_TEXT: &str = "Generating\u{2026}";
 /// [`GENERATE_WORKING_TEXT`] is: a forty-character sentence at 17px monospace
 /// is wider than the card, and the one state whose whole job is to be read is
 /// not the state to truncate.
-pub const GENERATE_FAILED_TEXT: &str = "Could not generate a password. Try again.";
+pub fn generate_failed_text() -> &'static str {
+    crate::i18n::t("generate.failed")
+}
 
 /// **Puts the card on screen and answers the password the user chose to keep**
 /// -- `None` if they dismissed it.
@@ -1759,10 +1779,10 @@ static KEPT: std::sync::Mutex<Option<Zeroizing<String>>> = std::sync::Mutex::new
 mod win32 {
     use super::{
         Box2, Event, GenerateForm, GenerateWindow, GeneratedKind, Generator, ValueState, APP_NAME,
-        GENERATE_AVOID_LABEL, GENERATE_AVOID_SAMPLE, GENERATE_CAPTION, GENERATE_CLASSES_CAPTION,
-        GENERATE_COPY_LABEL, GENERATE_FAILED_TEXT, GENERATE_LABEL, GENERATE_MIN_NUMBER_LABEL,
-        GENERATE_PROMPT_TITLE, GENERATE_REGENERATE_LABEL, GENERATE_SAVE_LABEL,
-        GENERATE_WORKING_TEXT, GONE, KEPT, PENDING, REGENERATE_SHORTCUT, SECRET, VIEW,
+        generate_avoid_label, GENERATE_AVOID_SAMPLE, generate_caption, generate_classes_caption,
+        generate_copy_label, generate_failed_text, generate_label, generate_min_number_label,
+        GENERATE_PROMPT_TITLE, generate_regenerate_label, generate_save_label,
+        generate_working_text, GONE, KEPT, PENDING, REGENERATE_SHORTCUT, SECRET, VIEW,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -2319,7 +2339,7 @@ mod win32 {
                 // caller's error can carry a URL, a status and a response body.
                 log::warn!("the password generator could not be reached: {detail}");
                 wipe_secret();
-                Some(GENERATE_FAILED_TEXT.to_string())
+                Some(generate_failed_text().to_string())
             }
         }
     }
@@ -2531,10 +2551,10 @@ mod win32 {
         text_in(hdc, fonts.sample, dev(l.slider_high), &high.to_string(), TEXT_FAINT, right);
 
         let classes_ink = if form.classes_live() { INK } else { TEXT_GHOST };
-        text(hdc, fonts.prose, l.classes_caption, GENERATE_CLASSES_CAPTION, classes_ink);
+        text(hdc, fonts.prose, l.classes_caption, generate_classes_caption(), classes_ink);
 
         let min_ink = if form.min_number_live() { INK } else { TEXT_GHOST };
-        text(hdc, fonts.prose, l.min_label, GENERATE_MIN_NUMBER_LABEL, min_ink);
+        text(hdc, fonts.prose, l.min_label, generate_min_number_label(), min_ink);
         // The stepper's middle cell: one cell of a joined three, drawn through
         // the same painter its two buttons are so the seams line up.
         draw_segment_cell(
@@ -2550,7 +2570,7 @@ mod win32 {
             scale(super::RADIUS),
         );
 
-        text(hdc, fonts.prose, l.avoid_label, GENERATE_AVOID_LABEL, classes_ink);
+        text(hdc, fonts.prose, l.avoid_label, generate_avoid_label(), classes_ink);
         text(
             hdc,
             fonts.sample,
@@ -2786,7 +2806,7 @@ mod win32 {
         let label_right = rc.right - lane;
         let glyph = scale(super::REFRESH_GLYPH);
         let gap = scale(super::REFRESH_GAP);
-        let chars: Vec<u16> = GENERATE_REGENERATE_LABEL.encode_utf16().collect();
+        let chars: Vec<u16> = generate_regenerate_label().encode_utf16().collect();
         let label_w = text_width_utf16(hdc, fonts.button, &chars);
         let total = glyph + gap + label_w;
         let left = rc.left + ((label_right - rc.left) - total) / 2;
@@ -2801,7 +2821,7 @@ mod win32 {
             hdc,
             fonts.button,
             RECT { left: left + glyph + gap, right: label_right, ..rc },
-            GENERATE_REGENERATE_LABEL,
+            generate_regenerate_label(),
             ink,
             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
         );
@@ -3251,17 +3271,17 @@ mod win32 {
 
             if let Some(fonts) = fonts {
                 paint_lockup(mem, &l, fonts.brand);
-                text(mem, fonts.title, l.title, GENERATE_LABEL, crate::theme::INK);
+                text(mem, fonts.title, l.title, generate_label(), crate::theme::INK);
 
                 // The caption over the value (D 1.8): 15 in the faint ink.
-                text(mem, fonts.caption, l.caption, GENERATE_CAPTION, crate::theme::TEXT_FAINT);
+                text(mem, fonts.caption, l.caption, generate_caption(), crate::theme::TEXT_FAINT);
 
                 match form.state() {
                     ValueState::InFlight => text(
                         mem,
                         fonts.value,
                         l.value,
-                        GENERATE_WORKING_TEXT,
+                        generate_working_text(),
                         crate::theme::TEXT_FAINT,
                     ),
                     ValueState::Failed(message) => {
@@ -3433,9 +3453,9 @@ mod win32 {
                     // (drawn at [`super::BUTTON_H`]), `padding: 0 12px`,
                     // `border-radius: 7px`.
                     let (label, skin, glyph) = if id == ID_SAVE {
-                        (GENERATE_SAVE_LABEL, ButtonSkin::panel_primary(), true)
+                        (generate_save_label(), ButtonSkin::panel_primary(), true)
                     } else {
-                        (GENERATE_COPY_LABEL, ButtonSkin::panel_outline(), false)
+                        (generate_copy_label(), ButtonSkin::panel_outline(), false)
                     };
                     let skin = if !live {
                         skin.disabled()
@@ -3942,7 +3962,7 @@ mod tests {
             show: |_, _| {},
             fill: |_, request, generate| match generate(request) {
                 Ok(_) => None,
-                Err(_) => Some(GENERATE_FAILED_TEXT.to_string()),
+                Err(_) => Some(generate_failed_text().to_string()),
             },
             copy: |_| {},
             keep: |_| {},
@@ -4138,7 +4158,7 @@ mod tests {
             // The first round trip fails and the second succeeds.
             fill: |_, _, _| {
                 if FILLS.fetch_add(1, Ordering::SeqCst) == 0 {
-                    Some(GENERATE_FAILED_TEXT.to_string())
+                    Some(generate_failed_text().to_string())
                 } else {
                     None
                 }
@@ -5188,23 +5208,23 @@ mod tests {
     /// reason a test can read them at all on a surface no test may open.
     #[test]
     fn the_cards_words_are_the_ones_it_promises() {
-        assert_eq!(GENERATE_LABEL, "New password", "3d's caption over the field");
-        assert_eq!(GENERATE_CAPTION, "Suggested password", "design 1b's label over the value");
+        assert_eq!(generate_label(), "New password", "3d's caption over the field");
+        assert_eq!(generate_caption(), "Suggested password", "design 1b's label over the value");
         assert_eq!(
-            GENERATE_SAVE_LABEL, "Save to vault",
+            generate_save_label(), "Save to vault",
             "the primary button says *Fill*, on a path that holds no injector and cannot type \
              into the window behind the card"
         );
-        assert_eq!(GENERATE_COPY_LABEL, "Copy");
+        assert_eq!(generate_copy_label(), "Copy");
         assert_eq!(
-            GENERATE_REGENERATE_LABEL, "Regenerate",
+            generate_regenerate_label(), "Regenerate",
             "the newer 3d draws a *Regenerate* button where the older one drew a bare `CTRL+R \
              NEW` run; the composed run this used to assert is gone with it"
         );
         assert_eq!(REGENERATE_SHORTCUT, "CTRL+R");
-        assert_eq!(GENERATE_CLASSES_CAPTION, "Characters");
-        assert_eq!(GENERATE_MIN_NUMBER_LABEL, "At least this many digits");
-        assert_eq!(GENERATE_AVOID_LABEL, "Avoid look-alikes");
+        assert_eq!(generate_classes_caption(), "Characters");
+        assert_eq!(generate_min_number_label(), "At least this many digits");
+        assert_eq!(generate_avoid_label(), "Avoid look-alikes");
         assert_eq!(
             GENERATE_AVOID_SAMPLE, "0 O \u{b7} 1 l I",
             "the sample is the image's own two pairs, not a sentence about them"
@@ -5370,7 +5390,7 @@ mod tests {
         let _ = run_with(&calls, "Ledgerline", &detailed);
         let seen = SEEN.lock().unwrap().join(" ");
         assert!(
-            seen.contains(GENERATE_FAILED_TEXT),
+            seen.contains(generate_failed_text()),
             "the card did not show its own failure sentence: {seen}"
         );
         assert!(

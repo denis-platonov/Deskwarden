@@ -190,14 +190,18 @@ pub const LOCKED_CARD_TITLE: &str = "Deskwarden vault locked";
 /// title, "3 logins match", is not used: the process cannot know how many
 /// logins match while the vault is locked, and a number here would be the old
 /// lie in a new place.
-pub const LOCKED_PILL: &str = "Locked";
+pub fn locked_pill() -> &'static str {
+    crate::i18n::t("locked_card.pill")
+}
 
 /// What 3b's one button says, and **the only card that may carry it**.
 ///
 /// **It is not "Unlock Deskwarden"**, which is
 /// [`crate::unlock_prompt::UNLOCK_PROMPT_TITLE`]: a button says what pressing
 /// it does, and the window it opens says what it is.
-pub const UNLOCK_LABEL: &str = "Unlock";
+pub fn unlock_label() -> &'static str {
+    crate::i18n::t("locked_card.unlock")
+}
 
 /// The `Enter` chip inside the *Unlock* button: Enter presses it.
 pub const ENTER_SHORTCUT: &str = crate::prompt_card::ENTER_SHORTCUT;
@@ -230,8 +234,8 @@ pub const LOCKED_ROWS: usize = 1;
 /// fixed box rather than being allowed to grow a card that cannot scroll.
 pub fn locked_text(app_name: &str) -> (String, String) {
     (
-        "Deskwarden is locked".to_string(),
-        format!("Unlock to check the vault for {app_name}."),
+        crate::i18n::t("locked_card.title").to_string(),
+        crate::i18n::tf("locked_card.body", &[("app_name", app_name)]),
     )
 }
 
@@ -272,10 +276,10 @@ pub fn painted(app_name: &str) -> Vec<Painted> {
     let l = layout();
     let (primary, secondary) = locked_text(app_name);
     vec![
-        Painted { text: LOCKED_PILL.to_string(), at: l.pill, role: Role::Pill },
+        Painted { text: locked_pill().to_string(), at: l.pill, role: Role::Pill },
         Painted { text: primary, at: l.primary, role: Role::Primary },
         Painted { text: secondary, at: l.secondary, role: Role::Secondary },
-        Painted { text: UNLOCK_LABEL.to_string(), at: l.unlock, role: Role::Button },
+        Painted { text: unlock_label().to_string(), at: l.unlock, role: Role::Button },
     ]
 }
 
@@ -1378,7 +1382,7 @@ mod tests {
             .filter(|r| r.role == Role::Button)
             .map(|r| r.text)
             .collect();
-        assert_eq!(buttons, vec![UNLOCK_LABEL.to_string()]);
+        assert_eq!(buttons, vec![unlock_label().to_string()]);
         let all = painted(APP)
             .into_iter()
             .map(|r| r.text)
@@ -1639,8 +1643,8 @@ mod tests {
     /// than a literal at the paint site.
     #[test]
     fn the_cards_words_are_the_ones_it_promises() {
-        assert_eq!(LOCKED_PILL, "Locked");
-        assert_eq!(UNLOCK_LABEL, "Unlock");
+        assert_eq!(locked_pill(), "Locked");
+        assert_eq!(unlock_label(), "Unlock");
         assert_eq!(ENTER_SHORTCUT, "ENTER");
         assert_eq!(
             locked_text(APP),
@@ -1651,13 +1655,13 @@ mod tests {
             "the second line's verb is `check`: `see the login` would promise there is one"
         );
         assert_ne!(
-            LOCKED_PILL,
+            locked_pill(),
             locked_text(APP).0,
             "the pill names the state and the title explains it; a pill that repeated the title \
              would leave the card saying one thing twice"
         );
         assert_ne!(
-            UNLOCK_LABEL,
+            unlock_label(),
             crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
             "a button says what pressing it does; the window it opens says what it is"
         );

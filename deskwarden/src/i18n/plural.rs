@@ -206,7 +206,7 @@ impl Rule {
 /// CLDR's `many` for the Romance languages: `e = 0 and i != 0 and
 /// i % 1000000 = 0` -- one million, two million, and so on.
 fn is_exact_million(n: u64) -> bool {
-    n != 0 && n % 1_000_000 == 0
+    n != 0 && n.is_multiple_of(1_000_000)
 }
 
 #[cfg(test)]

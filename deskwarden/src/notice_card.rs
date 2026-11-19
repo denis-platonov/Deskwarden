@@ -122,7 +122,9 @@ pub fn run_with(calls: &NoticeCalls, notice: &Notice) -> Outcome {
 pub const NOTICE_CARD_TITLE: &str = "Deskwarden notice";
 
 /// The card's title for a fill that typed nothing at all.
-pub const NOTHING_TYPED_TITLE: &str = "Nothing was typed";
+pub fn nothing_typed_title() -> &'static str {
+    crate::i18n::t("notice_card.nothing_typed")
+}
 
 /// The card's title for a run that was abandoned part-way.
 ///
@@ -132,17 +134,23 @@ pub const NOTHING_TYPED_TITLE: &str = "Nothing was typed";
 /// is on their screen. The code already tells the two apart: an abandoned run
 /// is the one message that leads with
 /// [`crate::injector::sequence::STOPPED_PREFIX`].
-pub const STOPPED_TITLE: &str = "Typing stopped";
+pub fn stopped_title() -> &'static str {
+    crate::i18n::t("notice_card.stopped")
+}
 
 /// The one button's label.
-pub const OK_LABEL: &str = "OK";
+pub fn ok_label() -> &'static str {
+    crate::i18n::t("notice_card.ok")
+}
 
 /// The chip inside it. `crate::prompt_card::ENTER_SHORTCUT`'s spelling.
 pub const ENTER_SHORTCUT: &str = crate::prompt_card::ENTER_SHORTCUT;
 
 /// What the body says when the refusal arrived with no words at all. No
 /// caller sends one today; a card with an empty well is worse than this.
-pub const FALLBACK_BODY: &str = "Deskwarden did not complete this fill.";
+pub fn fallback_body() -> &'static str {
+    crate::i18n::t("notice_card.fallback_body")
+}
 
 /// **What the card says for one refusal.**
 ///
@@ -156,8 +164,8 @@ pub const FALLBACK_BODY: &str = "Deskwarden did not complete this fill.";
 pub fn notice_for(detail: &str) -> Notice {
     let detail = detail.trim();
     let (title, rest) = match detail.strip_prefix(crate::injector::sequence::STOPPED_PREFIX) {
-        Some(rest) => (STOPPED_TITLE, rest.trim_start()),
-        None => (NOTHING_TYPED_TITLE, detail),
+        Some(rest) => (stopped_title(), rest.trim_start()),
+        None => (nothing_typed_title(), detail),
     };
     let heading = format!("{}. ", crate::vault_window::preflight::REFUSED_HEADING);
     let rest = rest.strip_prefix(heading.as_str()).unwrap_or(rest);
@@ -169,7 +177,7 @@ fn sentence(text: &str) -> String {
     let text = text.trim();
     let mut chars = text.chars();
     let Some(first) = chars.next() else {
-        return FALLBACK_BODY.to_string();
+        return fallback_body().to_string();
     };
     let mut out: String = first.to_uppercase().collect();
     out.push_str(chars.as_str());
@@ -230,7 +238,7 @@ pub fn painted(notice: &Notice, body_text_h: i32) -> Vec<Painted> {
     vec![
         Painted { text: notice.title.to_string(), at: l.title, role: Role::Title },
         Painted { text: notice.body.clone(), at: l.body_text, role: Role::Body },
-        Painted { text: OK_LABEL.to_string(), at: l.ok, role: Role::Button },
+        Painted { text: ok_label().to_string(), at: l.ok, role: Role::Button },
     ]
 }
 
@@ -403,9 +411,18 @@ pub enum DoneCase {
 /// The title and subtitle for `case` (D 1.4).
 pub fn done_copy(case: DoneCase) -> (&'static str, &'static str) {
     match case {
-        DoneCase::Saved => ("Login saved", "Deskwarden fills it next time"),
-        DoneCase::Updated => ("Password updated", "Saved to your vault"),
-        DoneCase::SignedIn => ("Signed in", "Filled by Deskwarden"),
+        DoneCase::Saved => (
+            crate::i18n::t("notice_card.saved_title"),
+            crate::i18n::t("notice_card.saved_sub"),
+        ),
+        DoneCase::Updated => (
+            crate::i18n::t("notice_card.updated_title"),
+            crate::i18n::t("notice_card.updated_sub"),
+        ),
+        DoneCase::SignedIn => (
+            crate::i18n::t("notice_card.signed_in_title"),
+            crate::i18n::t("notice_card.signed_in_sub"),
+        ),
     }
 }
 
@@ -1011,7 +1028,7 @@ mod win32 {
     fn shown() -> (Vec<Painted>, i32) {
         let held = SHOWN.lock().ok().and_then(|slot| slot.clone());
         let (notice, body_h) = held.unwrap_or_else(|| {
-            (Notice { title: super::NOTHING_TYPED_TITLE, body: String::new() }, 0)
+            (Notice { title: super::nothing_typed_title(), body: String::new() }, 0)
         });
         (super::painted(&notice, body_h), body_h)
     }
@@ -1458,7 +1475,7 @@ mod tests {
         let detail = run(&kb, 7, &plan).expect_err("the run is abandoned");
 
         let notice = notice_for(&detail);
-        assert_eq!(notice.title, STOPPED_TITLE);
+        assert_eq!(notice.title, stopped_title());
         assert!(
             notice.body.starts_with("Window 7 is no longer in front"),
             "the body still carries the prefix the title replaced: {:?}",
@@ -1479,7 +1496,7 @@ mod tests {
         ];
         for detail in details {
             let notice = notice_for(&detail);
-            assert_eq!(notice.title, NOTHING_TYPED_TITLE, "for {detail:?}");
+            assert_eq!(notice.title, nothing_typed_title(), "for {detail:?}");
             let first = notice.body.chars().next().unwrap();
             assert!(first.is_uppercase(), "{:?} does not start a sentence", notice.body);
             assert!(notice.body.ends_with('.'), "{:?} does not end one", notice.body);
@@ -1493,8 +1510,8 @@ mod tests {
             "The auto-type sequence types nothing."
         );
         assert_eq!(notice_for("Already a sentence!").body, "Already a sentence!");
-        assert_eq!(notice_for("").body, FALLBACK_BODY);
-        assert_eq!(notice_for("   ").title, NOTHING_TYPED_TITLE);
+        assert_eq!(notice_for("").body, fallback_body());
+        assert_eq!(notice_for("   ").title, nothing_typed_title());
         // A non-ASCII first letter is capitalised as a letter, not a byte.
         assert_eq!(notice_for("élan").body, "Élan.");
     }
@@ -1673,12 +1690,12 @@ mod tests {
 
     #[test]
     fn the_cards_words_and_dimensions_are_the_ones_it_promises() {
-        assert_eq!(NOTHING_TYPED_TITLE, "Nothing was typed");
-        assert_eq!(OK_LABEL, "OK");
+        assert_eq!(nothing_typed_title(), "Nothing was typed");
+        assert_eq!(ok_label(), "OK");
         assert_eq!(ENTER_SHORTCUT, "ENTER");
         assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H);
         assert_eq!(WIDTH, crate::panel_draw::CARD_W);
-        assert_ne!(NOTHING_TYPED_TITLE, STOPPED_TITLE);
+        assert_ne!(nothing_typed_title(), stopped_title());
     }
 
     /// **The done card says what the design says**, and nothing it cannot know.

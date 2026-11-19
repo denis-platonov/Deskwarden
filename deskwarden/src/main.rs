@@ -1976,7 +1976,7 @@ fn main() {
                     .as_ref()
                     .map(|(config_dir, account)| (config_dir.as_path(), account)),
                 sign_in_first_run,
-                SETUP_MESSAGE,
+                setup_message(),
                 // ON A WORKER THREAD. `try_start_backend` rather than
                 // `start_backend`: the fatal variant puts a modal message box
                 // up, and doing that from a worker while an eframe window owns
@@ -4743,12 +4743,7 @@ fn learn_active_account_details(
 /// wording drifted into "Remove this account?" would be asking about something
 /// far less final than what happens next.
 fn account_removal_warning(label: &str) -> String {
-    format!(
-        "Remove {label} from Deskwarden?\n\nThis signs that account out and DELETES its local \
-         Bitwarden profile from this computer, including its saved session and its Windows \
-         Hello quick unlock. Your vault on the server is not touched, and you can sign in to \
-         this account again afterwards.\n\nThis cannot be undone."
-    )
+    deskwarden::i18n::tf("main.remove_account_warning", &[("label", label)])
 }
 
 /// Asks before deleting an account's profile. `true` only on an explicit Yes.
@@ -4758,7 +4753,7 @@ fn account_removal_warning(label: &str) -> String {
 /// app does, and a stray Return should not be what does it.
 fn confirm_account_removal(label: &str) -> bool {
     let answer = message_box(
-        "Deskwarden: remove account",
+        deskwarden::i18n::t("main.remove_account_title"),
         &account_removal_warning(label),
         MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2,
     );
@@ -4787,7 +4782,7 @@ fn confirm_account_removal(label: &str) -> bool {
 /// the app running and locked and names a recovery that works.
 fn fatal_startup_error(message: &str) -> ! {
     log::error!("refusing to start: {}", message.replace('\n', " "));
-    message_box("Deskwarden cannot start", message, MB_ICONERROR | MB_OK);
+    message_box(deskwarden::i18n::t("main.cannot_start_title"), message, MB_ICONERROR | MB_OK);
     std::process::exit(1);
 }
 
@@ -4892,13 +4887,9 @@ fn check_bw_signature(bw_exe: &std::path::Path) {
                 bw_exe.display(),
                 subject_dn
             );
-            fatal_startup_error(&format!(
-                "The Bitwarden CLI that Deskwarden found is not validly signed, so Deskwarden \
-                 will not run it.\n\nFile:\n{}\n\nWindows could not confirm the file's \
-                 signature. It may have been modified or replaced. Deskwarden hands this \
-                 program your master password, so it is stopping instead.\n\nReinstall the \
-                 Bitwarden CLI from bitwarden.com, or reinstall Deskwarden.",
-                bw_exe.display()
+            fatal_startup_error(&deskwarden::i18n::tf(
+                "main.cli_not_signed",
+                &[("file", &bw_exe.display().to_string())],
             ));
         }
         BwSignatureVerdict::AskUnrecognizedOrg => {
@@ -4909,7 +4900,7 @@ fn check_bw_signature(bw_exe: &std::path::Path) {
                 subject_dn
             );
             (
-                "signed by an organization Deskwarden does not recognize",
+                deskwarden::i18n::t("main.cli_unrecognized_org"),
                 describe_signer(subject_dn.as_deref()),
             )
         }
@@ -4918,27 +4909,23 @@ fn check_bw_signature(bw_exe: &std::path::Path) {
                 .as_ref()
                 .err()
                 .map(String::as_str)
-                .unwrap_or("(no detail was reported)");
+                .unwrap_or_else(|| deskwarden::i18n::t("main.cli_no_detail"));
             log::warn!(
                 "could not verify the signature of {}: {e}",
                 bw_exe.display()
             );
             (
-                "could not be signature-checked at all",
-                format!("The check failed with: {e}"),
+                deskwarden::i18n::t("main.cli_unverifiable"),
+                deskwarden::i18n::tf("main.cli_check_failed", &[("error", e)]),
             )
         }
     };
 
     let answer = message_box(
-        "Deskwarden: unrecognized Bitwarden CLI",
-        &format!(
-            "The Bitwarden CLI Deskwarden is about to use {headline}.\n\nFile:\n{}\n\n{detail}\n\n\
-             Deskwarden gives this program your master password and vault session, so it should \
-             only be Bitwarden's own CLI. This can also happen with a `bw` installed through \
-             Scoop or Chocolatey, which are signed differently (or not at all).\n\nContinue \
-             anyway?\n\nChoose No unless you know where this bw.exe came from.",
-            bw_exe.display()
+        deskwarden::i18n::t("main.cli_unrecognized_title"),
+        &deskwarden::i18n::tf(
+            "main.cli_unrecognized_body",
+            &[("headline", headline), ("file", &bw_exe.display().to_string()), ("detail", &detail)],
         ),
         MB_ICONWARNING | MB_YESNO | MB_DEFBUTTON2,
     );
@@ -4961,12 +4948,12 @@ fn check_bw_signature(bw_exe: &std::path::Path) {
 /// raw multi-line DN in a dialog is noise to everyone who isn't debugging.
 fn describe_signer(subject_dn: Option<&str>) -> String {
     let Some(dn) = subject_dn else {
-        return "It has no signer certificate.".to_string();
+        return deskwarden::i18n::t("main.signer_none").to_string();
     };
     let orgs = deskwarden::signature::dn_component(dn, "O");
     match orgs.first() {
-        Some(org) => format!("It is signed by: {org}"),
-        None => "Its signer certificate names no organization.".to_string(),
+        Some(org) => deskwarden::i18n::tf("main.signer_org", &[("org", org)]),
+        None => deskwarden::i18n::t("main.signer_no_org").to_string(),
     }
 }
 
@@ -6137,7 +6124,7 @@ fn the_second_lock_takes_the_session_down_and_says_so(
         "the startup window was locked a second time and had no teardown left to run; \
          the session has been taken down here and Deskwarden is exiting cleanly"
     );
-    message_box("Deskwarden", SECOND_LOCK_EXIT_MESSAGE, MB_ICONWARNING | MB_OK);
+    message_box("Deskwarden", second_lock_exit_message(), MB_ICONWARNING | MB_OK);
     std::process::exit(0);
 }
 
@@ -6147,8 +6134,9 @@ fn the_second_lock_takes_the_session_down_and_says_so(
 /// this path is that the app no longer disappears without saying anything,
 /// and "it says something" is only a property while something checks it.
 /// It has to name the state the vault is in and the way back.
-const SECOND_LOCK_EXIT_MESSAGE: &str = "Your vault is locked and Deskwarden has closed.\n\n\
-     Start Deskwarden again to sign back in.";
+fn second_lock_exit_message() -> &'static str {
+    deskwarden::i18n::t("main.second_lock_exit")
+}
 
 /// Rebuilds the tray's "Accounts" submenu after the vault window has closed.
 ///
@@ -8197,8 +8185,7 @@ impl VaultOps for RealVaultOps<'_> {
                 );
                 message_box(
                     "Deskwarden",
-                    "Could not open the vault window.\n\nDeskwarden could not start the \
-                     process that draws it. Please try Open Vault again.",
+                    deskwarden::i18n::t("main.vault_window_failed"),
                     MB_ICONERROR,
                 );
             }
@@ -11337,7 +11324,9 @@ fn sync_outcome_from(
 /// Neither retry opens a window of its own any more -- the silent one shows
 /// nothing, and the recovery's retry happens inside the recovery window -- so
 /// there is nothing left for either message to distinguish.
-const SETUP_MESSAGE: &str = "Setting up your vault...";
+fn setup_message() -> &'static str {
+    deskwarden::i18n::t("main.setup")
+}
 
 /// Outcome of [`wait_for_the_vault`].
 ///
@@ -12743,7 +12732,7 @@ fn run_as_a_ui_process(surface: Surface) -> i32 {
             // see `resolve_startup` above. So there is never a newly minted
             // account here to offer it for.
             false,
-            SETUP_MESSAGE,
+            setup_message(),
             // **THE STAGE BETWEEN THE CARD AND THE VAULT, and it now has two
             // shapes because two sign-ins reach it.**
             //
@@ -13167,8 +13156,7 @@ fn the_daemon_let_this_window_go() {
     deskwarden::clipboard::clear_if_still_ours_for(deskwarden::clipboard::ClearTrigger::Quit);
     message_box(
         "Deskwarden",
-        "This vault window lost its connection to Deskwarden -- the vault was locked, or \
-         Deskwarden restarted. Open the vault again from the Deskwarden tray icon.",
+        deskwarden::i18n::t("main.window_lost_connection"),
         MB_ICONWARNING | MB_OK,
     );
     std::process::exit(0);
@@ -13735,10 +13723,7 @@ fn apply_disk_cache_change(cache: &VaultCache, before: bool, after: bool) -> boo
                 log::warn!("could not start keeping an encrypted vault copy: {e}");
                 message_box(
                     "Deskwarden",
-                    &format!(
-                        "Deskwarden could not start keeping an encrypted copy of your vault:\n\n\
-                         {e}\n\nThe setting has been left off."
-                    ),
+                    &deskwarden::i18n::tf("main.cache_start_failed", &[("error", &e.to_string())]),
                     MB_ICONWARNING | MB_OK,
                 );
                 false
@@ -13749,10 +13734,7 @@ fn apply_disk_cache_change(cache: &VaultCache, before: bool, after: bool) -> boo
                 log::error!("could not delete the encrypted vault copy: {e}");
                 message_box(
                     "Deskwarden",
-                    &format!(
-                        "The encrypted copy of your vault could not be deleted:\n\n{e}\n\n\
-                         It is still on disk at that location."
-                    ),
+                    &deskwarden::i18n::tf("main.cache_delete_failed", &[("error", &e.to_string())]),
                     MB_ICONERROR | MB_OK,
                 );
             } else {
@@ -15546,13 +15528,8 @@ fn start_backend(session_token: &str, job: Option<&job_object::KillOnCloseJob>) 
 fn stand_down_without_a_backend(e: &BackendStartError) {
     log::warn!("continuing without a vault backend: {e}");
     message_box(
-        "Deskwarden started without your vault",
-        &format!(
-            "{e}\n\nDeskwarden is running and its tray icon is available, but your vault is \
-             empty and autofill has nothing to fill from until the Bitwarden CLI is back.\n\n\
-             The tray icon can still sign you out, switch accounts and open preferences. \
-             Restarting Deskwarden will offer to reinstall the CLI again."
-        ),
+        deskwarden::i18n::t("main.no_vault_title"),
+        &deskwarden::i18n::tf("main.no_vault_body", &[("error", &e.to_string())]),
         MB_ICONWARNING | MB_OK,
     );
 }
@@ -19835,14 +19812,16 @@ mod tests {
     #[test]
     fn the_second_lock_says_something_before_it_goes() {
         assert!(
-            SECOND_LOCK_EXIT_MESSAGE.contains("locked"),
+            second_lock_exit_message().contains("locked"),
             "the second lock's message does not tell the user their vault is locked, which \
-             is the one fact they need: {SECOND_LOCK_EXIT_MESSAGE:?}"
+             is the one fact they need: {:?}",
+            second_lock_exit_message()
         );
         assert!(
-            SECOND_LOCK_EXIT_MESSAGE.contains("again"),
+            second_lock_exit_message().contains("again"),
             "the message names no way back, so as far as the user is concerned the app has \
-             still just disappeared: {SECOND_LOCK_EXIT_MESSAGE:?}"
+             still just disappeared: {:?}",
+            second_lock_exit_message()
         );
     }
 
@@ -35497,7 +35476,7 @@ mod startup_shape_tests {
                  space -- a backstop, not a teardown",
             ),
             (
-                concat!("message_", "box(\"Deskwarden\", SECOND_LOCK_EXIT_MESSAGE"),
+                concat!("message_", "box(\"Deskwarden\", second_lock_exit_message()"),
                 "the second lock exits without showing the user anything, which is the \
                  finding verbatim: press Lock twice and the app vanishes with no word",
             ),

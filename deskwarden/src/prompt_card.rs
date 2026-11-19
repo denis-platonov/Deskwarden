@@ -184,10 +184,20 @@ pub fn account_lines(
     username: Option<&str>,
 ) -> (String, String) {
     match (username, item_name.is_empty()) {
-        (Some(u), false) => (u.to_string(), format!("{item_name} · fills {app_name}")),
-        (Some(u), true) => (u.to_string(), format!("fills {app_name}")),
-        (None, false) => (item_name.to_string(), format!("fills {app_name}")),
-        (None, true) => ("Saved credentials".to_string(), format!("fills {app_name}")),
+        (Some(u), false) => (
+            u.to_string(),
+            crate::i18n::tf("prompt_card.item_fills", &[("item_name", item_name), ("app_name", app_name)]),
+        ),
+        (Some(u), true) => {
+            (u.to_string(), crate::i18n::tf("prompt_card.fills", &[("app_name", app_name)]))
+        }
+        (None, false) => {
+            (item_name.to_string(), crate::i18n::tf("prompt_card.fills", &[("app_name", app_name)]))
+        }
+        (None, true) => (
+            crate::i18n::t("prompt_card.saved_credentials").to_string(),
+            crate::i18n::tf("prompt_card.fills", &[("app_name", app_name)]),
+        ),
     }
 }
 
@@ -480,7 +490,7 @@ pub fn layout(rows: usize) -> Layout {
     let (tx, ty, tw, th) = crate::panel_draw::tip_box(
         (help.x, help.y, help.right(), help.bottom()),
         WIDTH,
-        crate::panel_draw::FILL_KEY_HINTS.len(),
+        crate::panel_draw::fill_key_hints().len(),
     );
     let tip = Box2 { x: tx, y: ty, w: tw, h: th };
 
@@ -836,7 +846,7 @@ mod win32 {
         else {
             return abandon(window);
         };
-        panel_draw::set_tip(tip_font, &panel_draw::FILL_KEY_HINTS, DPI_PERCENT.load(Ordering::SeqCst));
+        panel_draw::set_tip(tip_font, &panel_draw::fill_key_hints(), DPI_PERCENT.load(Ordering::SeqCst));
         if !panel_draw::create_tip(window, dev(l.tip)) {
             return abandon(window);
         }
@@ -2007,8 +2017,8 @@ mod tests {
     fn the_cards_words_are_the_ones_it_promises() {
         assert_eq!(ENTER_SHORTCUT, "ENTER");
         // The panel's own key hints, which the `?` badge opens.
-        assert_eq!(crate::panel_draw::ENTER_LABEL, "Enter");
-        assert!(crate::panel_draw::FILL_KEY_HINTS.iter().any(|l| l.contains("Esc")));
+        assert_eq!(crate::panel_draw::enter_label(), "Enter");
+        assert!(crate::panel_draw::fill_key_hints().iter().any(|l| l.contains("Esc")));
     }
 
     /// **The title is this window's own.**

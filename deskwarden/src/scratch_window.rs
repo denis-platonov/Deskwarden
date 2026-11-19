@@ -686,15 +686,17 @@ pub fn arrived_job(arrived: &str, font: egui::FontId) -> egui::text::LayoutJob {
 /// shape this crate keeps getting caught by.
 pub fn act_row(act: &Arrival) -> (String, String) {
     match act {
-        Arrival::Typed(text) => ("Typed".to_string(), text.clone()),
-        Arrival::Pressed(key) => ("Pressed".to_string(), key.clone()),
-        Arrival::Paused(d) => ("Paused".to_string(), rehearsal::elapsed_label(*d)),
+        Arrival::Typed(text) => (crate::i18n::t("scratch.typed").to_string(), text.clone()),
+        Arrival::Pressed(key) => (crate::i18n::t("scratch.pressed").to_string(), key.clone()),
+        Arrival::Paused(d) => (crate::i18n::t("scratch.paused").to_string(), rehearsal::elapsed_label(*d)),
     }
 }
 
 /// The heading over the list of acts the sender was handed, in the same tracked
 /// uppercase mono 4d gives [`rehearsal::ARRIVED_HEADING`].
-pub const SENT_HEADING: &str = "WHAT WAS SENT";
+pub fn sent_heading() -> &'static str {
+    crate::i18n::t("scratch.sent_heading")
+}
 
 /// The width of the label column in the acts list, from 4d's own rows.
 const ACT_LABEL_WIDTH: f32 = 104.0;
@@ -779,7 +781,7 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
             egui::Frame::new().inner_margin(Margin::symmetric(16, 14)).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().item_spacing.y = 8.0;
-                ui.label(theme::letterspaced_mono(SENT_HEADING, 12.0, 0.66, theme::TEXT_FAINT));
+                ui.label(theme::letterspaced_mono(sent_heading(), 12.0, 0.66, theme::TEXT_FAINT));
                 for act in &view.sent {
                     let (label, value) = act_row(act);
                     ui.horizontal(|ui| {
@@ -807,7 +809,7 @@ pub fn draw(ui: &mut egui::Ui, view: &RehearsalView, arrived: &mut String) -> bo
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, "Close", None).clicked();
+                        close |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, crate::i18n::t("scratch.close"), None).clicked();
                     });
                 });
         });
