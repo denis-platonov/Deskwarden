@@ -1608,6 +1608,10 @@ pub fn draw_share_form(
     ui.add_space(16.0);
 
     let problem = export_problem(draft, now);
+    if draft.selection.password {
+        note(ui, PASSWORD_TRAVELS, theme::DANGER_INK);
+        ui.add_space(8.0);
+    }
     if let Some(problem) = problem.filter(|p| *p != NOTHING_TICKED) {
         note(ui, problem, theme::ERROR);
         ui.add_space(8.0);

@@ -2918,13 +2918,17 @@ pub fn build_frame_with_search(
             }
         }
         let shortcuts = keyboard_shortcuts_enabled(prefs.is_some());
+        // Review (slice 5): Ctrl+K/N/F and the record and 2FA chords never act
+        // behind a modal (one Esc would then close two) nor before the vault
+        // is on screen. Ctrl+L still locks from anywhere.
+        let chords = shortcuts && !item_list::a_modal_is_up(ui.ctx()) && !vault_loading;
         let rail_new_item = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::NewItem);
         let rail_lock = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::Lock);
         let (ctrl_k, ctrl_l, ctrl_n, send_record_chord, add_totp_chord) = ui.ctx().input(|i| {
             (
-                shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::K),
+                chords && i.modifiers.ctrl && i.key_pressed(egui::Key::K),
                 shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::L),
-                shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::N),
+                chords && i.modifiers.ctrl && i.key_pressed(egui::Key::N),
                 // **`matches_exact`, and the three above deliberately are
                 // not.** Those three read `i.modifiers.ctrl`, which is TRUE
                 // WITH SHIFT HELD -- so a fourth chord spelled the same loose
@@ -2971,10 +2975,11 @@ pub fn build_frame_with_search(
             add_totp_asked = true;
         }
         // Spec B §4: Ctrl+K is the palette; Ctrl+F is the search box.
-        if ctrl_k || sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenPalette) {
+        let chip_palette = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenPalette);
+        if (ctrl_k || chip_palette) && palette_state.is_none() {
             palette_state = Some(palette::PaletteState::default());
         }
-        if shortcuts && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+        if chords && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
         }
         if ctrl_l {
@@ -6788,6 +6793,9 @@ pub fn build_frame_with_search(
         // it -- the item pane resolves a selection against the filter's own
         // list, and under All an archived id would be "Select an item.".
         if let Some(item_id) = open_record {
+            // Spec B §7's Change password asked for the editor; taken here so a
+            // record that cannot be opened does not leave the ask behind.
+            let edit_after = ctx_edit_after_open(false);
             let holds = |list: Option<&[VaultItem]>| list.is_some_and(|l| l.iter().any(|item| item.id == item_id));
             let home = if holds(Some(items.as_slice())) {
                 Some(SidebarFilter::All)
@@ -6806,9 +6814,13 @@ pub fn build_frame_with_search(
                 selected_id = Some(item_id.clone());
                 detail_dismissed = false;
                 mode = DetailMode::Read;
-                // Spec B §7's Change password: straight into the editor.
-                if ctx_edit_after_open(false) {
-                    if let Some(item) = items.iter().find(|i| i.id == item_id) {
+                // Spec B §7's Change password: straight into the editor -- but
+                // not past the master-password re-prompt or onto an item this
+                // account may not edit; those open read, where Edit asks.
+                if edit_after {
+                    if let Some(item) = items.iter().find(|i| i.id == item_id).filter(|item| {
+                        crate::vault_bridge::may_edit(item) && !crate::vault_bridge::reprompt_protected(item)
+                    }) {
                         mode = DetailMode::Edit(EditDraft::from_item(item));
                     }
                 }
@@ -7147,14 +7159,30 @@ pub fn build_frame_with_search(
                 palette::PaletteAnswer::Closed => palette_state = None,
                 palette::PaletteAnswer::Item(id) => {
                     palette_state = None;
-                    selected_id = Some(id);
-                    mode = DetailMode::Read;
+                    // The vault, unfiltered, with the item in it: the pane
+                    // resolves its selection against the filter's list, so a
+                    // pick under Trash or a screen would show nothing.
+                    sends_selected = false;
+                    received_selected = false;
+                    health_selected = false;
+                    filter = SidebarFilter::All;
+                    detail_dismissed = false;
+                    if selected_id.as_deref() != Some(id.as_str()) && !asks_to_discard(&mut mode) {
+                        search.clear();
+                        selected_id = Some(id);
+                        mode = DetailMode::Read;
+                    }
                 }
                 palette::PaletteAnswer::Action(action) => {
                     palette_state = None;
                     match action {
                         palette::PaletteAction::NewLogin => {
-                            mode = DetailMode::Create(EditDraft::empty_of(crate::vault_bridge::ItemKind::Login))
+                            sends_selected = false;
+                            received_selected = false;
+                            health_selected = false;
+                            if !asks_to_discard(&mut mode) {
+                                mode = DetailMode::Create(EditDraft::empty_of(crate::vault_bridge::ItemKind::Login))
+                            }
                         }
                         palette::PaletteAction::Share => send_record_asked = true,
                         palette::PaletteAction::Settings => {
@@ -7168,7 +7196,7 @@ pub fn build_frame_with_search(
                 }
             }
         }
-        if send_record_asked {
+        if send_record_asked && record_send.is_none() {
             if let Some(item) = selected_id
                 .as_ref()
                 .and_then(|id| items.iter().find(|i| &i.id == id))
@@ -7813,7 +7841,9 @@ pub fn build_frame_with_search(
             match new_item_modal::draw(ui.ctx()) {
                 new_item_modal::ChooserAnswer::Picked(kind) => {
                     new_item_chooser = false;
-                    mode = DetailMode::Create(EditDraft::empty_of(kind));
+                    if !asks_to_discard(&mut mode) {
+                        mode = DetailMode::Create(EditDraft::empty_of(kind));
+                    }
                 }
                 new_item_modal::ChooserAnswer::Closed => new_item_chooser = false,
                 new_item_modal::ChooserAnswer::Open => {}
@@ -12627,6 +12657,18 @@ impl SendDeleteState {
             // is what refuses a delete started while it runs.
             revoking: self.in_flight.as_deref() == Some(send.id.as_str()) && !self.extending,
         })
+    }
+}
+
+/// Whether an open editor has unsaved changes; if so its discard
+/// confirmation is raised and the caller leaves the editor where it is.
+fn asks_to_discard(mode: &mut DetailMode) -> bool {
+    match mode {
+        DetailMode::Edit(draft) | DetailMode::Create(draft) if draft.is_dirty() => {
+            draft.discard_prompt = true;
+            true
+        }
+        _ => false,
     }
 }
 
@@ -28786,8 +28828,17 @@ mod preferences_modal_wiring_tests {
             1,
             "the shortcut block does not compute {asks:?}, so nothing suppresses Ctrl+K/L/N"
         );
+        // Ctrl+L on `shortcuts`; Ctrl+K and Ctrl+N on `chords`, which is
+        // `shortcuts` and no other modal up (slice 5 review).
         assert_eq!(
-            occurrences(concat!("shortcuts && i.modifiers.", "ctrl && i.key_pressed")),
+            occurrences(concat!("let chords = shortcuts", " && ")),
+            1,
+            "Ctrl+K and Ctrl+N are not gated through `shortcuts`"
+        );
+        assert_eq!(
+            occurrences(concat!("shortcuts && i.modifiers.", "ctrl && i.key_pressed"))
+                + occurrences(concat!("chords && i.modifiers.", "ctrl && i.key_pressed(egui::Key::K)"))
+                + occurrences(concat!("chords && i.modifiers.", "ctrl && i.key_pressed(egui::Key::N)")),
             3,
             "not all three of Ctrl+K, Ctrl+L and Ctrl+N are gated on the modal; the ungated \
              one fires from behind it"
@@ -29132,8 +29183,9 @@ mod preferences_modal_wiring_tests {
             // `mod titlebar_switcher_placement_tests`, which measured the v1
             // chrome's gear, chevron and drag zone.
             // 70 with `edit_trash_wiring` (v2 editor, Move to trash); 71 with
-            // `new_item_chooser_wiring`; 72 with `palette_wiring`.
-            modules, 72,
+            // `new_item_chooser_wiring`; 72 with `palette_wiring`; 73 with
+            // `slice5_review_guards`.
+            modules, 73,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -41153,7 +41205,7 @@ mod reprompt_gating_tests {
         // The two chords: inside the block that opens each form.
         let may_edit = concat!(".filter(|item| crate::vault_bridge::may_", "edit(item))");
         for (opens, form) in [
-            ("if send_record_asked {", concat!("record_send = permit_record_", "send(")),
+            ("if send_record_asked && record_send.is_none() {", concat!("record_send = permit_record_", "send(")),
             ("if add_totp_asked && totp_add_state.is_none() {", concat!("totp_add::TotpAdd::", "opening(")),
         ] {
             let start = at(opens);
@@ -42097,7 +42149,7 @@ mod new_item_chooser_wiring {
         assert!(SOURCE[at..at + 120].contains(concat!("new_item_chooser", " = true;")));
         assert!(!SOURCE.contains(concat!("ctrl_n || ", "rail_new_item")), "the rail still creates a login");
         let pick = SOURCE.find(concat!("ChooserAnswer::", "Picked(kind) => {")).expect("the pick arm");
-        assert!(SOURCE[pick..pick + 200].contains(concat!("EditDraft::", "empty_of(kind)")));
+        assert!(SOURCE[pick..pick + 320].contains(concat!("EditDraft::", "empty_of(kind)")));
     }
 }
 
@@ -42109,10 +42161,52 @@ mod palette_wiring {
 
     #[test]
     fn ctrl_k_opens_the_palette() {
-        let at = SOURCE.find(concat!("if ctrl_k", " || ")).expect("the Ctrl+K arm");
+        let at = SOURCE.find(concat!("if (ctrl_k", " || chip_palette)")).expect("the Ctrl+K arm");
         assert!(SOURCE[at..at + 260].contains(concat!("palette_state = Some(", "palette::PaletteState::default())")));
         let draw = SOURCE.find(concat!("palette::draw(", "ui.ctx()")).expect("the palette is drawn");
-        let send = SOURCE.find(concat!("if send_record_asked", " {")).expect("the Share request is read");
+        let send = SOURCE.find(concat!("if send_record_asked", " && record_send.is_none() {")).expect("the Share request is read");
         assert!(draw < send, "the palette's Share would be read a frame late and dropped");
+    }
+}
+
+#[cfg(test)]
+mod slice5_review_guards {
+    //! The slice 5 review's fixes. Source guards (the arms live in `run`'s
+    //! per-frame closure); needles split across literals.
+    use super::*;
+    const SOURCE: &str = include_str!("mod.rs");
+
+    #[test]
+    fn a_waiting_share_is_never_replaced() {
+        assert!(SOURCE.contains(concat!("if send_record_asked && ", "record_send.is_none() {")));
+    }
+
+    #[test]
+    fn chords_do_not_act_behind_a_modal() {
+        assert!(SOURCE.contains(concat!("let chords = ", "shortcuts && !item_list::a_modal_is_up(ui.ctx()) && !vault_loading;")));
+        for chord in ["K", "N"] {
+            assert!(SOURCE.contains(&format!("chords && i.modifiers.ctrl && i.key_pressed(egui::Key::{chord})")), "Ctrl+{chord}");
+        }
+    }
+
+    #[test]
+    fn change_password_respects_the_reprompt_and_never_lingers() {
+        let at = SOURCE.find(concat!("if let Some(item_id) = ", "open_record {")).expect("the open-record arm");
+        assert!(SOURCE[at..at + 300].contains(concat!("ctx_edit_after_open", "(false)")), "the ask is taken first");
+        assert!(SOURCE.contains(concat!("!crate::vault_bridge::", "reprompt_protected(item)")));
+    }
+
+    #[test]
+    fn a_dirty_draft_asks_before_a_pick_replaces_it() {
+        let mut draft = EditDraft::from_item(&serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "Ledgerline", "type": 1, "login": { "uris": [] }
+        })).unwrap());
+        draft.name = "Changed".into();
+        let mut mode = DetailMode::Edit(draft);
+        assert!(asks_to_discard(&mut mode), "a dirty draft is kept");
+        let DetailMode::Edit(draft) = &mode else { panic!("the editor was replaced") };
+        assert!(draft.discard_prompt, "and its confirmation raised");
+        let mut clean = DetailMode::Read;
+        assert!(!asks_to_discard(&mut clean));
     }
 }
