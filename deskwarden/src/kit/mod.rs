@@ -12,6 +12,7 @@ pub mod controls;
 pub mod field;
 pub mod icon;
 pub mod input;
+pub mod modal;
 pub mod motion;
 #[cfg(test)]
 pub(crate) mod testing;

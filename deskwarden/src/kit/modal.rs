@@ -1,0 +1,256 @@
+//! Spec B §2: the v2 modal frame -- a scrim over the window that closes the
+//! dialog when clicked, a radius-24 card centred on it (or set at a given
+//! top), its title and subtitle, a 38pt close mark, and Esc.
+//!
+//! Each dialog names its scrim `"<id>-scrim"`; that name must be listed in
+//! `vault_window::item_list::MODAL_SCRIM_AREAS` so the window knows a modal
+//! is up.
+
+use eframe::egui::{self, Color32, CornerRadius, Rect, Sense, Shadow, Vec2};
+
+use crate::theme;
+
+/// Whether the dialog is still up after this frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalOutcome {
+    Open,
+    Closed,
+}
+
+/// `rgba(20,26,48,.38)`.
+pub const SCRIM: Color32 = Color32::from_rgba_unmultiplied_const(20, 26, 48, 97);
+/// The card's radius and inner padding.
+pub const RADIUS: u8 = 24;
+pub const PADDING: i8 = 30;
+/// The close mark's square, and its inset from the card's top-right.
+pub const CLOSE_SIZE: f32 = 38.0;
+pub const CLOSE_INSET: f32 = 18.0;
+/// The room a dialog keeps from the window's edges.
+pub const GUTTER: f32 = 24.0;
+
+const SUB_INK: Color32 = Color32::from_rgb(0x7d, 0x79, 0x79);
+const CLOSE_INK: Color32 = Color32::from_rgb(0x6b, 0x68, 0x66);
+const CLOSE_HOVER: Color32 = Color32::from_rgb(0xf1, 0xf0, 0xee);
+
+/// The id of a dialog's close mark.
+pub fn close_id(id: &str) -> egui::Id {
+    egui::Id::new((id, "modal-close"))
+}
+
+/// The id of a dialog's card (its area).
+pub fn card_id(id: &str) -> egui::Id {
+    egui::Id::new((id, "modal-card"))
+}
+
+/// The name of a dialog's scrim area.
+pub fn scrim_name(id: &str) -> String {
+    format!("{id}-scrim")
+}
+
+/// One v2 dialog.
+pub struct Dialog<'a> {
+    id: &'a str,
+    width: f32,
+    title: Option<&'a str>,
+    sub: Option<&'a str>,
+    top: Option<f32>,
+    closable: bool,
+    padding: i8,
+    radius: u8,
+}
+
+impl<'a> Dialog<'a> {
+    pub fn new(id: &'a str, width: f32) -> Self {
+        Self { id, width, title: None, sub: None, top: None, closable: true, padding: PADDING, radius: RADIUS }
+    }
+
+    pub fn title(mut self, title: &'a str) -> Self {
+        self.title = Some(title);
+        self
+    }
+
+    pub fn sub(mut self, sub: &'a str) -> Self {
+        self.sub = Some(sub);
+        self
+    }
+
+    /// Set the card `top` points below the window's top instead of centring
+    /// it (the palette's 90).
+    pub fn top(mut self, top: f32) -> Self {
+        self.top = Some(top);
+        self
+    }
+
+    /// No close mark (the palette); the scrim and Esc still close it.
+    pub fn without_close(mut self) -> Self {
+        self.closable = false;
+        self
+    }
+
+    pub fn padding(mut self, padding: i8) -> Self {
+        self.padding = padding;
+        self
+    }
+
+    pub fn radius(mut self, radius: u8) -> Self {
+        self.radius = radius;
+        self
+    }
+
+    /// The card's width on this window: what was asked for, less any part
+    /// that would come within [`GUTTER`] of an edge.
+    pub fn width_on(&self, screen: Rect) -> f32 {
+        self.width.min(screen.width() - 2.0 * GUTTER).max(0.0)
+    }
+
+    /// Draw it. `add` fills the card under the title.
+    pub fn show<R>(self, ctx: &egui::Context, add: impl FnOnce(&mut egui::Ui) -> R) -> (ModalOutcome, R) {
+        let screen = ctx.content_rect();
+        let width = self.width_on(screen);
+
+        let scrim = egui::Area::new(egui::Id::new(scrim_name(self.id)))
+            .order(egui::Order::Middle)
+            .fixed_pos(screen.min)
+            .show(ctx, |ui| {
+                let response = ui.allocate_response(screen.size(), Sense::click());
+                ui.painter().rect_filled(screen, CornerRadius::ZERO, SCRIM);
+                response.clicked()
+            })
+            .inner;
+
+        // `sense(click)`: the card takes the clicks that land on it, so they
+        // never reach the scrim behind it.
+        let mut area = egui::Area::new(card_id(self.id)).order(egui::Order::Foreground).sense(Sense::click());
+        area = match self.top {
+            Some(top) => area.anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, top)),
+            None => area.anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO),
+        };
+        let (inner, closed_by_mark) = area
+            .show(ctx, |ui| {
+                let shown = egui::Frame::new()
+                    .fill(theme::CARD)
+                    .corner_radius(CornerRadius::same(self.radius))
+                    .shadow(Shadow { offset: [0, 30], blur: 80, spread: 0, color: Color32::from_rgba_unmultiplied(20, 26, 48, 89) })
+                    .inner_margin(self.padding)
+                    .show(ui, |ui| {
+                        let inner_width = (width - 2.0 * f32::from(self.padding)).max(0.0);
+                        ui.set_width(inner_width);
+                        if let Some(title) = self.title {
+                            // Room on the title's line for the close mark.
+                            let reserve = if self.closable { 44.0 } else { 0.0 };
+                            ui.allocate_ui(Vec2::new(inner_width - reserve, 0.0), |ui| {
+                                ui.label(
+                                    egui::RichText::new(title)
+                                        .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
+                                        .color(theme::INK),
+                                );
+                                if let Some(sub) = self.sub {
+                                    ui.label(egui::RichText::new(sub).size(16.0).color(SUB_INK));
+                                }
+                            });
+                            ui.add_space(22.0);
+                        }
+                        add(ui)
+                    });
+                let mut closed = false;
+                if self.closable {
+                    let card = shown.response.rect;
+                    let mark = Rect::from_min_size(
+                        egui::pos2(card.right() - CLOSE_INSET - CLOSE_SIZE, card.top() + CLOSE_INSET),
+                        Vec2::splat(CLOSE_SIZE),
+                    );
+                    let response = ui.interact(mark, close_id(self.id), Sense::click());
+                    if response.hovered() {
+                        ui.painter().rect_filled(mark, CornerRadius::same(12), CLOSE_HOVER);
+                    }
+                    crate::kit::icon::stroke(
+                        ui.painter(),
+                        Rect::from_center_size(mark.center(), Vec2::splat(16.0)),
+                        crate::kit::icon::glyph::CLOSE,
+                        2.0,
+                        CLOSE_INK,
+                    );
+                    closed = response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked();
+                }
+                (shown.inner, closed)
+            })
+            .inner;
+
+        let esc = ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+        let outcome = if scrim || closed_by_mark || esc { ModalOutcome::Closed } else { ModalOutcome::Open };
+        (outcome, inner)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kit::testing::{self, click_at};
+
+    const SCREEN: Vec2 = egui::vec2(1280.0, 820.0);
+
+    fn frame(ctx: &egui::Context, time: f64, screen: Vec2, events: Vec<egui::Event>) -> ModalOutcome {
+        let mut outcome = ModalOutcome::Open;
+        let _ = testing::frame(ctx, time, screen, events, |_ui| {
+            let ctx = _ui.ctx().clone();
+            outcome = Dialog::new("test-dialog", 560.0)
+                .title("Share Ledgerline")
+                .sub("Send a secure link. Revoke it any time.")
+                .show(&ctx, |ui| {
+                    ui.label("body");
+                })
+                .0;
+        });
+        outcome
+    }
+
+    /// Two idle frames: an anchored area is laid out unseen on its first.
+    fn shown(screen: Vec2) -> egui::Context {
+        let ctx = testing::ctx();
+        let _ = frame(&ctx, 0.0, screen, vec![]);
+        let _ = frame(&ctx, 0.1, screen, vec![]);
+        // And a third: `read_response` answers from the pass before last.
+        let _ = frame(&ctx, 0.15, screen, vec![]);
+        ctx
+    }
+
+    #[test]
+    fn the_scrim_closes_the_dialog() {
+        let ctx = shown(SCREEN);
+        assert_eq!(frame(&ctx, 0.2, SCREEN, click_at(egui::pos2(8.0, 8.0))), ModalOutcome::Closed);
+    }
+
+    #[test]
+    fn esc_closes_the_dialog() {
+        let ctx = shown(SCREEN);
+        let esc = egui::Event::Key { key: egui::Key::Escape, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::default() };
+        assert_eq!(frame(&ctx, 0.2, SCREEN, vec![esc]), ModalOutcome::Closed);
+    }
+
+    #[test]
+    fn the_close_mark_closes_the_dialog() {
+        let ctx = shown(SCREEN);
+        let mark = ctx.read_response(close_id("test-dialog")).expect("the close mark").rect;
+        assert_eq!(mark.size(), Vec2::splat(CLOSE_SIZE));
+        assert_eq!(frame(&ctx, 0.2, SCREEN, click_at(mark.center())), ModalOutcome::Closed);
+    }
+
+    #[test]
+    fn a_click_in_the_card_keeps_it_open() {
+        let ctx = shown(SCREEN);
+        let mark = ctx.read_response(close_id("test-dialog")).unwrap().rect;
+        // Left of the close mark, on the title's line: card, not scrim.
+        let inside = mark.left_center() - Vec2::new(120.0, 0.0);
+        assert_eq!(frame(&ctx, 0.2, SCREEN, click_at(inside)), ModalOutcome::Open);
+    }
+
+    #[test]
+    fn a_narrow_window_keeps_a_24pt_gutter() {
+        let narrow = egui::vec2(500.0, 700.0);
+        let dialog = Dialog::new("x", 660.0);
+        assert_eq!(dialog.width_on(Rect::from_min_size(egui::Pos2::ZERO, narrow)), 452.0);
+        let ctx = shown(narrow);
+        let mark = ctx.read_response(close_id("test-dialog")).unwrap().rect;
+        assert!(mark.right() <= narrow.x - GUTTER - CLOSE_INSET + 0.5, "{mark:?}");
+    }
+}
