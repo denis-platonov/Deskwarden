@@ -1610,6 +1610,17 @@ pub struct PrefsState {
     /// set: the tests and `examples/ui_preview` install their own `fn` and
     /// touch no shared state at all.
     account_source: fn() -> Option<AccountStatus>,
+    /// The logon entry's two switches (Settings > General > Startup), or
+    /// `None` when this state was not given the registry -- which is every
+    /// state but the production shells', so that no test can write the real
+    /// Run key. With `None` the two rows are not drawn.
+    pub(crate) startup: Option<crate::autostart_repair::Startup>,
+    /// Writes the logon entry; answers whether it now says what was asked.
+    /// A pointer for [`Self::account_source`]'s reason.
+    pub(crate) startup_sink: fn(crate::autostart_repair::Startup) -> bool,
+    /// What "Start in the system tray" will be when "Open when I sign in" is
+    /// next turned on: the entry cannot hold a preference it does not exist.
+    pub(crate) tray_when_opened: bool,
     /// The Breaches page's scan flow: its stage, and the receiver its worker
     /// threads report on.
     ///
@@ -1836,6 +1847,9 @@ impl PrefsState {
             shortcut_error: None,
             update: crate::update_panel::UpdatePanel::default(),
             account_source: published_account_status,
+            startup: None,
+            startup_sink: |_| false,
+            tray_when_opened: true,
             scan: crate::breach_scan::ScanPanel::default(),
             // **Empty, and NOT read off disk here.** See
             // [`Self::with_scan_history`]: `new` is called by roughly forty
@@ -1912,6 +1926,8 @@ impl PrefsState {
             keys: load_service_keys(),
             keys_sink: save_service_keys,
             key_copy: crate::clipboard::copy_secret,
+            startup: Some(crate::autostart_repair::read_startup()),
+            startup_sink: crate::autostart_repair::write_startup,
             ..Self::new(settings)
         }
     }

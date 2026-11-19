@@ -1369,6 +1369,26 @@ pub struct Settings {
     /// The v2 sidebar's colours: navy (the design's default) or light.
     /// Missing from files written before 1.0, which read as navy.
     pub sidebar_style: crate::kit::tokens::SidebarStyle,
+    /// General > Look > Theme. Missing from files written before slice 8, which
+    /// read as light -- the only look they ever had.
+    ///
+    /// The default is `Light`, not the spec's `System`, until every surface
+    /// follows the palette (see the slice 8 plan's Rulings): a user on a dark
+    /// Windows would otherwise get a half-dark window on upgrade.
+    pub theme: crate::kit::tokens::ThemeChoice,
+    /// General > Look > Text size, applied as egui's zoom factor.
+    pub text_size: crate::kit::tokens::TextSize,
+    /// Security > Locking > "Lock when the computer sleeps". On by default (a
+    /// file without the key keeps today's behaviour, which locks on suspend).
+    /// Still gated by auto-lock being on: see `away_lock::locks_the_vault`.
+    pub lock_on_sleep: bool,
+    /// Security > Locking > "Lock when I lock my screen" (Win+L, a session
+    /// switch). On by default, as today.
+    pub lock_on_screen_lock: bool,
+    /// Security > Privacy > "Hide passwords while I share my screen": the
+    /// vault window is excluded from screen capture
+    /// (`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`).
+    pub hide_on_screen_share: bool,
     /// Whether the vault window locks itself at all.
     ///
     /// `true` (the default, and what an older `settings.json` without this
@@ -1855,6 +1875,11 @@ impl Default for Settings {
             check_for_updates: true,
             reveal_totp_seed: false,
             sidebar_style: crate::kit::tokens::SidebarStyle::Navy,
+            theme: crate::kit::tokens::ThemeChoice::Light,
+            text_size: crate::kit::tokens::TextSize::Default,
+            lock_on_sleep: true,
+            lock_on_screen_lock: true,
+            hide_on_screen_share: true,
             auto_lock_enabled: true,
             auto_lock_minutes: DEFAULT_AUTO_LOCK_MINUTES,
             sync_push: true,
@@ -1993,6 +2018,11 @@ impl Settings {
         let Settings {
             keep_backend_running,
             sidebar_style,
+            theme,
+            text_size,
+            lock_on_sleep,
+            lock_on_screen_lock,
+            hide_on_screen_share,
             keep_ui_loaded,
             prompt_on_match,
             shortcuts,
@@ -2062,6 +2092,11 @@ impl Settings {
         on_disk.check_for_updates = *check_for_updates;
         on_disk.reveal_totp_seed = *reveal_totp_seed;
         on_disk.sidebar_style = *sidebar_style;
+        on_disk.theme = *theme;
+        on_disk.text_size = *text_size;
+        on_disk.lock_on_sleep = *lock_on_sleep;
+        on_disk.lock_on_screen_lock = *lock_on_screen_lock;
+        on_disk.hide_on_screen_share = *hide_on_screen_share;
         on_disk.auto_lock_enabled = *auto_lock_enabled;
         on_disk.auto_lock_minutes = *auto_lock_minutes;
         on_disk.sync_push = *sync_push;
@@ -2229,6 +2264,28 @@ mod tests {
     fn a_settings_file_without_a_sidebar_style_reads_as_navy() {
         let old: Settings = serde_json::from_str("{}").expect("an empty file parses");
         assert_eq!(old.sidebar_style, crate::kit::tokens::SidebarStyle::Navy);
+    }
+
+    #[test]
+    fn a_settings_file_without_the_slice_8_keys_keeps_todays_behaviour() {
+        let old: Settings = serde_json::from_str("{}").expect("an empty file parses");
+        assert_eq!(old.theme, crate::kit::tokens::ThemeChoice::Light);
+        assert_eq!(old.text_size, crate::kit::tokens::TextSize::Default);
+        assert!(old.lock_on_sleep && old.lock_on_screen_lock && old.hide_on_screen_share);
+    }
+
+    #[test]
+    fn the_theme_and_text_size_are_saved_as_lowercase_words() {
+        let chosen = Settings {
+            theme: crate::kit::tokens::ThemeChoice::System,
+            text_size: crate::kit::tokens::TextSize::Large,
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&chosen).unwrap();
+        assert!(json.contains("\"theme\":\"system\""), "{json}");
+        assert!(json.contains("\"text_size\":\"large\""), "{json}");
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, chosen);
     }
 
     #[test]
@@ -2658,6 +2715,11 @@ mod tests {
             check_for_updates: false,
             reveal_totp_seed: true,
             sidebar_style: crate::kit::tokens::SidebarStyle::Light,
+            theme: crate::kit::tokens::ThemeChoice::Dark,
+            text_size: crate::kit::tokens::TextSize::Larger,
+            lock_on_sleep: false,
+            lock_on_screen_lock: false,
+            hide_on_screen_share: false,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             sync_push: false,
@@ -2996,6 +3058,11 @@ mod tests {
             check_for_updates: false,
             reveal_totp_seed: true,
             sidebar_style: crate::kit::tokens::SidebarStyle::Light,
+            theme: crate::kit::tokens::ThemeChoice::Dark,
+            text_size: crate::kit::tokens::TextSize::Larger,
+            lock_on_sleep: false,
+            lock_on_screen_lock: false,
+            hide_on_screen_share: false,
             auto_lock_enabled: false,
             auto_lock_minutes: 42,
             sync_push: false,
@@ -3744,6 +3811,11 @@ mod tests {
             check_for_updates: false,
             reveal_totp_seed: true,
             sidebar_style: crate::kit::tokens::SidebarStyle::Light,
+            theme: crate::kit::tokens::ThemeChoice::Dark,
+            text_size: crate::kit::tokens::TextSize::Larger,
+            lock_on_sleep: false,
+            lock_on_screen_lock: false,
+            hide_on_screen_share: false,
             auto_lock_enabled: true,
             auto_lock_minutes: 5,
             sync_push: false,

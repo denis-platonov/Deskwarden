@@ -120,6 +120,60 @@ impl Palette {
         danger_ink: rgb(0x8c3c33),
         close_hover: rgb(0xc42b1c),
     };
+
+    /// The dark theme (spec D2): the warm greys inverted, the same hues, the
+    /// blues kept where they are fills and lifted where they are text. The navy
+    /// sidebar is not part of the palette and does not change.
+    pub const DARK: Palette = Palette {
+        ink: rgb(0xf2f0ee),
+        text_nav: rgb(0xcfccc9),
+        text_muted: rgb(0xb0adaa),
+        text_icon: rgb(0xa09d9a),
+        text_faint: rgb(0x9b9895),
+        text_label: rgb(0x9b9895),
+        text_ghost: rgb(0x6b6866),
+        card: rgb(0x262423),
+        list_bg: rgb(0x1f1d1c),
+        window_bg: rgb(0x181716),
+        field_bg: rgb(0x2d2b2a),
+        hover: rgb(0x302e2d),
+        secondary_hover: rgb(0x2a2827),
+        badge_bg: rgb(0x3a3735),
+        hairline: rgb(0x302e2c),
+        card_ring: rgb(0x34322f),
+        row_rule: rgb(0x2e2c2a),
+        border: rgb(0x403d3a),
+        kbd_border: rgb(0x4a4744),
+        switch_off: rgb(0x4a4744),
+        meter_track: rgb(0x3a3735),
+        tag_neutral_bg: rgb(0x3d3a37),
+        tag_neutral_ink: rgb(0xe8e5e2),
+        star: rgb(0xf5b301),
+        blue_deep: rgb(0x9ab6f3),
+        blue: rgb(0x3b74e8),
+        blue_bright: rgb(0x3b74e8),
+        blue_bright_hover: rgb(0x5a8af0),
+        blue_soft: rgb(0x7fa4ef),
+        blue_wash: rgb(0x1d2a4d),
+        blue_edge: rgb(0x34487f),
+        focus: rgb(0x2a3d70),
+        chip_on: rgb(0x1f2745),
+        row_hover_blue: rgb(0x1e2338),
+        done_mark: rgb(0x4fc07b),
+        done_ink: rgb(0x7fd9a0),
+        done_wash: rgb(0x16301f),
+        tag_2fa_bg: rgb(0x1d3d29),
+        caution_wash: rgb(0x33290f),
+        caution_mark: rgb(0xe0a43a),
+        caution_ink: rgb(0xf0c46a),
+        caution_edge: rgb(0x5c4716),
+        caution_dot: rgb(0xe0a43a),
+        error: rgb(0xf0786e),
+        danger_edge: rgb(0x5c2a25),
+        danger_wash: rgb(0x2e1a18),
+        danger_ink: rgb(0xf0a8a0),
+        close_hover: rgb(0xc42b1c),
+    };
 }
 
 /// The palette this context's widgets paint with; [`Palette::LIGHT`] until
@@ -141,6 +195,50 @@ pub enum SidebarStyle {
     #[default]
     Navy,
     Light,
+}
+
+/// General > Look > Theme (spec D2). Saved as `"light"` / `"dark"` /
+/// `"system"`. `System` follows Windows' app theme.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeChoice {
+    #[default]
+    Light,
+    Dark,
+    System,
+}
+
+impl ThemeChoice {
+    /// The palette this choice paints, given whether Windows is in dark mode.
+    pub fn palette(self, system_is_dark: bool) -> Palette {
+        match self {
+            ThemeChoice::Light => Palette::LIGHT,
+            ThemeChoice::Dark => Palette::DARK,
+            ThemeChoice::System if system_is_dark => Palette::DARK,
+            ThemeChoice::System => Palette::LIGHT,
+        }
+    }
+}
+
+/// General > Look > Text size. Saved as `"default"` / `"large"` / `"larger"`;
+/// applied as egui's zoom factor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TextSize {
+    #[default]
+    Default,
+    Large,
+    Larger,
+}
+
+impl TextSize {
+    pub fn zoom_factor(self) -> f32 {
+        match self {
+            TextSize::Default => 1.0,
+            TextSize::Large => 1.125,
+            TextSize::Larger => 1.25,
+        }
+    }
 }
 
 /// The sidebar style this context's rail paints in; [`SidebarStyle::Navy`]
@@ -372,6 +470,52 @@ mod tests {
         let changed = Palette { ink: rgb(0x010203), ..Palette::LIGHT };
         set_palette(&ctx, changed);
         assert_eq!(palette(&ctx), changed);
+    }
+
+    fn luminance(c: Color32) -> f32 {
+        let lin = |v: u8| {
+            let v = v as f32 / 255.0;
+            if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
+        };
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
+
+    fn contrast(a: Color32, b: Color32) -> f32 {
+        let (la, lb) = (luminance(a), luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    #[test]
+    fn the_dark_palette_keeps_its_text_readable_on_its_surfaces() {
+        let d = Palette::DARK;
+        for surface in [d.card, d.list_bg, d.window_bg] {
+            assert!(contrast(d.ink, surface) >= 7.0, "ink on {surface:?}");
+            assert!(contrast(d.text_nav, surface) >= 7.0, "nav text on {surface:?}");
+            assert!(contrast(d.text_label, surface) >= 4.5, "label text on {surface:?}");
+            assert!(contrast(d.error, surface) >= 4.5, "error text on {surface:?}");
+        }
+        assert!(contrast(d.blue_deep, d.blue_wash) >= 4.5, "selected nav ink on its wash");
+        assert!(contrast(Color32::WHITE, d.blue) >= 3.5, "white on the primary button");
+        assert!(contrast(d.danger_ink, d.danger_wash) >= 4.5);
+        assert!(contrast(d.done_ink, d.done_wash) >= 4.5);
+        assert!(contrast(d.caution_ink, d.caution_wash) >= 4.5);
+    }
+
+    #[test]
+    fn dark_is_darker_than_light_on_every_surface() {
+        let (l, d) = (Palette::LIGHT, Palette::DARK);
+        for (light, dark) in [(l.card, d.card), (l.list_bg, d.list_bg), (l.window_bg, d.window_bg), (l.field_bg, d.field_bg)] {
+            assert!(luminance(dark) < luminance(light));
+        }
+        assert!(luminance(d.ink) > luminance(l.ink));
+    }
+
+    #[test]
+    fn the_theme_choice_picks_the_palette() {
+        assert_eq!(ThemeChoice::Light.palette(true), Palette::LIGHT);
+        assert_eq!(ThemeChoice::Dark.palette(false), Palette::DARK);
+        assert_eq!(ThemeChoice::System.palette(true), Palette::DARK);
+        assert_eq!(ThemeChoice::System.palette(false), Palette::LIGHT);
     }
 
     #[test]

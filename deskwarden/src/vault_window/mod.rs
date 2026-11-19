@@ -1669,6 +1669,14 @@ pub fn build_frame_with_search(
         .as_deref()
         .map(|path| crate::settings::Settings::load(path).sidebar_style)
         .unwrap_or_default();
+    // Slice 8: the look and the privacy of the window itself, read the same
+    // way and live-editable for the same reason (the Settings screen's edits
+    // reach `edited_settings`, so a change binds at once).
+    let look_at_open = settings_path.as_deref().map(crate::settings::Settings::load).unwrap_or_default();
+    let (theme_at_open, text_size_at_open, hide_share_at_open) =
+        (look_at_open.theme, look_at_open.text_size, look_at_open.hide_on_screen_share);
+    let screen_share_applied = crate::screen_share::Applied::default();
+    let system_dark = crate::system_theme::Watcher::default();
     // Whether an item's DOMAIN may be sent to the icon service at all, read
     // the same way and live-editable for the same reason -- but defaulting
     // the other way round. `true` is the default for this one (see
@@ -3176,7 +3184,32 @@ pub fn build_frame_with_search(
         // layer above the panes; and the kit's palette, set here once a frame
         // so a theme setting (slice 8) has one place to change it.
         crate::kit::toast::paint(ui.ctx());
-        crate::kit::tokens::set_palette(ui.ctx(), crate::kit::tokens::Palette::LIGHT);
+        // Slice 8's three window-wide preferences, from the Settings screen's
+        // live edits or else what the file said at open.
+        let (theme, text_size, hide_share) = edited_settings_for_closure
+            .borrow()
+            .as_ref()
+            .map_or((theme_at_open, text_size_at_open, hide_share_at_open), |s| {
+                (s.theme, s.text_size, s.hide_on_screen_share)
+            });
+        // The theme shows on the Settings screen, the one surface drawn wholly
+        // from the kit's palette; every other screen keeps the light look
+        // (its text and fills are `theme::` constants). One call, one place.
+        let frame_palette = if settings_selected && prefs.is_some() {
+            let system = theme == crate::kit::tokens::ThemeChoice::System;
+            // No repaint of its own: the window's per-frame schedule already
+            // wakes it, and the watcher asks Windows at most once a second.
+            let now = ui.input(|i| i.time);
+            theme.palette(system && system_dark.dark_at(now, crate::system_theme::apps_use_dark))
+        } else {
+            crate::kit::tokens::Palette::LIGHT
+        };
+        crate::kit::tokens::set_palette(ui.ctx(), frame_palette);
+        let zoom = text_size.zoom_factor();
+        if (ui.ctx().zoom_factor() - zoom).abs() > f32::EPSILON {
+            ui.ctx().set_zoom_factor(zoom);
+        }
+        screen_share_applied.sync(WINDOW_TITLE, hide_share);
         match body {
             VaultBodyState::Loading => {
                 top_bar_band(ui);

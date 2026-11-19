@@ -140,6 +140,8 @@ pub enum ScreenAction {
 /// Draws the whole screen into `ui`'s rect: the nav, then the page.
 pub fn draw(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) -> ScreenAction {
     let full = ui.max_rect();
+    // The screen's own ground, from the palette, so the theme reaches it.
+    ui.painter().rect_filled(full, CornerRadius::ZERO, palette(ui.ctx()).window_bg);
     let nav = Rect::from_min_max(full.min, Pos2::new(full.min.x + NAV_WIDTH, full.max.y));
     let content = Rect::from_min_max(Pos2::new(nav.max.x, full.min.y), full.max);
     let back = draw_nav(ui, nav, state, page);
@@ -245,11 +247,7 @@ fn body(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
             "Notification choices are not available yet",
             "Choosing which events tell you something arrives in a later release.",
         ),
-        Page::ImportExport => not_yet(
-            ui,
-            "Import and export are not on this page yet",
-            "Export your vault from the account menu; the import wizard arrives in a later release.",
-        ),
+        Page::ImportExport => import_export(ui),
         Page::Devices => not_yet(
             ui,
             "The device list is not available yet",
@@ -266,16 +264,89 @@ fn body(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
 // ---------------------------------------------------------------------------
 
 fn general(ui: &mut Ui, state: &mut PrefsState) {
+    group(ui, Some("Startup"), |ui| {
+        card(ui, |ui| {
+            startup_rows(ui, state);
+            if state.startup.is_some() {
+                kit_card::row_rule(ui);
+            }
+            value_row(ui, KEEP_RUNNING_LABEL, KEEP_RUNNING_SUB, KEEP_RUNNING_VALUE);
+        });
+    });
     group(ui, Some("Look"), |ui| {
         card(ui, |ui| {
-            use crate::kit::tokens::SidebarStyle;
+            use crate::kit::tokens::{SidebarStyle, TextSize, ThemeChoice};
             let now = if state.settings.sidebar_style == SidebarStyle::Navy { 0 } else { 1 };
             if let Some(picked) = segment_row(ui, prefs::SIDEBAR_STYLE_LABEL, prefs::SIDEBAR_STYLE_DESCRIPTION, &["Navy", "Light"], now) {
                 state.settings.sidebar_style = if picked == 0 { SidebarStyle::Navy } else { SidebarStyle::Light };
             }
+            kit_card::row_rule(ui);
+            let themes = [ThemeChoice::Light, ThemeChoice::Dark, ThemeChoice::System];
+            let now = themes.iter().position(|t| *t == state.settings.theme).unwrap_or(0);
+            if let Some(picked) = segment_row(ui, THEME_LABEL, "", &["Light", "Dark", "System"], now) {
+                state.settings.theme = themes[picked];
+            }
+            kit_card::row_rule(ui);
+            let sizes = [TextSize::Default, TextSize::Large, TextSize::Larger];
+            let now = sizes.iter().position(|t| *t == state.settings.text_size).unwrap_or(0);
+            if let Some(picked) = segment_row(ui, TEXT_SIZE_LABEL, "", &["Default", "Large", "Larger"], now) {
+                state.settings.text_size = sizes[picked];
+            }
+            kit_card::row_rule(ui);
+            if button_row(ui, LANGUAGE_LABEL, "", LANGUAGE_VALUE, false) {
+                crate::kit::toast::show(ui.ctx(), LANGUAGE_TOAST);
+            }
         });
     });
 }
+
+/// Startup > the two logon-entry switches. Drawn only when the state was
+/// handed the registry; a change is written at once (the entry is not part of
+/// `settings.json`), and the switch follows what the registry then says.
+fn startup_rows(ui: &mut Ui, state: &mut PrefsState) {
+    let Some(now) = state.startup else {
+        return;
+    };
+    let mut open = now.open_at_sign_in;
+    switch_row(ui, OPEN_AT_SIGN_IN_LABEL, "", &mut open, true);
+    kit_card::row_rule(ui);
+    let mut tray = if now.open_at_sign_in { now.in_tray } else { state.tray_when_opened };
+    switch_row(ui, START_IN_TRAY_LABEL, START_IN_TRAY_SUB, &mut tray, now.open_at_sign_in);
+    let wanted = crate::autostart_repair::Startup { open_at_sign_in: open, in_tray: tray };
+    if open == now.open_at_sign_in && (tray == now.in_tray || !now.open_at_sign_in) {
+        return;
+    }
+    if now.open_at_sign_in && !open {
+        state.tray_when_opened = now.in_tray;
+    }
+    if (state.startup_sink)(wanted) {
+        state.startup = Some(wanted);
+    } else {
+        crate::kit::toast::show(ui.ctx(), STARTUP_FAILED_TOAST);
+    }
+}
+
+/// The Startup rows' wording (spec C 2.4).
+pub const OPEN_AT_SIGN_IN_LABEL: &str = "Open when I sign in to Windows";
+pub const START_IN_TRAY_LABEL: &str = "Start in the system tray";
+const START_IN_TRAY_SUB: &str = "Start hidden; open the window from the tray icon";
+/// Closing the window only ever hides it: the tray keeps autofill running.
+pub const KEEP_RUNNING_LABEL: &str = "Keep running when I close the window";
+const KEEP_RUNNING_SUB: &str = "Autofill only works while Deskwarden is running. Closing the window just hides it.";
+const KEEP_RUNNING_VALUE: &str = "Always";
+const STARTUP_FAILED_TOAST: &str = "Could not change the Windows startup entry";
+/// The Security rows' wording (spec C 2.4).
+pub const LOCK_ON_SLEEP_LABEL: &str = "Lock when the computer sleeps";
+pub const LOCK_ON_SCREEN_LOCK_LABEL: &str = "Lock when I lock my screen";
+pub const HIDE_ON_SHARE_LABEL: &str = "Hide passwords while I share my screen";
+const HIDE_ON_SHARE_SUB: &str = "The whole window stays out of Teams, Zoom or Meet screen sharing, even if you press reveal.";
+/// The Look rows' wording (spec C 2.4).
+pub const THEME_LABEL: &str = "Theme";
+pub const TEXT_SIZE_LABEL: &str = "Text size";
+pub const LANGUAGE_LABEL: &str = "Language";
+const LANGUAGE_VALUE: &str = "English";
+/// Spec D6: English only, and a toast for the click.
+pub const LANGUAGE_TOAST: &str = "More languages are on the way";
 
 fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
     group(ui, Some("Suggestions"), |ui| {
@@ -305,8 +376,21 @@ fn apps(ui: &mut Ui, state: &mut PrefsState) {
 }
 
 fn security(ui: &mut Ui, state: &mut PrefsState) {
-    group(ui, Some("Locking"), |ui| prefs::draw_lock(ui, state));
-    group(ui, Some("Privacy"), |ui| prefs::draw_clipboard(ui, state));
+    group(ui, Some("Locking"), |ui| {
+        prefs::draw_lock(ui, state);
+        card(ui, |ui| {
+            let s = &mut state.settings;
+            switch_row(ui, LOCK_ON_SLEEP_LABEL, "", &mut s.lock_on_sleep, true);
+            kit_card::row_rule(ui);
+            switch_row(ui, LOCK_ON_SCREEN_LOCK_LABEL, "", &mut s.lock_on_screen_lock, true);
+        });
+    });
+    group(ui, Some("Privacy"), |ui| {
+        prefs::draw_clipboard(ui, state);
+        card(ui, |ui| {
+            switch_row(ui, HIDE_ON_SHARE_LABEL, HIDE_ON_SHARE_SUB, &mut state.settings.hide_on_screen_share, true);
+        });
+    });
     group(ui, Some("Breaches"), |ui| prefs::draw_breaches(ui, state));
 }
 
@@ -378,6 +462,23 @@ fn about(ui: &mut Ui, state: &mut PrefsState) {
 }
 
 /// One marked-disabled row, for a page whose behaviour is not built yet.
+/// Slice 9's import wizard, opened through the window's shell request.
+fn import_export(ui: &mut Ui) {
+    group(ui, None, |ui| {
+        card(ui, |ui| {
+            if button_row(
+                ui,
+                "Import passwords",
+                "From Bitwarden, 1Password, Keeper, LastPass, Chrome or Edge, or any CSV file",
+                "Import\u{2026}",
+                false,
+            ) {
+                crate::vault_window::sidebar::request_shell(ui.ctx(), crate::vault_window::sidebar::ShellRequest::OpenImport);
+            }
+        });
+    });
+}
+
 fn not_yet(ui: &mut Ui, title: &str, sub: &str) {
     group(ui, None, |ui| {
         card(ui, |ui| row(ui, title, sub, true, 0.0, |_| {}));
@@ -666,7 +767,7 @@ mod tests {
 
     #[test]
     fn the_empty_pages_say_so_in_one_disabled_row() {
-        for page in [Page::Notifications, Page::ImportExport, Page::Devices] {
+        for page in [Page::Notifications, Page::Devices] {
             let mut fixture = Fixture::new(page);
             let painted = fixture.settle();
             assert!(painted.text("later release").is_some(), "{page:?} says nothing about why it is empty");
@@ -685,5 +786,151 @@ mod tests {
         let rect = painted.rects.iter().filter(|r| (r.rect.width() - 50.0).abs() < 0.5 && (r.rect.center().y - at.center().y).abs() < 90.0).map(|r| r.rect.center()).next().expect("its switch");
         fixture.frame(click_at(rect));
         assert!(fixture.state.settings.fetch_icons_direct, "a greyed child was edited under an off master");
+    }
+    // ---- slice 8: General ----
+
+    thread_local! {
+        static WRITTEN: std::cell::RefCell<Vec<crate::autostart_repair::Startup>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn recording_sink(startup: crate::autostart_repair::Startup) -> bool {
+        WRITTEN.with(|w| w.borrow_mut().push(startup));
+        true
+    }
+
+    fn refusing_sink(_: crate::autostart_repair::Startup) -> bool {
+        false
+    }
+
+    fn with_registry(open_at_sign_in: bool, in_tray: bool, sink: fn(crate::autostart_repair::Startup) -> bool) -> Fixture {
+        let mut fixture = Fixture::new(Page::General);
+        fixture.state.startup = Some(crate::autostart_repair::Startup { open_at_sign_in, in_tray });
+        fixture.state.startup_sink = sink;
+        WRITTEN.with(|w| w.borrow_mut().clear());
+        fixture
+    }
+
+    /// The centres of the 50 px switch tracks, top to bottom.
+    fn switches(painted: &testing::Painted) -> Vec<Pos2> {
+        let mut found: Vec<Pos2> = painted.rects.iter().filter(|r| (r.rect.width() - 50.0).abs() < 0.5).map(|r| r.rect.center()).collect();
+        found.sort_by(|a, b| a.y.total_cmp(&b.y));
+        found.dedup_by(|a, b| (a.y - b.y).abs() < 1.0);
+        found
+    }
+
+    #[test]
+    fn the_startup_rows_are_not_drawn_without_the_registry() {
+        let mut fixture = Fixture::new(Page::General);
+        let painted = fixture.settle();
+        assert!(painted.text(OPEN_AT_SIGN_IN_LABEL).is_none(), "a switch connected to nothing");
+        assert!(painted.text(START_IN_TRAY_LABEL).is_none());
+        // The always-true row is honest without it.
+        assert!(painted.text(KEEP_RUNNING_LABEL).is_some());
+        assert!(painted.text("Always").is_some());
+    }
+
+    #[test]
+    fn turning_open_at_sign_in_on_writes_the_logon_entry() {
+        let mut fixture = with_registry(false, false, recording_sink);
+        let painted = fixture.settle();
+        assert!(painted.text(OPEN_AT_SIGN_IN_LABEL).is_some());
+        let first = switches(&painted)[0];
+        fixture.frame(click_at(first));
+        let written = WRITTEN.with(|w| w.borrow().clone());
+        assert_eq!(written, [crate::autostart_repair::Startup { open_at_sign_in: true, in_tray: true }], "on, and to the tray as the installer does");
+        assert_eq!(fixture.state.startup, Some(written[0]));
+    }
+
+    #[test]
+    fn turning_it_off_remembers_the_tray_choice_for_next_time() {
+        let mut fixture = with_registry(true, false, recording_sink);
+        let painted = fixture.settle();
+        fixture.frame(click_at(switches(&painted)[0]));
+        assert_eq!(WRITTEN.with(|w| w.borrow().clone()), [crate::autostart_repair::Startup { open_at_sign_in: false, in_tray: false }]);
+        assert!(!fixture.state.tray_when_opened, "the tray choice was lost with the entry");
+    }
+
+    #[test]
+    fn the_tray_switch_is_inert_while_open_at_sign_in_is_off() {
+        let mut fixture = with_registry(false, false, recording_sink);
+        let painted = fixture.settle();
+        fixture.frame(click_at(switches(&painted)[1]));
+        assert!(WRITTEN.with(|w| w.borrow().is_empty()), "a greyed switch wrote the registry");
+    }
+
+    #[test]
+    fn a_refused_write_leaves_the_switch_where_the_registry_is() {
+        let mut fixture = with_registry(false, false, refusing_sink);
+        let painted = fixture.settle();
+        fixture.frame(click_at(switches(&painted)[0]));
+        assert_eq!(fixture.state.startup, Some(crate::autostart_repair::Startup { open_at_sign_in: false, in_tray: false }));
+        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some(STARTUP_FAILED_TOAST));
+    }
+
+    #[test]
+    fn the_tray_switch_edits_the_entry_when_open_at_sign_in_is_on() {
+        let mut fixture = with_registry(true, true, recording_sink);
+        let painted = fixture.settle();
+        fixture.frame(click_at(switches(&painted)[1]));
+        assert_eq!(WRITTEN.with(|w| w.borrow().clone()), [crate::autostart_repair::Startup { open_at_sign_in: true, in_tray: false }]);
+    }
+
+    #[test]
+    fn theme_and_text_size_are_segments_over_the_settings() {
+        use crate::kit::tokens::{TextSize, ThemeChoice};
+        let mut fixture = Fixture::new(Page::General);
+        assert_eq!(fixture.state.settings.theme, ThemeChoice::Light);
+        let painted = fixture.settle();
+        assert!(painted.text(THEME_LABEL).is_some() && painted.text(TEXT_SIZE_LABEL).is_some());
+        for (text, check) in [("Dark", 0), ("System", 1), ("Larger", 2)] {
+            let painted = fixture.settle();
+            let at = painted.texts.iter().find(|(t, _, _)| t == text).unwrap_or_else(|| panic!("no {text}")).2.center();
+            fixture.frame(click_at(at));
+            fixture.frame(vec![egui::Event::PointerGone]);
+            match check {
+                0 => assert_eq!(fixture.state.settings.theme, ThemeChoice::Dark),
+                1 => assert_eq!(fixture.state.settings.theme, ThemeChoice::System),
+                _ => assert_eq!(fixture.state.settings.text_size, TextSize::Larger),
+            }
+        }
+    }
+
+    #[test]
+    fn the_security_page_has_the_lock_and_share_switches() {
+        let mut fixture = Fixture::new(Page::Security);
+        let painted = fixture.settle();
+        for label in [LOCK_ON_SLEEP_LABEL, LOCK_ON_SCREEN_LOCK_LABEL, HIDE_ON_SHARE_LABEL] {
+            assert!(painted.text(label).is_some(), "no {label}");
+        }
+        let at = painted.text(LOCK_ON_SLEEP_LABEL).unwrap().2;
+        let switch = painted
+            .rects
+            .iter()
+            .filter(|r| (r.rect.width() - 50.0).abs() < 0.5 && (r.rect.center().y - at.center().y).abs() < 20.0)
+            .map(|r| r.rect.center())
+            .next()
+            .expect("its switch");
+        fixture.frame(click_at(switch));
+        assert!(!fixture.state.settings.lock_on_sleep);
+    }
+
+    #[test]
+    fn the_language_row_says_english_and_its_click_says_more_are_coming() {
+        let mut fixture = Fixture::new(Page::General);
+        let painted = fixture.settle();
+        assert!(painted.text(LANGUAGE_LABEL).is_some());
+        let at = painted.text("English").expect("the button").2.center();
+        fixture.frame(click_at(at));
+        assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some("More languages are on the way"));
+    }
+    #[test]
+    fn the_screen_paints_its_ground_and_cards_from_the_palette() {
+        use crate::kit::tokens::{set_palette, Palette};
+        let mut fixture = Fixture::new(Page::General);
+        set_palette(&fixture.ctx, Palette::DARK);
+        let painted = fixture.settle();
+        assert!(painted.rects.iter().any(|r| r.fill == Palette::DARK.window_bg && r.rect.width() > 900.0), "the ground");
+        assert!(painted.rects.iter().any(|r| r.fill == Palette::DARK.card), "the cards");
+        assert!(!painted.rects.iter().any(|r| r.fill == Palette::LIGHT.window_bg), "a light ground under a dark theme");
     }
 }
