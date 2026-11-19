@@ -380,7 +380,7 @@ impl UiStartFailure {
     ];
 
     /// 66. One past `UI_LAUNCH_REFUSED`, which is one past
-    /// `UI_COULD_NOT_START`.
+    ///     `UI_COULD_NOT_START`.
     pub const FIRST_EXIT_CODE: i32 = 66;
 
     /// What the child exits with.

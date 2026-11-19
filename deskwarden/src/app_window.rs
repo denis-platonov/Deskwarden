@@ -119,14 +119,14 @@ const READINESS_ATTEMPTS: u64 = 11;
 ///      11 `list_items()` calls, so the real worst case is 30s of sleeping plus
 ///      110s of waiting on a backend that answers slowly instead of not at all:
 ///      ~140s, not 30s.
-/// **There is no third phase.** `produce` used to end with a
-/// `login_ui::check_bw_status_details_bounded()` -- a `bw status` spawn,
-/// unconditional and on the failure path too -- and this sum credited it
-/// `login_ui::STATUS_DEADLINE` (30s). The spawn is gone: the toolbar's account
-/// name and server come from the sign-in card that ran BEFORE this worker
-/// (`login_ui::SignedInIdentity`) or, on a launch that showed no card, off the
-/// `Account` on disk. Neither costs a process, so neither is a phase and
-/// neither owes this budget anything.
+///      **There is no third phase.** `produce` used to end with a
+///      `login_ui::check_bw_status_details_bounded()` -- a `bw status` spawn,
+///      unconditional and on the failure path too -- and this sum credited it
+///      `login_ui::STATUS_DEADLINE` (30s). The spawn is gone: the toolbar's account
+///      name and server come from the sign-in card that ran BEFORE this worker
+///      (`login_ui::SignedInIdentity`) or, on a launch that showed no card, off the
+///      `Account` on disk. Neither costs a process, so neither is a phase and
+///      neither owes this budget anything.
 ///
 /// Hence 90 + (30 + 11*10) = **230s**, down 30s again. Each shortening of this
 /// number has been the same trade and it goes the same way: the seconds given

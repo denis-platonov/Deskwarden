@@ -415,7 +415,7 @@ pub const CANCEL_LABEL: &str = "Cancel";
 /// FINDS a code there is never an overlay and never a box to drag: it asked
 /// for something that would not exist. The owner then: "the read a screen etc
 /// - takes few seconds and not clear what to expect - render the spinner in
-/// the meantime maybe on that open modal".
+///   the meantime maybe on that open modal".
 ///
 /// Both reports are about the same second and a half, and they are not in
 /// conflict. What was wrong was the WORDS, not the card: a surface that tells

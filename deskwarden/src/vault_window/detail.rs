@@ -2158,8 +2158,8 @@ pub(crate) fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
 ///
 /// The user asked for the app's name to "be clickable like link and have Ctrl
 /// + shortcut". Spelled as `(modifiers, key, chord)` -- the same triple
-/// [`COPY_SHORTCUTS`] carries, for the same reason: the chord a row PAINTS and
-/// the keys the handler is wired to have to be one value or they drift.
+///   [`COPY_SHORTCUTS`] carries, for the same reason: the chord a row PAINTS and
+///   the keys the handler is wired to have to be one value or they drift.
 ///
 /// **Standalone rather than a fifth row of [`COPY_SHORTCUTS`], and that is a
 /// decision about honesty, not tidiness.** Every function hanging off that

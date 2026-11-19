@@ -1813,10 +1813,10 @@ const OPT_IN_CHECK: f32 = 11.0;
 ///
 /// Fixed rather than derived from the galley's own height, which is ascent
 /// + descent — it reserves room for descenders that strings like "CTRL+H",
-/// "CTRL+N" and "Enter" never contain, so a galley-sized chip always came
-/// out taller than the design's. That gap widened when the monospace face
-/// became Consolas (see `system_monospace`), whose descent is deeper than
-/// the previously-used bundled face.
+///   "CTRL+N" and "Enter" never contain, so a galley-sized chip always came
+///   out taller than the design's. That gap widened when the monospace face
+///   became Consolas (see `system_monospace`), whose descent is deeper than
+///   the previously-used bundled face.
 pub const CHIP_HEIGHT: f32 = 18.0;
 
 /// The chip's text size, its horizontal padding and its corner radius, as

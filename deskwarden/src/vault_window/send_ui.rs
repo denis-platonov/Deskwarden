@@ -762,12 +762,12 @@ fn relative_words(remaining: i64) -> String {
 ///
 /// 5b's five rows read "to m.reyes - 40 min ago", "link only - 3 of 10 views
 /// - 6 d left", "to j.abara - expires in 3 h", "to contractor@vantage.io -
-/// never opened" and "revoked by you - 2 d ago". **Only the middle one is
-/// derivable today.** A recipient address is `emails` on the wire and this
-/// client neither sets it nor reads it; "40 min ago" and "2 d ago" are a
-/// `revisionDate` relative to now, which is available but says nothing until
-/// there is a per-access record to date -- see the `5c` timeline, which this
-/// pass deliberately did not build.
+///   never opened" and "revoked by you - 2 d ago". **Only the middle one is
+///   derivable today.** A recipient address is `emails` on the wire and this
+///   client neither sets it nor reads it; "40 min ago" and "2 d ago" are a
+///   `revisionDate` relative to now, which is available but says nothing until
+///   there is a per-access record to date -- see the `5c` timeline, which this
+///   pass deliberately did not build.
 ///
 /// **"link only" is omitted and its opposite is not.** The design prints it
 /// on the one row that has no password, and printing it on every unprotected
@@ -2794,10 +2794,10 @@ const TAG_PAD_X: f32 = 6.0;
 ///
 /// **5c's per-access timeline.** Its entries read `Password revealed - 15:01
 /// - Edge on Windows - Berlin, DE - 84.13....` and there is no per-access
-/// record in a Bitwarden Send at all: no time of any particular open, no user
-/// agent, no address, no geolocation. Having them would mean the owner's
-/// server logging every access with an IP, which is their decision about
-/// their service and not a gap in this screen.
+///   record in a Bitwarden Send at all: no time of any particular open, no user
+///   agent, no address, no geolocation. Having them would mean the owner's
+///   server logging every access with an IP, which is their decision about
+///   their service and not a gap in this screen.
 ///
 /// So there is **no Activity card**. A card headed `ACTIVITY` with nothing
 /// under it is worse than its absence twice over: it reads as a load that

@@ -9674,8 +9674,8 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
 ///   (`detail::OPEN_APP_CHORD`) starts the program from
 ///   [`AppMatch::launchable_path`] when it is not running, and a card that
 ///   could not say WHICH program would be a card that could not do that.
-/// Which of `match_engine`'s two rules this binding will really be matched
-/// by, in 8b's own words.
+///   Which of `match_engine`'s two rules this binding will really be matched
+///   by, in 8b's own words.
 ///
 /// **It is a READ-OUT and not a choice, which is this card's largest
 /// departure from 8a.** 8a draws a `150px` dropdown here offering `Process
@@ -9693,9 +9693,9 @@ fn app_add_block(ui: &mut egui::Ui) -> Option<AppAddChoice> {
 /// + title` on an ordinary desktop app would persist a value that changes
 /// nothing, which is the "succeeds and ignores you" control this file refuses
 /// everywhere (`AppMatch::trigger`, 8a's `On field focus`, 8a's `Require
-/// Windows Hello`). The row shows the rule instead, in the slot the dropdown
-/// occupies, drawn as a CHIP -- with no caret, because a caret is the one
-/// mark that promises a control opens.
+///   Windows Hello`). The row shows the rule instead, in the slot the dropdown
+///   occupies, drawn as a CHIP -- with no caret, because a caret is the one
+///   mark that promises a control opens.
 ///
 /// The same two strings 8b's `Match this window by` band uses, and not a
 /// second spelling of them: one vocabulary for one fact, across the card and

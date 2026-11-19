@@ -724,7 +724,7 @@ fn read_head(path: &Path) -> Vec<u8> {
 ///    An app killed mid-export leaves one behind; it is encrypted, so this is
 ///    litter rather than exposure, but it is litter in a folder the user
 ///    chose. Same shape as [`crate::updater::cleanup_stale_downloads`].
-/// 1b. **Delete this export's own staging file**, unconditionally, whatever
+///    1b. **Delete this export's own staging file**, unconditionally, whatever
 ///    its age. The sweep above only takes partials older than
 ///    [`STALE_PARTIAL_AGE`], so it cannot be relied on for this one.
 /// 2. **Run**, through the injected runner, which is pointed at

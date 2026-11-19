@@ -10963,25 +10963,25 @@ fn sync_refresh_for(child: &Option<BackendStart>) -> SyncRefresh {
 /// different door, so it is written out rather than left to be re-derived:
 ///
 ///  1. **A `clear` -- lock, re-auth into a possibly different account, quit.**
-///    The sync's result must be thrown away. `VaultCache::populate_with`'s own
-///    epoch guard covers the worker's fetch-to-write window; this covers the
-///    one after it, between the worker sending its outcome and `main` draining
-///    it, which is reachable because `open_vault_window` abandons an in-flight
-///    backend operation after `BACKEND_OP_TIMEOUT` and carries on into a lock
-///    recovery that calls `cache.clear()`. Applied unguarded, such a late
-///    arrival writes the PREVIOUS account's app matches over an engine the
-///    recovery has just armed correctly for the new one -- the same
-///    cross-account pairing `stand_down_after_unlock` exists to prevent, from
-///    the other direction. It also covers review 17's finding, where the
-///    recovery's own populate failed and left the cache legitimately empty:
-///    that recovery clears first, so the epoch has moved and nothing is
-///    applied to the empty cache.
+///     The sync's result must be thrown away. `VaultCache::populate_with`'s own
+///     epoch guard covers the worker's fetch-to-write window; this covers the
+///     one after it, between the worker sending its outcome and `main` draining
+///     it, which is reachable because `open_vault_window` abandons an in-flight
+///     backend operation after `BACKEND_OP_TIMEOUT` and carries on into a lock
+///     recovery that calls `cache.clear()`. Applied unguarded, such a late
+///     arrival writes the PREVIOUS account's app matches over an engine the
+///     recovery has just armed correctly for the new one -- the same
+///     cross-account pairing `stand_down_after_unlock` exists to prevent, from
+///     the other direction. It also covers review 17's finding, where the
+///     recovery's own populate failed and left the cache legitimately empty:
+///     that recovery clears first, so the epoch has moved and nothing is
+///     applied to the empty cache.
 ///  2. **A WRITE -- an "Add app..." save, or any vault-window edit.** The
-///    sync's result must NOT be thrown away, and must not overwrite the write
-///    either. A write is newer truth than a fetch that predates it, and the
-///    "Add app..." handler does not block on `backend_task_in_progress`
-///    while its two picker windows block the main thread, so a save landing
-///    inside a queued sync's window is ordinary, not exotic.
+///     sync's result must NOT be thrown away, and must not overwrite the write
+///     either. A write is newer truth than a fetch that predates it, and the
+///     "Add app..." handler does not block on `backend_task_in_progress`
+///     while its two picker windows block the main thread, so a save landing
+///     inside a queued sync's window is ordinary, not exotic.
 ///
 /// Review 18's third finding is what happens when one mechanism is asked to
 /// answer both: `Refreshed` carried the entries from the sync's own
@@ -24522,7 +24522,7 @@ mod tests {
     /// 4. [`the_fake_can_fail`] drives the loop with a deliberately wrong
     ///    expected log, so "the log matched" is known to be a real comparison
     ///    over a non-empty `Vec` rather than two empties agreeing.
-    /// **What a finished UI process is allowed to make the daemon do.**
+    ///    **What a finished UI process is allowed to make the daemon do.**
     ///
     /// `ui_vault_outcome` is the one decision on the way home from a polled
     /// child, and both directions of getting it wrong are serious: dropping a

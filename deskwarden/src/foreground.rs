@@ -2,10 +2,10 @@
 //!
 //! Reported as two symptoms with one cause: "when you click Login with Hello
 //! - Windows PIN screen launches in background ... same after login - has to
-//! be visible right away and not behind or even worse in tray". Before this
-//! module the only foreground handling in the crate was
-//! `with_always_on_top()` on the autofill overlay; every other window took
-//! whatever z-order Windows happened to hand it.
+//!   be visible right away and not behind or even worse in tray". Before this
+//!   module the only foreground handling in the crate was
+//!   `with_always_on_top()` on the autofill overlay; every other window took
+//!   whatever z-order Windows happened to hand it.
 //!
 //! ## Why the Hello prompt in particular lands behind
 //!
