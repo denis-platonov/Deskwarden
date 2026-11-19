@@ -12,6 +12,7 @@ pub mod detail_slide;
 pub mod folder_modal;
 pub mod icon_modal;
 pub mod item_list;
+pub mod new_item_modal;
 pub mod password_health;
 pub mod preflight;
 pub mod record_ui;
@@ -1523,6 +1524,8 @@ pub fn build_frame_with_search(
     // `record_ui`'s collision question, and for the same reason: a proof
     // demanded at the open proves nothing about a choice made a minute later.
     let mut totp_add_state: Option<totp_add::TotpAdd> = None;
+    // Spec B §5: the New item chooser is up.
+    let mut new_item_chooser = false;
     // **Design 6b's overlay, while it is up.**
     //
     // Held beside the form rather than inside it because it is a *window*, and
@@ -2939,10 +2942,13 @@ pub fn build_frame_with_search(
                     && i.key_pressed(ADD_TOTP_KEY),
             )
         });
-        // The rail's New item and Lock rows ask for exactly what the chords
-        // do, a frame later.
-        let ctrl_n = ctrl_n || rail_new_item;
+        // The rail's Lock row asks for exactly what the chord does, a frame
+        // later. Its New item row opens the chooser (spec B §5); Ctrl+N stays
+        // "new login" at once, as the palette's hint says.
         let ctrl_l = ctrl_l || rail_lock;
+        if rail_new_item {
+            new_item_chooser = true;
+        }
         if send_record_chord {
             send_record_asked = true;
         }
@@ -7735,6 +7741,16 @@ pub fn build_frame_with_search(
         // `may_edit` for a received record (spec 6.9): a code is a write to
         // the record, and CTRL+SHIFT+2 reaches here without the pane that
         // draws no ⏱ for one.
+        if new_item_chooser {
+            match new_item_modal::draw(ui.ctx()) {
+                new_item_modal::ChooserAnswer::Picked(kind) => {
+                    new_item_chooser = false;
+                    mode = DetailMode::Create(EditDraft::empty_of(kind));
+                }
+                new_item_modal::ChooserAnswer::Closed => new_item_chooser = false,
+                new_item_modal::ChooserAnswer::Open => {}
+            }
+        }
         if add_totp_asked && totp_add_state.is_none() {
             if let Some(item) = selected_id
                 .as_ref()
@@ -29030,8 +29046,9 @@ mod preferences_modal_wiring_tests {
             // 69 again when the v2 top bar retired
             // `mod titlebar_switcher_placement_tests`, which measured the v1
             // chrome's gear, chevron and drag zone.
-            // 70 with `edit_trash_wiring` (v2 editor, Move to trash).
-            modules, 70,
+            // 70 with `edit_trash_wiring` (v2 editor, Move to trash); 71 with
+            // `new_item_chooser_wiring`.
+            modules, 71,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -41980,5 +41997,22 @@ mod edit_trash_wiring {
         assert!(body.contains(concat!("delete_modal::DeleteKind::", "ToTrash")), "{body}");
         let done = SOURCE.find(concat!("selected_id = None;", "\r\n                        detail_dismissed = true;")).expect("the delete's success arm");
         assert!(SOURCE[done..done + 200].contains(concat!("mode = DetailMode::", "Read;")), "the editor outlives its item");
+    }
+}
+
+#[cfg(test)]
+mod new_item_chooser_wiring {
+    //! The rail's New item opens the chooser, and a pick opens that kind's
+    //! editor. Source guards, for `edit_history_copy_wiring`'s reason;
+    //! needles split across literals.
+    const SOURCE: &str = include_str!("mod.rs");
+
+    #[test]
+    fn the_sidebar_new_item_opens_the_chooser() {
+        let at = SOURCE.find(concat!("if rail_new_item", " {")).expect("the rail's arm");
+        assert!(SOURCE[at..at + 120].contains(concat!("new_item_chooser", " = true;")));
+        assert!(!SOURCE.contains(concat!("ctrl_n || ", "rail_new_item")), "the rail still creates a login");
+        let pick = SOURCE.find(concat!("ChooserAnswer::", "Picked(kind) => {")).expect("the pick arm");
+        assert!(SOURCE[pick..pick + 200].contains(concat!("EditDraft::", "empty_of(kind)")));
     }
 }

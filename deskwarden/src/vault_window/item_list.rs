@@ -1155,6 +1155,7 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "folder-edit-scrim",
     "icon-pick-scrim",
     "launch-confirm-scrim",
+    "new-item-scrim",
     "password-generator-scrim",
     "prefs-modal-scrim",
     "record-forget-scrim",
@@ -7541,6 +7542,23 @@ mod keyboard_selection_tests {
                     found.push(id.to_string());
                 }
             }
+        }
+        // `kit::modal::Dialog`s name their scrim "<ID>-scrim" from the
+        // module's ID const, which the module passes to the Dialog it opens.
+        let dialog = concat!("Dialog::new", "(ID,");
+        let decl = concat!("pub const ID: &str = ", "\"");
+        for (file, source) in crate_sources() {
+            if !source.contains(dialog) {
+                continue;
+            }
+            let at = source.find(decl).unwrap_or_else(|| panic!("`{file}` opens a Dialog with no `pub const ID`"));
+            let rest = &source[at + decl.len()..];
+            let scrim = format!("{}-scrim", &rest[..rest.find('"').expect("a closed literal")]);
+            assert!(
+                MODAL_SCRIM_AREAS.contains(&scrim.as_str()),
+                "`{file}` draws a dialog whose scrim `{scrim}` `MODAL_SCRIM_AREAS` does not name"
+            );
+            found.push(scrim);
         }
         found.sort();
         found.dedup();
