@@ -660,6 +660,8 @@ enum Surface {
     ModalNewItem,
     /// The Ctrl+K palette over the shell, with a query (spec B §4).
     ModalPalette,
+    /// The Generator screen (spec C §1).
+    ToolGenerator,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -908,6 +910,7 @@ const ALL: &[Surface] = &[
     Surface::VaultShellOffline,
     Surface::ModalNewItem,
     Surface::ModalPalette,
+    Surface::ToolGenerator,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -1005,6 +1008,7 @@ impl Surface {
             Surface::VaultShellOffline => "vault_shell_offline",
             Surface::ModalNewItem => "modal_new_item",
             Surface::ModalPalette => "modal_palette",
+            Surface::ToolGenerator => "tool_generator",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1184,6 +1188,7 @@ impl Surface {
             | Surface::VaultShellOffline
             | Surface::ModalNewItem
             | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
+            Surface::ToolGenerator => egui::vec2(1280.0 - 252.0, 820.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1323,6 +1328,7 @@ fn main() -> eframe::Result {
             Surface::VaultShellOffline,
             Surface::ModalNewItem,
             Surface::ModalPalette,
+            Surface::ToolGenerator,
         ]
     } else if list {
         vec![Surface::VaultList]
@@ -1794,6 +1800,10 @@ impl eframe::App for Preview {
                     self.list_selected = Some(card.id.clone());
                 }
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Card, false)
+            }
+            Surface::ToolGenerator => {
+                let mut state = deskwarden::vault_window::generator_screen::GeneratorScreen::new(Default::default());
+                let _ = deskwarden::vault_window::generator_screen::draw(root, &mut state);
             }
             Surface::ModalNewItem => {
                 self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
