@@ -213,7 +213,7 @@ fn sync_pill(ui: &mut Ui, rect: Rect, pill: &SyncPill) -> egui::Response {
 /// The search field (design 1a): 46 high, radius 14, field grey, a blue edge
 /// while it has the keyboard, a magnifier, and the chip that reads `Ctrl K`
 /// while empty and `Esc` -- which clears it -- once something is typed. It
-/// keeps the id Ctrl+K focuses, so the window's chord still finds it.
+/// keeps the id Ctrl+F focuses, so the window's chord still finds it.
 fn search_field(ui: &mut Ui, rect: Rect, value: &mut String, placeholder: &str) {
     let p = palette(ui.ctx());
     let id = crate::vault_window::item_list::search_field_id();
@@ -245,6 +245,9 @@ fn search_field(ui: &mut Ui, rect: Rect, value: &mut String, placeholder: &str) 
             value.clear();
         }
     } else {
+        if chip_response.clicked() {
+            super::sidebar::request_shell(ui.ctx(), super::sidebar::ShellRequest::OpenPalette);
+        }
         tips::hint(ui, &chip_response, "Quick search", &["Mod", "K"]);
     }
 

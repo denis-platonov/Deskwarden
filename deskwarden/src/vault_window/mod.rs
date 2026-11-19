@@ -13,6 +13,7 @@ pub mod folder_modal;
 pub mod icon_modal;
 pub mod item_list;
 pub mod new_item_modal;
+pub mod palette;
 pub mod password_health;
 pub mod preflight;
 pub mod record_ui;
@@ -1526,6 +1527,8 @@ pub fn build_frame_with_search(
     let mut totp_add_state: Option<totp_add::TotpAdd> = None;
     // Spec B §5: the New item chooser is up.
     let mut new_item_chooser = false;
+    // Spec B §4: the command palette is up, with its query.
+    let mut palette_state: Option<palette::PaletteState> = None;
     // **Design 6b's overlay, while it is up.**
     //
     // Held beside the form rather than inside it because it is a *window*, and
@@ -2955,7 +2958,11 @@ pub fn build_frame_with_search(
         if add_totp_chord {
             add_totp_asked = true;
         }
-        if ctrl_k {
+        // Spec B §4: Ctrl+K is the palette; Ctrl+F is the search box.
+        if ctrl_k || sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenPalette) {
+            palette_state = Some(palette::PaletteState::default());
+        }
+        if shortcuts && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
         }
         if ctrl_l {
@@ -7111,6 +7118,38 @@ pub fn build_frame_with_search(
         // on"). The pane draws no ✉ for one, and `detail::view_only` drops
         // the button's request; this filter is what the CTRL+SHIFT+S chord,
         // which never passes through the pane, meets.
+        // The palette, before the requests it can make are read below.
+        if let Some(state) = palette_state.as_mut() {
+            let selected_name = selected_id
+                .as_ref()
+                .and_then(|id| items.iter().find(|i| &i.id == id))
+                .map(|i| i.name.clone());
+            match palette::draw(ui.ctx(), state, &items, selected_name.as_deref()) {
+                palette::PaletteAnswer::Open => {}
+                palette::PaletteAnswer::Closed => palette_state = None,
+                palette::PaletteAnswer::Item(id) => {
+                    palette_state = None;
+                    selected_id = Some(id);
+                    mode = DetailMode::Read;
+                }
+                palette::PaletteAnswer::Action(action) => {
+                    palette_state = None;
+                    match action {
+                        palette::PaletteAction::NewLogin => {
+                            mode = DetailMode::Create(EditDraft::empty_of(crate::vault_bridge::ItemKind::Login))
+                        }
+                        palette::PaletteAction::Share => send_record_asked = true,
+                        palette::PaletteAction::Settings => {
+                            sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::OpenSettings)
+                        }
+                        palette::PaletteAction::Lock => {
+                            *locked_for_closure.borrow_mut() = true;
+                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    }
+                }
+            }
+        }
         if send_record_asked {
             if let Some(item) = selected_id
                 .as_ref()
@@ -29047,8 +29086,8 @@ mod preferences_modal_wiring_tests {
             // `mod titlebar_switcher_placement_tests`, which measured the v1
             // chrome's gear, chevron and drag zone.
             // 70 with `edit_trash_wiring` (v2 editor, Move to trash); 71 with
-            // `new_item_chooser_wiring`.
-            modules, 71,
+            // `new_item_chooser_wiring`; 72 with `palette_wiring`.
+            modules, 72,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -33785,7 +33824,7 @@ mod send_delete_wiring {
         let _ = ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
-                    key: egui::Key::K,
+                    key: egui::Key::F,
                     physical_key: None,
                     pressed: true,
                     repeat: false,
@@ -33814,7 +33853,7 @@ mod send_delete_wiring {
         // the failure mode that produced the shadow in the first place.
         assert!(
             find(&typed, "zq").is_some(),
-            "control: the search box does not paint \"zq\" after Ctrl+K and two letters, \
+            "control: the search box does not paint \"zq\" after Ctrl+F and two letters, \
              so nothing was typed and `search` is still empty. This step exists to make it \
              NON-empty; if it does not, the `search`-gated shadow it answers is green \
              again and nothing here would say so. What was painted: {:?}",
@@ -33859,7 +33898,7 @@ mod send_delete_wiring {
         let _ = ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
-                    key: egui::Key::K,
+                    key: egui::Key::F,
                     physical_key: None,
                     pressed: true,
                     repeat: false,
@@ -35047,7 +35086,7 @@ mod send_delete_wiring {
         let _ = ctx.run_ui(
             egui::RawInput {
                 events: vec![egui::Event::Key {
-                    key: egui::Key::K,
+                    key: egui::Key::F,
                     physical_key: None,
                     pressed: true,
                     repeat: false,
@@ -42014,5 +42053,21 @@ mod new_item_chooser_wiring {
         assert!(!SOURCE.contains(concat!("ctrl_n || ", "rail_new_item")), "the rail still creates a login");
         let pick = SOURCE.find(concat!("ChooserAnswer::", "Picked(kind) => {")).expect("the pick arm");
         assert!(SOURCE[pick..pick + 200].contains(concat!("EditDraft::", "empty_of(kind)")));
+    }
+}
+
+#[cfg(test)]
+mod palette_wiring {
+    //! Ctrl+K opens the palette and Ctrl+F the search box. Source guards;
+    //! needles split across literals.
+    const SOURCE: &str = include_str!("mod.rs");
+
+    #[test]
+    fn ctrl_k_opens_the_palette() {
+        let at = SOURCE.find(concat!("if ctrl_k", " || ")).expect("the Ctrl+K arm");
+        assert!(SOURCE[at..at + 260].contains(concat!("palette_state = Some(", "palette::PaletteState::default())")));
+        let draw = SOURCE.find(concat!("palette::draw(", "ui.ctx()")).expect("the palette is drawn");
+        let send = SOURCE.find(concat!("if send_record_asked", " {")).expect("the Share request is read");
+        assert!(draw < send, "the palette's Share would be read a frame late and dropped");
     }
 }

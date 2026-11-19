@@ -1108,7 +1108,7 @@ pub(crate) const LIST_PADDING_TOP: f32 = 4.0;
 /// The search field's own id.
 ///
 /// `theme::search_field` puts this on the `TextEdit` it builds, and
-/// `vault_window::mod`'s Ctrl+K asks `request_focus` for it by the same name
+/// `vault_window::mod`'s Ctrl+F asks `request_focus` for it by the same name
 /// from outside this file -- so it MUST NOT CHANGE. Written once here rather
 /// than at the two places in this module that need it (the field itself, and
 /// [`nav_key`]'s Home/End gate), so a rename cannot move one and leave the
@@ -1156,6 +1156,7 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "icon-pick-scrim",
     "launch-confirm-scrim",
     "new-item-scrim",
+    "palette-scrim",
     "password-generator-scrim",
     "prefs-modal-scrim",
     "record-forget-scrim",

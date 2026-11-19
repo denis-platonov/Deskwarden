@@ -979,6 +979,8 @@ pub enum ShellRequest {
     NewItem,
     Lock,
     OpenSettings,
+    /// The top bar's `Ctrl K` chip: open the command palette.
+    OpenPalette,
 }
 
 /// Records `request` for the window to answer on its next frame.
