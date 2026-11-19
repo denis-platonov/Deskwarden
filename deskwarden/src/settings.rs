@@ -1778,6 +1778,7 @@ pub struct Settings {
     pub accounts_unreadable: bool,
     /// The Generator screen's remembered options (slice 6). Local to this
     /// machine; nothing is stored on any item.
+    #[serde(deserialize_with = "lenient_generator")]
     pub generator: GeneratorPrefs,
 }
 
@@ -1815,6 +1816,14 @@ impl Default for GeneratorPrefs {
             avoid_lookalikes: false,
         }
     }
+}
+
+/// Reads the `generator` block, or the defaults when it cannot be read: a UI
+/// preference written by another build must never make the whole file (and
+/// its account list) unreadable.
+fn lenient_generator<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<GeneratorPrefs, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<GeneratorPrefs>(value).map(GeneratorPrefs::clamped).unwrap_or_default())
 }
 
 impl GeneratorPrefs {
@@ -5628,6 +5637,14 @@ mod generator_prefs_tests {
         let partial: Settings = serde_json::from_str(r#"{"generator":{"mode":"pin"}}"#).unwrap();
         assert_eq!(partial.generator.mode, crate::generator_mode::GeneratorMode::Pin);
         assert_eq!(partial.generator.length, 20, "the rest keep their defaults");
+    }
+
+    #[test]
+    fn a_malformed_generator_block_keeps_the_rest_of_the_file() {
+        let parsed: Settings = serde_json::from_str(r#"{"check_breaches":true,"generator":{"mode":"Nope","length":-1}}"#)
+            .expect("the file still parses");
+        assert!(parsed.check_breaches);
+        assert_eq!(parsed.generator, GeneratorPrefs::default());
     }
 
     #[test]

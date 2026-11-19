@@ -114,6 +114,24 @@ const SPECIAL: &str = "!@#$%^&*";
 /// `bw`'s own floor on a generated password's length, which
 /// [`PasswordRecipe::length`]'s doc records: the serve route clamps anything
 /// below this up to it.
+/// How many characters the password alphabet holds for these classes (the
+/// generator's own sets, look-alikes removed when asked).
+pub fn alphabet_size(upper: bool, lower: bool, number: bool, special: bool, avoid_ambiguous: bool) -> usize {
+    let with = |base: &str, ambiguous: &str, on: bool| {
+        if !on {
+            0
+        } else if avoid_ambiguous {
+            base.len()
+        } else {
+            base.len() + ambiguous.len()
+        }
+    };
+    with(UPPERCASE, UPPERCASE_AMBIGUOUS, upper)
+        + with(LOWERCASE, LOWERCASE_AMBIGUOUS, lower)
+        + with(NUMBER, NUMBER_AMBIGUOUS, number)
+        + if special { SPECIAL.len() } else { 0 }
+}
+
 const MIN_LENGTH: u32 = 5;
 
 /// A ceiling on the generated length. **This is one of the two places this

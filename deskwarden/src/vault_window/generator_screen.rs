@@ -33,11 +33,14 @@ pub struct GeneratorScreen {
     value: Zeroizing<String>,
     error: Option<String>,
     stale: bool,
+    /// Options changed and not yet written: the window writes them once the
+    /// pointer is up, not on every tick of a slider drag.
+    pub unsaved: bool,
 }
 
 impl GeneratorScreen {
     pub fn new(prefs: GeneratorPrefs) -> Self {
-        Self { prefs: prefs.clamped(), value: Zeroizing::new(String::new()), error: None, stale: true }
+        Self { prefs: prefs.clamped(), value: Zeroizing::new(String::new()), error: None, stale: true, unsaved: false }
     }
 
     /// The value on screen.
@@ -76,13 +79,14 @@ impl GeneratorScreen {
     }
 
     /// The password alphabet's size, for the strength line.
+    /// The generator's real alphabet (spec C §1.3 falls back to 26 with no
+    /// class on).
     fn pool(&self) -> usize {
         let p = &self.prefs;
-        [(p.uppercase, 26), (p.lowercase, 26), (p.numbers, 10), (p.symbols, 32)]
-            .iter()
-            .filter(|(on, _)| *on)
-            .map(|(_, n)| *n)
-            .sum()
+        match crate::password_gen::alphabet_size(p.uppercase, p.lowercase, p.numbers, p.symbols, p.avoid_lookalikes) {
+            0 => 26,
+            n => n,
+        }
     }
 
     fn size(&self) -> usize {
@@ -136,9 +140,10 @@ pub fn draw(ui: &mut egui::Ui, state: &mut GeneratorScreen) -> GeneratorAction {
             });
         });
     });
+    state.prefs = state.prefs.clone().clamped();
     if state.prefs != before {
-        state.prefs = state.prefs.clone().clamped();
         state.regenerate();
+        state.unsaved = true;
         GeneratorAction::PrefsChanged
     } else {
         GeneratorAction::None

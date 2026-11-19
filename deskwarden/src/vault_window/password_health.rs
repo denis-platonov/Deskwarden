@@ -596,16 +596,22 @@ pub struct OldItem {
 /// `None` when none of them can be read.
 pub fn password_age_days(item: &VaultItem, today: i64) -> Option<i64> {
     let login = item.login.as_ref()?;
-    let set = login
-        .other
-        .get("passwordRevisionDate")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or_else(|| {
-            crate::vault_bridge::password_history(item).first().and_then(|entry| entry.last_used_date.clone())
-        })
-        .or_else(|| item.other.get("creationDate").and_then(|v| v.as_str()).map(str::to_string))?;
-    Some(today - super::detail::date_days(&set)?)
+    if let Some(set) = login.other.get("passwordRevisionDate").and_then(|v| v.as_str()) {
+        return Some(today - super::detail::date_days(set)?);
+    }
+    // The newest history date, whichever order the entries come in; only the
+    // dates are read, never the previous passwords. History with no
+    // readable date is an unknown age, not the item's creation.
+    if let Some(history) = item.other.get("passwordHistory").and_then(|v| v.as_array()).filter(|h| !h.is_empty()) {
+        let newest = history
+            .iter()
+            .filter_map(|entry| entry.get("lastUsedDate")?.as_str())
+            .filter_map(super::detail::date_days)
+            .max()?;
+        return Some(today - newest);
+    }
+    let created = item.other.get("creationDate").and_then(|v| v.as_str())?;
+    Some(today - super::detail::date_days(created)?)
 }
 
 /// D5: every item with a password unchanged for [`OLD_DAYS`] or more. An
@@ -3344,6 +3350,23 @@ mod old_password_tests {
         assert!(old_items(&[fresh], today()).is_empty());
         let created = login(serde_json::json!({ "creationDate": "2024-01-01T00:00:00Z" }));
         assert_eq!(old_items(&[created], today()).len(), 1, "no change since it was created");
+    }
+
+    #[test]
+    fn the_newest_history_date_counts_whatever_the_order() {
+        let changed = login(serde_json::json!({
+            "creationDate": "2020-01-01T00:00:00Z",
+            "passwordHistory": [
+                { "password": "first-one", "lastUsedDate": "2021-01-01T00:00:00Z" },
+                { "password": "second-one", "lastUsedDate": "2026-10-01T00:00:00Z" }
+            ]
+        }));
+        assert!(old_items(&[changed], today()).is_empty(), "changed last month, oldest-first history");
+        let undated = login(serde_json::json!({
+            "creationDate": "2020-01-01T00:00:00Z",
+            "passwordHistory": [{ "password": "x" }]
+        }));
+        assert!(old_items(&[undated], today()).is_empty(), "changed at an unknown time is not old");
     }
 
     #[test]

@@ -8525,6 +8525,10 @@ pub(crate) fn date_days(date: &str) -> Option<i64> {
     let year: i64 = parts.next()?.parse().ok()?;
     let month: i64 = parts.next()?.parse().ok()?;
     let day: i64 = parts.next()?.parse().ok()?;
+    // A sentinel or a typo is not a date anything happened on.
+    if !(1990..=9999).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
     Some(days_from_civil(year, month, day))
 }
 

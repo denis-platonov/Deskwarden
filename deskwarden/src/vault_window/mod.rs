@@ -1533,7 +1533,7 @@ pub fn build_frame_with_search(
     // Spec B §5: the New item chooser is up.
     let mut new_item_chooser = false;
     // Spec C §3: "Empty trash?" is up.
-    let mut empty_trash_asked = false;
+    let mut empty_trash_ids: Option<Vec<String>> = None;
     // Spec B §4: the command palette is up, with its query.
     let mut palette_state: Option<palette::PaletteState> = None;
     // **Design 6b's overlay, while it is up.**
@@ -2998,6 +2998,15 @@ pub fn build_frame_with_search(
         if ctrl_n {
             mode = DetailMode::Create(EditDraft::empty());
         }
+        // Slice 6 review: an editor opened by any door (Ctrl+N, the
+        // palette, the chooser) is shown, not hidden behind the Generator;
+        // and the generated value does not outlive the screen.
+        if matches!(mode, DetailMode::Create(_) | DetailMode::Edit(_)) {
+            generator_selected = false;
+        }
+        if !generator_selected {
+            generator = None;
+        }
 
         // Until the vault arrives, the whole body is one centred spinner --
         // sidebar and item list included, rather than drawing the nav around
@@ -3820,7 +3829,11 @@ pub fn build_frame_with_search(
                                 (spawn_sync)(sync_tx.clone(), session_token.to_string());
                             }
                         }
-                        ItemListAction::EmptyTrash => empty_trash_asked = true,
+                        // The ids are taken now: the dialog counts and purges
+                        // exactly these, whatever reloads the list meanwhile.
+                        ItemListAction::EmptyTrash => {
+                            empty_trash_ids = trash_list.items.as_deref().map(|items| items.iter().map(|i| i.id.clone()).collect());
+                        }
                         ItemListAction::None => {}
                     }
                 });
@@ -4593,7 +4606,11 @@ pub fn build_frame_with_search(
                                 .unwrap_or_default(),
                         )
                     });
-                    if generator_screen::draw(ui, state) == generator_screen::GeneratorAction::PrefsChanged {
+                    let _ = generator_screen::draw(ui, state);
+                    // Written once the pointer is up, not on every tick of a
+                    // slider drag (settings.json is rewritten whole).
+                    if state.unsaved && !ui.input(|i| i.pointer.any_down()) {
+                        state.unsaved = false;
                         if let Some(path) = generator_settings_path.as_deref() {
                             if let Err(e) = crate::settings::Settings::persist_generator(path, &state.prefs) {
                                 log::warn!("the generator's options could not be saved: {e:?}");
@@ -6823,6 +6840,7 @@ pub fn build_frame_with_search(
         // it -- the item pane resolves a selection against the filter's own
         // list, and under All an archived id would be "Select an item.".
         if let Some(item_id) = open_record {
+            generator_selected = false;
             // Spec B §7's Change password asked for the editor; taken here so a
             // record that cannot be opened does not leave the ask behind.
             let edit_after = ctx_edit_after_open(false);
@@ -7873,26 +7891,30 @@ pub fn build_frame_with_search(
         // `may_edit` for a received record (spec 6.9): a code is a write to
         // the record, and CTRL+SHIFT+2 reaches here without the pane that
         // draws no ⏱ for one.
-        if empty_trash_asked {
-            let trashed: Vec<String> = trash_list.items.as_deref().unwrap_or_default().iter().map(|i| i.id.clone()).collect();
+        if let Some(trashed) = empty_trash_ids.clone().filter(|ids| !ids.is_empty()) {
             match trash_modal::draw(ui.ctx(), trashed.len()) {
                 trash_modal::EmptyTrashAnswer::Open => {}
-                trash_modal::EmptyTrashAnswer::Cancel => empty_trash_asked = false,
+                trash_modal::EmptyTrashAnswer::Cancel => empty_trash_ids = None,
                 trash_modal::EmptyTrashAnswer::Confirm => {
-                    empty_trash_asked = false;
+                    empty_trash_ids = None;
                     // One purge per item, stopping at the first refusal; the
                     // list is re-read either way, so it shows what is left.
+                    // Every item is tried; one that is refused does not keep
+                    // the rest.
                     let mut failed = None;
+                    let mut purged = Vec::new();
                     for id in &trashed {
-                        if let Err(e) = cache.purge_item(id) {
-                            log::warn!("emptying the trash: failed to purge item {id}: {e:?}");
-                            flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
-                            failed = Some(e);
-                            break;
+                        match cache.purge_item(id) {
+                            Ok(()) => purged.push(id.clone()),
+                            Err(e) => {
+                                log::warn!("emptying the trash: failed to purge item {id}: {e:?}");
+                                flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                                failed = Some(e);
+                            }
                         }
                     }
                     trash_list.invalidate();
-                    if selected_id.as_ref().is_some_and(|id| trashed.contains(id)) {
+                    if selected_id.as_ref().is_some_and(|id| purged.contains(id)) {
                         selected_id = None;
                     }
                     crate::kit::toast::show(
