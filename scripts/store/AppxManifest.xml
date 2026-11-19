@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Deskwarden -- Microsoft Store package manifest (TEMPLATE).
+
+  scripts/store/build-msix.ps1 copies this next to the built Deskwarden.exe
+  and replaces the four @TOKENS@ below. Do not edit the copy; edit this file.
+
+    @PACKAGE_NAME@            Partner Center -> Product identity -> Package/Identity/Name
+    @PUBLISHER@               Partner Center -> Product identity -> Package/Identity/Publisher
+                              (looks like CN=XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX)
+    @PUBLISHER_DISPLAY_NAME@  Partner Center -> Product identity -> Package/Properties/PublisherDisplayName
+    @VERSION@                 four-part, written by the script from Cargo.toml
+                              (1.0.0 -> 1.0.0.0). The Store reserves the 4th part: it must be 0.
+
+  These are the owner's to fill (docs/store/CHECKLIST.md). The package does
+  not build, and must not be uploaded, with a token left in it; the script
+  refuses.
+
+  Full trust, on purpose. Deskwarden reads other applications' windows through
+  UI Automation, types into them with SendInput, runs a background daemon and
+  a child process, and has a tray icon. None of that exists inside an AppContainer, so
+  the package declares runFullTrust and a Win32 entry point; it is the
+  "Desktop Bridge" shape. docs/store/microsoft/packaging.md has the reasoning.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap5="http://schemas.microsoft.com/appx/manifest/uap/windows10/5"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap5 rescap">
+
+  <Identity
+    Name="@PACKAGE_NAME@"
+    Publisher="@PUBLISHER@"
+    Version="@VERSION@"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>Deskwarden</DisplayName>
+    <PublisherDisplayName>@PUBLISHER_DISPLAY_NAME@</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Autofill Bitwarden-compatible vault logins into native Windows applications. Unofficial; not made by Bitwarden, Inc.</Description>
+  </Properties>
+
+  <Dependencies>
+    <!-- 1809: the first release with the startup-task manifest extension. -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.17763.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="Deskwarden" Executable="Deskwarden.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="Deskwarden"
+        Description="Autofill vault logins into native Windows applications"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile
+          Wide310x150Logo="Assets\Wide310x150Logo.png"
+          Square71x71Logo="Assets\Square71x71Logo.png"
+          Square310x310Logo="Assets\Square310x310Logo.png">
+          <uap:ShowNameOnTiles>
+            <uap:ShowOn Tile="square150x150Logo" />
+            <uap:ShowOn Tile="wide310x150Logo" />
+          </uap:ShowNameOnTiles>
+        </uap:DefaultTile>
+        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+      </uap:VisualElements>
+
+      <Extensions>
+        <!-- Start at sign-in. Shipped DISABLED: the user turns it on (Settings
+             -> Apps -> Startup, or from the app), exactly as the Inno installer's
+             unticked "Start Deskwarden automatically" task is opt-in. -->
+        <uap5:Extension
+          Category="windows.startupTask"
+          Executable="Deskwarden.exe"
+          EntryPoint="Windows.FullTrustApplication">
+          <uap5:StartupTask TaskId="DeskwardenStartup" Enabled="false" DisplayName="Deskwarden" />
+        </uap5:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <!-- Win32 process: UI Automation, SendInput, tray, child processes. -->
+    <rescap:Capability Name="runFullTrust" />
+    <!-- Site icons, breach check, the user's own vault server. -->
+    <Capability Name="internetClient" />
+    <!-- Home / office servers (self-hosted vaults, LAN icon fetches). -->
+    <Capability Name="privateNetworkClientServer" />
+    <!-- "Add a one-time code -> Use a webcam" (QR enrolment) only. -->
+    <DeviceCapability Name="webcam" />
+  </Capabilities>
+</Package>

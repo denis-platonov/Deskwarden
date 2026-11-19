@@ -413,3 +413,36 @@ jobs:
           # list was for is now the "Full changelog" link, which points at a
           # file written for people rather than at a diff.
           body_path: release-body.md
+
+  # The Microsoft Store package, built as a workflow ARTIFACT and nothing
+  # more. It is never uploaded to the Store, signed, or attached to the
+  # release: this job proves the package still assembles (the `store` feature
+  # compiles, the manifest is valid, every logo generates, makeappx accepts
+  # it) on every tag. The identity is a placeholder (`-CiBuild`), and the
+  # file is named UNSUBMITTABLE for that reason. The real submission is
+  # built by the owner with their Partner Center identity --
+  # docs/store/microsoft/packaging.md, docs/store/CHECKLIST.md.
+  store-package:
+    name: Microsoft Store package (artifact only)
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the Store package
+        shell: pwsh
+        run: scripts/store/build-msix.ps1 -CiBuild
+
+      - name: Keep the package as an artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deskwarden-store-package-unsubmittable
+          path: |
+            store-package/*.msix
+            store-package/generated-assets/listing/*.png
+          retention-days: 14
+          if-no-files-found: error

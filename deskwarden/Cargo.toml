@@ -490,6 +490,16 @@ regex = "1"
 # dev-dependency below is the only thing that does.
 test-support = []
 
+# The Microsoft Store edition (off by default; the MSIX is built with it on --
+# scripts/store/build-msix.ps1). Store policy forbids an app updating itself
+# outside the Store and restricts downloading executable code, so under it:
+#   * `updater::SELF_UPDATE` is false and the self-updater never checks,
+#     downloads or installs;
+#   * `bw_acquire::acquire_if_needed` refuses, so the official `bw` CLI is
+#     never downloaded at runtime.
+# Nothing else changes shape. See docs/store/microsoft/packaging.md.
+store = []
+
 [dev-dependencies]
 # THIS CRATE, ON ITSELF, WITH `test-support` ON. A dev-dependency cycle is
 # explicitly allowed by cargo, and this one adds no code to the tree: the
