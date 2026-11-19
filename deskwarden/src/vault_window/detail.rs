@@ -7340,6 +7340,9 @@ fn card_hero(
     let p = tokens::palette(ui.ctx());
     let width = ui.available_width().min(440.0);
     let (rect, _) = ui.allocate_exact_size(egui::vec2(width, width * 258.0 / 440.0), egui::Sense::hover());
+    // The design draws the face at 440; a narrower pane gets the same face
+    // at its own size, everything on it scaled by `k`.
+    let k = width / 440.0;
     let b = network
         .and_then(kit::avatar::network)
         .map_or(egui::Color32::from_rgb(0x14, 0x30, 0x7a), |(_, bg, _)| bg);
@@ -7354,19 +7357,19 @@ fn card_hero(
     painter.circle_filled(egui::pos2(rect.right() - 40.0 - 110.0, rect.bottom() + 120.0 - 110.0), 110.0, egui::Color32::from_white_alpha(13));
 
     let white = egui::Color32::WHITE;
-    let inner = rect.shrink2(egui::vec2(26.0, 22.0));
+    let inner = rect.shrink2(egui::vec2(26.0 * k, 22.0 * k));
     let ctx = ui.ctx().clone();
     let galley = |role: tokens::Role, text: &str, ink: egui::Color32| ctx.fonts_mut(|f| f.layout_job(tokens::job(role, text, ink)));
     // Top row: contactless at the right.
     kit::icon::stroke(
         ui.painter(),
-        egui::Rect::from_min_size(egui::pos2(inner.right() - 22.0, inner.top() + 3.0), egui::Vec2::splat(22.0)),
+        egui::Rect::from_min_size(egui::pos2(inner.right() - 22.0 * k, inner.top() + 3.0 * k), egui::Vec2::splat(22.0 * k)),
         kit::icon::glyph::CONTACTLESS,
         2.0,
         egui::Color32::from_white_alpha(191),
     );
     // The chip.
-    let chip = egui::Rect::from_min_size(egui::pos2(inner.left(), inner.top() + 28.0 + 18.0), egui::vec2(46.0, 34.0));
+    let chip = egui::Rect::from_min_size(egui::pos2(inner.left(), inner.top() + (28.0 + 18.0) * k), egui::vec2(46.0 * k, 34.0 * k));
     ui.painter().rect(chip, CornerRadius::same(7), egui::Color32::from_rgb(0xde, 0xbb, 0x57), Stroke::new(1.0, egui::Color32::from_black_alpha(31)), egui::StrokeKind::Inside);
     // The number, with its eye.
     let number = fields.number.as_deref().unwrap_or("");
@@ -7375,24 +7378,24 @@ fn card_hero(
     } else {
         crate::card_brand::mask_for(number, network)
     };
-    let mono = tokens::Role { size: 22.0, face: theme::MONO_BOLD, tracking_em: 0.1 };
+    let mono = tokens::Role { size: 22.0 * k, face: theme::MONO_BOLD, tracking_em: 0.1 };
     let digits = galley(mono, &shown, white);
-    let digits_at = egui::pos2(inner.left(), chip.bottom() + 18.0);
+    let digits_at = egui::pos2(inner.left(), chip.bottom() + 18.0 * k);
     let digits_size = digits.size();
     ui.painter().galley(digits_at, digits, white);
-    let eye = egui::Rect::from_center_size(egui::pos2(digits_at.x + digits_size.x + 12.0 + 16.0, digits_at.y + digits_size.y / 2.0), egui::Vec2::splat(32.0));
+    let eye = egui::Rect::from_center_size(egui::pos2(digits_at.x + digits_size.x + (12.0 + 16.0) * k, digits_at.y + digits_size.y / 2.0), egui::Vec2::splat(32.0 * k));
     if !number.is_empty() {
         let response = ui.interact(eye, ui.id().with("hero-number-eye"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-        ui.painter().circle_filled(eye.center(), 16.0, egui::Color32::from_white_alpha(if response.hovered() { 71 } else { 36 }));
+        ui.painter().circle_filled(eye.center(), 16.0 * k, egui::Color32::from_white_alpha(if response.hovered() { 71 } else { 36 }));
         let d = if reveal.card_number { kit::icon::glyph::EYE_OFF } else { kit::icon::glyph::EYE };
-        kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(eye.center(), egui::Vec2::splat(16.0)), d, 2.0, white);
+        kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(eye.center(), egui::Vec2::splat(16.0 * k)), d, 2.0, white);
         if response.clicked() {
             reveal.card_number = !reveal.card_number;
         }
     }
     // The bottom row: holder, expiry, code; the network's box at the right.
-    let label_role = tokens::Role { size: 11.0, face: theme::BOLD, tracking_em: 0.12 };
-    let value_role = tokens::Role { size: 16.0, face: theme::BOLD, tracking_em: 0.0 };
+    let label_role = tokens::Role { size: 11.0 * k, face: theme::BOLD, tracking_em: 0.12 };
+    let value_role = tokens::Role { size: 16.0 * k, face: theme::BOLD, tracking_em: 0.0 };
     let faint = egui::Color32::from_white_alpha(166);
     let mut x = inner.left();
     let code = fields.code.as_deref().unwrap_or("");
@@ -7421,21 +7424,21 @@ fn card_hero(
         ui.painter().galley(egui::pos2(x, label_y), l, faint);
         ui.painter().galley(egui::pos2(x, label_y + label_h + 2.0), v, white);
         if label == HERO_CODE && !code.is_empty() {
-            let at = egui::Rect::from_center_size(egui::pos2(x + value_w + 8.0 + 12.0, label_y + label_h + 2.0 + value_h / 2.0), egui::Vec2::splat(24.0));
+            let at = egui::Rect::from_center_size(egui::pos2(x + value_w + (8.0 + 12.0) * k, label_y + label_h + 2.0 + value_h / 2.0), egui::Vec2::splat(24.0 * k));
             let response = ui.interact(at, ui.id().with("hero-code-eye"), egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
-            ui.painter().circle_filled(at.center(), 12.0, egui::Color32::from_white_alpha(if response.hovered() { 71 } else { 36 }));
+            ui.painter().circle_filled(at.center(), 12.0 * k, egui::Color32::from_white_alpha(if response.hovered() { 71 } else { 36 }));
             let d = if reveal.card_code { kit::icon::glyph::EYE_OFF } else { kit::icon::glyph::EYE };
-            kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(at.center(), egui::Vec2::splat(12.0)), d, 2.0, white);
+            kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(at.center(), egui::Vec2::splat(12.0 * k)), d, 2.0, white);
             if response.clicked() {
                 reveal.card_code = !reveal.card_code;
             }
         }
-        x += w + 16.0 + if label == HERO_CODE { 32.0 } else { 0.0 };
+        x += w + (16.0 + if label == HERO_CODE { 32.0 } else { 0.0 }) * k;
     }
     if let Some(brand) = network {
-        let word = galley(tokens::Role { size: 20.0, face: theme::EXTRABOLD, tracking_em: 0.02 }, brand.wordmark(), white);
+        let word = galley(tokens::Role { size: 20.0 * k, face: theme::EXTRABOLD, tracking_em: 0.02 }, brand.wordmark(), white);
         let size = word.size();
-        let at = egui::pos2(inner.right() - (76.0 + size.x) / 2.0, inner.bottom() - 17.0 - size.y / 2.0);
+        let at = egui::pos2(inner.right() - (76.0 * k + size.x) / 2.0, inner.bottom() - 17.0 * k - size.y / 2.0);
         ui.painter().galley(at, word, white);
     }
     let _ = p;
@@ -18429,6 +18432,50 @@ mod tests {
             assert!(footer.top() > notes.bottom());
             assert_eq!(f.text_colour_of(&f.texts.iter().find(|(t, _)| t.starts_with("Updated")).unwrap().0.clone()), P.text_faint);
             assert!(!f.rects.iter().any(|(r, c)| *c == P.card && r.contains_rect(footer)), "the footer sits on no card");
+        }
+
+        /// Review focus 2: a masked secret is never laid out in clear, in
+        /// any run the pane paints.
+        #[test]
+        fn a_masked_secret_is_never_laid_out_in_clear() {
+            let login = Pane::new().tall().idle(&a_login(), &TotpState::NoSecret);
+            let card = Pane::new().tall().idle(&a_full_card(), &TotpState::NoSecret);
+            for (f, secrets) in [(&login, vec!["hunter2"]), (&card, vec!["4242424242424242", "4242 4242 4242 4242", "123"])] {
+                for (text, _) in &f.texts {
+                    for secret in &secrets {
+                        assert!(!text.contains(secret), "{secret:?} is painted in clear in {text:?}");
+                    }
+                }
+                for (source, rendered, _) in &f.rendered {
+                    for secret in &secrets {
+                        assert!(!source.contains(secret) && !rendered.contains(secret), "{secret:?} was laid out in {source:?}");
+                    }
+                }
+            }
+        }
+
+        /// Review focus 3: 8-digit codes and 60-second periods.
+        #[test]
+        fn an_eight_digit_sixty_second_code_groups_and_drains() {
+            let totp = TotpState::Code { code: "12345678".to_string(), seconds_left: 30, period: 60 };
+            let f = Pane::new().idle(&a_login_with_a_code(), &totp);
+            assert!(f.painted("1234 5678"), "{:?}", f.strings());
+            assert!(f.painted("30"));
+            let half = ring_points(egui::pos2(0.0, 0.0), 15.0, totp_bar_fraction(30, 60));
+            assert!((*half.last().unwrap() - egui::pos2(0.0, 15.0)).length() < 0.01, "half a 60s period is half a ring");
+        }
+
+        /// Review focus 4: at the 930pt window the pane is 298 wide, and
+        /// nothing in it -- header, hero, field rows -- runs past its edge.
+        #[test]
+        fn the_detail_fits_its_narrowest_width() {
+            for item in [a_login_with_a_code(), a_full_card()] {
+                let totp = TotpState::Code { code: "123456".to_string(), seconds_left: 12, period: 30 };
+                let f = Pane::wide(MIN_PANE).tall().idle(&item, &totp);
+                for (text, rect) in &f.texts {
+                    assert!(rect.right() <= MIN_PANE + 0.5, "{text:?} runs past the {MIN_PANE}pt pane to {}", rect.right());
+                }
+            }
         }
 
         #[test]

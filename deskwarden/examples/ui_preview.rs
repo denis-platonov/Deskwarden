@@ -646,6 +646,10 @@ enum Surface {
     VaultShellLight,
     /// The launch splash over the whole window (design 1a).
     VaultSplash,
+    /// The v2 shell with a card selected: the card hero and its field rows.
+    VaultShellCard,
+    /// The v2 shell offline: the cached vault, a failed sync, the banner.
+    VaultShellOffline,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -885,6 +889,8 @@ const ALL: &[Surface] = &[
     Surface::VaultShellNavy,
     Surface::VaultShellLight,
     Surface::VaultSplash,
+    Surface::VaultShellCard,
+    Surface::VaultShellOffline,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -975,6 +981,8 @@ impl Surface {
             Surface::VaultShellNavy => "vault_shell_navy",
             Surface::VaultShellLight => "vault_shell_light",
             Surface::VaultSplash => "vault_splash",
+            Surface::VaultShellCard => "vault_shell_card",
+            Surface::VaultShellOffline => "vault_shell_offline",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1142,9 +1150,11 @@ impl Surface {
             // A sheet, not a pane: its size is what the sheet needs.
             Surface::ItemKindMarks => egui::vec2(LIST_WIDTH, 360.0),
             Surface::KitSheet => egui::vec2(1280.0, 900.0),
-            Surface::VaultShellNavy | Surface::VaultShellLight | Surface::VaultSplash => {
-                egui::vec2(1280.0, 820.0)
-            }
+            Surface::VaultShellNavy
+            | Surface::VaultShellLight
+            | Surface::VaultSplash
+            | Surface::VaultShellCard
+            | Surface::VaultShellOffline => egui::vec2(1280.0, 820.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1276,7 +1286,13 @@ fn main() -> eframe::Result {
     } else if kit {
         vec![Surface::KitSheet]
     } else if shell {
-        vec![Surface::VaultShellNavy, Surface::VaultShellLight, Surface::VaultSplash]
+        vec![
+            Surface::VaultShellNavy,
+            Surface::VaultShellLight,
+            Surface::VaultSplash,
+            Surface::VaultShellCard,
+            Surface::VaultShellOffline,
+        ]
     } else if list {
         vec![Surface::VaultList]
     } else if rail {
@@ -1438,6 +1454,7 @@ fn main() -> eframe::Result {
                 rail_health: false,
                 rail_received: false,
                 rail_scope: sidebar::SendScope::All,
+                list_offline: false,
                 // The weak finding, so the health shot carries the selected
                 // treatment too -- and it is the row with a detail line
                 // under its name, which is the taller of the row's two
@@ -1555,6 +1572,8 @@ struct Preview {
     /// this shot has to be able to put any of them in any state.
     rail_received: bool,
     rail_scope: sidebar::SendScope,
+    /// Whether the shell's list draws the offline banner.
+    list_offline: bool,
     /// The Password health shot's own selection state.
     health_selected: Option<String>,
     /// Which row each Sends shot has picked.
@@ -1717,10 +1736,22 @@ impl eframe::App for Preview {
             Surface::ItemKindMarks => draw_item_kind_marks(root),
             Surface::KitSheet => draw_kit_sheet(root),
             Surface::VaultShellNavy => {
-                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy)
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false)
             }
             Surface::VaultShellLight => {
-                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Light)
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Light, DetailShot::Login, false)
+            }
+            Surface::VaultShellCard => {
+                // The list's own first card is the row shown selected.
+                if let Some(card) = self.fixtures.list.iter().find(|i| i.item_type == Some(3)) {
+                    self.list_selected = Some(card.id.clone());
+                }
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Card, false)
+            }
+            Surface::VaultShellOffline => {
+                // The login the detail pane shows is the row selected.
+                self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, true)
             }
             Surface::VaultSplash => {
                 let rect = root.max_rect();
@@ -2480,6 +2511,7 @@ impl Preview {
             preview_icons(root.ctx(), &self.fixtures.list, &["Ledgerline", "Ledgerline corporate card"])
         });
         let fixtures = &self.fixtures;
+        let offline = self.list_offline;
         let (search, selected, visible) =
             (&mut self.list_search, &mut self.list_selected, &mut self.list_visible);
         egui::CentralPanel::default()
@@ -2513,7 +2545,7 @@ impl Preview {
                     // so no row wears a person or a `view-only` chip.
                     &item_list::RowPeople::default(),
                     "All items",
-                    false,
+                    offline,
                 );
             });
     }
@@ -2657,7 +2689,14 @@ impl Preview {
     /// The v2 shell: the real rail in `style`, the real top bar, and the
     /// 0.15 list and detail panes laid out under the bar as the window lays
     /// them out.
-    fn draw_vault_shell(&mut self, root: &mut egui::Ui, style: deskwarden::kit::tokens::SidebarStyle) {
+    fn draw_vault_shell(
+        &mut self,
+        root: &mut egui::Ui,
+        style: deskwarden::kit::tokens::SidebarStyle,
+        shot: DetailShot,
+        offline: bool,
+    ) {
+        self.list_offline = offline;
         use deskwarden::vault_window::top_bar;
         deskwarden::kit::tokens::set_sidebar_style(root.ctx(), style);
         let window = root.max_rect();
@@ -2665,7 +2704,11 @@ impl Preview {
             egui::pos2(window.left() + SIDEBAR_WIDTH, window.top()),
             egui::pos2(window.right(), window.top() + top_bar::HEIGHT),
         );
-        let pill = top_bar::SyncPill::from_v1(theme::BLUE, "Synced just now");
+        let pill = if offline {
+            top_bar::SyncPill::from_v1(theme::ERROR, "Sync failed")
+        } else {
+            top_bar::SyncPill::from_v1(theme::BLUE, "Synced just now")
+        };
         let mut search = String::new();
         let placeholder = item_list::search_hint(Some(self.fixtures.list.len()), &SidebarFilter::All);
         let _ = top_bar::draw(root, bar, &mut search, &placeholder, &pill, false, false, |ui| {
@@ -2714,7 +2757,7 @@ impl Preview {
             .resizable(false)
             .frame(egui::Frame::NONE)
             .show(root, |ui| self.draw_vault_list(ui));
-        self.draw_pane(root, PaneKind::Detail(DetailShot::Login));
+        self.draw_pane(root, PaneKind::Detail(shot));
     }
 
     fn draw_vault_rail(&mut self, root: &mut egui::Ui) {
