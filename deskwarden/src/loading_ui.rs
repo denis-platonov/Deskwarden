@@ -762,7 +762,7 @@ pub fn draw_first_window_body(
                         ui.add_space(TITLE_TO_SUB);
                         ui.label(theme::regular(offline_line(synced), SUB_SIZE).color(theme::TEXT_GHOST));
                         ui.add_space(BLOCK_GAP);
-                        open_local_copy |= theme::secondary_button(ui, OPEN_LOCAL_LABEL).clicked();
+                        open_local_copy |= crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, OPEN_LOCAL_LABEL, None).clicked();
                     }
                 }
                 FirstWindowBody::Unreachable { retry: offer, local } => {
@@ -793,7 +793,7 @@ pub fn draw_first_window_body(
                     }
                     if offer == RetryOffer::Offered {
                         ui.add_space(BLOCK_GAP);
-                        retry = theme::primary_button(ui, "Retry", None).clicked();
+                        retry = crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, crate::kit::controls::ROW, "Retry", None).clicked();
                     }
                     if let LocalCopy::Here { .. } = local {
                         // Stacked under the Retry when there is one -- a
@@ -813,10 +813,10 @@ pub fn draw_first_window_body(
                         // action left.
                         let pressed = match offer {
                             RetryOffer::Offered => {
-                                theme::secondary_button(ui, CONTINUE_OFFLINE_LABEL).clicked()
+                                crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Outline, crate::kit::controls::ROW, CONTINUE_OFFLINE_LABEL, None).clicked()
                             }
                             RetryOffer::Spent => {
-                                theme::primary_button(ui, CONTINUE_OFFLINE_LABEL, None).clicked()
+                                crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, crate::kit::controls::ROW, CONTINUE_OFFLINE_LABEL, None).clicked()
                             }
                         };
                         open_local_copy |= pressed;
@@ -859,19 +859,19 @@ fn content_height(body: FirstWindowBody) -> f32 {
         height += TITLE_TO_SUB + SUB_SIZE * 1.4;
     }
     if let FirstWindowBody::Slow { local: LocalCopy::Here { .. }, .. } = body {
-        height += BLOCK_GAP + theme::BUTTON_HEIGHT;
+        height += BLOCK_GAP + crate::kit::controls::ROW.height;
     }
     if let FirstWindowBody::Unreachable { retry, local } = body {
         // The copy is two or three wrapped lines rather than one.
         height += SUB_SIZE * 1.4 * 2.0;
         if retry == RetryOffer::Offered {
-            height += BLOCK_GAP + theme::BUTTON_HEIGHT;
+            height += BLOCK_GAP + crate::kit::controls::ROW.height;
         }
         if local != LocalCopy::None {
             height += match retry {
                 RetryOffer::Offered => BUTTON_GAP,
                 RetryOffer::Spent => BLOCK_GAP,
-            } + theme::BUTTON_HEIGHT;
+            } + crate::kit::controls::ROW.height;
         }
     }
     height

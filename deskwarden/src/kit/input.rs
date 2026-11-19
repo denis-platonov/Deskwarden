@@ -270,6 +270,34 @@ mod tests {
     }
 
     #[test]
+    fn the_secret_field_has_the_sign_in_and_lock_sizes_and_hides_until_revealed() {
+        let ctx = testing::ctx();
+        let id = egui::Id::new("s");
+        let mut value = String::from("hunter2");
+        let mut revealed = false;
+        let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            secret(ui, id, &mut value, &mut revealed, "pw", 400.0, SIGN_IN);
+            secret(ui, id.with(1), &mut value, &mut revealed, "pw", 400.0, LOCK);
+        });
+        assert!(!p.texts.iter().any(|(t, _, _)| t.contains("hunter2")));
+        assert_eq!(p.rects.iter().filter(|r| r.rect.height() == 50.0 && r.fill == P.card).count(), 1);
+        assert_eq!(p.rects.iter().filter(|r| r.rect.height() == 58.0 && r.fill == P.card).count(), 1);
+    }
+
+    #[test]
+    fn a_disabled_field_shows_the_same_mask_whatever_the_buffer_and_takes_no_focus() {
+        let ctx = testing::ctx();
+        let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            secret_disabled(ui, 300.0, SIGN_IN);
+            text_disabled(ui, "a.novak", 300.0, SIGN_IN);
+        });
+        assert!(p.texts.iter().any(|(t, _, _)| t == &crate::theme::masked_readout()));
+        assert!(p.texts.iter().any(|(t, _, _)| t == "a.novak"));
+        assert!(p.rects.iter().any(|r| r.fill == P.field_bg), "greyed");
+        assert!(ctx.memory(|m| m.focused()).is_none());
+    }
+
+    #[test]
     fn the_strength_meter_names_and_colours_the_four_levels() {
         for (rating, label, colour) in [
             (Strength::Weak, "Weak", P.error),

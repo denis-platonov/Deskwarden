@@ -5956,6 +5956,233 @@ mod first_run_notice_tests {
              with it; got: {texts:?}"
         );
     }
+
+    // ---- The v2 screens (spec C 5.2 and 5.3), on the real surfaces.
+
+    const SCREEN: Vec2 = egui::vec2(1280.0, 820.0);
+
+    /// One screen's worth of frames at `SCREEN` size, 0.1 s apart so the
+    /// entrance has finished, answering what the last frame painted (with
+    /// where) and what it asked for. `click` is delivered on the last frame.
+    fn screen(
+        ctx: &egui::Context,
+        status: BwStatus,
+        hello: HelloState,
+        form: &mut LoginForm,
+        in_flight: bool,
+        click: Option<Pos2>,
+    ) -> (Vec<(String, egui::Rect)>, Option<LoginAction>) {
+        let mut painted = Vec::new();
+        let mut action = None;
+        let t0 = ctx.input(|i| i.time);
+        for i in 0..10 {
+            let last = i == 9;
+            let events = match (last, click) {
+                (true, Some(at)) => crate::kit::testing::click_at(at),
+                _ => Vec::new(),
+            };
+            let output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(Pos2::ZERO, SCREEN)),
+                    time: Some(t0 + 0.1 * (i + 1) as f64),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    let full = ui.max_rect();
+                    let mut flow = 0.0f32;
+                    let mut body = |ui: &mut egui::Ui| {
+                        let got = draw_login_window(
+                            ui,
+                            status,
+                            Some("a.novak@ledgerline.com"),
+                            "bitwarden.com",
+                            hello,
+                            form,
+                            &mut flow,
+                            in_flight,
+                            false,
+                            None,
+                        );
+                        if got.is_some() {
+                            action = got;
+                        }
+                    };
+                    let _ = if status == BwStatus::Unauthenticated {
+                        crate::kit::auth::split(ui, full, CloseControl::Active, &mut body)
+                    } else {
+                        crate::kit::auth::lock_surface(ui, full, CloseControl::Active, &mut body)
+                    };
+                },
+            );
+            if last {
+                for clipped in &output.shapes {
+                    walk_at(&clipped.shape, &mut painted);
+                }
+            }
+        }
+        (painted, action)
+    }
+
+    fn walk_at(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+        match shape {
+            egui::Shape::Text(text) => out.push((
+                text.galley.text().to_string(),
+                egui::Rect::from_min_size(text.pos, text.galley.size()),
+            )),
+            egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk_at(s, out)),
+            _ => {}
+        }
+    }
+
+    fn has(painted: &[(String, egui::Rect)], needle: &str) -> bool {
+        painted.iter().any(|(t, _)| t == needle)
+    }
+
+    fn at(painted: &[(String, egui::Rect)], needle: &str) -> egui::Rect {
+        painted
+            .iter()
+            .find(|(t, _)| t == needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not on the screen; painted {painted:?}"))
+            .1
+    }
+
+    #[test]
+    fn the_sign_in_screen_is_the_design_with_every_way_in_kept() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let (painted, _) =
+            screen(&ctx, BwStatus::Unauthenticated, NOT_ENROLLED, &mut form, false, None);
+        for wanted in [
+            "Log in",
+            "Email",
+            "Master password",
+            "Server",
+            "bitwarden.com",
+            "EU",
+            "Self-hosted",
+            "Log in and set up Windows Hello",
+            crate::api_key_ui::USE_API_KEY_LABEL,
+            "Uses your existing Bitwarden account",
+        ] {
+            assert!(has(&painted, wanted), "{wanted:?} is missing; painted {painted:?}");
+        }
+        assert!(!has(&painted, "Log in with another device"), "a control with nothing behind it");
+        assert!(!has(&painted, "Server URL"), "the URL field is for Self-hosted only");
+        // The form is in the right half.
+        assert!(at(&painted, "Email").left() > 640.0);
+        assert!(at(&painted, "Uses your existing Bitwarden account").right() < 640.0);
+
+        form.server_choice = ServerChoice::SelfHosted;
+        let (painted, _) =
+            screen(&ctx, BwStatus::Unauthenticated, NOT_ENROLLED, &mut form, false, None);
+        assert!(has(&painted, "Server URL"), "Self-hosted shows the URL field");
+    }
+
+    #[test]
+    fn the_sign_in_error_and_the_in_flight_state_are_painted() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        form.error = Some("That email and master password do not match.".to_string());
+        let (painted, _) =
+            screen(&ctx, BwStatus::Unauthenticated, HelloState::unavailable(), &mut form, false, None);
+        assert!(has(&painted, "That email and master password do not match."));
+        assert!(!has(&painted, "Log in and set up Windows Hello"), "no Hello, no opt-in");
+        let (busy, action) = screen(
+            &ctx,
+            BwStatus::Unauthenticated,
+            HelloState::unavailable(),
+            &mut form,
+            true,
+            Some(at(&painted, "Log in").center() + egui::vec2(0.0, 60.0)),
+        );
+        assert!(has(&busy, "Log in"));
+        assert!(action.is_none(), "nothing starts a second sign-in while one is in flight");
+    }
+
+    #[test]
+    fn choosing_a_server_in_the_segmented_control_sets_the_form() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let (painted, _) =
+            screen(&ctx, BwStatus::Unauthenticated, HelloState::unavailable(), &mut form, false, None);
+        let eu = at(&painted, "EU").center();
+        let _ = screen(&ctx, BwStatus::Unauthenticated, HelloState::unavailable(), &mut form, false, Some(eu));
+        assert_eq!(form.server_choice, ServerChoice::EuCloud);
+        assert_eq!(ServerChoice::from_segment(ServerChoice::SelfHosted.segment()), ServerChoice::SelfHosted);
+    }
+
+    #[test]
+    fn the_lock_screen_opens_on_the_hello_stage_and_hello_unlocks() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, None);
+        for wanted in [
+            "Welcome back",
+            "Your vault is locked",
+            "a.novak@ledgerline.com",
+            "Unlock with Windows Hello",
+            "Use master password instead",
+            "Log out",
+        ] {
+            assert!(has(&painted, wanted), "{wanted:?} is missing; painted {painted:?}");
+        }
+        assert!(!has(&painted, "Unlock"), "no password row on the Hello stage");
+        let button = at(&painted, "Unlock with Windows Hello").center();
+        let (_, action) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, Some(button));
+        assert_eq!(action, Some(LoginAction::HelloUnlock));
+    }
+
+    #[test]
+    fn the_hello_stage_says_checking_while_the_check_runs_and_cannot_be_clicked_again() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, true, None);
+        assert!(has(&painted, auth_checking()), "painted {painted:?}");
+        let (_, action) =
+            screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, true, Some(at(&painted, auth_checking()).center()));
+        assert!(action.is_none());
+    }
+
+    fn auth_checking() -> &'static str {
+        crate::kit::auth::HELLO_CHECKING
+    }
+
+    #[test]
+    fn the_link_moves_between_the_two_lock_stages() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, None);
+        let link = at(&painted, "Use master password instead").center();
+        let (painted, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, Some(link));
+        assert_eq!(form.lock_stage, LockStage::Password);
+        // One more frame to show the new stage.
+        let (painted2, _) = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, None);
+        let _ = painted;
+        assert!(has(&painted2, "Unlock"), "the password row has its Unlock button");
+        assert!(has(&painted2, "Master password") || painted2.iter().any(|(t, _)| t.is_empty()));
+        assert!(has(&painted2, "Unlock with Windows Hello"), "the link back to Hello");
+        let back = at(&painted2, "Unlock with Windows Hello").center();
+        let _ = screen(&ctx, BwStatus::Locked, ENROLLED, &mut form, false, Some(back));
+        assert_eq!(form.lock_stage, LockStage::Hello);
+    }
+
+    #[test]
+    fn with_hello_off_the_lock_screen_is_only_the_password_stage() {
+        let ctx = styled_context();
+        let mut form = LoginForm::default();
+        form.error = Some("That master password is not right.".to_string());
+        let (painted, _) =
+            screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, None);
+        assert!(has(&painted, "Unlock"));
+        assert!(has(&painted, "That master password is not right."));
+        assert!(!painted.iter().any(|(t, _)| t.contains("Windows Hello")), "{painted:?}");
+        assert!(!has(&painted, "Use master password instead"));
+        let logout = at(&painted, "Log out").center();
+        let (_, action) =
+            screen(&ctx, BwStatus::Locked, HelloState::unavailable(), &mut form, false, Some(logout));
+        assert_eq!(action, Some(LoginAction::LogOut));
+    }
 }
 
 #[cfg(test)]
