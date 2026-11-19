@@ -783,8 +783,38 @@ enum Surface {
     LoginUnlockPasswordError,
     /// The second-factor prompt, on the split screen.
     LoginSecondFactor,
+    /// The code stage after a wrong code: six red boxes and the line under them.
+    LoginSecondFactorWrong,
+    /// The code stage for an emailed code, after Send code.
+    LoginSecondFactorEmail,
+    /// The code stage for a YubiKey (one field, not six boxes).
+    LoginSecondFactorYubiKey,
+    /// The code stage while the code is with the server.
+    LoginSecondFactorBusy,
+    /// The stage for an account whose only methods are ones Deskwarden cannot complete.
+    LoginSecondFactorUnsupported,
+    /// The API-key sign-in's master-password step.
+    LoginApiKeyPassword,
+    /// The API-key sign-in's first step after the server refused the key.
+    LoginApiKeyError,
+    /// The API-key sign-in while the server is answering.
+    LoginApiKeyBusy,
     /// The API-key sign-in, on the split screen.
     LoginApiKey,
+    /// The sign-in screen with the offline banner over the form (cloud server).
+    LoginSigninOffline,
+    /// The sign-in screen with the red "Can't reach your server" banner (Self-hosted).
+    LoginSigninServerDown,
+    /// The sign-in screen with the email box empty and red.
+    LoginSigninEmailError,
+    /// The sign-in screen with Self-hosted chosen and its address box empty and red.
+    LoginSigninUrlError,
+    /// The sign-in screen while the server is answering: greyed fields, "Checking" over its bar.
+    LoginSigninBusy,
+    /// The "Too many tries" stage.
+    LoginSigninTooMany,
+    /// The "You're in" stage.
+    LoginSigninDone,
     /// **One cycle of design 7's `dw-bar`, laid out as a filmstrip.**
     ///
     /// The one thing a PNG of this widget cannot show is the thing it is:
@@ -977,6 +1007,21 @@ const ALL: &[Surface] = &[
     Surface::LoginUnlockPasswordError,
     Surface::LoginSecondFactor,
     Surface::LoginApiKey,
+    Surface::LoginSecondFactorWrong,
+    Surface::LoginSecondFactorEmail,
+    Surface::LoginSecondFactorYubiKey,
+    Surface::LoginSecondFactorBusy,
+    Surface::LoginSecondFactorUnsupported,
+    Surface::LoginApiKeyPassword,
+    Surface::LoginApiKeyError,
+    Surface::LoginApiKeyBusy,
+    Surface::LoginSigninOffline,
+    Surface::LoginSigninServerDown,
+    Surface::LoginSigninEmailError,
+    Surface::LoginSigninUrlError,
+    Surface::LoginSigninBusy,
+    Surface::LoginSigninTooMany,
+    Surface::LoginSigninDone,
     Surface::ProgressBarCycle,
 ];
 
@@ -1094,6 +1139,21 @@ impl Surface {
             Surface::LoginUnlockPasswordError => "login_unlock_password_error",
             Surface::LoginSecondFactor => "login_second_factor",
             Surface::LoginApiKey => "login_api_key",
+            Surface::LoginSecondFactorWrong => "login_second_factor_wrong",
+            Surface::LoginSecondFactorEmail => "login_second_factor_email",
+            Surface::LoginSecondFactorYubiKey => "login_second_factor_yubikey",
+            Surface::LoginSecondFactorBusy => "login_second_factor_busy",
+            Surface::LoginSecondFactorUnsupported => "login_second_factor_unsupported",
+            Surface::LoginApiKeyPassword => "login_api_key_password",
+            Surface::LoginApiKeyError => "login_api_key_error",
+            Surface::LoginApiKeyBusy => "login_api_key_busy",
+            Surface::LoginSigninOffline => "login_signin_offline",
+            Surface::LoginSigninServerDown => "login_signin_server_down",
+            Surface::LoginSigninEmailError => "login_signin_email_error",
+            Surface::LoginSigninUrlError => "login_signin_url_error",
+            Surface::LoginSigninBusy => "login_signin_busy",
+            Surface::LoginSigninTooMany => "login_signin_too_many",
+            Surface::LoginSigninDone => "login_signin_done",
             Surface::ProgressBarCycle => "progress_bar_cycle",
         }
     }
@@ -1122,6 +1182,21 @@ impl Surface {
             | Surface::LoginUnlockPassword
             | Surface::LoginUnlockPasswordError
             | Surface::LoginSecondFactor
+            | Surface::LoginSigninOffline
+            | Surface::LoginSigninServerDown
+            | Surface::LoginSigninEmailError
+            | Surface::LoginSigninUrlError
+            | Surface::LoginSigninBusy
+            | Surface::LoginSigninTooMany
+            | Surface::LoginSigninDone
+            | Surface::LoginSecondFactorWrong
+            | Surface::LoginSecondFactorEmail
+            | Surface::LoginSecondFactorYubiKey
+            | Surface::LoginSecondFactorBusy
+            | Surface::LoginSecondFactorUnsupported
+            | Surface::LoginApiKeyPassword
+            | Surface::LoginApiKeyError
+            | Surface::LoginApiKeyBusy
             | Surface::LoginApiKey => egui::vec2(1280.0, 820.0),
             // Wide enough for the design's own 260px track with room
             // either side, and tall enough for six of them stacked with
@@ -1326,6 +1401,21 @@ impl Surface {
                 | Surface::LoginUnlockPassword
                 | Surface::LoginUnlockPasswordError
                 | Surface::LoginSecondFactor
+                | Surface::LoginSigninOffline
+                | Surface::LoginSigninServerDown
+                | Surface::LoginSigninEmailError
+                | Surface::LoginSigninUrlError
+                | Surface::LoginSigninBusy
+                | Surface::LoginSigninTooMany
+                | Surface::LoginSigninDone
+                | Surface::LoginSecondFactorWrong
+                | Surface::LoginSecondFactorEmail
+                | Surface::LoginSecondFactorYubiKey
+                | Surface::LoginSecondFactorBusy
+                | Surface::LoginSecondFactorUnsupported
+                | Surface::LoginApiKeyPassword
+                | Surface::LoginApiKeyError
+                | Surface::LoginApiKeyBusy
                 | Surface::LoginApiKey
         )
     }
@@ -1333,7 +1423,9 @@ impl Surface {
 
 fn main() -> eframe::Result {
     let arg = |name: &str| std::env::args().any(|a| a == name);
-    let all = arg("--all");
+    // The sign-in, unlock, first-window and second-factor screens only.
+    let auth = arg("--auth");
+    let all = arg("--all") || auth;
     let screenshot = all || arg("--screenshot");
     let signin = arg("--signin");
     let cli_setup = arg("--cli-setup");
@@ -1381,7 +1473,12 @@ fn main() -> eframe::Result {
 
     // `--all` walks the whole list; otherwise the single surface the flags
     // name, exactly as this example has always behaved.
-    let queue: Vec<Surface> = if all {
+    let queue: Vec<Surface> = if auth {
+        ALL.iter()
+            .copied()
+            .filter(|s| s.stem().starts_with("login_") || s.stem().starts_with("first_window_"))
+            .collect()
+    } else if all {
         ALL.to_vec()
     } else if cli_setup {
         vec![Surface::LoginCliSetup]
@@ -1606,6 +1703,8 @@ fn main() -> eframe::Result {
                 window_height: 0.0,
                 login_variant: LoginVariant::Plain,
                 second_factor: None,
+                second_factor_for: None,
+                api_key_for: None,
                 api_key: deskwarden::api_key_ui::ApiKeyForm::new(),
                 styled: false,
                 fixtures: Fixtures::new(),
@@ -1738,6 +1837,8 @@ struct Preview {
     /// Which state of the sign-in or lock screen the current surface shows.
     login_variant: LoginVariant,
     second_factor: Option<deskwarden::second_factor_ui::Prompt>,
+    second_factor_for: Option<Surface>,
+    api_key_for: Option<Surface>,
     api_key: deskwarden::api_key_ui::ApiKeyForm,
     /// Whether the theme has been applied yet. Done on the first update
     /// frame, not in the creation context, for the same reason as the real
@@ -1825,8 +1926,47 @@ impl eframe::App for Preview {
                 self.login_variant = LoginVariant::UnlockPasswordError;
                 self.draw_login(root, &ctx, false, false, None)
             }
-            Surface::LoginSecondFactor => self.draw_second_factor(root),
-            Surface::LoginApiKey => self.draw_api_key(root),
+            Surface::LoginSigninOffline => {
+                self.login_variant = LoginVariant::SignInOffline;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginSigninServerDown => {
+                self.login_variant = LoginVariant::SignInServerDown;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginSigninEmailError => {
+                self.login_variant = LoginVariant::SignInEmailError;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginSigninUrlError => {
+                self.login_variant = LoginVariant::SignInUrlError;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginSigninBusy => self.draw_login(root, &ctx, true, true, None),
+            Surface::LoginSigninTooMany => {
+                self.login_variant = LoginVariant::SignInTooMany;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginSigninDone => {
+                self.login_variant = LoginVariant::SignInDone;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginSecondFactor
+            | Surface::LoginSecondFactorWrong
+            | Surface::LoginSecondFactorEmail
+            | Surface::LoginSecondFactorYubiKey
+            | Surface::LoginSecondFactorBusy
+            | Surface::LoginSecondFactorUnsupported => {
+                let surface = self.current();
+                self.draw_second_factor(root, surface)
+            }
+            Surface::LoginApiKey
+            | Surface::LoginApiKeyPassword
+            | Surface::LoginApiKeyError
+            | Surface::LoginApiKeyBusy => {
+                let surface = self.current();
+                self.draw_api_key(root, surface)
+            }
             Surface::ProgressBarCycle => draw_progress_bar_cycle(root),
             Surface::LoginSignin => self.draw_login(root, &ctx, true, false, None),
             Surface::LoginCliSetup => self.draw_login(
@@ -2157,6 +2297,12 @@ enum LoginVariant {
     Plain,
     SignInSelfHosted,
     SignInError,
+    SignInOffline,
+    SignInServerDown,
+    SignInEmailError,
+    SignInUrlError,
+    SignInTooMany,
+    SignInDone,
     UnlockPassword,
     UnlockPasswordError,
 }
@@ -2198,6 +2344,9 @@ impl Preview {
                 HelloState { available: true, enrolled: true },
             )
         };
+        if signin && auth_in_progress {
+            self.form.email = "a.novak@ledgerline.com".to_string();
+        }
         if signin && cli_setup.is_some() {
             self.form.server_choice = login_ui::ServerChoice::SelfHosted;
         }
@@ -2207,10 +2356,39 @@ impl Preview {
                 self.form.server_url = "https://vault.ledgerline.eu".to_string();
             }
             LoginVariant::SignInError => {
+                self.form.email = "a.novak@ledgerline.com".to_string();
+                self.form.error =
+                    Some("That email or master password didn't work. Check them and try again.".to_string());
+            }
+            LoginVariant::SignInOffline => {
+                self.form.email = "a.novak@ledgerline.com".to_string();
                 self.form.error = Some(
-                    "That email and master password do not match. Check them and try again."
+                    "Couldn't reach the server. Check your connection \u{2014} and the server URL, if this is a self-hosted account."
                         .to_string(),
                 );
+            }
+            LoginVariant::SignInServerDown => {
+                self.form.server_choice = login_ui::ServerChoice::SelfHosted;
+                self.form.server_url = "https://vault.ledgerline.com".to_string();
+                self.form.email = "a.novak@ledgerline.com".to_string();
+                self.form.error = Some(
+                    "Couldn't reach the server. Check your connection \u{2014} and the server URL, if this is a self-hosted account."
+                        .to_string(),
+                );
+            }
+            LoginVariant::SignInEmailError => {
+                self.form.error = Some(login_ui::ENTER_EMAIL.to_string());
+            }
+            LoginVariant::SignInUrlError => {
+                self.form.server_choice = login_ui::ServerChoice::SelfHosted;
+                self.form.email = "a.novak@ledgerline.com".to_string();
+                self.form.error = Some(login_ui::ENTER_SERVER.to_string());
+            }
+            LoginVariant::SignInTooMany => {
+                self.form.error = Some("Too many failed attempts. Wait a few minutes, then try again.".to_string());
+            }
+            LoginVariant::SignInDone => {
+                self.form.signed_in = true;
             }
             LoginVariant::UnlockPassword => {
                 self.form.lock_stage = login_ui::LockStage::Password;
@@ -2252,23 +2430,83 @@ impl Preview {
         self.login_variant = LoginVariant::Plain;
     }
 
-    /// The second-factor prompt on the split screen: an account with an
-    /// emailed code and an authenticator, mid-way through a wrong code.
-    fn draw_second_factor(&mut self, root: &mut egui::Ui) {
+    /// The second-factor prompt on the split screen, in the state `surface` names.
+    fn draw_second_factor(&mut self, root: &mut egui::Ui, surface: Surface) {
         use deskwarden::rest::api::SecondFactor;
-        let prompt = self.second_factor.get_or_insert_with(|| {
-            let mut prompt = deskwarden::second_factor_ui::Prompt::new(vec![
-                SecondFactor::Email { masked: Some("a***@ledgerline.com".to_string()) },
+        if self.second_factor_for != Some(surface) {
+            self.second_factor_for = Some(surface);
+            let both = vec![
                 SecondFactor::Authenticator,
-            ]);
-            prompt.error = Some("That code was not accepted. Check it and try again.".to_string());
-            prompt
-        });
-        let _ = deskwarden::second_factor_ui::draw(root, prompt);
+                SecondFactor::Email { masked: Some("a***@ledgerline.com".to_string()) },
+            ];
+            let mut prompt = match surface {
+                Surface::LoginSecondFactorEmail => deskwarden::second_factor_ui::Prompt::new(vec![
+                    SecondFactor::Email { masked: Some("a***@ledgerline.com".to_string()) },
+                    SecondFactor::Authenticator,
+                ]),
+                Surface::LoginSecondFactorYubiKey => {
+                    deskwarden::second_factor_ui::Prompt::new(vec![SecondFactor::YubiKey, SecondFactor::Authenticator])
+                }
+                Surface::LoginSecondFactorUnsupported => {
+                    deskwarden::second_factor_ui::Prompt::new(vec![SecondFactor::Unsupported(2)])
+                }
+                _ => deskwarden::second_factor_ui::Prompt::new(both),
+            };
+            match surface {
+                Surface::LoginSecondFactor => prompt.code = "482".to_string(),
+                Surface::LoginSecondFactorWrong => {
+                    prompt.code = "482913".to_string();
+                    prompt.went_wrong(deskwarden::second_factor_ui::Trouble::CodeRejected);
+                    prompt.code = "482913".to_string();
+                }
+                Surface::LoginSecondFactorEmail => {
+                    prompt.choose(SecondFactor::Email { masked: Some("a***@ledgerline.com".to_string()) });
+                    prompt.sent_a_code();
+                    prompt.code = "71".to_string();
+                }
+                Surface::LoginSecondFactorYubiKey => {
+                    prompt.choose(SecondFactor::YubiKey);
+                    prompt.code = "ccccccbtkgrn".to_string();
+                }
+                Surface::LoginSecondFactorBusy => {
+                    prompt.code = "482913".to_string();
+                    prompt.busy = true;
+                }
+                _ => {}
+            }
+            self.second_factor = Some(prompt);
+        }
+        if let Some(prompt) = self.second_factor.as_mut() {
+            let _ = deskwarden::second_factor_ui::draw(root, prompt);
+        }
     }
 
-    /// The API-key sign-in's first step on the split screen.
-    fn draw_api_key(&mut self, root: &mut egui::Ui) {
+    /// The API-key sign-in on the split screen, in the state `surface` names.
+    fn draw_api_key(&mut self, root: &mut egui::Ui, surface: Surface) {
+        if self.api_key_for != Some(surface) {
+            self.api_key_for = Some(surface);
+            let mut form = deskwarden::api_key_ui::ApiKeyForm::new();
+            match surface {
+                Surface::LoginApiKeyPassword => {
+                    form.step = deskwarden::api_key_ui::ApiKeyStep::MasterPassword;
+                }
+                Surface::LoginApiKeyError => {
+                    form.client_id = "user.0b3c1a52-7a1e".to_string();
+                    form.secret = zeroize::Zeroizing::new("not-a-real-secret".to_string());
+                    form.error = Some(deskwarden::api_key_ui::message_for(
+                        deskwarden::api_key_ui::ApiKeyRefusal::KeyPairRejected,
+                    )
+                    .to_string());
+                }
+                Surface::LoginApiKeyBusy => {
+                    form.client_id = "user.0b3c1a52-7a1e".to_string();
+                    form.secret = zeroize::Zeroizing::new("not-a-real-secret".to_string());
+                    form.busy = true;
+                }
+                _ => {}
+            }
+            self.api_key = form;
+        }
         let _ = deskwarden::api_key_ui::draw(root, &mut self.api_key);
     }
 

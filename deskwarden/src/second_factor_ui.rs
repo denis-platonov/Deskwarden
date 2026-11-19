@@ -145,9 +145,7 @@ pub fn factor_title(factor: &SecondFactor) -> &'static str {
 pub fn factor_hint(factor: &SecondFactor) -> String {
     match factor {
         SecondFactor::Authenticator => {
-            "Open your authenticator app and enter the 6-digit code it shows for this \
-             account."
-                .to_string()
+            "Open your authenticator app and type the code for Bitwarden.".to_string()
         }
         SecondFactor::Email { masked: Some(address) } => format!(
             "Send a code to {address}, then enter it here. Codes expire after a few \
@@ -321,8 +319,6 @@ impl Prompt {
     }
 }
 
-pub const CODE_LABEL: &str = "Verification code";
-pub const SWITCH_LABEL: &str = "Use a different method";
 pub const CONTINUE_LABEL: &str = "Continue";
 pub const BACK_LABEL: &str = "Back";
 
@@ -362,83 +358,121 @@ pub fn draw(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
     asked
 }
 
-/// The prompt itself, in the form column.
+/// The big words over the code boxes (the sign-in gallery's "Enter your
+/// 6-digit code" for the two numeric methods).
+pub fn stage_heading(factor: &SecondFactor) -> &'static str {
+    match factor {
+        SecondFactor::Authenticator | SecondFactor::Email { .. } => "Enter your 6-digit code",
+        SecondFactor::YubiKey => "Touch your YubiKey",
+        SecondFactor::Unsupported(_) => "Two-step login",
+    }
+}
+
+/// What the stage says when Continue is pressed with fewer than six digits.
+pub const SHORT_CODE: &str = "Enter all 6 digits.";
+/// The link that moves to the next method the account offers.
+pub const OTHER_METHOD_LABEL: &str = "Use another method";
+
+/// The glyph in the stage's tile.
+fn tile_glyph(factor: &SecondFactor) -> &'static str {
+    match factor {
+        SecondFactor::Authenticator => crate::kit::auth::PHONE_CODE,
+        SecondFactor::Email { .. } => "M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2zM22 7l-10 6L2 7",
+        SecondFactor::YubiKey => crate::kit::icon::glyph::PASSKEY,
+        SecondFactor::Unsupported(_) => crate::kit::auth::LOCK_TILE,
+    }
+}
+
+/// True for the methods whose code is six digits.
+fn six_digits(factor: &SecondFactor) -> bool {
+    matches!(factor, SecondFactor::Authenticator | SecondFactor::Email { .. })
+}
+
+/// The next supported method after `chosen`, wrapping, if there is another.
+fn next_method(prompt: &Prompt, chosen: &SecondFactor) -> Option<SecondFactor> {
+    let supported = prompt.supported();
+    let at = supported.iter().position(|f| f == chosen)?;
+    let next = &supported[(at + 1) % supported.len()];
+    (next != chosen).then(|| next.clone())
+}
+
+/// The prompt itself, in the form column: the tile, the heading, the code
+/// (six boxes, or one field for a YubiKey), its error, Continue, and the
+/// links.
 fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
     use crate::kit::auth::{self, FORM_GAP};
-    use crate::kit::controls::ButtonKind;
     let width = ui.available_width();
     ui.spacing_mut().item_spacing.y = 0.0;
-    let button = |ui: &mut egui::Ui, kind: ButtonKind, label: &str| match kind {
-        ButtonKind::Primary => {
-            auth::wide_button(ui, kind, 56.0, 16, 17.0, label, None, width).clicked()
-        }
-        _ => auth::wide_button(ui, kind, 52.0, 14, 16.0, label, None, width).clicked(),
-    };
 
     if let Some(message) = unsupported_only_message(prompt.offered()) {
-        auth::title(ui, factor_title(&SecondFactor::Unsupported(0)));
-        ui.add_space(FORM_GAP);
-        auth::explain(ui, &message);
-        ui.add_space(FORM_GAP);
+        auth::stage_tile(ui, tile_glyph(&SecondFactor::Unsupported(0)), false);
+        ui.add_space(20.0);
+        auth::stage_title(ui, stage_heading(&SecondFactor::Unsupported(0)));
+        ui.add_space(6.0);
+        auth::subtitle(ui, &message);
+        ui.add_space(20.0);
         // The message above names the API key and where to create it. This is
         // the button that makes it true.
-        if button(ui, ButtonKind::Primary, crate::api_key_ui::USE_API_KEY_LABEL) {
+        if auth::submit_button(ui, crate::api_key_ui::USE_API_KEY_LABEL, false, width).clicked() {
             return Some(PromptAction::UseApiKey);
         }
-        ui.add_space(12.0);
-        return button(ui, ButtonKind::Outline, BACK_LABEL).then_some(PromptAction::Back);
+        ui.add_space(20.0);
+        return auth::link_big(ui, BACK_LABEL).clicked().then_some(PromptAction::Back);
     }
 
     let Some(chosen) = prompt.chosen() else {
         // An empty provider list. Nothing to ask for, and nothing to
         // apologise for either -- `unsupported_only_message` answers `None`
         // for the empty offer, so this arm exists and must say something.
-        auth::error_line(ui, message_for(Trouble::Unreachable));
+        auth::field_error(ui, message_for(Trouble::Unreachable));
         ui.add_space(FORM_GAP);
-        return button(ui, ButtonKind::Outline, BACK_LABEL).then_some(PromptAction::Back);
+        return auth::link_big(ui, BACK_LABEL).clicked().then_some(PromptAction::Back);
     };
 
-    auth::title(ui, factor_title(&chosen));
-    ui.add_space(12.0);
-    auth::explain(ui, &factor_hint(&chosen));
-    ui.add_space(FORM_GAP);
+    // The gallery's column: 20 between the parts.
+    auth::stage_tile(ui, tile_glyph(&chosen), false);
+    ui.add_space(20.0);
+    auth::stage_title(ui, stage_heading(&chosen));
+    ui.add_space(6.0);
+    auth::subtitle(ui, &factor_hint(&chosen));
+    ui.add_space(20.0);
 
     let mut asked = None;
 
     if prompt.wants_send_button() {
         let busy = prompt.busy;
-        ui.horizontal(|ui| {
-            let send = ui
-                .add_enabled_ui(!busy, |ui| {
-                    crate::kit::controls::button(
-                        ui,
-                        ButtonKind::Outline,
-                        crate::kit::controls::ROW,
-                        SEND_CODE_LABEL,
-                        None,
-                    )
-                })
-                .inner;
-            if send.clicked() {
-                asked = Some(PromptAction::Send);
-            }
-            if prompt.email_sent {
-                ui.add_space(12.0);
-                let p = crate::kit::tokens::palette(ui.ctx());
-                ui.label(theme::regular(CODE_SENT_NOTICE, 14.0).color(p.text_muted));
-            }
-        });
-        ui.add_space(FORM_GAP);
+        let send = ui
+            .add_enabled_ui(!busy, |ui| {
+                crate::kit::controls::button(
+                    ui,
+                    crate::kit::controls::ButtonKind::Outline,
+                    crate::kit::controls::ROW,
+                    SEND_CODE_LABEL,
+                    None,
+                )
+            })
+            .inner;
+        if send.clicked() {
+            asked = Some(PromptAction::Send);
+        }
+        if prompt.email_sent {
+            ui.add_space(10.0);
+            let p = crate::kit::tokens::palette(ui.ctx());
+            ui.add(egui::Label::new(theme::regular(CODE_SENT_NOTICE, 14.0).color(p.text_muted)).wrap());
+        }
+        ui.add_space(20.0);
     }
 
-    auth::label(ui, CODE_LABEL);
-    ui.add_space(auth::LABEL_GAP);
     let entry_id = egui::Id::new("auth-second-factor-code");
-    let entry = ui
-        .add_enabled_ui(!prompt.busy, |ui| {
-            crate::kit::input::text(ui, entry_id, &mut prompt.code, "", true, width)
+    let bad = prompt.error.is_some();
+    let entry = if six_digits(&chosen) {
+        auth::code_boxes(ui, entry_id, &mut prompt.code, bad, width, !prompt.busy)
+    } else {
+        ui.add_enabled_ui(!prompt.busy, |ui| {
+            auth::field_text(ui, entry_id, &mut prompt.code, "", width, bad, None)
         })
-        .inner;
+        .inner
+    };
     // A YubiKey types its code and presses Enter itself, which is why the
     // focus goes here on entry and why Enter submits.
     if !prompt.busy {
@@ -447,37 +481,38 @@ fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
     let entered = entry.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
     if let Some(error) = prompt.error.as_deref() {
-        ui.add_space(FORM_GAP);
-        auth::error_line(ui, error);
+        ui.add_space(8.0);
+        auth::field_error(ui, error);
     }
 
-    ui.add_space(FORM_GAP);
-    let ready = !prompt.busy && !prompt.code.trim().is_empty();
-    let go = ui.add_enabled_ui(ready, |ui| button(ui, ButtonKind::Primary, CONTINUE_LABEL)).inner;
-    if (go || (entered && ready)) && asked.is_none() {
-        asked = Some(PromptAction::Submit(crate::rest::api::SecondFactorAnswer::new(
-            chosen.clone(),
-            prompt.code.trim(),
-        )));
-    }
-    ui.add_space(12.0);
-    if button(ui, ButtonKind::Outline, BACK_LABEL) {
-        asked = Some(PromptAction::Back);
+    ui.add_space(20.0);
+    let label = if prompt.busy { crate::login_ui::CHECKING_LABEL } else { CONTINUE_LABEL };
+    let go = auth::submit_button(ui, label, prompt.busy, width).clicked();
+    if (go || entered) && !prompt.busy && asked.is_none() {
+        let code = prompt.code.trim().to_string();
+        if code.is_empty() || (six_digits(&chosen) && code.len() < 6) {
+            prompt.error = Some(SHORT_CODE.to_string());
+        } else {
+            asked = Some(PromptAction::Submit(crate::rest::api::SecondFactorAnswer::new(
+                chosen.clone(),
+                &code,
+            )));
+        }
     }
 
-    // Only the factors the user could switch TO, so a one-factor account is
-    // not offered a choice between one thing and itself.
-    let alternatives: Vec<SecondFactor> =
-        prompt.supported().into_iter().filter(|factor| *factor != chosen).collect();
-    if !alternatives.is_empty() {
-        ui.add_space(FORM_GAP);
-        auth::label(ui, SWITCH_LABEL);
-        for factor in alternatives {
-            ui.add_space(6.0);
-            if auth::link(ui, factor_title(&factor)).clicked() {
+    // Back always; the other method only when the account has one.
+    ui.add_space(20.0);
+    let other = next_method(prompt, &chosen);
+    let labels: Vec<&str> =
+        if other.is_some() { vec![BACK_LABEL, OTHER_METHOD_LABEL] } else { vec![BACK_LABEL] };
+    match auth::link_row(ui, &labels) {
+        Some(0) => asked = Some(PromptAction::Back),
+        Some(_) => {
+            if let Some(factor) = other {
                 prompt.choose(factor);
             }
         }
+        None => {}
     }
 
     asked
@@ -912,20 +947,15 @@ mod tests {
     fn the_provider_switch_appears_only_with_more_than_one_factor() {
         let mut two = Prompt::new(vec![SecondFactor::Authenticator, SecondFactor::YubiKey]);
         let two_texts = painted(&mut two);
-        assert!(says(&two_texts, SWITCH_LABEL), "got {two_texts:?}");
-        assert!(
-            says(&two_texts, factor_title(&SecondFactor::Authenticator)),
-            "the factor NOT chosen must be offered by name, or the switch switches to \
-             nothing; got {two_texts:?}"
-        );
+        assert!(says(&two_texts, OTHER_METHOD_LABEL), "got {two_texts:?}");
 
         let mut one = Prompt::new(vec![SecondFactor::Authenticator]);
         let one_texts = painted(&mut one);
         assert!(
-            says(&one_texts, "Authenticator app"),
-            "control: the single-factor card painted its title; got {one_texts:?}"
+            says(&one_texts, stage_heading(&SecondFactor::Authenticator)),
+            "control: the single-factor card painted its heading; got {one_texts:?}"
         );
-        assert!(!says(&one_texts, SWITCH_LABEL), "got {one_texts:?}");
+        assert!(!says(&one_texts, OTHER_METHOD_LABEL), "got {one_texts:?}");
     }
 
     /// An unsupported-only account gets the message and NO code box: a box
@@ -936,12 +966,12 @@ mod tests {
         let texts = painted(&mut duo);
         assert!(says(&texts, "Duo"), "got {texts:?}");
         assert!(says(&texts, "API key"), "got {texts:?}");
-        assert!(!says(&texts, CODE_LABEL), "there is nothing to type; got {texts:?}");
+        assert!(!says(&texts, CONTINUE_LABEL), "there is nothing to submit; got {texts:?}");
         // Control: a card that CAN be answered does paint the box, so the
         // absence above is about this account and not about a `draw` that
         // stopped drawing.
         let mut totp = Prompt::new(vec![SecondFactor::Authenticator]);
-        assert!(says(&painted(&mut totp), CODE_LABEL), "control: the box is painted at all");
+        assert!(says(&painted(&mut totp), CONTINUE_LABEL), "control: the box is painted at all");
     }
 
     /// The error line is painted under the box, and it is the one the trouble
@@ -1008,5 +1038,96 @@ mod tests {
             !says(&texts, crate::api_key_ui::USE_API_KEY_LABEL),
             "an account with an authenticator app should use it; got {texts:?}"
         );
+    }
+
+    // ---- the code stage in the sign-in gallery's layout (slice 15a) --------
+
+    const STAGE: egui::Vec2 = egui::vec2(1280.0, 820.0);
+
+    fn stage_frames(prompt: &mut Prompt) -> (egui::Context, crate::kit::testing::Painted) {
+        let ctx = crate::kit::testing::ctx();
+        let mut painted = crate::kit::testing::Painted::default();
+        for i in 0..8 {
+            painted = crate::kit::testing::frame(&ctx, f64::from(i) * 0.2, STAGE, vec![], |ui| {
+                let _ = draw(ui, prompt);
+            });
+        }
+        (ctx, painted)
+    }
+
+    fn press_continue(prompt: &mut Prompt) -> Option<PromptAction> {
+        let (ctx, painted) = stage_frames(prompt);
+        let at = painted.text(CONTINUE_LABEL).unwrap().2.center();
+        let mut asked = None;
+        crate::kit::testing::frame(&ctx, 1.6, STAGE, crate::kit::testing::click_at(at), |ui| {
+            asked = draw(ui, prompt);
+        });
+        asked
+    }
+
+    #[test]
+    fn the_numeric_methods_share_one_heading_and_a_yubikey_has_its_own() {
+        assert_eq!(stage_heading(&SecondFactor::Authenticator), "Enter your 6-digit code");
+        assert_eq!(stage_heading(&SecondFactor::Email { masked: None }), "Enter your 6-digit code");
+        assert_eq!(stage_heading(&SecondFactor::YubiKey), "Touch your YubiKey");
+    }
+
+    #[test]
+    fn the_stage_draws_six_boxes_and_the_two_links_for_an_account_with_two_methods() {
+        let mut prompt = Prompt::new(vec![
+            SecondFactor::Authenticator,
+            SecondFactor::Email { masked: Some("a***@b.c".to_string()) },
+        ]);
+        prompt.code = "482".to_string();
+        let (_, painted) = stage_frames(&mut prompt);
+        assert_eq!(painted.rects.iter().filter(|r| r.rect.height() == 64.0).count(), 6);
+        for word in ["Enter your 6-digit code", CONTINUE_LABEL, BACK_LABEL, OTHER_METHOD_LABEL] {
+            assert!(painted.text(word).is_some(), "{word}");
+        }
+    }
+
+    #[test]
+    fn a_one_method_account_has_no_other_method_link() {
+        let mut prompt = Prompt::new(vec![SecondFactor::Authenticator]);
+        let (_, painted) = stage_frames(&mut prompt);
+        assert!(painted.text(OTHER_METHOD_LABEL).is_none());
+        assert!(painted.text(BACK_LABEL).is_some());
+    }
+
+    #[test]
+    fn the_other_method_link_moves_on_and_wraps_round() {
+        let prompt = Prompt::new(vec![
+            SecondFactor::Authenticator,
+            SecondFactor::Email { masked: None },
+            SecondFactor::YubiKey,
+        ]);
+        assert_eq!(next_method(&prompt, &SecondFactor::Authenticator), Some(SecondFactor::Email { masked: None }));
+        assert_eq!(next_method(&prompt, &SecondFactor::YubiKey), Some(SecondFactor::Authenticator));
+        let single = Prompt::new(vec![SecondFactor::Authenticator]);
+        assert_eq!(next_method(&single, &SecondFactor::Authenticator), None);
+    }
+
+    #[test]
+    fn continue_with_a_short_code_says_so_instead_of_sending_it() {
+        let mut prompt = Prompt::new(vec![SecondFactor::Authenticator]);
+        prompt.code = "482".to_string();
+        assert!(press_continue(&mut prompt).is_none(), "nothing is sent");
+        assert_eq!(prompt.error.as_deref(), Some(SHORT_CODE));
+    }
+
+    #[test]
+    fn six_digits_are_sent_when_continue_is_pressed() {
+        let mut prompt = Prompt::new(vec![SecondFactor::Authenticator]);
+        prompt.code = "482913".to_string();
+        assert!(matches!(press_continue(&mut prompt), Some(PromptAction::Submit(_))));
+    }
+
+    #[test]
+    fn a_busy_stage_reads_checking() {
+        let mut prompt = Prompt::new(vec![SecondFactor::Authenticator]);
+        prompt.code = "482913".to_string();
+        prompt.busy = true;
+        let (_, painted) = stage_frames(&mut prompt);
+        assert!(painted.text(crate::login_ui::CHECKING_LABEL).is_some());
     }
 }
