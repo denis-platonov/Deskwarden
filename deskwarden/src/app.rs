@@ -3716,6 +3716,13 @@ pub fn handle_no_match(
         remember_never_for_app,
     );
     log::info!("the save-a-new-login card was answered: {}", describe_outcome(&outcome));
+    // The done check (design D 1.4): a saved login is confirmed on a card of its
+    // own, which takes no focus and closes itself (about 1.5 s, on this thread,
+    // after the save is already done). Only a save that really reached the
+    // vault earns it.
+    if matches!(outcome, SaveOutcome::Created(Ok(_))) {
+        crate::notice_card::show_done(crate::notice_card::DoneCase::Saved);
+    }
     // 3c's own answers never open a window: `Save` wrote the item, and the
     // other three are silences of different lengths. Nothing follows.
     NoMatchFollowUp::Nothing

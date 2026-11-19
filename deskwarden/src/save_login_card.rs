@@ -221,7 +221,7 @@ pub const PASSWORD_HINT: &str = "type the password you used";
 pub const SAVE_LOGIN_CARD_TITLE: &str = "Deskwarden save a login";
 
 /// What 3c's header says.
-pub const SAVE_LOGIN_LABEL: &str = "Save a login";
+pub const SAVE_LOGIN_LABEL: &str = "Save this login?";
 
 /// 3c's primary button.
 pub const SAVE_LABEL: &str = "Save";
@@ -244,8 +244,9 @@ pub const NOT_NOW_LABEL: &str = "Not now";
 /// are choosing.
 pub const NEVER_LABEL: &str = "Never for this app";
 
-/// The four rows' captions, top to bottom.
-pub const ROW_CAPTIONS: [&str; 4] = ["App", "Username", "Password", "Folder"];
+/// The two fields' captions, top to bottom. The App and Folder rows are the
+/// preview block now (design D 1.7), which says the same two things.
+pub const ROW_CAPTIONS: [&str; 2] = ["Username", "Password"];
 
 /// The `Enter` chip drawn inside *Save*.
 pub const SAVE_SHORTCUT: &str = "ENTER";
@@ -412,62 +413,41 @@ pub static REAL: SaveLoginCalls = SaveLoginCalls {
 /// [`crate::picker_prompt::WIDTH`], because it is the same kind of card in the
 /// same place on screen and two frameless daemon cards of different widths read
 /// as two different programs.
-pub const WIDTH: i32 = 380;
+pub const WIDTH: i32 = crate::panel_draw::SAVE_W;
 
-/// Content inset, and the top margin.
-const MARGIN_X: i32 = 14;
-const MARGIN_TOP: i32 = 12;
+/// Content inset, and the top margin (design D 1.7: `pad 18`).
+const MARGIN_X: i32 = crate::panel_draw::PAD;
+const MARGIN_TOP: i32 = crate::panel_draw::PAD;
+/// The gap between the card's blocks (D 1.7: `gap 14`).
+const BLOCK_GAP: i32 = crate::panel_draw::BLOCK_GAP;
 
-/// The width of 3c's caption column -- the design's `width: 80px`, less the
-/// margin this card's rows already carry.
-///
-/// A **fixed** width rather than a sized-to-content one, which is what keeps
-/// the four rows' bodies aligned with each other and, more importantly, keeps
-/// each row's height independent of its caption.
-const LABEL_W: i32 = 74;
+/// The preview block (D 1.7): `pad 12`, a 42 px tile and two lines.
+const PREVIEW_PAD: i32 = 12;
+const PREVIEW_H: i32 = crate::panel_draw::AVATAR + 2 * PREVIEW_PAD;
 
-/// The height of one of 3c's four rows -- the design's `height: 32px` input
-/// box, which is what sets the row's pitch whether or not the row holds one.
-///
-/// **Every row is this tall, including the two that hold no field.** That is
-/// what makes the card's height a function of four rows rather than of what
-/// happens to be in them, and it is why an `app_name` of any length cannot grow
-/// it: the App row's text is drawn `DT_END_ELLIPSIS` on one line.
-const ROW_H: i32 = 30;
+/// A field's caption line, and the gap under it.
+const CAPTION_H: i32 = 20;
+const CAPTION_GAP: i32 = 6;
+/// The gap between the Username field and the Password caption.
+const FIELD_GAP: i32 = 12;
+/// A field's height: the design's 46 px control.
+const FIELD_H: i32 = 46;
 
-/// The vertical gap between two of 3c's four rows.
-const ROW_GAP: i32 = 8;
-
-/// The *Generate* control's lane in the Password row, and the gap that keeps it
-/// off the field.
-///
-/// A constant rather than a literal because it is subtracted from the password
-/// field's width, and a lane too small clips the control off the right edge of a
-/// window that cannot scroll in that direction either.
+/// The *Generate* control, a small button in the Password caption's row.
 const GENERATE_W: i32 = 78;
-const GENERATE_GAP: i32 = 8;
-
-/// The height of the in-row *Generate* control. Shorter than a footer button,
-/// because it sits inside a [`ROW_H`] row.
 const GENERATE_H: i32 = 26;
 
-/// Button height. `theme::BUTTON_HEIGHT`, pinned by
-/// [`tests::the_cards_dimensions_are_the_themes`].
-const BUTTON_H: i32 = 32;
-
-/// The footer's three answers. *Save* carries its `ENTER` chip inside itself,
-/// so it is wider than its label needs; *Never for this app* is the longest
-/// label on the card.
-const SAVE_W: i32 = 106;
-const NOT_NOW_W: i32 = 78;
-const NEVER_W: i32 = 132;
-const FOOTER_GAP: i32 = 8;
+/// Button height and the footer gap (D 1.7: `h46`, `gap 8`).
+const BUTTON_H: i32 = crate::panel_draw::BUTTON_H;
+const FOOTER_GAP: i32 = crate::panel_draw::BUTTON_GAP;
+/// The *Never for this app* link's line, and the gap above it.
+const NEVER_H: i32 = 28;
+const NEVER_GAP: i32 = 10;
 
 /// How far inside the painted field box the `EDIT` child sits, and how tall it
-/// is. `unlock_prompt`'s and `picker_prompt`'s numbers, so the caret sits off
-/// the border rather than against it.
-const FIELD_INSET_X: i32 = 10;
-const FIELD_TEXT_H: i32 = 20;
+/// is, so the caret sits off the border rather than against it.
+const FIELD_INSET_X: i32 = 14;
+const FIELD_TEXT_H: i32 = 22;
 
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -492,35 +472,30 @@ impl Box2 {
 /// Pure arithmetic with no Win32 in it, for `prompt_card::layout`'s reason: a
 /// control whose bottom edge fell past the window's would simply be invisible on
 /// a window that neither scrolls nor resizes, and that is a property worth
-/// asserting without opening anything. This is by far the tallest card in the
-/// crate and the one with the most to lose -- a control past the bottom edge
-/// here is *Save*, or the password field itself.
+/// asserting without opening anything. A control past the bottom edge here is
+/// *Save*, or the password field itself.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
-    /// The brand lockup's shield, and the wordmark beside it. **Not optional.**
-    /// Four cards lost the lockup in porting and it had to be restored
-    /// afterwards; a frameless always-on-top window that offers to put a
-    /// password into the user's vault has to say whose window it is.
+    /// The brand shield, and the title beside it (D 1.7: the title takes the
+    /// wordmark's place). **Not optional**: a frameless always-on-top window that
+    /// offers to put a password into the user's vault has to say whose window it
+    /// is.
     pub mark: Box2,
-    pub wordmark: Box2,
     pub title: Box2,
     pub close_glyph: Box2,
-    pub header_rule: Box2,
-    pub footer_rule: Box2,
-    /// The tinted band the footer's three answers sit on.
-    pub footer: Box2,
-    /// The four caption boxes, in [`ROW_CAPTIONS`] order.
-    pub captions: [Box2; 4],
-    /// The App row's read-only value.
+    /// The preview block: the app's tile, its name and where the login goes.
+    pub preview: Box2,
+    pub tile: Box2,
     pub app_value: Box2,
+    pub folder_value: Box2,
+    /// The two captions, in [`ROW_CAPTIONS`] order.
+    pub captions: [Box2; 2],
     /// The two painted field boxes. The `EDIT` children sit inside them; see
     /// [`field_child`].
     pub username: Box2,
     pub password: Box2,
     pub generate: Box2,
-    /// The Folder row's read-only value.
-    pub folder_value: Box2,
     pub save: Box2,
     pub not_now: Box2,
     pub never: Box2,
@@ -528,80 +503,66 @@ pub struct Layout {
 
 /// **The card's geometry. There is exactly one shape.**
 ///
-/// The card has no rows to count, no modes and no second step: it is four
-/// fixed-height rows and three answers, and nothing about it varies at runtime.
-/// The window is sized to this content and to nothing else.
+/// The card has no rows to count, no modes and no second step: a preview block,
+/// two fields and three answers, and nothing about it varies at runtime.
 pub fn layout() -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
-    let lockup = crate::win32_draw::card_lockup();
+    let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
-    let wordmark =
-        Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    // The ✕ sits on the lockup's line, which is where every card header in the
-    // design carries it.
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
-    let title =
-        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w - 24, h: 21 };
-    let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
+    let close = crate::panel_draw::CLOSE_LARGE;
+    let close_glyph =
+        Box2 { x: WIDTH - MARGIN_X + 4 - close, y: mark.y + (mark.h - close) / 2, w: close, h: close };
+    let title_x = mark.right() + lockup.gap;
+    let title = Box2 { x: title_x, y: mark.y, w: close_glyph.x - 4 - title_x, h: mark.h };
 
-    let rows_top = header_rule.bottom() + 10;
-    let row_y = |i: i32| rows_top + i * (ROW_H + ROW_GAP);
-    let value_x = MARGIN_X + LABEL_W;
-    let value_w = WIDTH - MARGIN_X - value_x;
-
-    let captions = [
-        Box2 { x: MARGIN_X, y: row_y(0), w: LABEL_W, h: ROW_H },
-        Box2 { x: MARGIN_X, y: row_y(1), w: LABEL_W, h: ROW_H },
-        Box2 { x: MARGIN_X, y: row_y(2), w: LABEL_W, h: ROW_H },
-        Box2 { x: MARGIN_X, y: row_y(3), w: LABEL_W, h: ROW_H },
-    ];
-    let app_value = Box2 { x: value_x, y: row_y(0), w: value_w, h: ROW_H };
-    let username = Box2 { x: value_x, y: row_y(1), w: value_w, h: ROW_H };
-    // The *Generate* lane is taken out BEFORE the field takes what is left, so
-    // a control added after it cannot be pushed off the right edge of a window
-    // that has no horizontal scroll either.
-    let password = Box2 {
-        x: value_x,
-        y: row_y(2),
-        w: value_w - GENERATE_GAP - GENERATE_W,
-        h: ROW_H,
+    let preview = Box2 { x: MARGIN_X, y: mark.bottom() + BLOCK_GAP, w: content_w, h: PREVIEW_H };
+    let tile = Box2 {
+        x: preview.x + PREVIEW_PAD,
+        y: preview.y + PREVIEW_PAD,
+        w: crate::panel_draw::AVATAR,
+        h: crate::panel_draw::AVATAR,
     };
+    let text_x = tile.right() + 12;
+    let text_w = preview.right() - PREVIEW_PAD - text_x;
+    let app_value = Box2 { x: text_x, y: tile.y + 1, w: text_w, h: 21 };
+    let folder_value = Box2 { x: text_x, y: app_value.bottom(), w: text_w, h: 19 };
+
+    let caption_user = Box2 { x: MARGIN_X, y: preview.bottom() + BLOCK_GAP, w: content_w, h: CAPTION_H };
+    let username = Box2 { x: MARGIN_X, y: caption_user.bottom() + CAPTION_GAP, w: content_w, h: FIELD_H };
+    let caption_pass = Box2 { x: MARGIN_X, y: username.bottom() + FIELD_GAP, w: content_w, h: CAPTION_H };
+    // *Generate* sits at the right end of the Password caption's row, taken out
+    // of the caption's own width so the two cannot overlap.
     let generate = Box2 {
-        x: password.right() + GENERATE_GAP,
-        y: row_y(2) + (ROW_H - GENERATE_H) / 2,
+        x: MARGIN_X + content_w - GENERATE_W,
+        y: caption_pass.y + (CAPTION_H - GENERATE_H) / 2,
         w: GENERATE_W,
         h: GENERATE_H,
     };
-    let folder_value = Box2 { x: value_x, y: row_y(3), w: value_w, h: ROW_H };
+    let caption_pass = Box2 { w: generate.x - MARGIN_X - 6, ..caption_pass };
+    let password = Box2 { x: MARGIN_X, y: caption_pass.bottom() + CAPTION_GAP, w: content_w, h: FIELD_H };
 
-    let footer_rule = Box2 { x: 0, y: folder_value.bottom() + 10, w: WIDTH, h: 1 };
-    let save = Box2 { x: MARGIN_X, y: footer_rule.bottom() + 10, w: SAVE_W, h: BUTTON_H };
+    let half = (content_w - FOOTER_GAP) / 2;
+    let save = Box2 { x: MARGIN_X, y: password.bottom() + BLOCK_GAP, w: half, h: BUTTON_H };
     let not_now =
-        Box2 { x: save.right() + FOOTER_GAP, y: save.y, w: NOT_NOW_W, h: BUTTON_H };
-    let never =
-        Box2 { x: not_now.right() + FOOTER_GAP, y: save.y, w: NEVER_W, h: BUTTON_H };
+        Box2 { x: MARGIN_X + content_w - half, y: save.y, w: half, h: BUTTON_H };
+    let never = Box2 { x: MARGIN_X, y: save.bottom() + NEVER_GAP, w: content_w, h: NEVER_H };
 
-    let height = save.bottom() + MARGIN_TOP;
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: height };
-    let footer =
-        Box2 { x: 0, y: footer_rule.bottom(), w: WIDTH, h: height - footer_rule.bottom() };
+    let window = Box2 { x: 0, y: 0, w: WIDTH, h: never.bottom() + MARGIN_TOP };
 
     Layout {
         window,
         mark,
-        wordmark,
         title,
         close_glyph,
-        header_rule,
-        footer_rule,
-        footer,
-        captions,
+        preview,
+        tile,
         app_value,
+        folder_value,
+        captions: [caption_user, caption_pass],
         username,
         password,
         generate,
-        folder_value,
         save,
         not_now,
         never,
@@ -696,9 +657,8 @@ mod win32 {
         WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{
-        draw_button_with_shortcut, draw_card_lockup, draw_text, rgb, ButtonSkin,
-    };
+    use crate::panel_draw::PanelButton;
+    use crate::win32_draw::{draw_button_with_shortcut, draw_text, rgb, ButtonSkin};
 
     use zeroize::Zeroizing;
 
@@ -800,33 +760,53 @@ mod win32 {
     /// Every face the card paints with, created at open and destroyed at close.
     /// Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
-        brand: HFONT,
+        /// The title beside the shield, 17/800.
         title: HFONT,
+        /// A field's caption, 13/600; also the *Generate* control's label.
         caption: HFONT,
-        /// The two `EDIT`s' face, and the App row's value: the same size, so a
-        /// pre-filled row and a typed one read as the same kind of thing.
+        /// The preview's bold line (16/700), its faint one (14) and the tile's
+        /// initials (14/700).
+        name: HFONT,
+        sub: HFONT,
+        avatar: HFONT,
+        /// The two `EDIT`s' face: the same size as the design's field text.
         field: HFONT,
+        /// The footer buttons, 15/700, and the keyboard chip inside *Save*.
         button: HFONT,
         hint: HFONT,
+        /// The *Never for this app* link, 14/600.
+        link: HFONT,
     }
 
     impl Fonts {
         fn build() -> Self {
-            use crate::theme::{BOLD, REGULAR, SEMIBOLD};
+            use crate::theme::{BOLD, EXTRABOLD, REGULAR, SEMIBOLD};
             Fonts {
-                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
-                title: font(BOLD, 15),
-                caption: font(REGULAR, 11),
-                field: font(REGULAR, 12),
-                button: font(SEMIBOLD, 12),
+                title: font(EXTRABOLD, crate::panel_draw::SAVE_TITLE_PX),
+                caption: font(SEMIBOLD, 13),
+                name: font(BOLD, crate::panel_draw::ROW_NAME_PX),
+                sub: font(REGULAR, crate::panel_draw::ROW_SUB_PX),
+                avatar: font(BOLD, crate::panel_draw::ROW_SUB_PX),
+                field: font(REGULAR, crate::panel_draw::BODY_PX),
+                button: font(BOLD, crate::panel_draw::BUTTON_PX),
                 hint: mono(crate::theme::CHIP_TEXT_PX as i32),
+                link: font(SEMIBOLD, 14),
             }
         }
 
         fn destroy(&self) {
             unsafe {
-                for f in [self.brand, self.title, self.caption, self.field, self.button, self.hint]
-                {
+                for f in [
+                    self.title,
+                    self.caption,
+                    self.name,
+                    self.sub,
+                    self.avatar,
+                    self.field,
+                    self.button,
+                    self.hint,
+                    self.link,
+                ] {
                     let _ = DeleteObject(f);
                 }
             }
@@ -1629,10 +1609,11 @@ mod win32 {
 
             // The window IS the card, so its whole client area is `theme::CARD`.
             fill_rect(mem, client, crate::theme::CARD);
-            fill_box(mem, l.footer, crate::theme::CARD_TINT);
-            fill_box(mem, l.header_rule, crate::theme::HAIRLINE);
-            fill_box(mem, l.footer_rule, crate::theme::HAIRLINE);
             SetBkMode(mem, TRANSPARENT);
+
+            // The preview block: the soft ground the design sets the app's tile
+            // on (D 1.7: `pad 12, r14, #f7f6f5`).
+            rounded(mem, l.preview, 14, crate::theme::WINDOW_BG, None);
 
             // The two field boxes, and their focus halos. The `EDIT`s are
             // children sitting inside these, painted by comctl32 in the colours
@@ -1646,7 +1627,7 @@ mod win32 {
                     rounded(
                         mem,
                         Box2 { x: at.x - 2, y: at.y - 2, w: at.w + 4, h: at.h + 4 },
-                        9,
+                        13,
                         crate::theme::FOCUS_RING,
                         None,
                     );
@@ -1654,40 +1635,40 @@ mod win32 {
                 rounded(
                     mem,
                     at,
-                    8,
+                    12,
                     crate::theme::CARD,
-                    Some((1, crate::theme::BORDER)),
+                    Some((1, if focused { crate::theme::BLUE } else { crate::theme::BORDER })),
                 );
             }
 
             if let Some(fonts) = fonts {
-                paint_lockup(mem, &l, fonts.brand);
+                let dev = |b: Box2| RECT {
+                    left: scale(b.x),
+                    top: scale(b.y),
+                    right: scale(b.right()),
+                    bottom: scale(b.bottom()),
+                };
+                crate::win32_draw::draw_mark(mem, dev(l.mark));
                 text(mem, fonts.title, l.title, SAVE_LOGIN_LABEL, crate::theme::INK);
 
                 for (caption, at) in ROW_CAPTIONS.iter().zip(l.captions.iter()) {
-                    text(mem, fonts.caption, *at, caption, crate::theme::TEXT_FAINT);
+                    text(mem, fonts.caption, *at, caption, crate::theme::TEXT_SECONDARY);
                 }
-                // **The App row is the one pre-filled row**, and its value is
-                // user-controlled: it is drawn on one `DT_END_ELLIPSIS` line, so
-                // no name a user can supply can make this card taller.
-                text(
+
+                // **The app is the one pre-filled fact**, and its value is
+                // user-controlled: drawn on one `DT_END_ELLIPSIS` line, so no
+                // name a user can supply can make this card taller.
+                let app = app_name();
+                crate::panel_draw::draw_avatar(
                     mem,
-                    fonts.field,
-                    // `+ FIELD_INSET_X`, not a literal: the read-only rows'
-                    // text has to start on the same column the two `EDIT`
-                    // children's does, and that column is the one
-                    // `field_child` insets them by.
-                    Box2 { x: l.app_value.x + super::FIELD_INSET_X, ..l.app_value },
-                    &app_name(),
-                    crate::theme::INK,
+                    dev(l.tile),
+                    &crate::theme::initials(&app),
+                    fonts.avatar,
+                    crate::panel_draw::avatar_colours(0),
+                    DPI_PERCENT.load(Ordering::SeqCst),
                 );
-                text(
-                    mem,
-                    fonts.caption,
-                    Box2 { x: l.folder_value.x + super::FIELD_INSET_X, ..l.folder_value },
-                    FOLDER_ROW_TEXT,
-                    crate::theme::TEXT_FAINT,
-                );
+                text(mem, fonts.name, l.app_value, &app, crate::theme::INK);
+                text(mem, fonts.sub, l.folder_value, FOLDER_ROW_TEXT, crate::theme::TEXT_FAINT);
             }
 
             paint_close_glyph(mem, l.close_glyph);
@@ -1722,50 +1703,56 @@ mod win32 {
             let l = super::layout();
             let dpi = DPI_PERCENT.load(Ordering::SeqCst);
 
-            // The footer's three answers sit on the tint, the Password row's
-            // *Generate* on the card -- otherwise a button's rounded corners
-            // show the wrong colour through them.
-            let under = if id == ID_GENERATE {
-                crate::theme::CARD
-            } else {
-                crate::theme::CARD_TINT
-            };
-            fill_rect(mem, whole, under);
+            // Every button sits on the card's white, which is what its rounded
+            // corners show through.
+            fill_rect(mem, whole, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
-                let (label, hint, skin, face, box2) = control_skin(id, &l, fonts);
-                let skin = if hovered { skin.hovered() } else { skin };
-                let hint = hint.map(|text| (text, fonts.hint));
-                let radius = if id == ID_GENERATE { 7 } else { 8 };
-                if focused {
-                    // **The ring is given LOGICAL size, from `layout`.**
-                    // `rounded` scales everything it is handed, and `rc` came
-                    // back from `GetClientRect` in device pixels already:
-                    // passing it would draw the ring at 1.5x the control at
-                    // 150%, running past the client area and being clipped --
-                    // losing exactly the rounded corners the ring exists to
-                    // draw.
-                    rounded(
+                if id == ID_NEVER {
+                    // **A text link, not a button** (D 1.7): the one control on
+                    // the card that writes to `settings.json` gets the least
+                    // weight. Keyboard focus lights it like a hover.
+                    crate::panel_draw::draw_link(
                         mem,
-                        Box2 { x: 0, y: 0, w: box2.w, h: box2.h },
-                        radius + 1,
-                        crate::theme::FOCUS_RING,
-                        None,
-                    );
-                    let inner = RECT {
-                        left: whole.left + 2,
-                        top: whole.top + 2,
-                        right: whole.right - 2,
-                        bottom: whole.bottom - 2,
-                    };
-                    draw_button_with_shortcut(
-                        mem, inner, &label, face, skin, scale(radius), hint, dpi,
+                        whole,
+                        NEVER_LABEL,
+                        fonts.link,
+                        hovered || focused,
+                        true,
                     );
                 } else {
-                    draw_button_with_shortcut(
-                        mem, whole, &label, face, skin, scale(radius), hint, dpi,
-                    );
+                    let (label, hint, skin, face, box2) = control_skin(id, &l, fonts);
+                    let skin = if hovered { skin.hovered() } else { skin };
+                    let hint = hint.map(|text| (text, fonts.hint));
+                    let radius =
+                        if id == ID_GENERATE { 8 } else { crate::panel_draw::BUTTON_RADIUS };
+                    if focused {
+                        // **The ring is given LOGICAL size, from `layout`.**
+                        // `rounded` scales everything it is handed, and `rc`
+                        // came back from `GetClientRect` in device pixels
+                        // already.
+                        rounded(
+                            mem,
+                            Box2 { x: 0, y: 0, w: box2.w, h: box2.h },
+                            radius + 1,
+                            crate::theme::FOCUS_RING,
+                            None,
+                        );
+                        let inner = RECT {
+                            left: whole.left + 2,
+                            top: whole.top + 2,
+                            right: whole.right - 2,
+                            bottom: whole.bottom - 2,
+                        };
+                        draw_button_with_shortcut(
+                            mem, inner, &label, face, skin, scale(radius), hint, dpi,
+                        );
+                    } else {
+                        draw_button_with_shortcut(
+                            mem, whole, &label, face, skin, scale(radius), hint, dpi,
+                        );
+                    }
                 }
             }
             drop(guard);
@@ -1780,9 +1767,8 @@ mod win32 {
 
     /// What button `id` says, how it is drawn, and the logical box it occupies.
     ///
-    /// **Only *Save* is primary.** *Not now* and *Never for this app* are the
-    /// two silences, and the design gives the stronger of them the least weight
-    /// -- it is the one control on the card that writes to `settings.json`.
+    /// **Only *Save* is primary.** *Not now* is outlined, and *Never for this
+    /// app* is not a button at all (see `paint_control`).
     fn control_skin(
         id: usize,
         l: &super::Layout,
@@ -1792,64 +1778,37 @@ mod win32 {
             ID_SAVE => (
                 SAVE_LABEL.to_string(),
                 Some(SAVE_SHORTCUT),
-                ButtonSkin::primary(),
+                crate::panel_draw::skin(PanelButton::Primary, false),
                 fonts.button,
                 l.save,
             ),
             ID_NOT_NOW => (
                 NOT_NOW_LABEL.to_string(),
                 None,
-                ButtonSkin::secondary(),
+                crate::panel_draw::skin(PanelButton::Outline, false),
                 fonts.button,
                 l.not_now,
-            ),
-            ID_NEVER => (
-                NEVER_LABEL.to_string(),
-                None,
-                ButtonSkin::secondary(),
-                fonts.button,
-                l.never,
             ),
             _ => (
                 SAVE_GENERATE_LABEL.to_string(),
                 None,
-                ButtonSkin::secondary(),
-                fonts.field,
+                crate::panel_draw::skin(PanelButton::Outline, false),
+                fonts.caption,
                 l.generate,
             ),
         }
     }
 
-    /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] -- the
-    /// crate's one mark painter, which every card draws through. What is this
-    /// card's own is only the logical-to-device conversion.
-    fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
-        let dev = |b: Box2| RECT {
-            left: scale(b.x),
-            top: scale(b.y),
-            right: scale(b.right()),
-            bottom: scale(b.bottom()),
-        };
-        let tracking = scale(crate::win32_draw::card_lockup().tracking);
-        draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
-    }
-
     /// The header's close glyph, drawn as two strokes because no bundled face
     /// has it at this weight.
     fn paint_close_glyph(hdc: HDC, at: Box2) {
-        unsafe {
-            use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::theme::TEXT_FAINT));
-            let old = SelectObject(hdc, pen);
-            let (x, y, w, h) = (scale(at.x), scale(at.y), scale(at.w), scale(at.h));
-            let pad = w / 3;
-            let _ = MoveToEx(hdc, x + pad, y + pad, None);
-            let _ = LineTo(hdc, x + w - pad, y + h - pad);
-            let _ = MoveToEx(hdc, x + w - pad, y + pad, None);
-            let _ = LineTo(hdc, x + pad, y + h - pad);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(pen);
-        }
+        let rc = RECT {
+            left: scale(at.x),
+            top: scale(at.y),
+            right: scale(at.right()),
+            bottom: scale(at.bottom()),
+        };
+        crate::panel_draw::draw_close_x(hdc, rc, scale(1).max(1), crate::theme::TEXT_GHOST);
     }
 
     fn fill_rect(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {
@@ -1858,20 +1817,6 @@ mod win32 {
             FillRect(hdc, &rc, brush);
             let _ = DeleteObject(brush);
         }
-    }
-
-    /// [`fill_rect`], for a **logical** rectangle.
-    fn fill_box(hdc: HDC, at: Box2, colour: eframe::egui::Color32) {
-        fill_rect(
-            hdc,
-            RECT {
-                left: scale(at.x),
-                top: scale(at.y),
-                right: scale(at.right()),
-                bottom: scale(at.bottom()).max(scale(at.y) + 1),
-            },
-            colour,
-        );
     }
 
     /// A rounded rectangle in logical coordinates, optionally stroked.
@@ -2181,25 +2126,25 @@ mod tests {
     #[test]
     fn every_control_is_inside_the_window() {
         let l = layout();
-        let boxes: Vec<(&str, Box2)> = vec![
-            ("mark", l.mark),
-            ("wordmark", l.wordmark),
-            ("title", l.title),
-            ("close_glyph", l.close_glyph),
-            ("header_rule", l.header_rule),
-            ("app_value", l.app_value),
-            ("username", l.username),
-            ("password", l.password),
-            ("generate", l.generate),
-            ("folder_value", l.folder_value),
-            ("footer_rule", l.footer_rule),
-            ("save", l.save),
-            ("not_now", l.not_now),
-            ("never", l.never),
+        let mut boxes: Vec<(String, Box2)> = vec![
+            ("mark".into(), l.mark),
+            ("title".into(), l.title),
+            ("close_glyph".into(), l.close_glyph),
+            ("preview".into(), l.preview),
+            ("tile".into(), l.tile),
+            ("app_value".into(), l.app_value),
+            ("folder_value".into(), l.folder_value),
+            ("username".into(), l.username),
+            ("password".into(), l.password),
+            ("generate".into(), l.generate),
+            ("save".into(), l.save),
+            ("not_now".into(), l.not_now),
+            ("never".into(), l.never),
         ];
-        for (name, at) in boxes.iter().chain(
-            l.captions.iter().enumerate().map(|(i, b)| (ROW_CAPTIONS[i], *b)).collect::<Vec<_>>().iter(),
-        ) {
+        for (i, caption) in l.captions.iter().enumerate() {
+            boxes.push((ROW_CAPTIONS[i].to_string(), *caption));
+        }
+        for (name, at) in &boxes {
             assert!(at.x >= 0, "`{name}` starts left of the window");
             assert!(at.y >= 0, "`{name}` starts above the window");
             assert!(
@@ -2221,35 +2166,31 @@ mod tests {
         // shortens the window rather than leaving a hole nothing notices.
         assert_eq!(
             l.window.h,
-            l.never.bottom() + 12,
-            "the window's height is no longer the footer's bottom plus one margin, so it has \
-             slack in it that no test can tell from a control that vanished"
+            l.never.bottom() + MARGIN_TOP,
+            "the window's height is no longer the last control's bottom plus one margin, so it \
+             has slack in it that no test can tell from a control that vanished"
         );
     }
 
-    /// The footer's three answers do not overlap each other, and the Password
-    /// row's field does not run into its *Generate*.
+    /// The footer's two answers do not overlap each other, the *Generate*
+    /// control does not run into its caption, and the blocks stack in order.
     #[test]
     fn no_two_controls_overlap() {
         let l = layout();
         assert!(l.save.right() < l.not_now.x, "*Save* runs into *Not now*");
-        assert!(l.not_now.right() < l.never.x, "*Not now* runs into *Never for this app*");
+        assert!(l.save.bottom() < l.never.y, "the *Never* link touches the buttons above it");
         assert!(
-            l.password.right() < l.generate.x,
-            "the password field runs into the *Generate* control, which is the lane the layout \
-             reserves before the field takes what is left"
+            l.captions[1].right() <= l.generate.x,
+            "the Password caption runs into the *Generate* control"
         );
-        assert!(
-            l.captions[0].right() <= l.app_value.x,
-            "the caption column runs into the value column"
-        );
-        for (a, b) in [
-            (l.captions[0], l.captions[1]),
-            (l.captions[1], l.captions[2]),
-            (l.captions[2], l.captions[3]),
-        ] {
-            assert!(a.bottom() < b.y, "two of the four rows overlap vertically");
-        }
+        assert!(l.preview.bottom() < l.captions[0].y);
+        assert!(l.captions[0].bottom() < l.username.y);
+        assert!(l.username.bottom() < l.captions[1].y);
+        assert!(l.captions[1].bottom() < l.password.y);
+        assert!(l.password.bottom() < l.save.y);
+        assert!(l.tile.right() < l.app_value.x, "the app's name runs under its tile");
+        assert!(l.app_value.bottom() <= l.folder_value.y);
+        assert!(l.title.right() <= l.close_glyph.x, "the title runs under the ✕");
     }
 
     /// The `EDIT` children sit strictly inside the boxes the parent paints, or
@@ -2267,40 +2208,31 @@ mod tests {
         }
     }
 
-    /// The card's dimensions come from `theme`, not from numbers invented here.
+    /// The card's dimensions are design 1b's, not numbers invented here.
     #[test]
-    fn the_cards_dimensions_are_the_themes() {
-        assert_eq!(
-            BUTTON_H,
-            crate::theme::BUTTON_HEIGHT as i32,
-            "the footer's buttons are no longer `theme::BUTTON_HEIGHT` tall"
-        );
-        assert_eq!(
-            WIDTH,
-            crate::picker_prompt::WIDTH,
-            "two frameless daemon cards of different widths read as two different programs"
-        );
-        let lockup = crate::win32_draw::card_lockup();
+    fn the_cards_dimensions_are_the_designs() {
+        assert_eq!(BUTTON_H, 46, "design D 1.7's buttons are 46 px");
+        assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H);
+        assert_eq!(WIDTH, 370, "design D 1.7's Save card is 370 wide");
+        assert_eq!(WIDTH, crate::panel_draw::SAVE_W);
+        let lockup = crate::panel_draw::lockup();
         let l = layout();
         assert_eq!(l.mark.h, lockup.mark_h);
-        assert_eq!(l.wordmark.w, lockup.word_w);
-        assert!(
-            l.wordmark.right() < l.close_glyph.x,
-            "the wordmark runs into the header's ✕"
-        );
+        assert_eq!(l.close_glyph.w, 32, "D 1.7's close target is 32 px");
+        assert_eq!(l.tile.w, 42);
+        assert_eq!(l.save.w, l.not_now.w, "*Save* and *Not now* are equal halves");
     }
 
-    /// **The brand lockup is drawn, and it is drawn through the crate's one
-    /// mark painter.** Four cards lost it in porting and it had to be restored
-    /// afterwards.
+    /// **The brand mark is drawn**, through the crate's one mark painter. Four
+    /// cards lost it in porting and it had to be restored afterwards.
     #[test]
-    fn the_card_carries_the_brand_lockup() {
+    fn the_card_carries_the_brand_mark() {
         let (production, discarded) = production();
         assert!(discarded > 0, "control: nothing was cut out of the file");
         let code = code(&production);
         assert!(
-            code.contains("draw_card_lockup("),
-            "the card does not draw the brand lockup. A frameless always-on-top window that \
+            code.contains("draw_mark("),
+            "the card does not draw the brand shield. A frameless always-on-top window that \
              offers to put a password into the user's vault has to say whose window it is"
         );
     }
@@ -2324,7 +2256,7 @@ mod tests {
                  not read"
             );
         }
-        assert_eq!(ROW_CAPTIONS, ["App", "Username", "Password", "Folder"]);
+        assert_eq!(ROW_CAPTIONS, ["Username", "Password"]);
         assert!(
             FOLDER_ROW_TEXT.contains("No folder"),
             "the Folder row no longer states where the item goes"

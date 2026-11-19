@@ -709,16 +709,16 @@ pub static REAL: PickerCalls = PickerCalls {
 /// The card's width, and so the window's. Narrower than
 /// `unlock_prompt::WIDTH`: that card holds a 470px form, this one holds a list
 /// whose longest line is an item name.
-pub const WIDTH: i32 = 380;
+pub const WIDTH: i32 = crate::panel_draw::LIST_W;
 
 /// Content inset, and the top margin.
 const MARGIN_X: i32 = 16;
-const MARGIN_TOP: i32 = 16;
+const MARGIN_TOP: i32 = crate::panel_draw::HEADER_PAD_TOP;
 
 /// One row. Tall enough for a name over a username, and for a square icon
 /// gutter beside them -- [`crate::win32_draw::draw_row`] takes the gutter to
 /// be the row's own height, so this is also the icon column's width.
-const ROW_H: i32 = 44;
+const ROW_H: i32 = 58;
 
 /// **How many CANDIDATES the card has room for.**
 ///
@@ -743,7 +743,7 @@ pub const ROW_CAP: usize = 5;
 pub const LIST_ROWS: usize = ROW_CAP + 1;
 
 /// Button height. `theme::BUTTON_HEIGHT`.
-const BUTTON_H: i32 = 32;
+const BUTTON_H: i32 = crate::panel_draw::BUTTON_H;
 
 /// The search box's height. `theme::SEARCH_FIELD_HEIGHT` -- design 2b's search
 /// box, which is deliberately shorter than a form field, and this is the same
@@ -779,7 +779,7 @@ const FIELD_PAD_X: i32 = 10;
 /// shape. The halo is one larger so its outer edge stays concentric with the
 /// border it surrounds rather than cutting across it, which is exactly the
 /// relationship the footer buttons' ring already has to their 8.
-const FIELD_RADIUS: i32 = 8;
+const FIELD_RADIUS: i32 = 12;
 const FIELD_RING_RADIUS: i32 = FIELD_RADIUS + 1;
 
 /// How far the focus halo stands outside the field it surrounds.
@@ -797,30 +797,43 @@ const FOCUS_RING_W: i32 = 2;
 /// slot the overflow notice holds here -- see [`search_overflow_label`].
 pub const SEARCH_CAP: usize = ROW_CAP;
 
-/// The *New login* / *Edit binding* button's width: its label, and room for
-/// the [`NEW_LOGIN_SHORTCUT`] chip beside it. See [`layout`].
-///
-/// **Left where it was when the chip was `CTRL+ALT+N`**, which is now a bare
-/// `N`. The width is therefore slack rather than tight, and slack is the safe
-/// direction: `draw_button_with_shortcut` centres the label in what the chip
-/// leaves, and *Edit binding* -- the longer of the two labels this button
-/// carries -- is sized against this same number. Narrowing it to fit the
-/// shorter chip would be re-deriving a width for a label that did not change.
-const SECONDARY_W: i32 = 168;
+/// The footer's gap between its two equal buttons (design D 1.5: `gap 8`).
+const FOOTER_GAP: i32 = crate::panel_draw::BUTTON_GAP;
 
-/// The *Cancel* button's width: its label, and room for the [`ESC_SHORTCUT`]
-/// chip beside it, the same relationship [`SECONDARY_W`] has to
-/// [`NEW_LOGIN_SHORTCUT`]. Wider than the bare-label 84 px it used to be --
-/// `ESC` is a short chip, so it did not need much of an increase, but a chip
-/// drawn into a button never widened for it is a chip drawn over its own
-/// label. Unchanged by the move to bare keys: `ESC` was never a chord and is
-/// still `ESC`. At the bare-label 84 px there was 86 px of slack
-/// between the footer pair and the card's left margin, so this 20 px went into
-/// slack the card already had: with [`SECONDARY_W`] beside it the pair now
-/// starts 66 px inside [`MARGIN_X`], and both buttons are still on screen --
-/// see `nothing_the_card_lays_out_falls_off_the_bottom_of_it`, which pins that
-/// against `MARGIN_X` rather than against the window's edge.
-const CANCEL_W: i32 = 104;
+/// The gap between the header and the title under it, and the title block's
+/// own line heights.
+const TITLE_GAP: i32 = 12;
+const TITLE_H: i32 = 24;
+const SUBTITLE_H: i32 = 20;
+
+/// The most key-hint lines any mode prints; the tooltip's box is sized for it.
+pub const TIP_LINES_MAX: usize = 6;
+
+/// What the `?` tooltip says in the first step: the keys this card answers.
+pub const LIST_KEY_HINTS: [&str; 6] = [
+    "\u{2191} \u{2193} choose an account",
+    "Enter fill",
+    "1-5 fill that row",
+    "S search the vault",
+    "N new login",
+    "Esc close",
+];
+/// The second step's (a field to type).
+pub const PALETTE_KEY_HINTS: [&str; 5] = [
+    "\u{2191} \u{2193} choose a field",
+    "Enter type it",
+    "1-5 type that row",
+    "B edit binding",
+    "Esc close",
+];
+/// Search mode's. A bare digit would be typed into the box, so the digits wear
+/// `Ctrl`.
+pub const SEARCH_KEY_HINTS: [&str; 4] = [
+    "\u{2191} \u{2193} choose a result",
+    "Enter fill",
+    "Ctrl+1-5 fill that result",
+    "Esc close",
+];
 
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -857,6 +870,9 @@ pub struct Layout {
     /// window's -- see [`crate::win32_draw::draw_card_lockup`].
     pub mark: Box2,
     pub wordmark: Box2,
+    /// The `?` badge on the lockup's line, and the key-hint tooltip it opens.
+    pub help: Box2,
+    pub tip: Box2,
     pub title: Box2,
     pub subtitle: Box2,
     /// **The one bordered container**, and the only rectangle on this card
@@ -926,14 +942,36 @@ pub fn layout(rows: usize) -> Layout {
 pub fn layout_for(rows: usize, search: bool) -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
-    let lockup = crate::win32_draw::card_lockup();
+    let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
         Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
+    let close = crate::panel_draw::CLOSE;
+    let close_glyph = Box2 {
+        x: WIDTH - MARGIN_X - close,
+        y: mark.y + (mark.h - close) / 2,
+        w: close,
+        h: close,
+    };
+    let badge = crate::panel_draw::HELP;
+    let help = Box2 {
+        x: close_glyph.x - crate::panel_draw::BUTTON_GAP - badge,
+        y: mark.y + (mark.h - badge) / 2,
+        w: badge,
+        h: badge,
+    };
+    // Sized for the longest list of keys any mode prints; a mode with fewer
+    // draws fewer lines in the same box.
+    let (tx, ty, tw, th) = crate::panel_draw::tip_box(
+        (help.x, help.y, help.right(), help.bottom()),
+        WIDTH,
+        TIP_LINES_MAX,
+    );
+    let tip = Box2 { x: tx, y: ty, w: tw, h: th };
 
     let title =
-        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w, h: 21 };
-    let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: 17 };
+        Box2 { x: MARGIN_X, y: mark.bottom() + TITLE_GAP, w: content_w, h: TITLE_H };
+    let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: SUBTITLE_H };
 
     // **The field starts where the list used to**, and in search mode its
     // first element is the search box rather than the first row. The box no
@@ -949,26 +987,22 @@ pub fn layout_for(rows: usize, search: bool) -> Layout {
     let field =
         Box2 { x: MARGIN_X, y: field_y, w: content_w, h: list.bottom() - field_y };
 
-    // Right-aligned, Cancel outermost: the choice that does nothing sits where
-    // the eye leaves the card.
+    // Two equal halves (design D 1.5), the card's own offer on the left and the
+    // choice that does nothing on the right, where the eye leaves the card.
+    let half = (content_w - FOOTER_GAP) / 2;
+    let footer_y = list.bottom() + 12;
+    let secondary = Box2 { x: MARGIN_X, y: footer_y, w: half, h: BUTTON_H };
     let cancel =
-        Box2 { x: MARGIN_X + content_w - CANCEL_W, y: list.bottom() + 12, w: CANCEL_W, h: BUTTON_H };
-    // Wider than Cancel because it carries its shortcut inside itself, the way
-    // `theme::toolbar_button_with_shortcut` does: the label, then the chip,
-    // in one pill that is clickable over the whole of it.
-    let secondary =
-        Box2 { x: cancel.x - 10 - SECONDARY_W, y: cancel.y, w: SECONDARY_W, h: BUTTON_H };
+        Box2 { x: MARGIN_X + content_w - half, y: footer_y, w: half, h: BUTTON_H };
 
     let window = Box2 { x: 0, y: 0, w: WIDTH, h: cancel.bottom() + MARGIN_TOP };
-    // The ✕ moves up onto the lockup's line, which is where every card header
-    // in the design carries it -- and where it has to be now that the title is
-    // no longer the top line.
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
 
     Layout {
         window,
         mark,
         wordmark,
+        help,
+        tip,
         title,
         subtitle,
         field,
@@ -1495,9 +1529,8 @@ mod win32 {
     /// whole-file hash of `Cargo.toml`.
     const EN_CHANGE: u32 = 0x0300;
 
-    use crate::win32_draw::{
-        draw_button_with_shortcut, draw_row, draw_text, rgb, ButtonSkin, RowState,
-    };
+    use crate::panel_draw::{self, PanelButton};
+    use crate::win32_draw::{draw_button_with_shortcut, draw_text, rgb};
 
     /// Row `i` is control `ID_ROW + i`; the footer's two ids sit below them
     /// all, so a row id can never collide with a button id however many rows
@@ -1594,15 +1627,22 @@ mod win32 {
     /// Every face the card paints with, created at open and destroyed at
     /// close. Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
-        /// The lockup's wordmark: `theme::CARD_HEADER_WORD_PX` in the bold
-        /// cut, which is what `theme::card_header` letterspaces "DESKWARDEN"
-        /// in.
+        /// The wordmark: "Deskwarden" at 15/800 (design D 1.3).
         brand: HFONT,
+        /// The heading pair: 17/800 over 14.
         title: HFONT,
         subtitle: HFONT,
+        /// A row's bold line (16/700) and its faint one (14), the tile's
+        /// initials (14/700) and the `Enter` badge (13/700).
         name: HFONT,
         username: HFONT,
+        avatar: HFONT,
+        badge: HFONT,
+        /// The footer buttons' and the empty offers' face, 15/700.
         button: HFONT,
+        /// The `?` badge (12/800) and its tooltip (14).
+        help: HFONT,
+        tip: HFONT,
         /// The search box's face. The app's regular cut at the size a row's
         /// name is set in, so what the user types reads as the same kind of
         /// text as the rows it filters.
@@ -1626,15 +1666,19 @@ mod win32 {
 
     impl Fonts {
         fn build() -> Self {
-            use crate::theme::{BOLD, REGULAR, SEMIBOLD};
+            use crate::theme::{BOLD, EXTRABOLD, REGULAR};
             Fonts {
-                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
-                title: font(BOLD, 15),
-                subtitle: font(REGULAR, 12),
-                name: font(SEMIBOLD, 13),
-                username: font(REGULAR, 11),
-                button: font(SEMIBOLD, 12),
-                field: font(REGULAR, 13),
+                brand: font(EXTRABOLD, panel_draw::WORD_PX),
+                title: font(EXTRABOLD, panel_draw::SAVE_TITLE_PX),
+                subtitle: font(REGULAR, panel_draw::ROW_SUB_PX),
+                name: font(BOLD, panel_draw::ROW_NAME_PX),
+                username: font(REGULAR, panel_draw::ROW_SUB_PX),
+                avatar: font(BOLD, panel_draw::ROW_SUB_PX),
+                badge: font(BOLD, panel_draw::BADGE_PX),
+                button: font(BOLD, panel_draw::BUTTON_PX),
+                help: font(EXTRABOLD, panel_draw::PILL_PX),
+                tip: font(REGULAR, panel_draw::TIP_PX),
+                field: font(REGULAR, panel_draw::BODY_PX),
                 hint: mono(crate::theme::CHIP_TEXT_PX as i32),
             }
         }
@@ -1647,7 +1691,11 @@ mod win32 {
                     self.subtitle,
                     self.name,
                     self.username,
+                    self.avatar,
+                    self.badge,
                     self.button,
+                    self.help,
+                    self.tip,
                     self.field,
                     self.hint,
                 ] {
@@ -1736,17 +1784,7 @@ mod win32 {
         }
     }
 
-    /// **A row's icon gutter**: the square `win32_draw::draw_row` leaves blank
-    /// on the left, which it takes to be the row's own height.
-    ///
-    /// Derived here once because both lists draw into it -- the first step a
-    /// favicon, the second a field mark -- and the two lining up is the whole
-    /// of what was asked for.
-    fn gutter_of(rect: RECT) -> RECT {
-        RECT { right: rect.left + (rect.bottom - rect.top), ..rect }
-    }
-
-    /// Blends one icon into the row's gutter, centred and square.
+    /// Blends one icon into a row's tile, centred and square.
     fn draw_icon(hdc: HDC, gutter: RECT, icon: &Icon) {
         unsafe {
             let side = scale(ICON_SIDE);
@@ -2059,6 +2097,17 @@ mod win32 {
         )
         .is_none()
         {
+            return abandon(window);
+        }
+
+        // The key-hint tooltip, created last so it is the topmost child, and
+        // hidden until the pointer is on the `?`.
+        let Some(tip_font) = FONTS.lock().ok().and_then(|guard| guard.as_ref().map(|f| f.tip))
+        else {
+            return abandon(window);
+        };
+        panel_draw::set_tip(tip_font, &tip_lines(), DPI_PERCENT.load(Ordering::SeqCst));
+        if !panel_draw::create_tip(window, dev(l.tip)) {
             return abandon(window);
         }
 
@@ -2655,7 +2704,14 @@ mod win32 {
                 let _ = ShowWindow(control, if search { SW_SHOW } else { SW_HIDE });
             }
             place(window, ID_SECONDARY, l.secondary);
-            place(window, ID_CANCEL, l.cancel);
+            place(window, ID_CANCEL, cancel_box());
+            let (tip_font, scale_now) = (
+                FONTS.lock().ok().and_then(|g| g.as_ref().map(|f| f.tip)),
+                DPI_PERCENT.load(Ordering::SeqCst),
+            );
+            if let Some(tip_font) = tip_font {
+                panel_draw::set_tip(tip_font, &tip_lines(), scale_now);
+            }
             for index in 0..LIST_ROWS {
                 place(window, ID_ROW + index, super::row_at_for(rows, search, index));
                 if let Ok(control) = GetDlgItem(window, (ID_ROW + index) as i32) {
@@ -2690,6 +2746,44 @@ mod win32 {
             }
         }
         repaint(window);
+    }
+
+    /// **The *Cancel* button's rectangle in the mode showing.** Half the footer
+    /// beside the card's own offer, and the whole footer on the empty card,
+    /// whose footer is Cancel alone -- an offer hidden beside it would leave a
+    /// button hanging off the right half of a card with nothing to its left.
+    fn cancel_box() -> Box2 {
+        let l = card();
+        if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
+            Box2 { x: l.secondary.x, w: l.cancel.right() - l.secondary.x, ..l.cancel }
+        } else {
+            l.cancel
+        }
+    }
+
+    /// The keys the `?` tooltip lists in the mode showing.
+    fn tip_lines() -> Vec<&'static str> {
+        match MODE.load(Ordering::SeqCst) {
+            MODE_PALETTE => super::PALETTE_KEY_HINTS.to_vec(),
+            MODE_SEARCH => super::SEARCH_KEY_HINTS.to_vec(),
+            _ => super::LIST_KEY_HINTS.to_vec(),
+        }
+    }
+
+    /// Whether the card shows a `?`: every mode but the empty one, whose two
+    /// offers are buttons that say their own keys.
+    fn has_help() -> bool {
+        MODE.load(Ordering::SeqCst) != MODE_EMPTY
+    }
+
+    /// The `?` badge's rect in DEVICE pixels.
+    fn help_rect() -> RECT {
+        dev(card().help)
+    }
+
+    /// A logical rectangle in DEVICE pixels.
+    fn dev(b: Box2) -> RECT {
+        RECT { left: scale(b.x), top: scale(b.y), right: scale(b.right()), bottom: scale(b.bottom()) }
     }
 
     /// Moves one control to a **logical** rectangle, scaling it as
@@ -2749,6 +2843,7 @@ mod win32 {
         unsafe {
             let _ = DestroyWindow(hwnd(window.0));
         }
+        panel_draw::clear_tip();
         if let Ok(mut slot) = FONTS.lock() {
             if let Some(fonts) = slot.take() {
                 fonts.destroy();
@@ -2955,6 +3050,17 @@ mod win32 {
                 if HOVERED.swap(0, Ordering::SeqCst) != 0 {
                     repaint(window);
                 }
+                // The `?` badge is painted by this window, so its hover is
+                // decided here.
+                let x = (lparam.0 & 0xffff) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                let on_badge =
+                    has_help() && crate::win32_draw::on_close_glyph(x, y, help_rect());
+                panel_draw::help_pointer(window, on_badge);
+                LRESULT(0)
+            }
+            panel_draw::WM_MOUSELEAVE => {
+                panel_draw::set_help(window, false);
                 LRESULT(0)
             }
             WM_COMMAND => {
@@ -3097,6 +3203,8 @@ mod win32 {
                 if HOVERED.swap(id, Ordering::SeqCst) != id {
                     repaint(control);
                 }
+                // A row or a button under the pointer is not the `?` badge.
+                panel_draw::help_pointer_left_badge(control);
                 LRESULT(0)
             }
             _ => {
@@ -3163,76 +3271,70 @@ mod win32 {
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
-            fill(mem, client, crate::theme::WINDOW_BG);
+            // The window IS the panel: white, as design 1b draws it.
+            fill(mem, client, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
             let l = card();
 
-            // **One field, and it is the only border on the card.** The rows
-            // sit on it -- so a row's own white reads as part of one surface
-            // rather than as five floating strips -- and in search mode the
-            // `EDIT` sits on it too, at the top, with no box of its own. That
-            // is what was asked for: "no border for those matching elements
-            // (item + search) but they both inside of same field".
+            // **Search mode is the one mode with a container.** The search box
+            // and the rows it filters are elements of one bordered field, as the
+            // owner asked ("no border for those matching elements (item +
+            // search) but they both inside of same field"); the design's list
+            // is bare rows on white, so the other modes draw no field at all.
             //
-            // **Focus is shown on the field, in the design's own vocabulary.**
-            // Taking the input's border away would otherwise take its focus
-            // indication with it, so the indication moves outward onto the
-            // container the input is an element of: `theme::FOCUS_RING` as a
-            // halo standing `FOCUS_RING_W` outside the edge, and the edge
-            // itself in `theme::BLUE`. That is the same pair `paint_control`
-            // draws around a focused footer button and the same pair
-            // `unlock_prompt` draws around its password field -- nothing new
-            // is invented here.
-            let search_focused = l.search.is_some()
-                && GetDlgItem(window, ID_SEARCH as i32)
+            // Focus is shown on the field, in the design's own vocabulary:
+            // `theme::FOCUS_RING` as a halo standing `FOCUS_RING_W` outside the
+            // edge, and the edge itself in `theme::BLUE`.
+            if l.search.is_some() {
+                let search_focused = GetDlgItem(window, ID_SEARCH as i32)
                     .map(|control| GetFocus() == control)
                     .unwrap_or(false);
-            if search_focused {
+                if search_focused {
+                    rounded(
+                        mem,
+                        Box2 {
+                            x: l.field.x - FOCUS_RING_W,
+                            y: l.field.y - FOCUS_RING_W,
+                            w: l.field.w + 2 * FOCUS_RING_W,
+                            h: l.field.h + 2 * FOCUS_RING_W,
+                        },
+                        FIELD_RING_RADIUS,
+                        crate::theme::FOCUS_RING,
+                        None,
+                    );
+                }
                 rounded(
                     mem,
-                    Box2 {
-                        x: l.field.x - FOCUS_RING_W,
-                        y: l.field.y - FOCUS_RING_W,
-                        w: l.field.w + 2 * FOCUS_RING_W,
-                        h: l.field.h + 2 * FOCUS_RING_W,
-                    },
-                    FIELD_RING_RADIUS,
-                    crate::theme::FOCUS_RING,
-                    None,
+                    l.field,
+                    FIELD_RADIUS,
+                    crate::theme::CARD,
+                    Some((
+                        1,
+                        if search_focused { crate::theme::BLUE } else { crate::theme::HAIRLINE },
+                    )),
                 );
-            }
-            rounded(
-                mem,
-                l.field,
-                FIELD_RADIUS,
-                crate::theme::CARD,
-                Some((
-                    1,
-                    if search_focused { crate::theme::BLUE } else { crate::theme::HAIRLINE },
-                )),
-            );
-
-            // **The hairline between the two elements**, drawn inside the
-            // search box's own slot rather than at the first row's top edge:
-            // the rows are child windows painted over this surface, so a line
-            // on their side of the boundary would simply be covered. It is
-            // `theme::HAIRLINE`, the same value the field's own edge is drawn
-            // in -- a separator within one field, not a border around either
-            // half of it.
-            if let Some(box2) = l.search {
-                rounded(
-                    mem,
-                    Box2 { x: box2.x, y: box2.bottom() - 1, w: box2.w, h: 1 },
-                    0,
-                    crate::theme::HAIRLINE,
-                    None,
-                );
+                // **The hairline between the two elements**, drawn inside the
+                // search box's own slot rather than at the first row's top edge:
+                // the rows are child windows painted over this surface, so a
+                // line on their side of the boundary would simply be covered.
+                if let Some(box2) = l.search {
+                    rounded(
+                        mem,
+                        Box2 { x: box2.x, y: box2.bottom() - 1, w: box2.w, h: 1 },
+                        0,
+                        crate::theme::HAIRLINE,
+                        None,
+                    );
+                }
             }
 
             if let Some(fonts) = fonts {
                 let (title_run, subtitle_run) = headings();
                 paint_lockup(mem, &l, fonts.brand);
+                if has_help() {
+                    panel_draw::draw_help_badge(mem, dev(l.help), fonts.help, panel_draw::help_hot());
+                }
                 text(mem, fonts.title, l.title, &title_run, crate::theme::INK);
                 text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::theme::TEXT_FAINT);
             }
@@ -3279,22 +3381,14 @@ mod win32 {
                     // by Tab as readily as by the pointer, and a focused row
                     // with no mark on it is a keyboard user pressing Enter on
                     // a card that never said which account they were on.
-                    paint_row(
-                        mem,
-                        whole,
-                        id - ID_ROW,
-                        RowState { selected: focused, hovered },
-                        fonts,
-                    );
+                    paint_row(mem, whole, id - ID_ROW, focused, hovered, fonts);
                 }
             } else {
-                // The footer sits on the window's own background, not on the
-                // card -- otherwise the button's rounded corners show system
-                // grey through them.
-                fill(mem, whole, crate::theme::WINDOW_BG);
+                // The footer sits on the panel's white, which is also what the
+                // button's rounded corners show through.
+                fill(mem, whole, crate::theme::CARD);
                 SetBkMode(mem, TRANSPARENT);
-                let skin =
-                    if hovered { ButtonSkin::secondary().hovered() } else { ButtonSkin::secondary() };
+                let skin = panel_draw::skin(PanelButton::Outline, hovered);
                 if let Some(fonts) = fonts {
                     let label = footer_label(id);
                     // *Cancel* always shows `ESC` -- Escape cancels the card
@@ -3336,11 +3430,11 @@ mod win32 {
                         // logical size independently, so nothing has to divide
                         // device pixels back down and round badly doing it.
                         let l = card();
-                        let button = if id == ID_CANCEL { l.cancel } else { l.secondary };
+                        let button = if id == ID_CANCEL { cancel_box() } else { l.secondary };
                         rounded(
                             mem,
                             Box2 { x: 0, y: 0, w: button.w, h: button.h },
-                            8,
+                            panel_draw::BUTTON_RADIUS + 1,
                             crate::theme::FOCUS_RING,
                             None,
                         );
@@ -3351,11 +3445,25 @@ mod win32 {
                             bottom: whole.bottom - 2,
                         };
                         draw_button_with_shortcut(
-                            mem, inner, &label, fonts.button, skin, scale(7), hint, dpi,
+                            mem,
+                            inner,
+                            &label,
+                            fonts.button,
+                            skin,
+                            scale(panel_draw::BUTTON_RADIUS),
+                            hint,
+                            dpi,
                         );
                     } else {
                         draw_button_with_shortcut(
-                            mem, whole, &label, fonts.button, skin, scale(7), hint, dpi,
+                            mem,
+                            whole,
+                            &label,
+                            fonts.button,
+                            skin,
+                            scale(panel_draw::BUTTON_RADIUS),
+                            hint,
+                            dpi,
                         );
                     }
                 }
@@ -3408,12 +3516,29 @@ mod win32 {
 
     /// One row, in whichever step is showing.
     ///
-    /// Both steps go through [`crate::win32_draw::draw_row`] rather than one
-    /// of them growing its own painter: the edge-to-edge highlight is the
-    /// property that function exists to hold, and a second row painter is a
-    /// second place for it to be got wrong.
-    fn paint_row(hdc: HDC, rect: RECT, index: usize, state: RowState, fonts: &Fonts) {
+    /// Every step's rows go through [`panel_draw::draw_account_row`] rather than
+    /// one of them growing its own painter: the edge-to-edge wash and the
+    /// `Enter` badge are the properties that function exists to hold, and a
+    /// second row painter is a second place for them to be got wrong. The one
+    /// exception is the empty card, whose two offers are the design's buttons.
+    fn paint_row(hdc: HDC, rect: RECT, index: usize, focused: bool, hovered: bool, fonts: &Fonts) {
         let dpi = DPI_PERCENT.load(Ordering::SeqCst);
+        let faces = panel_draw::RowFonts {
+            name: fonts.name,
+            sub: fonts.username,
+            avatar: fonts.avatar,
+            badge: fonts.badge,
+            chip: fonts.hint,
+        };
+        let look = |tile, name: &str, sub: &str, selected: bool, chip: Option<&str>| {
+            panel_draw::draw_account_row(
+                hdc,
+                rect,
+                panel_draw::RowLook { tile, name, sub, selected, hovered, chip },
+                &faces,
+                dpi,
+            )
+        };
         if MODE.load(Ordering::SeqCst) == MODE_SEARCH {
             let shown = SEARCH_SHOWN.lock().map(|s| s.clone()).unwrap_or_default();
             let total = SEARCH_TOTAL.load(Ordering::SeqCst).max(0) as usize;
@@ -3434,28 +3559,26 @@ mod win32 {
                     //
                     // Up/Down and Enter are untouched, and the highlight is
                     // still how the card says which result they are on; focus
-                    // cannot say it, because focus is in the `EDIT`.
-                    let state = RowState {
-                        // Focus still counts: Tab can take the keyboard out of
-                        // the box and onto a row, and a focused row with no
-                        // mark on it is the defect the other modes draw
-                        // selection-from-focus to avoid.
-                        selected: state.selected
-                            || SEARCH_SEL.load(Ordering::SeqCst) == at as isize,
-                        hovered: state.hovered,
-                    };
+                    // cannot say it, because focus is in the `EDIT`. Focus still
+                    // counts: Tab can take the keyboard out of the box and onto
+                    // a row, and a focused row with no mark on it is the defect
+                    // the other modes draw selection-from-focus to avoid.
+                    let selected = focused || SEARCH_SEL.load(Ordering::SeqCst) == at as isize;
                     let shortcut = super::search_shortcut(at, shown.len());
-                    let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
-                    draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, hint, dpi);
+                    look(
+                        panel_draw::Tile::Initials(&candidate.name, at),
+                        &candidate.name,
+                        &candidate.username,
+                        selected,
+                        shortcut.as_deref(),
+                    );
                 }
                 // **No chip on either.** Neither is an account, and a number on
                 // one would be a trap -- the same rule the *Search the vault*
                 // row is drawn under.
                 SearchRow::Overflow { .. } | SearchRow::Nothing => {
                     let (name, says) = super::search_row_text(row);
-                    let row =
-                        Candidate { id: String::new(), name, username: says };
-                    draw_row(hdc, rect, &row, state, fonts.name, fonts.username, None, dpi);
+                    look(panel_draw::Tile::None, &name, &says, focused, None);
                 }
             }
             return;
@@ -3464,16 +3587,50 @@ mod win32 {
             let Some(action) = super::empty_rows().get(index).copied() else {
                 return;
             };
-            let (name, says) = super::empty_label(action);
-            let row =
-                Candidate { id: String::new(), name: name.to_string(), username: says.to_string() };
+            let (name, _says) = super::empty_label(action);
             // The empty card's two offers answer the two letter keys -- see
-            // `new_login_control` and `search_control` -- so they say so.
-            let hint = match action {
-                EmptyAction::NewLogin => Some((NEW_LOGIN_SHORTCUT, fonts.hint)),
-                EmptyAction::SearchVault => Some((SEARCH_SHORTCUT, fonts.hint)),
+            // `new_login_control` and `search_control` -- so they say so. They
+            // are the design's two buttons (D 1.5): the primary is the offer
+            // the card exists for, and the other is outlined.
+            let (kind, key) = match action {
+                EmptyAction::NewLogin => (PanelButton::Primary, NEW_LOGIN_SHORTCUT),
+                EmptyAction::SearchVault => (PanelButton::Outline, SEARCH_SHORTCUT),
             };
-            draw_row(hdc, rect, &row, state, fonts.name, fonts.username, hint, dpi);
+            let height = scale(panel_draw::BUTTON_H);
+            let top = rect.top + ((rect.bottom - rect.top) - height) / 2;
+            let button = RECT { top, bottom: top + height, ..rect };
+            if focused {
+                // The keyboard ring, one step outside the button.
+                panel_draw::round_rect(
+                    hdc,
+                    RECT {
+                        left: button.left - scale(2),
+                        top: button.top - scale(2),
+                        right: button.right + scale(2),
+                        bottom: button.bottom + scale(2),
+                    },
+                    scale(panel_draw::BUTTON_RADIUS + 2),
+                    crate::theme::FOCUS_RING,
+                    None,
+                );
+            }
+            let inset = if focused { scale(2) } else { 0 };
+            let button = RECT {
+                left: button.left + inset,
+                top: button.top + inset,
+                right: button.right - inset,
+                bottom: button.bottom - inset,
+            };
+            draw_button_with_shortcut(
+                hdc,
+                button,
+                name,
+                fonts.button,
+                panel_draw::skin(kind, hovered),
+                scale(panel_draw::BUTTON_RADIUS),
+                Some((key, fonts.hint)),
+                dpi,
+            );
             return;
         }
         if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
@@ -3482,19 +3639,13 @@ mod win32 {
                 return;
             };
             let (name, says) = super::send_label(&send);
-            let row = Candidate { id: String::new(), name, username: says.to_string() };
             // **The digit is drawn on the row it runs**, the same chip and the
-            // same painter the first step's candidates carry. It used to say
-            // nothing at all and this step took no digits either; both halves
-            // moved together, so the chip is never a promise `shortcut` does
-            // not keep -- `super::palette_for_digit` is the one rule both read.
+            // same painter the first step's candidates carry --
+            // `super::palette_for_digit` is the one rule both read.
             let shortcut = super::palette_shortcut(index, rows);
-            let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
-            draw_row(hdc, rect, &row, state, fonts.name, fonts.username, hint, dpi);
-            // The gutter `draw_row` leaves blank -- the same square the step
-            // before blends a favicon into, which is what makes the two lists
-            // line up rather than merely both being lists.
-            crate::win32_draw::draw_field_mark(hdc, gutter_of(rect), super::send_mark(&send), dpi);
+            let tile = look(panel_draw::Tile::Blank, &name, says, focused, shortcut.as_deref());
+            // The tile the row leaves blank: the field's own mark in it.
+            crate::win32_draw::draw_field_mark(hdc, tile, super::send_mark(&send), dpi);
             return;
         }
 
@@ -3504,13 +3655,28 @@ mod win32 {
             // can see is a shortcut nobody uses, and this chip is the only
             // place the card says the digits exist.
             let shortcut = super::row_shortcut(index);
-            let hint = shortcut.as_deref().map(|text| (text, fonts.hint));
-            draw_row(hdc, rect, candidate, state, fonts.name, fonts.username, hint, dpi);
-            // The gutter `draw_row` deliberately leaves blank.
-            if let Ok(icons) = ICONS.lock() {
-                if let Some(Some(icon)) = icons.get(index) {
-                    draw_icon(hdc, gutter_of(rect), icon);
-                }
+            let icon = ICONS.lock().ok().and_then(|icons| {
+                icons.get(index).and_then(|slot| slot.as_ref().map(|i| (i.bitmap, i.w, i.h)))
+            });
+            // A favicon takes the tile when the row came with one; otherwise the
+            // tile is the account's initials.
+            if let Some((bitmap, w, h)) = icon {
+                let tile = look(
+                    panel_draw::Tile::Blank,
+                    &candidate.name,
+                    &candidate.username,
+                    focused,
+                    shortcut.as_deref(),
+                );
+                draw_icon(hdc, tile, &Icon { bitmap, w, h });
+            } else {
+                look(
+                    panel_draw::Tile::Initials(&candidate.name, index),
+                    &candidate.name,
+                    &candidate.username,
+                    focused,
+                    shortcut.as_deref(),
+                );
             }
             return;
         }
@@ -3518,59 +3684,24 @@ mod win32 {
         // candidates. Its second line is the only place a truncated list is
         // told it was truncated -- see `super::search_row_label`.
         let (name, says) = super::search_row_label(TRUNCATED.load(Ordering::SeqCst));
-        let row = Candidate {
-            id: String::new(),
-            name: name.to_string(),
-            username: says.to_string(),
-        };
         // **`S`, and never a number.** A digit on this row would be a trap --
         // it is the one row that is not an account, and `candidate_for_digit`
         // is measured so none can land here. `S` is its own key for its own
         // thing, and `search_control` clicks this very control, so the chip
         // names what the key does rather than describing a second path.
-        draw_row(
-            hdc,
-            rect,
-            &row,
-            state,
-            fonts.name,
-            fonts.username,
-            Some((SEARCH_SHORTCUT, fonts.hint)),
-            dpi,
-        );
+        look(panel_draw::Tile::None, name, says, focused, Some(SEARCH_SHORTCUT));
     }
 
-    /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
-    /// the crate's one mark painter, which `unlock_prompt` also draws through.
-    /// What is this card's own is only the logical-to-device conversion, which
-    /// no other card's `Box2` type can share.
+    /// The brand lockup, through [`panel_draw::draw_lockup`] -- which every
+    /// panel card draws through.
     fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
-        let dev = |b: Box2| RECT {
-            left: scale(b.x),
-            top: scale(b.y),
-            right: scale(b.right()),
-            bottom: scale(b.bottom()),
-        };
-        let tracking = scale(crate::win32_draw::card_lockup().tracking);
-        crate::win32_draw::draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
+        panel_draw::draw_lockup(hdc, dev(l.mark), dev(l.wordmark), font);
     }
 
     /// The header's close glyph, drawn as two strokes because no bundled face
     /// has it at this weight.
     fn paint_close_glyph(hdc: HDC, at: Box2) {
-        unsafe {
-            use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::theme::TEXT_FAINT));
-            let old = SelectObject(hdc, pen);
-            let (x, y, w, h) = (scale(at.x), scale(at.y), scale(at.w), scale(at.h));
-            let pad = w / 3;
-            let _ = MoveToEx(hdc, x + pad, y + pad, None);
-            let _ = LineTo(hdc, x + w - pad, y + h - pad);
-            let _ = MoveToEx(hdc, x + w - pad, y + pad, None);
-            let _ = LineTo(hdc, x + pad, y + h - pad);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(pen);
-        }
+        panel_draw::draw_close_x(hdc, dev(at), scale(1).max(1), crate::theme::TEXT_FAINT);
     }
 
     fn fill(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {
@@ -3872,7 +4003,7 @@ mod card_tests {
         // this card now carries again. Pinned to the new truth rather than
         // loosened: the card grew by the lockup's height plus its gap, and the
         // window's own height assertions below are what hold that honest.
-        let lockup = crate::win32_draw::card_lockup();
+        let lockup = crate::panel_draw::lockup();
         assert_eq!(
             (l.mark.x, l.mark.y),
             (MARGIN_X, MARGIN_TOP),
@@ -3887,10 +4018,17 @@ mod card_tests {
         );
         assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
         assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
+        assert!(l.wordmark.right() <= l.help.x, "the wordmark runs under the `?` badge");
+        assert!(l.help.right() < l.close_glyph.x, "the `?` badge touches the ✕");
         assert!(
-            l.wordmark.right() <= l.close_glyph.x,
-            "the wordmark runs under the ✕"
+            l.tip.right() <= l.help.x && l.tip.bottom() <= l.window.bottom(),
+            "the key-hint tooltip is not inside the card, to the left of its badge"
         );
+        assert_eq!(l.tip.h, crate::panel_draw::tip_height(TIP_LINES_MAX));
+        for lines in [&LIST_KEY_HINTS[..], &PALETTE_KEY_HINTS[..], &SEARCH_KEY_HINTS[..]] {
+            assert!(lines.len() <= TIP_LINES_MAX, "a mode lists more keys than the tooltip holds");
+            assert!(lines.last().unwrap().starts_with("Esc"));
+        }
         assert!(
             l.wordmark.bottom() <= l.title.y,
             "the card's title runs into the brand lockup above it"
@@ -4242,7 +4380,7 @@ mod card_tests {
             "the card's search box has grown a height of its own, so a redesign of design 2b's \
              search box would leave this one behind"
         );
-        assert_eq!(BUTTON_H as f32, crate::theme::BUTTON_HEIGHT);
+        assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H);
     }
 
     /// The field's own numbers are the card's existing ones, not new ones.

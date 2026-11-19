@@ -1439,7 +1439,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 93] = [
+        const OPENS_NO_WINDOW: [&str; 94] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1782,6 +1782,10 @@ mod tests {
             // own; whatever HWND it draws into was already created by its
             // caller.
             "win32_draw",
+            // The v2 autofill panel kit (slice 11): geometry, painters and
+            // the done check's animation curves, all drawn into a device
+            // context a card already owns. It creates no window.
+            "panel_draw",
             // **Judgement call, recorded rather than assumed** -- the same
             // shape as `file_picker`'s above, and the harder of the two.
             //

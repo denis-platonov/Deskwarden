@@ -261,17 +261,17 @@ pub static REAL: NoticeCalls = NoticeCalls {
 
 /// The card's width: `crate::prompt_card::WIDTH`, the width every daemon card
 /// in this family is.
-pub const WIDTH: i32 = crate::prompt_card::WIDTH;
+pub const WIDTH: i32 = crate::panel_draw::CARD_W;
 
-const MARGIN_X: i32 = 16;
-const MARGIN_TOP: i32 = 16;
+const MARGIN_X: i32 = crate::panel_draw::PAD;
+const MARGIN_TOP: i32 = crate::panel_draw::PAD;
 
 /// The body well's padding around its text.
 const BODY_PAD_X: i32 = 12;
 const BODY_PAD_Y: i32 = 10;
 
 /// One line of body text, at 100%, in the body's 13 px face.
-pub const BODY_LINE_H: i32 = 18;
+pub const BODY_LINE_H: i32 = 20;
 
 /// The fewest lines the body is sized for, and the most. Every refusal this
 /// app writes fits in five; past eight the text is cut at a whole line
@@ -280,11 +280,11 @@ pub const MIN_BODY_LINES: i32 = 1;
 pub const MAX_BODY_LINES: i32 = 8;
 
 /// Button height: `crate::theme::BUTTON_HEIGHT`.
-const BUTTON_H: i32 = 32;
+const BUTTON_H: i32 = crate::panel_draw::BUTTON_H;
 
 /// The *OK* button's width: the word and its `ENTER` chip, with the padding a
 /// pill needs.
-const OK_W: i32 = 108;
+const OK_W: i32 = 140;
 
 /// Every rectangle the card paints, computed once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -329,13 +329,23 @@ pub fn layout(body_text_h: i32) -> Layout {
         body_text_h.clamp(MIN_BODY_LINES * BODY_LINE_H, MAX_BODY_LINES * BODY_LINE_H);
     let content_w = WIDTH - 2 * MARGIN_X;
 
-    let lockup = crate::win32_draw::card_lockup();
+    let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
         Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
-    let title =
-        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w - 24, h: 20 };
+    let close = crate::panel_draw::CLOSE;
+    let close_glyph = Box2 {
+        x: WIDTH - MARGIN_X - close,
+        y: mark.y + (mark.h - close) / 2,
+        w: close,
+        h: close,
+    };
+    let title = Box2 {
+        x: MARGIN_X,
+        y: mark.bottom() + crate::panel_draw::BLOCK_GAP,
+        w: content_w - 24,
+        h: 26,
+    };
     let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
 
     let body = Box2 {
@@ -371,6 +381,70 @@ pub fn layout(body_text_h: i32) -> Layout {
         footer,
         ok,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The done check (design D 1.4)
+// ---------------------------------------------------------------------------
+
+/// Which confirmation the done card shows. The design's three (D 1.4's
+/// `doneText`), with the one fabricated detail -- "in 1.2 s" -- left out: no
+/// timer here knows how long a fill took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DoneCase {
+    /// A login was saved from the save-a-login card.
+    Saved,
+    /// A password was changed and kept.
+    Updated,
+    /// A fill went through.
+    SignedIn,
+}
+
+/// The title and subtitle for `case` (D 1.4).
+pub fn done_copy(case: DoneCase) -> (&'static str, &'static str) {
+    match case {
+        DoneCase::Saved => ("Login saved", "Deskwarden fills it next time"),
+        DoneCase::Updated => ("Password updated", "Saved to your vault"),
+        DoneCase::SignedIn => ("Signed in", "Filled by Deskwarden"),
+    }
+}
+
+/// The done card's width: the design's overlay is the host window; this is a
+/// card of its own, as wide as the disc and the longest subtitle need.
+pub const DONE_WIDTH: i32 = 320;
+const DONE_PAD: i32 = 28;
+const DONE_GAP: i32 = 16;
+
+/// Every rectangle the done card paints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DoneLayout {
+    pub window: Box2,
+    /// The disc's centre.
+    pub disc: (i32, i32),
+    pub title: Box2,
+    pub subtitle: Box2,
+}
+
+/// The done card's geometry (D 1.4: a centred column, disc 84, `gap 16`).
+pub fn done_layout() -> DoneLayout {
+    let disc_d = crate::panel_draw::DONE_DISC;
+    let disc = (DONE_WIDTH / 2, DONE_PAD + disc_d / 2);
+    let title = Box2 { x: DONE_PAD, y: DONE_PAD + disc_d + DONE_GAP, w: DONE_WIDTH - 2 * DONE_PAD, h: 32 };
+    let subtitle = Box2 { x: DONE_PAD, y: title.bottom() + 2, w: title.w, h: 22 };
+    let window = Box2 { x: 0, y: 0, w: DONE_WIDTH, h: subtitle.bottom() + DONE_PAD };
+    DoneLayout { window, disc, title, subtitle }
+}
+
+/// **Shows the done check and returns when it has closed** -- about a second
+/// and a half. It runs on the calling thread, which is the daemon thread right
+/// after a save, where nothing is waiting on it; a thread of its own would be a
+/// new entry in `job_object`'s exact `std::thread::spawn` census for a card that
+/// lives 1.5 s. It takes no focus (`WS_EX_NOACTIVATE`), closes itself when the
+/// animation and its hold are over and on any click, and queues behind any card
+/// already up.
+pub fn show_done(case: DoneCase) {
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    win32::run_done(case);
 }
 
 // ---------------------------------------------------------------------------
@@ -421,9 +495,7 @@ mod win32 {
         WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{
-        draw_button_with_shortcut, draw_card_lockup, draw_text, rgb, ButtonSkin,
-    };
+    use crate::win32_draw::{draw_button_with_shortcut, draw_text, rgb};
 
     const ID_OK: usize = 101;
     const CLASS_NAME: PCWSTR = w!("DeskwardenAutofillNoticeCard");
@@ -478,23 +550,36 @@ mod win32 {
         body: HFONT,
         button: HFONT,
         hint: HFONT,
+        /// The done card's title (24/800) and subtitle (15).
+        done_title: HFONT,
+        done_sub: HFONT,
     }
 
     impl Fonts {
         fn build() -> Self {
-            use crate::theme::{BOLD, REGULAR, SEMIBOLD};
+            use crate::theme::{BOLD, EXTRABOLD, REGULAR};
             Fonts {
-                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
-                title: font(BOLD, 14),
-                body: font(REGULAR, 13),
-                button: font(SEMIBOLD, 12),
+                brand: font(EXTRABOLD, crate::panel_draw::WORD_PX),
+                title: font(EXTRABOLD, crate::panel_draw::TITLE_PX),
+                body: font(REGULAR, crate::panel_draw::BODY_PX),
+                button: font(BOLD, crate::panel_draw::BUTTON_PX),
                 hint: mono(crate::theme::CHIP_TEXT_PX as i32),
+                done_title: font(EXTRABOLD, 24),
+                done_sub: font(REGULAR, crate::panel_draw::BODY_PX),
             }
         }
 
         fn destroy(&self) {
             unsafe {
-                for f in [self.brand, self.title, self.body, self.button, self.hint] {
+                for f in [
+                    self.brand,
+                    self.title,
+                    self.body,
+                    self.button,
+                    self.hint,
+                    self.done_title,
+                    self.done_sub,
+                ] {
                     let _ = DeleteObject(f);
                 }
             }
@@ -742,6 +827,163 @@ mod win32 {
         }
     }
 
+    // ---- the done card -------------------------------------------------------
+
+    /// Which confirmation is on screen, if the window up is the done card, and
+    /// how many milliseconds into its life it is.
+    static DONE: Mutex<Option<super::DoneCase>> = Mutex::new(None);
+    static DONE_MS: AtomicI32 = AtomicI32::new(0);
+
+    fn done_active() -> bool {
+        DONE.lock().map(|slot| slot.is_some()).unwrap_or(false)
+    }
+
+    /// **Runs the done card to its end** on the calling thread: opens a
+    /// non-activating topmost card, repaints it every ~16 ms with the
+    /// animation's elapsed time, and closes it when the animation and its hold
+    /// are over, on a click, or when something quits the thread.
+    ///
+    /// It never takes the foreground and never asks for the keyboard, so the
+    /// fill or the save it confirms is not interrupted: no
+    /// `SetForegroundWindow` and no focus here. It shows nothing secret, so it
+    /// is not excluded from capture either.
+    pub(super) fn run_done(case: super::DoneCase) {
+        use windows::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW};
+        crate::win32_draw::register_fonts();
+        GONE.store(false, Ordering::SeqCst);
+        HOVERED.store(0, Ordering::SeqCst);
+        DONE_MS.store(0, Ordering::SeqCst);
+        unsafe {
+            DPI_PERCENT.store(
+                {
+                    let dc = GetDC(None);
+                    let dpi = GetDeviceCaps(dc, LOGPIXELSX);
+                    ReleaseDC(None, dc);
+                    if dpi > 0 {
+                        dpi * 100 / 96
+                    } else {
+                        100
+                    }
+                },
+                Ordering::SeqCst,
+            );
+        }
+        register_class();
+        {
+            let Ok(mut slot) = FONTS.lock() else { return };
+            if let Some(previous) = slot.take() {
+                previous.destroy();
+            }
+            *slot = Some(Fonts::build());
+        }
+        if let Ok(mut slot) = DONE.lock() {
+            *slot = Some(case);
+        }
+
+        let l = super::done_layout();
+        let (w, h) = (scale(l.window.w), scale(l.window.h));
+        let (x, y) = super::place(None, work_area(), w, h);
+        let window = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(WS_EX_TOPMOST.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0),
+                CLASS_NAME,
+                &HSTRING::from(NOTICE_CARD_TITLE),
+                WS_POPUP | WS_VISIBLE,
+                x,
+                y,
+                w,
+                h,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+        let Ok(window) = window else {
+            if let Ok(mut slot) = DONE.lock() {
+                *slot = None;
+            }
+            release();
+            return;
+        };
+        round_corners(window);
+        unsafe {
+            let _ = ShowWindow(window, SW_SHOWNOACTIVATE);
+        }
+
+        let started = std::time::Instant::now();
+        loop {
+            let elapsed = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+            DONE_MS.store(elapsed as i32, Ordering::SeqCst);
+            if GONE.load(Ordering::SeqCst) || elapsed >= crate::panel_draw::DONE_TOTAL_MS {
+                break;
+            }
+            repaint(window);
+            let mut msg = MSG::default();
+            unsafe {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        GONE.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+        }
+        unsafe {
+            let _ = DestroyWindow(window);
+        }
+        if let Ok(mut slot) = DONE.lock() {
+            *slot = None;
+        }
+        release();
+    }
+
+    /// The done card: the disc and its drawn-on check at the animation's
+    /// current time, and the two lines under it.
+    fn paint_done(window: HWND) {
+        use windows::Win32::Foundation::POINT;
+        use windows::Win32::Graphics::Gdi::DT_CENTER;
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(window, &mut ps);
+            let mut client = RECT::default();
+            let _ = GetClientRect(window, &mut client);
+            let (w, h) = (client.right, client.bottom);
+            let mem = CreateCompatibleDC(hdc);
+            let bmp = CreateCompatibleBitmap(hdc, w, h);
+            let old = SelectObject(mem, bmp);
+
+            let guard = FONTS.lock();
+            let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
+            let case = DONE.lock().ok().and_then(|slot| *slot);
+            let l = super::done_layout();
+            fill_rect(mem, client, crate::theme::CARD);
+            SetBkMode(mem, TRANSPARENT);
+            if let (Some(fonts), Some(case)) = (fonts, case) {
+                let (title, subtitle) = super::done_copy(case);
+                let centre = POINT { x: scale(l.disc.0), y: scale(l.disc.1) };
+                crate::panel_draw::draw_done_check(
+                    mem,
+                    centre,
+                    DPI_PERCENT.load(Ordering::SeqCst),
+                    DONE_MS.load(Ordering::SeqCst).max(0) as u32,
+                );
+                let centred = DT_CENTER | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
+                text(mem, fonts.done_title, l.title, title, crate::theme::INK, centred);
+                text(mem, fonts.done_sub, l.subtitle, subtitle, crate::theme::TEXT_MUTED, centred);
+            }
+            drop(guard);
+            let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+            SelectObject(mem, old);
+            let _ = DeleteObject(bmp);
+            let _ = DeleteDC(mem);
+            let _ = EndPaint(window, &ps);
+        }
+    }
+
     // ---- plumbing ----------------------------------------------------------
 
     fn hwnd(h: isize) -> HWND {
@@ -864,7 +1106,10 @@ mod win32 {
                 close_glyph_rect(),
             ),
             WM_LBUTTONDOWN => {
-                if in_close_glyph(lparam) {
+                if done_active() {
+                    // Any click puts the confirmation away.
+                    GONE.store(true, Ordering::SeqCst);
+                } else if in_close_glyph(lparam) {
                     set_pending(Event::Dismiss);
                 }
                 LRESULT(0)
@@ -958,6 +1203,10 @@ mod win32 {
 
     /// The card's own surface. Its words are [`super::painted`]'s.
     fn paint(window: HWND) {
+        if done_active() {
+            paint_done(window);
+            return;
+        }
         unsafe {
             let mut ps = PAINTSTRUCT::default();
             let hdc = BeginPaint(window, &mut ps);
@@ -974,19 +1223,17 @@ mod win32 {
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
+            // Design 1b's panels have no rules and no tinted footer; the layout
+            // keeps those slots as spacing and nothing is painted in them.
             fill_rect(mem, client, crate::theme::CARD);
-            fill_rect(mem, dev(l.footer), crate::theme::CARD_TINT);
-            fill_rect(mem, dev(l.header_rule), crate::theme::HAIRLINE);
-            fill_rect(mem, dev(l.footer_rule), crate::theme::HAIRLINE);
             SetBkMode(mem, TRANSPARENT);
 
             // The well: the theme's caution wash and edge, which is what the
             // message box's yellow triangle was saying.
-            rounded(mem, l.body, 8, crate::theme::CAUTION_WASH, crate::theme::CAUTION_EDGE);
+            rounded(mem, l.body, 12, crate::theme::CAUTION_WASH, crate::theme::CAUTION_EDGE);
 
             if let Some(fonts) = fonts {
-                let tracking = scale(crate::win32_draw::card_lockup().tracking);
-                draw_card_lockup(mem, dev(l.mark), dev(l.wordmark), fonts.brand, tracking);
+                crate::panel_draw::draw_lockup(mem, dev(l.mark), dev(l.wordmark), fonts.brand);
                 for run in &runs {
                     if run.role == Role::Button {
                         // The control paints its own.
@@ -1027,8 +1274,8 @@ mod win32 {
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
-            // The button sits on the footer's tint.
-            fill_rect(mem, whole, crate::theme::CARD_TINT);
+            // The button sits on the card's white.
+            fill_rect(mem, whole, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
@@ -1038,8 +1285,7 @@ mod win32 {
                     .find(|r| r.role == Role::Button)
                     .map(|r| r.text)
                     .unwrap_or_default();
-                let skin =
-                    if hovered { ButtonSkin::primary().hovered() } else { ButtonSkin::primary() };
+                let skin = crate::panel_draw::skin(crate::panel_draw::PanelButton::Primary, hovered);
                 let hint = Some((super::ENTER_SHORTCUT, fonts.hint));
                 let dpi = DPI_PERCENT.load(Ordering::SeqCst);
                 if focused {
@@ -1047,7 +1293,13 @@ mod win32 {
                     // scales what it is handed.
                     let ok = super::layout(body_h).ok;
                     let ring = Box2 { x: 0, y: 0, w: ok.w, h: ok.h };
-                    rounded(mem, ring, 9, crate::theme::FOCUS_RING, crate::theme::FOCUS_RING);
+                    rounded(
+                        mem,
+                        ring,
+                        crate::panel_draw::BUTTON_RADIUS + 1,
+                        crate::theme::FOCUS_RING,
+                        crate::theme::FOCUS_RING,
+                    );
                     let inner = RECT {
                         left: whole.left + 2,
                         top: whole.top + 2,
@@ -1055,11 +1307,25 @@ mod win32 {
                         bottom: whole.bottom - 2,
                     };
                     draw_button_with_shortcut(
-                        mem, inner, &label, fonts.button, skin, scale(8), hint, dpi,
+                        mem,
+                        inner,
+                        &label,
+                        fonts.button,
+                        skin,
+                        scale(crate::panel_draw::BUTTON_RADIUS),
+                        hint,
+                        dpi,
                     );
                 } else {
                     draw_button_with_shortcut(
-                        mem, whole, &label, fonts.button, skin, scale(8), hint, dpi,
+                        mem,
+                        whole,
+                        &label,
+                        fonts.button,
+                        skin,
+                        scale(crate::panel_draw::BUTTON_RADIUS),
+                        hint,
+                        dpi,
                     );
                 }
             }
@@ -1410,9 +1676,55 @@ mod tests {
         assert_eq!(NOTHING_TYPED_TITLE, "Nothing was typed");
         assert_eq!(OK_LABEL, "OK");
         assert_eq!(ENTER_SHORTCUT, "ENTER");
-        assert_eq!(BUTTON_H, crate::theme::BUTTON_HEIGHT as i32);
-        assert_eq!(WIDTH, crate::prompt_card::WIDTH);
+        assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H);
+        assert_eq!(WIDTH, crate::panel_draw::CARD_W);
         assert_ne!(NOTHING_TYPED_TITLE, STOPPED_TITLE);
+    }
+
+    /// **The done card says what the design says**, and nothing it cannot know.
+    #[test]
+    fn the_done_card_says_the_designs_words_and_no_invented_timing() {
+        assert_eq!(done_copy(DoneCase::Saved), ("Login saved", "Deskwarden fills it next time"));
+        assert_eq!(done_copy(DoneCase::Updated).0, "Password updated");
+        assert_eq!(done_copy(DoneCase::SignedIn).0, "Signed in");
+        for case in [DoneCase::Saved, DoneCase::Updated, DoneCase::SignedIn] {
+            let (title, subtitle) = done_copy(case);
+            assert!(!title.is_empty() && !subtitle.is_empty());
+            // D 1.4's `Filled by Deskwarden in 1.2 s` is a mock-up's stopwatch: no
+            // timer here knows how long a fill took.
+            assert!(!subtitle.contains(" in ") && !subtitle.chars().any(|c| c.is_ascii_digit()));
+        }
+    }
+
+    /// The done card's disc is centred and everything lies inside its window.
+    #[test]
+    fn the_done_card_lays_out_a_centred_column_inside_its_window() {
+        let l = done_layout();
+        let r = crate::panel_draw::DONE_DISC / 2;
+        assert_eq!(l.disc.0, l.window.w / 2, "the disc is not centred");
+        assert!(l.disc.1 - r >= 0 && l.disc.0 - r >= 0 && l.disc.0 + r <= l.window.w);
+        assert!(l.disc.1 + r < l.title.y, "the title runs into the disc");
+        assert!(l.title.bottom() <= l.subtitle.y);
+        for b in [l.title, l.subtitle] {
+            assert!(b.x >= 0 && b.right() <= l.window.w && b.bottom() <= l.window.h);
+        }
+        assert_eq!(l.window.h, l.subtitle.bottom() + DONE_PAD);
+    }
+
+    /// **The done card never takes the keyboard.** It confirms a fill or a save
+    /// the user just made; stealing the foreground from the app that was just
+    /// typed into would be the card undoing what it confirms.
+    #[test]
+    fn the_done_card_is_opened_without_activating_anything() {
+        let (production, _) = production();
+        let code = code(&production);
+        let a = code.find("pub(super) fn run_done").expect("control: run_done is gone");
+        let b = code[a..].find("fn paint_done").expect("control: paint_done is gone") + a;
+        let body = &code[a..b];
+        assert!(body.contains("WS_EX_NOACTIVATE"));
+        assert!(body.contains("SW_SHOWNOACTIVATE"));
+        assert!(!body.contains("SetForegroundWindow("), "the done card asks for the foreground");
+        assert!(!body.contains("SetFocus("), "the done card asks for the keyboard");
     }
 
     #[test]

@@ -179,13 +179,15 @@ pub fn run_with(
 /// the same title three other windows of this process open under.
 pub const LOCKED_CARD_TITLE: &str = "Deskwarden vault locked";
 
-/// What the card's header says.
+/// The status pill in the header (design D 1.6): the state, in one word.
 ///
 /// **It must not be the body's first line**: the two are different claims --
-/// the header names the state, the body explains it -- and a header that
-/// repeated the body would leave the card saying one thing twice and the app
-/// unnamed.
-pub const LOCKED_LABEL: &str = "Vault locked";
+/// the pill names the state, the title explains it -- and a pill that repeated
+/// the title would leave the card saying one thing twice. The design's own
+/// title, "3 logins match", is not used: the process cannot know how many
+/// logins match while the vault is locked, and a number here would be the old
+/// lie in a new place.
+pub const LOCKED_PILL: &str = "Locked";
 
 /// What 3b's one button says, and **the only card that may carry it**.
 ///
@@ -194,10 +196,8 @@ pub const LOCKED_LABEL: &str = "Vault locked";
 /// it does, and the window it opens says what it is.
 pub const UNLOCK_LABEL: &str = "Unlock";
 
-/// The `Esc` chip in the footer, and the word beside it.
-pub const ESC_SHORTCUT: &str = "ESC";
-/// The footer hint's word.
-pub const DISMISS_LABEL: &str = "Dismiss";
+/// The `Enter` chip inside the *Unlock* button: Enter presses it.
+pub const ENTER_SHORTCUT: &str = crate::prompt_card::ENTER_SHORTCUT;
 
 /// The number of `crate::app::overlay_height` choice-row pitches the
 /// caller's placement is computed from.
@@ -236,18 +236,14 @@ pub fn locked_text(app_name: &str) -> (String, String) {
 /// its font and its colour.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// The header.
-    Title,
-    /// The body's first line.
+    /// The status pill's word.
+    Pill,
+    /// The title (19/800).
     Primary,
-    /// The body's second line.
+    /// The body line under it (15).
     Secondary,
     /// The *Unlock* button's label. Painted by the control, not by the card.
     Button,
-    /// The `ESC` keyboard chip.
-    Chip,
-    /// The word beside the chip.
-    Hint,
 }
 
 /// One run of text the card paints, and where.
@@ -273,12 +269,10 @@ pub fn painted(app_name: &str) -> Vec<Painted> {
     let l = layout();
     let (primary, secondary) = locked_text(app_name);
     vec![
-        Painted { text: LOCKED_LABEL.to_string(), at: l.title, role: Role::Title },
+        Painted { text: LOCKED_PILL.to_string(), at: l.pill, role: Role::Pill },
         Painted { text: primary, at: l.primary, role: Role::Primary },
         Painted { text: secondary, at: l.secondary, role: Role::Secondary },
         Painted { text: UNLOCK_LABEL.to_string(), at: l.unlock, role: Role::Button },
-        Painted { text: ESC_SHORTCUT.to_string(), at: l.esc_chip, role: Role::Chip },
-        Painted { text: DISMISS_LABEL.to_string(), at: l.dismiss, role: Role::Hint },
     ]
 }
 
@@ -322,53 +316,43 @@ pub static REAL: LockedCalls = LockedCalls {
 // Layout
 // ---------------------------------------------------------------------------
 
-/// The card's width, and so the window's. `crate::prompt_card::WIDTH`, because
-/// this card and that one are the same card in two states of the same vault
-/// and appear in the same place on screen.
-pub const WIDTH: i32 = crate::prompt_card::WIDTH;
+/// The card's width: design 1b's Locked panel, 410.
+pub const WIDTH: i32 = crate::panel_draw::CARD_W;
 
-const MARGIN_X: i32 = 16;
-const MARGIN_TOP: i32 = 16;
+/// The card's padding on every side (design D 1.6: `pad 18`).
+const MARGIN_X: i32 = crate::panel_draw::PAD;
+const MARGIN_TOP: i32 = crate::panel_draw::PAD;
 
-/// The body well's height: two lines and the padding around them, fixed
-/// whatever the app is called.
-const BODY_H: i32 = 52;
+/// The gap between the card's blocks (D 1.6: `gap 14`), and between the title and
+/// the body under it (D 1.5's title block: `gap 4`).
+const BLOCK_GAP: i32 = crate::panel_draw::BLOCK_GAP;
+const TITLE_GAP: i32 = 4;
 
-/// Button height. `crate::theme::BUTTON_HEIGHT`, pinned by
-/// [`the_cards_dimensions_are_the_themes`].
-const BUTTON_H: i32 = 32;
+/// The title's and the body's line boxes.
+const TITLE_H: i32 = 26;
+const BODY_H: i32 = 22;
 
-/// The *Unlock* button's width: its label, at the app's own type, with the
-/// padding a pill needs.
-const UNLOCK_W: i32 = 96;
+/// Button height: the Locked panel's tall one (D 1.6: `h54, r15`).
+const BUTTON_H: i32 = crate::panel_draw::TALL_BUTTON_H;
 
-const ESC_CHIP_W: i32 = 34;
+/// The status pill's width: "Locked" at 12/700 and the design's 10 px padding.
+const PILL_W: i32 = 64;
 
 /// Every rectangle the card paints, computed once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
-    /// The brand lockup's shield, and the wordmark beside it. **The card had
-    /// no brand at all after the port**: the egui notice it replaced carried
-    /// `theme::card_header`'s shield and letterspaced DESKWARDEN, and a
+    /// The brand lockup's shield, and "Deskwarden" beside it. **Not optional**: a
     /// frameless always-on-top window that names the user's apps and asks for
-    /// their master password has to say whose window it is. The compact
-    /// lockup, not the login window's -- see
-    /// [`crate::win32_draw::draw_card_lockup`].
+    /// their master password has to say whose window it is.
     pub mark: Box2,
     pub wordmark: Box2,
-    pub title: Box2,
+    /// The `Locked` pill, left of the ✕ on the lockup's line.
+    pub pill: Box2,
     pub close_glyph: Box2,
-    pub header_rule: Box2,
-    pub footer_rule: Box2,
-    pub footer: Box2,
-    /// The tinted well the two body lines sit in.
-    pub body: Box2,
     pub primary: Box2,
     pub secondary: Box2,
     pub unlock: Box2,
-    pub esc_chip: Box2,
-    pub dismiss: Box2,
 }
 
 /// **The card's geometry. There is exactly one shape.**
@@ -380,58 +364,34 @@ pub struct Layout {
 pub fn layout() -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
-    let lockup = crate::win32_draw::card_lockup();
+    let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
         Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    // The ✕ moves up onto the lockup's line, which is where every card header
-    // in the design carries it -- and where it has to be now, because the
-    // title is no longer the top line.
-    let close_glyph =
-        Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
-    let title =
-        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: content_w - 24, h: 20 };
-    let header_rule = Box2 { x: 0, y: title.bottom() + 10, w: WIDTH, h: 1 };
-
-    let body = Box2 { x: MARGIN_X, y: header_rule.bottom() + 8, w: content_w, h: BODY_H };
-    // Two lines inside the well, inset from its edges. Both are drawn with
-    // `DT_END_ELLIPSIS` into these boxes: the second carries `app_name`, and
-    // this window cannot grow and cannot scroll.
-    let primary = Box2 { x: body.x + 10, y: body.y + 8, w: body.w - 20, h: 18 };
-    let secondary = Box2 { x: body.x + 10, y: primary.bottom() + 1, w: body.w - 20, h: 16 };
-
-    let footer_rule = Box2 { x: 0, y: body.bottom() + 8, w: WIDTH, h: 1 };
-    let unlock =
-        Box2 { x: MARGIN_X, y: footer_rule.bottom() + 8, w: UNLOCK_W, h: BUTTON_H };
-    let esc_chip = Box2 { x: unlock.right() + 10, y: unlock.y, w: ESC_CHIP_W, h: BUTTON_H };
-    let dismiss = Box2 {
-        x: esc_chip.right() + 5,
-        y: unlock.y,
-        w: MARGIN_X + content_w - (esc_chip.right() + 5),
-        h: BUTTON_H,
+    let close = crate::panel_draw::CLOSE;
+    let close_glyph = Box2 {
+        x: WIDTH - MARGIN_X - close,
+        y: mark.y + (mark.h - close) / 2,
+        w: close,
+        h: close,
+    };
+    let pill = Box2 {
+        x: close_glyph.x - crate::panel_draw::BUTTON_GAP - PILL_W,
+        y: mark.y + (mark.h - crate::panel_draw::PILL_H) / 2,
+        w: PILL_W,
+        h: crate::panel_draw::PILL_H,
     };
 
-    let height = unlock.bottom() + 8;
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: height };
-    let footer =
-        Box2 { x: 0, y: footer_rule.bottom(), w: WIDTH, h: height - footer_rule.bottom() };
+    // Two lines, both drawn with `DT_END_ELLIPSIS` into these boxes: the second
+    // carries `app_name`, and this window cannot grow and cannot scroll.
+    let primary = Box2 { x: MARGIN_X, y: mark.bottom() + BLOCK_GAP, w: content_w, h: TITLE_H };
+    let secondary =
+        Box2 { x: MARGIN_X, y: primary.bottom() + TITLE_GAP, w: content_w, h: BODY_H };
+    let unlock = Box2 { x: MARGIN_X, y: secondary.bottom() + BLOCK_GAP, w: content_w, h: BUTTON_H };
 
-    Layout {
-        window,
-        mark,
-        wordmark,
-        title,
-        close_glyph,
-        header_rule,
-        footer_rule,
-        footer,
-        body,
-        primary,
-        secondary,
-        unlock,
-        esc_chip,
-        dismiss,
-    }
+    let window = Box2 { x: 0, y: 0, w: WIDTH, h: unlock.bottom() + MARGIN_TOP };
+
+    Layout { window, mark, wordmark, pill, close_glyph, primary, secondary, unlock }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,9 +421,7 @@ static APP_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new())
 /// than stylistic: a D2D device was measured at 53.85 MB against this kind of
 /// window's 1.79 MB.
 mod win32 {
-    use super::{
-        Painted, Role, APP_NAME, ESC_SHORTCUT, GONE, LOCKED_CARD_TITLE, PENDING,
-    };
+    use super::{Painted, Role, APP_NAME, ENTER_SHORTCUT, GONE, LOCKED_CARD_TITLE, PENDING};
     use crate::prompt_card::Box2;
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -491,9 +449,8 @@ mod win32 {
         WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{
-        draw_button, draw_card_lockup, draw_hint_chip, draw_text, rgb, ButtonSkin,
-    };
+    use crate::panel_draw::{self, PanelButton};
+    use crate::win32_draw::{draw_button_with_shortcut, draw_text, rgb};
 
     const ID_UNLOCK: usize = 101;
     const CLASS_NAME: PCWSTR = w!("DeskwardenVaultLockedCard");
@@ -560,33 +517,34 @@ mod win32 {
     /// Every face the card paints with, created at open and destroyed at
     /// close. Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
-        /// The lockup's wordmark: `theme::CARD_HEADER_WORD_PX` in the bold
-        /// cut, which is what `theme::card_header` letterspaces "DESKWARDEN"
-        /// in.
+        /// The wordmark: "Deskwarden" at 15/800.
         brand: HFONT,
-        title: HFONT,
+        /// The status pill's word, 12/700.
+        pill: HFONT,
+        /// The title, 19/800, and the body under it, 15.
         primary: HFONT,
         secondary: HFONT,
+        /// The *Unlock* button's label, 16/700, and its `Enter` chip.
         button: HFONT,
         hint: HFONT,
     }
 
     impl Fonts {
         fn build() -> Self {
-            use crate::theme::{BOLD, REGULAR, SEMIBOLD};
+            use crate::theme::{BOLD, EXTRABOLD, REGULAR};
             Fonts {
-                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
-                title: font(BOLD, 14),
-                primary: font(SEMIBOLD, 13),
-                secondary: font(REGULAR, 11),
-                button: font(SEMIBOLD, 12),
+                brand: font(EXTRABOLD, panel_draw::WORD_PX),
+                pill: font(BOLD, panel_draw::PILL_PX),
+                primary: font(EXTRABOLD, panel_draw::TITLE_PX),
+                secondary: font(REGULAR, panel_draw::BODY_PX),
+                button: font(BOLD, 16),
                 hint: mono(crate::theme::CHIP_TEXT_PX as i32),
             }
         }
 
         fn destroy(&self) {
             unsafe {
-                for f in [self.brand, self.title, self.primary, self.secondary, self.button, self.hint]
+                for f in [self.brand, self.pill, self.primary, self.secondary, self.button, self.hint]
                 {
                     let _ = DeleteObject(f);
                 }
@@ -598,12 +556,10 @@ mod win32 {
         /// chose.
         fn skin(&self, role: Role) -> (HFONT, eframe::egui::Color32) {
             match role {
-                Role::Title => (self.title, crate::theme::INK),
+                Role::Pill => (self.pill, crate::theme::BLUE_DEEP),
                 Role::Primary => (self.primary, crate::theme::INK),
                 Role::Secondary => (self.secondary, crate::theme::TEXT_FAINT),
-                Role::Button => (self.button, crate::theme::INK),
-                Role::Chip => (self.hint, crate::theme::TEXT_FAINT),
-                Role::Hint => (self.secondary, crate::theme::TEXT_FAINT),
+                Role::Button => (self.button, crate::theme::CARD),
             }
         }
     }
@@ -1090,33 +1046,31 @@ mod win32 {
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
             let l = super::layout();
-            let dpi = DPI_PERCENT.load(Ordering::SeqCst);
 
             fill_rect(mem, client, crate::theme::CARD);
-            fill_box(mem, l.footer, crate::theme::CARD_TINT);
-            fill_box(mem, l.header_rule, crate::theme::HAIRLINE);
-            fill_box(mem, l.footer_rule, crate::theme::HAIRLINE);
             SetBkMode(mem, TRANSPARENT);
 
-            // The body well. `theme::CANVAS`, the same inset well the picker's
-            // rows sit in.
-            rounded(mem, l.body, 8, crate::theme::CANVAS);
-
             if let Some(fonts) = fonts {
-                paint_lockup(mem, &l, fonts.brand);
+                let dev = |b: Box2| RECT {
+                    left: scale(b.x),
+                    top: scale(b.y),
+                    right: scale(b.right()),
+                    bottom: scale(b.bottom()),
+                };
+                panel_draw::draw_lockup(mem, dev(l.mark), dev(l.wordmark), fonts.brand);
                 for run in runs() {
                     match run.role {
                         // The control paints its own.
                         Role::Button => {}
-                        Role::Chip => {
-                            let rc = RECT {
-                                left: scale(run.at.x),
-                                top: scale(run.at.y),
-                                right: scale(run.at.right()),
-                                bottom: scale(run.at.bottom()),
-                            };
-                            draw_hint_chip(mem, rc, ESC_SHORTCUT, fonts.hint, dpi);
-                        }
+                        // The status pill: the design's pale blue wash.
+                        Role::Pill => panel_draw::draw_pill(
+                            mem,
+                            dev(run.at),
+                            &run.text,
+                            fonts.pill,
+                            crate::theme::BLUE_WASH,
+                            crate::theme::BLUE_DEEP,
+                        ),
                         role => {
                             let (face, ink) = fonts.skin(role);
                             text(mem, face, run.at, &run.text, ink);
@@ -1134,21 +1088,6 @@ mod win32 {
             let _ = DeleteDC(mem);
             let _ = EndPaint(window, &ps);
         }
-    }
-
-    /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
-    /// the crate's one mark painter, which `unlock_prompt` also draws through.
-    /// What is this card's own is only the logical-to-device conversion, which
-    /// no other card's `Box2` type can share.
-    fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
-        let dev = |b: Box2| RECT {
-            left: scale(b.x),
-            top: scale(b.y),
-            right: scale(b.right()),
-            bottom: scale(b.bottom()),
-        };
-        let tracking = scale(crate::win32_draw::card_lockup().tracking);
-        draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
     }
 
     /// The *Unlock* button.
@@ -1170,9 +1109,9 @@ mod win32 {
             let guard = FONTS.lock();
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
 
-            // The button sits on the footer's tint -- otherwise its rounded
-            // corners show the wrong colour through them.
-            fill_rect(mem, whole, crate::theme::CARD_TINT);
+            // The button sits on the card's white, which is what its rounded
+            // corners show through.
+            fill_rect(mem, whole, crate::theme::CARD);
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
@@ -1181,20 +1120,19 @@ mod win32 {
                     .find(|r| r.role == Role::Button)
                     .map(|r| r.text)
                     .unwrap_or_default();
-                let skin = if hovered {
-                    ButtonSkin::primary().hovered()
-                } else {
-                    ButtonSkin::primary()
-                };
+                // The design's deep blue, hovering to brand blue.
+                let skin = panel_draw::skin(PanelButton::Deep, hovered);
                 let l = super::layout();
+                let dpi = DPI_PERCENT.load(Ordering::SeqCst);
+                let hint = Some((ENTER_SHORTCUT, fonts.hint));
                 if focused {
-                    // **The ring is given LOGICAL size, from `layout`.**
-                    // `rounded` scales what it is handed, and `rc` came back
-                    // from `GetClientRect` in device pixels already.
+                    // **The ring is given LOGICAL size, from `layout`.** `rounded`
+                    // scales what it is handed, and `rc` came back from
+                    // `GetClientRect` in device pixels already.
                     rounded(
                         mem,
                         Box2 { x: 0, y: 0, w: l.unlock.w, h: l.unlock.h },
-                        9,
+                        panel_draw::TALL_BUTTON_RADIUS + 1,
                         crate::theme::FOCUS_RING,
                     );
                     let inner = RECT {
@@ -1203,9 +1141,27 @@ mod win32 {
                         right: whole.right - 2,
                         bottom: whole.bottom - 2,
                     };
-                    draw_button(mem, inner, &label, fonts.button, skin, scale(8));
+                    draw_button_with_shortcut(
+                        mem,
+                        inner,
+                        &label,
+                        fonts.button,
+                        skin,
+                        scale(panel_draw::TALL_BUTTON_RADIUS),
+                        hint,
+                        dpi,
+                    );
                 } else {
-                    draw_button(mem, whole, &label, fonts.button, skin, scale(8));
+                    draw_button_with_shortcut(
+                        mem,
+                        whole,
+                        &label,
+                        fonts.button,
+                        skin,
+                        scale(panel_draw::TALL_BUTTON_RADIUS),
+                        hint,
+                        dpi,
+                    );
                 }
             }
             drop(guard);
@@ -1227,19 +1183,13 @@ mod win32 {
     /// not guaranteed to arrive, and the ✕ is the only mouse-operable way out
     /// of a window with no title bar.
     fn paint_close_glyph(hdc: HDC, at: Box2) {
-        unsafe {
-            use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::theme::TEXT_FAINT));
-            let old = SelectObject(hdc, pen);
-            let (x, y, w, h) = (scale(at.x), scale(at.y), scale(at.w), scale(at.h));
-            let pad = w / 3;
-            let _ = MoveToEx(hdc, x + pad, y + pad, None);
-            let _ = LineTo(hdc, x + w - pad, y + h - pad);
-            let _ = MoveToEx(hdc, x + w - pad, y + pad, None);
-            let _ = LineTo(hdc, x + pad, y + h - pad);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(pen);
-        }
+        let rc = RECT {
+            left: scale(at.x),
+            top: scale(at.y),
+            right: scale(at.right()),
+            bottom: scale(at.bottom()),
+        };
+        panel_draw::draw_close_x(hdc, rc, scale(1).max(1), crate::theme::TEXT_FAINT);
     }
 
     fn fill_rect(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {
@@ -1250,21 +1200,6 @@ mod win32 {
         }
     }
 
-    /// [`fill_rect`], for a **logical** rectangle.
-    fn fill_box(hdc: HDC, at: Box2, colour: eframe::egui::Color32) {
-        fill_rect(
-            hdc,
-            RECT {
-                left: scale(at.x),
-                top: scale(at.y),
-                right: scale(at.right()),
-                bottom: scale(at.bottom()).max(scale(at.y) + 1),
-            },
-            colour,
-        );
-    }
-
-    /// A rounded rectangle in logical coordinates.
     fn rounded(hdc: HDC, at: Box2, radius: i32, fill_colour: eframe::egui::Color32) {
         unsafe {
             let brush = CreateSolidBrush(rgb(fill_colour));
@@ -1407,7 +1342,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, FIXTURES.len() * 6, "the loop did not cover every run");
+        assert_eq!(checked, FIXTURES.len() * 4, "the loop did not cover every run");
     }
 
     /// **The card counts nothing.** The design as drawn counts matches ("3
@@ -1469,7 +1404,7 @@ mod tests {
         let mut checked = 0;
         for (name, app) in FIXTURES {
             let runs = painted(app);
-            assert_eq!(runs.len(), 6, "the {name:?} card paints a different number of runs");
+            assert_eq!(runs.len(), 4, "the {name:?} card paints a different number of runs");
             for run in &runs {
                 assert!(!run.text.is_empty(), "the {:?} run is empty", run.role);
                 assert_eq!(
@@ -1495,7 +1430,7 @@ mod tests {
                 checked += 1;
             }
         }
-        assert_eq!(checked, FIXTURES.len() * 6);
+        assert_eq!(checked, FIXTURES.len() * 4);
     }
 
     /// **No app name a user can supply changes the card's shape.**
@@ -1645,12 +1580,9 @@ mod tests {
         assert_eq!(l.window.w, WIDTH);
         assert_eq!((l.window.x, l.window.y), (0, 0));
 
-
-        // **The brand lockup**, which the port had dropped entirely and which
-        // this card now carries again. Pinned to the new truth rather than
-        // loosened: the card grew by the lockup's height plus its gap, and the
-        // window's own height assertions below are what hold that honest.
-        let lockup = crate::win32_draw::card_lockup();
+        // **The brand lockup**, which a window that names the user's apps and
+        // asks for their master password has to carry.
+        let lockup = crate::panel_draw::lockup();
         assert_eq!(
             (l.mark.x, l.mark.y),
             (MARGIN_X, MARGIN_TOP),
@@ -1665,87 +1597,46 @@ mod tests {
         );
         assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
         assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
-        assert!(
-            l.wordmark.right() <= l.close_glyph.x,
-            "the wordmark runs under the ✕"
-        );
-        assert!(
-            l.wordmark.bottom() <= l.title.y,
-            "the card's title runs into the brand lockup above it"
-        );
-
-        assert!(l.title.right() <= l.close_glyph.x, "the header text runs under the ✕");
+        assert!(l.wordmark.right() <= l.pill.x, "the wordmark runs under the status pill");
+        assert!(l.pill.right() < l.close_glyph.x, "the status pill touches the ✕");
         assert!(
             l.close_glyph.right() <= l.window.right() - MARGIN_X,
             "the close glyph has crossed the card's right margin"
         );
-        assert!(l.title.bottom() <= l.header_rule.y);
-        assert!(l.header_rule.bottom() <= l.body.y);
-        assert_eq!(l.body.x, MARGIN_X);
-        assert_eq!(l.body.right(), WIDTH - MARGIN_X);
-        for line in [l.primary, l.secondary] {
-            assert!(line.x >= l.body.x, "a body line starts outside the well");
-            assert!(line.right() <= l.body.right(), "a body line runs past the well");
-            assert!(line.y >= l.body.y && line.bottom() <= l.body.bottom());
+        assert_eq!(l.pill.h, crate::panel_draw::PILL_H);
+
+        assert!(l.mark.bottom() <= l.primary.y, "the title runs into the lockup above it");
+        for line in [l.primary, l.secondary, l.unlock] {
+            assert_eq!(line.x, MARGIN_X);
+            assert_eq!(line.right(), WIDTH - MARGIN_X, "a block does not run to the card's margin");
         }
-        assert!(l.primary.bottom() <= l.secondary.y, "the two body lines overlap");
-        assert!(l.body.bottom() <= l.footer_rule.y);
+        assert!(l.primary.bottom() <= l.secondary.y, "the two text lines overlap");
+        assert!(l.secondary.bottom() <= l.unlock.y, "the body runs into the button");
         assert_eq!(
-            l.footer.y,
-            l.footer_rule.bottom(),
-            "the footer's tint does not start at its rule"
-        );
-        assert_eq!(
-            l.footer.bottom(),
+            l.unlock.bottom() + MARGIN_TOP,
             l.window.bottom(),
-            "the footer's tint stops short of the card's bottom edge, leaving a band of the \
-             card's own colour under it"
-        );
-        assert!(l.footer_rule.bottom() <= l.unlock.y);
-        assert!(l.unlock.right() < l.esc_chip.x, "the Esc chip sits on the Unlock button");
-        assert!(l.esc_chip.right() < l.dismiss.x);
-        assert!(
-            l.dismiss.right() <= l.window.right() - MARGIN_X,
-            "the footer hint has crossed the card's right margin"
-        );
-        assert!(l.dismiss.w > 0, "the footer hint has no room for its word");
-        // **Against the MARGIN, not against the window's edge.** A pin that
-        // only forbade a control leaving the window is slacker than the layout
-        // it guards.
-        assert_eq!(
-            l.unlock.bottom() + 8,
-            l.window.bottom(),
-            "the card is not sized to its own footer: it asks the OS for a {} px window whose \
+            "the card is not sized to its own button: it asks the OS for a {} px window whose \
              last control ends at {} px",
             l.window.h,
             l.unlock.bottom()
         );
     }
 
-    /// **The card's dimensions are the theme's and the crate's.**
+    /// **The card's dimensions are the design's.**
     #[test]
-    fn the_cards_dimensions_are_the_themes() {
-        assert_eq!(
-            BUTTON_H,
-            crate::theme::BUTTON_HEIGHT as i32,
-            "the Unlock button is not the app's button height"
-        );
-        assert_eq!(
-            WIDTH,
-            crate::prompt_card::WIDTH,
-            "3b and 2a are two states of the same vault shown in the same place; two widths read \
-             as two different programs"
-        );
+    fn the_cards_dimensions_are_the_designs() {
+        assert_eq!((BUTTON_H, WIDTH), (54, 410), "design D 1.6's Unlock button and panel");
+        assert_eq!(BUTTON_H, crate::panel_draw::TALL_BUTTON_H);
+        assert_eq!(WIDTH, crate::panel_draw::CARD_W);
     }
 
     /// **The card says every one of its own words**, each a constant rather
     /// than a literal at the paint site.
     #[test]
     fn the_cards_words_are_the_ones_it_promises() {
-        assert_eq!(LOCKED_LABEL, "Vault locked");
+        assert_eq!(LOCKED_PILL, "Locked");
         assert_eq!(UNLOCK_LABEL, "Unlock");
-        assert_eq!(ESC_SHORTCUT, "ESC");
-        assert_eq!(DISMISS_LABEL, "Dismiss");
+        assert_eq!(ENTER_SHORTCUT, "ENTER");
         assert_eq!(
             locked_text(APP),
             (
@@ -1755,17 +1646,28 @@ mod tests {
             "the second line's verb is `check`: `see the login` would promise there is one"
         );
         assert_ne!(
-            LOCKED_LABEL,
+            LOCKED_PILL,
             locked_text(APP).0,
-            "the header and the body's first line are different claims -- the header names the \
-             state, the body explains it -- and a header that repeated the body would leave the \
-             card saying one thing twice"
+            "the pill names the state and the title explains it; a pill that repeated the title \
+             would leave the card saying one thing twice"
         );
         assert_ne!(
             UNLOCK_LABEL,
             crate::unlock_prompt::UNLOCK_PROMPT_TITLE,
             "a button says what pressing it does; the window it opens says what it is"
         );
+    }
+
+    /// **The card does not count logins it cannot see.** Design 1b titles this
+    /// panel "3 logins match"; while the vault is locked that number is not
+    /// knowable, so nothing here may be a number.
+    #[test]
+    fn the_card_never_prints_a_match_count() {
+        for (_, app) in FIXTURES {
+            let (title, body) = locked_text(app);
+            assert!(!title.contains("match") && !body.contains("match"));
+            assert!(!title.chars().any(|c| c.is_ascii_digit()));
+        }
     }
 
     /// **The title is this window's own.**
