@@ -12,6 +12,8 @@ pub mod detail_slide;
 pub mod folder_modal;
 pub mod generator_screen;
 pub mod icon_modal;
+pub mod import_formats;
+pub mod import_ui;
 pub mod item_list;
 pub mod new_item_modal;
 pub mod palette;
@@ -1536,6 +1538,8 @@ pub fn build_frame_with_search(
     let mut empty_trash_ids: Option<Vec<String>> = None;
     // Spec B §4: the command palette is up, with its query.
     let mut palette_state: Option<palette::PaletteState> = None;
+    // Spec B §3: the Import wizard is up.
+    let mut import_wizard: Option<import_ui::Wizard> = None;
     // **Design 6b's overlay, while it is up.**
     //
     // Held beside the form rather than inside it because it is a *window*, and
@@ -2987,6 +2991,11 @@ pub fn build_frame_with_search(
         let chip_palette = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenPalette);
         if (ctrl_k || chip_palette) && palette_state.is_none() {
             palette_state = Some(palette::PaletteState::default());
+        }
+        // The Settings page's Import row asks for the wizard the same way the
+        // palette's action does.
+        if sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenImport) && import_wizard.is_none() {
+            import_wizard = Some(import_ui::Wizard::default());
         }
         if chords && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
@@ -7242,6 +7251,11 @@ pub fn build_frame_with_search(
                         palette::PaletteAction::Settings => {
                             sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::OpenSettings)
                         }
+                        palette::PaletteAction::Import => {
+                            if import_wizard.is_none() {
+                                import_wizard = Some(import_ui::Wizard::default());
+                            }
+                        }
                         palette::PaletteAction::Lock => {
                             *locked_for_closure.borrow_mut() = true;
                             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
@@ -7922,6 +7936,49 @@ pub fn build_frame_with_search(
                         if failed.is_some() { "Couldn't empty the whole trash" } else { trash_modal::EMPTIED_TOAST },
                     );
                 }
+            }
+        }
+        if let Some(wizard) = import_wizard.as_mut() {
+            // A finished import: the cache already holds what landed, so the
+            // window's own lists are re-read from it.
+            if let Some(finished) = wizard.poll() {
+                if let Some(e) = &finished.first_error {
+                    flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, e);
+                }
+                items = cache.items();
+                folders = cache.folders();
+            }
+            let mut close = false;
+            match import_ui::draw(ui.ctx(), wizard) {
+                import_ui::Answer::Open => {}
+                import_ui::Answer::Closed => close = true,
+                import_ui::Answer::SeeItems => {
+                    close = true;
+                    sends_selected = false;
+                    received_selected = false;
+                    health_selected = false;
+                    generator_selected = false;
+                    filter = SidebarFilter::All;
+                    detail_dismissed = false;
+                }
+                // The file dialog is modal and pumps its own message loop, so
+                // it opens here, after the draw closure has returned -- the
+                // rule `pick_qr_image` documents.
+                import_ui::Answer::PickFile => {
+                    if let Some(path) = crate::file_picker::pick_import_file() {
+                        wizard.begin(
+                            std::path::Path::new(&path),
+                            &items,
+                            import_ui::launch_on_cache(ui.ctx().clone(), cache.clone()),
+                        );
+                    }
+                }
+                import_ui::Answer::File(path) => {
+                    wizard.begin(&path, &items, import_ui::launch_on_cache(ui.ctx().clone(), cache.clone()));
+                }
+            }
+            if close {
+                import_wizard = None;
             }
         }
         if new_item_chooser {
