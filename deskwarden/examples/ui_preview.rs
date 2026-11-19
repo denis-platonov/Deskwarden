@@ -656,6 +656,10 @@ enum Surface {
     VaultShellCard,
     /// The v2 shell offline: the cached vault, a failed sync, the banner.
     VaultShellOffline,
+    /// The New item chooser over the shell (spec B §5).
+    ModalNewItem,
+    /// The Ctrl+K palette over the shell, with a query (spec B §4).
+    ModalPalette,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -902,6 +906,8 @@ const ALL: &[Surface] = &[
     Surface::VaultSplash,
     Surface::VaultShellCard,
     Surface::VaultShellOffline,
+    Surface::ModalNewItem,
+    Surface::ModalPalette,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -997,6 +1003,8 @@ impl Surface {
             Surface::VaultSplash => "vault_splash",
             Surface::VaultShellCard => "vault_shell_card",
             Surface::VaultShellOffline => "vault_shell_offline",
+            Surface::ModalNewItem => "modal_new_item",
+            Surface::ModalPalette => "modal_palette",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1173,7 +1181,9 @@ impl Surface {
             | Surface::VaultShellLight
             | Surface::VaultSplash
             | Surface::VaultShellCard
-            | Surface::VaultShellOffline => egui::vec2(1280.0, 820.0),
+            | Surface::VaultShellOffline
+            | Surface::ModalNewItem
+            | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1311,6 +1321,8 @@ fn main() -> eframe::Result {
             Surface::VaultSplash,
             Surface::VaultShellCard,
             Surface::VaultShellOffline,
+            Surface::ModalNewItem,
+            Surface::ModalPalette,
         ]
     } else if list {
         vec![Surface::VaultList]
@@ -1782,6 +1794,17 @@ impl eframe::App for Preview {
                     self.list_selected = Some(card.id.clone());
                 }
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Card, false)
+            }
+            Surface::ModalNewItem => {
+                self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
+                let _ = deskwarden::vault_window::new_item_modal::draw(root.ctx());
+            }
+            Surface::ModalPalette => {
+                self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
+                let mut state = deskwarden::vault_window::palette::PaletteState { query: "led".into(), active: 0 };
+                let _ = deskwarden::vault_window::palette::draw(root.ctx(), &mut state, &self.fixtures.list, Some("Ledgerline"));
             }
             Surface::VaultShellOffline => {
                 // The login the detail pane shows is the row selected.
