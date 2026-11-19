@@ -393,8 +393,17 @@ pub mod glyph {
     pub const CONTACTLESS: &str = "M8.5 8.5a5 5 0 0 1 0 7M12 6a8.5 8.5 0 0 1 0 12M15.5 3.5a12 12 0 0 1 0 17";
     /// The editor's avatar badge (spec B 1.1).
     pub const CAMERA: &str = "M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2zM12 17a4 4 0 1 0 0-8 4 4 0 0 0 0 8z";
+    // Spec B 1.4 D's step icons, the arrow between chips and Test's play.
+    pub const PERSON: &str = "M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10z";
+    pub const SHIELD_CHECK: &str = "M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10zM9 12l2 2 4-4";
+    pub const TAB_KEY: &str = "M3 12h14M13 6l6 6-6 6M21 5v14";
+    pub const SHIFT_TAB: &str = "M21 12H7M11 6l-6 6 6 6M3 5v14";
+    pub const RETURN: &str = "M9 10l-5 5 5 5M20 4v7a4 4 0 0 1-4 4H4";
+    pub const HOURGLASS: &str = "M5 22h14M5 2h14M17 22v-4.2a2 2 0 0 0-.6-1.4L12 12l-4.4 4.4a2 2 0 0 0-.6 1.4V22M7 2v4.2a2 2 0 0 0 .6 1.4L12 12l4.4-4.4a2 2 0 0 0 .6-1.4V2";
+    pub const ARROW_RIGHT: &str = "M5 12h14M13 6l6 6-6 6";
+    pub const PLAY: &str = "M7 4l13 8-13 8z";
     /// Every glyph, named, for tests and the kit sheet.
-    pub const ALL_GLYPHS: [(&str, &str); 38] = [
+    pub const ALL_GLYPHS: [(&str, &str); 46] = [
         ("all", ALL),
         ("fav", FAV),
         ("login", LOGIN),
@@ -433,6 +442,14 @@ pub mod glyph {
         ("wifi-off", WIFI_OFF),
         ("contactless", CONTACTLESS),
         ("camera", CAMERA),
+        ("person", PERSON),
+        ("shield-check", SHIELD_CHECK),
+        ("tab-key", TAB_KEY),
+        ("shift-tab", SHIFT_TAB),
+        ("return", RETURN),
+        ("hourglass", HOURGLASS),
+        ("arrow-right", ARROW_RIGHT),
+        ("play", PLAY),
     ];
 }
 

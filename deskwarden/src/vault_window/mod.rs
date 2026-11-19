@@ -21,6 +21,7 @@ pub mod send_ui;
 /// Personal sharing: the Share dialog, the people on a record, share rows in Sent and received records in Shared with me.
 pub mod share_ui;
 pub mod sequence_builder;
+pub mod sign_in_steps;
 pub mod sidebar;
 pub mod splash;
 pub mod totp_add;

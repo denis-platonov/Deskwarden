@@ -8388,6 +8388,19 @@ fn app_sequence_block(
     // Through `row_with_buttons` like every other row on this form that ends
     // in a control, so `Edit sequence` lands flush with the `Copy` above it
     // and the chips take exactly what is left.
+    // Spec B 1.4 D: a sequence the seven steps can say is chips, presets and
+    // a test; anything else keeps 0.15's row and its template editor.
+    if !app.sequence_open && super::sign_in_steps::parse(&app.sequence).is_some() {
+        let name = if app.title.is_empty() { app.process.clone() } else { app.title.clone() };
+        if super::sign_in_steps::draw(ui, &mut app.sequence, &name) {
+            if creating {
+                app.sequence_open = true;
+            } else {
+                opened = Some(EditAction::OpenSequenceBuilder);
+            }
+        }
+        return opened;
+    }
     if !app.sequence_open {
         theme::section_row(ui, SEQUENCE_ROW_LABEL, |ui| {
             row_with_buttons(ui, &[SEQUENCE_EDIT_BUTTON], |ui, room| {
@@ -19755,13 +19768,10 @@ mod sequence_builder_tests {
         let mut draft = draft_for(&item, "");
         let painted = frame(&ctx, PANE, &mut draft, &item, &detail::TotpState::NoSecret, &[]);
         let strings = painted.strings();
-        // 8a's row: the caption, the chips, and the way in. The card no
-        // longer writes `APP_SEQUENCE_LABEL` over the row nor says what it
-        // types in a SENTENCE -- both were replaced by the row itself, which
-        // says it in chips. See `app_sequence_block`.
-        assert!(strings.contains(&SEQUENCE_ROW_LABEL), "{strings:?}");
+        // Spec B 1.4 D: the steps as chips, and 0.15's editor one link away.
+        // See `sign_in_steps`.
         assert!(strings.contains(&SEQUENCE_EDIT_BUTTON), "there is no way in: {strings:?}");
-        for chip in ["Username", "Tab", "Password"] {
+        for chip in ["Type username", "Press Tab", "Type password"] {
             assert!(
                 strings.contains(&chip),
                 "the default sequence is not drawn as 8a's chips: {strings:?}"
