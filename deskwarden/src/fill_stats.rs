@@ -84,6 +84,13 @@ impl FillStats {
         self.load().get(item_id).copied().unwrap_or(0)
     }
 
+    /// Every item's count, read once. The tray popup ranks its recent list by
+    /// these, and one read is the difference between one file open and one per
+    /// vault item.
+    pub fn counts(&self) -> HashMap<String, u32> {
+        self.load()
+    }
+
     /// Moves `old`'s count to `new` -- a shared record moved back to the
     /// personal vault takes a new id, and "Filled 41 times" should come with
     /// it. Best-effort, like every write here.
