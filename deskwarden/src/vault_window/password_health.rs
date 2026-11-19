@@ -242,6 +242,8 @@ pub struct HealthReport {
     ///
     /// Empty when no scan has run. That is not the same as "nothing was
     /// found", and [`Self::scanned`] is what tells them apart.
+    /// D5: passwords unchanged for a year or more.
+    pub old: Vec<OldItem>,
     pub breached: Vec<BreachGroup>,
     /// Items a scan **asked about and could not find out**, in vault order.
     ///
@@ -280,6 +282,7 @@ impl HealthReport {
             .iter()
             .flat_map(|group| group.items.iter())
             .chain(self.weak.iter().map(|weak| &weak.item))
+            .chain(self.old.iter().map(|old| &old.item))
             // **Breached and unknown items count too.** The badge is "how
             // many items on this screen need attention", and a breached
             // password that the rail did not count is a finding the user has
@@ -305,6 +308,7 @@ impl HealthReport {
             HealthFilter::All => self.flagged_items(),
             HealthFilter::Reused => self.reused.iter().map(|g| g.items.len()).sum(),
             HealthFilter::Weak => self.weak.len(),
+            HealthFilter::Old => self.old.len(),
             HealthFilter::Breached => {
                 self.breached.iter().map(|g| g.items.len()).sum::<usize>() + self.unknown.len()
             }
@@ -322,6 +326,8 @@ pub enum HealthFilter {
     All,
     Reused,
     Weak,
+    /// D5: unchanged for [`OLD_DAYS`] or more.
+    Old,
     Breached,
 }
 
@@ -331,8 +337,13 @@ impl HealthFilter {
     /// `All` first because it is where the screen opens; `Breached` last
     /// because it is the one that depends on something having been run, and a
     /// chip that is often empty does not belong where the eye lands first.
-    pub const ALL: [HealthFilter; 4] =
-        [HealthFilter::All, HealthFilter::Reused, HealthFilter::Weak, HealthFilter::Breached];
+    pub const ALL: [HealthFilter; 5] = [
+        HealthFilter::All,
+        HealthFilter::Reused,
+        HealthFilter::Weak,
+        HealthFilter::Old,
+        HealthFilter::Breached,
+    ];
 
     /// The chip's word.
     pub fn label(self) -> &'static str {
@@ -340,6 +351,7 @@ impl HealthFilter {
             HealthFilter::All => "All",
             HealthFilter::Reused => "Reused",
             HealthFilter::Weak => "Weak",
+            HealthFilter::Old => "Old",
             HealthFilter::Breached => "Breached",
         }
     }
@@ -351,6 +363,10 @@ impl HealthFilter {
 
     fn shows_weak(self) -> bool {
         matches!(self, HealthFilter::All | HealthFilter::Weak)
+    }
+
+    fn shows_old(self) -> bool {
+        matches!(self, HealthFilter::All | HealthFilter::Old)
     }
 
     fn shows_breached(self) -> bool {
@@ -557,9 +573,57 @@ pub fn report_with_scan(
         weak,
         breached,
         unknown,
+        old: old_items(items, super::detail::today_days()),
         scanned: !scan.is_empty(),
         with_password,
     }
+}
+
+/// D5's threshold.
+pub const OLD_DAYS: i64 = 365;
+pub const OLD_HEADING: &str = "OLD";
+
+/// A password unchanged for a year or more.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OldItem {
+    pub item: FoundItem,
+    pub days: i64,
+}
+
+/// How many days ago `item`'s password last changed: `passwordRevisionDate`,
+/// else the newest password-history entry, else `creationDate` -- the read
+/// pane's own rule (`revisionDate` moves on any edit, so it is never asked).
+/// `None` when none of them can be read.
+pub fn password_age_days(item: &VaultItem, today: i64) -> Option<i64> {
+    let login = item.login.as_ref()?;
+    let set = login
+        .other
+        .get("passwordRevisionDate")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .or_else(|| {
+            crate::vault_bridge::password_history(item).first().and_then(|entry| entry.last_used_date.clone())
+        })
+        .or_else(|| item.other.get("creationDate").and_then(|v| v.as_str()).map(str::to_string))?;
+    Some(today - super::detail::date_days(&set)?)
+}
+
+/// D5: every item with a password unchanged for [`OLD_DAYS`] or more. An
+/// item whose date cannot be read is never counted.
+pub fn old_items(items: &[VaultItem], today: i64) -> Vec<OldItem> {
+    items
+        .iter()
+        .filter(|item| password_of(item).is_some())
+        .filter_map(|item| {
+            let days = password_age_days(item, today)?;
+            (days >= OLD_DAYS).then(|| OldItem { item: found(item), days })
+        })
+        .collect()
+}
+
+/// An old finding's line.
+pub fn old_detail(old: &OldItem) -> String {
+    format!("Not changed in {} days", old.days)
 }
 
 /// The non-secret half of an item: what a finding row draws and clicks.
@@ -844,6 +908,16 @@ pub fn draw_password_health(
                         }
                     }
                 }
+                if filter.shows_old() && !report.old.is_empty() {
+                    section_heading(ui, OLD_HEADING);
+                    for old in &report.old {
+                        let detail = old_detail(old);
+                        let selected = selected_id.as_deref() == Some(old.item.id.as_str());
+                        if finding_row(ui, &old.item.name, Some(&detail), selected) {
+                            *selected_id = Some(old.item.id.clone());
+                        }
+                    }
+                }
                 if filter.shows_breached() {
                     if !report.breached.is_empty() {
                         section_heading(ui, BREACHED_HEADING);
@@ -1095,6 +1169,7 @@ pub fn nothing_under(filter: HealthFilter, report: &HealthReport) -> String {
         HealthFilter::All => "No reused, weak or breached passwords.".to_string(),
         HealthFilter::Reused => "No password in this vault is used twice.".to_string(),
         HealthFilter::Weak => "No password in this vault is weak.".to_string(),
+        HealthFilter::Old => "No password in this vault is a year old.".to_string(),
         // **The one filter whose empty state has two meanings**, and they are
         // opposite claims: nothing was found, or nothing was looked at. An
         // empty list cannot tell them apart, so the sentence does.
@@ -3230,5 +3305,61 @@ mod tests {
             health_spans(40, true),
             "the rows moved between a report that fits and one that scrolls"
         );
+    }
+}
+
+#[cfg(test)]
+mod old_password_tests {
+    //! D5.
+    use super::*;
+
+    fn login(extra: serde_json::Value) -> VaultItem {
+        let mut base = serde_json::json!({
+            "id": "1", "name": "Ledgerline", "type": 1,
+            "login": { "username": "a", "password": "correct-horse-battery-staple-7", "uris": [] }
+        });
+        if let (Some(base), Some(extra)) = (base.as_object_mut(), extra.as_object()) {
+            for (k, v) in extra {
+                if k == "passwordRevisionDate" {
+                    base["login"].as_object_mut().unwrap().insert(k.clone(), v.clone());
+                } else {
+                    base.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn today() -> i64 {
+        super::super::detail::date_days("2026-11-19").unwrap()
+    }
+
+    #[test]
+    fn a_password_unchanged_for_a_year_is_old() {
+        let old = login(serde_json::json!({ "passwordRevisionDate": "2025-10-01T00:00:00Z", "revisionDate": "2026-11-18T00:00:00Z" }));
+        let found = old_items(&[old], today());
+        assert_eq!(found.len(), 1, "an edit last week does not make an old password new");
+        assert_eq!(old_detail(&found[0]), "Not changed in 414 days");
+        let fresh = login(serde_json::json!({ "passwordRevisionDate": "2026-06-01T00:00:00Z" }));
+        assert!(old_items(&[fresh], today()).is_empty());
+        let created = login(serde_json::json!({ "creationDate": "2024-01-01T00:00:00Z" }));
+        assert_eq!(old_items(&[created], today()).len(), 1, "no change since it was created");
+    }
+
+    #[test]
+    fn an_item_with_no_password_date_is_not_old() {
+        let unknown = login(serde_json::json!({ "revisionDate": "2020-01-01T00:00:00Z" }));
+        assert!(old_items(&[unknown], today()).is_empty(), "revisionDate is never asked");
+    }
+
+    #[test]
+    fn old_counts_in_the_findings() {
+        let report = HealthReport {
+            old: vec![OldItem { item: FoundItem { id: "1".into(), name: "x".into() }, days: 400 }],
+            ..HealthReport::default()
+        };
+        assert_eq!(report.flagged_items(), 1);
+        assert_eq!(report.shown_under(HealthFilter::Old), 1);
+        assert_eq!(HealthFilter::Old.label(), "Old");
     }
 }
