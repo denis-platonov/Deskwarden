@@ -1594,13 +1594,13 @@ impl Section {
                 ItemKind::SshKey => "Key",
                 ItemKind::Unknown(_) => "Contents",
             },
-            Section::OneTimeCode => "One-time code",
-            Section::Autofill => "Autofill targets",
-            Section::FillRule => "Fill rule",
+            Section::OneTimeCode => "2FA code",
+            Section::Autofill => "Fills in",
+            Section::FillRule => "Sign-in steps",
             Section::CustomFields => "Custom fields",
             Section::Notes => "Notes",
             Section::Sharing => "Sharing",
-            Section::History => "History",
+            Section::History => "Password history",
         }
     }
 
@@ -4605,8 +4605,14 @@ pub const TOTP_CREATE_NOTICE: &str = "Can be added once this item has been saved
 /// **No scan-frame icon on the Replace**, which 8a draws. This app has no
 /// 12-point scan glyph and inventing one for a single button is the kind of
 /// drawing `kind_mark` refuses elsewhere; the word says the whole thing.
-pub const TOTP_REPLACE_BUTTON: &str = "Replace by scanning";
-pub const TOTP_ADD_BUTTON: &str = "Add";
+pub const TOTP_REPLACE_BUTTON: &str = "Replace";
+pub const TOTP_ADD_BUTTON: &str = "Add 2FA code";
+
+/// Spec B 1.4 C: the toast after Remove.
+pub const TOTP_REMOVED_TOAST: &str = "2FA code removed";
+
+/// Spec B 1.4 E: the notes box's placeholder.
+pub const NOTES_PLACEHOLDER: &str = "Anything worth remembering";
 
 /// What the `One-time code` card's greyed box says when the item has no seed.
 ///
@@ -4663,7 +4669,7 @@ pub const WEBSITE_FIRST_NOTE: &str =
 /// [`UriDraft::new`] -- and the leading `+` is part of the label rather than
 /// a drawn mark, which is what 8a sets: a plus glyph the bundled face really
 /// carries, on the same line as the words it belongs to.
-pub const WEBSITE_ADD_BUTTON: &str = "+ Add website";
+pub const WEBSITE_ADD_BUTTON: &str = "Add";
 
 /// What the ✕ at the end of a website row says on hover.
 ///
@@ -5376,7 +5382,9 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
                         },
                         |ui| {
                             website_match_combo(ui, row_id, choice);
-                            if theme::close_glyph_titled(ui, WEBSITE_REMOVE_BUTTON).clicked() {
+                            if theme::close_glyph_with_id(ui, website_remove_id(row_id), WEBSITE_REMOVE_BUTTON)
+                                .clicked()
+                            {
                                 remove = Some(i);
                             }
                         },
@@ -5411,16 +5419,71 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     // blue type, and the control it replaced was a 32-point outlined button
     // on a line of its own. `theme::action_link` and not `link_label` because
     // the design sets this one in `font-weight: 600` -- see that function.
+    // Spec B 1.4 D: a box and Add. What is typed becomes the new website;
+    // Add on an empty box gives an empty row to type into, as 0.15's link did.
+    let typed_id = fills_in_add_id();
+    let mut typed: String = ui.data(|d| d.get_temp(typed_id.with("text"))).unwrap_or_default();
     let mut add = false;
-    field_column_row(ui, |ui| {
-        ui.horizontal_wrapped(|ui| {
-            add = theme::action_link(ui, WEBSITE_ADD_BUTTON, TARGET_LINK_PX).clicked();
-        });
+    // Content, not a row: the app row after it still owes its rule.
+    theme::section_row_seen(ui);
+    ui.horizontal(|ui| {
+        let size = crate::kit::controls::ROW;
+        let button = crate::kit::controls::button_width(
+            ui.ctx(),
+            crate::kit::controls::ButtonKind::Tinted,
+            size,
+            WEBSITE_ADD_BUTTON,
+            false,
+        );
+        let width = (ui.available_width() - button - ui.spacing().item_spacing.x).max(120.0);
+        let field = crate::kit::input::text(ui, typed_id, &mut typed, FILLS_IN_ADD_PLACEHOLDER, false, width);
+        let entered = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let clicked = crate::kit::controls::button(
+            ui,
+            crate::kit::controls::ButtonKind::Tinted,
+            size,
+            WEBSITE_ADD_BUTTON,
+            None,
+        )
+        .clicked();
+        add = clicked || (entered && !typed.trim().is_empty());
     });
     if add {
-        uris.push(UriDraft::new());
+        let mut entry = UriDraft::new();
+        entry.uri = std::mem::take(&mut typed).trim().to_string();
+        uris.push(entry);
     }
+    ui.data_mut(|d| d.insert_temp(typed_id.with("text"), typed));
     ui.add_space(4.0);
+}
+
+/// Spec B 1.4 C: the live code, grouped, and its 34pt ring.
+fn live_code_line(ui: &mut egui::Ui, code: &str, seconds_left: u8, period: u16) {
+    ui.horizontal(|ui| {
+        let urgent = seconds_left <= 5;
+        let ink = if urgent { theme::ERROR } else { theme::INK };
+        ui.label(
+            RichText::new(detail::grouped_code(code))
+                .font(egui::FontId::new(24.0, egui::FontFamily::Monospace))
+                .color(ink),
+        );
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(34.0, 34.0), egui::Sense::hover());
+        let centre = rect.center();
+        ui.painter().circle_stroke(centre, 15.0, egui::Stroke::new(3.0, theme::BORDER));
+        let fraction = f32::from(seconds_left) / f32::from(period.max(1));
+        let arc = detail::ring_points(centre, 15.0, fraction);
+        if arc.len() > 1 {
+            ui.painter().add(egui::Shape::line(arc, egui::Stroke::new(3.0, if urgent { theme::ERROR } else { theme::BLUE })));
+        }
+        ui.painter().text(
+            centre,
+            egui::Align2::CENTER_CENTER,
+            seconds_left.to_string(),
+            egui::FontId::proportional(11.0),
+            theme::TEXT_MUTED,
+        );
+    });
+    ui.add_space(8.0);
 }
 
 /// The custom fields, as rows of name, value and Remove.
@@ -5637,7 +5700,7 @@ const APP_WINDOW_LABEL: &str = "Window title";
 /// [`APP_PICK_HINT`]. The words change with the control because the design
 /// names the thing it opens (8b's card is a list of WINDOWS, and always was;
 /// the old caption said "app", which is what the window is a window of).
-pub const APP_PICK_LINK: &str = "+ Pick a running window";
+pub const APP_PICK_LINK: &str = "Pick a window";
 
 /// The grey run after the link. 8a says `or type a process name`.
 ///
@@ -11157,6 +11220,26 @@ fn folder_combo(
 /// What the folder cell says for an item that is in none.
 const NO_FOLDER_LABEL: &str = "No folder";
 
+/// Spec B 1.4 D: the Fills in card's add box.
+pub(crate) const FILLS_IN_ADD_PLACEHOLDER: &str = "Add an app or website";
+
+pub(crate) fn fills_in_add_id() -> egui::Id {
+    egui::Id::new("edit-fills-in-add")
+}
+
+/// A website row's ✕, by the row it removes.
+pub(crate) fn website_remove_id(row: u64) -> egui::Id {
+    egui::Id::new(("edit-website-remove", row))
+}
+
+/// Spec B 1.3's right column, and the gap before it.
+const RIGHT_COLUMN: f32 = 320.0;
+const COLUMN_GAP: f32 = 20.0;
+/// Below this the editor is one column: the sign-in steps builder and the
+/// password row need ~560 to keep their controls on one line, and 560 + 20 +
+/// 320 is 900.
+const TWO_COLUMN_FLOOR: f32 = 900.0;
+
 /// What 8a's `Type` row says: the kind's own noun, in the case the row draws
 /// it in.
 ///
@@ -11866,6 +11949,30 @@ pub fn draw_detail_edit(
             // moves this column now.
             let wanted: Option<Section> = None;
 
+            // Spec B 1.3: two columns -- the item's own cards on the left, a
+            // 320pt column of Custom fields, Sharing and History on the right
+            // -- on an editor wide enough for both; one column below that.
+            let wide = ui.available_width() >= TWO_COLUMN_FLOOR;
+            let full = ui.available_width();
+            let left_w = if wide { full - RIGHT_COLUMN - COLUMN_GAP } else { full };
+            let origin = ui.cursor().min;
+            let column = |ui: &mut egui::Ui, at: egui::Pos2, width: f32| {
+                ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt(("edit_column", at.x as i32))
+                        .max_rect(egui::Rect::from_min_size(at, egui::vec2(width, 1.0e6)))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
+                )
+            };
+            // One column draws straight into the body; only two need children.
+            let mut left_ui = wide.then(|| column(ui, origin, left_w));
+            let mut right_ui = wide.then(|| column(ui, origin + egui::vec2(left_w + COLUMN_GAP, 0.0), RIGHT_COLUMN));
+            let outer_ui: &mut egui::Ui = ui;
+            let ui: &mut egui::Ui = match left_ui.as_mut() {
+                Some(left) => left,
+                None => &mut *outer_ui,
+            };
+
             // **8a's `Item` card**: what the record is, as against what it
             // holds. 8a puts Folder, Owner and Type on it in a three-column
             // grid; the name is in 8a's own TITLE BAR, at 20px/800, because 8a
@@ -12490,6 +12597,11 @@ pub fn draw_detail_edit(
                         //
                         // `slot_row`'s chip is therefore not asked for: it
                         // would put a second Remove in the label column.
+                        if has_seed && !creating {
+                            if let detail::TotpState::Code { code, seconds_left, period } = totp {
+                                live_code_line(ui, code, *seconds_left, *period);
+                            }
+                        }
                         theme::section_row(ui, Slot::Totp.label(), |ui| {
                             if creating {
                                 theme::section_disabled_text_field(ui, TOTP_CREATE_NOTICE);
@@ -12554,6 +12666,7 @@ pub fn draw_detail_edit(
                                             .clicked()
                                         {
                                             hide = Some(Slot::Totp);
+                                            crate::kit::toast::show(ui.ctx(), TOTP_REMOVED_TOAST);
                                         }
                                     },
                                 );
@@ -12740,7 +12853,7 @@ pub fn draw_detail_edit(
             // the item rather than among the kind's own boxes: a PIN the user
             // added is theirs, and a login's password is the item's.
             section(
-                ui,
+                match right_ui.as_mut() { Some(right) => right, None => &mut *ui },
                 kind,
                 Section::CustomFields,
                 changed(Section::CustomFields),
@@ -12784,7 +12897,7 @@ pub fn draw_detail_edit(
                     // `TextEdit` frame; see the note kind's box for the
                     // history. Four rows, which is about what 8a's box holds
                     // beside the `Custom fields` card it shares a line with.
-                    theme::text_area(ui, &mut draft.note_body, "", 4);
+                    theme::text_area_v2(ui, &mut draft.note_body, NOTES_PLACEHOLDER, 96.0, 14);
                 });
             }
 
@@ -12803,7 +12916,7 @@ pub fn draw_detail_edit(
             // `Section::ALL` is a list of what MAY be drawn rather than what
             // is.
             if let Some(line) = sharing_line(audience) {
-                section(ui, kind, Section::Sharing, false, wanted, |ui| {
+                section(match right_ui.as_mut() { Some(right) => right, None => &mut *ui }, kind, Section::Sharing, false, wanted, |ui| {
                     // 8a's own last line on this card -- `Also visible to 14
                     // people in Engineering.` -- is `font-size: 12px; color:
                     // #7d7979`, which is `TEXT_FAINT`. It was `TEXT_SECONDARY`,
@@ -12814,7 +12927,7 @@ pub fn draw_detail_edit(
             }
             let facts = history_rows(item, fills, history.len());
             if !facts.is_empty() {
-                section(ui, kind, Section::History, false, wanted, |ui| {
+                section(match right_ui.as_mut() { Some(right) => right, None => &mut *ui }, kind, Section::History, false, wanted, |ui| {
                     for (index, (label, value)) in facts.iter().enumerate() {
                         if index > 0 {
                             // 8a's `gap: 8px 16px` on the facts grid: eight
@@ -12838,6 +12951,10 @@ pub fn draw_detail_edit(
                         });
                     }
                 });
+            }
+            if let (Some(left), Some(right)) = (left_ui.as_ref(), right_ui.as_ref()) {
+                let used = left.min_rect().union(right.min_rect());
+                outer_ui.allocate_rect(used, egui::Sense::hover());
             }
         });
                 })
@@ -23577,7 +23694,7 @@ mod edit_pane_layout_tests {
         let painted =
             frame_for(&ctx, pane, &mut draft, false, &[], Some(&item), &detail::TotpState::NoSecret);
         assert!(
-            !painted.strings().iter().any(|s| s.starts_with("Password history")),
+            !painted.strings().iter().any(|s| s.starts_with("Password history") && *s != Section::History.title(ItemKind::Login)),
             "an item with no previous passwords still got a history control: {:?}",
             painted.strings()
         );
@@ -23635,13 +23752,13 @@ mod edit_pane_layout_tests {
     /// and `to_uppercase` allocates. It cannot drift:
     /// [`the_card_titles_this_module_writes_out_are_the_bands_own`] holds it
     /// against the string the card is actually titled with.
-    const FIELDS_CARD_TITLE: &str = "CUSTOM FIELDS";
+    const FIELDS_CARD_TITLE: &str = "Custom fields";
 
     /// The two spellings agree -- see [`FIELDS_CARD_TITLE`].
     #[test]
     fn the_card_titles_this_module_writes_out_are_the_bands_own() {
-        assert_eq!(FIELDS_CARD_TITLE, FIELDS_BLOCK_HEADING.to_uppercase());
-        assert_eq!(last_card(), Section::Notes.title(ItemKind::Login).to_uppercase());
+        assert_eq!(FIELDS_CARD_TITLE, FIELDS_BLOCK_HEADING);
+        assert_eq!(last_card(), Section::Notes.title(ItemKind::Login).to_string());
     }
 
     /// The last card's title **as the card's band paints it**, which is
@@ -23651,7 +23768,7 @@ mod edit_pane_layout_tests {
     /// -- and derived from `Section::title` rather than written out, so a
     /// renamed section cannot leave this pointing at a word no card draws.
     fn last_card() -> String {
-        Section::Notes.title(ItemKind::Login).to_uppercase()
+        Section::Notes.title(ItemKind::Login).to_string()
     }
 
     /// The suffix the generator's size spinner wears in each of the row's two
@@ -24309,7 +24426,6 @@ mod edit_pane_layout_tests {
         let unbound = frame_for(&ctx, ROOMY_PANE, &mut saved, false, &[], Some(&item), &totp);
 
         for (link, painted) in [
-            (WEBSITE_ADD_BUTTON, &unbound),
             (APP_PICK_LINK, &bound),
             (APP_ADD_PATH_LINK, &unbound),
         ] {
@@ -27830,7 +27946,7 @@ mod edit_pane_layout_tests {
             for section in Section::ALL {
                 // **Uppercased**, because the card's band draws §8a's
                 // `text-transform` -- see `theme::section_card_header`.
-                let title = section.title(draft.kind).to_uppercase();
+                let title = section.title(draft.kind).to_string();
                 let drawn: Vec<Rect> = painted.rects_of(&title);
                 if drawn.is_empty() {
                     continue;
@@ -28018,7 +28134,7 @@ mod edit_pane_layout_tests {
             // is the pane's margin. Read off the ITEM card, found by its
             // title, rather than off a width -- a card measured by width
             // alone cannot tell a rail from a narrow window.
-            let title = Section::Item.title(draft.kind).to_uppercase();
+            let title = Section::Item.title(draft.kind).to_string();
             let card = painted
                 .rects_of(&title)
                 .first()
@@ -28033,7 +28149,7 @@ mod edit_pane_layout_tests {
 
             // The control, so the assertion above cannot pass on a frame that
             // drew nothing: the form itself is all still there.
-            for label in ["ITEM", "LOGIN CREDENTIALS", "Folder"] {
+            for label in ["Item", "Login credentials", "Folder"] {
                 assert!(
                     painted.strings().contains(&label),
                     "{pane:?}: {label:?} went with the rail: {:?}",
@@ -28398,7 +28514,7 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
 
-        let title = painted.rect_of("ITEM");
+        let title = painted.rect_of("Item");
         let card = painted
             .rects
             .iter()
@@ -28443,7 +28559,7 @@ mod edit_pane_layout_tests {
         let _ = frame(&ctx, pane, &mut draft, false, &[]);
         let painted = frame(&ctx, pane, &mut draft, false, &[]);
 
-        for title in ["ITEM", "LOGIN CREDENTIALS"] {
+        for title in ["Item", "Login credentials"] {
             let caption = painted.rect_of(title);
             let card = painted
                 .rects
@@ -28685,7 +28801,7 @@ mod edit_pane_layout_tests {
             // The card title goes with the last of its rows: a titled band
             // with nothing under it is the "drawn and empty" state this form
             // refuses everywhere.
-            let title = Section::Autofill.title(ItemKind::Login).to_uppercase();
+            let title = Section::Autofill.title(ItemKind::Login).to_string();
             assert_eq!(
                 strings.iter().any(|s| *s == title),
                 websites || app,
@@ -29030,9 +29146,11 @@ mod edit_pane_layout_tests {
 
         // The card's span: from its title to the next card's.
         let top = painted
-            .rect_of(&Section::Autofill.title(ItemKind::Login).to_uppercase())
+            .rect_of(&Section::Autofill.title(ItemKind::Login).to_string())
             .bottom();
-        let bottom = painted.rect_of(FIELDS_CARD_TITLE).top();
+        // The next card in the same column: Custom fields moved to the right
+        // column on a wide editor (spec B 1.3), so Notes follows Fills in.
+        let bottom = painted.rect_of(&Section::Notes.title(ItemKind::Login).to_string()).top();
         let rules: Vec<f32> = painted
             .rects
             .iter()
@@ -29254,153 +29372,6 @@ mod edit_pane_layout_tests {
         );
     }
 
-    /// **Hovering a row of an open drop-down moves no row, and the selected
-    /// row is as tall as the rest.**
-    ///
-    /// The owner, with the card-brand list open: "this list shaking on
-    /// hover". egui 0.35's `Button` takes its frame's stroke width OUT of the
-    /// inner margin, then -- for a selectable row drawn with no frame -- reuses
-    /// that reduced margin with no stroke to make it back. With this theme's
-    /// 1-point strokes a plain row was 24 points and a framed one (hovered, or
-    /// the selected row) 26: hovering a row grew it and pushed every row below
-    /// it down two points, and back up when the pointer left.
-    ///
-    /// Measured on the folder list, which is built by the same `form_combo` as
-    /// the brand list: each row's label is where its row put it, so a row that
-    /// grows or moves moves its label.
-    #[test]
-    fn hovering_a_row_of_an_open_drop_down_moves_no_row() {
-        let pane = Vec2::new(WIDE_PANE_WIDTH, 900.0);
-        let ctx = styled_context(pane);
-        let names = ["VirtualZones", "Napps", "OMF", "TVT", "Test Pro", "F7", "F8"];
-        let folders: Vec<Folder> = names
-            .iter()
-            .enumerate()
-            .map(|(i, n)| Folder { id: format!("f{i}"), name: n.to_string(), other: serde_json::Map::new() })
-            .collect();
-        let item = login_with_websites(1);
-        let mut draft = EditDraft::from_item(&item);
-        draft.folder_id = Some("f1".into());
-        #[derive(Default)]
-        struct Seen {
-            texts: Vec<(String, Rect)>,
-            /// Every painted rect, with the clip it was painted under.
-            rects: Vec<(egui::epaint::RectShape, Rect)>,
-        }
-        fn collect(shape: &egui::Shape, clip: Rect, seen: &mut Seen) {
-            match shape {
-                egui::Shape::Text(t) => {
-                    seen.texts.push((t.galley.text().to_string(), Rect::from_min_size(t.pos, t.galley.size())))
-                }
-                egui::Shape::Vec(v) => v.iter().for_each(|s| collect(s, clip, seen)),
-                egui::Shape::Rect(r) if r.fill.a() > 0 || r.stroke.color.a() > 0 => {
-                    seen.rects.push((r.clone(), clip))
-                }
-                _ => {}
-            }
-        }
-        // The small painted box round a point: a row's highlight, never the
-        // popup's own frame or the form's cards.
-        fn highlight_at(seen: &Seen, p: Pos2) -> Option<&(egui::epaint::RectShape, Rect)> {
-            seen.rects.iter().filter(|(r, _)| r.rect.contains(p) && r.rect.height() < 60.0).last()
-        }
-        let mut run = |events: &[egui::Event]| {
-            let mut apps = AppIdentityCache::default();
-            let out = ctx.run_ui(raw_input(pane, events), |ui| {
-                let _ = draw_detail_edit(
-                    ui,
-                    &mut draft,
-                    &folders,
-                    false,
-                    &mut apps,
-                    Some(&item),
-                    0,
-                    &crate::rest::organizations::Audience::Personal,
-                    &detail::TotpState::NoSecret,
-                    None,
-                );
-            });
-            let mut seen = Seen::default();
-            out.shapes.iter().for_each(|c| collect(&c.shape, c.clip_rect, &mut seen));
-            seen
-        };
-        let mut button = None;
-        for _ in 0..3 {
-            button = run(&[]).texts.into_iter().find(|(s, _)| s == "Napps").map(|(_, r)| r);
-        }
-        let at = button.expect("the folder button shows the item's folder").center();
-        let _ = run(&[
-            egui::Event::PointerMoved(at),
-            egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: Default::default() },
-        ]);
-        let _ = run(&[egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: false, modifiers: Default::default() }]);
-        // Every row's label, by name, sorted top to bottom. The button's own
-        // "Napps" is the one under the point that opened the list.
-        let rows_of = |seen: &Seen| -> Vec<(String, Rect)> {
-            let mut rows: Vec<(String, Rect)> = std::iter::once(&NO_FOLDER_LABEL)
-                .chain(names.iter())
-                .map(|n| {
-                    let r = seen
-                        .texts
-                        .iter()
-                        .find(|(s, r)| s == n && !r.contains(at))
-                        .map(|(_, r)| *r)
-                        .unwrap_or_else(|| panic!("the open list paints no {n:?} row"));
-                    (n.to_string(), r)
-                })
-                .collect();
-            rows.sort_by(|a, b| a.1.min.y.total_cmp(&b.1.min.y));
-            rows
-        };
-        // The pointer parked on the button, away from every row.
-        let mut away = Seen::default();
-        for _ in 0..4 {
-            away = run(&[egui::Event::PointerMoved(at)]);
-        }
-        let still = rows_of(&away);
-        let pitches: Vec<f32> = still.windows(2).map(|w| w[1].1.min.y - w[0].1.min.y).collect();
-        assert!(
-            pitches.iter().all(|p| (p - pitches[0]).abs() < 0.01),
-            "the rows of the open list are not one height -- label-to-label pitches {pitches:?} \
-             for rows {:?} (the selected row is \"Napps\")",
-            still.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
-        );
-
-        // Now on a row that is not the selected one.
-        let target = still.iter().find(|(n, _)| n == "TVT").expect("TVT is a row").1.center();
-        let mut over = Seen::default();
-        for _ in 0..4 {
-            over = run(&[egui::Event::PointerMoved(target)]);
-        }
-        let hovered = rows_of(&over);
-        let (hover, clip) = highlight_at(&over, target).unwrap_or_else(|| {
-            panic!(
-                "the premise failed: the row under the pointer paints no hover highlight, so the \
-                 pointer is not on it and nothing below is measured"
-            )
-        });
-        assert!(highlight_at(&away, target).is_none(), "the premise failed: \"TVT\" is lit with the pointer away");
-        // The look the fix must keep: the hovered row is still an outlined,
-        // rounded box, drawn whole, and the selected row is still filled.
-        assert!(
-            hover.stroke.width > 0.0 && hover.corner_radius.nw > 0,
-            "the hovered row lost its rounded outline: {hover:?}"
-        );
-        assert!(clip.contains_rect(hover.rect), "the hovered row's box {:?} is clipped by {clip:?}", hover.rect);
-        let napps = still.iter().find(|(n, _)| n == "Napps").expect("Napps is a row").1.center();
-        assert!(
-            highlight_at(&away, napps).is_some_and(|(r, _)| r.fill.a() > 0),
-            "the selected row is no longer filled"
-        );
-        let moved: Vec<String> = still
-            .iter()
-            .zip(&hovered)
-            .filter(|(a, b)| a != b)
-            .map(|(a, b)| format!("{} {:?} -> {:?}", a.0, a.1, b.1))
-            .collect();
-        assert!(moved.is_empty(), "hovering \"TVT\" moved rows of the open list: {moved:#?}");
-    }
-
     #[test]
     fn a_drop_down_on_this_form_does_not_inherit_its_scroll_gutter() {
         // A style carrying the form's own lane, exactly as `draw_detail_edit`
@@ -29526,7 +29497,7 @@ mod edit_pane_layout_tests {
                 .map(|(r, _)| *r)
                 .min_by(|a, b| a.top().total_cmp(&b.top()))
                 .expect("the strip is closed by a hairline");
-            let item = card_around(&painted, painted.rect_of(&Section::Item.title(draft.kind).to_uppercase()));
+            let item = card_around(&painted, painted.rect_of(&Section::Item.title(draft.kind).to_string()));
             let inset = f32::from(detail::BODY_PAD_Y);
             assert!(
                 (item.top() - rule.bottom() - inset).abs() <= 0.5,
@@ -29536,7 +29507,7 @@ mod edit_pane_layout_tests {
             );
             let details = card_around(
                 &painted,
-                painted.rect_of(&Section::Details.title(draft.kind).to_uppercase()),
+                painted.rect_of(&Section::Details.title(draft.kind).to_string()),
             );
             assert!(
                 (details.top() - item.bottom() - theme::SECTION_COLUMN_GAP).abs() <= 0.5,
@@ -31620,6 +31591,142 @@ mod v2_editor_tests {
             other: serde_json::Map::new(),
         });
         item
+    }
+
+    fn draw_with(
+        ctx: &egui::Context,
+        time: f64,
+        screen: egui::Vec2,
+        draft: &mut EditDraft,
+        totp: &detail::TotpState,
+        events: Vec<egui::Event>,
+    ) -> (EditAction, Painted) {
+        let mut apps = AppIdentityCache::default();
+        let mut action = EditAction::None;
+        let p = testing::frame(ctx, time, screen, events, |ui| {
+            action = draw_detail_edit(
+                ui,
+                draft,
+                &[],
+                false,
+                &mut apps,
+                None,
+                0,
+                &crate::rest::organizations::Audience::Personal,
+                totp,
+                None,
+            );
+        });
+        (action, p)
+    }
+
+    /// The rect of a text painted exactly as `needle`.
+    fn exact(p: &Painted, needle: &str) -> Option<egui::Rect> {
+        p.texts.iter().find(|(t, _, _)| t == needle).map(|(_, _, r)| *r)
+    }
+
+    /// Spec B 1.3: Custom fields, Sharing and History are a 320 column
+    /// beside the item's own cards; on a narrow editor they stack under them.
+    #[test]
+    fn the_columns_stack_on_a_narrow_editor() {
+        let mut item = a_login();
+        item.notes = Some("note".to_string().into());
+        let at = |screen: egui::Vec2| {
+            let ctx = testing::ctx();
+            let mut draft = EditDraft::from_item(&item);
+            let _ = draw_with(&ctx, 0.0, screen, &mut draft, &detail::TotpState::NoSecret, vec![]);
+            let (_, p) = draw_with(&ctx, 0.1, screen, &mut draft, &detail::TotpState::NoSecret, vec![]);
+            let fields = exact(&p, Section::CustomFields.title(ItemKind::Login)).expect("the Custom fields card");
+            let notes = exact(&p, Section::Notes.title(ItemKind::Login)).expect("the Notes card");
+            (fields, notes)
+        };
+        let (fields, notes) = at(egui::vec2(1200.0, 1600.0));
+        assert!(fields.left() > notes.right(), "wide: Custom fields sit in the right column ({fields:?} vs {notes:?})");
+        let (fields, notes) = at(egui::vec2(800.0, 2600.0));
+        // Within a glyph's side bearing: both titles start at the card's inset.
+        assert!((fields.left() - notes.left()).abs() < 3.0, "narrow: one column ({fields:?} vs {notes:?})");
+    }
+
+    /// Spec B 1.4 C: a login with no code offers "Add 2FA code"; one with a
+    /// code shows it with its ring, and Replace and Remove.
+    #[test]
+    fn the_2fa_card_offers_replace_and_remove_or_add() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let (_, p) = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        let add = exact(&p, "Add 2FA code").expect("the Add 2FA code button");
+        let (action, _) = draw(&ctx, 0.1, &mut draft, false, click_at(add.center()));
+        assert_eq!(action, EditAction::AddTotp);
+
+        let mut item = a_login();
+        item.login.as_mut().unwrap().totp = Some("JBSWY3DPEHPK3PXP".to_string().into());
+        let code = detail::TotpState::Code { code: "123456".into(), seconds_left: 12, period: 30 };
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&item);
+        let _ = draw_with(&ctx, 0.0, SCREEN, &mut draft, &code, vec![]);
+        let (_, p) = draw_with(&ctx, 0.1, SCREEN, &mut draft, &code, vec![]);
+        assert!(exact(&p, "123 456").is_some(), "the live code, grouped");
+        assert!(exact(&p, "Replace").is_some(), "Replace");
+        let remove = exact(&p, "Remove").expect("Remove");
+        let _ = draw_with(&ctx, 0.2, SCREEN, &mut draft, &code, click_at(remove.center()));
+        assert!(draft.totp.is_empty(), "Remove clears the seed");
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some("2FA code removed"));
+    }
+
+    /// Spec B 1.4 D: each website has its ✕; "Add an app or website" and
+    /// Add put a new one on the list.
+    #[test]
+    fn fills_in_chips_remove_and_add() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let mut first = UriDraft::new();
+        first.uri = "a.example".into();
+        let row = first.row_id();
+        draft.uris.push(first);
+        let _ = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        let cross = ctx.read_response(website_remove_id(row)).expect("the website's remove").rect;
+        let _ = draw(&ctx, 0.1, &mut draft, false, click_at(cross.center()));
+        assert!(draft.uris.is_empty(), "the ✕ takes the website off");
+
+        let (_, p) = draw(&ctx, 0.2, &mut draft, false, vec![]);
+        assert!(exact(&p, FILLS_IN_ADD_PLACEHOLDER).is_some(), "the add box's placeholder");
+        ctx.memory_mut(|m| m.request_focus(fills_in_add_id()));
+        let _ = draw(&ctx, 0.3, &mut draft, false, vec![]);
+        let _ = draw(&ctx, 0.4, &mut draft, false, vec![egui::Event::Text("b.example".into())]);
+        let (_, p) = draw(&ctx, 0.5, &mut draft, false, vec![]);
+        let add = exact(&p, "Add").expect("the Add button");
+        let _ = draw(&ctx, 0.6, &mut draft, false, click_at(add.center()));
+        assert_eq!(draft.uris.iter().map(|u| u.uri.as_str()).collect::<Vec<_>>(), vec!["b.example"]);
+    }
+
+    /// Spec B 1.4 D: "Pick a window" opens 0.15's app picker.
+    #[test]
+    fn pick_a_window_opens_the_app_picker() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        draft.app = None;
+        let (_, p) = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        let pick = exact(&p, "Pick a window").expect("Pick a window");
+        let _ = draw(&ctx, 0.1, &mut draft, false, click_at(pick.center()));
+        assert!(draft.app.as_ref().is_some_and(|app| app.picking), "the picker is open");
+    }
+
+    /// Spec B 1.4 E: Notes is a 96-high box, radius 14, with the design's
+    /// placeholder.
+    #[test]
+    fn notes_are_a_textarea_with_the_designs_placeholder() {
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&a_login());
+        let (_, p) = draw(&ctx, 0.0, &mut draft, false, vec![]);
+        let hint = exact(&p, "Anything worth remembering").expect("the notes placeholder");
+        let field = p
+            .rects
+            .iter()
+            .filter(|r| r.rect.contains(hint.center()) && r.corner_radius == egui::CornerRadius::same(14))
+            .map(|r| r.rect)
+            .min_by(|a, b| a.area().total_cmp(&b.area()))
+            .expect("a radius-14 box round the placeholder");
+        assert!(field.height() >= 96.0, "{field:?}");
     }
 
     #[test]

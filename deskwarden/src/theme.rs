@@ -4625,6 +4625,15 @@ pub fn close_glyph(ui: &mut Ui) -> Response {
 /// paints two line segments and no glyph, so a reader has nothing to read.
 /// See `detail_edit`'s `WEBSITE_REMOVE_BUTTON` and `APP_REMOVE_BUTTON`, which
 /// are the two sentences this form hands it.
+/// [`close_glyph_titled`] under a stable id, so a test (or a later frame)
+/// can find this one mark among many.
+pub fn close_glyph_with_id(ui: &mut Ui, id: egui::Id, tooltip: &str) -> Response {
+    let (rect, _) = ui.allocate_exact_size(Vec2::splat(CLOSE_MARK_HIT), Sense::hover());
+    let response = ui.interact(rect, id, Sense::click());
+    paint_close_mark(ui, rect, &response, CloseInk::OnCard);
+    response.on_hover_text(tooltip.to_string())
+}
+
 pub fn close_glyph_titled(ui: &mut Ui, tooltip: &str) -> Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(CLOSE_MARK_HIT), Sense::click());
     paint_close_mark(ui, rect, &response, CloseInk::OnCard);
@@ -6957,6 +6966,22 @@ const TEXT_AREA_PAD_Y: f32 = 9.0;
 /// page. It is measured from the text this frame rather than fixed beforehand,
 /// because a note longer than a fixed box ran straight out of the bottom of it.
 pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Response {
+    text_area_shaped(ui, value, hint, rows, 0.0, FIELD_RADIUS)
+}
+
+/// Spec B 1.4 E's notes box: at least `min_height` tall, radius `radius`.
+pub fn text_area_v2(ui: &mut Ui, value: &mut String, hint: &str, min_height: f32, radius: u8) -> Response {
+    text_area_shaped(ui, value, hint, 4, min_height, radius)
+}
+
+fn text_area_shaped(
+    ui: &mut Ui,
+    value: &mut String,
+    hint: &str,
+    rows: usize,
+    min_height: f32,
+    radius: u8,
+) -> Response {
     let bg = ui.painter().add(egui::Shape::Noop);
     let row_height = text_area_row(ui);
     let top_left = ui.next_widget_position();
@@ -6979,7 +7004,10 @@ pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Re
     );
     let outer = Rect::from_min_size(
         top_left,
-        Vec2::new(width, response.rect.height().max(inner.height()) + TEXT_AREA_PAD_Y * 2.0),
+        Vec2::new(
+            width,
+            (response.rect.height().max(inner.height()) + TEXT_AREA_PAD_Y * 2.0).max(min_height),
+        ),
     );
     ui.advance_cursor_after_rect(outer);
     let border = field_border(ui, outer, response.has_focus());
@@ -6987,7 +7015,7 @@ pub fn text_area(ui: &mut Ui, value: &mut String, hint: &str, rows: usize) -> Re
         bg,
         egui::epaint::RectShape::new(
             outer,
-            CornerRadius::same(FIELD_RADIUS),
+            CornerRadius::same(radius),
             CARD,
             border,
             StrokeKind::Middle,
@@ -8475,7 +8503,8 @@ pub fn form_footer_note_width(ui: &Ui, text: &str) -> f32 {
 
 /// §8a's `border-radius: 10px`. Two less than [`FORM_CARD_RADIUS`]; see the
 /// block comment for why the two cards are not one.
-pub const SECTION_CARD_RADIUS: u8 = 10;
+/// Spec B 0.6: the editor's cards are radius 18.
+pub const SECTION_CARD_RADIUS: u8 = 18;
 
 /// §8a's `padding: 11px 16px` header and `12px 16px` rows, in the horizontal
 /// axis, **for a card too narrow to draw at 16**. See [`section_card_pad_x`],
@@ -8783,6 +8812,7 @@ pub fn section_rows_fit_at(width: f32) -> bool {
 pub fn section_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R) {
     let framed = egui::Frame::new()
         .fill(CARD)
+        .shadow(crate::kit::tokens::card_shadow())
         .corner_radius(CornerRadius::same(SECTION_CARD_RADIUS))
         // **This card does NOT reserve its 1-point border, and `detail::card`
         // does.** So its bands sit one point higher and two points wider than
@@ -8846,6 +8876,9 @@ pub fn section_card<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> (Rect, R)
 /// (see `section_rows_fit`'s neighbours), and a dirty state that is only
 /// visible in a column that is only sometimes on screen is a dirty state the
 /// user cannot rely on.
+/// The editor's card titles (spec B 0.6: 18px/800).
+pub const EDIT_CARD_TITLE_PX: f32 = 18.0;
+
 pub fn section_card_header(ui: &mut Ui, title: &str, note: &str, changed: bool) -> Rect {
     section_card_header_at(ui, SECTION_CARD_PAD_X, title, note, changed)
 }
@@ -8874,9 +8907,10 @@ pub fn section_card_header_at(
     // what the bottom gives up -- so the band keeps the height 2b and 8a both
     // give it. `ink_drop` is this module's own measurement of the slack; see
     // it for why the correction is not a fudge factor.
+    // Spec B 0.6: a card's title is 18/800 in ink, set as written.
     let drop = ink_drop(
         ui.ctx(),
-        &FontId::new(SECTION_TITLE_PX, FontFamily::Name(BOLD.into())),
+        &FontId::new(EDIT_CARD_TITLE_PX, FontFamily::Name(EXTRABOLD.into())),
         None,
     )
     .round() as i8;
@@ -8921,11 +8955,11 @@ pub fn section_card_header_at(
                 // are one click apart and were reading as two applications.
                 let title_rect = ui
                     .label(letterspaced(
-                        &title.to_uppercase(),
-                        SECTION_TITLE_PX,
-                        BOLD,
-                        SECTION_TITLE_TRACKING,
-                        TEXT_MUTED,
+                        title,
+                        EDIT_CARD_TITLE_PX,
+                        EXTRABOLD,
+                        -0.18,
+                        INK,
                     ))
                     .rect;
                 if !note.is_empty() {
