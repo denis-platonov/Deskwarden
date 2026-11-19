@@ -1,7 +1,7 @@
 //! Spec C §1: the Generator as its own screen -- a password, a passphrase or
 //! a PIN, with its options remembered between runs.
 
-use eframe::egui::{self, Color32, CornerRadius, Vec2};
+use eframe::egui::{self, Color32, Vec2};
 use zeroize::Zeroizing;
 
 use crate::generator_mode::{generator_strength, GeneratorMode};
@@ -150,17 +150,17 @@ pub fn draw(ui: &mut egui::Ui, state: &mut GeneratorScreen) -> GeneratorAction {
     }
 }
 
+/// The kit's card (ring and soft shadow); a shadow alone reads as clipped
+/// corners on the light page.
 fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(18))
-        .shadow(crate::kit::tokens::card_shadow())
-        .inner_margin(22)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            add(ui);
-        });
+    crate::kit::card::card(ui, 18, egui::Margin::same(22), |ui| {
+        ui.set_width(ui.available_width());
+        add(ui);
+    });
 }
+
+/// The slider's empty rail.
+const SLIDER_RAIL: Color32 = Color32::from_rgb(0xe6, 0xe3, 0xdf);
 
 fn value_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
     card(ui, |ui| {
@@ -218,8 +218,15 @@ fn options_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
         ui.horizontal(|ui| {
             ui.label(theme::bold(label, 15.0).color(theme::INK));
             ui.add_space(12.0);
+            // egui's default rail is the card's own white: paint it a
+            // visible grey with a blue trailing fill.
+            let visuals = ui.visuals_mut();
+            visuals.widgets.inactive.bg_fill = SLIDER_RAIL;
+            visuals.widgets.inactive.weak_bg_fill = SLIDER_RAIL;
+            visuals.selection.bg_fill = theme::BLUE;
             ui.spacing_mut().slider_width = (ui.available_width() - 80.0).max(120.0);
-            ui.add(egui::Slider::new(value, range));
+            ui.spacing_mut().slider_rail_height = 6.0;
+            ui.add(egui::Slider::new(value, range).trailing_fill(true));
         });
         if state.prefs.mode == GeneratorMode::Password {
             ui.add_space(14.0);
@@ -231,14 +238,14 @@ fn options_card(ui: &mut egui::Ui, state: &mut GeneratorScreen) {
                     ("0-9", &mut state.prefs.numbers),
                     ("!@#", &mut state.prefs.symbols),
                 ] {
-                    ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         controls::switch(ui, on);
                         ui.label(theme::bold(text, 15.0).color(theme::INK));
                     });
                 }
             });
             ui.add_space(12.0);
-            ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 controls::switch(ui, &mut state.prefs.avoid_lookalikes);
                 ui.label(theme::bold(AVOID_LOOKALIKES, 15.0).color(theme::INK));
             });

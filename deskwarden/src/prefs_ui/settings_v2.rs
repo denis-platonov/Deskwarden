@@ -336,6 +336,8 @@ const KEEP_RUNNING_SUB: &str = "Autofill only works while Deskwarden is running.
 const KEEP_RUNNING_VALUE: &str = "Always";
 const STARTUP_FAILED_TOAST: &str = "Could not change the Windows startup entry";
 /// The Security rows' wording (spec C 2.4).
+const IDLE_LOCK_SUB: &str = "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
+const IDLE_MINUTES_SUB: &str = "Minutes of no activity. One minute is the shortest.";
 pub const LOCK_ON_SLEEP_LABEL: &str = "Lock when the computer sleeps";
 pub const LOCK_ON_SCREEN_LOCK_LABEL: &str = "Lock when I lock my screen";
 pub const HIDE_ON_SHARE_LABEL: &str = "Hide passwords while I share my screen";
@@ -393,8 +395,18 @@ fn apps(ui: &mut Ui, state: &mut PrefsState) {
 fn security(ui: &mut Ui, state: &mut PrefsState) {
     super::security_score::draw(ui);
     group(ui, Some("Locking"), |ui| {
-        prefs::draw_lock(ui, state);
+        // One card in this page's row style: the idle lock, its minutes,
+        // and the two away events (the 0.x Lock card's rows, folded in).
         card(ui, |ui| {
+            switch_row(ui, prefs::AUTO_LOCK_ENABLED_LABEL, IDLE_LOCK_SUB, &mut state.settings.auto_lock_enabled, true);
+            kit_card::row_rule(ui);
+            let enabled = state.settings.auto_lock_enabled;
+            let stepper_w = prefs::STEPPER_STEP_WIDTH * 2.0 + prefs::STEPPER_VALUE_WIDTH;
+            row(ui, prefs::AUTO_LOCK_LABEL, IDLE_MINUTES_SUB, !enabled, stepper_w, |ui| {
+                state.settings.auto_lock_minutes =
+                    prefs::minutes_stepper(ui, state.settings.auto_lock_minutes, &mut state.auto_lock_text, enabled);
+            });
+            kit_card::row_rule(ui);
             let s = &mut state.settings;
             switch_row(ui, LOCK_ON_SLEEP_LABEL, "", &mut s.lock_on_sleep, true);
             kit_card::row_rule(ui);

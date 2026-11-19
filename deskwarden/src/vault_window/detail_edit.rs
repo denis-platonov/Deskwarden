@@ -10772,7 +10772,20 @@ fn edit_header(
     let column_h = kind_galley.size().y + 2.0 + title_h;
     let top = row.center().y - column_h / 2.0;
     ui.painter().galley(egui::pos2(left, top), kind_galley.clone(), p.text_label);
-    let pencil = egui::Rect::from_min_size(egui::pos2(right - 30.0, top + kind_galley.size().y + 2.0 + 3.0), egui::Vec2::splat(30.0));
+    // The pencil follows the name (with room for the field's own margins)
+    // rather than waiting at the far edge of a wide header.
+    let shown = if draft.name.is_empty() { if creating { "Give it a name" } else { "Untitled" } } else { draft.name.as_str() };
+    let name_w = ctx.fonts_mut(|f| {
+        f.layout_no_wrap(
+            shown.to_owned(),
+            egui::FontId::new(28.0, egui::FontFamily::Name(theme::EXTRABOLD.into())),
+            p.ink,
+        )
+        .size()
+        .x
+    });
+    let pencil_x = (left + name_w + 8.0 + 4.0 + 8.0).min(right - 30.0);
+    let pencil = egui::Rect::from_min_size(egui::pos2(pencil_x, top + kind_galley.size().y + 2.0 + 3.0), egui::Vec2::splat(30.0));
     let field = egui::Rect::from_min_max(
         egui::pos2(left - 8.0, top + kind_galley.size().y + 2.0),
         egui::pos2(pencil.left() - 8.0, top + kind_galley.size().y + 2.0 + title_h),
