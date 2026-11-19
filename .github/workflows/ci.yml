@@ -196,6 +196,14 @@ jobs:
         working-directory: deskwarden
         run: cargo test -j 8
 
+      # The Microsoft Store edition (docs/store/microsoft/packaging.md): the
+      # same library with the self-updater and the Bitwarden CLI download
+      # switched off. Its own run, because the gates are constants and the
+      # Store-only assertions are no-ops in the run above.
+      - name: Run the library tests, Store edition
+        working-directory: deskwarden
+        run: cargo test --lib --features store -j 8
+
       # "Zero warnings, including a shipping build" is a standing rule in
       # every plan in docs/superpowers/plans. A rule nothing enforces is a
       # rule that decays, so it is enforced here.

@@ -60,6 +60,43 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+// ---- the Microsoft Store edition -----------------------------------------
+
+/// Whether this build updates itself. `false` in the Microsoft Store edition
+/// (`--features store`), where the Store is the only thing that may replace
+/// the program: Store policy forbids an app updating itself outside the Store
+/// and restricts downloading executable code.
+///
+/// Under it [`check_for_update`], [`download_and_verify`] and
+/// [`apply_update`] each refuse before touching the network, the disk or the
+/// installer, so there is no path by which this build fetches or runs a
+/// replacement of itself. See `docs/store/microsoft/packaging.md`.
+pub const SELF_UPDATE: bool = !cfg!(feature = "store");
+
+/// What the Updates page says in place of its check and download controls
+/// when [`SELF_UPDATE`] is off.
+pub const STORE_UPDATES_NOTICE: &str = "Updates come from the Microsoft Store";
+
+/// The one hook the Preferences -> Updates page reads: `Some(sentence)` in
+/// the Store edition (show it, hide the check/download/install controls and
+/// the automatic-check switch), `None` everywhere else.
+#[must_use]
+pub fn store_updates_notice() -> Option<&'static str> {
+    if SELF_UPDATE {
+        None
+    } else {
+        Some(STORE_UPDATES_NOTICE)
+    }
+}
+
+/// The refusal an update action gives in the Store edition.
+fn store_refusal(what: &str) -> String {
+    format!(
+        "this is the Microsoft Store edition of Deskwarden, which never {what}: \
+         updates come from the Microsoft Store"
+    )
+}
+
 /// A SHA-256 digest, as 32 raw bytes.
 ///
 /// A newtype rather than a `String` so that the comparison at the gate is
@@ -818,6 +855,12 @@ pub fn check_for_update(
         log::debug!("update check skipped: this is a test profile");
         return Ok(None);
     }
+    // **The Store edition never looks.** After the profile gate and before
+    // the first request, so no request is made at all.
+    if !SELF_UPDATE {
+        log::debug!("update check skipped: Microsoft Store edition");
+        return Ok(None);
+    }
     let url = format!(
         "{base_url}/repos/denis-platonov/deskwarden/releases?per_page={RELEASES_PER_PAGE}"
     );
@@ -1248,6 +1291,9 @@ pub fn download_and_verify(
     if !crate::app_profile::touches_the_installed_copy() {
         return Err(crate::app_profile::installed_copy_refusal("downloads an update"));
     }
+    if !SELF_UPDATE {
+        return Err(store_refusal("downloads an update"));
+    }
     // Created here rather than assumed to exist: this is a dedicated cache
     // subdirectory (see `main.rs`), not the config directory the rest of the
     // app already creates at startup.
@@ -1677,6 +1723,9 @@ pub fn apply_update(dest_dir: &Path, release: &ReleaseInfo) -> Result<(), String
     if !crate::app_profile::touches_the_installed_copy() {
         return Err(crate::app_profile::installed_copy_refusal("runs the installer"));
     }
+    if !SELF_UPDATE {
+        return Err(store_refusal("runs an installer"));
+    }
     apply_update_with(dest_dir, release, &UpdaterEnv::production())
 }
 
@@ -1704,8 +1753,81 @@ mod tests {
         format!("[{release}]")
     }
 
+    // ---- the Microsoft Store edition (`--features store`) ------------------
+
+    // **These tests read `SELF_UPDATE`, not `cfg!`/`#[cfg]` on the feature.**
+    // `job_object`'s build-divergence guard allows exactly ONE `cfg!` naming
+    // the `store` feature in this crate -- the definition of `SELF_UPDATE` --
+    // so everything below asks the constant. The consequence: the Store
+    // assertions are no-ops in a default test run and bite under
+    // `cargo test --lib --features store`, which CI runs; the tests that
+    // need the real network are no-ops under it.
+
+    /// The flag and the hook say one thing.
+    #[test]
+    fn the_edition_flag_and_the_ui_hook_agree() {
+        assert_eq!(SELF_UPDATE, store_updates_notice().is_none());
+        if let Some(sentence) = store_updates_notice() {
+            assert_eq!(sentence, "Updates come from the Microsoft Store");
+        }
+    }
+
+    /// **No request, no file, no installer** in the Store edition: the check
+    /// is pointed at a port nothing listens on and still answers `Ok(None)`
+    /// (a request would be `Err`), and the download and the install refuse by
+    /// name before touching the disk.
+    #[test]
+    fn the_store_edition_never_checks_downloads_or_installs() {
+        if SELF_UPDATE {
+            return;
+        }
+        let current = Version::parse("0.0.1").unwrap();
+        let agent = build_api_agent();
+        assert_eq!(check_for_update("http://127.0.0.1:1", &current, &agent), Ok(None));
+
+        let release = ReleaseInfo {
+            version: Version::parse("9.9.9").unwrap(),
+            installer_download_url: "http://127.0.0.1:1/deskwarden-9.9.9-installer.exe".into(),
+            installer_sha256: parse_asset_digest(&format!("sha256:{}", "11".repeat(32))).unwrap(),
+            body: String::new(),
+        };
+        let dir = std::env::temp_dir().join("deskwarden-store-edition-never-downloads");
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = download_and_verify(&release, &dir, &build_download_agent(), NO_PROGRESS)
+            .expect_err("the Store edition downloaded");
+        assert!(error.contains("Microsoft Store"), "{error}");
+        assert!(!dir.exists(), "the refusal created {}", dir.display());
+        let error = apply_update(&dir, &release).expect_err("the Store edition ran an installer");
+        assert!(error.contains("Microsoft Store"), "{error}");
+    }
+
+    /// The gates are in gating position in the source: each store refusal
+    /// comes before the first act, in every build, so a build without the
+    /// feature cannot silently lose them.
+    #[test]
+    fn every_update_action_asks_the_edition_before_it_acts() {
+        let code = production_slice();
+        let gate = concat!("if !SELF_", "UPDATE {");
+        for (function, first_act) in [
+            ("pub fn check_for_update(", ".get(&url)"),
+            ("pub fn download_and_verify(", "create_dir_all("),
+            ("pub fn apply_update(", "apply_update_with("),
+        ] {
+            let body = &code[code.find(function).unwrap_or_else(|| panic!("no {function}"))..];
+            let body = &body[..body.find("\n}").unwrap()];
+            let asked = body.find(gate).unwrap_or_else(|| panic!("`{function}` never asks"));
+            let acted = body.find(first_act).unwrap_or_else(|| panic!("control: {first_act}"));
+            assert!(asked < acted, "`{function}` acts before it asks the edition");
+        }
+    }
+
     #[test]
     fn reports_a_newer_release_as_available() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.2.0",
@@ -1750,6 +1872,11 @@ mod tests {
     /// exact prose the mock served.
     #[test]
     fn the_release_notes_come_back_with_the_version_from_the_one_response() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.2.0",
@@ -1881,6 +2008,11 @@ mod tests {
     /// comes from in production.
     #[test]
     fn the_notes_cover_every_release_the_user_skipped_newest_first() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let released = |v: &str, what: &str| format!("## What's new in {v}\\n{what}");
         let releases = [
             a_release_json("v0.8.4", &released("0.8.4", "the newest thing"), ""),
@@ -1928,6 +2060,11 @@ mod tests {
     /// wrong one is visible rather than coincidentally right.
     #[test]
     fn the_installer_and_its_digest_come_from_the_newest_release_alone() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let releases = [
             a_release_json("v0.8.2", "older", ""),
             a_release_json("v0.8.4", "newest", ""),
@@ -1951,6 +2088,11 @@ mod tests {
     /// line of notes.
     #[test]
     fn drafts_and_prereleases_are_excluded_from_the_range() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let releases = [
             a_release_json("v0.9.0", "a draft", r#""draft": true,"#),
             a_release_json("v0.8.9", "a prerelease", r#""prerelease": true,"#),
@@ -1985,6 +2127,11 @@ mod tests {
     /// from a gap in the numbers what the page could simply say.
     #[test]
     fn a_release_with_no_notes_is_still_named_in_the_range() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let releases = [
             a_release_json("v0.8.4", "the newest thing", ""),
             a_release_json("v0.8.3", "", ""),
@@ -2005,6 +2152,11 @@ mod tests {
     /// down with it.
     #[test]
     fn a_tag_that_is_not_a_version_is_skipped_rather_than_fatal() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let releases = [
             a_release_json("nightly", "not a version", ""),
             a_release_json("v0.8.4", "the real one", ""),
@@ -2025,6 +2177,11 @@ mod tests {
     /// ended.
     #[test]
     fn a_very_long_range_is_cut_and_says_that_it_was() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let releases: Vec<String> = (1..=MAX_NOTES_RELEASES + 5)
             .rev()
             .map(|n| a_release_json(&format!("v0.{n}.0"), &format!("release {n}"), ""))
@@ -2053,6 +2210,11 @@ mod tests {
     /// passing.
     #[test]
     fn the_check_asks_for_exactly_one_page_of_a_stated_size() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", RELEASES_PATH)
@@ -2630,6 +2792,11 @@ mod tests {
 
     #[test]
     fn selects_the_installer_asset_even_when_a_bare_exe_is_also_present() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         // Task 6's release workflow publishes both a bare `deskwarden.exe` and
         // a `*-installer.exe`. This test pins the selection logic to picking
         // the installer specifically, regardless of asset order.
@@ -2676,6 +2843,11 @@ mod tests {
     /// to make that true is here, before anything is downloaded.
     #[test]
     fn a_release_whose_installer_has_no_digest_is_refused_rather_than_offered() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let mut server = crate::test_http::server();
         let body = r#"{
             "tag_name": "v1.2.0",
@@ -2706,6 +2878,11 @@ mod tests {
     /// accepted into a value the gate would then compare against.
     #[test]
     fn a_release_whose_digest_is_malformed_is_refused_rather_than_offered() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let sixty_four = "a".repeat(64);
         for bad in [
             // No algorithm qualifier: 64 hex characters that might be anything.
@@ -2829,6 +3006,11 @@ mod tests {
     /// same code, same fixture size, different digest on the release.
     #[test]
     fn a_download_whose_digest_does_not_match_is_deleted_and_refused() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/deskwarden-9.9.9-installer.exe")
@@ -2870,6 +3052,11 @@ mod tests {
     /// replaced.
     #[test]
     fn a_download_whose_digest_matches_is_kept_and_its_path_returned() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let mut server = crate::test_http::server();
         let _m = server
             .mock("GET", "/deskwarden-9.9.9-installer.exe")
@@ -3117,6 +3304,11 @@ mod tests {
 
     #[test]
     fn errors_when_no_installer_asset_is_present() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let mut server = crate::test_http::server();
         let body = r#"{"tag_name": "v1.2.0", "assets": []}"#;
         let _m = server
@@ -3422,6 +3614,11 @@ mod tests {
     /// fails to open it and the refusal happens before any spawn.
     #[test]
     fn apply_update_launches_only_the_file_the_download_pass_wrote() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !SELF_UPDATE {
+            return;
+        }
         let dir = scratch_dir("apply-constructs");
         let release = ReleaseInfo {
             version: Version::parse("9.9.9").unwrap(),

@@ -285,6 +285,11 @@ pub enum AcquireRefusal {
     /// Everything arrived and verified, and the file could not be put where
     /// it belongs.
     CouldNotInstall(String),
+    /// The Microsoft Store edition (`--features store`) never downloads the
+    /// CLI: Store policy restricts downloading executable code. Refused
+    /// before the first request. Not retryable -- pressing Continue again
+    /// cannot change the edition.
+    NotInThisEdition,
 }
 
 impl AcquireRefusal {
@@ -344,6 +349,11 @@ impl AcquireRefusal {
                  but could not install it. Try again. bitwarden.com requires the Bitwarden \
                  CLI; a self-hosted server does not."
                 .to_string(),
+            Self::NotInThisEdition => "The Microsoft Store edition of Deskwarden does not \
+                 download programs, so it cannot fetch the Bitwarden CLI that bitwarden.com \
+                 requires. Install the Bitwarden CLI yourself from bitwarden.com/help/cli/ \
+                 and sign in again, or use a self-hosted server, which does not need it."
+                .to_string(),
         }
     }
 
@@ -356,7 +366,7 @@ impl AcquireRefusal {
     /// up or when one attempt happens to slip through.
     #[must_use]
     pub fn retryable(&self) -> bool {
-        !matches!(self, Self::NotBitwardenSigned { .. })
+        !matches!(self, Self::NotBitwardenSigned { .. } | Self::NotInThisEdition)
     }
 }
 
@@ -926,6 +936,12 @@ pub fn acquire_if_needed(
 ) -> Result<AcquireOutcome, AcquireRefusal> {
     if let Some(existing) = (env.already_present)() {
         return Ok(AcquireOutcome::AlreadyPresent(existing));
+    }
+    // **The Store edition downloads nothing.** After the already-present
+    // check (using a `bw` the user installed is not a download) and before
+    // the first request.
+    if !crate::updater::SELF_UPDATE {
+        return Err(AcquireRefusal::NotInThisEdition);
     }
 
     on_stage(AcquireStage::Resolving);
@@ -1750,6 +1766,51 @@ mod tests {
             m.contains("Continue"),
             "a declined user is not told how to change their mind: {m:?}"
         );
+    }
+
+    /// The Store edition's refusal says what it is and what to do, and does
+    /// not offer another attempt.
+    #[test]
+    fn the_store_refusal_names_the_edition_the_cli_and_the_way_out() {
+        let r = AcquireRefusal::NotInThisEdition;
+        let m = r.message();
+        for needle in ["Microsoft Store", "Bitwarden CLI", "bitwarden.com", "self-hosted"] {
+            assert!(m.contains(needle), "{m:?} does not say {needle}");
+        }
+        assert!(!r.retryable());
+    }
+
+    /// In the Store edition nothing is resolved, downloaded or installed:
+    /// every seam is a panic, and the answer is the edition's refusal. With
+    /// the feature off the same seams are reached (the rest of this module).
+    #[test]
+    fn the_store_edition_never_fetches_the_cli() {
+        // A no-op unless built `--features store`; see the note in
+        // `updater::tests` on why this reads the constant and not `cfg`.
+        if crate::updater::SELF_UPDATE {
+            return;
+        }
+        fn boom<T>() -> T {
+            panic!("the Store edition reached a download seam")
+        }
+        let env = BwAcquireEnv {
+            already_present: || None,
+            resolve: |_| boom(),
+            download: |_, _, _, _| boom(),
+            extract: |_, _| boom(),
+            verify: |_| boom(),
+            install: |_| boom(),
+        };
+        assert_eq!(
+            acquire_if_needed(&env, &|_| boom()),
+            Err(AcquireRefusal::NotInThisEdition)
+        );
+        // A `bw` the user installed is used, not refused: nothing is downloaded.
+        let env = BwAcquireEnv { already_present: || Some(PathBuf::from("bw.exe")), ..env };
+        assert!(matches!(
+            acquire_if_needed(&env, &|_| boom()),
+            Ok(AcquireOutcome::AlreadyPresent(_))
+        ));
     }
 
     /// Retryability is per-variant, and the signature failure is the one that
@@ -3061,6 +3122,11 @@ mod tests {
     /// immediately if it is wrong.
     #[test]
     fn an_existing_binary_short_circuits_before_the_resolver() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !crate::updater::SELF_UPDATE {
+            return;
+        }
         let _guard = counters_locked();
         let env = BwAcquireEnv::substitute(present_at_a_path, verify_counting_ok);
         let result = acquire_if_needed(&env, &|_| {});
@@ -3092,6 +3158,11 @@ mod tests {
     /// rather than as something vaguer.
     #[test]
     fn a_resolver_failure_never_reaches_the_install() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !crate::updater::SELF_UPDATE {
+            return;
+        }
         let _guard = counters_locked();
         let env = BwAcquireEnv::substitute(absent, verify_counting_ok);
         let refusal = acquire_if_needed(&env, &|_| {}).expect_err("the stub resolver fails");
@@ -3112,6 +3183,11 @@ mod tests {
     /// not a bare spinner.
     #[test]
     fn the_stages_are_reported_as_they_happen() {
+        // Needs the self-updater / the CLI download, neither of which the
+        // Microsoft Store edition has; those refusals are pinned in their own test.
+        if !crate::updater::SELF_UPDATE {
+            return;
+        }
         let _guard = counters_locked();
         let seen = std::sync::Mutex::new(Vec::new());
         let env = BwAcquireEnv::substitute(absent, verify_counting_ok);

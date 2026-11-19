@@ -3178,7 +3178,20 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (29701, 0xcb35_0ed7_b18a_6775) exactly, so it is measuring
             // what this test measures.
-            (29705, 0x6fcc_62cc_c06d_5cda_u64),
+            // **30230 bytes, new hash: the `store` FEATURE was declared.**
+            // `[features]` gained `store = []` and its comment block (525 bytes).
+            // No dependency was added, removed, re-pointed or re-featured, no
+            // `[patch]`/`[replace]`/`[workspace.dependencies]` table appeared, no path or
+            // fork appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. The feature itself is policed by the build-divergence
+            // test below (`nothing_in_this_crate_is_compiled_differently_when_it_is_tested`):
+            // declared features are exactly `test-support` and `store`, and the one `cfg!`
+            // naming `store` is `updater::SELF_UPDATE`.
+            //
+            // Recomputed in a separate implementation outside this crate, which was first
+            // run against the PREVIOUS pinned pair and reproduced
+            // (29705, 0x6fcc_62cc_c06d_5cda) exactly.
+            (30230, 0x5ed9_4133_1732_0372_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
@@ -6607,6 +6620,17 @@ mod tests {
                 .any(|token| token == "test")
         };
 
+        // **THE ONE SANCTIONED `cfg!`: the Microsoft Store edition.**
+        // `updater::SELF_UPDATE` is `!cfg!(feature = "store")`, and it is the
+        // only place in the crate allowed to ask which edition this is. The
+        // Store edition is a DIFFERENT SHIPPED PRODUCT (it may not update
+        // itself or download programs), not the same product compiled
+        // differently under test: CI runs the whole suite on both editions
+        // (`cargo test --lib` and `cargo test --lib --features store`), so
+        // "the tested build is the shipped build" holds for each. Everything
+        // else -- tests included -- asks the constant. Counted here and
+        // pinned to `updater.rs` below; a second one is red.
+        let mut store_bangs = 0usize;
         let mut offenders = Vec::new();
         for file in &files {
             let text = std::fs::read_to_string(file).unwrap();
@@ -6622,9 +6646,23 @@ mod tests {
             // The second shape, and the one the `not(` scan is blind to.
             // Every `cfg!`, whatever it asks about.
             for predicate in cfg_bang_predicates(&text) {
+                if predicate == "feature=" && file.ends_with("updater.rs") {
+                    store_bangs += 1;
+                    continue;
+                }
                 offenders.push(format!("{}: cfg!({predicate})", file.display()));
             }
         }
+        assert_eq!(
+            store_bangs, 1,
+            "the Store edition's one `cfg!` (updater::SELF_UPDATE) is not exactly one"
+        );
+        let updater_raw = std::fs::read_to_string(src.join("updater.rs")).unwrap();
+        assert_eq!(
+            updater_raw.matches(concat!("cfg!(fea", "ture = \"store\")")).count(),
+            1,
+            "the one sanctioned `cfg!` in updater.rs does not name the `store` feature"
+        );
         assert!(
             offenders.is_empty(),
             "this crate compiles differently when it is under test, so the suite is green about \
@@ -6677,6 +6715,9 @@ mod tests {
         // to tell an additive gate from a subtractive one, and the `any(test,`
         // is what does that.
         const TEST_ONLY_FEATURES: [&str; 1] = [concat!("test-", "support")];
+        // The shipped-edition feature, sanctioned above and below, and not
+        // test-only: see "THE ONE SANCTIONED `cfg!`".
+        const EDITION_FEATURES: [&str; 1] = ["store"];
         const FEATURES_TABLE: &str = concat!("[fea", "tures]");
         const FEATURE_CFG: &str = "feature=";
         const TEST_ONLY_GATE: &str = "#[cfg(any(test,feature=))]";
@@ -6699,10 +6740,15 @@ mod tests {
                 .filter(|name| !name.is_empty() && !name.starts_with('#'))
                 .collect(),
         };
+        let allowed: Vec<String> = TEST_ONLY_FEATURES
+            .iter()
+            .chain(EDITION_FEATURES.iter())
+            .map(|name| name.to_string())
+            .collect();
         assert_eq!(
             declared,
-            TEST_ONLY_FEATURES.to_vec(),
-            "this crate's declared Cargo features are no longer exactly {TEST_ONLY_FEATURES:?}. \
+            allowed,
+            "this crate's declared Cargo features are no longer exactly {allowed:?}. \
              A feature is a third way to compile the shipped binary differently from the tested \
              library, and neither matcher above can see one. Adding one is allowed only on the \
              terms below: it must be turned on by a dev-dependency and never by default, and \
@@ -6722,7 +6768,11 @@ mod tests {
         let mut feature_gates = Vec::new();
         for file in &files {
             let text = code_only(&std::fs::read_to_string(file).unwrap());
-            let named = text.matches(FEATURE_CFG).count();
+            // The Store edition's one `cfg!` (counted and pinned above) is
+            // the only non-additive feature gate; it is subtracted here so
+            // this scan keeps meaning "no OTHER feature gate".
+            let edition = text.matches(concat!("cfg!(", "feature=)")).count();
+            let named = text.matches(FEATURE_CFG).count() - edition;
             let additive = text.matches(TEST_ONLY_GATE).count();
             if named != additive {
                 feature_gates.push(format!(
