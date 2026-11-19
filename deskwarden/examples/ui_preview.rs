@@ -2801,7 +2801,7 @@ impl Preview {
                         sidebar::VaultLists { health_findings: 4, ..sidebar::VaultLists::live_only(&fixtures.list) },
                         &fixtures.rail_folders,
                         selected,
-                        sidebar::Screens { sends, health, received, scope },
+                        sidebar::Screens { sends, health, received, generator: &mut false, scope },
                         "Locks in 11:42",
                         false,
                     );
@@ -2854,7 +2854,7 @@ impl Preview {
                     },
                     &fixtures.rail_folders,
                     selected,
-                    sidebar::Screens { sends, health, received, scope },
+                    sidebar::Screens { sends, health, received, generator: &mut false, scope },
                     "Locks in 11:42",
                     false,
                 );

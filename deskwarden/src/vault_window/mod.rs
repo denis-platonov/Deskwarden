@@ -10,6 +10,7 @@ pub mod detail;
 pub mod detail_edit;
 pub mod detail_slide;
 pub mod folder_modal;
+pub mod generator_screen;
 pub mod icon_modal;
 pub mod item_list;
 pub mod new_item_modal;
@@ -1133,6 +1134,9 @@ pub fn build_frame_with_search(
     // line in `receive_history.json` rather than anything in the vault list,
     // so no `SidebarFilter` predicate can express it either.
     let mut received_selected = false;
+    // Slice 6: the Generator screen, and its state while it is open.
+    let mut generator_selected = false;
+    let mut generator: Option<generator_screen::GeneratorScreen> = None;
     // Which of design 5b's three SHARING sub-filters is in force. A THIRD
     // axis, orthogonal to both `filter` and the screen flags, and `Screens`
     // is the one place it is written -- see `sidebar::SendScope`, which
@@ -1830,6 +1834,8 @@ pub fn build_frame_with_search(
     let waiting_for_show = std::rc::Rc::new(std::cell::Cell::new(false));
     let woken = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
 
+    // The Generator screen reads and writes its options here (slice 6).
+    let generator_settings_path = settings_path.clone();
     let vault_frame_fn = move |ui: &mut egui::Ui| {
         // **The hidden window's whole life, run before anything paints.**
         //
@@ -3424,6 +3430,7 @@ pub fn build_frame_with_search(
                         sends: &mut sends_selected,
                         health: &mut health_selected,
                         received: &mut received_selected,
+                        generator: &mut generator_selected,
                         scope: &mut send_scope,
                     },
                     &lock_countdown,
@@ -3593,7 +3600,7 @@ pub fn build_frame_with_search(
         // appear exactly once in this file. Two panels sharing an id would
         // make that guard unable to tell an item list drawn here from one
         // drawn on the Sends screen.
-        if !show_sends && on_health {
+        if !show_sends && on_health && !generator_selected {
             egui::Panel::left("vault-password-health")
                 .exact_size(LIST_WIDTH)
                 .resizable(false)
@@ -3670,7 +3677,7 @@ pub fn build_frame_with_search(
         // Spec B 1: the editor is a page of its own -- the list column steps
         // aside while a draft is open.
         let editing = matches!(mode, DetailMode::Edit(_) | DetailMode::Create(_));
-        let detail_pane_width = if show_sends || on_health {
+        let detail_pane_width = if show_sends || on_health || generator_selected {
             0.0
         } else if editing {
             ui.available_width()
@@ -3678,7 +3685,7 @@ pub fn build_frame_with_search(
             let full = (ui.available_width() - LIST_WIDTH).max(0.0);
             detail_slide.width(ui.ctx(), full, selected_id.is_some())
         };
-        if !show_sends && !on_health && !editing {
+        if !show_sends && !on_health && !editing && !generator_selected {
             // **Whether a detail pane is on screen RIGHT NOW**, read before
             // the list is drawn, because the list is what changes it. This is
             // the "with no details panel" half of the owner's second gesture:
@@ -4572,6 +4579,25 @@ pub fn build_frame_with_search(
                 // account" and "a failed fetch" become three different
                 // things -- see `send_ui::pane_state`, where that decision
                 // is tested.
+                // Slice 6: the Generator takes the list's and the pane's place.
+                if generator_selected && !show_sends {
+                    let state = generator.get_or_insert_with(|| {
+                        generator_screen::GeneratorScreen::new(
+                            generator_settings_path
+                                .as_deref()
+                                .map(|path| crate::settings::Settings::load(path).generator)
+                                .unwrap_or_default(),
+                        )
+                    });
+                    if generator_screen::draw(ui, state) == generator_screen::GeneratorAction::PrefsChanged {
+                        if let Some(path) = generator_settings_path.as_deref() {
+                            if let Err(e) = crate::settings::Settings::persist_generator(path, &state.prefs) {
+                                log::warn!("the generator's options could not be saved: {e:?}");
+                            }
+                        }
+                    }
+                    return send_ui::no_sends_screen_this_frame();
+                }
                 if let Some(state) = &show_sends
                     .then(|| send_ui::with_sent_facts(send_ui::pane_state(send_fetch.result.as_ref(), &crate::send::SystemClock, &crate::local_time::SystemZone), &sent_history))
                 {
@@ -7185,6 +7211,12 @@ pub fn build_frame_with_search(
                             }
                         }
                         palette::PaletteAction::Share => send_record_asked = true,
+                        palette::PaletteAction::Generate => {
+                            sends_selected = false;
+                            received_selected = false;
+                            health_selected = false;
+                            generator_selected = true;
+                        }
                         palette::PaletteAction::Settings => {
                             sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::OpenSettings)
                         }
@@ -24832,6 +24864,7 @@ mod the_idle_timer_follows_the_edited_setting {
                     sends: &mut false,
                     health: &mut false,
                     received: &mut false,
+                    generator: &mut false,
                     scope: &mut sidebar::SendScope::All,
                 },
                 lock_countdown,
@@ -38128,9 +38161,11 @@ mod send_delete_wiring {
             "the frame draws the Sends pane {} times, not once",
             code.matches(concat!("draw_send_", "pane(")).count()
         );
+        // Two: the detail pane's, and the Generator screen's (slice 6) --
+        // neither is the Sends screen, and both are the panel's only answer.
         assert_eq!(
             code.matches(concat!("no_sends_screen_this_", "frame()")).count(),
-            1,
+            2,
             "the one verdict this module may mint without drawing the pane is written {} \
              times, not once. Each extra one is a place the real verdict can be dropped \
              for an inert one",

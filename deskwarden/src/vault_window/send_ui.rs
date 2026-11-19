@@ -14010,7 +14010,7 @@ mod source_pins {
     #[test]
     fn the_item_list_is_drawn_only_inside_the_not_sends_gate() {
         let production = production();
-        let gate = concat!("        if !show_", "sends && !on_health && !editing {\r\n");
+        let gate = concat!("        if !show_", "sends && !on_health && !editing && !generator_selected {\r\n");
         assert_eq!(
             production.matches(gate).count(),
             1,

@@ -25,6 +25,8 @@ const ACTIVE: Color32 = Color32::from_rgb(0xee, 0xf2, 0xfc);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PaletteAction {
     NewLogin,
+    /// Slice 6: the Generator screen.
+    Generate,
     Share,
     Settings,
     Lock,
@@ -70,11 +72,13 @@ pub fn matching_items<'a>(items: &'a [VaultItem], query: &str) -> Vec<&'a VaultI
 }
 
 /// The actions whose label holds the query. "Share" is offered only with an
-/// item selected. (Generate and Import join with their screens, slices 6
-/// and 9.)
+/// item selected. (Import joins with its wizard, slice 9.)
 pub fn matching_actions(selected: Option<&str>, query: &str) -> Vec<ActionRow> {
     let query = query.trim().to_lowercase();
-    let mut rows = vec![ActionRow { action: PaletteAction::NewLogin, label: "New login".into(), hint: "Ctrl N", glyph: glyph::LOGIN }];
+    let mut rows = vec![
+        ActionRow { action: PaletteAction::NewLogin, label: "New login".into(), hint: "Ctrl N", glyph: glyph::LOGIN },
+        ActionRow { action: PaletteAction::Generate, label: "Generate a password".into(), hint: "", glyph: glyph::GEN },
+    ];
     if let Some(name) = selected {
         rows.push(ActionRow { action: PaletteAction::Share, label: format!("Share {name}"), hint: "", glyph: glyph::SHARED });
     }
@@ -280,7 +284,7 @@ mod tests {
     #[test]
     fn actions_filter_by_label() {
         let labels = |q: &str| matching_actions(Some("Ledgerline"), q).into_iter().map(|a| a.label).collect::<Vec<_>>();
-        assert_eq!(labels(""), vec!["New login", "Share Ledgerline", "Open settings", "Lock now"]);
+        assert_eq!(labels(""), vec!["New login", "Generate a password", "Share Ledgerline", "Open settings", "Lock now"]);
         assert_eq!(labels("lock"), vec!["Lock now"]);
         assert!(matching_actions(None, "share").is_empty(), "no Share without an item");
     }

@@ -879,6 +879,8 @@ pub struct Screens<'a> {
     pub health: &'a mut bool,
     /// Design 5b's `Shared with me`. See [`RECEIVED_ROW_LABEL`].
     pub received: &'a mut bool,
+    /// Slice 6: the Generator screen.
+    pub generator: &'a mut bool,
     /// Which SHARING sub-row is in force, meaningful only while `sends` is
     /// true. See [`SendScope`].
     pub scope: &'a mut SendScope,
@@ -892,13 +894,15 @@ pub enum Screen {
     /// Design 5b's `Shared with me`: the local record of what was imported
     /// from somebody else's link.
     Received,
+    /// Slice 6: the Generator screen.
+    Generator,
 }
 
 impl Screens<'_> {
     /// Whether any screen is up -- i.e. whether `selected` is currently
     /// describing a row the user is NOT looking at.
     pub fn any(&self) -> bool {
-        *self.sends || *self.health || *self.received
+        *self.sends || *self.health || *self.received || *self.generator
     }
 
     /// Whether this particular screen is the one that is up.
@@ -907,6 +911,7 @@ impl Screens<'_> {
             Screen::Sends => *self.sends,
             Screen::Health => *self.health,
             Screen::Received => *self.received,
+            Screen::Generator => *self.generator,
         }
     }
 
@@ -940,6 +945,7 @@ impl Screens<'_> {
         *self.sends = false;
         *self.health = false;
         *self.received = false;
+        *self.generator = false;
         // See the type's docs: the scope belongs to the Sends screen, so
         // leaving that screen by ANY door puts it back.
         *self.scope = SendScope::All;
@@ -953,6 +959,7 @@ impl Screens<'_> {
             Screen::Sends => *self.sends = true,
             Screen::Health => *self.health = true,
             Screen::Received => *self.received = true,
+            Screen::Generator => *self.generator = true,
         }
     }
 
@@ -1674,6 +1681,9 @@ fn draw_organisations(
 /// which no per-item `scope_contains` can answer. So they are flags in
 /// [`Screens`] rather than [`SidebarFilter`] variants, and [`Screens::select`]
 /// is the only way in.
+/// Slice 6: the TOOLS row for the Generator screen.
+pub const GENERATOR_ROW_LABEL: &str = "Generator";
+
 fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_>) -> bool {
     use crate::kit::icon::glyph;
     ui.spacing_mut().item_spacing.y = ROW_GAP;
@@ -1704,6 +1714,14 @@ fn tools_rows(ui: &mut egui::Ui, lists: VaultLists<'_>, screens: &mut Screens<'_
         let count = badge_text(Some(lists.health_findings));
         if sidebar_row(ui, glyph::HEALTH, label, Some(&count), on, width, 0.0, ROW_HEIGHT).clicked() {
             screens.select(Screen::Health);
+        }
+    }
+    {
+        // Slice 6: the Generator screen.
+        let width = ui.available_width();
+        let on = screens.is(Screen::Generator);
+        if sidebar_row(ui, glyph::GEN, GENERATOR_ROW_LABEL, None, on, width, 0.0, ROW_HEIGHT).clicked() {
+            screens.select(Screen::Generator);
         }
     }
     let width = ui.available_width();
@@ -2197,6 +2215,7 @@ mod drag_and_drop_tests {
                                     sends: &mut false,
                                     health: &mut false,
                                     received: &mut false,
+                                    generator: &mut false,
                                     scope: &mut SendScope::All,
                                 },
                                 "Locks in 11:42",
@@ -2432,6 +2451,7 @@ mod drag_and_drop_tests {
                                     sends,
                                     health,
                                     received: &mut false,
+                                    generator: &mut false,
                                     scope: &mut SendScope::All,
                                 },
                                 countdown,
@@ -2608,6 +2628,7 @@ mod drag_and_drop_tests {
                                     sends: &mut false,
                                     health: &mut false,
                                     received: &mut false,
+                                    generator: &mut false,
                                     scope: &mut SendScope::All,
                                 },
                                 "Locks in 11:42",
@@ -3278,6 +3299,7 @@ mod tests {
                     sends: &mut sends_selected,
                     health: &mut health_selected,
                     received: &mut false,
+                    generator: &mut false,
                     scope: &mut SendScope::All,
                 },
                 lock_countdown,
@@ -3947,6 +3969,7 @@ mod tests {
                             sends: &mut sends,
                             health: &mut health,
                             received: &mut false,
+                            generator: &mut false,
                             scope: &mut SendScope::All,
                         },
                     "Locks in 11:42",
@@ -4074,6 +4097,7 @@ mod tests {
                     sends: &mut sends_selected,
                     health: &mut health_selected,
                     received: &mut false,
+                    generator: &mut false,
                     scope: &mut SendScope::All,
                 },
                     "Locks in 11:42",
@@ -4277,6 +4301,7 @@ mod tests {
                             sends: &mut sends,
                             health: &mut health,
                             received: &mut false,
+                            generator: &mut false,
                             scope: &mut SendScope::All,
                         },
                             "Locks in 11:42",
@@ -4440,6 +4465,7 @@ mod tests {
                             sends: &mut sends,
                             health: &mut health,
                             received: &mut false,
+                            generator: &mut false,
                             scope: &mut SendScope::All,
                         },
                             COUNTDOWN,
@@ -5144,6 +5170,7 @@ mod v2_rail_tests {
                                 sends: &mut self.sends,
                                 health: &mut self.health,
                                 received: &mut self.received,
+                                generator: &mut false,
                                 scope: &mut self.scope,
                             },
                             countdown,
