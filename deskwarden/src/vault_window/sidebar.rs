@@ -971,7 +971,7 @@ pub(crate) const PANEL_PAD_X: i8 = 14;
 ///
 /// A function because it is drawn in two places -- the window and the rail's
 /// own tests -- and they must be the same frame.
-pub(crate) fn panel_frame(style: crate::kit::tokens::SidebarStyle) -> egui::Frame {
+pub fn panel_frame(style: crate::kit::tokens::SidebarStyle) -> egui::Frame {
     egui::Frame::new().fill(style.palette().bg).inner_margin(egui::Margin {
         left: PANEL_PAD_X,
         right: 0,

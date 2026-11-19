@@ -23,6 +23,7 @@
 //! cargo run --example ui_preview -- --totp --screenshot         # designs 6a/6c/6d, the add-a-code card, seven states
 //! cargo run --example ui_preview -- --edit --screenshot         # design 8a's Edit login form, five states
 //! cargo run --example ui_preview -- --kit --screenshot          # the v2 kit sheet (1.0 redesign)
+//! cargo run --example ui_preview -- --shell --screenshot        # the v2 shell, navy and light, and the splash
 //! cargo run --example ui_preview -- --all                 # EVERY surface below
 //! ```
 //!
@@ -638,6 +639,13 @@ enum Surface {
     /// Every piece is drawn through `kit`'s own calls, so nothing here is a
     /// second drawing that could drift.
     KitSheet,
+    /// **The v2 shell, whole**: the real rail (navy), the real top bar, and
+    /// the 0.15 list and detail panes beneath it, at design 1a's 1280x820.
+    VaultShellNavy,
+    /// The same, with the light rail.
+    VaultShellLight,
+    /// The launch splash over the whole window (design 1a).
+    VaultSplash,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -753,16 +761,16 @@ enum Surface {
 /// Spelled out rather than imported because those three are `pub(crate)` in
 /// `vault_window::mod` and an example is a separate crate. If that window is
 /// ever resized, this is the number that has to follow it.
-const PANE_WIDTH: f32 = 1240.0 - 212.0 - 390.0;
+const PANE_WIDTH: f32 = 1280.0 - 252.0 - 380.0;
 
 /// The item list panel's exact width in the shipped vault window, i.e.
 /// `vault_window::mod`'s `LIST_WIDTH`. Spelled out here for the reason
 /// [`PANE_WIDTH`] is spelled out.
-const LIST_WIDTH: f32 = 390.0;
+const LIST_WIDTH: f32 = 380.0;
 
 /// The rail's exact width in the shipped vault window, i.e.
 /// `vault_window::mod`'s `SIDEBAR_WIDTH`.
-const SIDEBAR_WIDTH: f32 = 212.0;
+const SIDEBAR_WIDTH: f32 = 252.0;
 
 /// Tall enough that no pane below scrolls, so a screenshot is the whole
 /// surface rather than the top of it. The shipped window is 740 high.
@@ -874,6 +882,9 @@ const ALL: &[Surface] = &[
     Surface::VaultListKinds,
     Surface::ItemKindMarks,
     Surface::KitSheet,
+    Surface::VaultShellNavy,
+    Surface::VaultShellLight,
+    Surface::VaultSplash,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -961,6 +972,9 @@ impl Surface {
             Surface::VaultListKinds => "vault_item_list_kinds",
             Surface::ItemKindMarks => "item_kind_marks",
             Surface::KitSheet => "kit_sheet",
+            Surface::VaultShellNavy => "vault_shell_navy",
+            Surface::VaultShellLight => "vault_shell_light",
+            Surface::VaultSplash => "vault_splash",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1128,6 +1142,9 @@ impl Surface {
             // A sheet, not a pane: its size is what the sheet needs.
             Surface::ItemKindMarks => egui::vec2(LIST_WIDTH, 360.0),
             Surface::KitSheet => egui::vec2(1280.0, 900.0),
+            Surface::VaultShellNavy | Surface::VaultShellLight | Surface::VaultSplash => {
+                egui::vec2(1280.0, 820.0)
+            }
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1212,6 +1229,7 @@ fn main() -> eframe::Result {
     // reports they answer were filed together and are looked at together.
     let kinds = arg("--kinds");
     let kit = arg("--kit");
+    let shell = arg("--shell");
     let rail = arg("--rail");
     let health = arg("--health");
     // Design 5b's Sends screen, in every state that has a different SHAPE:
@@ -1257,6 +1275,8 @@ fn main() -> eframe::Result {
         vec![Surface::VaultListKinds, Surface::ItemKindMarks, Surface::LoginDetailFavicon]
     } else if kit {
         vec![Surface::KitSheet]
+    } else if shell {
+        vec![Surface::VaultShellNavy, Surface::VaultShellLight, Surface::VaultSplash]
     } else if list {
         vec![Surface::VaultList]
     } else if rail {
@@ -1349,6 +1369,9 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_kinds")
     } else if kit {
         target_dir().join("ui_preview_kit.png")
+    } else if shell {
+        // A DIRECTORY: navy, light and the splash belong side by side.
+        target_dir().join("ui_preview_shell")
     } else if list {
         target_dir().join("ui_preview_vault_item_list.png")
     } else if rail {
@@ -1380,7 +1403,7 @@ fn main() -> eframe::Result {
             Ok(Box::new(Preview {
                 queue,
                 at: 0,
-                directory: all || vault || kinds || sends || totp || edit,
+                directory: all || vault || kinds || sends || totp || edit || shell,
                 out,
                 form: LoginForm::default(),
                 // The app name a real 3c card would have been pre-filled with,
@@ -1693,6 +1716,16 @@ impl eframe::App for Preview {
             Surface::VaultListKinds => self.draw_vault_list_kinds(root),
             Surface::ItemKindMarks => draw_item_kind_marks(root),
             Surface::KitSheet => draw_kit_sheet(root),
+            Surface::VaultShellNavy => {
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy)
+            }
+            Surface::VaultShellLight => {
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Light)
+            }
+            Surface::VaultSplash => {
+                let rect = root.max_rect();
+                deskwarden::vault_window::splash::paint(root.ctx(), rect, false, 0.0);
+            }
             Surface::LoginDetailFavicon => {
                 self.draw_pane(root, PaneKind::Detail(DetailShot::LoginFavicon))
             }
@@ -2615,6 +2648,69 @@ impl Preview {
     ///
     /// Four folder rows: enough that the FOLDERS group reads as a group, few
     /// enough that the two screen rows below them are in the picture.
+    /// The v2 shell: the real rail in `style`, the real top bar, and the
+    /// 0.15 list and detail panes laid out under the bar as the window lays
+    /// them out.
+    fn draw_vault_shell(&mut self, root: &mut egui::Ui, style: deskwarden::kit::tokens::SidebarStyle) {
+        use deskwarden::vault_window::top_bar;
+        deskwarden::kit::tokens::set_sidebar_style(root.ctx(), style);
+        let window = root.max_rect();
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(window.left() + SIDEBAR_WIDTH, window.top()),
+            egui::pos2(window.right(), window.top() + top_bar::HEIGHT),
+        );
+        let pill = top_bar::SyncPill::from_v1(theme::BLUE, "Synced just now");
+        let mut search = String::new();
+        let placeholder = item_list::search_hint(Some(self.fixtures.list.len()), &SidebarFilter::All);
+        let _ = top_bar::draw(root, bar, &mut search, &placeholder, &pill, false, |ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(top_bar::AVATAR), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), top_bar::AVATAR / 2.0, theme::INK);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "AN",
+                egui::FontId::new(14.0, egui::FontFamily::Name(theme::BOLD.into())),
+                egui::Color32::WHITE,
+            );
+        });
+        {
+            let fixtures = &self.fixtures;
+            let (selected, sends, health, received, scope) = (
+                &mut self.rail_selected,
+                &mut self.rail_sends,
+                &mut self.rail_health,
+                &mut self.rail_received,
+                &mut self.rail_scope,
+            );
+            egui::Panel::left("vault-sidebar")
+                .exact_size(SIDEBAR_WIDTH)
+                .resizable(false)
+                .frame(sidebar::panel_frame(style))
+                .show(root, |ui| {
+                    let _ = sidebar::draw_sidebar(
+                        ui,
+                        sidebar::VaultLists { health_findings: 4, ..sidebar::VaultLists::live_only(&fixtures.list) },
+                        &fixtures.rail_folders,
+                        selected,
+                        sidebar::Screens { sends, health, received, scope },
+                        "Locks in 11:42",
+                        false,
+                    );
+                });
+        }
+        egui::Panel::top("vault-top-bar-band")
+            .exact_size(top_bar::HEIGHT)
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show(root, |_ui| {});
+        egui::Panel::left("vault-item-list")
+            .exact_size(LIST_WIDTH)
+            .resizable(false)
+            .frame(egui::Frame::NONE)
+            .show(root, |ui| self.draw_vault_list(ui));
+        self.draw_pane(root, PaneKind::Detail(DetailShot::Login));
+    }
+
     fn draw_vault_rail(&mut self, root: &mut egui::Ui) {
         let fixtures = &self.fixtures;
         let (selected, sends, health, received, scope) = (
@@ -2627,7 +2723,7 @@ impl Preview {
         egui::CentralPanel::default()
             // Design 4.8's own frame, copied from the `Panel::left` in
             // `vault_window::mod`: `theme::CARD` with `padding: 14px 10px`.
-            .frame(egui::Frame::new().fill(theme::CARD).inner_margin(Margin::symmetric(10, 14)))
+            .frame(sidebar::panel_frame(deskwarden::kit::tokens::SidebarStyle::Navy))
             .show(root, |ui| {
                 let _ = sidebar::draw_sidebar(
                     ui,
