@@ -13,7 +13,7 @@
 //! nothing reads as a broken feature. The three pages that would be empty
 //! without them carry one marked-disabled row instead.
 
-use eframe::egui::{self, Align, CornerRadius, Layout, Margin, Pos2, Rect, Sense, Ui, UiBuilder, Vec2};
+use eframe::egui::{self, CornerRadius, Margin, Pos2, Rect, Sense, Ui, UiBuilder, Vec2};
 
 use super as prefs;
 use super::PrefsState;
@@ -29,17 +29,13 @@ pub const NAV_HEADING: &str = "Settings";
 /// The Back affordance at the top of the nav.
 pub const BACK_LABEL: &str = "Back";
 
-const NAV_WIDTH: f32 = 232.0;
+pub const NAV_WIDTH: f32 = 232.0;
 const COLUMN_MAX: f32 = 760.0;
 const PAGE_GAP: f32 = 18.0;
 const GROUP_GAP: f32 = 10.0;
-const ROW_GAP: f32 = 14.0;
-const ROW_MIN_HEIGHT: f32 = 42.0;
 
 const HEADING: Role = Role { size: 26.0, face: theme::EXTRABOLD, tracking_em: -0.02 };
 const PAGE_TITLE: Role = Role { size: 30.0, face: theme::EXTRABOLD, tracking_em: -0.03 };
-const ROW_TITLE: Role = Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 };
-const VALUE: Role = Role { size: 15.0, face: theme::SEMIBOLD, tracking_em: 0.0 };
 
 /// The twelve pages, in nav order.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -206,10 +202,11 @@ fn nav_row(ui: &mut Ui, glyph: &str, label: &str, selected: bool, height: f32) -
 
 fn draw_page(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
     let p = palette(ui.ctx());
-    egui::ScrollArea::vertical()
-        .id_salt(("settings-page", *page as u8))
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
+    let mut scroll = egui::ScrollArea::vertical().id_salt(("settings-page", *page as u8)).auto_shrink([false, false]);
+    if let Some(y) = state.scroll_y {
+        scroll = scroll.vertical_scroll_offset(y);
+    }
+    scroll.show(ui, |ui| {
             let available = ui.available_width();
             let column = (available - 80.0).clamp(320.0, COLUMN_MAX);
             let side = ((available - column) / 2.0).max(24.0);
@@ -336,8 +333,8 @@ const KEEP_RUNNING_SUB: &str = "Autofill only works while Deskwarden is running.
 const KEEP_RUNNING_VALUE: &str = "Always";
 const STARTUP_FAILED_TOAST: &str = "Could not change the Windows startup entry";
 /// The Security rows' wording (spec C 2.4).
-const IDLE_LOCK_SUB: &str = "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
-const IDLE_MINUTES_SUB: &str = "Minutes of no activity. One minute is the shortest.";
+pub const IDLE_LOCK_SUB: &str = "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
+pub const IDLE_MINUTES_SUB: &str = "Minutes of no activity. One minute is the shortest.";
 pub const LOCK_ON_SLEEP_LABEL: &str = "Lock when the computer sleeps";
 pub const LOCK_ON_SCREEN_LOCK_LABEL: &str = "Lock when I lock my screen";
 pub const HIDE_ON_SHARE_LABEL: &str = "Hide passwords while I share my screen";
@@ -365,10 +362,8 @@ fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
     });
     group(ui, Some("Shortcut"), |ui| {
         card(ui, |ui| {
-            let chord = match state.settings.shortcuts.picker {
-                Some(chord) => chord.to_string(),
-                None => prefs::SHORTCUT_NOT_SET.to_string(),
-            };
+            // The spec's wording: the keys joined by a space (`Ctrl Alt B`).
+            let chord = prefs::chord_keys(false, state.settings.shortcuts.picker).join(" ");
             if button_row(ui, FILL_SHORTCUT_LABEL, FILL_SHORTCUT_SUB, &chord, false) {
                 *page = Page::Shortcuts;
             }
@@ -559,12 +554,10 @@ fn not_yet(ui: &mut Ui, title: &str, sub: &str) {
 
 /// A group: an optional tracked-capitals title over a card, 10 apart.
 fn group(ui: &mut Ui, title: Option<&str>, add: impl FnOnce(&mut Ui)) {
-    let p = palette(ui.ctx());
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = GROUP_GAP;
         if let Some(title) = title {
-            ui.add_space(6.0);
-            kit_card::section_label(ui, &title.to_uppercase(), p.text_label);
+            prefs::group_title(ui, title);
         }
         add(ui);
     });
@@ -572,38 +565,14 @@ fn group(ui: &mut Ui, title: Option<&str>, add: impl FnOnce(&mut Ui)) {
 
 /// The v2 card the rows live in: rows carry their own padding.
 fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
-    kit_card::card(ui, tokens::R_CARD_SETTINGS, Margin::ZERO, |ui| {
-        ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing = Vec2::ZERO;
-        add(ui);
-    });
+    prefs::card(ui, add);
 }
 
 /// The row frame: title and optional sub on the left, a control `control_w`
-/// wide on the right, vertically centred on the row.
-///
-/// The text column is measured first and the control is handed a rect of
-/// exactly that height (see `prefs::control_row_of` for why a right-to-left
-/// layout over an unbounded height cannot be used here).
+/// wide on the right. One implementation, shared with the panes in the parent
+/// module, so every row on every page is the same row.
 fn row(ui: &mut Ui, title: &str, sub: &str, ghost: bool, control_w: f32, control: impl FnOnce(&mut Ui)) {
-    let p = palette(ui.ctx());
-    egui::Frame::new().inner_margin(Margin { left: 24, right: 24, top: 17, bottom: 17 }).show(ui, |ui| {
-        let width = ui.available_width();
-        let text_w = (width - control_w - ROW_GAP).max(80.0);
-        let origin = ui.cursor().min;
-        let (ink, sub_ink) = if ghost { (p.text_ghost, p.text_ghost) } else { (p.ink, p.text_label) };
-        let text = ui.allocate_ui_with_layout(Vec2::new(text_w, 0.0), Layout::top_down(Align::Min), |ui| {
-            ui.set_width(text_w);
-            ui.spacing_mut().item_spacing.y = 3.0;
-            ui.label(tokens::job(ROW_TITLE, title, ink));
-            if !sub.is_empty() {
-                ui.label(tokens::job(tokens::SUBTITLE, sub, sub_ink));
-            }
-        });
-        let height = text.response.rect.height().max(ROW_MIN_HEIGHT);
-        let rect = Rect::from_min_size(Pos2::new(origin.x + width - control_w, origin.y), Vec2::new(control_w, height));
-        ui.scope_builder(UiBuilder::new().max_rect(rect).layout(Layout::right_to_left(Align::Center)), control);
-    });
+    prefs::control_row_w(ui, title, sub, ghost, control_w, control);
 }
 
 /// `sw`: a switch bound to a setting. With `enabled` false it is painted
@@ -641,11 +610,7 @@ fn button_row(ui: &mut Ui, title: &str, sub: &str, label: &str, _danger: bool) -
 
 /// `va`: a read-only value.
 fn value_row(ui: &mut Ui, title: &str, sub: &str, value: &str) {
-    let p = palette(ui.ctx());
-    let width = ui.fonts_mut(|f| f.layout_job(tokens::job(VALUE, value, p.text_nav))).size().x.ceil() + 2.0;
-    row(ui, title, sub, false, width, |ui| {
-        ui.label(tokens::job(VALUE, value, p.text_nav));
-    });
+    prefs::value_row(ui, title, sub, value);
 }
 
 #[cfg(test)]
@@ -815,7 +780,7 @@ mod tests {
     fn the_fill_shortcut_row_goes_to_the_shortcuts_page() {
         let mut fixture = Fixture::new(Page::Autofill);
         let painted = fixture.settle();
-        let chord = fixture.state.settings.shortcuts.picker.map(|c| c.to_string()).unwrap_or_else(|| prefs::SHORTCUT_NOT_SET.into());
+        let chord = prefs::chord_keys(false, fixture.state.settings.shortcuts.picker).join(" ");
         let at = painted.texts.iter().filter(|(t, _, _)| *t == chord).map(|(_, _, r)| r.center()).next().expect("the chord button");
         fixture.frame(click_at(at));
         assert_eq!(fixture.page, Page::Shortcuts);
