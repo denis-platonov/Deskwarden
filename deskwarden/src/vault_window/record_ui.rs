@@ -747,6 +747,8 @@ pub enum RecordUiAction {
     FetchLink,
     /// Create the item the fetched record describes.
     SubmitImport,
+    /// The done state's "See in Shared": the Sends screen.
+    SeeInShared,
     /// Close the form without doing anything.
     Cancel,
 }
@@ -885,110 +887,6 @@ pub(crate) fn record_chip(ui: &mut egui::Ui, item_name: &str, kind_and_folder: &
         });
 }
 
-/// **One row of §5a's include list.** Answers whether it was clicked.
-///
-/// The whole row is the target, not the 17-point square: §5a draws a row and
-/// a row is what a pointer aims at. `egui::Checkbox` cannot do this -- it
-/// draws its own square at its own size in its own palette and senses only
-/// itself -- which is why this is built out of `theme::opt_in_box` and an
-/// `interact` over the band.
-///
-/// **The password row is tinted, labelled and masked in §5a's red**, and the
-/// three together are the design making one point in the only three ways a
-/// row has: this is the field that travels in the clear. The pill beside the
-/// label says it in words.
-fn include_row(ui: &mut egui::Ui, row: &IncludeRow, enabled: bool) -> bool {
-    let danger = row.field == IncludeField::Password && row.ticked;
-    // §5a's `#b42318` on the ticked password, which is `theme::ERROR`
-    // exactly -- a step louder than the `DANGER_INK` its label is set in, so
-    // the three red things on this row do not all shout at one pitch.
-    let tone = if danger { theme::ERROR } else { theme::BLUE };
-    let mut clicked = false;
-    let band = egui::Frame::new()
-        .fill(if danger { theme::DANGER_WASH } else { egui::Color32::TRANSPARENT })
-        .inner_margin(egui::Margin::symmetric(INCLUDE_PAD_X, INCLUDE_PAD_Y))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                theme::opt_in_box(ui, row.ticked, tone);
-                ui.add_space(INCLUDE_GAP);
-                let ink = if danger { theme::DANGER_INK } else { theme::INK };
-                if danger {
-                    ui.label(theme::semibold(row.label, INCLUDE_LABEL_PX).color(ink));
-                    ui.add_space(7.0);
-                    visible_pill(ui);
-                } else {
-                    ui.label(
-                        egui::RichText::new(row.label).size(INCLUDE_LABEL_PX).color(ink),
-                    );
-                }
-                // The value hangs off the right edge, which is §5a's own
-                // `flex: 1` on the label with the value after it. Measured and
-                // right-aligned rather than pushed, so a long address cannot
-                // walk the label off the row.
-                if !row.value.is_empty() {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let text = if row.secret {
-                            theme::letterspaced_mono_in(
-                                &row.value,
-                                INCLUDE_VALUE_PX,
-                                0.0,
-                                theme::DANGER_QUIET,
-                                theme::ascent_of(
-                                    ui.ctx(),
-                                    &egui::FontId::new(
-                                        INCLUDE_VALUE_PX,
-                                        egui::FontFamily::Monospace,
-                                    ),
-                                ),
-                            )
-                        } else {
-                            egui::text::LayoutJob::simple_singleline(
-                                row.value.clone(),
-                                egui::FontId::proportional(INCLUDE_VALUE_PX),
-                                theme::TEXT_MUTED,
-                            )
-                        };
-                        ui.label(text);
-                    });
-                }
-            });
-        })
-        .response
-        .rect;
-    // Registered after the contents so it is on top of them -- nothing inside
-    // a row of this list is separately clickable, so there is nothing for it
-    // to steal. Greyed rows are inert, which is what `in_flight` means
-    // everywhere else on this card.
-    if enabled {
-        let hit = ui.interact(band, ui.next_auto_id().with(row.label), egui::Sense::click());
-        if hit.hovered() {
-            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-        }
-        clicked = hit.clicked();
-    }
-    clicked
-}
-
-/// §5a's `visible to anyone with the link` pill, beside the password's name.
-///
-/// Its own drawing rather than [`theme::state_pill`]: that one is a 20-point
-/// bordered capsule for a STATE -- Waiting, Used, Changed -- and this is a
-/// `border-radius: 5px` tag with no border and no mark, sitting inline in a
-/// row of text. Two shapes that say different things about a row.
-fn visible_pill(ui: &mut egui::Ui) {
-    egui::Frame::new()
-        .fill(theme::DANGER_PILL)
-        .corner_radius(CornerRadius::same(5))
-        .inner_margin(egui::Margin::symmetric(7, 2))
-        .show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(VISIBLE_PILL).size(11.0).color(theme::DANGER_QUIET),
-            );
-        });
-}
-
 /// §5a's caution band, minus the promise this build cannot keep.
 ///
 /// The design reads "This Send contains a password. Rotate it after the
@@ -1007,17 +905,6 @@ pub const VISIBLE_PILL: &str = "visible to anyone with the link";
 
 /// §5a's note beside the one-time code row.
 pub const TOTP_ROW_NOTE: &str = "rotates \u{2014} the recipient sees a live code";
-
-/// §5a's `padding: 10px 12px` on an include row.
-const INCLUDE_PAD_X: i8 = 12;
-/// See [`INCLUDE_PAD_X`].
-const INCLUDE_PAD_Y: i8 = 10;
-/// §5a's `gap: 11px` between the tick and the name.
-const INCLUDE_GAP: f32 = 11.0;
-/// §5a's `font-size: 13px` on a row's name.
-const INCLUDE_LABEL_PX: f32 = 13.0;
-/// §5a's `font-size: 12px` on the value beside it.
-const INCLUDE_VALUE_PX: f32 = 12.0;
 
 /// Which of [`RecordSelection`]'s five a row is about.
 ///
@@ -1153,312 +1040,6 @@ pub(crate) fn chip_subtitle(item: Option<&crate::vault_bridge::VaultItem>, folde
         Some(name) => format!("{kind} \u{b7} {name}"),
         None => kind.to_string(),
     }
-}
-
-/// The export form.
-///
-/// Every decision it paints comes from [`export_problem`] and
-/// [`warning_is_shown`]; there is no condition in this function that a test
-/// cannot also ask directly.
-pub fn draw_export_form(
-    ui: &mut egui::Ui,
-    draft: &mut RecordDraft,
-    item_name: &str,
-    // **What §5a draws beside each tick, borrowed for the frame and stored
-    // nowhere.**
-    //
-    // §5a's include list is not five bare labels: every row carries the
-    // value that would travel -- the address, the masked password, `3 apps`
-    // -- because the question the card asks is "what travels", and a tick
-    // beside the word `Password` does not answer it. The owner, of the
-    // version without them: "Current UI is very plain and not even close to
-    // this design".
-    //
-    // **This does not break [`RecordDraft`]'s rule**, which is that the form
-    // never holds a record's values BETWEEN frames: this is a borrow that
-    // lives for one paint, exactly as `detail::draw_detail_read` takes the
-    // item it draws. What is still re-resolved by id at submit time is the
-    // record that gets PUBLISHED, which is the half of that rule that
-    // matters.
-    //
-    // `None` where the window cannot find the item any more. The rows then
-    // draw their labels and no values, which is what this card looked like
-    // before -- a degradation, not a panic.
-    item: Option<&crate::vault_bridge::VaultItem>,
-    // The folder's NAME, already resolved by `sidebar::folder_name` -- see
-    // `detail::draw_detail_read`, which takes it for the same line and the
-    // same reason.
-    folder: Option<&str>,
-    // Preferences' "Use advanced sharing". Off, the card sends the whole
-    // record and draws one line saying so; on, it draws 5a's ticks.
-    advanced: bool,
-    // Who this user has sent to before, for the Recipient row's suggestions.
-    history: &crate::sent_history::SentHistory,
-    in_flight: bool,
-    now: &dyn crate::send::SendClock,
-    zone: &dyn crate::local_time::LocalOffset,
-) -> RecordUiAction {
-    let mut action = RecordUiAction::None;
-    let enabled = !in_flight;
-    if !advanced {
-        // Every frame, so a draft opened with the setting on and continued
-        // with it off cannot keep a narrower choice nobody can see.
-        draft.selection = whole_record_selection();
-        draft.set_totp(false);
-    }
-    let (card_rect, title) = card(ui, |ui| {
-        // **§5a's paper plane**, which only this card wears: the import form
-        // below is the same band without one, because the design draws the
-        // mark on the card that SENDS.
-        let title = theme::form_card_header_marked(ui, EXPORT_HEADING, true);
-        theme::form_card_body(ui, |ui| {
-            // **§5a's `RECORD` block: the record is NAMED, not mentioned.**
-            //
-            // The design opens the composer with a chip -- a monogram tile, the
-            // record's name set in the blue the rest of this app gives a chosen
-            // thing, and a subtitle -- under an eyebrow that says what the block
-            // is. What stood here was the item's name in [`note`]'s 11px grey,
-            // which is the size and colour this file uses for fine print: the one
-            // line that says WHICH record is about to be published was drawn
-            // quieter than the sentence explaining why the button is grey.
-            //
-            // The tile is `theme::avatar`, which is the same tile the item list
-            // and the delete modal draw, so the chip reads as the row it was
-            // opened from. `emphasized` is on for §5a's reason: this record is
-            // the chosen one, and blue-on-wash is what this app's tiles already
-            // say that with.
-            theme::eyebrow(ui, RECORD_EYEBROW);
-            ui.add_space(theme::EYEBROW_GAP);
-            record_chip(ui, item_name, &chip_subtitle(item, folder));
-            ui.add_space(theme::BLOCK_GAP);
-
-            // **The whole record, by default** -- one line naming what travels,
-            // in place of 5a's ticks. The owner: "we may skip which fields to
-            // share for now - share the whole thing".
-            if !advanced {
-                theme::eyebrow(ui, INCLUDE_EYEBROW);
-                ui.add_space(theme::EYEBROW_GAP);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(WHOLE_RECORD_LEAD).size(13.0).color(theme::INK));
-                    ui.add_space(4.0);
-                    super::send_ui::field_pills(ui, &whole_record_fields(item));
-                });
-                let has_seed = item
-                    .and_then(|i| i.login.as_ref())
-                    .and_then(|l| l.totp.as_ref())
-                    .is_some_and(|seed| !seed.trim().is_empty());
-                if has_seed {
-                    ui.add_space(6.0);
-                    note(ui, SEED_STAYS_NOTE, theme::TEXT_FAINT);
-                }
-            }
-            // **§5a's `INCLUDE` block**, with the design's own running count
-            // beside its eyebrow. See [`include_counter`] for why the number is
-            // worth having and why it is a pure function.
-            if advanced {
-            ui.horizontal(|ui| {
-                theme::eyebrow(ui, INCLUDE_EYEBROW);
-                ui.add_space(10.0);
-                ui.label(
-                    egui::RichText::new(include_counter(draft))
-                        .size(12.0)
-                        .color(theme::TEXT_GHOST),
-                );
-            });
-            ui.add_space(theme::EYEBROW_GAP);
-
-            // **The ticks are a LIST, and §5a draws the list as one boxed
-            // object**: a 1px hairline outline round the run, a 10px radius, and
-            // the lighter `#f3f2f2` rule between one row and the next. Both
-            // weights are already this design system's -- `theme::HAIRLINE` is
-            // the card border and `theme::row_rule` is the between-rows rule the
-            // detail pane draws -- so the box is assembled out of the two
-            // dividers the app has rather than a third.
-            //
-            // It is not decoration. Five loose check-boxes stacked in a column
-            // are five independent questions; the same five inside one outline
-            // are the answer to "what travels", which is the whole subject of
-            // this card and the thing §5a's caption calls out ("each field is an
-            // explicit opt-in"). The counter above only reads as a counter of
-            // something once the something has an edge.
-            egui::Frame::new()
-                .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
-                .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
-                    // **§5a's rows, each a tick, a name and the value that
-                    // would travel** -- and the rule between them runs edge to
-                    // edge, so the list carries no inner margin of its own and
-                    // every padding below is a row's.
-                    let rows = include_rows(draft, item);
-                    let last = rows.len().saturating_sub(1);
-                    for (index, row) in rows.into_iter().enumerate() {
-                        if include_row(ui, &row, enabled) {
-                            let on = !row.ticked;
-                            match row.field {
-                                // The seed's tick goes through `set_totp`
-                                // rather than a `&mut bool`, so unticking it
-                                // drops the passphrase with it.
-                                IncludeField::Totp => draft.set_totp(on),
-                                IncludeField::Username => draft.selection.username = on,
-                                IncludeField::Password => draft.selection.password = on,
-                                IncludeField::Uri => draft.selection.uri = on,
-                                IncludeField::Notes => draft.selection.notes = on,
-                            }
-                        }
-                        if index != last {
-                            theme::row_rule(ui);
-                        }
-                    }
-                });
-
-            if warning_is_shown(draft) {
-                ui.add_space(8.0);
-                // Painted in the error colour and at the same size as the labels
-                // above it, not as fine print: it is the sentence that decides
-                // whether the tick above was a mistake.
-                ui.label(egui::RichText::new(SEED_WARNING).size(12.0).color(theme::ERROR));
-                ui.add_space(8.0);
-                // `theme::hinted_field` and not a bare `egui::TextEdit`: this box
-                // sat directly under the composer's other boxes wearing egui's
-                // frame instead of the design's, which is the same defect the
-                // Sends composer's name and body fields had. See that function.
-                ui.add_enabled_ui(enabled, |ui| {
-                    theme::hinted_field(ui, &mut draft.passphrase, PASSPHRASE_HINT, true)
-                });
-                ui.add_space(4.0);
-                note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
-            }
-            }
-
-            // **§5a's `ACCESS` block**, drawn by the one function in this app that
-            // draws it -- `send_ui::draw_access_block`, which the Sends screen's
-            // own composer also calls. Everything about what it draws, what it
-            // deliberately does not draw, and why each absence is a decision
-            // rather than a to-do is argued there, in one place, rather than
-            // halved between this file and that one.
-            //
-            // It lives in `send_ui` and is called from here, which is the
-            // direction that makes sense of the two: `send_ui` is this window's
-            // Send module and already owns the composer, the pane and the plan;
-            // `record_ui` is a modal that borrows the Send machinery to publish
-            // one record. The block is a control for three fields of a
-            // `crate::send::SendPlan`, so it belongs beside the screen that is
-            // made of `SendPlan`s.
-            ui.add_space(12.0);
-            super::send_ui::draw_access_block(
-                ui,
-                super::send_ui::AccessControls {
-                    lifetime: &mut draft.access.lifetime,
-                    password: &mut draft.access.password,
-                    max_access_count: &mut draft.access.max_access_count,
-                },
-                enabled,
-                now,
-                zone,
-            );
-            if let super::send_ui::RecipientAnswer::Forget(email) =
-                super::send_ui::draw_recipient_row(ui, &mut draft.recipient, history, enabled)
-            {
-                draft.forget = Some(email);
-            }
-        });
-
-        let problem = export_problem(draft, now);
-        let can_submit = export_can_submit(problem, in_flight);
-        // **§5a's footer: a filled primary beside an outlined secondary.**
-        //
-        // The two answers on this card were two bare `egui::Button`s with the
-        // same default fill, the same default outline and the same 26px
-        // height, differing only in the colour of their text -- so the
-        // publish and the throw-away read as a matched pair, and §5a's
-        // one clear point about this footer (a blue button and a white one)
-        // was the one thing missing from it. `theme.rs` names this defect on
-        // the item form's Save, and `primary_button_enabled` is the half of
-        // the design system that exists so a footer needing `add_enabled` has
-        // no reason to leave it.
-        //
-        // These are `theme::BUTTON_HEIGHT`'s 32 and not §5a's 34. The design
-        // draws this card's buttons two points taller than every other action
-        // button in the app, and `theme.rs` already refused to move those to
-        // match one outlier; this footer is an action footer like every
-        // other, so it takes the action footer's metrics.
-        //
-        // **And they are in §5a's footer BAND now**, which they were not:
-        // the two answers used to be simply the last things in the body, with
-        // the refusal sentence trailing after them as loose prose. Both cards
-        // are fixed together and by the same functions, because two composers
-        // that publish the same object and end differently is the defect one
-        // level up from the one the owner reported.
-        // **§5a's caution band**, drawn between the body and the answers, and
-        // only when the thing it cautions about is really in the parcel.
-        //
-        // §5a's own sentence continues "-- Deskwarden will offer to when the
-        // Send expires", and that half is NOT drawn: nothing in this build
-        // offers a rotation when a Send expires, and a card that promised one
-        // would be the drawn-and-dead defect this project has shipped twice
-        // already. What is left is the true half, and it is the half a reader
-        // does something about.
-        if draft.selection.password {
-            theme::form_card_caution(ui, PASSWORD_TRAVELS);
-        }
-        theme::form_card_footer(ui, |ui| {
-            // **§5a's footer has ONE slot at its right-hand end, and more
-            // than one thing wants it**: the standing note (`Appears in
-            // Sends`) and the sentence saying why the primary is off. They
-            // share the slot rather than stacking, and the refusal wins while
-            // there is one -- "why not" is what the reader is looking for
-            // while the form cannot be submitted, and the note is a fact
-            // about a Send that does not exist yet.
-            let note_text = problem.unwrap_or(super::send_ui::APPEARS_IN_SENDS);
-            let mut beside = false;
-            ui.horizontal(|ui| {
-                if theme::primary_button_enabled(ui, EXPORT_SUBMIT_LABEL, None, can_submit)
-                    .clicked()
-                {
-                    action = RecordUiAction::SubmitExport;
-                }
-                ui.add_space(theme::FORM_FOOTER_GAP);
-                if ui
-                    .add_enabled_ui(enabled, |ui| theme::secondary_button(ui, EXPORT_CANCEL_LABEL))
-                    .inner
-                    .clicked()
-                {
-                    action = RecordUiAction::Cancel;
-                }
-                if theme::form_footer_note_width(ui, note_text) + theme::FORM_FOOTER_GAP
-                    <= ui.available_width()
-                {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        theme::form_footer_note(ui, note_text);
-                    });
-                    beside = true;
-                }
-            });
-            if !beside {
-                ui.add_space(theme::FORM_FOOTER_GAP);
-                theme::form_footer_note(ui, note_text);
-            }
-        });
-        title
-    });
-    // **The ✕ answers exactly what [`EXPORT_CANCEL_LABEL`] answers, and is
-    // gated by exactly what gates that button.** A mark that stayed live while
-    // Cancel was greyed would be a second exit from a state the card's own
-    // exit refuses -- the hazard this mark exists to remove rather than to
-    // create. Greyed, it still PAINTS: a control that vanished for the
-    // duration of a send and came back would read as the card changing shape.
-    //
-    // **Neither of this file's two modals binds Escape at all**, here or in
-    // `vault_window::mod`, so there is no keyboard gesture for the mark to
-    // have to agree with -- and one is deliberately not invented in passing,
-    // because binding a key to a card is a decision about that card's
-    // keyboard rather than about its corner.
-    if theme::modal_corner_mark_gated(ui, card_rect, title, enabled) {
-        action = RecordUiAction::Cancel;
-    }
-    action
 }
 
 /// The import form.
@@ -1730,28 +1311,120 @@ pub const SEND_RECORD_SHORTCUT: &str = "CTRL+SHIFT+S";
 /// is what the form paints, and it is a copy rather than a second lookup so
 /// the heading cannot go blank if the item disappears underneath.
 pub struct RecordSend {
-    /// The chosen item's id. See the struct doc.
     pub item_id: String,
-    /// The chosen item's name, as painted. See the struct doc.
     pub item_name: String,
-    /// The ticks and the passphrase.
     pub draft: RecordDraft,
+    /// Create link was pressed and the Send is being made: the modal stays
+    /// up, its button says so, until the window hears back.
+    pub waiting: bool,
+    /// The made Send's link: the modal shows "Link ready" (spec B §6.2).
+    pub done: Option<zeroize::Zeroizing<String>>,
+    /// "More options" (0.15's access block and recipient row) is open.
+    pub more: bool,
+    /// The done state's summary line, taken when Create link is pressed
+    /// (the draft's access answers are handed over to the Send then).
+    pub summary: String,
 }
 
 impl RecordSend {
-    /// Opens the composer against one item.
-    ///
-    /// `open` is set here rather than left to the caller: a `RecordSend` that
-    /// exists at all *is* the composer being on screen, and a second flag the
-    /// caller had to remember to set is the second enumeration this crate
-    /// keeps losing to.
+    /// Spec B §6.1's defaults: the link works for a day and opens once.
     pub fn opening(item_id: &str, item_name: &str) -> Self {
+        let mut draft = RecordDraft { open: true, ..RecordDraft::default() };
+        draft.access.lifetime = crate::send::SendLifetime::Hours(24);
+        draft.access.max_access_count = Some(1);
         Self {
             item_id: item_id.to_string(),
             item_name: item_name.to_string(),
-            draft: RecordDraft { open: true, ..RecordDraft::default() },
+            draft,
+            waiting: false,
+            done: None,
+            more: false,
+            summary: String::new(),
         }
     }
+}
+
+/// The scrim's area name (listed in `item_list::MODAL_SCRIM_AREAS`).
+pub const ID: &str = "record-send";
+pub const SHARE_SUB: &str = "Send a secure link. Revoke it any time.";
+pub const WHAT_TO_SHARE: &str = "What to share";
+pub const WHAT_TO_SHARE_TIP: &str =
+    "Only what you pick travels. The person never gets access to the rest of your vault.";
+pub const LINK_WORKS_FOR: &str = "Link works for";
+pub const OPEN_ONCE: &str = "Open only once";
+pub const OPEN_ONCE_TIP: &str = "The link stops working right after it's opened, even if it hasn't expired.";
+pub const CREATE_LINK: &str = "Create link";
+pub const CREATING_LINK: &str = "Creating link\u{2026}";
+pub const NOTHING_PICKED: &str = "Pick at least one thing to share";
+pub const MORE_OPTIONS: &str = "More options";
+pub const LINK_READY: &str = "Link ready";
+pub const LINK_COPIED: &str = "Link copied";
+pub const COPY_LINK: &str = "Copy";
+pub const DONE: &str = "Done";
+pub const SEE_IN_SHARED: &str = "See in Shared";
+const SHARE_WIDTH: f32 = 560.0;
+
+/// Spec B §6.1's expiry choices.
+pub const LINK_LIFETIMES: [(&str, u32); 4] = [("1 hour", 1), ("1 day", 24), ("7 days", 168), ("30 days", 720)];
+
+/// Which of [`LINK_LIFETIMES`] `lifetime` is, if any.
+pub fn lifetime_choice(lifetime: &crate::send::SendLifetime) -> Option<usize> {
+    match lifetime {
+        crate::send::SendLifetime::Hours(h) => LINK_LIFETIMES.iter().position(|(_, hours)| hours == h),
+        _ => None,
+    }
+}
+
+/// The chips, in order: label, which field, whether it is the password.
+pub fn share_chips() -> [(&'static str, IncludeField); 5] {
+    [
+        (USERNAME_LABEL, IncludeField::Username),
+        (PASSWORD_LABEL, IncludeField::Password),
+        ("2FA code", IncludeField::Totp),
+        (WEBSITES_LABEL, IncludeField::Uri),
+        (NOTES_LABEL, IncludeField::Notes),
+    ]
+}
+
+fn chip_on(selection: &RecordSelection, field: IncludeField) -> bool {
+    match field {
+        IncludeField::Username => selection.username,
+        IncludeField::Password => selection.password,
+        IncludeField::Totp => selection.totp,
+        IncludeField::Uri => selection.uri,
+        IncludeField::Notes => selection.notes,
+    }
+}
+
+/// Spec B §6.2's summary: what was picked, how long, and "opens once".
+pub fn done_summary(draft: &RecordDraft, advanced: bool) -> String {
+    let picked: Vec<&str> = if advanced {
+        share_chips().iter().filter(|(_, f)| chip_on(&draft.selection, *f)).map(|(l, _)| *l).collect()
+    } else {
+        vec![WHOLE_RECORD_LEAD]
+    };
+    let mut line = picked.join(", ");
+    if let Some(i) = lifetime_choice(&draft.access.lifetime) {
+        line.push_str(" \u{b7} ");
+        line.push_str(LINK_LIFETIMES[i].0);
+    }
+    if draft.access.max_access_count == Some(1) {
+        line.push_str(" \u{b7} opens once");
+    }
+    line
+}
+
+/// One chip id, for tests.
+pub fn chip_id(field: IncludeField) -> egui::Id {
+    egui::Id::new(("share-chip", field as u8))
+}
+
+pub fn create_link_id() -> egui::Id {
+    egui::Id::new("share-create-link")
+}
+
+pub fn copy_link_id() -> egui::Id {
+    egui::Id::new("share-copy-link")
 }
 
 /// **Design §5a's own 690**, measured off the design rather than described from
@@ -1777,9 +1450,6 @@ impl RecordSend {
 /// labels do not fit 544 points any more than they fit 226.
 const MODAL_WIDTH: f32 = 690.0;
 
-/// The least room kept between the composer and the window's edge when the
-/// window is narrower than [`MODAL_WIDTH`].
-const MODAL_EDGE: f32 = 16.0;
 
 /// [`draw_export_form`] over a dimmed scrim, centred, for `vault_window::mod`
 /// to call from its frame closure.
@@ -1799,7 +1469,7 @@ pub fn draw_export_modal(
     ctx: &egui::Context,
     state: &mut RecordSend,
     // The item this composer was opened against, re-found by the window on
-    // every frame and borrowed for the paint -- see [`draw_export_form`].
+    // every frame and borrowed for the paint.
     item: Option<&crate::vault_bridge::VaultItem>,
     folder: Option<&str>,
     advanced: bool,
@@ -1808,34 +1478,252 @@ pub fn draw_export_modal(
     now: &dyn crate::send::SendClock,
     zone: &dyn crate::local_time::LocalOffset,
 ) -> RecordUiAction {
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-send-scrim")));
+    let _ = folder;
+    let title = format!("Share {}", state.item_name);
+    let busy = in_flight || state.waiting;
+    let mut dialog = crate::kit::modal::Dialog::new(ID, SHARE_WIDTH);
+    if state.done.is_none() {
+        dialog = dialog.title(&title).sub(SHARE_SUB);
+    }
+    let (outcome, action) = dialog.show(ctx, |ui| match state.done.as_ref() {
+        Some(link) => draw_share_done(ui, &state.summary, link),
+        None => draw_share_form(ui, state, item, advanced, history, busy, now, zone),
+    });
+    match (action, outcome) {
+        (RecordUiAction::None, crate::kit::modal::ModalOutcome::Closed) if !busy => RecordUiAction::Cancel,
+        (action, _) => action,
+    }
+}
 
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-send-modal")))
-        .show(ctx, |ui| {
-            // Before the form, not after: a drag strip laid over the form's
-            // controls would swallow their clicks. See
-            // `theme::modal_drag_handle`.
-            theme::modal_drag_handle(ui, FORM_HEADER_HEIGHT);
-            // A fixed width, not only a ceiling. The area sizes itself from
-            // what was drawn the frame before, and the rows here measure
-            // `available_width` at different moments, so with only a ceiling
-            // the header rule, the record tile and the caution band each ended
-            // at a different edge when the window was narrower than the card.
-            ui.set_width(MODAL_WIDTH.min(ctx.content_rect().width() - 2.0 * MODAL_EDGE));
-            draw_export_form(
-                ui,
-                &mut state.draft,
-                &state.item_name,
-                item,
-                folder,
-                advanced,
-                history,
-                in_flight,
-                now,
-                zone,
-            )
-        })
+/// Spec B §6.1.
+#[allow(clippy::too_many_arguments)]
+pub fn draw_share_form(
+    ui: &mut egui::Ui,
+    state: &mut RecordSend,
+    item: Option<&crate::vault_bridge::VaultItem>,
+    advanced: bool,
+    history: &crate::sent_history::SentHistory,
+    busy: bool,
+    now: &dyn crate::send::SendClock,
+    zone: &dyn crate::local_time::LocalOffset,
+) -> RecordUiAction {
+    let mut action = RecordUiAction::None;
+    let draft = &mut state.draft;
+    if !advanced {
+        draft.selection = whole_record_selection();
+        draft.set_totp(false);
+    }
+    let label = |ui: &mut egui::Ui, text: &str, tip: Option<&str>| {
+        ui.horizontal(|ui| {
+            ui.label(theme::bold(text, 15.0).color(theme::INK));
+            if let Some(tip) = tip {
+                ui.label(egui::RichText::new("?").color(theme::TEXT_FAINT)).on_hover_text(tip);
+            }
+        });
+    };
+
+    label(ui, WHAT_TO_SHARE, Some(WHAT_TO_SHARE_TIP));
+    ui.add_space(10.0);
+    if advanced {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for (text, field) in share_chips() {
+                let on = chip_on(&draft.selection, field);
+                if share_chip(ui, text, field, on, field == IncludeField::Password, !busy) {
+                    match field {
+                        IncludeField::Totp => draft.set_totp(!on),
+                        IncludeField::Username => draft.selection.username = !on,
+                        IncludeField::Password => draft.selection.password = !on,
+                        IncludeField::Uri => draft.selection.uri = !on,
+                        IncludeField::Notes => draft.selection.notes = !on,
+                    }
+                }
+            }
+        });
+        if warning_is_shown(draft) {
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new(SEED_WARNING).size(13.0).color(theme::ERROR));
+            ui.add_space(6.0);
+            ui.add_enabled_ui(!busy, |ui| theme::hinted_field(ui, &mut draft.passphrase, PASSPHRASE_HINT, true));
+            ui.add_space(4.0);
+            note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
+        }
+    } else {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new(WHOLE_RECORD_LEAD).size(15.0).color(theme::INK));
+            ui.add_space(4.0);
+            super::send_ui::field_pills(ui, &whole_record_fields(item));
+        });
+    }
+    ui.add_space(22.0);
+
+    label(ui, LINK_WORKS_FOR, None);
+    ui.add_space(10.0);
+    let labels: Vec<&str> = LINK_LIFETIMES.iter().map(|(l, _)| *l).collect();
+    let chosen = lifetime_choice(&draft.access.lifetime).unwrap_or(usize::MAX);
+    if let Some(picked) = ui
+        .add_enabled_ui(!busy, |ui| crate::kit::controls::segmented(ui, &labels, chosen, crate::kit::controls::SEG_EXPIRY))
         .inner
+    {
+        draft.access.lifetime = crate::send::SendLifetime::Hours(LINK_LIFETIMES[picked].1);
+    }
+    ui.add_space(22.0);
+
+    ui.horizontal(|ui| {
+        label(ui, OPEN_ONCE, Some(OPEN_ONCE_TIP));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let mut once = draft.access.max_access_count == Some(1);
+            if ui.add_enabled_ui(!busy, |ui| crate::kit::controls::switch(ui, &mut once)).inner.changed() {
+                draft.access.max_access_count = once.then_some(1);
+            }
+        });
+    });
+    ui.add_space(16.0);
+
+    // 0.15's access block (a password, a date, a view cap) and the
+    // recipient row, folded under one link: nothing 0.15 offered is gone.
+    if theme::action_link(ui, MORE_OPTIONS, 14.0).clicked() {
+        state.more = !state.more;
+    }
+    let draft = &mut state.draft;
+    if state.more {
+        ui.add_space(8.0);
+        super::send_ui::draw_access_block(
+            ui,
+            super::send_ui::AccessControls {
+                lifetime: &mut draft.access.lifetime,
+                password: &mut draft.access.password,
+                max_access_count: &mut draft.access.max_access_count,
+            },
+            !busy,
+            now,
+            zone,
+        );
+        if let super::send_ui::RecipientAnswer::Forget(email) =
+            super::send_ui::draw_recipient_row(ui, &mut draft.recipient, history, !busy)
+        {
+            draft.forget = Some(email);
+        }
+    }
+    ui.add_space(16.0);
+
+    let problem = export_problem(draft, now);
+    if let Some(problem) = problem.filter(|p| *p != NOTHING_TICKED) {
+        note(ui, problem, theme::ERROR);
+        ui.add_space(8.0);
+    }
+    let size = crate::kit::controls::ButtonSize { height: 54.0, pad_x: 22.0, radius: 16, font_px: 17.0 };
+    let mut button_ui = ui.new_child(
+        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 54.0))),
+    );
+    if busy {
+        button_ui.disable();
+    }
+    let text = if busy { CREATING_LINK } else { CREATE_LINK };
+    let button = crate::kit::controls::button(&mut button_ui, crate::kit::controls::ButtonKind::Primary, size, text, None);
+    let _ = ui.interact(button.rect, create_link_id(), egui::Sense::hover());
+    ui.advance_cursor_after_rect(egui::Rect::from_min_size(button.rect.min, egui::vec2(ui.available_width(), 54.0)));
+    if button.clicked() {
+        if advanced && !share_chips().iter().any(|(_, f)| chip_on(&draft.selection, *f)) {
+            crate::kit::toast::show(ui.ctx(), NOTHING_PICKED);
+        } else if export_can_submit(problem, busy) {
+            action = RecordUiAction::SubmitExport;
+        }
+    }
+    action
+}
+
+/// One "What to share" chip; true when clicked.
+fn share_chip(ui: &mut egui::Ui, text: &str, field: IncludeField, on: bool, secret: bool, enabled: bool) -> bool {
+    let font = egui::FontId::new(15.0, egui::FontFamily::Name(theme::BOLD.into()));
+    let (edge, fill, ink) = match (on, secret) {
+        (true, true) => (theme::ERROR, theme::DANGER_WASH, theme::DANGER_INK),
+        (true, false) => (theme::BLUE, egui::Color32::from_rgb(0xf5, 0xf7, 0xfd), egui::Color32::from_rgb(0x14, 0x30, 0x7a)),
+        (false, _) => (egui::Color32::from_rgb(0xe8, 0xe6, 0xe3), theme::CARD, egui::Color32::from_rgb(0x6b, 0x68, 0x66)),
+    };
+    let galley = ui.painter().layout_no_wrap(text.to_string(), font, ink);
+    let check = if on { 16.0 + 8.0 } else { 0.0 };
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(16.0 + check + galley.size().x + 16.0, 42.0), egui::Sense::click());
+    let _ = ui.interact(rect, chip_id(field), egui::Sense::hover());
+    ui.painter().rect(rect, CornerRadius::same(12), fill, egui::Stroke::new(2.0, edge), egui::StrokeKind::Inside);
+    let mut x = rect.left() + 16.0;
+    if on {
+        crate::kit::icon::stroke(
+            ui.painter(),
+            egui::Rect::from_center_size(egui::pos2(x + 8.0, rect.center().y), egui::Vec2::splat(16.0)),
+            crate::kit::icon::glyph::TICK,
+            3.0,
+            ink,
+        );
+        x += check;
+    }
+    ui.painter().galley(egui::pos2(x, rect.center().y - galley.size().y / 2.0), galley, ink);
+    enabled && response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+}
+
+/// Spec B §6.2.
+pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUiAction {
+    let mut action = RecordUiAction::None;
+    ui.vertical_centered(|ui| {
+        ui.add_space(10.0);
+        let (circle, _) = ui.allocate_exact_size(egui::Vec2::splat(76.0), egui::Sense::hover());
+        ui.painter().circle_filled(circle.center(), 38.0, egui::Color32::from_rgb(0xe8, 0xf3, 0xec));
+        crate::kit::icon::stroke(
+            ui.painter(),
+            egui::Rect::from_center_size(circle.center(), egui::Vec2::splat(38.0)),
+            crate::kit::icon::glyph::TICK,
+            2.6,
+            egui::Color32::from_rgb(0x1b, 0x7a, 0x3f),
+        );
+        ui.add_space(16.0);
+        ui.label(
+            egui::RichText::new(LINK_READY)
+                .font(egui::FontId::new(26.0, egui::FontFamily::Name(theme::EXTRABOLD.into())))
+                .color(theme::INK),
+        );
+        ui.add_space(6.0);
+        ui.label(egui::RichText::new(summary).size(16.0).color(egui::Color32::from_rgb(0x7d, 0x79, 0x79)));
+    });
+    ui.add_space(16.0);
+    // The link bar.
+    egui::Frame::new()
+        .fill(egui::Color32::from_rgb(0xf3, 0xf2, 0xf0))
+        .corner_radius(CornerRadius::same(16))
+        .inner_margin(egui::Margin { left: 18, right: 8, top: 7, bottom: 7 })
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let size = crate::kit::controls::ButtonSize { height: 42.0, pad_x: 18.0, radius: 12, font_px: 15.0 };
+                let copy_w = crate::kit::controls::button_width(ui.ctx(), crate::kit::controls::ButtonKind::Primary, size, COPY_LINK, false);
+                let room = (ui.available_width() - copy_w - 12.0).max(40.0);
+                ui.add_sized(
+                    egui::vec2(room, 42.0),
+                    egui::Label::new(
+                        egui::RichText::new(link)
+                            .font(egui::FontId::new(15.0, egui::FontFamily::Monospace))
+                            .color(egui::Color32::from_rgb(0x4a, 0x47, 0x45)),
+                    )
+                    .truncate(),
+                );
+                let copy = crate::kit::controls::button(ui, crate::kit::controls::ButtonKind::Primary, size, COPY_LINK, None);
+                let _ = ui.interact(copy.rect, copy_link_id(), egui::Sense::hover());
+                if copy.clicked() {
+                    crate::clipboard::copy_secret(link);
+                    crate::kit::toast::show(ui.ctx(), LINK_COPIED);
+                }
+            });
+        });
+    ui.add_space(16.0);
+    ui.columns(2, |columns| {
+        let size = crate::kit::controls::ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        if crate::kit::controls::button(&mut columns[0], crate::kit::controls::ButtonKind::Outline, size, DONE, None).clicked() {
+            action = RecordUiAction::Cancel;
+        }
+        if crate::kit::controls::button(&mut columns[1], crate::kit::controls::ButtonKind::Outline, size, SEE_IN_SHARED, None).clicked() {
+            action = RecordUiAction::SeeInShared;
+        }
+    });
+    action
 }
 
 /// **Forgetting a person who still holds shares is asked first.** The owner:
@@ -2679,15 +2567,6 @@ mod paint_tests {
 
     const NOW: i64 = 1_786_320_000_000;
 
-    /// The timezone every paint test below stands in: UTC, injected.
-    ///
-    /// The export form now prints the instant its link dies, in the user's
-    /// own day -- so without a fixed offset here, a test that read a date off
-    /// the painted glyphs would pass or fail depending on where the machine
-    /// running `cargo test` happens to be. `send::expiry_wording`'s own tests
-    /// make the same arrangement for the same reason.
-    const UTC: crate::local_time::FixedOffset = crate::local_time::FixedOffset(0);
-
     /// Everything one frame painted that these tests can ask about: the
     /// glyph runs, where each of them landed, and every filled rectangle with
     /// the colour it was filled in.
@@ -2823,52 +2702,6 @@ mod paint_tests {
         );
     }
 
-    /// **By default the card sends the whole record and says so, with no
-    /// ticks.** The owner: "we may skip which fields to share for now - share
-    /// the whole thing", then "use advanced sharing to offer fields, off by
-    /// default". The line names what this record has, the password among it;
-    /// the tick rows are gone; the draft publishes every field but the seed;
-    /// and the record's seed is said to be staying behind.
-    #[test]
-    fn by_default_the_whole_record_goes_and_the_card_says_what_that_is() {
-        let item = a_login();
-        let mut draft = RecordDraft::default();
-        // A narrower choice from before the setting went off must not survive.
-        draft.selection.notes = false;
-        draft.set_totp(true);
-        let painted = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&item),
-                Some("Engineering"),
-                false,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &crate::send::FixedClock(0),
-                &crate::local_time::FixedOffset(0),
-            );
-        });
-        assert!(painted.text.iter().any(|t| t == WHOLE_RECORD_LEAD), "{:?}", painted.text);
-        for pill in [USERNAME_LABEL, PASSWORD_LABEL, WEBSITES_LABEL, NOTES_LABEL] {
-            assert!(painted.text.iter().any(|t| t == pill), "no {pill} pill: {:?}", painted.text);
-        }
-        assert!(
-            !painted.text.iter().any(|t| t == TOTP_LABEL || t == URI_LABEL),
-            "the tick rows are still drawn: {:?}",
-            painted.text
-        );
-        assert!(painted.text.iter().any(|t| t == SEED_STAYS_NOTE), "the seed note is missing");
-        assert_eq!(
-            (draft.selection.username, draft.selection.password, draft.selection.uri, draft.selection.notes),
-            (true, true, true, true),
-            "the draft does not send the whole record"
-        );
-        assert!(!draft.selection.totp, "the seed went with the whole record");
-        assert!(draft.passphrase.is_empty(), "the seed's passphrase outlived the untick");
-    }
-
     /// **What the sent log files is what actually went**: the fields the
     /// selection asks for AND the item has, the seed only when it travels
     /// sealed. Labels, never values.
@@ -2920,89 +2753,6 @@ mod paint_tests {
         assert!(whole_record_fields(None).is_empty());
     }
 
-    /// **The password row is red in all three of §5a's ways**, and only when
-    /// it is really going.
-    ///
-    /// The tint, the tick and the tag: the design makes one point in the only
-    /// three ways a row has, and any one of them alone would pass against a
-    /// row that had lost the other two.
-    #[test]
-    fn the_password_row_is_red_only_while_the_password_is_going() {
-        let item = a_login();
-        // **The password IS ticked by default** -- `RecordDraft::default`
-        // says so and argues it: a user sending a login is sending a
-        // password. So the quiet frame is one with it deliberately turned
-        // OFF, and the assertion below is that the red goes with it.
-        assert!(
-            RecordDraft::default().selection.password,
-            "control: this test has the default the wrong way round"
-        );
-        let quiet = paint(|ui| {
-            let mut draft = RecordDraft::default();
-            draft.selection.password = false;
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&item),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-        assert!(
-            !quiet.has(VISIBLE_PILL),
-            "the tag is on a row whose password is not going"
-        );
-        assert!(
-            !quiet.has(PASSWORD_TRAVELS),
-            "the caution band is up over a Send with no password in it"
-        );
-
-        let mut sending = RecordDraft::default();
-        assert!(sending.selection.password, "control: the loud frame is not sending one");
-        let loud = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut sending,
-                "SAP Production",
-                Some(&item),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-        assert!(
-            loud.has(VISIBLE_PILL),
-            "the tag is missing from a password that is going: {:?}",
-            loud.text
-        );
-        assert!(
-            loud.has(PASSWORD_TRAVELS),
-            "§5a's caution band is missing from a Send carrying a password"
-        );
-        // The tint, which no glyph reader can see: §5a's `#fdf3f2` is painted
-        // on this card only by the password's row and by the caution band, and
-        // one of the two is enough to prove the colour reached the frame --
-        // so both are counted, and the quiet frame must have neither.
-        let washes = |p: &Painted| {
-            p.fills.iter().filter(|(_, fill)| *fill == theme::DANGER_WASH).count()
-        };
-        assert_eq!(washes(&quiet), 0, "the danger wash is on a card sending no password");
-        assert!(
-            washes(&loud) >= 2,
-            "only {} danger-washed bands on a card sending a password; §5a has the row and \
-             the caution strip",
-            washes(&loud)
-        );
-    }
-
     /// The record these shots are about: a login with something in every
     /// field §5a's include list draws a value for.
     ///
@@ -3050,324 +2800,6 @@ mod paint_tests {
              against nothing"
         );
         painted
-    }
-
-    /// **The record composer is the same banded card the Sends composer is**,
-    /// and this test exists because the two coming apart is the defect one
-    /// level up from the one that was reported.
-    ///
-    /// The owner screenshotted `send_ui`'s text composer and said it was not
-    /// as per design: no card, bare inputs, a footer of loose buttons and
-    /// floating prose. Every one of those was equally true here -- the two
-    /// forms had each written out `Frame::new().fill(CARD).corner_radius(8)`
-    /// in their own file, so they agreed only by coincidence, and the
-    /// coincidence was that neither was §5a. Fixing one of them and not the
-    /// other would have produced two composers that publish the same object
-    /// and look like two applications.
-    ///
-    /// Asserted on this card's own paint rather than by comparing two
-    /// screens' pixels: the shared thing is `theme::form_card` and its three
-    /// bands, so what each card has to show is that it went through them.
-    #[test]
-    fn the_export_card_is_the_banded_card_and_not_a_form_laid_flat() {
-        let mut draft = RecordDraft::default();
-        let painted = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-
-        let heading = painted.rect_of(EXPORT_HEADING).expect("the heading was not painted");
-        let submit = painted.rect_of(EXPORT_SUBMIT_LABEL).expect("the submit was not painted");
-
-        // The footer band: §5a's `#fbfaf9`, which is `theme::CARD_TINT`, and
-        // nothing else on this card is painted in it.
-        let band = painted
-            .fills
-            .iter()
-            .filter(|(_, colour)| *colour == theme::CARD_TINT)
-            .map(|(rect, _)| *rect)
-            .max_by(|a, b| a.bottom().total_cmp(&b.bottom()))
-            .expect("no tinted footer band was painted -- the answers are still the last \
-                     things in the body");
-        assert!(
-            band.contains_rect(submit),
-            "the submit at {submit:?} is outside the footer band at {band:?}"
-        );
-        assert!(
-            !band.contains_rect(heading),
-            "the heading is inside the footer band, so the 'band' found is the whole card"
-        );
-
-        // §5a's standing note, in the footer's right-hand slot, spelled once
-        // for both composers.
-        assert!(
-            painted.has(crate::vault_window::send_ui::APPEARS_IN_SENDS),
-            "the record composer's footer does not say where the Send ends up, and the Sends \
-             composer's does -- one fact, two cards, two answers: {:?}",
-            painted.text
-        );
-
-        // The header band's closing rule. `theme::hairline` is the one weight
-        // §5a draws under a card's title, and a card with no rule under its
-        // heading is a heading with a gap under it.
-        //
-        // Bounded by the heading above and the body's first line below rather
-        // than by an arithmetic guess at the band's height: the heading's rect
-        // is its GLYPH ink, which stops short of the line box, so "one padding
-        // below the heading" is not where the rule is.
-        let first_block =
-            painted.rect_of(RECORD_EYEBROW).expect("the RECORD eyebrow was not painted");
-        let rule = painted.fills.iter().any(|(rect, colour)| {
-            *colour == theme::HAIRLINE
-                && (rect.height() - 1.0).abs() < 0.5
-                && rect.top() > heading.bottom()
-                && rect.bottom() < first_block.top()
-        });
-        assert!(rule, "no hairline closes the header band off from the body");
-    }
-
-    /// **The warning is on screen when the seed is ticked, and not before.**
-    ///
-    /// The pure test says `warning_is_shown` answers correctly; this says the
-    /// form draws what it answers. Both halves are needed: a constant nothing
-    /// paints is not a safety control.
-    #[test]
-    fn the_form_paints_the_warning_only_with_the_seed_ticked() {
-        let mut draft = RecordDraft::default();
-        let before = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-        assert!(before.has(EXPORT_HEADING), "control: the form drew nothing recognisable");
-        assert!(before.has(TOTP_LABEL), "the seed tick is not on the form at all");
-        assert!(
-            !before.has("cloning the second factor"),
-            "the warning was painted with no seed ticked"
-        );
-
-        let mut ticked = RecordDraft::default();
-        ticked.set_totp(true);
-        let after = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut ticked,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-        assert!(
-            after.has(SEED_WARNING),
-            "the seed was ticked and the warning was NOT painted: {:?}",
-            after.text
-        );
-        assert!(after.has(NEEDS_PASSPHRASE), "the greyed button's reason was not painted");
-    }
-
-    /// **Design §5a's footer is a primary beside a secondary, measured on the
-    /// fills and not on the words.**
-    ///
-    /// Until this pass the two answers were bare `egui::Button`s that
-    /// differed only in the colour of their *text*, which no test could see
-    /// and which on screen made the publish and the throw-away one matched
-    /// pair. The assertion is therefore on the rectangle behind each label:
-    /// [`theme::BLUE`] under the submit, [`theme::CARD`] under the way out.
-    /// A regression that reverted either button to egui's default chrome
-    /// reds here, where reverting it used to change nothing any test could
-    /// name.
-    ///
-    /// The heights are pinned alongside, because a control drawn at zero size
-    /// still paints its galley -- `send_ui`'s paint tests learned that once
-    /// -- and "there is a blue rectangle somewhere behind these words" is not
-    /// yet a button.
-    #[test]
-    fn the_export_footer_wears_the_design_systems_two_buttons() {
-        // A draft with something ticked, so the submit is LIVE: a disabled
-        // primary is faded toward the window colour and this test would then
-        // be asserting the fade rather than the fill.
-        let mut draft = RecordDraft::default();
-        assert!(
-            export_problem(&draft, &FixedClock(NOW)).is_none(),
-            "the fixture wants a submittable draft, or the fill below is a disabled one"
-        );
-        let painted = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-
-        let (submit, submit_fill) = painted.button_under(EXPORT_SUBMIT_LABEL);
-        assert_eq!(
-            submit_fill,
-            theme::BLUE,
-            "the composer's submit is not the design system's filled primary -- §5a's footer \
-             is a blue button beside a white one, and a footer whose two answers carry the \
-             same chrome says neither is the one the card is for"
-        );
-        assert_eq!(
-            submit.height(),
-            theme::BUTTON_HEIGHT,
-            "the submit is not this app's action-button height"
-        );
-
-        let (cancel, cancel_fill) = painted.button_under(EXPORT_CANCEL_LABEL);
-        assert_eq!(
-            cancel_fill,
-            theme::CARD,
-            "the composer's way out is not the design system's outlined secondary"
-        );
-        assert_eq!(
-            cancel.height(),
-            theme::BUTTON_HEIGHT,
-            "the two footer answers are different heights"
-        );
-        assert_ne!(
-            submit_fill, cancel_fill,
-            "the two answers paint the same fill, which is the exact defect this pass fixed"
-        );
-    }
-
-    /// **§5a's `RECORD` block: the eyebrow, the monogram tile and the record's
-    /// own name.**
-    ///
-    /// The name is the one line on this card that says *which* record is
-    /// about to become a public link, and it used to be painted in the same
-    /// 11px grey this file uses for fine print. Pinned by the tile's size as
-    /// well as by the glyphs, because "the initials are on screen" is true of
-    /// two letters dropped anywhere.
-    #[test]
-    fn the_record_block_names_the_record_under_its_own_eyebrow() {
-        let mut draft = RecordDraft::default();
-        let painted = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-
-        assert!(
-            painted.has(RECORD_EYEBROW),
-            "§5a's RECORD eyebrow is not on the card: {:?}",
-            painted.text
-        );
-        assert!(
-            painted.has("SAP Production"),
-            "the composer does not name the record it was opened against: {:?}",
-            painted.text
-        );
-
-        let initials = theme::initials("SAP Production");
-        let tile = painted
-            .rect_of(&initials)
-            .unwrap_or_else(|| panic!("the monogram {initials:?} was not painted"));
-        // The glyphs' own ink is smaller than the tile; what is asserted is
-        // that they sit inside a box of the design's 32, which is the tile
-        // `avatar` allocated.
-        assert!(
-            tile.width() <= RECORD_CHIP_TILE && tile.height() <= RECORD_CHIP_TILE,
-            "the record chip's monogram does not fit the design's {RECORD_CHIP_TILE}pt tile: \
-             {tile:?}"
-        );
-    }
-
-    /// **The counter agrees with the list under it, for every one of the six
-    /// tick counts the form can be in.**
-    ///
-    /// [`include_counter`] is a pure function over a struct of five `bool`s
-    /// and [`INCLUDE_FIELD_COUNT`] is a hand-written 5 beside it; nothing in
-    /// the type system holds the two together, and a sixth tick row added
-    /// without touching the constant would put a counter on screen that
-    /// disagrees with the rows it is counting. This walks the real form and
-    /// counts the labels it really drew.
-    #[test]
-    fn the_include_counter_counts_every_row_the_form_draws() {
-        let labels = [USERNAME_LABEL, PASSWORD_LABEL, URI_LABEL, NOTES_LABEL, TOTP_LABEL];
-        assert_eq!(
-            labels.len(),
-            INCLUDE_FIELD_COUNT,
-            "the denominator and the list of rows have come apart"
-        );
-
-        let mut draft = RecordDraft::default();
-        let painted = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-        for label in labels {
-            assert!(painted.has(label), "{label} is not a row on the form: {:?}", painted.text);
-        }
-
-        // The default draft is username + password, which is the state §5a
-        // itself draws -- "2 of 5 fields".
-        assert_eq!(include_counter(&RecordDraft::default()), "2 of 5 fields");
-        assert!(
-            painted.has("2 of 5 fields"),
-            "the counter §5a puts beside INCLUDE is not painted: {:?}",
-            painted.text
-        );
-
-        // Every count, including the two ends and the singular.
-        let with = |username, password, uri, notes, totp| RecordDraft {
-            selection: RecordSelection { username, password, uri, notes, totp },
-            ..RecordDraft::default()
-        };
-        assert_eq!(include_counter(&with(false, false, false, false, false)), "0 of 5 fields");
-        assert_eq!(include_counter(&with(true, false, false, false, false)), "1 of 5 field");
-        assert_eq!(include_counter(&with(true, true, true, false, false)), "3 of 5 fields");
-        assert_eq!(include_counter(&with(true, true, true, true, false)), "4 of 5 fields");
-        assert_eq!(include_counter(&with(true, true, true, true, true)), "5 of 5 fields");
     }
 
     /// The import form paints the field **names** of a record it was given,
@@ -3445,191 +2877,6 @@ mod paint_tests {
         // Control on the same fixture: the form did draw, so the absences
         // above are not the absences of a blank frame.
         assert!(painted.has(IMPORT_HEADING), "{:?}", painted.text);
-    }
-
-    /// **§5a's `ACCESS` block is on this card: the eyebrow, three row labels,
-    /// four lifetime cells, and the date the link dies.**
-    ///
-    /// It is worth a paint test and not only the pure ones because every
-    /// other assertion about this block is about a value in a struct. A
-    /// `draw_access_block` that had been left out of `draw_export_form`
-    /// entirely would leave `export_problem`, `view_limit_from` and
-    /// `send_plan_from` all green and all pointless: the user would have no
-    /// way to set any of the three.
-    #[test]
-    fn the_access_block_is_on_the_record_composer() {
-        let mut draft = RecordDraft::default();
-        let painted = paint(|ui| {
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-
-        assert!(
-            painted.has(super::super::send_ui::ACCESS_EYEBROW),
-            "§5a's ACCESS eyebrow is not on the card: {:?}",
-            painted.text
-        );
-        for label in [
-            super::super::send_ui::EXPIRES_LABEL,
-            super::super::send_ui::VIEWS_LABEL,
-            super::super::send_ui::OPEN_WITH_LABEL,
-        ] {
-            assert!(painted.has(label), "the {label:?} row is missing: {:?}", painted.text);
-        }
-
-        // The lifetime control, shut, saying the answer in force. It is a
-        // dropdown rather than a run of cells -- see
-        // `send_ui::draw_access_block` for the measurement that forced the
-        // change -- so what the card carries is one label and not nine.
-        assert!(
-            painted.has(&crate::send::lifetime_label(
-                crate::send::DEFAULT_LIFETIME,
-                &UTC
-            )),
-            "the lifetime control does not say the answer in force: {:?}",
-            painted.text
-        );
-
-        // The sentence under the control, naming the day this link dies -- at
-        // the UTC offset these tests stand in, and from `send.rs`'s own
-        // `expiry_wording` rather than from a second formatter here.
-        assert!(
-            painted.has(&crate::send::expiry_wording(
-                crate::send::DEFAULT_LIFETIME,
-                &FixedClock(NOW),
-                &UTC,
-            )),
-            "the composer does not say when the link stops working: {:?}",
-            painted.text
-        );
-        assert!(
-            painted.has("17 Aug 2026"),
-            "control: that sentence names some other day than the one seven days from `NOW`, \
-             so the assertion above is comparing a formatter with itself: {:?}",
-            painted.text
-        );
-
-        // Neither optional control is switched on, and the notes beside them
-        // say so rather than leaving two blank boxes.
-        assert!(painted.has(super::super::send_ui::NO_VIEW_LIMIT_NOTE), "{:?}", painted.text);
-        assert_eq!(draft.access.password, None, "a frame put a password on the Send");
-        assert_eq!(draft.access.max_access_count, None, "a frame capped the Send");
-
-        // **Recipient IS on the card now, and as what it is.** The owner
-        // asked for it: "if sent once - we should save the email\recepient
-        // and suggest those from the list next time". It is kept on this PC
-        // in `sent_history` and locks nothing -- which is why §5a's two
-        // toggles beneath it stay absent: each claims the link does something
-        // a Bitwarden Send does not, and adding one reds this test rather
-        // than shipping.
-        assert!(painted.has(super::super::send_ui::RECIPIENT_LABEL), "{:?}", painted.text);
-        for absent in ["Only this address can open it", "Tell me when it is opened"] {
-            assert!(
-                !painted.has(absent),
-                "{absent:?} is drawn on the composer, and there is no server behind it -- see \
-                 `send_ui::draw_access_block` on why these are absences and not to-dos"
-            );
-        }
-    }
-
-    /// **§5a's Access block fits the modal it is drawn in.**
-    ///
-    /// The block's widest row is the lifetime control sitting to the right of
-    /// a 96-point label column, inside a card that is [`MODAL_WIDTH`] wide
-    /// with a 12-point margin each side. That leaves **226 points**, and it is
-    /// a real constraint that is not obvious by inspection.
-    ///
-    /// **This test is why the lifetime row is a dropdown.** It used to loop
-    /// over a segmented run's cells, because a run sizes each cell to its own
-    /// label plus `theme::SEGMENT_PADDING` -- so the run grew when the picker
-    /// went from three cells to four, and when the set reached nine there was
-    /// no setting of any constant that fitted it in 226 points.
-    /// `send_ui::EXPIRY_FIELD_WIDTH` is a fixed box that cannot grow at all,
-    /// and this measures the box rather than a label inside it, so the claim
-    /// survives a reworded answer.
-    ///
-    /// **This is the measurement that has cost this project rework before.**
-    /// The design page is content-box, so §5a's `width: 690px` column and its
-    /// `height: 30px` boxes are all inside their borders; reading any of them
-    /// as a border-box number puts a control two points wider than it is,
-    /// which is invisible in a screenshot until the row it is in overflows.
-    /// The other paint tests here run in a 640-point pane, where nothing
-    /// overflows and nothing is learned.
-    #[test]
-    fn the_access_block_fits_inside_the_modal_it_is_drawn_in() {
-        let mut draft = RecordDraft::default();
-        let painted = paint(|ui| {
-            // The modal's own constraint, applied the way `draw_export_modal`
-            // applies it, so this measures the card the user actually sees.
-            ui.set_max_width(MODAL_WIDTH);
-            draw_export_form(
-                ui,
-                &mut draft,
-                "SAP Production",
-                Some(&a_login()),
-                Some("Engineering"),
-                true,
-                &crate::sent_history::SentHistory::default(),
-                false,
-                &FixedClock(NOW),
-                &UTC,
-            );
-        });
-
-        // The card's own left edge, taken from a control that is definitely
-        // in it, so the budget below is measured from the drawing and not
-        // from an assumption about where the pane starts.
-        let eyebrow = painted
-            .rect_of(super::super::send_ui::ACCESS_EYEBROW)
-            .expect("control: the ACCESS eyebrow did not paint");
-        let right_edge = eyebrow.left() + MODAL_WIDTH;
-
-        // The lifetime control, measured as a BOX and not as a label. The
-        // label is found first because that is the only thing the paint
-        // harness can see, and the box is then reconstructed round it: the
-        // text starts one `DROPDOWN_PAD_X` inside the left edge, and the box
-        // runs `EXPIRY_FIELD_WIDTH` from there. Measuring the label alone
-        // would pass for a box twice as wide as the card.
-        let answer = crate::send::lifetime_label(crate::send::DEFAULT_LIFETIME, &UTC);
-        let label = painted
-            .rect_of(&answer)
-            .unwrap_or_else(|| panic!("the {answer:?} answer did not paint"));
-        let box_right =
-            label.left() - theme::DROPDOWN_PAD_X + super::super::send_ui::EXPIRY_FIELD_WIDTH;
-        assert!(
-            box_right <= right_edge,
-            "the lifetime control runs {}pt past the right edge of a {MODAL_WIDTH}pt modal. \
-             §5a's Access rows are a 96-point label column plus a control, which leaves 226 \
-             points -- and a control wider than that overflows the card before it overflows \
-             anything a screenshot shows",
-            box_right - right_edge
-        );
-
-        // The notes beside the two optional controls are the other things on
-        // these rows that can push right, and they are sentences rather than
-        // labels.
-        for note in [
-            super::super::send_ui::NO_VIEW_LIMIT_NOTE,
-            super::super::send_ui::OPEN_WITH_LABEL,
-        ] {
-            let rect =
-                painted.rect_of(note).unwrap_or_else(|| panic!("{note:?} did not paint"));
-            assert!(
-                rect.right() <= right_edge,
-                "{note:?} runs {}pt past the modal's right edge",
-                rect.right() - right_edge
-            );
-        }
     }
 
     /// **The import footer is a primary beside a secondary, and the CREATE is
@@ -3904,95 +3151,6 @@ mod paint_tests {
         );
     }
 
-    /// **The composer's ✕ is drawn, and pressing it cancels -- the same answer
-    /// its own Cancel button gives.**
-    ///
-    /// **Neither of these two modals binds Escape**, here or in
-    /// `vault_window::mod`, so there is no keyboard gesture for the mark to
-    /// have to match; what it matches is [`EXPORT_CANCEL_LABEL`], which is the
-    /// card's existing way out. One is deliberately not invented in passing.
-    #[test]
-    fn the_composers_dismiss_mark_is_drawn_and_cancels() {
-        let ctx = modal_context();
-        let mut state = RecordSend::opening("itm-1", "SAP Production");
-        let run = |events: &[egui::Event], state: &mut RecordSend| {
-            let mut action = RecordUiAction::None;
-            let output = ctx.run_ui(modal_input(events), |ui| {
-                action = draw_export_modal(
-                    ui.ctx(),
-                    state,
-                    Some(&a_login()),
-                    Some("Engineering"),
-                    true,
-                    &crate::sent_history::SentHistory::default(),
-                    false,
-                    &FixedClock(NOW),
-                    &UTC,
-                );
-            });
-            (action, output)
-        };
-
-        // One sizing pass, then a live one -- an anchored `Area` paints
-        // nothing until egui has measured it.
-        let _ = run(&[], &mut state);
-        let (idle, drawn) = run(&[], &mut state);
-        assert_eq!(idle, RecordUiAction::None, "the card reported a press with no input");
-        let at = dismiss_mark(&drawn);
-        assert_shared_inset(&ctx, "record-send-modal", at);
-
-        let (action, _) = run(&modal_click(at), &mut state);
-        assert_eq!(
-            action,
-            RecordUiAction::Cancel,
-            "the composer's ✕ at {at:?} reported nothing -- either the card's drag strip \
-             swallowed the click, or the mark is drawn and dead"
-        );
-    }
-
-    /// **A composer with a `bw send create` in flight does not answer its
-    /// ✕**, for the same reason it greys its Cancel: walking away from the
-    /// card leaves a child writing into state nobody is watching. A mark that
-    /// stayed live beside a greyed Cancel would be a second exit from a state
-    /// the card's own exit refuses -- the exact hazard this pass exists to
-    /// remove rather than to add.
-    #[test]
-    fn the_composers_dismiss_mark_is_dead_while_the_send_is_in_flight() {
-        let ctx = modal_context();
-        let mut state = RecordSend::opening("itm-1", "SAP Production");
-        let run = |events: &[egui::Event], in_flight: bool, state: &mut RecordSend| {
-            let mut action = RecordUiAction::None;
-            let output = ctx.run_ui(modal_input(events), |ui| {
-                action = draw_export_modal(
-                    ui.ctx(),
-                    state,
-                    Some(&a_login()),
-                    Some("Engineering"),
-                    true,
-                    &crate::sent_history::SentHistory::default(),
-                    in_flight,
-                    &FixedClock(NOW),
-                    &UTC,
-                );
-            });
-            (action, output)
-        };
-
-        let _ = run(&[], true, &mut state);
-        let (_, drawn) = run(&[], true, &mut state);
-        // It is still PAINTED -- a control that vanished for the duration
-        // would read as the card changing shape.
-        let at = dismiss_mark(&drawn);
-
-        let (action, _) = run(&modal_click(at), true, &mut state);
-        assert_eq!(
-            action,
-            RecordUiAction::None,
-            "the ✕ closed a composer with a send in flight, which its own Cancel button \
-             refuses to do"
-        );
-    }
-
     /// **The import card's ✕ is drawn, and pressing it cancels.**
     ///
     /// On this card the mark is not a consistency but a FIX. The import form
@@ -4031,5 +3189,97 @@ mod paint_tests {
             "the import card's ✕ at {at:?} reported nothing -- and it is this card's only way \
              out, so a dead mark here is a modal a user cannot leave"
         );
+    }
+}
+
+#[cfg(test)]
+mod v2_share_tests {
+    //! Spec B §6: the Share modal.
+    use super::*;
+    use crate::kit::testing::{self, click_at, Painted};
+    use eframe::egui;
+
+    const SCREEN: egui::Vec2 = egui::vec2(1280.0, 900.0);
+
+    fn frame(ctx: &egui::Context, time: f64, state: &mut RecordSend, events: Vec<egui::Event>) -> (RecordUiAction, Painted) {
+        let history = crate::sent_history::SentHistory::default();
+        let mut action = RecordUiAction::None;
+        let p = testing::frame(ctx, time, SCREEN, events, |ui| {
+            action = draw_export_modal(
+                ui.ctx(),
+                state,
+                None,
+                None,
+                true,
+                &history,
+                false,
+                &crate::send::SystemClock,
+                &crate::local_time::SystemZone,
+            );
+        });
+        (action, p)
+    }
+
+    fn settled(state: &mut RecordSend) -> (egui::Context, Painted) {
+        let ctx = testing::ctx();
+        let _ = frame(&ctx, 0.0, state, vec![]);
+        let _ = frame(&ctx, 0.1, state, vec![]);
+        let (_, p) = frame(&ctx, 0.2, state, vec![]);
+        (ctx, p)
+    }
+
+    fn click_id(ctx: &egui::Context, time: f64, state: &mut RecordSend, id: egui::Id) -> RecordUiAction {
+        let at = ctx.read_response(id).unwrap_or_else(|| panic!("nothing under {id:?}")).rect.center();
+        let action = frame(ctx, time, state, click_at(at)).0;
+        // The pointer leaves, and the frame after settles.
+        let _ = frame(ctx, time + 0.05, state, vec![egui::Event::PointerGone]);
+        let _ = frame(ctx, time + 0.1, state, vec![]);
+        action
+    }
+
+    #[test]
+    fn no_field_picked_asks_for_one() {
+        let mut state = RecordSend::opening("1", "Ledgerline");
+        let (ctx, _) = settled(&mut state);
+        let _ = click_id(&ctx, 0.3, &mut state, chip_id(IncludeField::Username));
+        let _ = click_id(&ctx, 0.5, &mut state, chip_id(IncludeField::Password));
+        assert!(!state.draft.selection.username && !state.draft.selection.password);
+        let action = click_id(&ctx, 0.7, &mut state, create_link_id());
+        assert_eq!(action, RecordUiAction::None, "nothing is sent");
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(NOTHING_PICKED));
+    }
+
+    #[test]
+    fn the_password_chip_is_red_when_picked() {
+        let mut state = RecordSend::opening("1", "Ledgerline");
+        let (_, p) = settled(&mut state);
+        assert!(state.draft.selection.password, "the password is picked by default");
+        assert!(p.rects.iter().any(|r| r.fill == theme::DANGER_WASH && r.stroke.color == theme::ERROR && r.rect.height() == 42.0));
+    }
+
+    #[test]
+    fn the_plan_maps_expiry_and_once() {
+        let mut state = RecordSend::opening("1", "Ledgerline");
+        assert_eq!(state.draft.access.lifetime, crate::send::SendLifetime::Hours(24), "a day by default");
+        assert_eq!(state.draft.access.max_access_count, Some(1), "opens once by default");
+        let (ctx, p) = settled(&mut state);
+        let week = p.texts.iter().find(|(t, _, _)| t == "7 days").expect("the 7 days segment").2.center();
+        let _ = frame(&ctx, 0.3, &mut state, click_at(week));
+        assert_eq!(state.draft.access.lifetime, crate::send::SendLifetime::Hours(168));
+        assert_eq!(done_summary(&state.draft, true), "Username, Password \u{b7} 7 days \u{b7} opens once");
+    }
+
+    #[test]
+    fn done_shows_the_link_and_copies_it() {
+        let mut state = RecordSend::opening("1", "Ledgerline");
+        state.summary = "Username, Password \u{b7} 1 day \u{b7} opens once".into();
+        state.done = Some(zeroize::Zeroizing::new("https://vault.example/#/send/abc/def".into()));
+        let (ctx, p) = settled(&mut state);
+        for text in [LINK_READY, "https://vault.example/#/send/abc/def", COPY_LINK, DONE, SEE_IN_SHARED, "Username, Password \u{b7} 1 day \u{b7} opens once"] {
+            assert!(p.texts.iter().any(|(t, _, _)| t == text), "no {text}");
+        }
+        assert!(ctx.read_response(copy_link_id()).is_some(), "the link bar's Copy");
+        let see = p.texts.iter().find(|(t, _, _)| t == SEE_IN_SHARED).unwrap().2.center();
+        assert_eq!(frame(&ctx, 0.3, &mut state, click_at(see)).0, RecordUiAction::SeeInShared);
     }
 }

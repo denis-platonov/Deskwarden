@@ -3128,17 +3128,16 @@ impl Preview {
                     );
                 }
                 PaneKind::Composer => {
-                    let _ = record_ui::draw_export_form(
-                        ui,
-                        &mut fixtures.record,
-                        "Ledgerline",
-                        // §5a's rows carry the values that would travel, so the
-                        // shot needs a real record behind them rather than a
-                        // name with the user name glued on the end of it.
+                    // v2: the Share modal over the shot (spec B §6), with
+                    // the chips (advanced sharing on).
+                    let mut state = record_ui::RecordSend::opening(&fixtures.login.id, "Ledgerline");
+                    state.draft.selection = fixtures.record.selection.clone();
+                    let _ = record_ui::draw_export_modal(
+                        ui.ctx(),
+                        &mut state,
                         Some(&fixtures.login),
                         Some("Engineering"),
-                        // The default: the whole record, not the ticks.
-                        false,
+                        true,
                         &deskwarden::sent_history::SentHistory::default(),
                         false,
                         &send::FixedClock(PREVIEW_MILLIS),

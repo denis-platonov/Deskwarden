@@ -2431,6 +2431,18 @@ pub fn build_frame_with_search(
         // to whom, under the id the server gave it. Taken, so it is filed
         // once however many frames the report stays on screen; a failed
         // create drops it, since there is no Send to file it under.
+        // Spec B §6.2: the waiting Share modal turns into "Link ready", or
+        // closes on a failure (whose message the window shows as before).
+        if let Some(state) = record_send.as_mut().filter(|s| s.waiting) {
+            match &send_create.report {
+                Some(SendCreateReport::Created { access_url, .. }) => {
+                    state.waiting = false;
+                    state.done = Some(zeroize::Zeroizing::new(access_url.clone()));
+                }
+                Some(SendCreateReport::Failed { .. }) => record_send = None,
+                None => {}
+            }
+        }
         match &send_create.report {
             Some(SendCreateReport::Created { id, .. }) => {
                 if let Some(mut entry) = pending_sent.take() {
@@ -7326,6 +7338,8 @@ pub fn build_frame_with_search(
                     // frame in which the emptied draft is drawn, and if the
                     // item turns out to be gone the taken plan is simply
                     // dropped, which wipes it.
+                    // The done state's line, before the access answers go.
+                    state.summary = record_ui::done_summary(&state.draft, advanced_sharing);
                     let access = std::mem::take(&mut state.draft.access);
                     let mut pending = None;
                     // Re-resolved by id: the vault may have been re-read
@@ -7387,15 +7401,22 @@ pub fn build_frame_with_search(
                             session_token.clone(),
                             plan,
                         );
+                        // Spec B §6.2: the modal waits for its link. The
+                        // seed's passphrase is wiped now rather than when the
+                        // modal goes.
+                        state.draft.passphrase = zeroize::Zeroizing::new(String::new());
+                        state.waiting = true;
+                    } else {
+                        // The item is gone: closed, which drops the draft.
+                        record_send = None;
                     }
-                    // **Closed either way, and closed by replacing the whole
-                    // value.** The draft holds a `Zeroizing` passphrase for a
-                    // seed; dropping the composer wipes it, where an `open =
-                    // false` would leave it resident for the life of the
-                    // window.
-                    record_send = None;
                 }
                 record_ui::RecordUiAction::Cancel => record_send = None,
+                // Spec B §6.2's "See in Shared": the Sends screen.
+                record_ui::RecordUiAction::SeeInShared => {
+                    record_send = None;
+                    sends_selected = true;
+                }
                 // The import form's two actions are unreachable from this
                 // modal, which draws the export form alone -- the import form
                 // is drawn by the block immediately below, out of its own
@@ -7580,6 +7601,8 @@ pub fn build_frame_with_search(
             // one place, after the borrow above has ended.
             let mut close = false;
             match action {
+                // The import form has no done state.
+                record_ui::RecordUiAction::SeeInShared => {}
                 record_ui::RecordUiAction::FetchLink => {
                     let link = state.draft.link.trim().to_string();
                     if !state.in_flight && !link.is_empty() {
@@ -35657,7 +35680,7 @@ mod send_delete_wiring {
         //    test ends up pressing whatever has since moved under it.
         matrix_locate_envelope(state, &output);
         assert!(
-            matrix_find(&output, record_ui::EXPORT_HEADING).is_none(),
+            matrix_find(&output, record_ui::SHARE_SUB).is_none(),
             "control: the composer is already on screen with nothing pressed, so pressing \
              the envelope below would prove nothing"
         );
@@ -35675,7 +35698,7 @@ mod send_delete_wiring {
         let row_at = matrix_locate(state, &output, FRAME_ITEM_NAME);
         let selected = matrix_click(&ctx, &mut frame_fn, row_at);
         assert!(
-            matrix_find(&selected, record_ui::EXPORT_HEADING).is_none(),
+            matrix_find(&selected, record_ui::SHARE_SUB).is_none(),
             "control: selecting a row opened the composer on its own, so the press below \
              proves nothing"
         );
@@ -35684,7 +35707,7 @@ mod send_delete_wiring {
         let envelope_at = matrix_locate_envelope(state, &selected);
         let opened = matrix_click(&ctx, &mut frame_fn, envelope_at);
         assert!(
-            matrix_find(&opened, record_ui::EXPORT_HEADING).is_some(),
+            matrix_find(&opened, record_ui::SHARE_SUB).is_some(),
             "pressing the {:?} envelope with {FRAME_ITEM_NAME:?} selected painted no \
              composer, so the surface is still unreachable. What was painted: {:?}",
             record_ui::SEND_RECORD_LABEL,
@@ -35704,12 +35727,11 @@ mod send_delete_wiring {
             "the seed warning is on screen before the seed was ticked"
         );
 
-        // 5. Cancel closes it, which is what drops the draft and its
+        // 5. Closing it (v2: a click on the scrim) drops the draft and its
         //    `Zeroizing` passphrase buffer.
-        let cancel_at = matrix_locate(state, &opened, "Cancel");
-        let closed = matrix_click(&ctx, &mut frame_fn, cancel_at);
+        let closed = matrix_click(&ctx, &mut frame_fn, egui::pos2(6.0, 400.0));
         assert!(
-            matrix_find(&closed, record_ui::EXPORT_HEADING).is_none(),
+            matrix_find(&closed, record_ui::SHARE_SUB).is_none(),
             "Cancel left the composer open, so the draft it holds is never dropped: {:?}",
             matrix_texts(&closed)
         );
@@ -40108,7 +40130,7 @@ mod send_create_wiring {
             functions.len(),
             functions.iter().map(|(m, n, _)| format!("{m}::{n}")).collect::<Vec<_>>()
         );
-        for expected in ["draw_import_form", "draw_export_form", "draw_item_list"] {
+        for expected in ["draw_import_form", "draw_share_form", "draw_item_list"] {
             assert!(
                 functions.iter().any(|(_, n, _)| n == expected),
                 "control: {expected:?} was not found by the parser, so this walk would call \

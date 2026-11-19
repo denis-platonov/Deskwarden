@@ -108,7 +108,8 @@ impl<'a> Dialog<'a> {
         let screen = ctx.content_rect();
         let width = self.width_on(screen);
 
-        let scrim = egui::Area::new(egui::Id::new(scrim_name(self.id)))
+        let scrim_area = egui::Id::new(scrim_name(self.id));
+        let scrim_widget = egui::Area::new(scrim_area)
             .order(egui::Order::Middle)
             .fixed_pos(screen.min)
             .show(ctx, |ui| {
@@ -117,6 +118,21 @@ impl<'a> Dialog<'a> {
                 response.clicked()
             })
             .inner;
+        // Also asked of the layers directly: a click whose top layer is the
+        // scrim closes the dialog, whatever the window's own passes did to the
+        // widget's response.
+        let (clicked, at) = ctx.input(|i| (i.pointer.any_click(), i.pointer.interact_pos()));
+        let scrim_layer = egui::LayerId::new(egui::Order::Middle, scrim_area);
+        // Not on the pass the dialog first appears: the click that opened it
+        // is still in that pass's input, and it now lands on the new scrim.
+        let pass = ctx.cumulative_pass_nr();
+        let seen_id = scrim_area.with("last-pass");
+        let last = ctx.data(|d| d.get_temp::<u64>(seen_id));
+        ctx.data_mut(|d| d.insert_temp(seen_id, pass));
+        let fresh = last.is_none_or(|last| last + 1 < pass);
+        let scrim = !fresh
+            && (scrim_widget
+                || (clicked && at.is_some_and(|at| ctx.memory(|m| m.layer_id_at(at)) == Some(scrim_layer))));
 
         // `sense(click)`: the card takes the clicks that land on it, so they
         // never reach the scrim behind it.
@@ -218,6 +234,17 @@ mod tests {
     fn the_scrim_closes_the_dialog() {
         let ctx = shown(SCREEN);
         assert_eq!(frame(&ctx, 0.2, SCREEN, click_at(egui::pos2(8.0, 8.0))), ModalOutcome::Closed);
+    }
+
+    /// A real press and release arrive in two frames.
+    #[test]
+    fn a_two_frame_click_on_the_scrim_closes_the_dialog() {
+        let ctx = shown(SCREEN);
+        let at = egui::pos2(8.0, 400.0);
+        let button = |pressed| egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+        let down = frame(&ctx, 0.2, SCREEN, vec![egui::Event::PointerMoved(at), button(true)]);
+        let up = frame(&ctx, 0.25, SCREEN, vec![button(false)]);
+        assert!(down == ModalOutcome::Closed || up == ModalOutcome::Closed);
     }
 
     #[test]
