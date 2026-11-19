@@ -1637,6 +1637,12 @@ pub fn build_frame_with_search(
         .as_deref()
         .map(|path| crate::settings::Settings::load(path).reveal_totp_seed)
         .unwrap_or(false);
+    // The v2 rail's look, read the same way and live-editable for the same
+    // reason. Navy by default.
+    let sidebar_style_at_open = settings_path
+        .as_deref()
+        .map(|path| crate::settings::Settings::load(path).sidebar_style)
+        .unwrap_or_default();
     // Whether an item's DOMAIN may be sent to the icon service at all, read
     // the same way and live-editable for the same reason -- but defaulting
     // the other way round. `true` is the default for this one (see
@@ -2740,7 +2746,9 @@ pub fn build_frame_with_search(
                 // does take from 2b is its metrics: `theme::tune_button` is 28px
                 // square, matching the Lock pill's height and the avatar's
                 // diameter beside it.
-                if theme::tune_button(ui).clicked() {
+                if theme::tune_button(ui).clicked()
+                    || sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenSettings)
+                {
                     // **NOT the two-step dance Lock does immediately below.**
                     // This window stays exactly where it is; the form is drawn
                     // over it, dimmed, by the block at the very end of this
@@ -3002,6 +3010,8 @@ pub fn build_frame_with_search(
             }
         }
         let shortcuts = keyboard_shortcuts_enabled(prefs.is_some());
+        let rail_new_item = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::NewItem);
+        let rail_lock = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::Lock);
         let (ctrl_k, ctrl_l, ctrl_n, send_record_chord, add_totp_chord) = ui.ctx().input(|i| {
             (
                 shortcuts && i.modifiers.ctrl && i.key_pressed(egui::Key::K),
@@ -3039,6 +3049,10 @@ pub fn build_frame_with_search(
                     && i.key_pressed(ADD_TOTP_KEY),
             )
         });
+        // The rail's New item and Lock rows ask for exactly what the chords
+        // do, a frame later.
+        let ctrl_n = ctrl_n || rail_new_item;
+        let ctrl_l = ctrl_l || rail_lock;
         if send_record_chord {
             send_record_asked = true;
         }
@@ -3395,6 +3409,13 @@ pub fn build_frame_with_search(
         // from its link (Paste an invite link) or in the web vault.
         let waiting_from: Vec<crate::rest::sharing::WaitingEntry> =
             sharing.view.as_ref().map(|v| v.waiting.clone()).unwrap_or_default();
+        // The rail's look, live from the preferences modal as the other
+        // live-editable preferences are, published for the rail to read.
+        let sidebar_style = edited_settings_for_closure
+            .borrow()
+            .as_ref()
+            .map_or(sidebar_style_at_open, |s| s.sidebar_style);
+        crate::kit::tokens::set_sidebar_style(ui.ctx(), sidebar_style);
         egui::Panel::left("vault-sidebar")
             .exact_size(SIDEBAR_WIDTH)
             .resizable(false)
@@ -3404,7 +3425,7 @@ pub fn build_frame_with_search(
             // rather than inline here so that the rail's own tests can draw
             // it inside the REAL one; see that function for the measurements
             // and for why the padding moved rather than disappeared.
-            .frame(sidebar::panel_frame())
+            .frame(sidebar::panel_frame(sidebar_style))
             .show(ui, |ui| {
                 // Every list this window holds, in the one shape the sidebar
                 // and the item pane both read -- so a row's badge and its
@@ -3472,13 +3493,28 @@ pub fn build_frame_with_search(
                     &lock_countdown,
                     may_unfile,
                 ) {
-                    SidebarAction::NewFolder => match cache.create_folder("New folder") {
-                        Ok(folder) => folders.push(folder),
+                    // The inline New folder row, submitted with a name.
+                    SidebarAction::CreateFolder(name) => match cache.create_folder(&name) {
+                        Ok(folder) => {
+                            folders.push(folder);
+                            crate::kit::toast::show(ui.ctx(), "Folder created");
+                        }
                         Err(e) => {
                             log::warn!("failed to create folder: {e:?}");
                             flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
                         }
                     },
+                    // The rail's New item, Lock and Settings: each is the
+                    // request the window already answers for Ctrl+N, Ctrl+L
+                    // and the gear, so the rail cannot grow a second path.
+                    // Read on the next frame, beside those.
+                    SidebarAction::NewItem => {
+                        sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::NewItem)
+                    }
+                    SidebarAction::Lock => sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::Lock),
+                    SidebarAction::OpenSettings => {
+                        sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::OpenSettings)
+                    }
                     // Opens the "Edit folder" modal (drawn once, after all
                     // three panels, further down) seeded with this folder's
                     // current name. Rename and delete both happen there.
@@ -24385,12 +24421,13 @@ mod the_idle_timer_follows_the_edited_setting {
         // back, so a label that moved off-pane (egui culls shapes entirely
         // outside the screen rect) would come back as nothing here.
         let painted = painted_sidebar_text(&line);
+        // The v2 Lock row carries the countdown as its count: "Off".
         assert!(
-            painted.iter().any(|t| t == AUTO_LOCK_OFF_LABEL),
+            painted.iter().any(|t| t == sidebar::lock_count(AUTO_LOCK_OFF_LABEL)),
             "the sidebar did not paint {AUTO_LOCK_OFF_LABEL:?}; it painted {painted:?}"
         );
         assert!(
-            !painted.iter().any(|t| t.starts_with("Locks in")),
+            !painted.iter().any(|t| t == sidebar::lock_count("Locks in 4:00")),
             "the sidebar painted a countdown as well as the off label: {painted:?}"
         );
 
@@ -24400,7 +24437,7 @@ mod the_idle_timer_follows_the_edited_setting {
         // nothing.
         let painted_ticking = painted_sidebar_text(&ticking);
         assert!(
-            painted_ticking.iter().any(|t| t == "Locks in 4:00"),
+            painted_ticking.iter().any(|t| t == sidebar::lock_count("Locks in 4:00")),
             "the fixture does not paint the countdown either, so it cannot witness the off \
              label: {painted_ticking:?}"
         );
@@ -35109,7 +35146,9 @@ mod send_delete_wiring {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1100.0, 800.0),
+                // Tall enough for the v2 rail's 44pt rows: the matrix clicks
+                // folder rows, which an 800pt window now scrolls out of view.
+                egui::vec2(1100.0, 2000.0),
             )),
             ..Default::default()
         }

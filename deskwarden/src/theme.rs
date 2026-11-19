@@ -10941,12 +10941,16 @@ mod tests {
         // the two panes different paddings, this is the line to change -- and
         // changing it is a decision about what the reader sees, not a
         // formality, which is why it fails rather than being skipped.
+        // **v2 gives the two panes different paddings** (design 1a: the rail
+        // `padding: 22px 14px 16px`), so this is that line, changed: the
+        // rail's lane is the rail's own padding. The item list's is revisited
+        // when slice 3 restyles that pane.
         assert_eq!(
-            floating_allocated_width, list.floating_allocated_width,
-            "the rail's lane is {floating_allocated_width}pt and the item list's is {}pt, so \
-             the two bars stand off their content by different amounts",
-            list.floating_allocated_width
+            floating_allocated_width,
+            f32::from(crate::vault_window::sidebar::PANEL_PAD_X),
+            "the rail's lane is {floating_allocated_width}pt, not the rail's own padding"
         );
+        let _ = list.floating_allocated_width;
         assert_eq!(
             floating_allocated_width, rail_gutter,
             "`scrollbar_in_gutter` stopped reserving its caller's gutter, so the rail's bar is \

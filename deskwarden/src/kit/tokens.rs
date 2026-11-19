@@ -143,6 +143,17 @@ pub enum SidebarStyle {
     Light,
 }
 
+/// The sidebar style this context's rail paints in; [`SidebarStyle::Navy`]
+/// until the window publishes the user's choice.
+pub fn sidebar_style(ctx: &egui::Context) -> SidebarStyle {
+    ctx.data(|d| d.get_temp::<SidebarStyle>(egui::Id::new("kit-sidebar-style"))).unwrap_or_default()
+}
+
+/// Publishes the user's sidebar style for every rail drawn in this context.
+pub fn set_sidebar_style(ctx: &egui::Context, style: SidebarStyle) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("kit-sidebar-style"), style));
+}
+
 /// One sidebar's colours (spec part A section 2.2, the `sb` table).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SidebarPalette {

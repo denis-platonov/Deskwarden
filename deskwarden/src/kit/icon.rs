@@ -362,8 +362,18 @@ pub mod glyph {
     /// The toast badge's tick, as design 1a draws it.
     pub const TICK: &str = "M20 6 9 17l-5-5";
 
+    /// The 0.15 rows design 1a does not draw, in the same stroke language.
+    pub const APPS: &str = "M3 4h18v12H3zM8 20h8M12 16v4";
+    pub const PASSKEY: &str = "M14 9a4 4 0 1 1-8 0 4 4 0 0 1 8 0zM13 11.5l7 7M17 15.5l2-2M15 13.5l2-2";
+    pub const IDENTITY: &str = "M3 5h18v14H3zM9 11a2 2 0 1 0 0-4 2 2 0 0 0 0 4zM6 16c.5-2 2-3 3-3s2.5 1 3 3M14 9h4M14 13h4";
+    pub const SSH: &str = "M4 5h16v14H4zM8 10l3 2-3 2M13 15h3";
+    pub const ARCHIVE: &str = "M3 4h18v4H3zM5 8v12h14V8M10 12h4";
+    pub const HEALTH: &str = "M3 12h4l3-7 4 14 3-7h4";
+    pub const RECEIVED: &str = "M22 12h-6l-2 3h-4l-2-3H2M5.5 5h13L22 12v7H2v-7z";
+    pub const ORG: &str = "M4 21V4h10v17M14 9h6v12M8 8h2M8 12h2M8 16h2M3 21h18";
+    pub const PENCIL: &str = "M4 20h4L19 9l-4-4L4 16z";
     /// Every glyph, named, for tests and the kit sheet.
-    pub const ALL_GLYPHS: [(&str, &str); 15] = [
+    pub const ALL_GLYPHS: [(&str, &str); 24] = [
         ("all", ALL),
         ("fav", FAV),
         ("login", LOGIN),
@@ -379,6 +389,15 @@ pub mod glyph {
         ("back", BACK),
         ("check", CHECK),
         ("tick", TICK),
+        ("apps", APPS),
+        ("passkey", PASSKEY),
+        ("identity", IDENTITY),
+        ("ssh", SSH),
+        ("archive", ARCHIVE),
+        ("health", HEALTH),
+        ("received", RECEIVED),
+        ("org", ORG),
+        ("pencil", PENCIL),
     ];
 }
 

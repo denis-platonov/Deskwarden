@@ -9,6 +9,9 @@ pub struct Painted {
     pub circles: Vec<epaint::CircleShape>,
     /// (text, colour, rect on screen)
     pub texts: Vec<(String, Color32, Rect)>,
+    /// The clip rect each of `texts` was painted under, in the same order:
+    /// what of it a person can actually see is `rect.intersect(clip)`.
+    pub text_clips: Vec<Rect>,
     pub repaint_delay: std::time::Duration,
 }
 
@@ -18,7 +21,7 @@ impl Painted {
     }
 }
 
-fn collect(shape: &Shape, out: &mut Painted) {
+fn collect(shape: &Shape, clip: Rect, out: &mut Painted) {
     match shape {
         Shape::Rect(r) => out.rects.push(r.clone()),
         Shape::Circle(c) => out.circles.push(*c),
@@ -30,8 +33,9 @@ fn collect(shape: &Shape, out: &mut Painted) {
             // still the whole string, but its glyphs end in the ellipsis.
             let drawn: String = t.galley.rows.iter().flat_map(|row| row.glyphs.iter().map(|g| g.chr)).collect();
             out.texts.push((drawn, color, t.visual_bounding_rect()));
+            out.text_clips.push(clip);
         }
-        Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, out)),
+        Shape::Vec(shapes) => shapes.iter().for_each(|s| collect(s, clip, out)),
         _ => {}
     }
 }
@@ -69,7 +73,7 @@ pub fn frame(
         ..Default::default()
     };
     for clipped in &output.shapes {
-        collect(&clipped.shape, &mut painted);
+        collect(&clipped.shape, clipped.clip_rect, &mut painted);
     }
     painted
 }
