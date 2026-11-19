@@ -2514,9 +2514,6 @@ pub(crate) fn draw_share_toast(ui: &egui::Ui, pane_rect: egui::Rect, clear_of: O
 pub(crate) const SHARE_KEY_PREFIX: &str = "share:";
 /// 6c's header, beside the share pill.
 pub(crate) const SHARED_WITH_A_PERSON: &str = "Shared with a person";
-/// 6c's two cards.
-pub(crate) const PERSON_CARD_TITLE: &str = "PERSON";
-pub(crate) const WHAT_THEY_SEE_TITLE: &str = "WHAT THEY SEE";
 /// 6c's PERSON rows. `Since` falls back to [`SINCE_UNKNOWN`] for a share this
 /// PC holds no record of -- made on another PC, or before the sent history
 /// kept shares. "On another PC" would be a guess; this is what is known.
@@ -2541,22 +2538,22 @@ pub(crate) const CANNOT_VALUE: &str = "Edit, delete or share it on";
 
 /// **A share in the Sent list**: one record, one person (mock 6c).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ShareRow {
+pub struct ShareRow {
     /// `share:{item id}:{email}` -- the Sent pane's selection key. See
     /// [`share_key`].
-    pub(crate) key: String,
-    pub(crate) item_id: String,
+    pub key: String,
+    pub item_id: String,
     /// The VAULT ITEM's name -- the decrypted record, whose cipher the vault
     /// authenticated -- and never anything the view carries: the view's
     /// people come from collection names, and a name is not proof.
-    pub(crate) name: String,
+    pub name: String,
     /// The person, normalised as the view holds them.
-    pub(crate) email: String,
-    pub(crate) state: PersonState,
+    pub email: String,
+    pub state: PersonState,
     /// "to anna@example.com · Shared".
-    pub(crate) subtitle: String,
+    pub subtitle: String,
     /// "14 Sep", from the local record of the share.
-    pub(crate) since: Option<String>,
+    pub since: Option<String>,
 }
 
 impl ShareRow {
@@ -2696,6 +2693,28 @@ pub struct PeopleRows<'a> {
     pub(crate) busy: bool,
 }
 
+impl<'a> PeopleRows<'a> {
+    /// Person shares and nothing else: what a preview (or a caller with only
+    /// a Sent list to show) hands the pane.
+    #[must_use]
+    pub fn with_shares(shares: &'a [ShareRow]) -> Self {
+        Self { shares, ..PeopleRows::none() }
+    }
+
+    /// Records other people share with this account, for Shared with me.
+    #[must_use]
+    pub fn with_received(received: &'a [ReceivedShareRow]) -> Self {
+        Self { received, ..PeopleRows::none() }
+    }
+
+    /// The same, with the Stop sharing question armed for `key`.
+    #[must_use]
+    pub fn confirming_stop(mut self, key: &str) -> Self {
+        self.confirming = Some(key.to_string());
+        self
+    }
+}
+
 impl PeopleRows<'static> {
     /// Nothing about sharing: what every caller that is not about it passes.
     #[must_use]
@@ -2744,33 +2763,29 @@ pub(crate) const RECEIVED_KEY_PREFIX: &str = "recv:";
 /// Mock 6d's two `.lgroup` eyebrows over Shared with me's list.
 pub(crate) const FROM_PEOPLE_EYEBROW: &str = "FROM PEOPLE";
 pub(crate) const FROM_SENDS_EYEBROW: &str = "IMPORTED FROM SENDS";
-/// `.lgroup { font-size: 10px; letter-spacing: 0.1em; padding: 6px 4px 0 }`.
-const GROUP_EYEBROW_PX: f32 = 10.0;
-const GROUP_EYEBROW_TRACKING: f32 = 1.0;
-const GROUP_EYEBROW_TOP: f32 = 6.0;
 const GROUP_EYEBROW_INSET: f32 = 4.0;
 
 /// A record someone shares with this account, in Shared with me.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ReceivedShareRow {
+pub struct ReceivedShareRow {
     /// `recv:{item id}` -- see [`RECEIVED_KEY_PREFIX`].
-    pub(crate) key: String,
-    pub(crate) item_id: String,
+    pub key: String,
+    pub item_id: String,
     /// The VAULT ITEM's name, for [`ShareRow::name`]'s reason: the vault
     /// decrypted and authenticated the record, and the view only says which
     /// item it is.
-    pub(crate) name: String,
+    pub name: String,
     /// Who shares it, as the view names them. **For display only**: the org's
     /// one owner where the server let a member read the roster, else the org
     /// name's claim, which anyone could have spelled as anybody -- and then
     /// [`Self::verified`] is false and the row says so. It decides nothing.
-    pub(crate) from: String,
+    pub from: String,
     /// The sharer is the server's word (official-path spec §4.3); `false`
     /// draws "unverified" in the row's subtitle ([`received_subtitle`]).
-    pub(crate) verified: bool,
+    pub verified: bool,
     /// The sharing org it is in: [`draw_received_group`] draws a hairline
     /// where one org's records end and the next's begin (fix round 1, m8).
-    pub(crate) organization_id: String,
+    pub organization_id: String,
 }
 
 /// A received row's subtitle: who shares it and that it is view-only, with
@@ -2824,88 +2839,6 @@ pub(crate) fn received_share_rows(view: Option<&SharingView>, items: &[VaultItem
     }
     rows.sort_by_key(|(group, _)| *group);
     rows.into_iter().map(|(_, row)| row).collect()
-}
-
-/// The height [`group_eyebrow`] takes, measured -- what `send_ui` adds to its
-/// row count's height so its scroll bar decides on the list really drawn.
-pub(crate) fn group_eyebrow_height(ui: &egui::Ui) -> f32 {
-    let bold = egui::FontId::new(GROUP_EYEBROW_PX, egui::FontFamily::Name(theme::BOLD.into()));
-    GROUP_EYEBROW_TOP + ui.ctx().fonts_mut(|f| f.row_height(&bold))
-}
-
-/// **One of mock 6d's list eyebrows** (`.lgroup`): 10pt bold, tracked 0.1em,
-/// in the ghost ink, 6pt under whatever is above it and 4pt in from the row
-/// edge. Not `theme::eyebrow`, which is the rail's 11pt header: the mock sets
-/// these a size down, as headers INSIDE a list rather than over one.
-pub(crate) fn group_eyebrow(ui: &mut egui::Ui, width: f32, text: &str) {
-    let job = theme::letterspaced(text, GROUP_EYEBROW_PX, theme::BOLD, GROUP_EYEBROW_TRACKING, theme::TEXT_GHOST);
-    let galley = ui.painter().layout_job(job);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, group_eyebrow_height(ui)), egui::Sense::hover());
-    ui.painter().galley(egui::pos2(rect.left() + GROUP_EYEBROW_INSET, rect.top() + GROUP_EYEBROW_TOP), galley, theme::TEXT_GHOST);
-}
-
-/// **Shared with me's people half** (mock 6d): the FROM PEOPLE eyebrow and a
-/// row per received record -- "from denis@example.com · view-only" under its
-/// name. A row opens the record in the vault, where its pane is view-only.
-/// Draws nothing, not even the eyebrow, when nobody shares anything, so the
-/// screen of an account that only ever imported Sends is unchanged.
-///
-/// **IMPORTED FROM SENDS is not drawn here** although the mock puts it under
-/// this group: this function cannot see whether there are imports, and an
-/// eyebrow over no rows says a group exists that does not. `send_ui` draws it,
-/// where both lists are known (`shared_with_me_puts_records_from_people_above
-/// _the_imports`).
-///
-/// `records` are the vault's tiles, so a received record wears in this list
-/// the favicon it wears in All items -- the Sent list's share row's rule.
-pub(crate) fn draw_received_group(
-    ui: &mut egui::Ui,
-    people: &mut PeopleRows<'_>,
-    width: f32,
-    height: f32,
-    selected: &mut Option<String>,
-    records: crate::vault_window::send_ui::RecordTiles<'_>,
-) -> Option<crate::vault_window::send_ui::SendUiAction> {
-    if people.received.is_empty() {
-        return None;
-    }
-    let mut action = None;
-    group_eyebrow(ui, width, FROM_PEOPLE_EYEBROW);
-    let mut group: Option<&str> = None;
-    for row in people.received {
-        // **One organisation's records end where a hairline is** (fix round
-        // 1, m8): two orgs that claim one sharer read as two groups, not as
-        // one sharer's. Painted in the row gap above the next group's first
-        // row, so it takes no height and `send_ui`'s measured list is
-        // unchanged.
-        if group.is_some_and(|org| org != row.organization_id) {
-            let y = ui.cursor().top() - ui.spacing().item_spacing.y / 2.0;
-            let left = ui.cursor().left() + GROUP_EYEBROW_INSET;
-            ui.painter().hline(left..=left + (width - GROUP_EYEBROW_INSET * 2.0).max(0.0), y, egui::Stroke::new(1.0, theme::HAIRLINE));
-        }
-        group = Some(&row.organization_id);
-        let clicked = crate::vault_window::send_ui::draw_person_row(
-            ui,
-            crate::vault_window::send_ui::PersonRow {
-                key: &row.key,
-                item_id: &row.item_id,
-                name: &row.name,
-                subtitle: &received_subtitle(row),
-                pill: None,
-                // The spec's words for why, wherever "unverified" is said
-                // (fix round 1, m7).
-                hover: (!row.verified).then_some(crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP),
-            },
-            width,
-            height,
-            selected,
-            records,
-        );
-        if clicked {
-            action = Some(crate::vault_window::send_ui::SendUiAction::OpenRecord(row.item_id.clone()));
-        }
-    }
-    action
 }
 
 // ---- Shared with me: Paste an invite link, and the sharers being waited on ------------
@@ -3015,16 +2948,6 @@ pub(crate) fn draw_paste_and_waiting(ui: &mut egui::Ui, people: &mut PeopleRows<
             let _ = response.on_hover_text(crate::vault_window::detail::UNVERIFIED_SHARER_TOOLTIP);
         }
     }
-}
-
-/// The height [`draw_paste_and_waiting`] takes, with the list's `gap` BETWEEN
-/// its rows -- `n` rows, `n - 1` gaps, and nothing for none. The gap joining
-/// them to rows under them is the caller's: only it knows whether there are
-/// any (`send_ui`'s `rows_area`, which counts gaps the same way).
-pub(crate) fn paste_and_waiting_height(people: &PeopleRows<'_>, row_gap: f32) -> f32 {
-    let paste = usize::from(people.paste.is_some());
-    let rows = paste + people.waiting.len();
-    paste as f32 * PASTE_ROW_HEIGHT + people.waiting.len() as f32 * WAITING_LINE_HEIGHT + rows.saturating_sub(1) as f32 * row_gap
 }
 
 /// The join question's body, and its two answers (fix round 1, M2).
@@ -4680,42 +4603,6 @@ mod tests {
         texts
     }
 
-    /// **Mock 6d**: FROM PEOPLE above IMPORTED FROM SENDS, each received row
-    /// "from denis@example.com · view-only", and a click opens the record.
-    #[test]
-    fn shared_with_me_lists_received_records_from_people_and_opens_them() {
-        use crate::vault_window::send_ui::{RecordTiles, SendUiAction};
-        let received = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
-        let mut people = PeopleRows { received: &received, ..PeopleRows::none() };
-        let mut selected = None;
-        let texts = ui_frame(400.0, Vec::new(), |ui| {
-            let _ = draw_received_group(ui, &mut people, 376.0, 62.0, &mut selected, RecordTiles::default());
-        });
-        assert!(texts.iter().any(|(t, _)| t == FROM_PEOPLE_EYEBROW));
-        assert!(texts.iter().any(|(t, _)| t == "from denis@x.io \u{b7} view-only"), "{texts:?}");
-        let row = texts.iter().find(|(t, _)| t == "Acme VPN").map(|(_, r)| r.center()).expect("the row");
-        let mut opened = None;
-        let _ = ui_frame(400.0, click(row), |ui| {
-            if let Some(action) = draw_received_group(ui, &mut people, 376.0, 62.0, &mut selected, RecordTiles::default()) {
-                opened = Some(action);
-            }
-        });
-        assert!(matches!(opened, Some(SendUiAction::OpenRecord(ref id)) if id == "r9"));
-        assert_eq!(selected.as_deref(), Some("recv:r9"), "the row is picked as it opens");
-    }
-
-    /// **Nobody shares anything: nothing is drawn**, not even the eyebrow --
-    /// a Shared with me that only ever imported Sends looks as it always did.
-    #[test]
-    fn no_received_records_draw_no_group() {
-        use crate::vault_window::send_ui::RecordTiles;
-        let mut people = PeopleRows::none();
-        let texts = ui_frame(400.0, Vec::new(), |ui| {
-            let _ = draw_received_group(ui, &mut people, 376.0, 62.0, &mut None, RecordTiles::default());
-        });
-        assert!(texts.is_empty(), "{texts:?}");
-    }
-
     /// **The row's name is the VAULT item's**, never the view's: the view
     /// says only which item and who from. An entry the vault does not hold
     /// (a view a frame older than a sync) is left out rather than drawn
@@ -4764,7 +4651,6 @@ mod tests {
         let mut people = PeopleRows::none();
         let texts = ui_frame(400.0, Vec::new(), |ui| draw_paste_and_waiting(ui, &mut people, 376.0));
         assert!(texts.is_empty(), "{texts:?}");
-        assert!(paste_and_waiting_height(&PeopleRows::none(), 6.0).abs() < f32::EPSILON);
     }
 
     /// **An unverified sharer says so, and is grouped by organisation**
@@ -4803,48 +4689,6 @@ mod tests {
         // "Stop receiving from X?" names them the same way (fix round 1, m9).
         assert_eq!(stop_receiving_title(&named_sharer("boss@x.io", false)), "Stop receiving from boss@x.io (unverified)?");
         assert_eq!(stop_receiving_title(&named_sharer("boss@x.io", true)), "Stop receiving from boss@x.io?");
-    }
-
-    /// **Each organisation's received records end at a hairline** (fix round
-    /// 1, m8): two orgs that claim one sharer are told apart on screen, and
-    /// one org's records are not split. Drawn in the row gap, so it adds no
-    /// height.
-    #[test]
-    fn a_hairline_parts_one_organisations_received_records_from_the_next() {
-        use crate::vault_window::send_ui::RecordTiles;
-        fn hairlines(shape: &egui::Shape) -> usize {
-            match shape {
-                egui::Shape::Vec(shapes) => shapes.iter().map(hairlines).sum(),
-                egui::Shape::LineSegment { stroke, .. } if stroke.color == theme::HAIRLINE => 1,
-                _ => 0,
-            }
-        }
-        let row = |id: &str, org: &str| ReceivedShareRow {
-            key: format!("recv:{id}"),
-            item_id: id.into(),
-            name: id.into(),
-            from: "boss@x.io".into(),
-            verified: false,
-            organization_id: org.into(),
-        };
-        let drawn = |rows: &[ReceivedShareRow]| {
-            let ctx = egui::Context::default();
-            let _ = ctx.run_ui(egui::RawInput::default(), |_ui| {});
-            theme::apply(&ctx);
-            let mut height = 0.0;
-            let output = ctx.run_ui(egui::RawInput::default(), |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                let top = ui.cursor().top();
-                let mut people = PeopleRows { received: rows, ..PeopleRows::none() };
-                let _ = draw_received_group(ui, &mut people, 376.0, 62.0, &mut None, RecordTiles::default());
-                height = ui.cursor().top() - top;
-            });
-            (output.shapes.iter().map(|c| hairlines(&c.shape)).sum::<usize>(), height)
-        };
-        let (one_org, one_height) = drawn(&[row("a", "org-1"), row("b", "org-1")]);
-        let (two_orgs, two_height) = drawn(&[row("a", "org-1"), row("b", "org-2")]);
-        assert_eq!(two_orgs, one_org + 1, "one hairline between the two orgs");
-        assert!((two_height - one_height).abs() < f32::EPSILON, "it takes no height");
     }
 
     /// **"Stop receiving from X?"** names the sharer and what goes, and
@@ -4986,16 +4830,4 @@ mod tests {
         assert!(!pane.is_busy());
     }
 
-    /// **The paste row's and the waiting lines' measured height counts the
-    /// gaps BETWEEN its rows**: `n` rows, `n - 1` gaps -- the gap under them
-    /// is the list's to add.
-    #[test]
-    fn the_paste_and_waiting_height_counts_the_gaps_between_its_rows() {
-        let waiting = [crate::rest::sharing::WaitingEntry { organization_id: "org-x".into(), from: "e@x.io".into(), verified: true }];
-        let one = PeopleRows { paste: Some(Zeroizing::new(String::new())), ..PeopleRows::none() };
-        assert!((paste_and_waiting_height(&one, 6.0) - PASTE_ROW_HEIGHT).abs() < f32::EPSILON);
-        let two = PeopleRows { paste: Some(Zeroizing::new(String::new())), waiting: &waiting, ..PeopleRows::none() };
-        assert!((paste_and_waiting_height(&two, 6.0) - (PASTE_ROW_HEIGHT + WAITING_LINE_HEIGHT + 6.0)).abs() < f32::EPSILON);
-        assert!((PASTE_ROW_HEIGHT - theme::BUTTON_HEIGHT).abs() < f32::EPSILON, "one inline field high");
-    }
 }

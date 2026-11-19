@@ -1245,6 +1245,7 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "record-leave-scrim",
     "record-send-scrim",
     "record-share-scrim",
+    "send-detail-scrim",
     "totp-add-scrim",
 ];
 
@@ -1890,33 +1891,7 @@ pub struct RowMarks<'a> {
 /// draws; a size stated twice would drift. `pub(crate)` for the row geometry's
 /// reason: the Sent list's rows set their two lines in these.
 pub(crate) const TITLE_SIZE: f32 = 16.0;
-pub(crate) const SUBTITLE_SIZE: f32 = 14.0;
 pub(crate) const TITLE_GAP_Y: f32 = 3.0;
-
-/// The exact height the row's one- or two-line text column will lay out to,
-/// measured from the fonts it is about to be drawn with.
-///
-/// Needed because that column has to be ALLOCATED at its own height for
-/// design 2b's `align-items: center` to have anything to centre against the
-/// avatar -- an allocation that took the row's available height would
-/// top-align its content inside it instead, which is the reported defect.
-///
-/// The two font FAMILIES are restated here rather than shared with the draw
-/// below (which builds `RichText` through `theme::bold`/`theme::semibold`,
-/// not `FontId`s). What keeps the two in step is
-/// `the_title_and_email_are_centred_against_the_avatar_not_hung_from_its_top`
-/// and its single-line sibling: a family here that did not match the one
-/// drawn would mis-measure the column and shift it off centre.
-pub(crate) fn text_column_height(ui: &egui::Ui, username: &str, selected: bool) -> f32 {
-    let family = if selected { theme::BOLD } else { theme::SEMIBOLD };
-    let title = egui::FontId::new(TITLE_SIZE, egui::FontFamily::Name(family.into()));
-    let mut height = ui.ctx().fonts_mut(|f| f.row_height(&title));
-    if !username.is_empty() {
-        let subtitle = egui::FontId::new(SUBTITLE_SIZE, egui::FontFamily::Proportional);
-        height += TITLE_GAP_Y + ui.ctx().fonts_mut(|f| f.row_height(&subtitle));
-    }
-    height
-}
 
 /// What one drawn row reports back to [`draw_item_list`].
 struct RowOutcome {
@@ -1983,45 +1958,6 @@ pub(crate) fn row_tile(
     };
     kit::avatar::paint(ui.painter(), rect, &look, 12);
 }
-
-/// **Design 2b's list header strip**: a white tile the full width of the
-/// column, `padding: 12px` around a row the search box's own 34pt tall, and a
-/// 1pt hairline along its foot -- drawn by one function for both lists that
-/// take this column.
-///
-/// The Sent list's header was a second strip built by hand: 56pt against this
-/// one's 58, its own padding and its own rule, and the owner could see the two
-/// headers were not one thing when the columns swapped. So the records list
-/// and the Sent list both draw their headers through here, and what goes IN
-/// the strip is theirs: the search box and `+ New` here, the heading, the
-/// count and the sort there.
-///
-/// The hairline is painted rather than stroked so it is on the bottom edge
-/// only -- a full-box stroke would draw a second line down the pane's own
-/// right edge, on top of `Panel`'s separator.
-pub(crate) fn list_strip<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let shown = egui::Frame::new()
-        .fill(theme::CARD)
-        .inner_margin(Margin::same(LIST_STRIP_PAD))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.set_min_height(theme::SEARCH_FIELD_HEIGHT);
-            add(ui)
-        });
-    let strip = shown.response.rect;
-    ui.painter().rect_filled(
-        egui::Rect::from_min_max(
-            egui::Pos2::new(strip.left(), strip.bottom() - 1.0),
-            strip.right_bottom(),
-        ),
-        CornerRadius::ZERO,
-        theme::HAIRLINE,
-    );
-    shown.inner
-}
-
-/// Design 2b's `padding: 12px` on the list header strip.
-pub(crate) const LIST_STRIP_PAD: i8 = 12;
 
 // Draw entry point: its arguments are the state it paints; a bundle would only move them.
 #[allow(clippy::too_many_arguments)]

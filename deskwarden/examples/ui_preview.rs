@@ -579,6 +579,15 @@ enum Surface {
     /// "something is missing", it is "the same pane reads differently", and
     /// only the pair shows that.
     SendsNarrow,
+    /// The Send detail modal with its revoke question standing (spec B 7):
+    /// Copy link and Extend held back, Cancel where Revoke was.
+    SendsConfirm,
+    /// A person share's modal (design 6c).
+    SendsShare,
+    /// The same modal with Stop sharing's question up.
+    SendsShareStop,
+    /// Shared with me with records from people above the imported Sends.
+    SendsPeople,
     /// **The vault window's item list**, at the exact width the window gives
     /// it, with a card of every network this app can name in it.
     ///
@@ -1011,6 +1020,10 @@ const ALL: &[Surface] = &[
     Surface::SendsEmpty,
     Surface::SendsReceived,
     Surface::SendsNarrow,
+    Surface::SendsConfirm,
+    Surface::SendsShare,
+    Surface::SendsShareStop,
+    Surface::SendsPeople,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
     Surface::FirstWindowLoading,
@@ -1146,6 +1159,10 @@ impl Surface {
             Surface::SendsEmpty => "sends_empty",
             Surface::SendsReceived => "sends_received",
             Surface::SendsNarrow => "sends_narrow",
+            Surface::SendsConfirm => "sends_confirm",
+            Surface::SendsShare => "sends_share",
+            Surface::SendsShareStop => "sends_share_stop",
+            Surface::SendsPeople => "sends_people",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
             Surface::FirstWindowLoading => "first_window_loading",
@@ -1392,6 +1409,10 @@ impl Surface {
             Surface::SendsSelected
             | Surface::SendsList
             | Surface::SendsEmpty
+            | Surface::SendsConfirm
+            | Surface::SendsShare
+            | Surface::SendsShareStop
+            | Surface::SendsPeople
             | Surface::SendsReceived => egui::vec2(SENDS_WIDTH, PANE_HEIGHT),
             Surface::SendsNarrow => egui::vec2(SENDS_NARROW_WIDTH, SENDS_NARROW_HEIGHT),
             // The viewport's own inner size, read off the module that builds
@@ -1455,6 +1476,9 @@ impl Surface {
         )
     }
 }
+
+/// The person the Sends previews share a record with.
+const SHARE_EMAIL: &str = "anna@example.com";
 
 fn main() -> eframe::Result {
     let arg = |name: &str| std::env::args().any(|a| a == name);
@@ -1568,6 +1592,10 @@ fn main() -> eframe::Result {
             Surface::SendsEmpty,
             Surface::SendsReceived,
             Surface::SendsNarrow,
+            Surface::SendsConfirm,
+            Surface::SendsShare,
+            Surface::SendsShareStop,
+            Surface::SendsPeople,
         ]
     } else if edit {
         // Pristine first, because that is the picture the report was about;
@@ -1741,6 +1769,8 @@ fn main() -> eframe::Result {
                 // detail draws the present-tense sentence; the row below it
                 // in the same picture is the one whose item has gone.
                 sends_received_selected: Some("list-0001".to_string()),
+                sends_confirm_selected: Some("send-wifi".to_string()),
+                sends_share_selected: Some(format!("share:list-0001:{SHARE_EMAIL}")),
                 sends_none_selected: None,
                 window_height: 0.0,
                 login_variant: LoginVariant::Plain,
@@ -1869,6 +1899,8 @@ struct Preview {
     sends_selected: Option<String>,
     sends_narrow_selected: Option<String>,
     sends_received_selected: Option<String>,
+    sends_confirm_selected: Option<String>,
+    sends_share_selected: Option<String>,
     /// The two shots that are pictures of a column with NOTHING picked. A
     /// field rather than a temporary, because the pane takes `&mut` and a
     /// temporary would be a place a click could write to that nothing ever
@@ -2251,6 +2283,10 @@ impl eframe::App for Preview {
             | Surface::SendsList
             | Surface::SendsEmpty
             | Surface::SendsReceived
+            | Surface::SendsConfirm
+            | Surface::SendsShare
+            | Surface::SendsShareStop
+            | Surface::SendsPeople
             | Surface::SendsNarrow => self.draw_sends(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
@@ -3462,7 +3498,26 @@ impl Preview {
             &send::FixedClock(PREVIEW_MILLIS),
             &PREVIEW_ZONE,
         );
-        let view = if matches!(surface, Surface::SendsReceived) {
+        // The people the pane is told about: one person share, and one record
+        // somebody shares with this account.
+        let shares = vec![deskwarden::vault_window::share_ui::ShareRow {
+            key: format!("share:list-0001:{SHARE_EMAIL}"),
+            item_id: "list-0001".to_string(),
+            name: "Ledgerline".to_string(),
+            email: SHARE_EMAIL.to_string(),
+            state: deskwarden::rest::sharing::PersonState::Shared,
+            subtitle: format!("to {SHARE_EMAIL} \u{b7} Shared"),
+            since: Some("14 Sep".to_string()),
+        }];
+        let from_people = vec![deskwarden::vault_window::share_ui::ReceivedShareRow {
+            key: "recv:list-0002".to_string(),
+            item_id: "list-0002".to_string(),
+            name: "Northwind Mail".to_string(),
+            from: "denis@example.com".to_string(),
+            verified: true,
+            organization_id: "org-1".to_string(),
+        }];
+        let view = if matches!(surface, Surface::SendsReceived | Surface::SendsPeople) {
             send_ui::SendView::Received(&received)
         } else {
             send_ui::SendView::Mine(sidebar::SendScope::All)
@@ -3473,6 +3528,8 @@ impl Preview {
             Surface::SendsSelected => &mut self.sends_selected,
             Surface::SendsNarrow => &mut self.sends_narrow_selected,
             Surface::SendsReceived => &mut self.sends_received_selected,
+            Surface::SendsConfirm => &mut self.sends_confirm_selected,
+            Surface::SendsShare | Surface::SendsShareStop => &mut self.sends_share_selected,
             // `SendsList` and `SendsEmpty` are the pictures of a column with
             // nothing picked, so they are handed a selection that is None and
             // stays None -- a field of their own would be a field nothing
@@ -3482,17 +3539,31 @@ impl Preview {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(root, |ui| {
+                let delete = if matches!(surface, Surface::SendsConfirm) {
+                    send_ui::SendDeleteView { confirming: Some("send-wifi"), ..send_ui::SendDeleteView::default() }
+                } else {
+                    send_ui::SendDeleteView::default()
+                };
+                use deskwarden::vault_window::share_ui::PeopleRows;
+                let mut people = match surface {
+                    Surface::SendsShare => PeopleRows::with_shares(&shares),
+                    Surface::SendsShareStop => {
+                        PeopleRows::with_shares(&shares).confirming_stop(&format!("share:list-0001:{SHARE_EMAIL}"))
+                    }
+                    Surface::SendsPeople => PeopleRows::with_received(&from_people),
+                    // No daemon behind the other shots: no person share.
+                    _ => PeopleRows::none(),
+                };
                 let verdict = send_ui::draw_send_pane(
                     ui,
                     &state,
                     None,
-                    send_ui::SendDeleteView::default(),
+                    delete,
                     view,
                     selected,
                     // No vault behind the preview: every tile a monogram.
                     send_ui::RecordTiles::default(),
-                    // No daemon behind it either: no person share to list.
-                    &mut deskwarden::vault_window::share_ui::PeopleRows::none(),
+                    &mut people,
                 );
                 // Taken and thrown away: a preview has no window to act on.
                 // See the doc above for why it must not simply be dropped.
