@@ -3175,7 +3175,6 @@ pub fn build_frame_with_search(
         // layer above the panes; and the kit's palette, set here once a frame
         // so a theme setting (slice 8) has one place to change it.
         crate::kit::toast::paint(ui.ctx());
-        crate::kit::tokens::set_palette(ui.ctx(), crate::kit::tokens::Palette::LIGHT);
         // Slice 8's three window-wide preferences, from the Settings screen's
         // live edits or else what the file said at open.
         let (theme, text_size, hide_share) = edited_settings_for_closure
@@ -3184,6 +3183,19 @@ pub fn build_frame_with_search(
             .map_or((theme_at_open, text_size_at_open, hide_share_at_open), |s| {
                 (s.theme, s.text_size, s.hide_on_screen_share)
             });
+        // The theme shows on the Settings screen, the one surface drawn wholly
+        // from the kit's palette; every other screen keeps the light look
+        // (its text and fills are `theme::` constants). One call, one place.
+        let frame_palette = if settings_selected && prefs.is_some() {
+            let system = theme == crate::kit::tokens::ThemeChoice::System;
+            // No repaint of its own: the window's per-frame schedule already
+            // wakes it, and the watcher asks Windows at most once a second.
+            let now = ui.input(|i| i.time);
+            theme.palette(system && system_dark.dark_at(now, crate::system_theme::apps_use_dark))
+        } else {
+            crate::kit::tokens::Palette::LIGHT
+        };
+        crate::kit::tokens::set_palette(ui.ctx(), frame_palette);
         let zoom = text_size.zoom_factor();
         if (ui.ctx().zoom_factor() - zoom).abs() > f32::EPSILON {
             ui.ctx().set_zoom_factor(zoom);
@@ -4647,20 +4659,7 @@ pub fn build_frame_with_search(
                 if settings_selected && !show_sends {
                     if let Some(state) = prefs.as_mut() {
                         let before = state.settings.generator.clone();
-                        // The Settings screen is the surface drawn wholly from
-                        // the kit's palette, so it is where the theme shows;
-                        // everything else is restored to the light look below.
-                        let settings_look = {
-                            let system = theme == crate::kit::tokens::ThemeChoice::System;
-                            if system {
-                                ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
-                            }
-                            let now = ui.input(|i| i.time);
-                            theme.palette(system && system_dark.dark_at(now, crate::system_theme::apps_use_dark))
-                        };
-                        crate::kit::tokens::set_palette(ui.ctx(), settings_look);
                         let action = crate::prefs_ui::settings_v2::draw(ui, state, &mut settings_page);
-                        crate::kit::tokens::set_palette(ui.ctx(), crate::kit::tokens::Palette::LIGHT);
                         *edited_settings_for_closure.borrow_mut() = Some(state.settings.clone());
                         delivered.set(false);
                         if state.settings.generator != before {
