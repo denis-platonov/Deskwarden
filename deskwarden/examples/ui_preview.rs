@@ -763,6 +763,18 @@ enum Surface {
     /// indicator does not exist. A state nobody renders is a state nobody
     /// looks at, which is this file's whole argument.
     LoginUnlockBusy,
+    /// The signed-out split screen with Self-hosted chosen and its URL field.
+    LoginSigninSelfHosted,
+    /// The signed-out split screen after a refused sign-in.
+    LoginSigninError,
+    /// The lock screen on its master-password stage.
+    LoginUnlockPassword,
+    /// The lock screen on its master-password stage after a wrong password.
+    LoginUnlockPasswordError,
+    /// The second-factor prompt, on the split screen.
+    LoginSecondFactor,
+    /// The API-key sign-in, on the split screen.
+    LoginApiKey,
     /// **One cycle of design 7's `dw-bar`, laid out as a filmstrip.**
     ///
     /// The one thing a PNG of this widget cannot show is the thing it is:
@@ -944,6 +956,12 @@ const ALL: &[Surface] = &[
     Surface::FirstWindowUnreachableSpentLocalCopy,
     Surface::FirstWindowUnreachableDeclinedCopy,
     Surface::LoginUnlockBusy,
+    Surface::LoginSigninSelfHosted,
+    Surface::LoginSigninError,
+    Surface::LoginUnlockPassword,
+    Surface::LoginUnlockPasswordError,
+    Surface::LoginSecondFactor,
+    Surface::LoginApiKey,
     Surface::ProgressBarCycle,
 ];
 
@@ -1050,6 +1068,12 @@ impl Surface {
                 "first_window_unreachable_declined_copy"
             }
             Surface::LoginUnlockBusy => "login_unlock_busy",
+            Surface::LoginSigninSelfHosted => "login_signin_self_hosted",
+            Surface::LoginSigninError => "login_signin_error",
+            Surface::LoginUnlockPassword => "login_unlock_password",
+            Surface::LoginUnlockPasswordError => "login_unlock_password_error",
+            Surface::LoginSecondFactor => "login_second_factor",
+            Surface::LoginApiKey => "login_api_key",
             Surface::ProgressBarCycle => "progress_bar_cycle",
         }
     }
@@ -1072,7 +1096,13 @@ impl Surface {
             | Surface::LoginSignin
             | Surface::LoginCliSetup
             | Surface::LoginBackendChoice
-            | Surface::LoginUnlockBusy => egui::vec2(470.0, 588.0),
+            | Surface::LoginUnlockBusy
+            | Surface::LoginSigninSelfHosted
+            | Surface::LoginSigninError
+            | Surface::LoginUnlockPassword
+            | Surface::LoginUnlockPasswordError
+            | Surface::LoginSecondFactor
+            | Surface::LoginApiKey => egui::vec2(1280.0, 820.0),
             // Wide enough for the design's own 260px track with room
             // either side, and tall enough for six of them stacked with
             // their labels.
@@ -1266,6 +1296,12 @@ impl Surface {
                 | Surface::LoginCliSetup
                 | Surface::LoginBackendChoice
                 | Surface::LoginUnlockBusy
+                | Surface::LoginSigninSelfHosted
+                | Surface::LoginSigninError
+                | Surface::LoginUnlockPassword
+                | Surface::LoginUnlockPasswordError
+                | Surface::LoginSecondFactor
+                | Surface::LoginApiKey
         )
     }
 }
@@ -1537,6 +1573,9 @@ fn main() -> eframe::Result {
                 sends_received_selected: Some("list-0001".to_string()),
                 sends_none_selected: None,
                 window_height: 0.0,
+                login_variant: LoginVariant::Plain,
+                second_factor: None,
+                api_key: deskwarden::api_key_ui::ApiKeyForm::new(),
                 styled: false,
                 fixtures: Fixtures::new(),
             }))
@@ -1656,6 +1695,10 @@ struct Preview {
     sends_none_selected: Option<String>,
     /// Last applied window height, for the login window's size-to-content.
     window_height: f32,
+    /// Which state of the sign-in or lock screen the current surface shows.
+    login_variant: LoginVariant,
+    second_factor: Option<deskwarden::second_factor_ui::Prompt>,
+    api_key: deskwarden::api_key_ui::ApiKeyForm,
     /// Whether the theme has been applied yet. Done on the first update
     /// frame, not in the creation context, for the same reason as the real
     /// windows (see login_ui): eframe re-applies its own style after
@@ -1722,6 +1765,24 @@ impl eframe::App for Preview {
         match self.current() {
             Surface::LoginUnlock => self.draw_login(root, &ctx, false, false, None),
             Surface::LoginUnlockBusy => self.draw_login(root, &ctx, false, true, None),
+            Surface::LoginSigninSelfHosted => {
+                self.login_variant = LoginVariant::SignInSelfHosted;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginSigninError => {
+                self.login_variant = LoginVariant::SignInError;
+                self.draw_login(root, &ctx, true, false, None)
+            }
+            Surface::LoginUnlockPassword => {
+                self.login_variant = LoginVariant::UnlockPassword;
+                self.draw_login(root, &ctx, false, false, None)
+            }
+            Surface::LoginUnlockPasswordError => {
+                self.login_variant = LoginVariant::UnlockPasswordError;
+                self.draw_login(root, &ctx, false, false, None)
+            }
+            Surface::LoginSecondFactor => self.draw_second_factor(root),
+            Surface::LoginApiKey => self.draw_api_key(root),
             Surface::ProgressBarCycle => draw_progress_bar_cycle(root),
             Surface::LoginSignin => self.draw_login(root, &ctx, true, false, None),
             Surface::LoginCliSetup => self.draw_login(
@@ -2005,6 +2066,16 @@ enum DetailShot {
     CardRevealed,
 }
 
+/// The states of the sign-in and lock screens a surface can ask for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoginVariant {
+    Plain,
+    SignInSelfHosted,
+    SignInError,
+    UnlockPassword,
+    UnlockPasswordError,
+}
+
 impl Preview {
     fn draw_login(
         &mut self,
@@ -2019,75 +2090,101 @@ impl Preview {
         // panel that failed to paint either one.
         cli_setup: Option<&deskwarden::bw_acquire::CliSetupState>,
     ) {
-        // The exact chrome the shipped window draws.
-        if login_ui::draw_window_chrome(root, "Log in to Deskwarden")
-            == login_ui::ChromeAction::Close
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        // The exact surfaces the shipped window draws: the split screen while
+        // signed out, the navy lock screen while locked, each with its own
+        // caption buttons.
+        let full = root.max_rect();
+        // A fresh form each frame: the variant below decides what it holds.
+        self.form = LoginForm::default();
+        // Sample data mirroring the design (unlock: Hello shown as enrolled
+        // so the Hello stage renders; sign-in: available but unenrolled so
+        // the opt-in renders); actions are ignored -- a preview must never
+        // spawn `bw` or pop Hello.
+        let (status, email, hello) = if signin {
+            (
+                BwStatus::Unauthenticated,
+                None,
+                HelloState { available: true, enrolled: false },
+            )
+        } else {
+            (
+                BwStatus::Locked,
+                Some("a.novak@ledgerline.com"),
+                HelloState { available: true, enrolled: true },
+            )
+        };
+        if signin && cli_setup.is_some() {
+            self.form.server_choice = login_ui::ServerChoice::SelfHosted;
         }
-        let mut resized = false;
-        egui::Frame::new()
-            .inner_margin(Margin { left: 26, right: 26, top: 24, bottom: 30 })
-            .show(root, |ui| {
-                ui.set_min_width(ui.available_width());
-                // Sample data mirroring the 3h mock (unlock: Hello shown as
-                // enrolled so the panel renders; sign-in: available but
-                // unenrolled so the opt-in and server dropdown render);
-                // actions are ignored -- a preview must never spawn `bw` or
-                // pop Hello.
-                let (status, email, hello) = if signin {
-                    // Self-hosted: the tallest state (URL field + email +
-                    // password + Hello panel), which is what overflowed a
-                    // fixed-height window.
-                    self.form.server_choice = login_ui::ServerChoice::SelfHosted;
-                    (
-                        BwStatus::Unauthenticated,
-                        None,
-                        HelloState { available: true, enrolled: false },
-                    )
-                } else {
-                    (
-                        BwStatus::Locked,
-                        Some("a.novak@ledgerline.com"),
-                        HelloState { available: true, enrolled: true },
-                    )
-                };
-                let mut flow_bottom = 0.0;
-                let _ = login_ui::draw_login_window(
-                    ui,
-                    status,
-                    email,
-                    "vault.ledgerline.eu",
-                    hello,
-                    &mut self.form,
-                    &mut flow_bottom,
-                    // In flight only for `LoginUnlockBusy`, and even there
-                    // nothing is actually running: this draws the window's
-                    // states and never spawns a real `bw`.
-                    auth_in_progress,
-                    // Not a first run: the preview draws the window an
-                    // existing account meets, so the first-run notice is not
-                    // part of what this screenshots.
-                    false,
-                    cli_setup,
+        match self.login_variant {
+            LoginVariant::SignInSelfHosted => {
+                self.form.server_choice = login_ui::ServerChoice::SelfHosted;
+                self.form.server_url = "https://vault.ledgerline.eu".to_string();
+            }
+            LoginVariant::SignInError => {
+                self.form.error = Some(
+                    "That email and master password do not match. Check them and try again."
+                        .to_string(),
                 );
-                // Size to content, exactly as run_login_flow does, so the
-                // screenshot shows the window the app would show.
-                let wanted = (flow_bottom + login_ui::FOOTER_RESERVE).ceil();
-                if (wanted - self.window_height).abs() > 0.5 {
-                    self.window_height = wanted;
-                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                        470.0, wanted,
-                    )));
-                    resized = true;
-                }
-            });
-        // The geometry moved, so the warm-up starts again: a capture taken on
-        // the frame a resize was asked for shows the PREVIOUS size, which is
-        // how a screenshot of a window nobody ships gets into an artifact.
-        if resized {
-            self.frames = 0;
+            }
+            LoginVariant::UnlockPassword => {
+                self.form.lock_stage = login_ui::LockStage::Password;
+            }
+            LoginVariant::UnlockPasswordError => {
+                self.form.lock_stage = login_ui::LockStage::Password;
+                self.form.error = Some("That master password is not right.".to_string());
+            }
+            LoginVariant::Plain => {}
         }
+        let mut flow_bottom = 0.0;
+        let form = &mut self.form;
+        let mut body = |ui: &mut egui::Ui| {
+            let _ = login_ui::draw_login_window(
+                ui,
+                status,
+                email,
+                "vault.ledgerline.eu",
+                hello,
+                form,
+                &mut flow_bottom,
+                // In flight only for `LoginUnlockBusy`, and even there
+                // nothing is actually running: this draws the window's
+                // states and never spawns a real `bw`.
+                auth_in_progress,
+                // Not a first run: the preview draws the window an
+                // existing account meets, so the first-run notice is not
+                // part of what this screenshots.
+                false,
+                cli_setup,
+            );
+        };
+        let caption = if signin {
+            deskwarden::kit::auth::split(root, full, login_ui::CloseControl::Active, &mut body)
+        } else {
+            deskwarden::kit::auth::lock_surface(root, full, login_ui::CloseControl::Active, &mut body)
+        };
+        deskwarden::kit::auth::apply_caption(ctx, caption);
+        self.login_variant = LoginVariant::Plain;
+    }
+
+    /// The second-factor prompt on the split screen: an account with an
+    /// emailed code and an authenticator, mid-way through a wrong code.
+    fn draw_second_factor(&mut self, root: &mut egui::Ui) {
+        use deskwarden::rest::api::SecondFactor;
+        let prompt = self.second_factor.get_or_insert_with(|| {
+            let mut prompt = deskwarden::second_factor_ui::Prompt::new(vec![
+                SecondFactor::Email { masked: Some("a***@ledgerline.com".to_string()) },
+                SecondFactor::Authenticator,
+            ]);
+            prompt.error = Some("That code was not accepted. Check it and try again.".to_string());
+            prompt
+        });
+        let _ = deskwarden::second_factor_ui::draw(root, prompt);
+    }
+
+    /// The API-key sign-in's first step on the split screen.
+    fn draw_api_key(&mut self, root: &mut egui::Ui) {
+        let _ = deskwarden::api_key_ui::draw(root, &mut self.api_key);
     }
 
     /// The preferences window's Clipboard page.

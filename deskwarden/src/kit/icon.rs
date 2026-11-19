@@ -402,8 +402,10 @@ pub mod glyph {
     pub const HOURGLASS: &str = "M5 22h14M5 2h14M17 22v-4.2a2 2 0 0 0-.6-1.4L12 12l-4.4 4.4a2 2 0 0 0-.6 1.4V22M7 2v4.2a2 2 0 0 0 .6 1.4L12 12l4.4-4.4a2 2 0 0 0 .6-1.4V2";
     pub const ARROW_RIGHT: &str = "M5 12h14M13 6l6 6-6 6";
     pub const PLAY: &str = "M7 4l13 8-13 8z";
+    /// The lock screen's Windows Hello button (Lucide `fingerprint`, ISC).
+    pub const FINGERPRINT: &str = "M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4M14 13.12c0 2.38 0 6.38-1 8.88M17.29 21.02c.12-.6.43-2.3.5-3.02M2 12a10 10 0 0 1 18-6M2 16h.01M21.8 16c.2-2 .131-5.354 0-6M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2M8.65 22c.21-.66.45-1.32.57-2M9 6.8a6 6 0 0 1 9 5.2v2";
     /// Every glyph, named, for tests and the kit sheet.
-    pub const ALL_GLYPHS: [(&str, &str); 46] = [
+    pub const ALL_GLYPHS: [(&str, &str); 47] = [
         ("all", ALL),
         ("fav", FAV),
         ("login", LOGIN),
@@ -450,6 +452,7 @@ pub mod glyph {
         ("hourglass", HOURGLASS),
         ("arrow-right", ARROW_RIGHT),
         ("play", PLAY),
+        ("fingerprint", FINGERPRINT),
     ];
 }
 

@@ -28,8 +28,7 @@
 //! taken elsewhere in this crate.
 
 use crate::rest::api::{Authenticated, Device, RestClient, RestError, Session};
-use crate::theme;
-use eframe::egui::{self, RichText};
+use eframe::egui;
 use zeroize::{Zeroize, Zeroizing};
 
 /// Which of the two things the user is being asked for.
@@ -513,64 +512,100 @@ pub enum ApiKeyAction {
 /// since it was written; the real fix is a fixed-capacity buffer, and it
 /// belongs to neither of them alone.
 pub fn draw(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
+    let full = ui.max_rect();
     let mut asked = None;
+    let caption = crate::kit::auth::split(ui, full, crate::login_ui::CloseControl::Active, |ui| {
+        asked = draw_form(ui, form);
+    });
+    crate::kit::auth::apply_caption(ui.ctx(), caption);
+    asked
+}
+
+/// The two steps, in the sign-in split screen's form column.
+fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
+    use crate::kit::auth::{self, FORM_GAP, LABEL_GAP};
+    use crate::kit::controls::ButtonKind;
+    use crate::kit::input;
+    let mut asked = None;
+    let width = ui.available_width();
+    ui.spacing_mut().item_spacing.y = 0.0;
     let ready = match form.step {
         ApiKeyStep::KeyPair => form.key_pair_ready(),
         ApiKeyStep::MasterPassword => form.password_ready(),
     };
+    // Whether the secret field shows what is typed: per window, not stored.
+    let reveal_id = egui::Id::new("auth-api-key-reveal");
+    let mut revealed = ui.data(|d| d.get_temp::<bool>(reveal_id)).unwrap_or(false);
 
     match form.step {
         ApiKeyStep::KeyPair => {
-            ui.label(RichText::new(KEY_PAIR_TITLE).size(17.0));
-            ui.add_space(6.0);
-            ui.label(RichText::new(KEY_PAIR_HINT).size(12.0).color(theme::TEXT_MUTED));
-            ui.add_space(14.0);
+            auth::title(ui, KEY_PAIR_TITLE);
+            ui.add_space(12.0);
+            auth::explain(ui, KEY_PAIR_HINT);
+            ui.add_space(FORM_GAP);
 
-            ui.label(RichText::new(CLIENT_ID_LABEL).size(12.0));
-            ui.add_enabled(
-                !form.busy,
-                egui::TextEdit::singleline(&mut form.client_id).desired_width(f32::INFINITY),
-            );
-            ui.add_space(10.0);
+            auth::label(ui, CLIENT_ID_LABEL);
+            ui.add_space(LABEL_GAP);
+            ui.add_enabled_ui(!form.busy, |ui| {
+                input::text(ui, egui::Id::new("auth-api-client-id"), &mut form.client_id, "", false, width);
+            });
+            ui.add_space(FORM_GAP);
 
-            ui.label(RichText::new(CLIENT_SECRET_LABEL).size(12.0));
-            ui.add_enabled(
-                !form.busy,
-                egui::TextEdit::singleline(&mut *form.secret)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            );
+            auth::label(ui, CLIENT_SECRET_LABEL);
+            ui.add_space(LABEL_GAP);
+            ui.add_enabled_ui(!form.busy, |ui| {
+                input::secret(
+                    ui,
+                    egui::Id::new("auth-api-client-secret"),
+                    &mut *form.secret,
+                    &mut revealed,
+                    "",
+                    width,
+                    input::SIGN_IN,
+                );
+            });
         }
         ApiKeyStep::MasterPassword => {
-            ui.label(RichText::new(PASSWORD_TITLE).size(17.0));
-            ui.add_space(6.0);
-            ui.label(RichText::new(PASSWORD_HINT).size(12.0).color(theme::TEXT_MUTED));
-            ui.add_space(14.0);
+            auth::title(ui, PASSWORD_TITLE);
+            ui.add_space(12.0);
+            auth::explain(ui, PASSWORD_HINT);
+            ui.add_space(FORM_GAP);
 
-            ui.label(RichText::new(PASSWORD_LABEL).size(12.0));
-            ui.add_enabled(
-                !form.busy,
-                egui::TextEdit::singleline(&mut *form.password)
-                    .password(true)
-                    .desired_width(f32::INFINITY),
-            );
+            auth::label(ui, PASSWORD_LABEL);
+            ui.add_space(LABEL_GAP);
+            ui.add_enabled_ui(!form.busy, |ui| {
+                input::secret(
+                    ui,
+                    egui::Id::new("auth-api-master-password"),
+                    &mut *form.password,
+                    &mut revealed,
+                    "",
+                    width,
+                    input::SIGN_IN,
+                );
+            });
         }
     }
+    ui.data_mut(|d| d.insert_temp(reveal_id, revealed));
 
     if let Some(error) = form.error.as_deref() {
-        ui.add_space(6.0);
-        ui.label(RichText::new(error).size(11.0).color(theme::ERROR));
+        ui.add_space(FORM_GAP);
+        auth::error_line(ui, error);
     }
 
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        if ui.add_enabled(!form.busy && ready, egui::Button::new(CONTINUE_LABEL)).clicked() {
-            asked = Some(ApiKeyAction::Submit);
-        }
-        if ui.button(BACK_LABEL).clicked() {
-            asked = Some(ApiKeyAction::Back);
-        }
-    });
+    ui.add_space(FORM_GAP);
+    let go = ui
+        .add_enabled_ui(!form.busy && ready, |ui| {
+            auth::wide_button(ui, ButtonKind::Primary, 56.0, 16, 17.0, CONTINUE_LABEL, None, width)
+        })
+        .inner;
+    if go.clicked() {
+        asked = Some(ApiKeyAction::Submit);
+    }
+    ui.add_space(12.0);
+    if auth::wide_button(ui, ButtonKind::Outline, 52.0, 14, 16.0, BACK_LABEL, None, width).clicked() {
+        asked = Some(ApiKeyAction::Back);
+    }
 
     asked
 }
@@ -1210,15 +1245,23 @@ mod tests {
         }
     }
 
-    /// Every string the card paints in one frame.
+    /// Every string the card paints once it has risen into place: the screen
+    /// fades in over half a second, and a fully transparent frame paints
+    /// nothing at all, so the harness runs a dozen frames 0.1 s apart and
+    /// reads the last.
     fn painted(form: &mut ApiKeyForm) -> Vec<String> {
         let ctx = styled_context();
-        let output = ctx.run_ui(raw_input(), |ui| {
-            let _ = draw(ui, form);
-        });
         let mut texts = Vec::new();
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut texts);
+        for i in 0..12 {
+            let mut input = raw_input();
+            input.time = Some(i as f64 * 0.1);
+            let output = ctx.run_ui(input, |ui| {
+                let _ = draw(ui, form);
+            });
+            texts.clear();
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut texts);
+            }
         }
         texts
     }

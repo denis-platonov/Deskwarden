@@ -85,6 +85,93 @@ pub fn password(ui: &mut Ui, id: egui::Id, value: &mut String, revealed: &mut bo
 /// Generate's word.
 pub const GENERATE: &str = "Generate";
 
+/// The size of a sign-in or lock field: its height, corner radius and type.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoxLook {
+    pub height: f32,
+    pub radius: u8,
+    pub font_px: f32,
+}
+
+/// The sign-in screen's fields (spec C 5.2): 50 high, radius 14, 16 pt.
+pub const SIGN_IN: BoxLook = BoxLook { height: 50.0, radius: 14, font_px: 16.0 };
+/// The lock screen's master-password field (spec C 5.3): 58 high, radius 16.
+pub const LOCK: BoxLook = BoxLook { height: 58.0, radius: 16, font_px: 17.0 };
+
+/// The eye's square, and the gap it keeps from the field's right edge.
+const EYE: f32 = 36.0;
+const EYE_INSET: f32 = 8.0;
+
+fn look_box(ui: &Ui, rect: Rect, look: BoxLook, edge: Color32, fill: Color32) {
+    ui.painter().rect(rect, CornerRadius::same(look.radius), fill, Stroke::new(1.0, edge), egui::StrokeKind::Inside);
+}
+
+/// A password field with an eye, hidden unless `revealed`: the box turns blue
+/// with the keyboard, like [`text`]. `placeholder` shows while it is empty.
+pub fn secret(
+    ui: &mut Ui,
+    id: egui::Id,
+    value: &mut String,
+    revealed: &mut bool,
+    placeholder: &str,
+    width: f32,
+    look: BoxLook,
+) -> Response {
+    let p = tokens::palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, look.height), Sense::hover());
+    let focused = ui.memory(|m| m.has_focus(id));
+    look_box(ui, rect, look, if focused { p.blue } else { p.border }, p.card);
+    let eye = Rect::from_center_size(egui::pos2(rect.right() - EYE_INSET - EYE / 2.0, rect.center().y), Vec2::splat(EYE));
+    let eye_response = ui.interact(eye, id.with("eye"), Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+    if eye_response.hovered() {
+        ui.painter().rect_filled(eye, CornerRadius::same(10), p.hover);
+    }
+    let d = if *revealed { icon::glyph::EYE_OFF } else { icon::glyph::EYE };
+    icon::stroke(ui.painter(), Rect::from_center_size(eye.center(), Vec2::splat(19.0)), d, 2.0, p.text_icon);
+    crate::kit::tips::hint(ui, &eye_response, "Show or hide", &[]);
+    if eye_response.clicked() {
+        *revealed = !*revealed;
+    }
+    let inner = Rect::from_min_max(egui::pos2(rect.left() + 16.0, rect.top()), egui::pos2(eye.left() - 4.0, rect.bottom()));
+    let response = ui.put(
+        inner,
+        egui::TextEdit::singleline(value)
+            .id(id)
+            .password(!*revealed)
+            .frame(egui::Frame::NONE)
+            .font(FontId::proportional(look.font_px))
+            .hint_text(placeholder)
+            .desired_width(inner.width())
+            .vertical_align(egui::Align::Center),
+    );
+    ui.advance_cursor_after_rect(rect);
+    response
+}
+
+/// A text field while an attempt is in flight: the box greyed and `value`
+/// painted as text, with **no `TextEdit` in it**, so it takes no focus, draws
+/// no caret and eats no click.
+pub fn text_disabled(ui: &mut Ui, value: &str, width: f32, look: BoxLook) -> Rect {
+    let p = tokens::palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, look.height), Sense::hover());
+    look_box(ui, rect, look, p.border, p.field_bg);
+    let galley = ui.painter().layout_no_wrap(value.to_owned(), FontId::proportional(look.font_px), p.text_faint);
+    let at = egui::pos2(rect.left() + 16.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().with_clip_rect(rect.shrink2(Vec2::new(16.0, 0.0))).galley(at, galley, p.text_faint);
+    rect
+}
+
+/// A password field while an attempt is in flight: the same ten bullets
+/// whatever the buffer holds (so the mask neither shows the length nor
+/// announces an emptied buffer), the eye greyed and inert.
+pub fn secret_disabled(ui: &mut Ui, width: f32, look: BoxLook) -> Rect {
+    let p = tokens::palette(ui.ctx());
+    let rect = text_disabled(ui, &crate::theme::masked_readout(), width, look);
+    let eye = Rect::from_center_size(egui::pos2(rect.right() - EYE_INSET - EYE / 2.0, rect.center().y), Vec2::splat(EYE));
+    icon::stroke(ui.painter(), Rect::from_center_size(eye.center(), Vec2::splat(19.0)), icon::glyph::EYE, 2.0, p.text_ghost);
+    rect
+}
+
 /// One step of the strength meter: its word, colour and how full the track is.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StrengthLevel {
@@ -180,6 +267,34 @@ mod tests {
             generated = password(ui, id, &mut value, &mut revealed, 400.0).generate_clicked;
         });
         assert!(generated, "Generate reports its click");
+    }
+
+    #[test]
+    fn the_secret_field_has_the_sign_in_and_lock_sizes_and_hides_until_revealed() {
+        let ctx = testing::ctx();
+        let id = egui::Id::new("s");
+        let mut value = String::from("hunter2");
+        let mut revealed = false;
+        let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            secret(ui, id, &mut value, &mut revealed, "pw", 400.0, SIGN_IN);
+            secret(ui, id.with(1), &mut value, &mut revealed, "pw", 400.0, LOCK);
+        });
+        assert!(!p.texts.iter().any(|(t, _, _)| t.contains("hunter2")));
+        assert_eq!(p.rects.iter().filter(|r| r.rect.height() == 50.0 && r.fill == P.card).count(), 1);
+        assert_eq!(p.rects.iter().filter(|r| r.rect.height() == 58.0 && r.fill == P.card).count(), 1);
+    }
+
+    #[test]
+    fn a_disabled_field_shows_the_same_mask_whatever_the_buffer_and_takes_no_focus() {
+        let ctx = testing::ctx();
+        let p = testing::frame(&ctx, 0.0, SCREEN, vec![], |ui| {
+            secret_disabled(ui, 300.0, SIGN_IN);
+            text_disabled(ui, "a.novak", 300.0, SIGN_IN);
+        });
+        assert!(p.texts.iter().any(|(t, _, _)| t == &crate::theme::masked_readout()));
+        assert!(p.texts.iter().any(|(t, _, _)| t == "a.novak"));
+        assert!(p.rects.iter().any(|r| r.fill == P.field_bg), "greyed");
+        assert!(ctx.memory(|m| m.focused()).is_none());
     }
 
     #[test]
