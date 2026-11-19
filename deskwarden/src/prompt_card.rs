@@ -583,42 +583,26 @@ mod win32 {
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect,
         GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC,
-        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DT_END_ELLIPSIS, DT_LEFT,
-        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
-        LOGPIXELSX, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
+        SelectObject, SetBkMode, CLEARTYPE_QUALITY, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT,
+        LOGFONTW, LOGPIXELSX, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetFocus, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, GetDlgItem, GetParent, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW,
-        PeekMessageW,
+        GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, PeekMessageW,
         RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowDisplayAffinity,
         SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW,
-        CS_VREDRAW, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_HIDE, SW_SHOW,
+        CS_VREDRAW, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW,
         WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY,
         WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT,
-        WNDCLASSW, WS_CHILD, WS_DISABLED, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+        WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
     use crate::panel_draw;
-    use crate::win32_draw::{draw_text, rgb};
+    use crate::win32_draw::rgb;
 
     /// Row `i` is control `ID_ROW + i`.
     const ID_ROW: usize = 100;
-    /// The key-hint tooltip: a hidden, disabled child that is shown over the
-    /// list while the pointer is on the `?` badge. A child window is what can
-    /// lie **above** the row controls; the parent's own paint cannot.
-    const ID_TIP: usize = 199;
-
-    /// `WM_MOUSELEAVE`, which `TrackMouseEvent` posts. Named here because the
-    /// `windows` crate files it under a feature this crate does not enable.
-    const WM_MOUSELEAVE: u32 = 0x02A3;
-
-    /// Whether the pointer is on the `?` badge, and so the tooltip is up.
-    static HELP_HOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
     const CLASS_NAME: PCWSTR = w!("DeskwardenAutofillPrompt");
 
     /// The window's DPI as a percentage of 96, sampled once per open.
@@ -845,11 +829,14 @@ mod win32 {
 
         // The key-hint tooltip, created last so it is the topmost child, and
         // hidden until the pointer is on the `?`.
-        match tip_child(window, l.tip) {
-            Some(tip) => subclass_tip(tip),
-            None => return abandon(window),
+        let Some(tip_font) = FONTS.lock().ok().and_then(|guard| guard.as_ref().map(|f| f.tip))
+        else {
+            return abandon(window);
+        };
+        panel_draw::set_tip(tip_font, &panel_draw::FILL_KEY_HINTS, DPI_PERCENT.load(Ordering::SeqCst));
+        if !panel_draw::create_tip(window, dev(l.tip)) {
+            return abandon(window);
         }
-        HELP_HOT.store(false, Ordering::SeqCst);
 
         unsafe {
             let _ = ShowWindow(window, SW_SHOW);
@@ -978,6 +965,7 @@ mod win32 {
         unsafe {
             let _ = DestroyWindow(hwnd(window.0));
         }
+        panel_draw::clear_tip();
         if let Ok(mut slot) = FONTS.lock() {
             if let Some(fonts) = slot.take() {
                 fonts.destroy();
@@ -1190,14 +1178,11 @@ mod win32 {
                 let x = (lparam.0 & 0xffff) as i16 as i32;
                 let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
                 let on_badge = crate::win32_draw::on_close_glyph(x, y, help_rect());
-                if on_badge {
-                    track_leave(window);
-                }
-                set_help(window, on_badge);
+                panel_draw::help_pointer(window, on_badge);
                 LRESULT(0)
             }
-            WM_MOUSELEAVE => {
-                set_help(window, false);
+            panel_draw::WM_MOUSELEAVE => {
+                panel_draw::set_help(window, false);
                 LRESULT(0)
             }
             WM_COMMAND => {
@@ -1267,11 +1252,7 @@ mod win32 {
                 }
                 // A row under the pointer is not the `?` badge: take the
                 // tooltip down.
-                if HELP_HOT.load(Ordering::SeqCst) {
-                    if let Ok(parent) = GetParent(control) {
-                        set_help(parent, false);
-                    }
-                }
+                panel_draw::help_pointer_left_badge(control);
                 LRESULT(0)
             }
             _ => {
@@ -1331,104 +1312,6 @@ mod win32 {
         }
     }
 
-    /// Asks Windows for a `WM_MOUSELEAVE` when the pointer leaves the window, so
-    /// a tooltip raised by the badge cannot outlive the pointer.
-    fn track_leave(window: HWND) {
-        unsafe {
-            let mut request = TRACKMOUSEEVENT {
-                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                dwFlags: TME_LEAVE,
-                hwndTrack: window,
-                dwHoverTime: 0,
-            };
-            let _ = TrackMouseEvent(&mut request);
-        }
-    }
-
-    /// Puts the tooltip up or takes it down, repainting only on a change.
-    fn set_help(window: HWND, hot: bool) {
-        if HELP_HOT.swap(hot, Ordering::SeqCst) == hot {
-            return;
-        }
-        unsafe {
-            if let Ok(tip) = GetDlgItem(window, ID_TIP as i32) {
-                let _ = ShowWindow(tip, if hot { SW_SHOW } else { SW_HIDE });
-            }
-        }
-        repaint(window);
-    }
-
-    /// The tooltip child: no text, not visible, not a tab stop and **disabled**,
-    /// so it can never take focus or a click.
-    fn tip_child(parent: HWND, at: Box2) -> Option<HWND> {
-        unsafe {
-            CreateWindowExW(
-                WINDOW_EX_STYLE(0),
-                w!("BUTTON"),
-                w!(""),
-                WINDOW_STYLE(WS_CHILD.0 | WS_DISABLED.0 | BS_PUSHBUTTON as u32),
-                scale(at.x),
-                scale(at.y),
-                scale(at.w),
-                scale(at.h),
-                parent,
-                HMENU(ID_TIP as *mut c_void),
-                None,
-                None,
-            )
-        }
-        .ok()
-    }
-
-    fn subclass_tip(tip: HWND) {
-        unsafe {
-            SetWindowLongPtrW(tip, GWLP_WNDPROC, tip_proc as *const () as isize);
-        }
-    }
-
-    /// The tooltip paints itself and is transparent to the pointer, so moving
-    /// down off the badge onto the list reaches the row beneath it.
-    unsafe extern "system" fn tip_proc(
-        tip: HWND,
-        msg: u32,
-        wparam: WPARAM,
-        lparam: LPARAM,
-    ) -> LRESULT {
-        match msg {
-            WM_ERASEBKGND => LRESULT(1),
-            WM_PAINT => {
-                paint_tip(tip);
-                LRESULT(0)
-            }
-            // `HTTRANSPARENT`.
-            WM_NCHITTEST => LRESULT(-1),
-            _ => DefWindowProcW(tip, msg, wparam, lparam),
-        }
-    }
-
-    fn paint_tip(tip: HWND) {
-        unsafe {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(tip, &mut ps);
-            let mut rc = RECT::default();
-            let _ = GetClientRect(tip, &mut rc);
-            let guard = FONTS.lock();
-            if let Some(fonts) = guard.as_ref().ok().and_then(|slot| slot.as_ref()) {
-                // The ground behind the tooltip's rounded corners is the card.
-                fill_rect(hdc, rc, crate::theme::CARD);
-                panel_draw::draw_key_tooltip(
-                    hdc,
-                    rc,
-                    fonts.tip,
-                    &panel_draw::FILL_KEY_HINTS,
-                    DPI_PERCENT.load(Ordering::SeqCst),
-                );
-            }
-            drop(guard);
-            let _ = EndPaint(tip, &ps);
-        }
-    }
-
     // ---- painting ----------------------------------------------------------
 
     /// The card's own surface: the header. Every row paints itself.
@@ -1468,7 +1351,7 @@ mod win32 {
                     mem,
                     dev(l.help),
                     fonts.help,
-                    HELP_HOT.load(Ordering::SeqCst),
+                    panel_draw::help_hot(),
                 );
             }
 
@@ -1532,11 +1415,9 @@ mod win32 {
 
     /// **One choice row, as design 1b draws an account row**: the account's
     /// tile, a bold line saying what pressing the row will type, the account
-    /// under it, and on the selected row the blue `Enter` badge.
-    ///
-    /// The background is a rounded wash over the whole row -- the tile's
-    /// padding included -- so hover and selection never hug just the text.
-    /// Every GDI object created here is restored and deleted before returning.
+    /// under it, and on the selected row the blue `Enter` badge. The painting is
+    /// [`panel_draw::draw_account_row`], which the account picker's rows go
+    /// through too, so the two cards cannot drift.
     fn paint_choice(
         hdc: HDC,
         rect: RECT,
@@ -1546,69 +1427,28 @@ mod win32 {
         fonts: &Fonts,
         dpi: i32,
     ) {
-        unsafe {
-            if selected {
-                panel_draw::round_rect(
-                    hdc,
-                    rect,
-                    scale(panel_draw::ROW_RADIUS),
-                    crate::theme::BLUE_WASH,
-                    None,
-                );
-            } else if hovered {
-                panel_draw::round_rect(
-                    hdc,
-                    rect,
-                    scale(panel_draw::ROW_RADIUS),
-                    crate::theme::WINDOW_BG,
-                    None,
-                );
-            }
-
-            // The badge first, so the text lane can stop short of it:
-            // `DT_END_ELLIPSIS` truncates against the rect it is given.
-            let lane = if selected {
-                panel_draw::draw_enter_badge(hdc, rect, fonts.badge, dpi)
-            } else {
-                0
-            };
-
-            let tile = RECT {
-                left: rect.left + scale(panel_draw::ROW_PAD_X),
-                top: rect.top + scale(panel_draw::ROW_PAD_Y),
-                right: rect.left + scale(panel_draw::ROW_PAD_X + panel_draw::AVATAR),
-                bottom: rect.top + scale(panel_draw::ROW_PAD_Y + panel_draw::AVATAR),
-            };
-            // **`initials` can legitimately answer an empty string** -- see
-            // `win32_draw::draw_text`, which is what keeps that from taking the
-            // daemon down.
-            panel_draw::draw_avatar(
-                hdc,
-                tile,
-                &crate::theme::initials(&row.account),
-                fonts.avatar,
-                panel_draw::avatar_colours(0),
-                dpi,
-            );
-
-            let left = tile.right + scale(panel_draw::ROW_TEXT_GAP);
-            let right = rect.right - crate::theme::TEXT_CLIP_INSET as i32 - lane;
-            let line = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
-            let mid = tile.top + (tile.bottom - tile.top) * 11 / 20;
-            SetBkMode(hdc, TRANSPARENT);
-
-            SetTextColor(hdc, rgb(crate::theme::INK));
-            let old_font = SelectObject(hdc, fonts.name);
-            let mut rc = RECT { left, top: tile.top, right, bottom: mid };
-            draw_text(hdc, &row.primary, &mut rc, line);
-            SelectObject(hdc, old_font);
-
-            SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
-            let old_font = SelectObject(hdc, fonts.user);
-            let mut rc = RECT { left, top: mid, right, bottom: tile.bottom };
-            draw_text(hdc, &row.account, &mut rc, line);
-            SelectObject(hdc, old_font);
-        }
+        let faces = panel_draw::RowFonts {
+            name: fonts.name,
+            sub: fonts.user,
+            avatar: fonts.avatar,
+            badge: fonts.badge,
+            // This card's rows carry no key chip: Enter fills the selected one.
+            chip: fonts.badge,
+        };
+        panel_draw::draw_account_row(
+            hdc,
+            rect,
+            panel_draw::RowLook {
+                tile: panel_draw::Tile::Initials(&row.account, 0),
+                name: &row.primary,
+                sub: &row.account,
+                selected,
+                hovered,
+                chip: None,
+            },
+            &faces,
+            dpi,
+        );
     }
 
     /// The header's close glyph, drawn as two strokes because no bundled face
