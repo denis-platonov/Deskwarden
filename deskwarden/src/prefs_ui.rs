@@ -4788,6 +4788,12 @@ fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) 
 /// now arguable in front of the switch rather than about a switch on another
 /// page.
 fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
+    // The Store edition never checks, downloads or installs: say where its
+    // updates come from instead of offering a switch that does nothing.
+    if let Some(notice) = crate::updater::store_updates_notice() {
+        card(ui, |ui| note_row(ui, UPDATES_LABEL, notice, ""));
+        return;
+    }
     card(ui, |ui| {
         // **Moved off General, whole.** It was the last row there,
         // deliberately apart from the two vault-keyed network rows because
@@ -4811,6 +4817,9 @@ fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
 /// answer to "how does a page inside a blocking event loop hear back from a
 /// background thread": it does not need `main.rs`'s loop, because it has its
 /// own frames and `pump` never blocks in one.
+/// The row title the Store edition's notice sits under.
+const UPDATES_LABEL: &str = "Updates";
+
 fn draw_update_card(ui: &mut Ui, state: &mut PrefsState) {
     use crate::update_panel::UpdateStage;
 

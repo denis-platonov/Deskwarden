@@ -497,6 +497,11 @@ fn about(ui: &mut Ui, state: &mut PrefsState) {
                 crate::vault_window::webbrowser_open(FEEDBACK_URL);
             }
             kit_card::row_rule(ui);
+            // The Store asks for the policy to be reachable from inside the app.
+            if button_row(ui, PRIVACY_LABEL, "", "", "Open", false) {
+                crate::vault_window::webbrowser_open(PRIVACY_URL);
+            }
+            kit_card::row_rule(ui);
             if button_row(ui, LOGS_LABEL, "", LOGS_TIP, "Copy", false) {
                 match log_location() {
                     Some(path) => {
@@ -516,6 +521,8 @@ pub const FEEDBACK_LABEL: &str = "Send feedback";
 pub const LOGS_LABEL: &str = "Diagnostic logs";
 const HELP_URL: &str = "https://github.com/denis-platonov/deskwarden#readme";
 const FEEDBACK_URL: &str = "https://github.com/denis-platonov/deskwarden/issues/new";
+pub const PRIVACY_LABEL: &str = "Privacy policy";
+const PRIVACY_URL: &str = "https://github.com/denis-platonov/deskwarden/blob/main/PRIVACY.md";
 /// The design's tip says logs never hold passwords; this screen cannot vouch
 /// for every line, so the tip says what the button really does.
 const LOGS_TIP: &str = "Copies where the log file is, not what is in it. Read it before you share it.";
@@ -819,11 +826,25 @@ mod tests {
     #[test]
     fn the_about_page_has_the_support_rows_and_https_links() {
         let painted = Fixture::new(Page::About).settle();
-        for label in [HELP_LABEL, FEEDBACK_LABEL, LOGS_LABEL] {
+        for label in [HELP_LABEL, FEEDBACK_LABEL, PRIVACY_LABEL, LOGS_LABEL] {
             assert!(painted.text(label).is_some(), "{label} is not drawn");
         }
-        for url in [HELP_URL, FEEDBACK_URL] {
+        for url in [HELP_URL, FEEDBACK_URL, PRIVACY_URL] {
             assert!(url.starts_with("https://github.com/denis-platonov/deskwarden"), "{url}");
+        }
+    }
+
+    /// The Store edition says where updates come from; the default build
+    /// keeps its switch. Both flavours run in CI, so each half is exercised.
+    #[test]
+    fn the_updates_group_matches_the_edition() {
+        let painted = Fixture::new(Page::About).settle();
+        match crate::updater::store_updates_notice() {
+            Some(notice) => {
+                assert!(painted.text(notice).is_some(), "the Store notice is not drawn");
+                assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_none(), "a Store build offers the update switch");
+            }
+            None => assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_some(), "the update switch is gone"),
         }
     }
 
