@@ -133,8 +133,10 @@ pub fn set_palette(ctx: &egui::Context, palette: Palette) {
     ctx.data_mut(|d| d.insert_temp(egui::Id::NULL, palette));
 }
 
-/// The design's two sidebars, chosen by a setting (General > Look).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The design's two sidebars, chosen by a setting (General > Look). Saved
+/// as `"navy"` / `"light"`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SidebarStyle {
     #[default]
     Navy,
@@ -342,6 +344,14 @@ mod tests {
         assert_eq!(light.q1, rgb(0x14307a));
 
         assert_eq!(SidebarStyle::default(), SidebarStyle::Navy);
+    }
+
+    #[test]
+    fn sidebar_style_round_trips_as_lowercase() {
+        assert_eq!(serde_json::to_string(&SidebarStyle::Light).unwrap(), "\"light\"");
+        assert_eq!(serde_json::to_string(&SidebarStyle::Navy).unwrap(), "\"navy\"");
+        let back: SidebarStyle = serde_json::from_str("\"light\"").unwrap();
+        assert_eq!(back, SidebarStyle::Light);
     }
 
     #[test]

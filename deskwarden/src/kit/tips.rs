@@ -147,7 +147,9 @@ fn paint_hint_at(ui: &Ui, target: Rect, label: &str, keys: &[&str], opacity: f32
         .collect();
     let chip_w = |g: &std::sync::Arc<egui::Galley>| (g.size().x + 10.0).max(20.0);
     let inner_h = text.size().y.max(20.0);
-    let width = 11.0 + text.size().x + chips.iter().map(|g| 8.0 + chip_w(g)).sum::<f32>() + 8.0;
+    // Spec 2.7: 8 between the label and the chips, 3 between chips.
+    let chips_w: f32 = chips.iter().map(chip_w).sum::<f32>() + 3.0 * chips.len().saturating_sub(1) as f32;
+    let width = 11.0 + text.size().x + if chips.is_empty() { 0.0 } else { 8.0 + chips_w } + 8.0;
     let rect = hint_rect(target, ui.ctx().content_rect(), Vec2::new(width, inner_h + 14.0));
     let painter = tooltip_painter(ui, "hint");
     let shadow = Shadow { offset: [0, 8], blur: 20, spread: 0, color: Color32::from_rgba_unmultiplied(0, 0, 0, 64).gamma_multiply(opacity) };
@@ -158,8 +160,8 @@ fn paint_hint_at(ui: &Ui, target: Rect, label: &str, keys: &[&str], opacity: f32
     painter.galley(pos2(x, mid - text.size().y / 2.0), text.clone(), white);
     x += text.size().x;
     let chip_fill = Color32::from_rgba_unmultiplied(255, 255, 255, 41).gamma_multiply(opacity);
-    for galley in chips {
-        x += 8.0;
+    for (i, galley) in chips.into_iter().enumerate() {
+        x += if i == 0 { 8.0 } else { 3.0 };
         let w = chip_w(&galley);
         let chip = Rect::from_min_size(pos2(x, mid - 10.0), Vec2::new(w, 20.0));
         painter.rect_filled(chip, CornerRadius::same(5), chip_fill);
@@ -283,6 +285,24 @@ mod tests {
             let r = bubble_rect(dot, placement);
             assert!(window.contains_rect(r), "{dot:?} {placement:?} put its bubble at {r:?}");
         }
+    }
+
+    /// Spec 2.7: chips sit 3 apart; 8 separates the label from the first.
+    #[test]
+    fn hint_chips_are_three_apart() {
+        let ctx = ctx();
+        let painted = frame(&ctx, 1.0, Vec2::new(800.0, 600.0), vec![], |ui| {
+            paint_hint(ui, target(400.0, 300.0), "Sync now", &["Mod", "Shift", "Y"]);
+        });
+        let chip_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 41);
+        let mut chips: Vec<Rect> = painted.rects.iter().filter(|r| r.fill == chip_fill).map(|r| r.rect).collect();
+        chips.sort_by(|a, b| a.left().total_cmp(&b.left()));
+        assert_eq!(chips.len(), 3);
+        for pair in chips.windows(2) {
+            assert!((pair[1].left() - pair[0].right() - 3.0).abs() < 0.01, "{pair:?}");
+        }
+        let label = painted.text("Sync now").unwrap().2;
+        assert!((chips[0].left() - label.right() - 8.0).abs() < 1.0, "label {label:?} chip {:?}", chips[0]);
     }
 
     #[test]
