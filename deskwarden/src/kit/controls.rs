@@ -175,13 +175,24 @@ pub fn button_width(ctx: &egui::Context, kind: ButtonKind, size: ButtonSize, lab
 }
 
 pub fn button(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str, icon: Option<&str>) -> Response {
+    let width = button_width(ui.ctx(), kind, size, label, icon.is_some());
+    paint_button(ui, kind, size, width, label, icon)
+}
+
+/// A button as wide as the room it is given, its label centred (the modals'
+/// `flex: 1` pairs: Back and Save code).
+pub fn button_filling(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str) -> Response {
+    let width = ui.available_width();
+    paint_button(ui, kind, size, width, label, None)
+}
+
+fn paint_button(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, width: f32, label: &str, icon: Option<&str>) -> Response {
     let p = palette(ui.ctx());
     let (face, ink) = button_look(&p, kind);
     let role = Role { size: size.font_px, face, tracking_em: 0.0 };
     let galley = ui.fonts_mut(|f| f.layout_job(tokens::job(role, label, ink)));
     let icon_px = (size.font_px + 2.0).round();
     let icon_w = if icon.is_some() { icon_px + 7.0 } else { 0.0 };
-    let width = button_width(ui.ctx(), kind, size, label, icon.is_some());
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, size.height), Sense::click());
     let hovered = response.hovered();
     let radius = CornerRadius::same(size.radius);
@@ -208,7 +219,10 @@ pub fn button(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str, icon
             painter.rect(rect, radius, fill, Stroke::new(1.0, p.danger_edge), egui::StrokeKind::Inside);
         }
     }
-    let mut x = rect.left() + size.pad_x;
+    // Centred in whatever width it was given; a natural-width button is
+    // already exactly its content and padding, so this is the same place.
+    let content = icon_w + galley.size().x;
+    let mut x = rect.left() + (rect.width() - content) / 2.0;
     if let Some(d) = icon {
         let glyph = Rect::from_min_size(egui::pos2(x, rect.center().y - icon_px / 2.0), Vec2::splat(icon_px));
         crate::kit::icon::stroke(painter, glyph, d, 2.2, ink);

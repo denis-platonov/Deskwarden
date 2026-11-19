@@ -63,11 +63,16 @@ fn inside(rect: Rect, window: Rect) -> Rect {
 /// The 18 px `?` dot. Hovering it shows `text` in a `width`-wide bubble on
 /// the `placement` side.
 pub fn help_dot(ui: &mut Ui, id: egui::Id, text: &str, width: f32, placement: Placement) -> Response {
+    help_dot_sized(ui, id, text, width, placement, 18.0)
+}
+
+/// [`help_dot`] at another diameter: the QR modal's is 20 with a 12 px `?`.
+pub fn help_dot_sized(ui: &mut Ui, id: egui::Id, text: &str, width: f32, placement: Placement, diameter: f32) -> Response {
     let p = palette(ui.ctx());
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-    ui.painter().circle_filled(rect.center(), 9.0, p.badge_bg);
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(diameter), Sense::hover());
+    ui.painter().circle_filled(rect.center(), diameter / 2.0, p.badge_bg);
     let glyph = ui.fonts_mut(|f| {
-        f.layout_job(tokens::job(Role { size: 11.0, face: EXTRABOLD, tracking_em: 0.0 }, "?", p.text_icon))
+        f.layout_job(tokens::job(Role { size: if diameter > 18.0 { 12.0 } else { 11.0 }, face: EXTRABOLD, tracking_em: 0.0 }, "?", p.text_icon))
     });
     ui.painter().galley(rect.center() - glyph.size() / 2.0, glyph, p.text_icon);
     let clock = id.with("help-bubble");

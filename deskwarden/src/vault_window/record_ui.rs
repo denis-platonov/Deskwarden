@@ -799,7 +799,7 @@ fn heading(ui: &mut egui::Ui, text: &str) -> egui::Rect {
 const FORM_HEADER_HEIGHT: f32 = theme::FORM_CARD_HEADER_HEIGHT;
 
 fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
-    ui.label(egui::RichText::new(text).size(11.0).color(colour));
+    ui.add(egui::Label::new(egui::RichText::new(text).size(13.0).color(colour)).wrap());
 }
 
 /// The tick list's own box, from design §5a: `border: 1px solid #eae7e7;
@@ -1519,7 +1519,9 @@ pub fn draw_share_form(
         ui.horizontal(|ui| {
             ui.label(theme::bold(text, 15.0).color(theme::INK));
             if let Some(tip) = tip {
-                ui.label(egui::RichText::new("?").color(theme::TEXT_FAINT)).on_hover_text(tip);
+                // Spec B 0.4: the 18 px dot, its bubble above (250 for "once").
+                let width = if text == OPEN_ONCE { 250.0 } else { 260.0 };
+                crate::kit::tips::help_dot(ui, egui::Id::new(("share-tip", text)), tip, width, crate::kit::tips::Placement::Above);
             }
         });
     };
@@ -1544,9 +1546,15 @@ pub fn draw_share_form(
         });
         if warning_is_shown(draft) {
             ui.add_space(8.0);
-            ui.label(egui::RichText::new(SEED_WARNING).size(13.0).color(theme::ERROR));
-            ui.add_space(6.0);
-            ui.add_enabled_ui(!busy, |ui| theme::hinted_field(ui, &mut draft.passphrase, PASSPHRASE_HINT, true));
+            crate::kit::modal::note(ui, crate::kit::modal::Tone::Danger, SEED_WARNING);
+            ui.add_space(8.0);
+            let field_id = egui::Id::new("share-passphrase");
+            let mut revealed = ui.data(|d| d.get_temp::<bool>(field_id.with("revealed"))).unwrap_or(false);
+            let width = ui.available_width();
+            ui.add_enabled_ui(!busy, |ui| {
+                crate::kit::input::secret(ui, field_id, &mut draft.passphrase, &mut revealed, PASSPHRASE_HINT, width, crate::kit::input::SIGN_IN)
+            });
+            ui.data_mut(|d| d.insert_temp(field_id.with("revealed"), revealed));
             ui.add_space(4.0);
             note(ui, PASSPHRASE_NOTE, theme::TEXT_FAINT);
         }
@@ -1618,17 +1626,13 @@ pub fn draw_share_form(
         note(ui, problem, theme::ERROR);
         ui.add_space(8.0);
     }
+    // Spec B 6.1: Create link is the dialog's full-width primary, 54 high.
     let size = crate::kit::controls::ButtonSize { height: 54.0, pad_x: 22.0, radius: 16, font_px: 17.0 };
-    let mut button_ui = ui.new_child(
-        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(ui.cursor().min, egui::vec2(ui.available_width(), 54.0))),
-    );
-    if busy {
-        button_ui.disable();
-    }
     let text = if busy { CREATING_LINK } else { CREATE_LINK };
-    let button = crate::kit::controls::button(&mut button_ui, crate::kit::controls::ButtonKind::Primary, size, text, None);
+    let button = ui
+        .add_enabled_ui(!busy, |ui| crate::kit::controls::button_filling(ui, crate::kit::controls::ButtonKind::Primary, size, text))
+        .inner;
     let _ = ui.interact(button.rect, create_link_id(), egui::Sense::hover());
-    ui.advance_cursor_after_rect(egui::Rect::from_min_size(button.rect.min, egui::vec2(ui.available_width(), 54.0)));
     if button.clicked() {
         if advanced && !share_chips().iter().any(|(_, f)| chip_on(&draft.selection, *f)) {
             crate::kit::toast::show(ui.ctx(), NOTHING_PICKED);
@@ -1722,10 +1726,10 @@ pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUi
     ui.add_space(16.0);
     ui.columns(2, |columns| {
         let size = crate::kit::controls::ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
-        if crate::kit::controls::button(&mut columns[0], crate::kit::controls::ButtonKind::Outline, size, DONE, None).clicked() {
+        if crate::kit::controls::button_filling(&mut columns[0], crate::kit::controls::ButtonKind::Outline, size, DONE).clicked() {
             action = RecordUiAction::Cancel;
         }
-        if crate::kit::controls::button(&mut columns[1], crate::kit::controls::ButtonKind::Outline, size, SEE_IN_SHARED, None).clicked() {
+        if crate::kit::controls::button_filling(&mut columns[1], crate::kit::controls::ButtonKind::Outline, size, SEE_IN_SHARED).clicked() {
             action = RecordUiAction::SeeInShared;
         }
     });
@@ -1772,37 +1776,28 @@ pub enum ForgetAnswer {
 /// The confirmation, over a scrim, as this window's other confirmations are
 /// drawn (`detail_edit::draw_discard_confirm`). `No` answers Escape.
 pub fn draw_forget_confirm(ctx: &egui::Context, email: &str, names: &[String]) -> Option<ForgetAnswer> {
-    let mut answer = None;
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-forget-scrim")));
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-forget-modal"))).show(ctx, |ui| {
-        theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-        egui::Frame::new()
-            .fill(theme::CARD)
-            .corner_radius(CornerRadius::same(10))
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-            .inner_margin(egui::Margin::same(20))
-            .show(ui, |ui| {
-                ui.set_width(380.0);
-                ui.label(theme::bold(forget_title(email), 15.0).color(theme::INK));
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new(forget_body(names)).size(12.0).color(theme::TEXT_SECONDARY));
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    if theme::destructive_button(ui, &forget_confirm_label(names.len())).clicked() {
-                        answer = Some(ForgetAnswer::DeleteShares);
-                    }
-                    ui.add_space(theme::FORM_FOOTER_GAP);
-                    if theme::secondary_button(ui, FORGET_KEEP).clicked() {
-                        answer = Some(ForgetAnswer::Keep);
-                    }
-                });
-            });
-    });
-    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        answer = Some(ForgetAnswer::Keep);
+    use crate::kit::controls::ButtonKind;
+    use crate::kit::modal::{confirm, Confirmed, Side};
+    let title = forget_title(email);
+    let body = forget_body(names);
+    let yes = forget_confirm_label(names.len());
+    match confirm(
+        ctx,
+        FORGET_ID,
+        480.0,
+        &title,
+        Some(&body),
+        (&yes, ButtonKind::Danger),
+        (FORGET_KEEP, ButtonKind::Outline),
+    ) {
+        Confirmed::Pressed(Side::Left) => Some(ForgetAnswer::DeleteShares),
+        Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(ForgetAnswer::Keep),
+        Confirmed::Open => None,
     }
-    answer
 }
+
+/// The dialog's id; its scrim is `"record-forget-scrim"`.
+pub const FORGET_ID: &str = "record-forget";
 
 // ---------------------------------------------------------------------------
 // The way in, the other direction

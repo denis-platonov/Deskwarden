@@ -155,98 +155,60 @@ pub enum DeleteConfirmAction {
     Cancel,
 }
 
-/// How wide the card is. Unchanged from the plain card this replaced: the
-/// sentence under the subject line is the longest thing on it, and 340 is the
-/// width at which the permanent delete's two lines break where they read
-/// best.
-const CARD_WIDTH: f32 = 340.0;
+/// How wide the dialog is (spec B 2: a standard v2 dialog; the confirmations
+/// are the narrow ones).
+const CARD_WIDTH: f32 = 480.0;
 
-/// Draws the modal as a centred card over a dimmed scrim and reports what was
-/// pressed.
+/// The dialog's id; its scrim is `"delete-confirm-scrim"`.
+pub const ID: &str = "delete-confirm";
+
+/// The id of the confirming button, for the window's tests.
+pub fn confirm_id() -> egui::Id {
+    crate::kit::modal::confirm_button_id(ID, crate::kit::modal::Side::Right)
+}
+
+/// Draws the dialog and reports what was pressed: a v2 dialog titled by what
+/// is being done, the sentence that says what the button does, the row it is
+/// about (its own icon, name and username -- two logins at the same bank differ
+/// by their username and nothing else), and Cancel / the red confirm.
 ///
-/// **The card is [`theme::modal_card`]'s**, which is the app's one modal
-/// shape: a coloured header band, a white body, and a footer whose two
-/// answers split its width. This file no longer lays out a card of its own,
-/// and [`super::icon_modal`] no longer lays out a second one -- see that
-/// function's own doc for why the layout moved into `theme`.
-///
-/// **The header carries [`theme::ERROR`] and the warning triangle**, because
-/// the accent is how the card says what kind of question it is before a word
-/// of it is read. It is the same red the confirm button wears, and the same
-/// red this app already spends on exactly this meaning (the kebab's Delete
-/// words, the sidebar's folder ×).
-///
-/// **Esc cancels and Enter does nothing.** Every other overlay in this app
-/// takes Esc, so this one does too; the affirmative key is deliberately
-/// missing, because a modal that a stray Return can dismiss into a delete is
-/// a modal that made the accident it was put there to prevent slightly more
-/// convenient.
+/// **Esc, the close mark and the scrim cancel; nothing confirms but a press.**
+/// A dialog a stray Return can dismiss into a delete is a dialog that made
+/// the accident it was put there to prevent slightly more convenient.
 pub fn draw_delete_modal(
     ctx: &egui::Context,
     state: &mut DeleteConfirmState,
 ) -> DeleteConfirmAction {
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    use crate::kit::modal::{confirm_button_id, Dialog, ModalOutcome, Side};
     let mut action = DeleteConfirmAction::None;
-
-    // The `Area` is declared HERE rather than inside `theme::modal_scrim`,
-    // and the id is a literal on purpose: `item_list::MODAL_SCRIM_AREAS` is
-    // walked for exactly this declaration, and a scrim it cannot see is a
-    // modal the item list's arrow keys steer straight through.
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("delete-confirm-scrim")));
-
-    let press = theme::modal_card(
-        ctx,
-        egui::Area::new(egui::Id::new("delete-confirm-modal")),
-        theme::ModalCard {
-            accent: theme::ERROR,
-            glyph: theme::ModalGlyph::Warning,
-            title: state.kind.heading(),
-            width: CARD_WIDTH,
-            dismiss: "Cancel",
-            body: theme::ModalBody::Padded,
-        },
-        |ui| {
-            // The row this is about, drawn as the results list draws it --
-            // its own icon, its own name, its own username. The menu that
-            // opened this is gone from the screen by now, and a confirmation
-            // that did not say which item it was about would be one click
-            // away from deleting the wrong credential; two logins at the same
-            // bank differ by their username and nothing else, which is why
-            // the second line is not decoration.
-            state.subject.draw(ui);
-            ui.add_space(12.0);
-            // Wrapped, not truncated: this is the sentence that says what the
-            // button does, and half of it is worse than none.
-            ui.add(
-                egui::Label::new(
-                    RichText::new(state.kind.body()).size(12.0).color(theme::TEXT_MUTED),
-                )
-                .wrap(),
-            );
-
-            if let Some(error) = &state.error {
-                ui.add_space(10.0);
-                ui.add(
-                    egui::Label::new(RichText::new(error).size(12.0).color(theme::ERROR)).wrap(),
-                );
+    let body = state.kind.body();
+    let (outcome, ()) = Dialog::new(ID, CARD_WIDTH).title(state.kind.heading()).sub(body).show(ctx, |ui| {
+        state.subject.draw(ui);
+        if let Some(error) = &state.error {
+            ui.add_space(10.0);
+            ui.add(egui::Label::new(RichText::new(error).size(14.0).color(theme::ERROR)).wrap());
+        }
+        ui.add_space(18.0);
+        let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+        ui.spacing_mut().item_spacing.x = 10.0;
+        ui.columns(2, |columns| {
+            let cancel = controls::button_filling(&mut columns[0], ButtonKind::Outline, size, "Cancel");
+            let _ = columns[0].interact(cancel.rect, confirm_button_id(ID, Side::Left), egui::Sense::hover());
+            if cancel.clicked() {
+                action = DeleteConfirmAction::Cancel;
             }
-        },
-        |ui| theme::destructive_button(ui, state.kind.confirm_label()),
-    );
-    if press.confirmed {
-        action = DeleteConfirmAction::Confirm;
-    }
-    // Second, so that the cautious answer wins a frame in which the pointer
-    // somehow reported both. Nothing in egui delivers two clicks in one
-    // frame today; this costs nothing and the other order costs a delete.
-    if press.dismissed {
+            let go = controls::button_filling(&mut columns[1], ButtonKind::Danger, size, state.kind.confirm_label());
+            let _ = columns[1].interact(go.rect, confirm_button_id(ID, Side::Right), egui::Sense::hover());
+            if go.clicked() {
+                action = DeleteConfirmAction::Confirm;
+            }
+        });
+    });
+    // The cautious answer wins a frame that somehow carried both.
+    if action == DeleteConfirmAction::None && outcome == ModalOutcome::Closed {
         action = DeleteConfirmAction::Cancel;
     }
-
-    // Esc cancels, same as every other transient overlay in this app.
-    if action == DeleteConfirmAction::None && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        action = DeleteConfirmAction::Cancel;
-    }
-
     action
 }
 
@@ -394,38 +356,6 @@ mod tests {
                 .filter(|r| r.fill_texture_id() != egui::TextureId::default())
                 .map(|r| r.rect)
                 .collect()
-        }
-
-        /// The one band that runs the card's whole width in `fill`.
-        ///
-        /// The width is part of the question: the confirm button is filled in
-        /// the same red as the header it sits under, and only the bands run
-        /// edge to edge.
-        fn band(&self, fill: egui::Color32) -> egui::Rect {
-            let found: Vec<egui::Rect> = self
-                .rects
-                .iter()
-                // **`CARD_WIDTH` plus the border on each side.** The bands are
-                // painted out over the card's border rather than stopping
-                // inside it, so that none of the card's own fill shows past
-                // them -- see `theme::MODAL_BAND_BLEED`, which is the fix for
-                // "there is some white line along the curve".
-                .filter(|r| {
-                    r.fill == fill
-                        && (r.rect.width() - (CARD_WIDTH + 2.0 * theme::MODAL_BAND_BLEED))
-                            .abs()
-                            < 0.5
-                })
-                .map(|r| r.rect)
-                .collect();
-            assert_eq!(
-                found.len(),
-                1,
-                "expected one full-width band filled {fill:?}, found {}; the card painted {:?}",
-                found.len(),
-                self.rects.iter().map(|r| (r.fill, r.rect.width())).collect::<Vec<_>>()
-            );
-            found[0]
         }
 
         /// The LOWEST rect painting `label`.
@@ -585,52 +515,6 @@ mod tests {
         assert_eq!(action, DeleteConfirmAction::None);
         assert!(!painted.texts.is_empty(), "the modal painted nothing at all");
         painted
-    }
-
-    /// **The header band is the destructive red, and the heading is in it.**
-    /// The accent is how the card says what kind of question it is before a
-    /// word of it is read, and this is the one modal in the window whose
-    /// question destroys something -- so it wears the same red as the button
-    /// that carries it out, and the same red this app already spends on
-    /// exactly this meaning everywhere else.
-    #[test]
-    fn the_header_band_is_the_destructive_colour_and_carries_the_heading() {
-        for kind in [DeleteKind::ToTrash, DeleteKind::Forever] {
-            let ctx = styled_context();
-            let mut state = DeleteConfirmState::new(&login(), None, kind);
-            let painted = opened(&ctx, &mut state);
-
-            let band = painted.band(theme::ERROR);
-            assert!(
-                // The band's own height plus the point it bleeds upward over
-                // the card's border -- see `theme::MODAL_BAND_BLEED`.
-                (band.height() - (theme::MODAL_HEADER_HEIGHT + theme::MODAL_BAND_BLEED))
-                    .abs()
-                    < 0.5,
-                "{kind:?}: the red band is {} tall, so it is not the header",
-                band.height()
-            );
-            let heading = painted
-                .texts
-                .iter()
-                .find(|(t, r)| t == kind.heading() && band.contains_rect(*r))
-                .map(|(_, r)| *r);
-            assert!(
-                heading.is_some(),
-                "{kind:?}: {:?} is not painted inside the header band at {band:?}; the card \
-                 painted {:?}",
-                kind.heading(),
-                painted.texts
-            );
-            // And the footer really is the third band, so this card is the
-            // frame's card and not a plain one that happens to have a red
-            // rectangle on it.
-            let footer = painted.band(theme::CARD_TINT);
-            assert!(
-                footer.top() > band.bottom(),
-                "the footer band at {footer:?} is not below the header at {band:?}"
-            );
-        }
     }
 
     /// **It names the item.** The menu that opened it is gone from the
@@ -845,65 +729,45 @@ mod tests {
         );
     }
 
-    /// **The header's dismiss ✕ cancels, and cannot delete.**
-    ///
-    /// This file gained no line for that mark: it is on
-    /// [`theme::modal_card`]'s header band, and the band reports through
-    /// [`theme::ModalPress::dismissed`] -- the same flag the Cancel button
-    /// sets, which this function already turns into
-    /// [`DeleteConfirmAction::Cancel`]. That is the whole argument for putting
-    /// the mark on the frame rather than on each card, and it is exactly why
-    /// the claim needs testing HERE: the card whose confirm destroys a vault
-    /// item is the one where a crossed wire would cost something, and no
-    /// assertion in `theme` can see what this file does with the flag.
-    ///
-    /// Driven on both kinds, because `Forever` is the one with nothing behind
-    /// it -- a permanent delete answered by accident is not in the trash.
+    /// The v2 dialog's own marks: the close mark and the scrim cancel, and
+    /// neither can answer the question the dialog asks.
     #[test]
-    fn the_header_dismiss_mark_cancels_and_never_deletes() {
+    fn the_close_mark_cancels_and_never_deletes() {
+        use crate::kit::testing;
         for kind in [DeleteKind::ToTrash, DeleteKind::Forever] {
-            let ctx = styled_context();
+            let ctx = testing::ctx();
             let mut state = DeleteConfirmState::new(&login(), None, kind);
-            let painted = opened(&ctx, &mut state);
-
-            // The mark, found from the paint: two diagonals
-            // `theme::CLOSE_MARK_SPAN` across. The only other stroke on this
-            // card is the warning bang's upright bar, which is not one.
-            let arms: Vec<&[egui::Pos2; 2]> = painted
-                .segments
-                .iter()
-                .filter(|[a, b]| {
-                    ((b.x - a.x).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
-                        && ((b.y - a.y).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
-                })
-                .collect();
-            assert_eq!(
-                arms.len(),
-                2,
-                "{kind:?}: the header carries {} arms the size of a ✕; it needs exactly two",
-                arms.len()
-            );
-            let at = arms[0][0].lerp(arms[0][1], 0.5);
-            assert!(
-                (arms[1][0].lerp(arms[1][1], 0.5) - at).length() < 0.01,
-                "{kind:?}: the two arms do not cross, so this is not a ✕"
-            );
-
-            let (action, _) = frame(&ctx, &mut state, &click(at));
-            assert_eq!(
-                action,
-                DeleteConfirmAction::Cancel,
-                "{kind:?}: the header's ✕ at {at:?} did not cancel -- and the one thing it must \
-                 never do is answer the question this card is asking"
-            );
-
-            // The pairing: Escape gives the same answer, so the mark is the
-            // gesture this card already had and not a second one.
-            let ctx = styled_context();
-            let mut fresh = DeleteConfirmState::new(&login(), None, kind);
-            let _ = opened(&ctx, &mut fresh);
-            let (by_key, _) = frame(&ctx, &mut fresh, &escape());
-            assert_eq!(by_key, action, "{kind:?}: the ✕ and Escape disagree");
+            let screen = egui::vec2(1280.0, 820.0);
+            for t in [0.0, 0.1, 0.2] {
+                let _ = testing::frame(&ctx, t, screen, vec![], |ui| {
+                    let _ = draw_delete_modal(ui.ctx(), &mut state);
+                });
+            }
+            let mark = ctx.read_response(crate::kit::modal::close_id(ID)).expect("the close mark").rect;
+            let mut action = DeleteConfirmAction::None;
+            let _ = testing::frame(&ctx, 0.3, screen, testing::click_at(mark.center()), |ui| {
+                action = draw_delete_modal(ui.ctx(), &mut state);
+            });
+            assert_eq!(action, DeleteConfirmAction::Cancel, "{kind:?}");
         }
+    }
+
+    #[test]
+    fn the_red_button_confirms_and_the_grey_one_cancels() {
+        use crate::kit::testing;
+        let ctx = testing::ctx();
+        let mut state = DeleteConfirmState::new(&login(), None, DeleteKind::Forever);
+        let screen = egui::vec2(1280.0, 820.0);
+        for t in [0.0, 0.1, 0.2] {
+            let _ = testing::frame(&ctx, t, screen, vec![], |ui| {
+                let _ = draw_delete_modal(ui.ctx(), &mut state);
+            });
+        }
+        let go = ctx.read_response(confirm_id()).expect("the confirm button").rect;
+        let mut action = DeleteConfirmAction::None;
+        let _ = testing::frame(&ctx, 0.3, screen, testing::click_at(go.center()), |ui| {
+            action = draw_delete_modal(ui.ctx(), &mut state);
+        });
+        assert_eq!(action, DeleteConfirmAction::Confirm);
     }
 }

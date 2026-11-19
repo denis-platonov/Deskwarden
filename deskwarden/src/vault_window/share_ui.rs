@@ -3081,37 +3081,25 @@ pub(crate) fn send_pasted_link(
 /// The scrim's id is a literal, spelled in the declaration, for
 /// `item_list::MODAL_SCRIM_AREAS`'s census.
 pub(crate) fn draw_join_confirm(ctx: &egui::Context, title: &str) -> Option<bool> {
-    let mut answer = None;
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-join-scrim")));
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-join-modal"))).show(ctx, |ui| {
-        theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-        egui::Frame::new()
-            .fill(theme::CARD)
-            .corner_radius(egui::CornerRadius::same(10))
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-            .inner_margin(egui::Margin::same(20))
-            .show(ui, |ui| {
-                ui.set_width(380.0);
-                ui.label(theme::bold(title, 15.0).color(theme::INK));
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new(JOIN_BODY).size(12.0).color(theme::TEXT_SECONDARY));
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    if theme::primary_button(ui, JOIN_YES_LABEL, None).clicked() {
-                        answer = Some(true);
-                    }
-                    ui.add_space(theme::FORM_FOOTER_GAP);
-                    if theme::secondary_button(ui, JOIN_NO_LABEL).clicked() {
-                        answer = Some(false);
-                    }
-                });
-            });
-    });
-    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        answer = Some(false);
+    use crate::kit::controls::ButtonKind;
+    use crate::kit::modal::{confirm, Confirmed, Side};
+    match confirm(
+        ctx,
+        JOIN_ID,
+        480.0,
+        title,
+        Some(JOIN_BODY),
+        (JOIN_YES_LABEL, ButtonKind::Primary),
+        (JOIN_NO_LABEL, ButtonKind::Outline),
+    ) {
+        Confirmed::Pressed(Side::Left) => Some(true),
+        Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(false),
+        Confirmed::Open => None,
     }
-    answer
 }
+
+/// The dialog's id; its scrim is `"record-join-scrim"`.
+pub(crate) const JOIN_ID: &str = "record-join";
 
 /// The leave question's two answers.
 pub(crate) const STOP_RECEIVING_LABEL: &str = "Stop receiving";
@@ -3143,37 +3131,27 @@ pub(crate) fn stop_receiving_body(from: &str) -> String {
 /// `item_list::MODAL_SCRIM_AREAS` names it (its census reads the literal)
 /// and the item list's arrow keys stand down behind the question.
 pub(crate) fn draw_leave_confirm(ctx: &egui::Context, from: &str) -> Option<bool> {
-    let mut answer = None;
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-leave-scrim")));
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-leave-modal"))).show(ctx, |ui| {
-        theme::modal_drag_handle(ui, theme::MODAL_PLAIN_HEADER_HEIGHT);
-        egui::Frame::new()
-            .fill(theme::CARD)
-            .corner_radius(egui::CornerRadius::same(10))
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-            .inner_margin(egui::Margin::same(20))
-            .show(ui, |ui| {
-                ui.set_width(380.0);
-                ui.label(theme::bold(stop_receiving_title(from), 15.0).color(theme::INK));
-                ui.add_space(10.0);
-                ui.label(egui::RichText::new(stop_receiving_body(from)).size(12.0).color(theme::TEXT_SECONDARY));
-                ui.add_space(18.0);
-                ui.horizontal(|ui| {
-                    if theme::destructive_button(ui, STOP_RECEIVING_LABEL).clicked() {
-                        answer = Some(true);
-                    }
-                    ui.add_space(theme::FORM_FOOTER_GAP);
-                    if theme::secondary_button(ui, KEEP_RECEIVING_LABEL).clicked() {
-                        answer = Some(false);
-                    }
-                });
-            });
-    });
-    if answer.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        answer = Some(false);
+    use crate::kit::controls::ButtonKind;
+    use crate::kit::modal::{confirm, Confirmed, Side};
+    let title = stop_receiving_title(from);
+    let body = stop_receiving_body(from);
+    match confirm(
+        ctx,
+        LEAVE_ID,
+        480.0,
+        &title,
+        Some(&body),
+        (STOP_RECEIVING_LABEL, ButtonKind::Danger),
+        (KEEP_RECEIVING_LABEL, ButtonKind::Outline),
+    ) {
+        Confirmed::Pressed(Side::Left) => Some(true),
+        Confirmed::Pressed(Side::Right) | Confirmed::Dismissed => Some(false),
+        Confirmed::Open => None,
     }
-    answer
 }
+
+/// The dialog's id; its scrim is `"record-leave-scrim"`.
+pub(crate) const LEAVE_ID: &str = "record-leave";
 
 #[cfg(test)]
 mod tests {

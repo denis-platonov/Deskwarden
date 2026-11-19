@@ -15512,8 +15512,8 @@ mod modal_card_tests {
 mod one_border_is_one_line_tests {
     /// **A rectangle stroked twice must be stroked the same way twice.**
     ///
-    /// Two cards in this app paint one border twice -- `theme::modal_card` and
-    /// `totp_add`'s `stage_card` -- because a `Frame`'s stroke is drawn under
+    /// The cards in this app that paint one border twice -- `theme::modal_card`, and
+    /// `totp_add`'s `stage_card` before the v2 dialog replaced it -- do so because a `Frame`'s stroke is drawn under
     /// its contents and a band that bleeds to the edge covers it. Painting the
     /// same border again over the top is the fix, and it is only a fix while
     /// the two strokes land on the same pixels.
@@ -15565,8 +15565,8 @@ mod one_border_is_one_line_tests {
             }
         }
         assert!(
-            found >= 2,
-            "the two cards that repaint their own border were not found, so this test is \
+            found >= 1,
+            "the card that repaints its own border was not found, so this test is \
              asserting about nothing"
         );
     }

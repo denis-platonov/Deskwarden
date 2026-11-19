@@ -36,10 +36,10 @@ pub fn draw(ctx: &egui::Context, count: usize) -> EmptyTrashAnswer {
         let mut answer = EmptyTrashAnswer::Open;
         let size = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
         ui.columns(2, |columns| {
-            if controls::button(&mut columns[0], ButtonKind::Outline, size, CANCEL, None).clicked() {
+            if controls::button_filling(&mut columns[0], ButtonKind::Outline, size, CANCEL).clicked() {
                 answer = EmptyTrashAnswer::Cancel;
             }
-            let confirm = controls::button(&mut columns[1], ButtonKind::Danger, size, CONFIRM, None);
+            let confirm = controls::button_filling(&mut columns[1], ButtonKind::Danger, size, CONFIRM);
             let _ = columns[1].interact(confirm.rect, confirm_id(), egui::Sense::hover());
             if confirm.clicked() {
                 answer = EmptyTrashAnswer::Confirm;
