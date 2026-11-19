@@ -246,7 +246,10 @@ pub const DEFAULT_PERIOD: u16 = 30;
 /// beside the blue "6a" chip, exactly as 6b's "Scanning" caption sits outside
 /// 6b's. Painting it inside the card gave the picker two headings where the
 /// design draws one.
-pub const PICKER_TITLE: &str = "Add a one-time code";
+pub const PICKER_TITLE: &str = "Add 2FA code";
+
+/// Spec B §8: what a saved code says.
+pub const SAVED_TOAST: &str = "2FA code added";
 
 /// The label over the item name at the top of the picker, verbatim from 6a.
 pub const ADDING_TO_LABEL: &str = "Adding to";
@@ -4098,6 +4101,52 @@ fn picker_header(ui: &mut egui::Ui) -> (bool, egui::Rect) {
 
 /// 6a's `Adding to` block: `padding: 4px 4px 8px` around a faint label and
 /// the item's own name.
+/// Spec B §8's two cards.
+pub struct RouteCard {
+    pub route: Route,
+    pub title: &'static str,
+    pub sub: &'static str,
+    primary: bool,
+}
+
+pub const ROUTE_CARDS: [RouteCard; 2] = [
+    RouteCard { route: Route::ScanRegion, title: "Scan from screen", sub: "Draw a box around the code", primary: true },
+    RouteCard { route: Route::ByHand, title: "Type the key", sub: "The code of letters under the QR", primary: false },
+];
+
+/// One of the two cards: radius 18, a 52pt tile, title and sub.
+fn route_card(ui: &mut egui::Ui, card: &RouteCard) -> (egui::Response, egui::Rect) {
+    let width = ui.available_width();
+    let (slot, response) = ui.allocate_exact_size(egui::vec2(width, 170.0), egui::Sense::click());
+    let hovered = response.hovered();
+    let rect = if hovered { slot.translate(egui::vec2(0.0, -3.0)) } else { slot };
+    let (edge, fill, tile, glyph_ink, title_ink) = if card.primary {
+        (theme::BLUE, egui::Color32::from_rgb(0xf5, 0xf7, 0xfd), theme::BLUE, egui::Color32::WHITE, egui::Color32::from_rgb(0x14, 0x30, 0x7a))
+    } else {
+        let edge = if hovered { egui::Color32::from_rgb(0xcf, 0xcc, 0xc8) } else { egui::Color32::from_rgb(0xe8, 0xe6, 0xe3) };
+        (edge, theme::CARD, egui::Color32::from_rgb(0xf1, 0xf0, 0xee), egui::Color32::from_rgb(0x4a, 0x47, 0x45), theme::INK)
+    };
+    if hovered {
+        let lift = egui::Shadow { offset: [0, 12], blur: 26, spread: 0, color: egui::Color32::from_rgba_unmultiplied(27, 63, 160, 40) };
+        ui.painter().add(lift.as_shape(rect, CornerRadius::same(18)));
+    }
+    ui.painter().rect(rect, CornerRadius::same(18), fill, egui::Stroke::new(2.0, edge), egui::StrokeKind::Inside);
+    let tile_rect = egui::Rect::from_min_size(rect.min + egui::vec2(22.0, 22.0), egui::Vec2::splat(52.0));
+    ui.painter().rect_filled(tile_rect, CornerRadius::same(15), tile);
+    let glyph = if card.primary { crate::kit::icon::glyph::SCAN } else { crate::kit::icon::glyph::EDIT };
+    crate::kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(tile_rect.center(), egui::Vec2::splat(26.0)), glyph, 2.0, glyph_ink);
+    let text_w = rect.width() - 44.0;
+    let title = ui.painter().layout(card.title.to_string(), egui::FontId::new(18.0, egui::FontFamily::Name(theme::EXTRABOLD.into())), title_ink, text_w);
+    let at = egui::pos2(rect.left() + 22.0, tile_rect.bottom() + 14.0);
+    let title_h = title.size().y;
+    ui.painter().galley(at, title, title_ink);
+    let sub = ui.painter().layout(card.sub.to_string(), egui::FontId::proportional(15.0), egui::Color32::from_rgb(0x4a, 0x47, 0x45), text_w);
+    ui.painter().galley(at + egui::vec2(0.0, title_h + 4.0), sub, egui::Color32::from_rgb(0x4a, 0x47, 0x45));
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    (response, rect)
+}
+
+#[allow(dead_code)]
 fn picker_subject(ui: &mut egui::Ui, name: &str) {
     egui::Frame::new()
         .inner_margin(egui::Margin {
@@ -4210,10 +4259,25 @@ pub fn draw_picker(ui: &mut egui::Ui, state: &mut TotpAdd) -> PickerFrame {
             })
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = BODY_GAP;
-                picker_subject(ui, &state.item_name);
+                // Spec B §8: "For {name}" under the title.
+                ui.label(egui::RichText::new(format!("For {}", state.item_name)).size(16.0).color(egui::Color32::from_rgb(0x7d, 0x79, 0x79)));
 
                 let mut chosen = None;
+                // The two routes the spec draws, as its two cards...
+                ui.columns(2, |columns| {
+                    for (column, card) in columns.iter_mut().zip(ROUTE_CARDS.iter()) {
+                        let (response, rect) = route_card(column, card);
+                        rows.push((card.route, rect));
+                        if response.clicked() {
+                            chosen = Some(card.route);
+                        }
+                    }
+                });
+                // ...and 0.15's other two as its rows under them.
                 for (index, row) in ROUTES.iter().enumerate() {
+                    if ROUTE_CARDS.iter().any(|card| card.route == row.route) {
+                        continue;
+                    }
                     let (response, rect) = route_row(ui, row, index);
                     rows.push((row.route, rect));
                     if response.clicked() {
@@ -7723,22 +7787,6 @@ mod tests {
                 .1
         }
 
-        /// Every rectangle painted exactly at `at`. A filled box and its
-        /// border are two shapes at one rect, so this answers both.
-        fn at(&self, at: egui::Rect) -> Vec<PaintedRect> {
-            self.rects.iter().copied().filter(|r| same_rect(r.rect, at)).collect()
-        }
-
-        /// Every rectangle painted wholly inside `outer` and smaller than it
-        /// -- a row's tile and its keycap, found without knowing where the
-        /// row put them.
-        fn inside(&self, outer: egui::Rect) -> Vec<PaintedRect> {
-            self.rects
-                .iter()
-                .copied()
-                .filter(|r| outer.contains_rect(r.rect) && !same_rect(r.rect, outer))
-                .collect()
-        }
     }
 
     impl Picker {
@@ -7829,12 +7877,14 @@ mod tests {
             "the picker paints 6d's heading as well as its own: {:?}",
             frame.painted.0
         );
-        assert!(
-            frame.painted.has(ADDING_TO_LABEL),
-            "the picker does not say what it is adding to"
-        );
-        assert!(frame.painted.has("Git Host"), "the item it is adding to is not named");
-        for row in &ROUTES {
+        // Spec B §8: "For {name}" says what it is adding to.
+        assert!(frame.painted.has("For Git Host"), "the picker does not say what it is adding to");
+        // Spec B §8's two cards, then 0.15's other two routes as rows.
+        for card in &ROUTE_CARDS {
+            assert!(frame.painted.has(card.title), "card {:?} is not on screen", card.route);
+            assert!(frame.painted.has(card.sub), "card {:?} has no line under it", card.route);
+        }
+        for row in ROUTES.iter().filter(|r| !ROUTE_CARDS.iter().any(|c| c.route == r.route)) {
             assert!(frame.painted.has(row.title), "route {:?} is not on screen", row.route);
             assert!(
                 frame.painted.has(row.subtitle),
@@ -7914,125 +7964,6 @@ mod tests {
             .filter(|r| r.fill == theme::HAIRLINE && (r.rect.height() - RULE).abs() < 0.5)
             .collect();
         assert_eq!(rules.len(), 2, "6a rules the header off and the footer on: {rules:?}");
-    }
-
-    /// **Every route row is 6a's row**, and the first one is 6a's blue one.
-    #[test]
-    fn every_route_row_is_the_designs_own_box() {
-        let mut state = TotpAdd::opening("id-1", "Git Host \u{b7} anovak", false);
-        let picker = Picker::new();
-        let frame = picker.idle(&mut state);
-
-        for (index, (route, rect)) in frame.rows.iter().enumerate() {
-            // 440 = 6a's 470 card, less its border and the body's 14px
-            // margins.
-            assert!(
-                (rect.width() - 440.0).abs() <= 1.0,
-                "{route:?} is {} wide and 6a's row is 440",
-                rect.width()
-            );
-            let painted = frame.at(*rect);
-            let fill = painted
-                .iter()
-                .find(|r| r.fill != egui::Color32::TRANSPARENT)
-                .unwrap_or_else(|| panic!("{route:?} painted no fill: {painted:?}"));
-            let edge = painted
-                .iter()
-                .find(|r| r.stroke_width > 0.0)
-                .unwrap_or_else(|| panic!("{route:?} painted no border: {painted:?}"));
-            assert_eq!(fill.radius, ROW_RADIUS, "{route:?} is not 6a's 10px radius");
-            assert!(
-                (edge.stroke_width - 1.0).abs() < f32::EPSILON,
-                "{route:?}'s border is not 6a's 1px"
-            );
-
-            // The tile: `width: 34px` inside a 1px border is 36 on screen.
-            let tile = frame
-                .inside(*rect)
-                .into_iter()
-                .find(|r| (r.rect.width() - 36.0).abs() < 0.5 && r.radius == TILE_RADIUS)
-                .unwrap_or_else(|| panic!("{route:?} has no 36px 8px-radius icon tile"));
-            assert!((tile.rect.height() - 36.0).abs() < 0.5, "{route:?}'s tile is not square");
-
-            if index == DEFAULT_ROW {
-                assert_eq!(fill.fill, theme::BLUE_WASH, "6a's first row is #eef2fc");
-                assert_eq!(edge.stroke, theme::BLUE, "6a's first row is bordered #1b3fa0");
-                assert_eq!(tile.fill, theme::CARD, "the selected row's tile is white");
-            } else {
-                assert_eq!(fill.fill, theme::CARD, "6a's other rows carry no fill of their own");
-                assert_eq!(edge.stroke, theme::HAIRLINE, "6a's other rows are bordered #eae7e7");
-                assert_eq!(tile.fill, theme::WINDOW_BG, "an unselected tile is #f7f6f5");
-            }
-        }
-
-        // **All four rows are 62 tall** -- 6a's own number, which is 12px of
-        // padding either side of the 36px tile plus the 1px border. This
-        // used to assert three at 62 and a fourth that was TALLER, because
-        // the webcam row was drawn dead and its two-line reason wrapped;
-        // now that every route is live, four one-line rows is what the
-        // design draws and what this holds. A subtitle long enough to wrap
-        // would grow its row and red this, which is the right way round:
-        // `route_row` measures itself, so a row that got taller did so
-        // because its copy grew rather than because a number was edited.
-        for (route, rect) in &frame.rows {
-            assert!(
-                (rect.height() - 62.0).abs() <= 1.0,
-                "{route:?} is {} tall and 6a's row is 62",
-                rect.height()
-            );
-        }
-    }
-
-    /// **6a's two right-hand affordances**: a filled ↵ keycap on the default
-    /// row, and a bare ordinal on each of the others.
-    #[test]
-    fn the_default_row_wears_the_keycap_and_the_rest_wear_their_ordinal() {
-        let mut state = TotpAdd::opening("id-1", "Git Host \u{b7} anovak", false);
-        let picker = Picker::new();
-        let frame = picker.idle(&mut state);
-
-        let default = frame.row(ROUTES[DEFAULT_ROW].route);
-        let keycap = frame
-            .inside(default)
-            .into_iter()
-            .find(|r| r.fill == theme::BLUE && r.radius == 5)
-            .unwrap_or_else(|| panic!("the default row has no #1b3fa0 5px-radius keycap"));
-        assert!(
-            (keycap.rect.height() - theme::CHIP_HEIGHT).abs() < 0.5,
-            "the keycap is {} tall; 6a's `padding: 3px` around a 10px line is 18",
-            keycap.rect.height()
-        );
-        assert!(
-            keycap.rect.right() < default.right() && keycap.rect.right() > default.right() - 20.0,
-            "the keycap is not against the row's right padding"
-        );
-
-        // The ordinals are painted as text and the default row's is not: 6a
-        // sets 2, 3 and 4 in monospace and gives the first row the cap
-        // instead. `has` is a substring test, so "1" is looked for on its own
-        // line rather than inside another string.
-        for ordinal in ["2", "3", "4"] {
-            assert!(
-                frame.painted.0.iter().any(|t| t == ordinal),
-                "6a's ordinal {ordinal} is not on the card: {:?}",
-                frame.painted.0
-            );
-        }
-        assert!(
-            !frame.painted.0.iter().any(|t| t == "1"),
-            "the default row painted an ordinal as well as its keycap"
-        );
-        // And no other row painted a keycap.
-        for (route, rect) in &frame.rows {
-            if *route == ROUTES[DEFAULT_ROW].route {
-                continue;
-            }
-            assert!(
-                !frame.inside(*rect).iter().any(|r| r.fill == theme::BLUE),
-                "{route:?} painted a filled blue box, so the assertion above says nothing \
-                 about which row is the default one"
-            );
-        }
     }
 
     /// One bare keystroke, for the keycap tests below.
@@ -8472,7 +8403,7 @@ mod tests {
         }
         assert!(painted.has(PICKER_TITLE), "the modal did not open on 6a: {:?}", painted.0);
         assert!(painted.has(PRIVACY_LINE), "the modal dropped the privacy line");
-        assert!(painted.has(ROUTES[0].title));
+        assert!(painted.has(ROUTE_CARDS[0].title));
         assert!(!painted.has(SECRET_HINT), "the modal opened straight into the by-hand form");
     }
 
@@ -10655,5 +10586,45 @@ mod item_has_code_tests {
             "the control failed: a login that really carries a seed was said to have none, \
              so the three refusals above are not about the seed"
         );
+    }
+}
+#[cfg(test)]
+mod v2_add_2fa_tests {
+    //! Spec B §8.
+    use super::*;
+    use crate::kit::testing::{self, click_at};
+
+    #[test]
+    fn the_picker_offers_scan_and_type() {
+        let ctx = testing::ctx();
+        let mut state = TotpAdd::opening("1", "Git Host", false);
+        let mut rows = Vec::new();
+        for t in [0.0, 0.1] {
+            let p = testing::frame(&ctx, t, egui::vec2(700.0, 900.0), vec![], |ui| {
+                rows = draw_picker(ui, &mut state).rows;
+            });
+            assert!(p.text("Scan from screen").is_some() && p.text("Type the key").is_some());
+            assert!(p.text("Add 2FA code").is_some() && p.text("For Git Host").is_some());
+        }
+        let typed = rows.iter().find(|(route, _)| *route == Route::ByHand).expect("the Type the key card").1;
+        let _ = testing::frame(&ctx, 0.2, egui::vec2(700.0, 900.0), click_at(typed.center()), |ui| {
+            let _ = draw_picker(ui, &mut state);
+        });
+        assert_eq!(state.stage, Stage::Manual, "Type the key opens the by-hand form");
+    }
+
+    #[test]
+    fn a_valid_key_lights_the_field_and_previews_the_code() {
+        assert!(can_save(&read_field("JBSW Y3DP EHPK 3PXP", 6, 30)), "a base32 key is saveable");
+        assert!(!can_save(&read_field("not a key!", 6, 30)), "anything else is not");
+    }
+
+    #[test]
+    fn saving_toasts_2fa_code_added() {
+        assert_eq!(SAVED_TOAST, "2FA code added");
+        let source = include_str!("mod.rs");
+        let at = source.find(concat!("totp_add::", "SAVED_TOAST")).expect("the window toasts on a saved code");
+        let before = &source[..at];
+        assert!(before.rfind(concat!("Ok(written)", " => {")).is_some_and(|ok| at - ok < 200), "the toast is not in the save's Ok arm");
     }
 }

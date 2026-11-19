@@ -8031,6 +8031,8 @@ pub fn build_frame_with_search(
                             // would make that suite's exactly-once counts
                             // meaningless rather than merely wrong.
                             Ok(written) => {
+                                // Spec B §8.
+                                crate::kit::toast::show(ui.ctx(), totp_add::SAVED_TOAST);
                                 // **An open edit form is told**, or its next
                                 // Save clears the seed this write just made.
                                 //
