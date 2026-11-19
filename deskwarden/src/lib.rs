@@ -81,6 +81,10 @@ pub mod generator_mode;
 pub mod hello;
 pub mod hotkey;
 pub mod http_agent;
+/// Translation: `locales/<tag>.txt` catalogs embedded in the binary, the
+/// `t`/`tf`/`tn` calls every screen asks for a string with, and the active
+/// language. See the module docs for the file format.
+pub mod i18n;
 pub mod icon;
 pub mod injector;
 /// A pasted organisation invite link -- Bitwarden's, Vaultwarden's or

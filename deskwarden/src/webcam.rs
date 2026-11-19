@@ -153,12 +153,12 @@ impl CameraRefusal {
     /// The headline, in the register of design 6d's own refusals.
     pub fn title(&self) -> &'static str {
         match self {
-            CameraRefusal::NoCamera => "No camera on this PC",
-            CameraRefusal::Busy => "That camera is already in use",
-            CameraRefusal::Denied => "Windows is not allowing camera access",
-            CameraRefusal::Silent => "That camera sent no picture",
-            CameraRefusal::Lost => "That camera stopped",
-            CameraRefusal::Unavailable => "Windows couldn't open that camera",
+            CameraRefusal::NoCamera => crate::i18n::t("webcam.title_no_camera"),
+            CameraRefusal::Busy => crate::i18n::t("webcam.title_busy"),
+            CameraRefusal::Denied => crate::i18n::t("webcam.title_denied"),
+            CameraRefusal::Silent => crate::i18n::t("webcam.title_silent"),
+            CameraRefusal::Lost => crate::i18n::t("webcam.title_lost"),
+            CameraRefusal::Unavailable => crate::i18n::t("webcam.title_unavailable"),
         }
     }
 
@@ -170,25 +170,22 @@ impl CameraRefusal {
     pub fn detail(&self) -> &'static str {
         match self {
             CameraRefusal::NoCamera => {
-                "Plug one in and choose this again, or scan the code off your screen instead."
+                crate::i18n::t("webcam.detail_no_camera")
             }
             CameraRefusal::Busy => {
-                "Close whatever has it open \u{2014} a video call, or a camera app \u{2014} and \
-                 choose it again."
+                crate::i18n::t("webcam.detail_busy")
             }
             CameraRefusal::Denied => {
-                "Turn on camera access for desktop apps in Settings \u{2192} Privacy & security \
-                 \u{2192} Camera, then choose it again."
+                crate::i18n::t("webcam.detail_denied")
             }
             CameraRefusal::Silent => {
-                "Check nothing is covering the lens and that any privacy switch on it is open, \
-                 then choose it again."
+                crate::i18n::t("webcam.detail_silent")
             }
             CameraRefusal::Lost => {
-                "It was unplugged or taken by another app. Plug it back in and choose it again."
+                crate::i18n::t("webcam.detail_lost")
             }
             CameraRefusal::Unavailable => {
-                "Try once more, or enter the secret the site prints under the code by hand."
+                crate::i18n::t("webcam.detail_unavailable")
             }
         }
     }
@@ -1075,7 +1072,7 @@ pub fn devices() -> Result<Vec<Device>, CameraRefusal> {
                 };
                 let name = allocated_string(&activate, &MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME)
                     .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| UNNAMED_CAMERA.to_string());
+                    .unwrap_or_else(|| unnamed_camera().to_string());
                 found.push(Device { name, id });
             }
         }
@@ -1106,7 +1103,9 @@ pub fn devices() -> Result<Vec<Device>, CameraRefusal> {
 ///
 /// It has to be called something: a row with an empty face is a row the user
 /// cannot tell from a rendering bug.
-pub const UNNAMED_CAMERA: &str = "Camera";
+pub fn unnamed_camera() -> &'static str {
+    crate::i18n::t("webcam.unnamed")
+}
 
 /// One `IMFAttributes` string, copied out and the OS allocation freed.
 ///

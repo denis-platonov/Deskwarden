@@ -436,15 +436,21 @@ pub struct Offer {
 /// restating it, exactly as `crate::app::FillChoice::label` does.
 pub fn send_label(send: &Send) -> (String, &'static str) {
     match send {
-        Send::All => ("Username + Tab + Password".to_string(), "Types both fields in order"),
-        Send::Sequence => ("Saved sequence".to_string(), "Runs this item's own sequence"),
+        Send::All => (
+            crate::i18n::t("picker.send_all").to_string(),
+            crate::i18n::t("picker.send_all_sub"),
+        ),
+        Send::Sequence => (
+            crate::i18n::t("picker.send_sequence").to_string(),
+            crate::i18n::t("picker.send_sequence_sub"),
+        ),
         Send::Field(field) => (
             field.label(),
             match field {
-                FieldRef::Username => "Types the username",
-                FieldRef::Password => "Types the password",
-                FieldRef::Totp => "Types a one-time code",
-                FieldRef::Custom(_) => "Types this custom field",
+                FieldRef::Username => crate::i18n::t("picker.send_username_sub"),
+                FieldRef::Password => crate::i18n::t("picker.send_password_sub"),
+                FieldRef::Totp => crate::i18n::t("picker.send_totp_sub"),
+                FieldRef::Custom(_) => crate::i18n::t("picker.send_custom_sub"),
             },
         ),
     }
@@ -598,7 +604,9 @@ pub fn empty_rows() -> Vec<EmptyAction> {
 /// the string a test finds in the painted output rather than one it re-spells.
 /// **It lived in `overlay_ui` until that module was deleted**; it is here now
 /// because this is the card that offers it.
-pub const NEW_LOGIN_LABEL: &str = "New login";
+pub fn new_login_label() -> &'static str {
+    crate::i18n::t("picker.new_login")
+}
 
 /// What the empty card's other row says, and **the only card that may NOT carry
 /// it**.
@@ -607,7 +615,9 @@ pub const NEW_LOGIN_LABEL: &str = "New login";
 /// one [`NEW_LOGIN_LABEL`] gives: while the vault is locked there is nothing to
 /// search, and a vault window opened with a query in its box would show an
 /// empty list that means "locked" and reads as "nothing found".
-pub const SEARCH_VAULT_LABEL: &str = "Search vault";
+pub fn search_vault_label() -> &'static str {
+    crate::i18n::t("picker.search_vault")
+}
 
 /// What each empty-card row is called, and what it says it will do.
 ///
@@ -618,8 +628,8 @@ pub const SEARCH_VAULT_LABEL: &str = "Search vault";
 /// written to prevent.
 pub fn empty_label(action: EmptyAction) -> (&'static str, &'static str) {
     match action {
-        EmptyAction::NewLogin => (NEW_LOGIN_LABEL, "Save a login for this app"),
-        EmptyAction::SearchVault => (SEARCH_VAULT_LABEL, "Look for it under another name"),
+        EmptyAction::NewLogin => (new_login_label(), crate::i18n::t("picker.empty_new_login_sub")),
+        EmptyAction::SearchVault => (search_vault_label(), crate::i18n::t("picker.empty_search_sub")),
     }
 }
 
@@ -638,8 +648,8 @@ pub fn empty_label(action: EmptyAction) -> (&'static str, &'static str) {
 /// can change the card's geometry; see [`layout`], whose height is a constant.
 pub fn empty_text(app_name: &str) -> (String, &'static str) {
     (
-        format!("No saved login for {app_name}"),
-        "Deskwarden matches windows by process name and title.",
+        crate::i18n::tf("picker.empty_title", &[("app_name", app_name)]),
+        crate::i18n::t("picker.empty_body"),
     )
 }
 
@@ -810,30 +820,36 @@ const SUBTITLE_H: i32 = 20;
 pub const TIP_LINES_MAX: usize = 6;
 
 /// What the `?` tooltip says in the first step: the keys this card answers.
-pub const LIST_KEY_HINTS: [&str; 6] = [
-    "\u{2191} \u{2193} choose an account",
-    "Enter fill",
-    "1-5 fill that row",
-    "S search the vault",
-    "N new login",
-    "Esc close",
-];
+pub fn list_key_hints() -> [&'static str; 6] {
+    [
+        crate::i18n::t("picker.hint_list_0"),
+        crate::i18n::t("picker.hint_list_1"),
+        crate::i18n::t("picker.hint_list_2"),
+        crate::i18n::t("picker.hint_list_3"),
+        crate::i18n::t("picker.hint_list_4"),
+        crate::i18n::t("picker.hint_list_5"),
+    ]
+}
 /// The second step's (a field to type).
-pub const PALETTE_KEY_HINTS: [&str; 5] = [
-    "\u{2191} \u{2193} choose a field",
-    "Enter type it",
-    "1-5 type that row",
-    "B edit binding",
-    "Esc close",
-];
+pub fn palette_key_hints() -> [&'static str; 5] {
+    [
+        crate::i18n::t("picker.hint_palette_0"),
+        crate::i18n::t("picker.hint_palette_1"),
+        crate::i18n::t("picker.hint_palette_2"),
+        crate::i18n::t("picker.hint_palette_3"),
+        crate::i18n::t("picker.hint_palette_4"),
+    ]
+}
 /// Search mode's. A bare digit would be typed into the box, so the digits wear
 /// `Ctrl`.
-pub const SEARCH_KEY_HINTS: [&str; 4] = [
-    "\u{2191} \u{2193} choose a result",
-    "Enter fill",
-    "Ctrl+1-5 fill that result",
-    "Esc close",
-];
+pub fn search_key_hints() -> [&'static str; 4] {
+    [
+        crate::i18n::t("picker.hint_search_0"),
+        crate::i18n::t("picker.hint_search_1"),
+        crate::i18n::t("picker.hint_search_2"),
+        crate::i18n::t("picker.hint_search_3"),
+    ]
+}
 
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1142,12 +1158,12 @@ pub fn search_row_text(row: SearchRow) -> (String, String) {
     match row {
         SearchRow::Result(_) => (String::new(), String::new()),
         SearchRow::Overflow { shown, total } => (
-            format!("{total} accounts match"),
-            format!("Showing the first {shown} \u{2014} keep typing to narrow it"),
+            crate::i18n::tf("picker.overflow_title", &[("total", &total.to_string())]),
+            crate::i18n::tf("picker.overflow_sub", &[("shown", &shown.to_string())]),
         ),
         SearchRow::Nothing => (
-            "No matches".to_string(),
-            "Nothing in your vault is named like that".to_string(),
+            crate::i18n::t("picker.nothing_title").to_string(),
+            crate::i18n::t("picker.nothing_sub").to_string(),
         ),
     }
 }
@@ -1158,8 +1174,8 @@ pub fn search_row_text(row: SearchRow) -> (String, String) {
 /// reason: the words the card shows are then the words a test can read.
 pub fn search_text() -> (&'static str, &'static str) {
     (
-        "Search the vault",
-        "Type to filter your accounts. Nothing is typed until you pick one.",
+        crate::i18n::t("picker.search_title"),
+        crate::i18n::t("picker.search_sub"),
     )
 }
 
@@ -2764,9 +2780,9 @@ mod win32 {
     /// The keys the `?` tooltip lists in the mode showing.
     fn tip_lines() -> Vec<&'static str> {
         match MODE.load(Ordering::SeqCst) {
-            MODE_PALETTE => super::PALETTE_KEY_HINTS.to_vec(),
-            MODE_SEARCH => super::SEARCH_KEY_HINTS.to_vec(),
-            _ => super::LIST_KEY_HINTS.to_vec(),
+            MODE_PALETTE => super::palette_key_hints().to_vec(),
+            MODE_SEARCH => super::search_key_hints().to_vec(),
+            _ => super::list_key_hints().to_vec(),
         }
     }
 
@@ -3485,8 +3501,8 @@ mod win32 {
     fn headings() -> (String, &'static str) {
         match MODE.load(Ordering::SeqCst) {
             MODE_PALETTE => (
-                "What should I type?".to_string(),
-                "Pick a field. Nothing is typed until you do.",
+                crate::i18n::t("picker.palette_title").to_string(),
+                crate::i18n::t("picker.palette_sub"),
             ),
             MODE_EMPTY => {
                 let app = APP_NAME.lock().map(|n| n.clone()).unwrap_or_default();
@@ -3497,20 +3513,20 @@ mod win32 {
                 (title.to_string(), subtitle)
             }
             _ => (
-                "Fill from vault".to_string(),
-                "These accounts look like they belong to this app.",
+                crate::i18n::t("picker.list_title").to_string(),
+                crate::i18n::t("picker.list_sub"),
             ),
         }
     }
 
     fn footer_label(id: usize) -> String {
         if id == ID_CANCEL {
-            return "Cancel".to_string();
+            return crate::i18n::t("picker.cancel").to_string();
         }
         if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
-            "Edit binding".to_string()
+            crate::i18n::t("picker.edit_binding").to_string()
         } else {
-            "New login".to_string()
+            crate::i18n::t("picker.new_login").to_string()
         }
     }
 
@@ -4025,7 +4041,7 @@ mod card_tests {
             "the key-hint tooltip is not inside the card, to the left of its badge"
         );
         assert_eq!(l.tip.h, crate::panel_draw::tip_height(TIP_LINES_MAX));
-        for lines in [&LIST_KEY_HINTS[..], &PALETTE_KEY_HINTS[..], &SEARCH_KEY_HINTS[..]] {
+        for lines in [&list_key_hints()[..], &palette_key_hints()[..], &search_key_hints()[..]] {
             assert!(lines.len() <= TIP_LINES_MAX, "a mode lists more keys than the tooltip holds");
             assert!(lines.last().unwrap().starts_with("Esc"));
         }

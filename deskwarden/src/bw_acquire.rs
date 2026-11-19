@@ -396,12 +396,12 @@ impl AcquiredCli {
     #[must_use]
     pub fn summary(&self) -> String {
         let version = match &self.version {
-            Some(v) => format!("version {v}"),
-            None => "an unknown version".to_string(),
+            Some(v) => crate::i18n::tf("cli.version", &[("version", v.as_str())]),
+            None => crate::i18n::t("cli.unknown_version").to_string(),
         };
-        format!(
-            "The Bitwarden CLI was installed ({version}, {}).",
-            megabytes(self.bytes)
+        crate::i18n::tf(
+            "cli.summary",
+            &[("version", &version), ("size", &megabytes(self.bytes))],
         )
     }
 }
@@ -445,12 +445,12 @@ impl AcquireStage {
     #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Resolving => "Finding the Bitwarden CLI download\u{2026}",
-            Self::Downloading { .. } => "Downloading the Bitwarden CLI from Bitwarden\u{2026}",
+            Self::Resolving => crate::i18n::t("cli.stage_resolving"),
+            Self::Downloading { .. } => crate::i18n::t("cli.stage_downloading"),
             // The reassuring half, and the user watching an unknown binary
             // arrive is owed it.
-            Self::Verifying => "Checking it is signed by Bitwarden\u{2026}",
-            Self::Installing => "Installing the Bitwarden CLI\u{2026}",
+            Self::Verifying => crate::i18n::t("cli.stage_verifying"),
+            Self::Installing => crate::i18n::t("cli.stage_installing"),
         }
     }
 }
@@ -576,8 +576,9 @@ pub enum CliSetupState {
 /// Bitwarden CLI will ...") so the same clause serves a statement of intent
 /// and a consequence of a button. The lead-in is the caller's; this constant
 /// starts at the bare infinitive and must keep doing so.
-const DOWNLOAD_DISCLOSURE: &str = "download it from Bitwarden, check that Bitwarden signed it, \
-     and install it. It is about 37 MB, and this happens once.";
+fn download_disclosure() -> &'static str {
+    crate::i18n::t("cli.download_disclosure")
+}
 
 /// The two clients, named once each.
 ///
@@ -585,8 +586,12 @@ const DOWNLOAD_DISCLOSURE: &str = "download it from Bitwarden, check that Bitwar
 /// the user is looking for when they read the prose. Two spellings of one
 /// thing -- "the Bitwarden CLI" in a sentence and "Official CLI" on the
 /// button -- is a user hunting for a control that is on screen.
-const OFFICIAL_CLI_NAME: &str = "the Bitwarden CLI";
-const BUILT_IN_NAME: &str = "Deskwarden's built-in client";
+fn official_cli_name() -> &'static str {
+    crate::i18n::t("cli.official_name")
+}
+fn built_in_name() -> &'static str {
+    crate::i18n::t("cli.built_in_name")
+}
 
 /// What the user did in the modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -626,12 +631,12 @@ impl CliSetupState {
             // user did not come here to pick an implementation, they came to
             // sign in, and the word for the thing that opens their vault is
             // the thing it does.
-            Self::Choosing { .. } => "Which client should open this vault?",
-            Self::Asking => "The Bitwarden CLI is required",
-            Self::AskingToRecover => "The Bitwarden CLI is missing",
-            Self::Working { .. } => "Installing the Bitwarden CLI",
-            Self::Installed(_) => "The Bitwarden CLI is installed",
-            Self::Failed(_) => "The Bitwarden CLI was not installed",
+            Self::Choosing { .. } => crate::i18n::t("cli.title_choosing"),
+            Self::Asking => crate::i18n::t("cli.title_asking"),
+            Self::AskingToRecover => crate::i18n::t("cli.title_recover"),
+            Self::Working { .. } => crate::i18n::t("cli.title_working"),
+            Self::Installed(_) => crate::i18n::t("cli.title_installed"),
+            Self::Failed(_) => crate::i18n::t("cli.title_failed"),
         }
     }
 
@@ -691,11 +696,7 @@ impl CliSetupState {
             // ~8 s cold start after a restart. A user can check every one of
             // them in Task Manager, which is why they are the measured ones.
             Self::Choosing => vec![
-                format!(
-                    "{BUILT_IN_NAME} talks to your server itself: about 19 MB of memory in the \
-                     tray, no second program, and no wait after a restart. Running small is what \
-                     this app is for."
-                ),
+                crate::i18n::tf("cli.body_choosing_built_in", &[("built_in", built_in_name())]),
                 // **Not `{OFFICIAL_CLI_NAME}` at the front.** That
                 // constant is the phrase "the Bitwarden CLI", written to sit
                 // MID-sentence, and this paragraph opened with it: the
@@ -704,37 +705,21 @@ impl CliSetupState {
                 // looking at the picture, which is the only place a
                 // capital letter lives. `no_body_line_starts_in_lower_case`
                 // is the assertion that means the next one is not.
-                format!(
-                    "The Bitwarden CLI is Bitwarden's own program, run beside Deskwarden: \
-                     about 118 MB of memory on top of Deskwarden's 10 MB, and about 8 \
-                     seconds after a restart before the vault answers. Choosing \
-                     {OFFICIAL_CLI_NAME} will {DOWNLOAD_DISCLOSURE}"
+                crate::i18n::tf(
+                    "cli.body_choosing_official",
+                    &[("official_cli", official_cli_name()), ("disclosure", download_disclosure())],
                 ),
-                "What it costs: the key that unlocks your vault is kept on this PC, \
-                 protected by Windows, and unlike a session it never expires, so anyone \
-                 who can run programs as you on this PC can use it. And its cryptography \
-                 is checked against Bitwarden's published test vectors, but it is not \
-                 Bitwarden's code."
-                    .to_string(),
+                crate::i18n::t("cli.body_choosing_cost").to_string(),
             ],
             Self::Asking => vec![
-                "Signing in to a Bitwarden server requires the official Bitwarden CLI."
-                    .to_string(),
-                format!("Deskwarden will {DOWNLOAD_DISCLOSURE}"),
-                "Press OK to continue, or Cancel to go back and choose a different server. \
-                 A self-hosted server can be used without it."
-                    .to_string(),
+                crate::i18n::t("cli.body_asking_1").to_string(),
+                crate::i18n::tf("cli.will_download", &[("disclosure", download_disclosure())]),
+                crate::i18n::t("cli.body_asking_3").to_string(),
             ],
             Self::AskingToRecover => vec![
-                "Your vault is served by the official Bitwarden CLI, and it is no longer on \
-                 this computer. Antivirus software, a cleanup tool, or a failed CLI update \
-                 can remove it."
-                    .to_string(),
-                format!("Deskwarden will {DOWNLOAD_DISCLOSURE}"),
-                "Press OK to reinstall it now, or Cancel to start without your vault. \
-                 Deskwarden will still open, and you can sign out or switch accounts from \
-                 the tray."
-                    .to_string(),
+                crate::i18n::t("cli.body_recover_1").to_string(),
+                crate::i18n::tf("cli.will_download", &[("disclosure", download_disclosure())]),
+                crate::i18n::t("cli.body_recover_3").to_string(),
             ],
             Self::Working { stage } => {
                 let mut lines = vec![stage.label().to_string()];
@@ -745,8 +730,8 @@ impl CliSetupState {
             }
             Self::Installed(cli) => vec![
                 cli.summary(),
-                format!("It is at {}.", cli.path.display()),
-                "Press OK to continue signing in.".to_string(),
+                crate::i18n::tf("cli.installed_at", &[("path", &cli.path.display().to_string())]),
+                crate::i18n::t("cli.installed_continue").to_string(),
             ],
             Self::Failed(refusal) => vec![refusal.message()],
         }
@@ -822,13 +807,13 @@ impl CliSetupState {
             // or "Continue" -- the two words that would make position and
             // colour the only information.
             Self::Choosing => vec![
-                ("Use the Bitwarden CLI", CliModalAction::UseOfficialCli, false),
-                ("Use the built-in client", CliModalAction::UseBuiltIn, true),
+                (crate::i18n::t("cli.button_use_official"), CliModalAction::UseOfficialCli, false),
+                (crate::i18n::t("cli.button_use_built_in"), CliModalAction::UseBuiltIn, true),
             ],
             Self::Asking | Self::AskingToRecover => {
                 vec![
-                    ("Cancel", CliModalAction::Cancel, false),
-                    ("OK", CliModalAction::Begin, false),
+                    (crate::i18n::t("cli.button_cancel"), CliModalAction::Cancel, false),
+                    (crate::i18n::t("cli.button_ok"), CliModalAction::Begin, false),
                 ]
             }
             // **No Cancel during state 2.** Not offered rather than offered
@@ -842,8 +827,8 @@ impl CliSetupState {
             // process that goes away before it leaves nothing behind, and the
             // scratch directory is swept at the next attempt.
             Self::Working { .. } => Vec::new(),
-            Self::Installed(_) => vec![("OK", CliModalAction::Close, false)],
-            Self::Failed(_) => vec![("Close", CliModalAction::Close, false)],
+            Self::Installed(_) => vec![(crate::i18n::t("cli.button_ok"), CliModalAction::Close, false)],
+            Self::Failed(_) => vec![(crate::i18n::t("cli.button_close"), CliModalAction::Close, false)],
         }
     }
 }

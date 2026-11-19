@@ -1800,6 +1800,21 @@ pub struct Settings {
     /// machine; nothing is stored on any item.
     #[serde(deserialize_with = "lenient_generator")]
     pub generator: GeneratorPrefs,
+    /// The language the interface is shown in: a tag from
+    /// [`crate::i18n::available`] (`"de"`, `"pt-BR"`, `"zh-Hans"`), written by
+    /// the Settings language picker.
+    ///
+    /// `None` -- the default, and what a `settings.json` from before this
+    /// field reads as -- means "follow Windows": [`crate::i18n::init`] shows
+    /// the first of the user's Windows display languages that has a catalog,
+    /// else English. A tag with no catalog (a file edited by hand, or written
+    /// by a newer version that had one more language) is treated the same
+    /// way rather than refused, so an old build never fails to start over it.
+    ///
+    /// Owned by the preferences writer ([`Self::persist_preferences`]); read
+    /// once at startup by every process that draws, so a change takes effect
+    /// on the next window.
+    pub language: Option<String>,
 }
 
 /// The Generator screen's options (spec C §1), remembered between runs.
@@ -1904,6 +1919,7 @@ impl Default for Settings {
             active_account: None,
             accounts_unreadable: false,
             generator: GeneratorPrefs::default(),
+            language: None,
         }
     }
 }
@@ -2074,6 +2090,7 @@ impl Settings {
             // Owned by the Generator screen, which writes it through
             // `persist_generator`; the preferences window never edits it.
             generator: _,
+            language,
         } = self;
         let mut on_disk = Self::load(path);
         on_disk.keep_backend_running = *keep_backend_running;
@@ -2111,6 +2128,7 @@ impl Settings {
         on_disk.cache_vault_to_disk = *cache_vault_to_disk;
         on_disk.read_through_cache = *read_through_cache;
         on_disk.service_enabled = *service_enabled;
+        on_disk.language = language.clone();
         on_disk.save(path)
     }
 
@@ -2671,6 +2689,7 @@ mod tests {
         let path = temp_path("round-trip");
         let written = Settings {
             generator: GeneratorPrefs::default(),
+            language: None,
             read_through_cache: false,
             // Opposite of the default, like every field here: a save that
             // dropped it would show up as a mismatch rather than as a pass.
@@ -3031,6 +3050,7 @@ mod tests {
         let path = temp_path("auto-lock-round-trip");
         let written = Settings {
             generator: GeneratorPrefs::default(),
+            language: None,
             read_through_cache: false,
             // Opposite of the default, like every field here: a save that
             // dropped it would show up as a mismatch rather than as a pass.
@@ -3786,6 +3806,7 @@ mod tests {
         let path = temp_path("geometry-round-trip");
         let written = Settings {
             generator: GeneratorPrefs::default(),
+            language: None,
             read_through_cache: false,
             // Opposite of the default, like every field here: a save that
             // dropped it would show up as a mismatch rather than as a pass.
@@ -5742,6 +5763,38 @@ mod generator_prefs_tests {
         let back = Settings::load(&path);
         assert_eq!(back.generator, prefs);
         assert!(back.check_breaches, "another preference was lost");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The language is a preference: it is written by the preferences
+    /// writer, read back, absent in an older file, and never lost by the
+    /// writers that do not own it.**
+    #[test]
+    fn the_language_round_trips_and_an_older_file_reads_as_following_windows() {
+        let dir = std::env::temp_dir().join(format!("dw-lang-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // An older file has no `language` key: follow Windows.
+        std::fs::write(&path, "{\"keep_backend_running\": true}").unwrap();
+        assert_eq!(Settings::load(&path).language, None);
+
+        // The preferences writer saves a choice and reads it back.
+        let chosen = Settings { language: Some("pt-BR".to_owned()), ..Settings::default() };
+        chosen.persist_preferences(&path).unwrap();
+        assert_eq!(Settings::load(&path).language.as_deref(), Some("pt-BR"));
+
+        // A writer that does not own it leaves it alone.
+        Settings::persist_generator(&path, &GeneratorPrefs::default()).unwrap();
+        assert_eq!(Settings::load(&path).language.as_deref(), Some("pt-BR"));
+
+        // "Follow Windows" again is a choice too, and is written.
+        Settings::default().persist_preferences(&path).unwrap();
+        assert_eq!(Settings::load(&path).language, None);
+
+        // The file says the language and nothing a guard forbids.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("language"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

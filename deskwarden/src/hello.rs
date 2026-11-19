@@ -169,7 +169,7 @@ pub fn state_for(config_dir: &Path, id: &AccountId) -> HelloState {
 /// already there.
 fn hello_derived_key(create: bool, account_suffix: &[u8]) -> Result<Zeroizing<[u8; 32]>, String> {
     if !hello_permitted(crate::app_profile::active()) {
-        return Err("Windows Hello is off in a Deskwarden test profile".to_string());
+        return Err(crate::i18n::t("hello.err_test_profile").to_string());
     }
     let name = HSTRING::from(CREDENTIAL_NAME);
 
@@ -199,23 +199,23 @@ fn hello_derived_key(create: bool, account_suffix: &[u8]) -> Result<Zeroizing<[u
     } else {
         KeyCredentialManager::OpenAsync(&name).and_then(|op| op.get())
     }
-    .map_err(|e| format!("Windows Hello is unavailable: {e}"))?;
+    .map_err(|e| crate::i18n::tf("hello.err_unavailable", &[("error", &e.to_string())]))?;
 
     match result.Status() {
         Ok(KeyCredentialStatus::Success) => {}
         Ok(KeyCredentialStatus::UserCanceled) => {
-            return Err("Windows Hello was cancelled.".to_string())
+            return Err(crate::i18n::t("hello.err_cancelled").to_string())
         }
         Ok(KeyCredentialStatus::NotFound) => {
-            return Err("No Windows Hello enrollment for Deskwarden on this machine.".to_string())
+            return Err(crate::i18n::t("hello.err_not_enrolled").to_string())
         }
-        Ok(other) => return Err(format!("Windows Hello failed ({other:?})")),
-        Err(e) => return Err(format!("Windows Hello failed: {e}")),
+        Ok(other) => return Err(crate::i18n::tf("hello.err_failed_status", &[("status", &format!("{other:?}"))])),
+        Err(e) => return Err(crate::i18n::tf("hello.err_failed", &[("error", &e.to_string())])),
     }
 
     let credential = result
         .Credential()
-        .map_err(|e| format!("Windows Hello returned no credential: {e}"))?;
+        .map_err(|e| crate::i18n::tf("hello.err_no_credential", &[("error", &e.to_string())]))?;
 
     // Again, immediately before the call that shows the prompt. The
     // create/open above may itself have shown one, in which case the broker
@@ -228,20 +228,20 @@ fn hello_derived_key(create: bool, account_suffix: &[u8]) -> Result<Zeroizing<[u
     let signed = credential
         .RequestSignAsync(&challenge)
         .and_then(|op| op.get())
-        .map_err(|e| format!("Windows Hello signing failed: {e}"))?;
+        .map_err(|e| crate::i18n::tf("hello.err_signing", &[("error", &e.to_string())]))?;
 
     match signed.Status() {
         Ok(KeyCredentialStatus::Success) => {}
         Ok(KeyCredentialStatus::UserCanceled) => {
-            return Err("Windows Hello was cancelled.".to_string())
+            return Err(crate::i18n::t("hello.err_cancelled").to_string())
         }
-        Ok(other) => return Err(format!("Windows Hello verification failed ({other:?})")),
-        Err(e) => return Err(format!("Windows Hello verification failed: {e}")),
+        Ok(other) => return Err(crate::i18n::tf("hello.err_verify_status", &[("status", &format!("{other:?}"))])),
+        Err(e) => return Err(crate::i18n::tf("hello.err_verify", &[("error", &e.to_string())])),
     }
 
     let signature_buffer = signed
         .Result()
-        .map_err(|e| format!("Windows Hello returned no signature: {e}"))?;
+        .map_err(|e| crate::i18n::tf("hello.err_no_signature", &[("error", &e.to_string())]))?;
     let mut signature = windows::core::Array::<u8>::new();
     CryptographicBuffer::CopyToByteArray(&signature_buffer, &mut signature)
         .map_err(|e| format!("could not read the Hello signature: {e}"))?;

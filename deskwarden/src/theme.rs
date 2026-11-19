@@ -426,6 +426,136 @@ fn cyrillic_for(archivo: &str) -> &'static str {
 /// defaults are precisely what Cyrillic was reaching, so a face appended
 /// after them would never be consulted and nothing would change.
 fn font_definitions() -> egui::FontDefinitions {
+    font_definitions_for(&[crate::i18n::current().fonts])
+}
+
+/// Where a language's own script comes from: the **system** faces in
+/// `C:\Windows\Fonts`, as `(file, index inside the file)` candidates tried in
+/// order. `regular` stands behind Archivo Regular, `semibold` behind SemiBold
+/// and `bold` behind Bold and ExtraBold. Chinese, Japanese and Korean have no
+/// semibold of their own on Windows, so theirs is the bold face -- a label
+/// that asks for 600 still reads as a label.
+///
+/// **Nothing here is bundled, and nothing here is read unless the language
+/// is active.** A CJK face is 14-20 MB; carrying four of them would triple
+/// the installer for text most users never see, and loading them for an
+/// English session would hold ~40 MB for nothing. Greek gets Segoe UI
+/// because the bundled Archivo has no Greek (4 of 75 codepoints) and the
+/// bundled Noto subset is Cyrillic only.
+struct SystemFaces {
+    regular: &'static [(&'static str, u32)],
+    semibold: &'static [(&'static str, u32)],
+    bold: &'static [(&'static str, u32)],
+}
+
+fn system_faces_for(need: crate::i18n::Fonts) -> Option<SystemFaces> {
+    use crate::i18n::Fonts;
+    Some(match need {
+        Fonts::Bundled => return None,
+        Fonts::Greek => SystemFaces {
+            regular: &[("segoeui.ttf", 0)],
+            semibold: &[("seguisb.ttf", 0), ("segoeuib.ttf", 0)],
+            bold: &[("segoeuib.ttf", 0)],
+        },
+        Fonts::ChineseSimplified => SystemFaces {
+            regular: &[("msyh.ttc", 0), ("msyh.ttf", 0), ("simsun.ttc", 0)],
+            semibold: &[("msyhbd.ttc", 0), ("msyhbd.ttf", 0), ("msyh.ttc", 0)],
+            bold: &[("msyhbd.ttc", 0), ("msyhbd.ttf", 0), ("msyh.ttc", 0)],
+        },
+        Fonts::ChineseTraditional => SystemFaces {
+            regular: &[("msjh.ttc", 0), ("msjh.ttf", 0), ("mingliu.ttc", 0)],
+            semibold: &[("msjhbd.ttc", 0), ("msjhbd.ttf", 0), ("msjh.ttc", 0)],
+            bold: &[("msjhbd.ttc", 0), ("msjhbd.ttf", 0), ("msjh.ttc", 0)],
+        },
+        Fonts::Japanese => SystemFaces {
+            // Medium, not Regular: Yu Gothic Regular is hairline at 13 px.
+            regular: &[("YuGothM.ttc", 0), ("YuGothR.ttc", 0), ("meiryo.ttc", 0), ("msgothic.ttc", 0)],
+            semibold: &[("YuGothB.ttc", 0), ("meiryob.ttc", 0), ("YuGothM.ttc", 0)],
+            bold: &[("YuGothB.ttc", 0), ("meiryob.ttc", 0), ("YuGothM.ttc", 0)],
+        },
+        Fonts::Korean => SystemFaces {
+            regular: &[("malgun.ttf", 0), ("gulim.ttc", 0)],
+            semibold: &[("malgunbd.ttf", 0), ("malgun.ttf", 0)],
+            bold: &[("malgunbd.ttf", 0), ("malgun.ttf", 0)],
+        },
+    })
+}
+
+/// The first of `candidates` that is a readable file, as egui font data.
+fn first_system_face(candidates: &[(&str, u32)]) -> Option<egui::FontData> {
+    candidates.iter().find_map(|(file, index)| {
+        system_font(file).map(|bytes| {
+            let mut data = egui::FontData::from_owned(bytes);
+            data.index = *index;
+            data
+        })
+    })
+}
+
+/// Adds the system faces for `needs` to `fonts`, behind each Archivo cut and
+/// its Noto Cyrillic face and ahead of egui's defaults -- the same slot the
+/// Cyrillic faces took, for the same reason: Latin keeps resolving to Archivo
+/// exactly as it does, and the script this language needs stops falling
+/// through to egui's one light face (or to nothing at all, for CJK).
+///
+/// A face that cannot be read is skipped with a debug line; the language then
+/// draws what egui's fallbacks can, which for CJK is empty boxes -- visible,
+/// and not a reason to refuse to start.
+fn add_system_script_faces(fonts: &mut egui::FontDefinitions, needs: &[crate::i18n::Fonts]) {
+    let mut slot = 2;
+    let mut loaded: Vec<crate::i18n::Fonts> = Vec::new();
+    for need in needs {
+        if loaded.contains(need) {
+            continue;
+        }
+        loaded.push(*need);
+        let Some(faces) = system_faces_for(*need) else { continue };
+        let tag = format!("{need:?}");
+        let mut register = |suffix: &str, candidates: &[(&str, u32)]| -> Option<String> {
+            let data = first_system_face(candidates)?;
+            let name = format!("System-{tag}-{suffix}");
+            fonts.font_data.insert(name.clone(), Arc::new(data));
+            Some(name)
+        };
+        let regular = register("Regular", faces.regular);
+        let semibold = register("SemiBold", faces.semibold);
+        // Bold and SemiBold often resolve to the same file; registering it
+        // twice would hold it twice, so the second asks for the first's entry.
+        let bold = if faces.bold == faces.semibold { semibold.clone() } else { register("Bold", faces.bold) };
+        for (family, face) in [
+            (REGULAR, &regular),
+            (SEMIBOLD, &semibold),
+            (BOLD, &bold),
+            (EXTRABOLD, &bold),
+        ] {
+            let Some(face) = face else { continue };
+            let key = if family == REGULAR {
+                FontFamily::Proportional
+            } else {
+                FontFamily::Name(family.into())
+            };
+            if let Some(stack) = fonts.families.get_mut(&key) {
+                let at = slot.min(stack.len());
+                stack.insert(at, face.clone());
+            }
+        }
+        slot += 1;
+        // Text in the monospace family -- a username or a note in Japanese --
+        // would otherwise draw boxes: the faces go on the END, behind Consolas
+        // and Hack, so nothing Latin or numeric moves.
+        for (family, face) in [(FontFamily::Monospace, &regular), (FontFamily::Name(MONO_BOLD.into()), &bold)] {
+            if let (Some(face), Some(stack)) = (face, fonts.families.get_mut(&family)) {
+                stack.push(face.clone());
+            }
+        }
+    }
+}
+
+/// [`font_definitions`] with the faces of `needs` in place of the active
+/// language's alone. The picker uses it so a language's own name -- Japanese
+/// 日本語, Greek Ελληνικά -- is drawn in its own script before that language
+/// is the one in force.
+pub(crate) fn font_definitions_for(needs: &[crate::i18n::Fonts]) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
     for (family, _, _, bytes) in ARCHIVO_FACES {
         fonts
@@ -496,7 +626,21 @@ fn font_definitions() -> egui::FontDefinitions {
     );
     fonts.families.insert(FontFamily::Name(MONO_BOLD.into()), bold_mono);
 
+    add_system_script_faces(&mut fonts, needs);
+
     fonts
+}
+
+/// Re-installs the fonts for the language in force **plus** the scripts in
+/// `extra` (`Fonts::Japanese`, ...), on a context that has already had
+/// [`apply`]. The Settings language picker calls it with every language it
+/// lists so each name is drawn in its own script, and again with an empty
+/// slice when it closes. Like any `set_fonts`, it goes live at the start of
+/// the next pass.
+pub fn set_fonts_for(ctx: &egui::Context, extra: &[crate::i18n::Fonts]) {
+    let mut needs = vec![crate::i18n::current().fonts];
+    needs.extend_from_slice(extra);
+    ctx.set_fonts(font_definitions_for(&needs));
 }
 
 /// `RichText` in Archivo SemiBold — the design's 600 weight.
@@ -11681,6 +11825,164 @@ mod tests {
     // -----------------------------------------------------------------
     // Cyrillic coverage (see `CYRILLIC_FACES`).
     // -----------------------------------------------------------------
+
+    /// A sentence of interface text in every language that needs a script the
+    /// bundled Archivo lacks -- or, for Vietnamese, one it must keep -- as
+    /// `(tag, text)`. Each is "Enter your master password" or near it.
+    const SCRIPT_SAMPLES: [(&str, &str); 7] = [
+        ("el", "\u{39a}\u{3c9}\u{3b4}\u{3b9}\u{3ba}\u{3cc}\u{3c2} \u{3c0}\u{3c1}\u{3cc}\u{3c3}\u{3b2}\u{3b1}\u{3c3}\u{3b7}\u{3c2}"),
+        ("ru", "\u{413}\u{43b}\u{430}\u{432}\u{43d}\u{44b}\u{439} \u{43f}\u{430}\u{440}\u{43e}\u{43b}\u{44c}"),
+        ("vi", "M\u{1ead}t kh\u{1ea9}u ch\u{ed}nh c\u{1ee7}a b\u{1ea1}n \u{111}\u{1ebf}n \u{1ee9}ng d\u{1ee5}ng"),
+        ("ja", "\u{30de}\u{30b9}\u{30bf}\u{30fc}\u{30d1}\u{30b9}\u{30ef}\u{30fc}\u{30c9}\u{3092}\u{5165}\u{529b}\u{3057}\u{3066}\u{304f}\u{3060}\u{3055}\u{3044}"),
+        ("zh-Hans", "\u{8f93}\u{5165}\u{60a8}\u{7684}\u{4e3b}\u{5bc6}\u{7801}"),
+        ("zh-Hant", "\u{8f38}\u{5165}\u{60a8}\u{7684}\u{4e3b}\u{5bc6}\u{78bc}"),
+        ("ko", "\u{b9c8}\u{c2a4}\u{d130} \u{bc88}\u{d638}\u{b97c} \u{c785}\u{b825}\u{d558}\u{c138}\u{c694}"),
+    ];
+
+    /// Whether the machine running the suite has the system faces `tag`
+    /// needs. They are Windows' own and present on every desktop edition; a
+    /// stripped server image may lack the CJK ones, and a test about drawing
+    /// them has nothing to measure there -- said out loud, not skipped quietly.
+    fn has_system_faces(tag: &str) -> bool {
+        let Some(locale) = crate::i18n::locale(tag) else { return false };
+        match system_faces_for(locale.fonts) {
+            None => true,
+            Some(faces) => {
+                let ok = first_system_face(faces.regular).is_some()
+                    && first_system_face(faces.bold).is_some();
+                if !ok {
+                    eprintln!("note: this machine has no system face for {tag}; its drawing test is not run");
+                }
+                ok
+            }
+        }
+    }
+
+    /// **A language's own script is drawn, in every weight the app asks for.**
+    /// Every glyph of the sample must rasterise to something: a missing face
+    /// answers egui's replacement box, which has a size, so the check is on
+    /// the glyph's own bitmap -- and on the characters, which a replaced one
+    /// no longer is.
+    #[test]
+    fn every_shipped_script_renders_in_every_weight() {
+        for (tag, text) in SCRIPT_SAMPLES {
+            if !has_system_faces(tag) {
+                continue;
+            }
+            crate::i18n::with_language(tag, || {
+                let ctx = ctx_with(font_definitions());
+                for family in [
+                    FontFamily::Proportional,
+                    FontFamily::Name(SEMIBOLD.into()),
+                    FontFamily::Name(BOLD.into()),
+                    FontFamily::Name(EXTRABOLD.into()),
+                ] {
+                    let font = FontId::new(15.0, family.clone());
+                    ctx.fonts_mut(|f| {
+                        let galley = f.layout_no_wrap(text.to_owned(), font, INK);
+                        let mut seen = 0;
+                        for row in &galley.rows {
+                            for glyph in &row.glyphs {
+                                if glyph.chr.is_whitespace() {
+                                    continue;
+                                }
+                                seen += 1;
+                                assert!(
+                                    glyph.uv_rect.size.x > 0.0 && glyph.uv_rect.size.y > 0.0,
+                                    "{tag}: {:?} rasterises to nothing in {family:?}",
+                                    glyph.chr
+                                );
+                            }
+                        }
+                        assert!(seen >= 4, "{tag}: only {seen} glyphs laid out in {family:?}");
+                    });
+                }
+            });
+        }
+    }
+
+    /// **Only the active language's system faces are loaded.** English holds
+    /// none of them -- a CJK face is 14-20 MB and an English session has no use
+    /// for it -- and Japanese holds Japanese's, not Korean's.
+    #[test]
+    fn only_the_active_languages_system_faces_are_loaded() {
+        let system = |fonts: &egui::FontDefinitions| {
+            let mut names: Vec<String> =
+                fonts.font_data.keys().filter(|k| k.starts_with("System-")).cloned().collect();
+            names.sort();
+            names
+        };
+        assert!(system(&font_definitions()).is_empty(), "English loads a system script face");
+        for tag in ["ru", "vi", "de", "tr", "pl"] {
+            crate::i18n::with_language(tag, || {
+                assert!(system(&font_definitions()).is_empty(), "{tag} loads a system script face");
+            });
+        }
+        if has_system_faces("ja") {
+            crate::i18n::with_language("ja", || {
+                let names = system(&font_definitions());
+                assert!(!names.is_empty(), "Japanese loads no face");
+                assert!(names.iter().all(|n| n.contains("Japanese")), "{names:?}");
+            });
+        }
+        if has_system_faces("el") {
+            crate::i18n::with_language("el", || {
+                let names = system(&font_definitions());
+                assert!(names.iter().all(|n| n.contains("Greek")), "{names:?}");
+                assert!(!names.is_empty());
+            });
+        }
+        // The picker's way to draw every language's name: extras on top of
+        // the active one.
+        let both = font_definitions_for(&[crate::i18n::Fonts::Korean, crate::i18n::Fonts::Japanese]);
+        if has_system_faces("ko") && has_system_faces("ja") {
+            let names = system(&both);
+            assert!(names.iter().any(|n| n.contains("Korean")) && names.iter().any(|n| n.contains("Japanese")), "{names:?}");
+        }
+    }
+
+    /// **Latin does not move in any language.** A system face goes BEHIND each
+    /// Archivo cut, so "Password" in a Japanese session measures exactly what
+    /// it does in an English one.
+    #[test]
+    fn latin_text_measures_the_same_in_every_language() {
+        let measure = || {
+            let ctx = ctx_with(font_definitions());
+            let font = FontId::new(15.0, FontFamily::Name(SEMIBOLD.into()));
+            ctx.fonts_mut(|f| f.layout_no_wrap("Password 0123 Unlock".to_owned(), font, INK).size())
+        };
+        let english = measure();
+        for tag in ["el", "ja", "zh-Hans", "zh-Hant", "ko", "ru", "vi"] {
+            if !has_system_faces(tag) {
+                continue;
+            }
+            assert_eq!(crate::i18n::with_language(tag, measure), english, "{tag} moved the Latin text");
+        }
+    }
+
+    /// Each system face sits behind its Archivo cut and its Cyrillic face and
+    /// ahead of egui's defaults, exactly where the Cyrillic faces sit.
+    #[test]
+    fn system_faces_sit_behind_archivo_and_ahead_of_eguis_fallbacks() {
+        if !has_system_faces("ja") {
+            return;
+        }
+        let fonts = crate::i18n::with_language("ja", font_definitions);
+        for family in [
+            FontFamily::Proportional,
+            FontFamily::Name(SEMIBOLD.into()),
+            FontFamily::Name(BOLD.into()),
+            FontFamily::Name(EXTRABOLD.into()),
+        ] {
+            let stack = &fonts.families[&family];
+            let at = stack.iter().position(|f| f.starts_with("System-Japanese")).expect("a Japanese face");
+            assert_eq!(at, 2, "{family:?}: {stack:?}");
+            assert!(stack[0].starts_with("Archivo") && stack[1].starts_with("NotoSans-Cyrillic"), "{stack:?}");
+        }
+        // And the end of the monospace family, behind Consolas and Hack.
+        let mono = &fonts.families[&FontFamily::Monospace];
+        assert!(mono.last().unwrap().starts_with("System-Japanese"), "{mono:?}");
+    }
 
     /// A word in Cyrillic ("Passwords"), all of it inside U+0400-04FF and
     /// none of it in Archivo.

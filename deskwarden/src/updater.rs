@@ -995,7 +995,9 @@ fn notes_heading(version: &Version) -> String {
 /// make the range a lie -- and "this one came with none" is a different fact
 /// from "this one is not in your update", told here rather than left to the
 /// reader to infer from a gap in the numbers.
-const NO_NOTES_FOR_RELEASE: &str = "_This release came with no notes._";
+fn no_notes_for_release() -> &'static str {
+    crate::i18n::t("updater.no_notes")
+}
 
 /// Joins the notes of every skipped release, newest first, each under its own
 /// version heading.
@@ -1026,7 +1028,7 @@ fn notes_across(releases: &[(Version, &serde_json::Value)]) -> String {
             // sentence between two other releases' notes.
             out.push_str(&notes_heading(version));
             out.push('\n');
-            out.push_str(NO_NOTES_FOR_RELEASE);
+            out.push_str(no_notes_for_release());
         } else {
             // The body opens with its own `## What's new in <version>` --
             // `release.yml` puts it there -- so it is already filed under a
@@ -1035,9 +1037,11 @@ fn notes_across(releases: &[(Version, &serde_json::Value)]) -> String {
         }
     }
     if releases.len() > MAX_NOTES_RELEASES {
-        out.push_str(&format!(
-            "\n\n_And {} earlier releases, whose notes are on GitHub._",
-            releases.len() - MAX_NOTES_RELEASES
+        out.push_str("\n\n");
+        out.push_str(&crate::i18n::tn(
+            "updater.earlier_releases",
+            (releases.len() - MAX_NOTES_RELEASES) as u64,
+            &[],
         ));
     }
     out
@@ -1856,7 +1860,7 @@ mod tests {
         );
         assert_eq!(
             release.body,
-            format!("{}\n{NO_NOTES_FOR_RELEASE}", notes_heading(&release.version)),
+            format!("{}\n{}", notes_heading(&release.version), no_notes_for_release()),
             "a release whose JSON carries no `body` must be named and said to have none, \
              rather than dropped out of a range the panel claims to cover"
         );
@@ -2140,7 +2144,7 @@ mod tests {
         let release = check_against(&releases, "0.8.2").unwrap().expect("an update");
 
         assert!(release.body.contains("0.8.3"), "got {:?}", release.body);
-        assert!(release.body.contains(NO_NOTES_FOR_RELEASE), "got {:?}", release.body);
+        assert!(release.body.contains(no_notes_for_release()), "got {:?}", release.body);
     }
 
     /// **A tag this build cannot read is skipped, not fatal.**

@@ -654,6 +654,14 @@ enum Surface {
     /// Every piece is drawn through `kit`'s own calls, so nothing here is a
     /// second drawing that could drift.
     KitSheet,
+    /// **The translation system's glyph sheet**: a test catalog in English,
+    /// Japanese, Simplified and Traditional Chinese, Korean, Russian, Greek and
+    /// Vietnamese, each row set in the four weights the app uses, with plural
+    /// forms picked by each language's own rule. It exists so the fonts every
+    /// language needs -- system faces for CJK and Greek, the bundled ones for
+    /// Cyrillic and Vietnamese -- can be LOOKED AT before a catalog is written.
+    /// `--i18n --screenshot` writes it on its own.
+    I18nFonts,
     /// **Design 1e's reference sheet**: every network and bank tile as the
     /// vault list draws it (44pt), the detail header's 72pt tiles with a
     /// network chip on a bank, and the text-fallback tiles beside them.
@@ -1012,6 +1020,7 @@ const ALL: &[Surface] = &[
     Surface::VaultListKinds,
     Surface::ItemKindMarks,
     Surface::KitSheet,
+    Surface::I18nFonts,
     Surface::CardLogos,
     Surface::VaultShellNavy,
     Surface::VaultShellLight,
@@ -1172,6 +1181,7 @@ impl Surface {
             Surface::VaultListKinds => "vault_item_list_kinds",
             Surface::ItemKindMarks => "item_kind_marks",
             Surface::KitSheet => "kit_sheet",
+            Surface::I18nFonts => "i18n_fonts",
             Surface::CardLogos => "card_logos",
             Surface::VaultShellNavy => "vault_shell_navy",
             Surface::VaultShellLight => "vault_shell_light",
@@ -1435,6 +1445,7 @@ impl Surface {
             // A sheet, not a pane: its size is what the sheet needs.
             Surface::ItemKindMarks => egui::vec2(LIST_WIDTH, 360.0),
             Surface::KitSheet => egui::vec2(1280.0, 900.0),
+            Surface::I18nFonts => egui::vec2(1280.0, 980.0),
             Surface::CardLogos => egui::vec2(1000.0, 520.0),
             Surface::VaultShellNavy
             | Surface::VaultShellLight
@@ -1577,7 +1588,7 @@ fn main() -> eframe::Result {
     // The sign-in, unlock, first-window and second-factor screens only.
     let auth = arg("--auth");
     let all = arg("--all") || auth;
-    let screenshot = all || arg("--screenshot");
+    let screenshot = all || arg("--screenshot") || arg("--i18n");
     let signin = arg("--signin");
     let cli_setup = arg("--cli-setup");
     // The self-hosted sign-in's backend choice. Its own flag, because it is
@@ -1594,6 +1605,8 @@ fn main() -> eframe::Result {
     // reports they answer were filed together and are looked at together.
     let kinds = arg("--kinds");
     let kit = arg("--kit");
+    // The translation system's glyph sheet: every script the app draws.
+    let i18n_sheet = arg("--i18n");
     let shell = arg("--shell");
     let rail = arg("--rail");
     let health = arg("--health");
@@ -1645,6 +1658,8 @@ fn main() -> eframe::Result {
         vec![Surface::VaultListKinds, Surface::ItemKindMarks, Surface::LoginDetailFavicon]
     } else if kit {
         vec![Surface::KitSheet]
+    } else if i18n_sheet {
+        vec![Surface::I18nFonts]
     } else if shell {
         vec![
             Surface::VaultShellNavy,
@@ -1791,6 +1806,8 @@ fn main() -> eframe::Result {
         target_dir().join("ui_preview_kinds")
     } else if kit {
         target_dir().join("ui_preview_kit.png")
+    } else if i18n_sheet {
+        target_dir().join("ui_preview_i18n.png")
     } else if shell {
         // A DIRECTORY: navy, light and the splash belong side by side.
         target_dir().join("ui_preview_shell")
@@ -2093,6 +2110,15 @@ impl eframe::App for Preview {
             self.warm_since = ctx.input(|i| i.time);
             self.shot_asked = false;
         }
+        // The glyph sheet draws every script at once, so the first time it is
+        // current it loads every language's system faces, the way the Settings
+        // picker does. They go live a frame later; the warm-up frames cover it.
+        if self.current() == Surface::I18nFonts && !I18N_SHEET_FONTS_LOADED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            theme::set_fonts_for(&ctx, &I18N_SHEET_FONTS);
+            self.frames = 0;
+            ctx.request_repaint();
+            return;
+        }
 
         match self.current() {
             Surface::LoginUnlock => self.draw_login(root, &ctx, false, false, None),
@@ -2241,6 +2267,7 @@ impl eframe::App for Preview {
             Surface::VaultListKinds => self.draw_vault_list_kinds(root),
             Surface::ItemKindMarks => draw_item_kind_marks(root),
             Surface::KitSheet => draw_kit_sheet(root),
+            Surface::I18nFonts => draw_i18n_fonts(root),
             Surface::CardLogos => draw_card_logos(root),
             Surface::VaultShellNavy => {
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false)
@@ -2684,12 +2711,12 @@ impl Preview {
                 );
             }
             LoginVariant::SignInEmailError => {
-                self.form.error = Some(login_ui::ENTER_EMAIL.to_string());
+                self.form.error = Some(login_ui::enter_email().to_string());
             }
             LoginVariant::SignInUrlError => {
                 self.form.server_choice = login_ui::ServerChoice::SelfHosted;
                 self.form.email = "a.novak@ledgerline.com".to_string();
-                self.form.error = Some(login_ui::ENTER_SERVER.to_string());
+                self.form.error = Some(login_ui::enter_server().to_string());
             }
             LoginVariant::SignInTooMany => {
                 self.form.error = Some("Too many failed attempts. Wait a few minutes, then try again.".to_string());
@@ -4563,6 +4590,109 @@ fn draw_card_logos(root: &mut egui::Ui) {
         paint(root.painter(), detail, &Look::Brand { mark: Mark::Bank(bank), chip: Some(chip) }, 20);
         label(root, area.min + vec2(x, 410.0), bank.name());
     }
+}
+
+/// The system-face groups the glyph sheet needs on top of English.
+const I18N_SHEET_FONTS: [deskwarden::i18n::Fonts; 5] = [
+    deskwarden::i18n::Fonts::Greek,
+    deskwarden::i18n::Fonts::ChineseSimplified,
+    deskwarden::i18n::Fonts::ChineseTraditional,
+    deskwarden::i18n::Fonts::Japanese,
+    deskwarden::i18n::Fonts::Korean,
+];
+
+static I18N_SHEET_FONTS_LOADED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A test catalog per language, in the real catalog format: a title, a
+/// sentence, a button word and a plural. Parsed by the same reader the app
+/// uses, and filled by the same `fill`.
+const I18N_SHEET: [(&str, &str); 8] = [
+    (
+        "en",
+        "title = Welcome back\nbody = Enter your master password to unlock your vault.\nbutton = Unlock\nitems[one] = {n} item\nitems[other] = {n} items\n",
+    ),
+    (
+        "ja",
+        "title = おかえりなさい\nbody = マスターパスワードを入力して保管庫のロックを解除してください。\nbutton = ロック解除\nitems[other] = {n} 件のアイテム\n",
+    ),
+    (
+        "zh-Hans",
+        "title = 欢迎回来\nbody = 输入主密码以解锁您的密码库。\nbutton = 解锁\nitems[other] = {n} 个项目\n",
+    ),
+    (
+        "zh-Hant",
+        "title = 歡迎回來\nbody = 輸入主密碼以解鎖您的密碼庫。\nbutton = 解鎖\nitems[other] = {n} 個項目\n",
+    ),
+    (
+        "ko",
+        "title = 다시 오신 것을 환영합니다\nbody = 마스터 비밀번호를 입력하여 보관함을 잠금 해제하세요.\nbutton = 잠금 해제\nitems[other] = {n}개 항목\n",
+    ),
+    (
+        "ru",
+        "title = С возвращением\nbody = Введите мастер-пароль, чтобы разблокировать хранилище.\nbutton = Разблокировать\nitems[one] = {n} элемент\nitems[few] = {n} элемента\nitems[many] = {n} элементов\nitems[other] = {n} элемента\n",
+    ),
+    (
+        "el",
+        "title = Καλώς ήρθατε ξανά\nbody = Εισαγάγετε τον κύριο κωδικό πρόσβασης για να ξεκλειδώσετε το θησαυροφυλάκιό σας.\nbutton = Ξεκλείδωμα\nitems[one] = {n} στοιχείο\nitems[other] = {n} στοιχεία\n",
+    ),
+    (
+        "vi",
+        "title = Chào mừng trở lại\nbody = Nhập mật khẩu chính để mở khóa kho của bạn.\nbutton = Mở khóa\nitems[other] = {n} mục\n",
+    ),
+];
+
+/// The glyph sheet: one band per language, each in the app's four weights.
+fn draw_i18n_fonts(root: &mut egui::Ui) {
+    use deskwarden::i18n::{self, plural::Category};
+    use deskwarden::kit::tokens;
+    use egui::{vec2, CornerRadius, Rect, UiBuilder};
+
+    let p = tokens::palette(root.ctx());
+    let area = root.max_rect();
+    root.painter().rect_filled(area, CornerRadius::ZERO, p.window_bg);
+    root.scope_builder(UiBuilder::new().max_rect(area.shrink2(vec2(28.0, 20.0))), |ui| {
+        ui.spacing_mut().item_spacing = vec2(0.0, 6.0);
+        ui.label(theme::bold("Translation fonts: every script the app draws", 18.0).color(theme::INK));
+        ui.add_space(4.0);
+        for (tag, text) in I18N_SHEET {
+            let locale = i18n::locale(tag).expect("a shipped language");
+            let parsed = i18n::catalog::parse(text);
+            assert!(parsed.problems.is_empty(), "{tag}: {:?}", parsed.problems);
+            let get = |key: &str| parsed.catalog.get(key, None).unwrap_or("?");
+            let band = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), 100.0));
+            ui.painter().rect_filled(band, CornerRadius::same(tokens::R_CARD), p.card);
+            ui.scope_builder(UiBuilder::new().max_rect(band.shrink2(vec2(18.0, 10.0))), |ui| {
+                ui.spacing_mut().item_spacing = vec2(0.0, 4.0);
+                ui.horizontal(|ui| {
+                    ui.label(theme::semibold(format!("{tag}  {}", locale.native_name), 12.0).color(theme::TEXT_MUTED));
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 22.0;
+                    ui.label(theme::extrabold(get("title"), 22.0).color(theme::INK));
+                    ui.label(theme::bold(get("button"), 15.0).color(theme::BLUE));
+                    ui.label(theme::semibold(get("button"), 15.0).color(theme::BLUE));
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 22.0;
+                    ui.label(theme::regular(get("body"), 14.0).color(theme::INK));
+                });
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 18.0;
+                    for n in [1u64, 2, 5, 21] {
+                        let category = locale.rule.category(n);
+                        let template = parsed
+                            .catalog
+                            .get("items", Some(category))
+                            .or_else(|| parsed.catalog.get("items", Some(Category::Other)))
+                            .unwrap_or("?");
+                        let line = i18n::fill(template, &[("n", &n.to_string())]);
+                        ui.label(theme::regular(format!("{line}  [{}]", category.name()), 13.0).color(theme::TEXT_MUTED));
+                    }
+                });
+            });
+            ui.advance_cursor_after_rect(band);
+        }
+    });
 }
 
 fn draw_kit_sheet(root: &mut egui::Ui) {

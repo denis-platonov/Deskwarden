@@ -1,3 +1,4 @@
+use crate::i18n;
 use crate::accounts::{account_label, AccountId, AccountsState};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
@@ -27,22 +28,27 @@ const APP_ICON_RESOURCE_ID: u16 = 1;
 const IDLE_TOOLTIP: &str = "Deskwarden";
 
 /// Label of the submenu every account action lives under.
-const ACCOUNTS_SUBMENU: &str = "Accounts";
+fn accounts_submenu() -> &'static str {
+    i18n::t("tray.accounts")
+}
 
-/// Label of the item that mints and signs in to another account.
-const ADD_ACCOUNT: &str = "Add account...";
+// The label of the item that mints and signs in to another account is the
+// catalog's `tray.add_account`.
 
 /// Shown, disabled, when there is exactly one account and nothing is refused.
 /// An empty submenu reads as a broken menu; this reads as "you have one".
-const NO_OTHER_ACCOUNTS: &str = "No other accounts yet";
+fn no_other_accounts() -> &'static str {
+    i18n::t("tray.no_other_accounts")
+}
 
 /// Shown, disabled, when this process has no `AccountsState` at all --
 /// `StartupAccounts::NoAccountList`, where `settings.json` could not be read,
 /// there is no `Account` in existence, and the app is running against the
 /// CLI's own default profile. Not a blocked state and not a one-account state:
 /// there is nothing here to switch *from*.
-const ACCOUNTS_NOT_SET_UP: &str =
-    "Accounts are not set up on this machine yet - restart Deskwarden";
+fn accounts_not_set_up() -> &'static str {
+    i18n::t("tray.accounts_not_set_up")
+}
 
 /// What the "Accounts" submenu should contain, decided from
 /// [`AccountsState`](crate::accounts::AccountsState) alone.
@@ -114,7 +120,7 @@ pub fn accounts_menu_plan(state: Option<&AccountsState>) -> AccountsMenuPlan {
         return AccountsMenuPlan {
             active: None,
             switch_to: Vec::new(),
-            notice: Some(ACCOUNTS_NOT_SET_UP.to_string()),
+            notice: Some(accounts_not_set_up().to_string()),
             add: false,
             remove: None,
         };
@@ -137,7 +143,7 @@ pub fn accounts_menu_plan(state: Option<&AccountsState>) -> AccountsMenuPlan {
             state
                 .blocked_reason()
                 .map(str::to_string)
-                .unwrap_or_else(|| NO_OTHER_ACCOUNTS.to_string()),
+                .unwrap_or_else(|| no_other_accounts().to_string()),
         )
     };
 
@@ -285,20 +291,20 @@ pub const FILL_HOTKEY: &str = "CTRL+ALT+B";
 #[must_use]
 pub fn fill_hint(status: &crate::hotkey::HotkeyStatus, chord: &str) -> String {
     match status {
-        crate::hotkey::HotkeyStatus::Armed => format!("Fill:  {chord}"),
+        crate::hotkey::HotkeyStatus::Armed => i18n::tf("tray.fill_armed", &[("chord", chord)]),
         crate::hotkey::HotkeyStatus::Unavailable(_) => {
-            format!("Fill shortcut ({chord}) unavailable")
+            i18n::tf("tray.fill_unavailable", &[("chord", chord)])
         }
         // **The user cleared it, so there is no shortcut to name.** Saying
         // "unavailable" here would blame the machine for a decision the user
         // took, and printing a chord would name one that is not registered.
-        crate::hotkey::HotkeyStatus::Unbound => "Fill shortcut turned off".to_string(),
+        crate::hotkey::HotkeyStatus::Unbound => i18n::t("tray.fill_off").to_string(),
     }
 }
 
 pub fn build_tray() -> AppTray {
     let menu = Menu::new();
-    let open_vault = MenuItem::new("Open Vault", true, None);
+    let open_vault = MenuItem::new(i18n::t("tray.open_vault"), true, None);
     // **Design decision D9: the right-click menu is short.** Left click opens
     // the popup (`crate::tray_popup`), and this menu stays for the user who
     // cannot or does not want to use a pointer-driven panel -- a keyboard or
@@ -306,9 +312,9 @@ pub fn build_tray() -> AppTray {
     // Lock and Quit are the three things such a user needs without a window;
     // everything 0.15 had here that is not one of them moves under "More"
     // rather than being dropped.
-    let lock = MenuItem::new("Lock", true, None);
-    let more = Submenu::new("More", true);
-    let add_app = MenuItem::new("Add app...", true, None);
+    let lock = MenuItem::new(i18n::t("tray.lock"), true, None);
+    let more = Submenu::new(i18n::t("tray.more"), true);
+    let add_app = MenuItem::new(i18n::t("tray.add_app"), true, None);
     // **Disabled: a label, not a command.** See `fill_hint` for why a
     // clickable Fill would fill the wrong window. Placed under Add app so
     // the two things about filling sit together.
@@ -321,8 +327,8 @@ pub fn build_tray() -> AppTray {
         false,
         None,
     );
-    let sync_item = MenuItem::new("Sync", true, None);
-    let quit = MenuItem::new("Quit", true, None);
+    let sync_item = MenuItem::new(i18n::t("tray.sync"), true, None);
+    let quit = MenuItem::new(i18n::t("tray.quit"), true, None);
     // **There is no update item here, and its absence is deliberate.** There
     // was one, created as `MenuItem::new("Update available", false, None)`:
     // the words were baked in at build time and the check's only effect was to
@@ -337,7 +343,7 @@ pub fn build_tray() -> AppTray {
     // once the account list exists and again after every change to it. Built
     // empty rather than not at all so there is exactly one place that decides
     // what is in it.
-    let accounts_submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+    let accounts_submenu = Submenu::new(accounts_submenu(), true);
     more.append(&add_app).unwrap();
     more.append(&fill_hint_item).unwrap();
     more.append(&sync_item).unwrap();
@@ -424,7 +430,7 @@ fn build_accounts_submenu(submenu: &Submenu, plan: &AccountsMenuPlan) -> Account
         // Disabled: this is the account you are on, and "switch to where you
         // already are" still tears the backend down and demands a master
         // password.
-        let header = MenuItem::new(format!("Signed in: {active}"), false, None);
+        let header = MenuItem::new(i18n::tf("tray.signed_in", &[("account", active.as_str())]), false, None);
         let _ = submenu.append(&header);
         let _ = submenu.append(&PredefinedMenuItem::separator());
     }
@@ -440,7 +446,7 @@ fn build_accounts_submenu(submenu: &Submenu, plan: &AccountsMenuPlan) -> Account
     }
 
     let add_id = plan.add.then(|| {
-        let item = MenuItem::new(ADD_ACCOUNT, true, None);
+        let item = MenuItem::new(i18n::t("tray.add_account"), true, None);
         let id = item.id().clone();
         let _ = submenu.append(&item);
         id
@@ -549,7 +555,7 @@ pub fn discard_queued_icon_events() -> usize {
 pub fn set_sync_in_progress(tray: &AppTray) {
     sync_item_to_in_progress(&tray.sync_item);
     tray.popup_sync.set(crate::tray_popup::Sync::Syncing);
-    set_tooltip(tray, "Deskwarden - syncing...".to_string());
+    set_tooltip(tray, i18n::t("tray.tooltip_syncing").to_string());
 }
 
 /// Returns the "Sync" item to its resting state: label, enabled state and
@@ -588,7 +594,7 @@ pub fn set_sync_idle(tray: &AppTray) {
 pub fn set_sync_failed(tray: &AppTray) {
     sync_item_to_failed(&tray.sync_item);
     tray.popup_sync.set(crate::tray_popup::Sync::Failed);
-    set_tooltip(tray, "Deskwarden - sync failed; see the log file".to_string());
+    set_tooltip(tray, i18n::t("tray.tooltip_sync_failed").to_string());
 }
 
 /// Disables the "Sync" item without touching its label, for an in-flight
@@ -624,17 +630,17 @@ pub fn set_sync_busy_with_backend_op(tray: &AppTray) {
 // genuinely does need the icon.
 
 fn sync_item_to_in_progress(item: &MenuItem) {
-    item.set_text("Syncing...");
+    item.set_text(i18n::t("tray.syncing"));
     item.set_enabled(false);
 }
 
 fn sync_item_to_idle(item: &MenuItem) {
-    item.set_text("Sync");
+    item.set_text(i18n::t("tray.sync"));
     item.set_enabled(true);
 }
 
 fn sync_item_to_failed(item: &MenuItem) {
-    item.set_text("Sync failed - click to retry");
+    item.set_text(i18n::t("tray.sync_failed"));
     item.set_enabled(true);
 }
 
@@ -999,7 +1005,7 @@ mod tests {
         assert_eq!(
             plan.notice.as_deref(),
             Some("No other accounts yet"),
-            "an empty submenu reads as a broken menu; NO_OTHER_ACCOUNTS is what fills it"
+            "an empty submenu reads as a broken menu; no_other_accounts() is what fills it"
         );
         assert!(
             plan.add,
@@ -1072,7 +1078,7 @@ mod tests {
     /// built and read back.
     #[test]
     fn the_built_submenu_carries_the_plans_rows_and_the_ids_they_were_built_for() {
-        let submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+        let submenu = Submenu::new(accounts_submenu(), true);
         let plan = accounts_menu_plan(Some(&two_accounts()));
         let menu = build_accounts_submenu(&submenu, &plan);
 
@@ -1086,7 +1092,7 @@ mod tests {
             "the switch target the plan chose was never built into a menu item: {labels:?}"
         );
         assert!(
-            labels.iter().any(|l| l == ADD_ACCOUNT),
+            labels.iter().any(|l| l == i18n::t("tray.add_account")),
             "\"Add account...\" was planned and never built: {labels:?}"
         );
         assert!(
@@ -1101,7 +1107,7 @@ mod tests {
             Some(&id(B)),
             "clicking the row labelled `two@example.com` would not switch to that account"
         );
-        let add_row = item_at(&submenu, row(&submenu, ADD_ACCOUNT));
+        let add_row = item_at(&submenu, row(&submenu, i18n::t("tray.add_account")));
         assert!(menu.is_add(add_row.id()));
         assert_eq!(
             menu.account_for_menu_id(add_row.id()),
@@ -1115,7 +1121,7 @@ mod tests {
     /// master password.
     #[test]
     fn the_header_and_the_notice_are_disabled_and_the_switch_rows_are_not() {
-        let submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+        let submenu = Submenu::new(accounts_submenu(), true);
         build_accounts_submenu(&submenu, &accounts_menu_plan(Some(&two_accounts())));
         let enabled = |text: &str| item_at(&submenu, row(&submenu, text)).is_enabled();
         assert!(
@@ -1127,7 +1133,7 @@ mod tests {
             "positive control: the switch row really is clickable"
         );
 
-        let lone = Submenu::new(ACCOUNTS_SUBMENU, true);
+        let lone = Submenu::new(accounts_submenu(), true);
         build_accounts_submenu(&lone, &accounts_menu_plan(Some(&one_account())));
         let notice = item_at(&lone, row(&lone, "No other accounts yet")).is_enabled();
         assert!(!notice, "the explanatory notice invites a click it cannot serve");
@@ -1140,7 +1146,7 @@ mod tests {
     /// deleted.
     #[test]
     fn rebuilding_the_submenu_replaces_the_previous_rows_and_their_ids() {
-        let submenu = Submenu::new(ACCOUNTS_SUBMENU, true);
+        let submenu = Submenu::new(accounts_submenu(), true);
         let first = build_accounts_submenu(&submenu, &accounts_menu_plan(Some(&two_accounts())));
         let before = submenu.items().len();
         assert!(before > 2, "control: the first build really put rows in");

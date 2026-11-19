@@ -1516,7 +1516,7 @@ mod win32 {
                     mem,
                     fonts.tagline,
                     l.tagline,
-                    "FILLS NATIVE WINDOWS",
+                    crate::i18n::t("unlock_prompt.tagline"),
                     crate::theme::TEXT_FAINT,
                     DT_LEFT,
                     2,
@@ -1525,7 +1525,7 @@ mod win32 {
                     mem,
                     fonts.title,
                     l.title,
-                    "Unlock your vault",
+                    crate::i18n::t("unlock_prompt.title"),
                     crate::theme::INK,
                     DT_LEFT,
                     0,
@@ -1534,7 +1534,7 @@ mod win32 {
                     mem,
                     fonts.subtitle,
                     l.subtitle,
-                    "Matches stay hidden until the vault opens.",
+                    crate::i18n::t("unlock_prompt.subtitle"),
                     crate::theme::TEXT_FAINT,
                     DT_LEFT,
                     0,
@@ -1555,7 +1555,7 @@ mod win32 {
                     mem,
                     fonts.label,
                     l.label,
-                    "Master password",
+                    crate::i18n::t("unlock_prompt.label"),
                     if BUSY.load(Ordering::SeqCst) {
                         crate::theme::TEXT_GHOST
                     } else {
@@ -1656,7 +1656,7 @@ mod win32 {
 
             let whole = RECT { left: 0, top: 0, right: rc.right, bottom: rc.bottom };
             let radius = scale(7);
-            let label = if primary { "Unlock" } else { "Cancel" };
+            let label = if primary { crate::i18n::t("unlock_prompt.unlock") } else { crate::i18n::t("unlock_prompt.cancel") };
 
             let guard = FONTS.lock();
             let font = guard.as_ref().ok().and_then(|s| s.as_ref()).map(|fonts| fonts.button);
@@ -2180,7 +2180,7 @@ mod tests {
 
     #[test]
     fn the_gate_matches_the_login_windows() {
-        assert_eq!(gate(""), Submit::Refuse(crate::login_ui::ENTER_PASSWORD));
+        assert_eq!(gate(""), Submit::Refuse(crate::login_ui::enter_password()));
         assert_eq!(gate("a"), Submit::Attempt);
         // Whitespace is a real password as far as this app is concerned, and
         // as far as `bw` is: only *empty* is the plumbing hazard.

@@ -1393,6 +1393,11 @@ impl Section {
 /// (the stepper's text buffer) that has to survive between frames.
 pub struct PrefsState {
     pub settings: Settings,
+    /// The Store edition's "updates come from the Store" line, which then
+    /// stands in for the update switch and card. `None` in [`Self::new`]
+    /// (what the paint tests build, so they exercise the full card in both
+    /// build flavours); [`Self::with_scan_history`] reads the edition.
+    pub updates_from_store: Option<&'static str>,
     section: Section,
     /// The Settings page the screen shows: what `section` selects, and what a
     /// nav click moves.
@@ -1700,6 +1705,7 @@ impl PrefsState {
                 clear_clipboard_seconds: interval.seconds(),
                 ..settings
             },
+            updates_from_store: None,
             section: Section::General,
             page: settings_v2::Page::General,
             scroll_y: None,
@@ -1790,6 +1796,7 @@ impl PrefsState {
     /// entries through [`Self::show_scan_history`].
     pub fn with_scan_history(settings: Settings) -> Self {
         Self {
+            updates_from_store: crate::updater::store_updates_notice(),
             scan_history: load_scan_history(),
             hello_available: crate::vault_disk_cache::hello_available,
             // The API keys are loaded here for the same reason and under the
@@ -4790,7 +4797,7 @@ fn account_row_text(status: Option<&AccountStatus>) -> (String, Option<String>) 
 fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
     // The Store edition never checks, downloads or installs: say where its
     // updates come from instead of offering a switch that does nothing.
-    if let Some(notice) = crate::updater::store_updates_notice() {
+    if let Some(notice) = state.updates_from_store {
         card(ui, |ui| note_row(ui, UPDATES_LABEL, notice, ""));
         return;
     }

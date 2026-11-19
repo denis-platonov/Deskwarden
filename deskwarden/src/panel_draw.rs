@@ -96,7 +96,9 @@ pub const ENTER_PAD_X: i32 = 10;
 pub const ENTER_RADIUS: i32 = 8;
 /// How far the badge stands off the row's right edge.
 pub const ENTER_INSET: i32 = 10;
-pub const ENTER_LABEL: &str = "Enter";
+pub fn enter_label() -> &'static str {
+    crate::i18n::t("panel.enter_label")
+}
 
 /// The `?` help badge (D 1.3): a 20 px circle.
 pub const HELP: i32 = 20;
@@ -150,8 +152,13 @@ pub fn avatar_colours(index: usize) -> (Color32, Color32) {
 
 /// What the `?` tooltip says on the Fill card (D 1.3, verbatim apart from the
 /// `Tab` line -- see `Ruling: Tab` in the slice 11 plan).
-pub const FILL_KEY_HINTS: [&str; 3] =
-    ["\u{2191} \u{2193} choose an account", "Enter fill", "Esc close"];
+pub fn fill_key_hints() -> [&'static str; 3] {
+    [
+        crate::i18n::t("panel.hint_choose_account"),
+        crate::i18n::t("panel.hint_enter_fill"),
+        crate::i18n::t("panel.hint_esc_close"),
+    ]
+}
 
 /// The tooltip's height for `lines` lines.
 pub fn tip_height(lines: usize) -> i32 {
@@ -263,7 +270,7 @@ pub fn enter_badge_rect(row: RECT, text_w: i32, scale: i32) -> RECT {
 /// Paints the blue `Enter` badge on a selected row and answers the lane it
 /// takes off the row's right edge, so the name beside it can stop short.
 pub fn draw_enter_badge(hdc: HDC, row: RECT, font: HFONT, scale: i32) -> i32 {
-    let chars: Vec<u16> = ENTER_LABEL.encode_utf16().collect();
+    let chars: Vec<u16> = enter_label().encode_utf16().collect();
     let text_w = text_width_utf16(hdc, font, &chars);
     let rc = enter_badge_rect(row, text_w, scale);
     round_rect(hdc, rc, px(ENTER_RADIUS, scale), crate::theme::BLUE, None);
@@ -272,7 +279,7 @@ pub fn draw_enter_badge(hdc: HDC, row: RECT, font: HFONT, scale: i32) -> i32 {
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, rgb(Color32::WHITE));
         let mut at = rc;
-        draw_text(hdc, ENTER_LABEL, &mut at, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        draw_text(hdc, enter_label(), &mut at, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         SelectObject(hdc, old);
     }
     row.right - rc.left + px(6, scale)
@@ -898,7 +905,7 @@ mod tests {
     #[test]
     fn the_tooltip_lies_on_the_panel_and_never_off_its_edge() {
         let badge = (340, 14, 360, 34);
-        let (x, y, w, h) = tip_box(badge, 400, FILL_KEY_HINTS.len());
+        let (x, y, w, h) = tip_box(badge, 400, fill_key_hints().len());
         assert!(x >= 0 && x + w <= 400, "the tooltip left the window: {x} + {w}");
         assert!(x + w <= badge.0, "the tooltip covers the badge it explains");
         assert_eq!(y, TIP_TOP);
@@ -907,7 +914,7 @@ mod tests {
 
     #[test]
     fn the_key_hints_promise_only_keys_the_cards_answer() {
-        let joined = FILL_KEY_HINTS.join("\n");
+        let joined = fill_key_hints().join("\n");
         assert!(joined.contains("Enter fill") && joined.contains("Esc close"));
         // The design's `Tab fill and sign in` is not offered: Tab moves focus on
         // these cards and nothing presses a sign-in button.

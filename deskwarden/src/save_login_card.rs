@@ -193,7 +193,9 @@ impl SaveLoginForm {
 /// the new login is created unfiled (`NewItem::login(.., None)`), and the vault
 /// window's edit form -- which has a scrollable pane and the whole folder list
 /// -- is where it is filed.
-pub const FOLDER_ROW_TEXT: &str = "No folder · file it in the vault window";
+pub fn folder_row_text() -> &'static str {
+    crate::i18n::t("save_login.folder_row")
+}
 
 /// The Username row's placeholder, and **the load-bearing half of the card's
 /// honesty about what it did and did not read.**
@@ -202,7 +204,9 @@ pub const FOLDER_ROW_TEXT: &str = "No folder · file it in the vault window";
 /// description of a value, because the field really is empty and really does
 /// have to be typed: there is no username reader in
 /// `crate::injector::ui_automation`.
-pub const USERNAME_HINT: &str = "type the username you used";
+pub fn username_hint() -> &'static str {
+    crate::i18n::t("save_login.username_hint")
+}
 
 /// The Password row's placeholder, and the sharper case of [`USERNAME_HINT`].
 ///
@@ -210,7 +214,9 @@ pub const USERNAME_HINT: &str = "type the username you used";
 /// The design draws this row pre-filled with bullets and a *Reveal* link, and
 /// this build does not, because there is nothing to reveal -- the value is
 /// whatever the user types into this box.
-pub const PASSWORD_HINT: &str = "type the password you used";
+pub fn password_hint() -> &'static str {
+    crate::i18n::t("save_login.password_hint")
+}
 
 /// The window's title.
 ///
@@ -221,20 +227,28 @@ pub const PASSWORD_HINT: &str = "type the password you used";
 pub const SAVE_LOGIN_CARD_TITLE: &str = "Deskwarden save a login";
 
 /// What 3c's header says.
-pub const SAVE_LOGIN_LABEL: &str = "Save this login?";
+pub fn save_login_label() -> &'static str {
+    crate::i18n::t("save_login.title")
+}
 
 /// 3c's primary button.
-pub const SAVE_LABEL: &str = "Save";
+pub fn save_label() -> &'static str {
+    crate::i18n::t("save_login.save")
+}
 
 /// 3c's Password-row control into design **3d**.
 ///
 /// Inside the row rather than in the footer, because it belongs to the field it
 /// fills: it is the same placement the edit form's own generator has, and the
 /// footer of this card is already three answers wide.
-pub const SAVE_GENERATE_LABEL: &str = "Generate";
+pub fn save_generate_label() -> &'static str {
+    crate::i18n::t("save_login.generate")
+}
 
 /// 3c's *silence today* answer.
-pub const NOT_NOW_LABEL: &str = "Not now";
+pub fn not_now_label() -> &'static str {
+    crate::i18n::t("save_login.not_now")
+}
 
 /// 3c's *silence forever* answer.
 ///
@@ -242,11 +256,15 @@ pub const NOT_NOW_LABEL: &str = "Not now";
 /// this is the one control on the card that writes to `settings.json`, and the
 /// user has to be able to tell from the words which of the two silences they
 /// are choosing.
-pub const NEVER_LABEL: &str = "Never for this app";
+pub fn never_label() -> &'static str {
+    crate::i18n::t("save_login.never")
+}
 
 /// The two fields' captions, top to bottom. The App and Folder rows are the
 /// preview block now (design D 1.7), which says the same two things.
-pub const ROW_CAPTIONS: [&str; 2] = ["Username", "Password"];
+pub fn row_captions() -> [&'static str; 2] {
+    [crate::i18n::t("save_login.caption_username"), crate::i18n::t("save_login.caption_password")]
+}
 
 /// The `Enter` chip drawn inside *Save*.
 pub const SAVE_SHORTCUT: &str = "ENTER";
@@ -492,7 +510,7 @@ pub struct Layout {
     pub tile: Box2,
     pub app_value: Box2,
     pub folder_value: Box2,
-    /// The two captions, in [`ROW_CAPTIONS`] order.
+    /// The two captions, in [`row_captions()`] order.
     pub captions: [Box2; 2],
     /// The two painted field boxes. The `EDIT` children sit inside them; see
     /// [`field_child`].
@@ -629,9 +647,9 @@ static APP_NAME: std::sync::Mutex<String> = std::sync::Mutex::new(String::new())
 /// here exhausts the table over a session rather than over a run.
 mod win32 {
     use super::{
-        field_child, Box2, Event, SaveLoginForm, SaveWindow, APP_NAME, FOLDER_ROW_TEXT, GONE,
-        NEVER_LABEL, NOT_NOW_LABEL, PASSWORD_HINT, PENDING, ROW_CAPTIONS, SAVE_GENERATE_LABEL,
-        SAVE_LABEL, SAVE_LOGIN_CARD_TITLE, SAVE_LOGIN_LABEL, SAVE_SHORTCUT, USERNAME_HINT,
+        field_child, Box2, Event, SaveLoginForm, SaveWindow, APP_NAME, folder_row_text, GONE,
+        never_label, not_now_label, password_hint, PENDING, row_captions, save_generate_label,
+        save_label, SAVE_LOGIN_CARD_TITLE, save_login_label, SAVE_SHORTCUT, username_hint,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -1537,7 +1555,7 @@ mod win32 {
 
     /// The hint drawn over an empty field, after comctl32 has painted it.
     fn paint_placeholder(control: HWND, id: usize) {
-        let hint = if id == ID_PASSWORD { PASSWORD_HINT } else { USERNAME_HINT };
+        let hint = if id == ID_PASSWORD { password_hint() } else { username_hint() };
         unsafe {
             let mut rc = RECT::default();
             let _ = GetClientRect(control, &mut rc);
@@ -1652,9 +1670,9 @@ mod win32 {
                     bottom: scale(b.bottom()),
                 };
                 crate::win32_draw::draw_mark(mem, dev(l.mark));
-                text(mem, fonts.title, l.title, SAVE_LOGIN_LABEL, crate::theme::INK);
+                text(mem, fonts.title, l.title, save_login_label(), crate::theme::INK);
 
-                for (caption, at) in ROW_CAPTIONS.iter().zip(l.captions.iter()) {
+                for (caption, at) in row_captions().iter().zip(l.captions.iter()) {
                     text(mem, fonts.caption, *at, caption, crate::theme::TEXT_SECONDARY);
                 }
 
@@ -1671,7 +1689,7 @@ mod win32 {
                     DPI_PERCENT.load(Ordering::SeqCst),
                 );
                 text(mem, fonts.name, l.app_value, &app, crate::theme::INK);
-                text(mem, fonts.sub, l.folder_value, FOLDER_ROW_TEXT, crate::theme::TEXT_FAINT);
+                text(mem, fonts.sub, l.folder_value, folder_row_text(), crate::theme::TEXT_FAINT);
             }
 
             paint_close_glyph(mem, l.close_glyph);
@@ -1719,7 +1737,7 @@ mod win32 {
                     crate::panel_draw::draw_link(
                         mem,
                         whole,
-                        NEVER_LABEL,
+                        never_label(),
                         fonts.link,
                         hovered || focused,
                         true,
@@ -1779,21 +1797,21 @@ mod win32 {
     ) -> (String, Option<&'static str>, ButtonSkin, HFONT, Box2) {
         match id {
             ID_SAVE => (
-                SAVE_LABEL.to_string(),
+                save_label().to_string(),
                 Some(SAVE_SHORTCUT),
                 crate::panel_draw::skin(PanelButton::Primary, false),
                 fonts.button,
                 l.save,
             ),
             ID_NOT_NOW => (
-                NOT_NOW_LABEL.to_string(),
+                not_now_label().to_string(),
                 None,
                 crate::panel_draw::skin(PanelButton::Outline, false),
                 fonts.button,
                 l.not_now,
             ),
             _ => (
-                SAVE_GENERATE_LABEL.to_string(),
+                save_generate_label().to_string(),
                 None,
                 crate::panel_draw::skin(PanelButton::Outline, false),
                 fonts.caption,
@@ -2145,7 +2163,7 @@ mod tests {
             ("never".into(), l.never),
         ];
         for (i, caption) in l.captions.iter().enumerate() {
-            boxes.push((ROW_CAPTIONS[i].to_string(), *caption));
+            boxes.push((row_captions()[i].to_string(), *caption));
         }
         for (name, at) in &boxes {
             assert!(at.x >= 0, "`{name}` starts left of the window");
@@ -2246,12 +2264,12 @@ mod tests {
     /// imply a capture it did not make.
     #[test]
     fn the_words_on_the_card_say_what_it_can_honestly_say() {
-        assert_ne!(NOT_NOW_LABEL, NEVER_LABEL);
+        assert_ne!(not_now_label(), never_label());
         assert!(
-            NEVER_LABEL.to_lowercase().contains("app"),
+            never_label().to_lowercase().contains("app"),
             "the strongest answer on the card does not say what it is scoped to"
         );
-        for hint in [USERNAME_HINT, PASSWORD_HINT] {
+        for hint in [username_hint(), password_hint()] {
             assert!(
                 hint.starts_with("type "),
                 "`{hint}` reads as a description of a value this process captured. It did not: \
@@ -2259,9 +2277,9 @@ mod tests {
                  not read"
             );
         }
-        assert_eq!(ROW_CAPTIONS, ["Username", "Password"]);
+        assert_eq!(row_captions(), ["Username", "Password"]);
         assert!(
-            FOLDER_ROW_TEXT.contains("No folder"),
+            folder_row_text().contains("No folder"),
             "the Folder row no longer states where the item goes"
         );
     }

@@ -1965,7 +1965,7 @@ where
                         if let Next::Show(next) = advance(stage, Event::Locked) {
                             stage = next;
                             if next == Stage::Working {
-                                working_message = LOCK_MESSAGE;
+                                working_message = lock_message();
                                 working_since = Some(Instant::now());
                             }
                         }
@@ -2082,7 +2082,9 @@ where
 /// and the post-sign-in repopulate are both `Stage::Working` -- which is why
 /// this host holds a `working_message` local rather than taking one
 /// `&'static str` parameter the way [`run`] does.
-pub const LOCK_MESSAGE: &str = "Locking your vault...";
+pub fn lock_message() -> &'static str {
+    crate::i18n::t("app_window.locking")
+}
 
 /// What a close arriving while the vault is up MEANS.
 ///
@@ -2458,7 +2460,7 @@ where
     // The message the spinner shows. A LOCAL and not a parameter, because it
     // changes mid-stage: the teardown and the post-sign-in repopulate are the
     // same `Stage::Working`. See [`LOCK_MESSAGE`].
-    let mut working_message: &'static str = LOCK_MESSAGE;
+    let mut working_message: &'static str = lock_message();
     // Restarted on every ENTRY to the working stage, not once. The stage is
     // entered twice on the lock path, and a stopwatch started at the first
     // entry would charge the repopulate for however long the user spent typing
@@ -2485,7 +2487,7 @@ where
                     if let Next::Show(next) = advance(stage, Event::Locked) {
                         stage = next;
                         if next == Stage::Working {
-                            working_message = LOCK_MESSAGE;
+                            working_message = lock_message();
                             working_since = Some(Instant::now());
                         }
                     }
@@ -6839,7 +6841,7 @@ mod lock_host_tests {
                  just locked",
             ),
             (
-                concat!("working_message = ", "LOCK_MESSAGE;"),
+                concat!("working_message = ", "lock_message();"),
                 "the spinner goes on saying it is setting the vault up while it is \
                  locking it, which is the message half of the same report",
             ),

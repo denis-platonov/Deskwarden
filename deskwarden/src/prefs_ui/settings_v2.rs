@@ -834,18 +834,26 @@ mod tests {
         }
     }
 
-    /// The Store edition says where updates come from; the default build
-    /// keeps its switch. Both flavours run in CI, so each half is exercised.
+    /// The Store edition says where updates come from instead of offering
+    /// the switch; the default edition keeps the switch.
     #[test]
     fn the_updates_group_matches_the_edition() {
+        let notice = "Updates come from the Microsoft Store";
+        let mut store = Fixture::new(Page::About);
+        store.state.updates_from_store = Some(notice);
+        let painted = store.settle();
+        assert!(painted.text(notice).is_some(), "the Store notice is not drawn");
+        assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_none(), "a Store build offers the update switch");
+
         let painted = Fixture::new(Page::About).settle();
-        match crate::updater::store_updates_notice() {
-            Some(notice) => {
-                assert!(painted.text(notice).is_some(), "the Store notice is not drawn");
-                assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_none(), "a Store build offers the update switch");
-            }
-            None => assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_some(), "the update switch is gone"),
-        }
+        assert!(painted.text(prefs::UPDATE_CHECK_LABEL).is_some(), "the update switch is gone");
+    }
+
+    /// The production constructor takes the edition from the updater.
+    #[test]
+    fn the_app_reads_the_edition_from_the_updater() {
+        let state = PrefsState::with_scan_history(Settings::default());
+        assert_eq!(state.updates_from_store, crate::updater::store_updates_notice());
     }
 
     #[test]

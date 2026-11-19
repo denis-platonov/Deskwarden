@@ -1,0 +1,415 @@
+# Deskwarden's English text: the source every other catalog translates.
+# The format is documented at the top of src/i18n.rs.
+# Keys are `area.thing`; sections below are grouped by the file that owns them.
+
+# ---- kit/auth.rs (sign-in and lock screens) ----
+auth.headline = Your Bitwarden vault, in every app.
+auth.brand_sub = Sign in once. Deskwarden fills SAP, VPNs and every desktop login for you.
+auth.brand_foot = Uses your existing Bitwarden account
+auth.hello_label = Unlock with Windows Hello
+auth.hello_checking = Checking…
+auth.use_password = Use master password instead
+auth.lock_heading = Welcome back
+auth.lock_sub = Your vault is locked
+auth.hide_password = Hide password
+auth.show_password = Show password
+auth.done_title = You're in
+auth.done_opening = Opening your vault
+
+# ---- login_ui.rs (sign-in, lock and two-step screens) ----
+login.first_run_notice = Deskwarden now keeps each account in its own profile — sign in once to set this one up. Windows Hello quick unlock has to be set up again too.
+login.hello_setup_needs_password = Type your master password first — Windows Hello is set up right after it unlocks the vault.
+login.hello_setup_label = Log in and set up Windows Hello
+login.hello_setup_link = Unlock and set up Windows Hello
+login.hello_setup_hint = First use: enter your master password, then click here
+login.sign_in_title = Log in
+login.server_label = Server
+login.server_tip = Most people use bitwarden.com. Pick EU if your account was made there, or Self-hosted if your company runs its own.
+login.password_placeholder = Your Bitwarden master password
+login.lock_placeholder = Master password
+login.enter_email = Enter your email.
+login.bad_email = That doesn't look like an email address.
+login.enter_password = Enter your master password.
+login.enter_server = Enter your server's address.
+login.sign_in_subtitle = Use your Bitwarden account
+login.forgot_label = Forgot?
+login.forgot_hint = Bitwarden can't see or reset it
+login.forgot_long_label = Forgot master password?
+login.too_many_title = Too many tries
+login.too_many_line = To keep your vault safe, logging in is paused on this PC.
+login.too_many_wait = a few minutes
+login.try_again = Try again
+login.checking = Checking
+login.log_in = Log in
+login.unlock = Unlock
+login.log_out = Log out
+
+# ---- login_ui.rs (sign-in, lock and two-step screens) ----
+login.err_bad_master_password = That master password didn't work. Check it and try again.
+login.err_bad_credentials = That email or master password didn't work. Check them and try again.
+login.err_two_step = That two-step login didn't complete. Try again — and if this account uses Duo or a security key, sign in with a personal API key instead.
+login.err_too_many = Too many failed attempts. Wait a few minutes, then try again.
+login.err_unreachable = Couldn't reach the server. Check your connection — and the server URL, if this is a self-hosted account.
+login.err_unlock_generic = Could not unlock the vault. The log has the details.
+login.banner_server_title = Can't reach your server
+login.banner_server_body = Check the address, or connect to your company VPN.
+login.retry = Retry
+login.banner_offline_title = You're offline
+login.banner_offline_body = Connect to the internet to log in. Once you have, your vault also opens offline.
+login.email_label = Email
+login.master_password_label = Master password
+login.try_again_in = Try again in
+login.hello_no_account = There is no account to unlock with Windows Hello.
+
+# ---- second_factor_ui.rs (the two-step code stage) ----
+second_factor.title_authenticator = Authenticator app
+second_factor.title_email = Email code
+second_factor.title_generic = Two-step login
+second_factor.hint_authenticator = Open your authenticator app and type the code for Bitwarden.
+second_factor.hint_email_unmasked = Send a code to the email address on this account, then enter it here. Codes expire after a few minutes.
+second_factor.hint_yubikey = Plug in your YubiKey, put the cursor in the box below and touch the key. It types the code for you.
+second_factor.hint_unsupported = Deskwarden cannot complete this kind of two-step login.
+second_factor.send_code = Send code
+second_factor.code_sent = Code sent. Check your email — it may take a moment to arrive.
+second_factor.err_code_rejected = That code didn't work. Check it and try again — codes change every 30 seconds.
+second_factor.err_send_failed = Deskwarden couldn't send the code. Check your connection, then try Send code again.
+second_factor.err_expired = This sign-in took too long and has expired. Enter your master password again to start over.
+second_factor.heading_code = Enter your 6-digit code
+second_factor.heading_yubikey = Touch your YubiKey
+second_factor.short_code = Enter all 6 digits.
+second_factor.other_method = Use another method
+second_factor.continue = Continue
+second_factor.back = Back
+
+# ---- second_factor_ui.rs (the two-step code stage) ----
+second_factor.hint_email_masked = Send a code to {address}, then enter it here. Codes expire after a few minutes.
+second_factor.provider_duo = Duo
+second_factor.provider_duo_org = Duo (organization)
+second_factor.provider_webauthn = a security key (WebAuthn)
+second_factor.provider_u2f = a U2F security key
+second_factor.provider_remembered = a remembered device
+second_factor.provider_recovery = a recovery code
+second_factor.provider_unknown = an unrecognised two-step method ({number})
+second_factor.list_and = {first} and {rest}
+second_factor.unsupported_only = This account's two-step login uses {list}, which Deskwarden cannot complete. Use a personal API key instead: create one under Account settings → Security → Keys in the Bitwarden web vault, then sign in here with it. You will still be asked for your master password — the API key signs you in, the password unlocks the vault.
+
+# ---- api_key_ui.rs (sign in with an API key) ----
+api_key.key_pair_title = Sign in with an API key
+api_key.key_pair_hint = Create a personal API key under Account settings → Security → Keys in the Bitwarden web vault, then paste both halves here.
+api_key.client_id = Client ID
+api_key.client_secret = Client secret
+api_key.password_title = Master password
+api_key.password_hint = The API key signed you in. Your master password is what unlocks the vault — the key cannot decrypt it.
+api_key.password_label = Master password
+api_key.use_api_key = Sign in with an API key
+
+# ---- tray.rs (the notification-area icon and its menu) ----
+tray.accounts = Accounts
+tray.add_account = Add account...
+tray.no_other_accounts = No other accounts yet
+tray.accounts_not_set_up = Accounts are not set up on this machine yet - restart Deskwarden
+tray.fill_armed = Fill:  {chord}
+tray.fill_unavailable = Fill shortcut ({chord}) unavailable
+tray.fill_off = Fill shortcut turned off
+tray.open_vault = Open Vault
+tray.lock = Lock
+tray.more = More
+tray.add_app = Add app...
+tray.sync = Sync
+tray.quit = Quit
+tray.signed_in = Signed in: {account}
+tray.tooltip_syncing = Deskwarden - syncing...
+tray.tooltip_sync_failed = Deskwarden - sync failed; see the log file
+tray.syncing = Syncing...
+tray.sync_failed = Sync failed - click to retry
+
+# ---- tray_popup.rs (the left-click quick-access panel) ----
+tray_popup.footer_locked = Locked · filling is paused
+tray_popup.footer_offline = Offline · filling still works
+tray_popup.footer_syncing = Syncing...
+tray_popup.footer_synced_one_minute = Synced · locks after 1 min idle
+tray_popup.footer_synced_minutes = Synced · locks after {minutes} min idle
+tray_popup.footer_synced = Synced
+tray_popup.toast_username_copied = Username copied
+tray_popup.toast_password_copied = Password copied
+tray_popup.toast_no_username = No username saved
+tray_popup.toast_no_password = No password saved
+tray_popup.toast_cancelled = Cancelled. Nothing was copied
+tray_popup.toast_needs_hello = Asks for the master password. Turn on Windows Hello
+tray_popup.toast_gone = That login is gone. Nothing was copied
+tray_popup.empty_title = Nothing to show yet
+tray_popup.empty_body = Logins you save will appear here.
+tray_popup.no_matches_title = No matches
+tray_popup.no_matches_body = Nothing in your vault is called that.
+tray_popup.label_recent = RECENT
+tray_popup.label_results = RESULTS
+tray_popup.label_top = TOP {shown} OF {total} MATCHES
+tray_popup.tile_generate = Generate
+tray_popup.tile_new_item = New item
+tray_popup.tile_share = Share
+tray_popup.locked_title = Deskwarden is locked
+tray_popup.locked_body = Unlock to search and copy your logins.
+tray_popup.unlock = Unlock
+tray_popup.search = Search
+
+# ---- loading_ui.rs (the waiting screens) ----
+loading.heading = Loading your vault
+loading.unreachable_title = Couldn't reach Bitwarden
+loading.unreachable_offered = Deskwarden can't open your vault until Bitwarden answers. Nothing has been lost — your items are still in your account.
+loading.unreachable_spent = Bitwarden still isn't answering. Closing this window leaves your vault locked; nothing has been lost, and opening Deskwarden again once you're back online picks up where this left off.
+loading.open_local = Open the local copy
+loading.continue_offline = Continue offline
+loading.hotkey_armed = Autofill is listening · {chord}
+loading.hotkey_pending = Autofill starts when your vault opens · {chord}
+loading.hotkey_taken = Another program is using {chord}, so autofill has no shortcut
+loading.hotkey_refused = Windows refused {chord}, so autofill has no shortcut
+loading.hotkey_unbound = Autofill has no keyboard shortcut set
+loading.offline_copy_age = Your copy on this machine · {age}
+loading.offline_copy_no_age = There's a copy on this machine. Opening it asks Windows Hello again.
+loading.stays_local = This stays on your machine
+loading.still_syncing = Still syncing with Bitwarden
+loading.retry = Retry
+loading.slow = Taking longer than usual — {seconds} s
+loading.signed_in_as = Signed in as {account}
+
+# ---- locked_card.rs (the locked-vault card) ----
+locked_card.pill = Locked
+locked_card.unlock = Unlock
+locked_card.title = Deskwarden is locked
+locked_card.body = Unlock to check the vault for {app_name}.
+
+# ---- prompt_card.rs (the matched-item autofill prompt) ----
+prompt_card.item_fills = {item_name} · fills {app_name}
+prompt_card.fills = fills {app_name}
+prompt_card.saved_credentials = Saved credentials
+
+# ---- notice_card.rs (the autofill notice and done cards) ----
+notice_card.nothing_typed = Nothing was typed
+notice_card.stopped = Typing stopped
+notice_card.ok = OK
+notice_card.fallback_body = Deskwarden did not complete this fill.
+notice_card.saved_title = Login saved
+notice_card.saved_sub = Deskwarden fills it next time
+notice_card.updated_title = Password updated
+notice_card.updated_sub = Saved to your vault
+notice_card.signed_in_title = Signed in
+notice_card.signed_in_sub = Filled by Deskwarden
+
+# ---- save_login_card.rs (the save-a-login card) ----
+save_login.folder_row = No folder · file it in the vault window
+save_login.username_hint = type the username you used
+save_login.password_hint = type the password you used
+save_login.title = Save this login?
+save_login.save = Save
+save_login.generate = Generate
+save_login.not_now = Not now
+save_login.never = Never for this app
+save_login.caption_username = Username
+save_login.caption_password = Password
+
+# ---- panel_draw.rs (the shared Win32 card chrome) ----
+panel.enter_label = Enter
+panel.hint_choose_account = ↑ ↓ choose an account
+panel.hint_enter_fill = Enter fill
+panel.hint_esc_close = Esc close
+
+# ---- generate_prompt.rs (the password-generator card) ----
+generate.new_password = New password
+generate.suggested = Suggested password
+generate.save_to_vault = Save to vault
+generate.copy = Copy
+generate.regenerate = Regenerate
+generate.characters = Characters
+generate.min_digits = At least this many digits
+generate.avoid_lookalikes = Avoid look-alikes
+generate.working = Generating…
+generate.failed = Could not generate a password. Try again.
+generate.kind_password = Password
+generate.kind_passphrase = Passphrase
+generate.length = Length
+generate.words = Words
+
+# ---- unlock_prompt.rs (the master-password prompt) ----
+unlock_prompt.tagline = FILLS NATIVE WINDOWS
+unlock_prompt.title = Unlock your vault
+unlock_prompt.subtitle = Matches stay hidden until the vault opens.
+unlock_prompt.label = Master password
+unlock_prompt.unlock = Unlock
+unlock_prompt.cancel = Cancel
+
+# ---- webcam.rs (camera refusals) ----
+webcam.title_no_camera = No camera on this PC
+webcam.title_busy = That camera is already in use
+webcam.title_denied = Windows is not allowing camera access
+webcam.title_silent = That camera sent no picture
+webcam.title_lost = That camera stopped
+webcam.title_unavailable = Windows couldn't open that camera
+webcam.detail_no_camera = Plug one in and choose this again, or scan the code off your screen instead.
+webcam.detail_busy = Close whatever has it open — a video call, or a camera app — and choose it again.
+webcam.detail_denied = Turn on camera access for desktop apps in Settings → Privacy & security → Camera, then choose it again.
+webcam.detail_silent = Check nothing is covering the lens and that any privacy switch on it is open, then choose it again.
+webcam.detail_lost = It was unplugged or taken by another app. Plug it back in and choose it again.
+webcam.detail_unavailable = Try once more, or enter the secret the site prints under the code by hand.
+webcam.unnamed = Camera
+
+# ---- picker_prompt.rs (the account picker card) ----
+picker.send_all = Username + Tab + Password
+picker.send_all_sub = Types both fields in order
+picker.send_sequence = Saved sequence
+picker.send_sequence_sub = Runs this item's own sequence
+picker.send_username_sub = Types the username
+picker.send_password_sub = Types the password
+picker.send_totp_sub = Types a one-time code
+picker.send_custom_sub = Types this custom field
+picker.empty_new_login_sub = Save a login for this app
+picker.empty_search_sub = Look for it under another name
+picker.new_login = New login
+picker.search_vault = Search vault
+picker.empty_title = No saved login for {app_name}
+picker.empty_body = Deskwarden matches windows by process name and title.
+picker.hint_list_0 = ↑ ↓ choose an account
+picker.hint_list_1 = Enter fill
+picker.hint_list_2 = 1-5 fill that row
+picker.hint_list_3 = S search the vault
+picker.hint_list_4 = N new login
+picker.hint_list_5 = Esc close
+picker.hint_palette_0 = ↑ ↓ choose a field
+picker.hint_palette_1 = Enter type it
+picker.hint_palette_2 = 1-5 type that row
+picker.hint_palette_3 = B edit binding
+picker.hint_palette_4 = Esc close
+picker.hint_search_0 = ↑ ↓ choose a result
+picker.hint_search_1 = Enter fill
+picker.hint_search_2 = Ctrl+1-5 fill that result
+picker.hint_search_3 = Esc close
+picker.overflow_title = {total} accounts match
+picker.overflow_sub = Showing the first {shown} — keep typing to narrow it
+picker.nothing_title = No matches
+picker.nothing_sub = Nothing in your vault is named like that
+picker.search_title = Search the vault
+picker.search_sub = Type to filter your accounts. Nothing is typed until you pick one.
+picker.palette_title = What should I type?
+picker.palette_sub = Pick a field. Nothing is typed until you do.
+picker.list_title = Fill from vault
+picker.list_sub = These accounts look like they belong to this app.
+picker.cancel = Cancel
+picker.edit_binding = Edit binding
+
+# ---- region_overlay.rs (the scan-a-region overlay) ----
+region.drag_title = Drag a box around the QR code
+region.drag_hint = Deskwarden reads it the moment you let go. Nothing is saved yet.
+region.locked_on = Code found · release to read
+region.scan_found = Code read
+region.all_screens = All screens
+region.cancel = Cancel
+region.scan_no_code = No QR code found on your screen. Drag a box around it instead.
+region.scan_several = More than one QR code is on your screen. Drag a box around the one you want.
+region.scan_refused_advice = Drag a box around the code instead.
+
+# ---- app_window.rs (the single window) ----
+app_window.locking = Locking your vault...
+
+# ---- updater.rs (release notes shown in the update panel) ----
+updater.no_notes = _This release came with no notes._
+updater.earlier_releases[one] = _And {n} earlier release, whose notes are on GitHub._
+updater.earlier_releases[other] = _And {n} earlier releases, whose notes are on GitHub._
+
+# ---- bw_acquire.rs (the Bitwarden CLI setup modal) ----
+cli.stage_resolving = Finding the Bitwarden CLI download…
+cli.stage_downloading = Downloading the Bitwarden CLI from Bitwarden…
+cli.stage_verifying = Checking it is signed by Bitwarden…
+cli.stage_installing = Installing the Bitwarden CLI…
+cli.title_choosing = Which client should open this vault?
+cli.title_asking = The Bitwarden CLI is required
+cli.title_recover = The Bitwarden CLI is missing
+cli.title_working = Installing the Bitwarden CLI
+cli.title_installed = The Bitwarden CLI is installed
+cli.title_failed = The Bitwarden CLI was not installed
+cli.body_choosing_built_in = {built_in} talks to your server itself: about 19 MB of memory in the tray, no second program, and no wait after a restart. Running small is what this app is for.
+cli.body_choosing_official = The Bitwarden CLI is Bitwarden's own program, run beside Deskwarden: about 118 MB of memory on top of Deskwarden's 10 MB, and about 8 seconds after a restart before the vault answers. Choosing {official_cli} will {disclosure}
+cli.body_choosing_cost = What it costs: the key that unlocks your vault is kept on this PC, protected by Windows, and unlike a session it never expires, so anyone who can run programs as you on this PC can use it. And its cryptography is checked against Bitwarden's published test vectors, but it is not Bitwarden's code.
+cli.body_asking_1 = Signing in to a Bitwarden server requires the official Bitwarden CLI.
+cli.will_download = Deskwarden will {disclosure}
+cli.body_asking_3 = Press OK to continue, or Cancel to go back and choose a different server. A self-hosted server can be used without it.
+cli.body_recover_1 = Your vault is served by the official Bitwarden CLI, and it is no longer on this computer. Antivirus software, a cleanup tool, or a failed CLI update can remove it.
+cli.body_recover_3 = Press OK to reinstall it now, or Cancel to start without your vault. Deskwarden will still open, and you can sign out or switch accounts from the tray.
+cli.installed_at = It is at {path}.
+cli.installed_continue = Press OK to continue signing in.
+cli.version = version {version}
+cli.unknown_version = an unknown version
+cli.summary = The Bitwarden CLI was installed ({version}, {size}).
+cli.button_use_official = Use the Bitwarden CLI
+cli.button_use_built_in = Use the built-in client
+cli.button_cancel = Cancel
+cli.button_ok = OK
+cli.button_close = Close
+cli.official_name = the Bitwarden CLI
+cli.built_in_name = Deskwarden's built-in client
+cli.download_disclosure = download it from Bitwarden, check that Bitwarden signed it, and install it. It is about 37 MB, and this happens once.
+
+# ---- picker_ui.rs (Add app: the vault-item and process pickers) ----
+picker_ui.loading = Loading your vault...
+picker_ui.empty_vault_body = Your Bitwarden vault doesn’t have any items yet.\n\nAdd an item from the vault window, then use “Add app…” again.
+picker_ui.empty_vault_title = Deskwarden: vault is empty
+picker_ui.no_logins_body = “Add app…” can only fill from a login, and your Bitwarden vault doesn’t have any login items yet — only other kinds, like secure notes or cards.\n\nAdd a login from the vault window, then use “Add app…” again.
+picker_ui.no_logins_title = Deskwarden: no logins to choose from
+picker_ui.locked_body = Deskwarden’s vault was locked while it was loading your items.\n\nOpen the vault window and unlock it, then use “Add app…” again.
+picker_ui.locked_title = Deskwarden: vault is locked
+picker_ui.unreachable_title = Deskwarden: could not load vault
+picker_ui.unreachable_body = Deskwarden could not load your vault items because its Bitwarden backend isn’t reachable right now.\n\nOpen the vault (which starts it) or try Sync from the tray menu, then use “Add app…” again.\n\n{reason}
+picker_ui.add_app = Add app
+picker_ui.which_item = Which vault item should this app fill from?
+picker_ui.create_item = Create an item that fills here from now on.
+picker_ui.search_vault = Search vault
+picker_ui.next = Next
+picker_ui.cancel = Cancel
+picker_ui.match_process = Match a process to “{name}”
+picker_ui.process_sub = The chosen process fills from this item from now on.
+picker_ui.search_windows = Search open windows
+picker_ui.preparing_backend = Preparing your Bitwarden backend…
+picker_ui.retry = Retry
+picker_ui.save = Save
+picker_ui.close = Close
+
+# ---- hello.rs (Windows Hello messages shown on the lock screen) ----
+hello.err_test_profile = Windows Hello is off in a Deskwarden test profile
+hello.err_unavailable = Windows Hello is unavailable: {error}
+hello.err_cancelled = Windows Hello was cancelled.
+hello.err_not_enrolled = No Windows Hello enrollment for Deskwarden on this machine.
+hello.err_failed_status = Windows Hello failed ({status})
+hello.err_failed = Windows Hello failed: {error}
+hello.err_no_credential = Windows Hello returned no credential: {error}
+hello.err_signing = Windows Hello signing failed: {error}
+hello.err_verify_status = Windows Hello verification failed ({status})
+hello.err_verify = Windows Hello verification failed: {error}
+hello.err_no_signature = Windows Hello returned no signature: {error}
+
+# ---- scratch_window.rs (the rehearsal window) ----
+scratch.typed = Typed
+scratch.pressed = Pressed
+scratch.paused = Paused
+scratch.sent_heading = WHAT WAS SENT
+scratch.close = Close
+
+# ---- main.rs (message boxes the daemon raises) ----
+main.second_lock_exit = Your vault is locked and Deskwarden has closed.\n\nStart Deskwarden again to sign back in.
+main.setup = Setting up your vault...
+main.remove_account_warning = Remove {label} from Deskwarden?\n\nThis signs that account out and DELETES its local Bitwarden profile from this computer, including its saved session and its Windows Hello quick unlock. Your vault on the server is not touched, and you can sign in to this account again afterwards.\n\nThis cannot be undone.
+main.remove_account_title = Deskwarden: remove account
+main.cannot_start_title = Deskwarden cannot start
+main.vault_window_failed = Could not open the vault window.\n\nDeskwarden could not start the process that draws it. Please try Open Vault again.
+main.window_lost_connection = This vault window lost its connection to Deskwarden -- the vault was locked, or Deskwarden restarted. Open the vault again from the Deskwarden tray icon.
+main.cache_start_failed = Deskwarden could not start keeping an encrypted copy of your vault:\n\n{error}\n\nThe setting has been left off.
+main.cache_delete_failed = The encrypted copy of your vault could not be deleted:\n\n{error}\n\nIt is still on disk at that location.
+main.no_vault_title = Deskwarden started without your vault
+main.no_vault_body = {error}\n\nDeskwarden is running and its tray icon is available, but your vault is empty and autofill has nothing to fill from until the Bitwarden CLI is back.\n\nThe tray icon can still sign you out, switch accounts and open preferences. Restarting Deskwarden will offer to reinstall the CLI again.
+main.cli_not_signed = The Bitwarden CLI that Deskwarden found is not validly signed, so Deskwarden will not run it.\n\nFile:\n{file}\n\nWindows could not confirm the file's signature. It may have been modified or replaced. Deskwarden hands this program your master password, so it is stopping instead.\n\nReinstall the Bitwarden CLI from bitwarden.com, or reinstall Deskwarden.
+main.cli_unrecognized_org = signed by an organization Deskwarden does not recognize
+main.cli_no_detail = (no detail was reported)
+main.cli_unverifiable = could not be signature-checked at all
+main.cli_check_failed = The check failed with: {error}
+main.cli_unrecognized_title = Deskwarden: unrecognized Bitwarden CLI
+main.cli_unrecognized_body = The Bitwarden CLI Deskwarden is about to use {headline}.\n\nFile:\n{file}\n\n{detail}\n\nDeskwarden gives this program your master password and vault session, so it should only be Bitwarden's own CLI. This can also happen with a `bw` installed through Scoop or Chocolatey, which are signed differently (or not at all).\n\nContinue anyway?\n\nChoose No unless you know where this bw.exe came from.
+main.signer_none = It has no signer certificate.
+main.signer_org = It is signed by: {org}
+main.signer_no_org = Its signer certificate names no organization.

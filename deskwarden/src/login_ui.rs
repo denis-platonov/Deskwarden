@@ -1,3 +1,4 @@
+use crate::i18n;
 use crate::accounts::{Account, AccountId};
 // No `bw_command` import. Every `bw` this window spawns names its profile
 // directory (`bw_command_in`), because this window is also the one
@@ -740,9 +741,9 @@ pub fn missing_credential_message(
     password: &str,
 ) -> Option<&'static str> {
     if status == BwStatus::Unauthenticated && (email.trim().is_empty() || !email.contains('@')) {
-        Some(if email.trim().is_empty() { ENTER_EMAIL } else { BAD_EMAIL })
+        Some(if email.trim().is_empty() { enter_email() } else { bad_email() })
     } else if password.is_empty() {
-        Some(ENTER_PASSWORD)
+        Some(enter_password())
     } else {
         None
     }
@@ -775,7 +776,7 @@ pub fn friendly_auth_error(stderr: &str) -> String {
         "invalid master password",
         "cryptography error",
     ]) {
-        return "That master password didn't work. Check it and try again.".to_string();
+        return i18n::t("login.err_bad_master_password").to_string();
     }
     // Sign-in, by contrast, is rejected by the server, and either field
     // could be the wrong one.
@@ -783,7 +784,7 @@ pub fn friendly_auth_error(stderr: &str) -> String {
         "username or password is incorrect",
         "invalid username or password",
     ]) {
-        return "That email or master password didn't work. Check them and try again."
+        return i18n::t("login.err_bad_credentials")
             .to_string();
     }
     // **This arm no longer sends anybody to a terminal.** It used to read
@@ -798,12 +799,11 @@ pub fn friendly_auth_error(stderr: &str) -> String {
     // `second_factor_ui::unsupported_only_message` does; it says what happened
     // and stops.
     if mentions(&["two-step", "two step", "two-factor", "twofactor"]) {
-        return "That two-step login didn't complete. Try again — and if this account \
-                uses Duo or a security key, sign in with a personal API key instead."
+        return i18n::t("login.err_two_step")
             .to_string();
     }
     if mentions(&["too many", "rate limit", "traffic from your network"]) {
-        return "Too many failed attempts. Wait a few minutes, then try again.".to_string();
+        return i18n::t("login.err_too_many").to_string();
     }
     if mentions(&[
         "econnrefused",
@@ -812,8 +812,7 @@ pub fn friendly_auth_error(stderr: &str) -> String {
         "getaddrinfo",
         "failed to fetch",
     ]) {
-        return "Couldn't reach the server. Check your connection — and the server URL, \
-                if this is a self-hosted account."
+        return i18n::t("login.err_unreachable")
             .to_string();
     }
 
@@ -842,7 +841,7 @@ fn strip_cli_log_scaffolding(stderr: &str) -> String {
             None => (*first).to_string(),
         };
     }
-    "Could not unlock the vault. The log has the details.".to_string()
+    i18n::t("login.err_unlock_generic").to_string()
 }
 
 /// Which server the sign-in talks to — the native client's bottom-of-page
@@ -1843,8 +1842,9 @@ fn draw_cli_setup_modal(
 /// Worded as setup rather than as an error, because nothing has gone wrong --
 /// and nothing of the user's has been touched: the CLI's own profile
 /// directory is left exactly where it is.
-pub const FIRST_RUN_NOTICE: &str = "Deskwarden now keeps each account in its own profile \u{2014} sign \
-     in once to set this one up. Windows Hello quick unlock has to be set up again too.";
+pub fn first_run_notice() -> &'static str {
+    i18n::t("login.first_run_notice")
+}
 
 /// Paints [`FIRST_RUN_NOTICE`]. One definition, two call sites (with the Hello
 /// button, and standing alone when there is none), so the two cannot drift
@@ -1853,7 +1853,7 @@ pub const FIRST_RUN_NOTICE: &str = "Deskwarden now keeps each account in its own
 fn draw_first_run_notice(ui: &mut egui::Ui, on_lock_screen: bool) {
     if on_lock_screen {
         let width = ui.available_width().min(crate::kit::auth::LOCK_ROW_WIDTH);
-        crate::kit::auth::lock_note(ui, FIRST_RUN_NOTICE, width);
+        crate::kit::auth::lock_note(ui, first_run_notice(), width);
         return;
     }
     let p = crate::kit::tokens::palette(ui.ctx());
@@ -1863,27 +1863,44 @@ fn draw_first_run_notice(ui: &mut egui::Ui, on_lock_screen: bool) {
         .inner_margin(Margin::symmetric(16, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(theme::regular(FIRST_RUN_NOTICE, 13.0).color(p.text_muted));
+            ui.label(theme::regular(first_run_notice(), 13.0).color(p.text_muted));
         });
 }
 
 /// What the window says after a first-use Hello click with no password typed.
-const HELLO_SETUP_NEEDS_PASSWORD: &str = "Type your master password first \u{2014} Windows Hello is set up right \
-     after it unlocks the vault.";
+fn hello_setup_needs_password() -> &'static str {
+    i18n::t("login.hello_setup_needs_password")
+}
 /// The button the sign-in screen offers when Windows Hello can be set up.
-const HELLO_SETUP_LABEL: &str = "Log in and set up Windows Hello";
+fn hello_setup_label() -> &'static str {
+    i18n::t("login.hello_setup_label")
+}
 /// The same, as the link under the lock screen's password row.
-const HELLO_SETUP_LINK: &str = "Unlock and set up Windows Hello";
+fn hello_setup_link() -> &'static str {
+    i18n::t("login.hello_setup_link")
+}
 /// What sits under [`HELLO_SETUP_LABEL`].
-const HELLO_SETUP_HINT: &str = "First use: enter your master password, then click here";
+fn hello_setup_hint() -> &'static str {
+    i18n::t("login.hello_setup_hint")
+}
 /// The sign-in screen's title.
-pub const SIGN_IN_TITLE: &str = "Log in";
+pub fn sign_in_title() -> &'static str {
+    i18n::t("login.sign_in_title")
+}
 /// The server row's label and the help bubble behind its `?` (spec C 5.2).
-const SERVER_LABEL: &str = "Server";
-const SERVER_TIP: &str = "Most people use bitwarden.com. Pick EU if your account was made there, or Self-hosted if your company runs its own.";
+fn server_label() -> &'static str {
+    i18n::t("login.server_label")
+}
+fn server_tip() -> &'static str {
+    i18n::t("login.server_tip")
+}
 /// The password fields' placeholders.
-const PASSWORD_PLACEHOLDER: &str = "Your Bitwarden master password";
-const LOCK_PLACEHOLDER: &str = "Master password";
+fn password_placeholder() -> &'static str {
+    i18n::t("login.password_placeholder")
+}
+fn lock_placeholder() -> &'static str {
+    i18n::t("login.lock_placeholder")
+}
 
 /// Draws the login/unlock body: the sign-in form for an account that is not
 /// signed in (spec C 5.2), the lock stage for one that is (spec C 5.3). Pure
@@ -1929,7 +1946,7 @@ pub fn draw_login_window(
     // -- is not drawn while it is open.
     if let Some(state) = cli_setup {
         if status == BwStatus::Unauthenticated {
-            crate::kit::auth::title(ui, SIGN_IN_TITLE);
+            crate::kit::auth::title(ui, sign_in_title());
             ui.add_space(crate::kit::auth::FORM_GAP);
         }
         let pressed = draw_cli_setup_modal(ui, state);
@@ -1948,13 +1965,21 @@ pub fn draw_login_window(
 }
 
 /// What the email box says when it is empty (the sign-in gallery's words).
-pub const ENTER_EMAIL: &str = "Enter your email.";
+pub fn enter_email() -> &'static str {
+    i18n::t("login.enter_email")
+}
 /// What it says when there is no `@` in it.
-pub const BAD_EMAIL: &str = "That doesn't look like an email address.";
+pub fn bad_email() -> &'static str {
+    i18n::t("login.bad_email")
+}
 /// What the master-password box says when it is empty.
-pub const ENTER_PASSWORD: &str = "Enter your master password.";
+pub fn enter_password() -> &'static str {
+    i18n::t("login.enter_password")
+}
 /// What the Self-hosted address box says when it is empty.
-pub const ENTER_SERVER: &str = "Enter your server's address.";
+pub fn enter_server() -> &'static str {
+    i18n::t("login.enter_server")
+}
 
 /// Which part of the sign-in form a message is about, so it is drawn where
 /// the design draws it: under the field, as a banner, or as a stage of its
@@ -1979,6 +2004,25 @@ pub enum ErrorSpot {
 /// Reads where `message` belongs. Matching is on the opening words of the
 /// messages this file and [`friendly_auth_error`] write.
 pub fn error_spot(message: &str) -> ErrorSpot {
+    // The messages this file writes, matched WHOLE in the language in force: the
+    // answer must not depend on how a translator worded them.
+    let whole = message.trim();
+    for (key, spot) in [
+        (crate::tk!("login.enter_email"), ErrorSpot::Email),
+        (crate::tk!("login.bad_email"), ErrorSpot::Email),
+        (crate::tk!("login.enter_server"), ErrorSpot::ServerUrl),
+        (crate::tk!("login.enter_password"), ErrorSpot::Password),
+        (crate::tk!("login.err_bad_master_password"), ErrorSpot::Password),
+        (crate::tk!("login.err_bad_credentials"), ErrorSpot::Password),
+        (crate::tk!("login.err_unreachable"), ErrorSpot::Unreachable),
+        (crate::tk!("login.err_too_many"), ErrorSpot::TooMany),
+    ] {
+        if whole == i18n::t(key) {
+            return spot;
+        }
+    }
+    // What is left is the English opening words, for messages that arrive as
+    // text from elsewhere (the CLI's own stderr, a test).
     let m = message.trim().to_ascii_lowercase();
     if m.starts_with("enter your email") || m.contains("look like an email") {
         ErrorSpot::Email
@@ -2056,16 +2100,16 @@ fn unreachable_banner(choice: ServerChoice) -> (crate::kit::auth::BannerTone, &'
     if choice == ServerChoice::SelfHosted {
         (
             BannerTone::Danger,
-            "Can't reach your server",
-            "Check the address, or connect to your company VPN.",
-            "Retry",
+            i18n::t("login.banner_server_title"),
+            i18n::t("login.banner_server_body"),
+            i18n::t("login.retry"),
         )
     } else {
         (
             BannerTone::Caution,
-            "You're offline",
-            "Connect to the internet to log in. Once you have, your vault also opens offline.",
-            "Try again",
+            i18n::t("login.banner_offline_title"),
+            i18n::t("login.banner_offline_body"),
+            i18n::t("login.try_again"),
         )
     }
 }
@@ -2112,9 +2156,9 @@ fn draw_sign_in_form(
         ui.add_space(FORM_GAP);
     }
 
-    auth::title(ui, SIGN_IN_TITLE);
+    auth::title(ui, sign_in_title());
     ui.add_space(6.0);
-    auth::subtitle(ui, SIGN_IN_SUBTITLE);
+    auth::subtitle(ui, sign_in_subtitle());
     ui.add_space(FORM_GAP);
 
     let needs_setup = !hello.enrolled;
@@ -2139,7 +2183,7 @@ fn draw_sign_in_form(
     // in it at all -- see their docs for why a read-only `TextEdit` is not the
     // same thing.
     use crate::kit::input;
-    group(ui, "Email", auth_in_progress, under(ErrorSpot::Email), |ui, bad| {
+    group(ui, i18n::t("login.email_label"), auth_in_progress, under(ErrorSpot::Email), |ui, bad| {
         if auth_in_progress {
             input::text_disabled(ui, &form.email, width, input::SIGN_IN);
         } else {
@@ -2153,11 +2197,11 @@ fn draw_sign_in_form(
         egui::vec2(width, 25.0),
         egui::Layout::left_to_right(egui::Align::Center),
         |ui| {
-            auth::label_dim(ui, "Master password", auth_in_progress);
+            auth::label_dim(ui, i18n::t("login.master_password_label"), auth_in_progress);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !auth_in_progress {
-                    let forgot = auth::link(ui, FORGOT_LABEL);
-                    crate::kit::tips::hint(ui, &forgot, FORGOT_HINT, &[]);
+                    let forgot = auth::link(ui, forgot_label());
+                    crate::kit::tips::hint(ui, &forgot, forgot_hint(), &[]);
                     if forgot.clicked() {
                         action = Some(LoginAction::ForgotPassword);
                     }
@@ -2178,7 +2222,7 @@ fn draw_sign_in_form(
             egui::Id::new("auth-password"),
             &mut form.password,
             &mut form.reveal_password,
-            PASSWORD_PLACEHOLDER,
+            password_placeholder(),
             width,
             password_error.is_some(),
         );
@@ -2193,11 +2237,11 @@ fn draw_sign_in_form(
     // under it.
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 8.0;
-        auth::label(ui, SERVER_LABEL);
+        auth::label(ui, server_label());
         crate::kit::tips::help_dot(
             ui,
             egui::Id::new("auth-server-tip"),
-            SERVER_TIP,
+            server_tip(),
             260.0,
             crate::kit::tips::Placement::Above,
         );
@@ -2249,7 +2293,7 @@ fn draw_sign_in_form(
     // bar inside the button. A second submit would spawn another `bw login`
     // against the same account while the first is still running, so the press
     // is ignored rather than the button greyed (the design keeps it at 85%).
-    let label = if auth_in_progress { CHECKING_LABEL } else { LOG_IN_LABEL };
+    let label = if auth_in_progress { checking_label() } else { log_in_label() };
     let log_in = auth::submit_button(ui, label, auth_in_progress, width);
     if log_in.clicked() && !auth_in_progress {
         action = Some(LoginAction::Submit);
@@ -2274,7 +2318,7 @@ fn draw_sign_in_form(
                     52.0,
                     14,
                     16.0,
-                    HELLO_SETUP_LABEL,
+                    hello_setup_label(),
                     Some(crate::kit::icon::glyph::FINGERPRINT),
                     width,
                 )
@@ -2283,12 +2327,12 @@ fn draw_sign_in_form(
             .clicked();
         ui.add_space(8.0);
         let p = crate::kit::tokens::palette(ui.ctx());
-        ui.label(theme::regular(HELLO_SETUP_HINT, 13.0).color(p.text_faint));
+        ui.label(theme::regular(hello_setup_hint(), 13.0).color(p.text_faint));
         let clicked = !auth_in_progress
             && (pressed || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H)));
         if clicked {
             if form.password.is_empty() {
-                form.error = Some(HELLO_SETUP_NEEDS_PASSWORD.to_string());
+                form.error = Some(hello_setup_needs_password().to_string());
             } else {
                 form.enable_hello = true;
                 action = Some(LoginAction::Submit);
@@ -2300,7 +2344,7 @@ fn draw_sign_in_form(
     // cannot complete -- Duo and WebAuthn are not reachable from `bw login`
     // either -- so it is kept, as a link under the form.
     ui.add_space(FORM_GAP);
-    if auth::link(ui, crate::api_key_ui::USE_API_KEY_LABEL).clicked() {
+    if auth::link(ui, crate::api_key_ui::use_api_key_label()).clicked() {
         action = Some(LoginAction::UseApiKey);
     }
 
@@ -2323,39 +2367,59 @@ fn draw_too_many(ui: &mut egui::Ui, form: &mut LoginForm) -> Option<LoginAction>
     let width = ui.available_width();
     auth::stage_tile(ui, auth::LOCK_TILE, true);
     ui.add_space(20.0);
-    auth::stage_title(ui, TOO_MANY_TITLE);
+    auth::stage_title(ui, too_many_title());
     ui.add_space(6.0);
-    auth::subtitle(ui, TOO_MANY_LINE);
+    auth::subtitle(ui, too_many_line());
     ui.add_space(20.0);
-    auth::wait_panel(ui, "Try again in", TOO_MANY_WAIT);
+    auth::wait_panel(ui, i18n::t("login.try_again_in"), too_many_wait());
     ui.add_space(20.0);
-    if auth::wide_button(ui, ButtonKind::Outline, 52.0, 14, 16.0, TRY_AGAIN_LABEL, None, width).clicked() {
+    if auth::wide_button(ui, ButtonKind::Outline, 52.0, 14, 16.0, try_again_label(), None, width).clicked() {
         form.error = None;
     }
     ui.add_space(FORM_GAP);
-    if auth::link_big(ui, FORGOT_LONG_LABEL).clicked() {
+    if auth::link_big(ui, forgot_long_label()).clicked() {
         action = Some(LoginAction::ForgotPassword);
     }
     action
 }
 
 /// The sign-in screen's line under its title.
-pub const SIGN_IN_SUBTITLE: &str = "Use your Bitwarden account";
+pub fn sign_in_subtitle() -> &'static str {
+    i18n::t("login.sign_in_subtitle")
+}
 /// The link on the master-password label row, and what it says on hover.
-const FORGOT_LABEL: &str = "Forgot?";
-const FORGOT_HINT: &str = "Bitwarden can't see or reset it";
+fn forgot_label() -> &'static str {
+    i18n::t("login.forgot_label")
+}
+fn forgot_hint() -> &'static str {
+    i18n::t("login.forgot_hint")
+}
 /// The same link under the "Too many tries" panel.
-const FORGOT_LONG_LABEL: &str = "Forgot master password?";
+fn forgot_long_label() -> &'static str {
+    i18n::t("login.forgot_long_label")
+}
 /// The "Too many tries" stage.
-pub const TOO_MANY_TITLE: &str = "Too many tries";
-pub const TOO_MANY_LINE: &str = "To keep your vault safe, logging in is paused on this PC.";
-pub const TOO_MANY_WAIT: &str = "a few minutes";
-pub const TRY_AGAIN_LABEL: &str = "Try again";
+pub fn too_many_title() -> &'static str {
+    i18n::t("login.too_many_title")
+}
+pub fn too_many_line() -> &'static str {
+    i18n::t("login.too_many_line")
+}
+pub fn too_many_wait() -> &'static str {
+    i18n::t("login.too_many_wait")
+}
+pub fn try_again_label() -> &'static str {
+    i18n::t("login.try_again")
+}
 /// The button's word while the server is answering.
-pub const CHECKING_LABEL: &str = "Checking";
+pub fn checking_label() -> &'static str {
+    i18n::t("login.checking")
+}
 
 /// The sign-in button's word.
-const LOG_IN_LABEL: &str = "Log in";
+fn log_in_label() -> &'static str {
+    i18n::t("login.log_in")
+}
 
 /// The lock stage (spec C 5.3): the shield, the heading, then either the
 /// Windows Hello button or the master-password row, with Log out and the
@@ -2383,7 +2447,7 @@ fn draw_lock_stage(
 
     ui.vertical_centered(|ui| {
         ui.spacing_mut().item_spacing.y = auth::LOCK_GAP;
-        auth::lock_header(ui, auth::LOCK_HEADING, auth::LOCK_SUB);
+        auth::lock_header(ui, auth::lock_heading(), auth::lock_sub());
         if let Some(email) = account_email {
             auth::lock_quiet(ui, email);
         }
@@ -2392,7 +2456,7 @@ fn draw_lock_stage(
         }
 
         if hello_stage {
-            let label = if auth_in_progress { auth::HELLO_CHECKING } else { auth::HELLO_LABEL };
+            let label = if auth_in_progress { auth::hello_checking() } else { auth::hello_label() };
             // Ignored while a check is under way: a second click would start a
             // second `bw unlock` over the first.
             let pressed = auth::hello_button(ui, label, auth_in_progress).clicked();
@@ -2401,11 +2465,11 @@ fn draw_lock_stage(
             {
                 action = Some(LoginAction::HelloUnlock);
             }
-            if !auth_in_progress && auth::lock_link(ui, auth::USE_PASSWORD_LABEL).clicked() {
+            if !auth_in_progress && auth::lock_link(ui, auth::use_password_label()).clicked() {
                 form.lock_stage = LockStage::Password;
             }
         } else {
-            let unlock_width = auth::lock_button_width(ui.ctx(), UNLOCK_LABEL);
+            let unlock_width = auth::lock_button_width(ui.ctx(), unlock_label());
             let field_width = (width - 10.0 - unlock_width).max(120.0);
             let mut unlock = false;
             ui.allocate_ui_with_layout(
@@ -2421,13 +2485,13 @@ fn draw_lock_stage(
                             egui::Id::new("auth-lock-password"),
                             &mut form.password,
                             &mut form.reveal_password,
-                            LOCK_PLACEHOLDER,
+                            lock_placeholder(),
                             field_width,
                             input::LOCK,
                         );
                     }
                     let button = ui
-                        .add_enabled_ui(!auth_in_progress, |ui| auth::lock_button(ui, UNLOCK_LABEL))
+                        .add_enabled_ui(!auth_in_progress, |ui| auth::lock_button(ui, unlock_label()))
                         .inner;
                     unlock = button.clicked();
                 },
@@ -2443,15 +2507,15 @@ fn draw_lock_stage(
             // with the password typed, one click unlocks AND enrols.
             if hello.available && !auth_in_progress {
                 if enrolled {
-                    if auth::lock_link(ui, auth::HELLO_LABEL).clicked() {
+                    if auth::lock_link(ui, auth::hello_label()).clicked() {
                         form.lock_stage = LockStage::Hello;
                     }
                 } else {
-                    let clicked = auth::lock_link(ui, HELLO_SETUP_LINK).clicked()
+                    let clicked = auth::lock_link(ui, hello_setup_link()).clicked()
                         || ui.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::H));
                     if clicked {
                         if form.password.is_empty() {
-                            form.error = Some(HELLO_SETUP_NEEDS_PASSWORD.to_string());
+                            form.error = Some(hello_setup_needs_password().to_string());
                         } else {
                             form.enable_hello = true;
                             action = Some(LoginAction::Submit);
@@ -2467,7 +2531,7 @@ fn draw_lock_stage(
 
         // The foot: which server this vault is on, and the way out.
         auth::lock_quiet(ui, server_host);
-        if auth::lock_link(ui, LOG_OUT_LABEL).clicked() {
+        if auth::lock_link(ui, log_out_label()).clicked() {
             action = Some(LoginAction::LogOut);
         }
     });
@@ -2475,8 +2539,12 @@ fn draw_lock_stage(
 }
 
 /// The lock screen's Unlock button and the way out under it.
-const UNLOCK_LABEL: &str = "Unlock";
-const LOG_OUT_LABEL: &str = "Log out";
+fn unlock_label() -> &'static str {
+    i18n::t("login.unlock")
+}
+fn log_out_label() -> &'static str {
+    i18n::t("login.log_out")
+}
 
 /// Runs a `bw login`/`bw unlock` on a one-shot background thread and reports
 /// the result over `tx`.
@@ -3850,7 +3918,7 @@ pub fn build_login_frame(
                                     let url = form.server_url.trim().to_string();
                                     if url.is_empty() {
                                         form.error =
-                                            Some(ENTER_SERVER.to_string());
+                                            Some(enter_server().to_string());
                                         None
                                     } else {
                                         Some(url)
@@ -3991,7 +4059,7 @@ pub fn build_login_frame(
                             // the panel and its Ctrl+H shortcut are never
                             // drawn -- but stated rather than unwrapped: the
                             // alternative would be an account-less blob.
-                            None => Err("There is no account to unlock with Windows Hello."
+                            None => Err(i18n::t("login.hello_no_account")
                                 .to_string()),
                         };
                         match opened {
@@ -5295,7 +5363,7 @@ Cryptography error, The decryption operation failed";
         ] {
             assert_eq!(
                 missing_credential_message(status, "a@b.c", ""),
-                Some(ENTER_PASSWORD),
+                Some(enter_password()),
                 "{status:?} let an empty password through"
             );
         }
@@ -5306,7 +5374,7 @@ Cryptography error, The decryption operation failed";
         // Signing in needs one...
         assert_eq!(
             missing_credential_message(BwStatus::Unauthenticated, "   ", "pw"),
-            Some(ENTER_EMAIL)
+            Some(enter_email())
         );
         // ...whereas unlocking already knows whose vault this is, so a blank
         // email is irrelevant and must not block the unlock.
@@ -5996,7 +6064,7 @@ mod first_run_notice_tests {
             "the modal painted nothing about the CLI; got {with:?}"
         );
         assert!(
-            with.iter().any(|t| t == SIGN_IN_TITLE),
+            with.iter().any(|t| t == sign_in_title()),
             "control: this is not the login window at all; got {with:?}"
         );
 
@@ -6296,7 +6364,7 @@ mod first_run_notice_tests {
             "EU",
             "Self-hosted",
             "Log in and set up Windows Hello",
-            crate::api_key_ui::USE_API_KEY_LABEL,
+            crate::api_key_ui::use_api_key_label(),
             "Uses your existing Bitwarden account",
         ] {
             assert!(has(&painted, wanted), "{wanted:?} is missing; painted {painted:?}");
@@ -6379,7 +6447,7 @@ mod first_run_notice_tests {
     }
 
     fn auth_checking() -> &'static str {
-        crate::kit::auth::HELLO_CHECKING
+        crate::kit::auth::hello_checking()
     }
 
     #[test]
@@ -6470,13 +6538,13 @@ mod first_run_notice_tests {
 
     #[test]
     fn a_message_is_drawn_where_it_belongs() {
-        assert_eq!(error_spot(ENTER_EMAIL), ErrorSpot::Email);
-        assert_eq!(error_spot(BAD_EMAIL), ErrorSpot::Email);
-        assert_eq!(error_spot(ENTER_PASSWORD), ErrorSpot::Password);
-        assert_eq!(error_spot(HELLO_SETUP_NEEDS_PASSWORD), ErrorSpot::Password);
+        assert_eq!(error_spot(enter_email()), ErrorSpot::Email);
+        assert_eq!(error_spot(bad_email()), ErrorSpot::Email);
+        assert_eq!(error_spot(enter_password()), ErrorSpot::Password);
+        assert_eq!(error_spot(hello_setup_needs_password()), ErrorSpot::Password);
         assert_eq!(error_spot(&friendly_auth_error("Invalid username or password")), ErrorSpot::Password);
         assert_eq!(error_spot(&friendly_auth_error("decryption operation failed")), ErrorSpot::Password);
-        assert_eq!(error_spot(ENTER_SERVER), ErrorSpot::ServerUrl);
+        assert_eq!(error_spot(enter_server()), ErrorSpot::ServerUrl);
         assert_eq!(error_spot(&friendly_auth_error("getaddrinfo ENOTFOUND")), ErrorSpot::Unreachable);
         assert_eq!(error_spot(&friendly_auth_error("Too many requests")), ErrorSpot::TooMany);
         assert_eq!(error_spot("something nobody planned for"), ErrorSpot::General);
@@ -6495,26 +6563,26 @@ mod first_run_notice_tests {
 
     #[test]
     fn the_email_check_has_the_two_words_the_gallery_has() {
-        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "", "pw"), Some(ENTER_EMAIL));
-        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "nobody", "pw"), Some(BAD_EMAIL));
-        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "a@b.c", ""), Some(ENTER_PASSWORD));
-        assert_eq!(missing_credential_message(BwStatus::Locked, "", ""), Some(ENTER_PASSWORD));
+        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "", "pw"), Some(enter_email()));
+        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "nobody", "pw"), Some(bad_email()));
+        assert_eq!(missing_credential_message(BwStatus::Unauthenticated, "a@b.c", ""), Some(enter_password()));
+        assert_eq!(missing_credential_message(BwStatus::Locked, "", ""), Some(enter_password()));
     }
 
     #[test]
     fn the_form_has_a_title_a_line_and_forgot() {
         let mut form = LoginForm::default();
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
-        for word in [SIGN_IN_TITLE, SIGN_IN_SUBTITLE, "Email", "Master password", "Forgot?", "Server"] {
+        for word in [sign_in_title(), sign_in_subtitle(), "Email", "Master password", "Forgot?", "Server"] {
             assert!(painted.text(word).is_some(), "{word} is missing");
         }
     }
 
     #[test]
     fn an_email_error_sits_under_the_email_box_and_not_at_the_foot() {
-        let mut form = login_form(|form| { form.error = Some(ENTER_EMAIL.to_string()); });
+        let mut form = login_form(|form| { form.error = Some(enter_email().to_string()); });
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
-        let message = y_of(&painted, ENTER_EMAIL);
+        let message = y_of(&painted, enter_email());
         assert!(message > y_of(&painted, "Email"), "under the Email label");
         assert!(message < y_of(&painted, "Master password"), "above the next field");
         let p = crate::kit::tokens::palette(&crate::kit::testing::ctx());
@@ -6541,7 +6609,7 @@ mod first_run_notice_tests {
         assert!(painted.text("You're offline").is_some());
         assert!(painted.text("Try again").is_some());
         assert!(painted.text(&down).is_none(), "the sentence is the banner's, not a second line");
-        assert!(y_of(&painted, "You're offline") < y_of(&painted, SIGN_IN_TITLE), "above the title");
+        assert!(y_of(&painted, "You're offline") < y_of(&painted, sign_in_title()), "above the title");
         assert!(painted.text("Master password").is_some(), "the form is still there");
 
         let mut form = login_form(|form| { form.error = Some(down); form.server_choice = ServerChoice::SelfHosted; });
@@ -6556,21 +6624,21 @@ mod first_run_notice_tests {
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
         assert!(y_of(&painted, "https://") > y_of(&painted, "Self-hosted"), "under the segmented control");
         assert!(painted.text("vault.example.com").is_some(), "the scheme is the prefix, the rest is typed");
-        assert!(y_of(&painted, "https://") < y_of(&painted, crate::api_key_ui::USE_API_KEY_LABEL), "above the links");
+        assert!(y_of(&painted, "https://") < y_of(&painted, crate::api_key_ui::use_api_key_label()), "above the links");
     }
 
     #[test]
     fn a_missing_address_is_red_under_its_own_box() {
-        let mut form = login_form(|form| { form.server_choice = ServerChoice::SelfHosted; form.error = Some(ENTER_SERVER.to_string()); });
+        let mut form = login_form(|form| { form.server_choice = ServerChoice::SelfHosted; form.error = Some(enter_server().to_string()); });
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
-        assert!(y_of(&painted, ENTER_SERVER) > y_of(&painted, "https://"));
+        assert!(y_of(&painted, enter_server()) > y_of(&painted, "https://"));
     }
 
     #[test]
     fn the_button_reads_checking_while_the_server_answers() {
         let mut form = LoginForm::default();
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, true, NO_HELLO);
-        assert!(painted.text(CHECKING_LABEL).is_some());
+        assert!(painted.text(checking_label()).is_some());
         assert!(painted.text("Forgot?").is_none(), "no link into the web vault while credentials are out");
     }
 
@@ -6578,7 +6646,7 @@ mod first_run_notice_tests {
     fn too_many_tries_replaces_the_form_and_try_again_puts_it_back() {
         let mut form = login_form(|form| { form.error = Some(friendly_auth_error("Too many requests from your network")); });
         let painted = gallery_frames(BwStatus::Unauthenticated, &mut form, false, NO_HELLO);
-        for word in [TOO_MANY_TITLE, TOO_MANY_LINE, "Try again in", TOO_MANY_WAIT, "Forgot master password?"] {
+        for word in [too_many_title(), too_many_line(), "Try again in", too_many_wait(), "Forgot master password?"] {
             assert!(painted.text(word).is_some(), "{word} is missing");
         }
         assert!(painted.text("Master password").is_none(), "the form is gone");
@@ -6607,7 +6675,7 @@ mod first_run_notice_tests {
         for i in 0..8 {
             painted = crate::kit::testing::frame(&ctx, f64::from(i) * 0.2, GALLERY, vec![], |ui| draw(ui, &mut form));
         }
-        let at = painted.texts.iter().find(|t| t.0 == TRY_AGAIN_LABEL).expect("the button").2.center();
+        let at = painted.texts.iter().find(|t| t.0 == try_again_label()).expect("the button").2.center();
         crate::kit::testing::frame(&ctx, 1.6, GALLERY, crate::kit::testing::click_at(at), |ui| draw(ui, &mut form));
         assert_eq!(form.error, None);
     }
