@@ -995,6 +995,8 @@ pub enum ShellRequest {
     OpenSettings,
     /// The top bar's `Ctrl K` chip: open the command palette.
     OpenPalette,
+    /// Settings > Import & export > Import: open the Import wizard.
+    OpenImport,
 }
 
 /// Records `request` for the window to answer on its next frame.

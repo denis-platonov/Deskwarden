@@ -28,6 +28,8 @@ pub enum PaletteAction {
     /// Slice 6: the Generator screen.
     Generate,
     Share,
+    /// Slice 9: the Import wizard.
+    Import,
     Settings,
     Lock,
 }
@@ -72,7 +74,7 @@ pub fn matching_items<'a>(items: &'a [VaultItem], query: &str) -> Vec<&'a VaultI
 }
 
 /// The actions whose label holds the query. "Share" is offered only with an
-/// item selected. (Import joins with its wizard, slice 9.)
+/// item selected. "Import passwords" opens the slice 9 wizard.
 pub fn matching_actions(selected: Option<&str>, query: &str) -> Vec<ActionRow> {
     let query = query.trim().to_lowercase();
     let mut rows = vec![
@@ -82,6 +84,7 @@ pub fn matching_actions(selected: Option<&str>, query: &str) -> Vec<ActionRow> {
     if let Some(name) = selected {
         rows.push(ActionRow { action: PaletteAction::Share, label: format!("Share {name}"), hint: "", glyph: glyph::SHARED });
     }
+    rows.push(ActionRow { action: PaletteAction::Import, label: "Import passwords".into(), hint: "", glyph: super::import_ui::DOWNLOAD_TRAY });
     rows.push(ActionRow { action: PaletteAction::Settings, label: "Open settings".into(), hint: "", glyph: glyph::SETTINGS });
     rows.push(ActionRow { action: PaletteAction::Lock, label: "Lock now".into(), hint: "Ctrl L", glyph: glyph::LOCK });
     rows.retain(|row| row.label.to_lowercase().contains(&query));
@@ -284,7 +287,8 @@ mod tests {
     #[test]
     fn actions_filter_by_label() {
         let labels = |q: &str| matching_actions(Some("Ledgerline"), q).into_iter().map(|a| a.label).collect::<Vec<_>>();
-        assert_eq!(labels(""), vec!["New login", "Generate a password", "Share Ledgerline", "Open settings", "Lock now"]);
+        assert_eq!(labels(""), vec!["New login", "Generate a password", "Share Ledgerline", "Import passwords", "Open settings", "Lock now"]);
+        assert_eq!(labels("import"), vec!["Import passwords"]);
         assert_eq!(labels("lock"), vec!["Lock now"]);
         assert!(matching_actions(None, "share").is_empty(), "no Share without an item");
     }

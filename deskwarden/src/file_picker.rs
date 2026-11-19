@@ -258,6 +258,59 @@ fn image_options(current: FILEOPENDIALOGOPTIONS) -> FILEOPENDIALOGOPTIONS {
 }
 
 // ---------------------------------------------------------------------------
+// The import dialog
+// ---------------------------------------------------------------------------
+
+/// **What the Import wizard's file dialog offers**, as the two halves of its
+/// first filter row. Every source the wizard reads is a `.csv` or a `.json`;
+/// a second row lets the user reach a file with some other name, because a
+/// password manager's export is whatever its author called it.
+pub const IMPORT_FILTER_NAME: &str = "Password export (*.csv, *.json)";
+pub const IMPORT_FILTER_SPEC: &str = "*.csv;*.json";
+
+/// Opens the shell's file-open dialog for the **Import wizard** and returns the
+/// chosen path, or `None` if the user cancelled or the dialog could not be
+/// created. Cancel and failure are the same answer, for [`pick_executable`]'s
+/// reason.
+///
+/// It chooses a path and nothing else: `vault_window::import_ui` reads the
+/// file, bounds its size and decides whether it is the format the user said.
+///
+/// # Blocking
+///
+/// The same rule as its siblings: `Show` is modal and pumps its own message
+/// loop, so this is called from the **vault window's action handler**, after
+/// the frame's draw closures have returned.
+pub fn pick_import_file() -> Option<String> {
+    with_com(|| unsafe { show_import_dialog() })
+}
+
+/// The COM half of [`pick_import_file`], split out so [`with_com`]'s balance
+/// covers every `?` in it -- `show_dialog`'s reason exactly.
+///
+/// # Safety
+///
+/// The calling thread must have COM initialised.
+unsafe fn show_import_dialog() -> Option<String> {
+    let dialog: IFileOpenDialog =
+        CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+    let filters = [
+        COMDLG_FILTERSPEC { pszName: w!("Password export (*.csv, *.json)"), pszSpec: w!("*.csv;*.json") },
+        COMDLG_FILTERSPEC { pszName: w!("All files"), pszSpec: w!("*.*") },
+    ];
+    let _ = dialog.SetFileTypes(&filters);
+    let _ = dialog.SetFileTypeIndex(1); // 1-based, not 0-based.
+    let _ = dialog.SetTitle(w!("Choose the file you exported"));
+    // The answer is about to be handed to `std::fs::read`, so it must be a real
+    // path: `image_options`' reason exactly.
+    if let Ok(current) = dialog.GetOptions() {
+        let _ = dialog.SetOptions(image_options(current));
+    }
+    dialog.Show(HWND::default()).ok()?;
+    chosen_path(&dialog)
+}
+
+// ---------------------------------------------------------------------------
 // The item-icon dialog
 // ---------------------------------------------------------------------------
 
@@ -844,10 +897,11 @@ mod tests {
         assert!(code.contains("    with_com(|| unsafe { show_dialog() })\n"));
         assert!(code.contains("    with_com(|| unsafe { show_image_dialog() })\n"));
         assert!(code.contains("    with_com(|| unsafe { show_icon_dialog() })\n"));
+        assert!(code.contains("    with_com(|| unsafe { show_import_dialog() })\n"));
         assert!(code.contains(
             "    with_com(|| unsafe { show_save_dialog(suggested_name) }).map(PathBuf::from)\n"
         ));
-        // **Four dialogs, four `Show` calls, and no fifth entry point that
+        // **Five dialogs, five `Show` calls (the Import wizard's is the fifth), and no fifth entry point that
         // skipped the balance above.** The count was three until "Select
         // icon..." added `show_icon_dialog`; it is raised rather than relaxed,
         // because the whole value of this line is that a new dialog cannot
@@ -855,7 +909,7 @@ mod tests {
         // exactly what this edit made happen.
         assert_eq!(
             code.matches("dialog.Show(HWND::default()).ok()?;").count(),
-            4,
+            5,
             "a dialog was added or removed without the apartment balance being re-checked"
         );
     }
@@ -888,6 +942,17 @@ mod tests {
                 "the icon filter offers {absent}, which `favicon::decode_rgba` cannot read"
             );
         }
+    }
+
+    /// The Import dialog's first filter row is the two constants that describe
+    /// it, for [`the_icon_dialogs_filter_is_the_one_the_constants_describe`]'s
+    /// reason: `w!()` takes a literal.
+    #[test]
+    fn the_import_dialogs_filter_is_the_one_the_constants_describe() {
+        let code = code_under_test();
+        assert!(code.contains(&format!(r#"pszName: w!("{IMPORT_FILTER_NAME}")"#)));
+        assert!(code.contains(&format!(r#"pszSpec: w!("{IMPORT_FILTER_SPEC}")"#)));
+        assert!(IMPORT_FILTER_SPEC.contains("*.csv") && IMPORT_FILTER_SPEC.contains("*.json"));
     }
 
     /// **The image route reaches the shell through this module's dialog.**

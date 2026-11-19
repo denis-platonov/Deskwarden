@@ -1203,6 +1203,7 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "empty-trash-scrim",
     "folder-edit-scrim",
     "icon-pick-scrim",
+    "import-scrim",
     "launch-confirm-scrim",
     "new-item-scrim",
     "palette-scrim",

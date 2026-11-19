@@ -660,6 +660,11 @@ enum Surface {
     ModalNewItem,
     /// The Ctrl+K palette over the shell, with a query (spec B §4).
     ModalPalette,
+    /// The Import wizard's four steps over the shell (spec B §3).
+    ModalImportSource,
+    ModalImportFile,
+    ModalImportProgress,
+    ModalImportDone,
     /// The Generator screen (spec C §1).
     ToolGenerator,
     /// Settings as a screen (spec C §2), one shot per page worth seeing.
@@ -927,6 +932,10 @@ const ALL: &[Surface] = &[
     Surface::VaultShellOffline,
     Surface::ModalNewItem,
     Surface::ModalPalette,
+    Surface::ModalImportSource,
+    Surface::ModalImportFile,
+    Surface::ModalImportProgress,
+    Surface::ModalImportDone,
     Surface::ToolGenerator,
     Surface::SettingsGeneral,
     Surface::SettingsSecurity,
@@ -1035,6 +1044,10 @@ impl Surface {
             Surface::VaultShellOffline => "vault_shell_offline",
             Surface::ModalNewItem => "modal_new_item",
             Surface::ModalPalette => "modal_palette",
+            Surface::ModalImportSource => "modal_import_source",
+            Surface::ModalImportFile => "modal_import_file",
+            Surface::ModalImportProgress => "modal_import_progress",
+            Surface::ModalImportDone => "modal_import_done",
             Surface::ToolGenerator => "tool_generator",
             Surface::SettingsGeneral => "settings_general",
             Surface::SettingsSecurity => "settings_security",
@@ -1230,6 +1243,10 @@ impl Surface {
             | Surface::VaultShellCard
             | Surface::VaultShellOffline
             | Surface::ModalNewItem
+            | Surface::ModalImportSource
+            | Surface::ModalImportFile
+            | Surface::ModalImportProgress
+            | Surface::ModalImportDone
             | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
             Surface::ToolGenerator
             | Surface::SettingsGeneral
@@ -1381,6 +1398,10 @@ fn main() -> eframe::Result {
             Surface::VaultShellOffline,
             Surface::ModalNewItem,
             Surface::ModalPalette,
+            Surface::ModalImportSource,
+            Surface::ModalImportFile,
+            Surface::ModalImportProgress,
+            Surface::ModalImportDone,
             Surface::ToolGenerator,
             Surface::SettingsGeneral,
             Surface::SettingsSecurity,
@@ -1911,6 +1932,25 @@ impl eframe::App for Preview {
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
                 let mut state = deskwarden::vault_window::palette::PaletteState { query: "led".into(), active: 0 };
                 let _ = deskwarden::vault_window::palette::draw(root.ctx(), &mut state, &self.fixtures.list, Some("Ledgerline"));
+            }
+            surface @ (Surface::ModalImportSource
+            | Surface::ModalImportFile
+            | Surface::ModalImportProgress
+            | Surface::ModalImportDone) => {
+                use deskwarden::vault_window::import_formats::ImportSource;
+                use deskwarden::vault_window::import_ui::{self, Step, Summary, Wizard};
+                self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
+                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
+                let done = Summary { imported: 128, duplicates: 3, ..Summary::default() };
+                let mut wizard = match surface {
+                    Surface::ModalImportSource => Wizard::default(),
+                    Surface::ModalImportFile => Wizard::preview(Step::File, ImportSource::Browser, Summary::default(), (0, 0)),
+                    Surface::ModalImportProgress => {
+                        Wizard::preview(Step::Progress, ImportSource::Browser, Summary::default(), (84, 128))
+                    }
+                    _ => Wizard::preview(Step::Done, ImportSource::Browser, done, (0, 0)),
+                };
+                let _ = import_ui::draw(root.ctx(), &mut wizard);
             }
             Surface::VaultShellOffline => {
                 // The login the detail pane shows is the row selected.
