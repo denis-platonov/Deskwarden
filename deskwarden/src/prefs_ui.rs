@@ -168,12 +168,9 @@ const UI_LOADED_LABEL: &str = "Open the vault instantly";
 ///    that the old sentence explained with the wrong reason. Naming both
 ///    directions of the toggle in one clause covers 2 and 3 together, and
 ///    tells the reader when it starts working.
-const UI_LOADED_DESCRIPTION: &str =
-    "Keeps the vault window loaded and hidden after you close it, so it opens \
-     immediately next time. Holds about 76 MB while the vault is unlocked. \
-     Locking or switching account closes it fully. Turning this on or off \
-     closes the window that is open, so it applies from the next time you \
-     open the vault.";
+const UI_LOADED_SUB: &str = "Opens at once next time";
+/// The tip behind the row's `?` dot.
+const UI_LOADED_TIP: &str = "Keeps the vault window loaded and hidden after you close it, so it opens immediately, and holds about 76 MB while the vault is unlocked. Locking or switching account closes it fully, and turning this on or off closes the open window, so it applies from the next time you open the vault.";
 
 /// The description under [`BACKEND_LABEL`].
 ///
@@ -210,9 +207,9 @@ const UI_LOADED_DESCRIPTION: &str =
 /// running backend would ghost the row a restart later than the switch that
 /// caused it, so the user would turn `bw` back on and find this row still
 /// grey with nothing on the page explaining the delay.
-const BACKEND_DESCRIPTION: &str =
-    "Faster, and uses about 118 MB while idle. Off runs it only while the vault window is \
-     open; autofill is unaffected either way.";
+const BACKEND_SUB: &str = "Faster, but uses more memory";
+/// The tip behind the row's `?` dot.
+const BACKEND_TIP: &str = "Faster, and uses about 118 MB while idle. Off runs it only while the vault window is open; autofill is unaffected either way.";
 
 /// The backend choice's label: the QUESTION, with the two answers beside it.
 ///
@@ -254,7 +251,7 @@ const BUILT_IN_CHOICE: &str = "Deskwarden's built-in client";
 
 /// The description shown under [`BACKEND_CHOICE_LABEL`], in its two states.
 ///
-/// A pure function of one fact, for [`disk_cache_description`]'s reason
+/// A pure function of one fact, for [`disk_cache_tip`]'s reason
 /// exactly: this is the text a user reads before deciding where their master
 /// key lives, so it is asserted by tests rather than buried in an eframe
 /// closure where nothing can reach it.
@@ -299,16 +296,10 @@ const BUILT_IN_CHOICE: &str = "Deskwarden's built-in client";
 /// (`accounts::official_cli_after_sign_in`, which reads exactly the field this
 /// row writes). A restart is one way to reach a sign-in and is no longer the
 /// only one, so the row names the moment rather than one route to it.
-fn official_crypto_description(self_hosted: bool) -> &'static str {
+fn official_crypto_tip(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "The official Bitwarden CLI is the `bw` program: it holds your keys in a background \
-         process of its own, and costs about 118 MB of RAM. Deskwarden's built-in client \
-         talks to your server itself for about 19 MB in total — but then the key that \
-         unlocks your vault is stored in the app, kept on this PC and protected by Windows, \
-         and unlike a session it never expires, so anyone who can run programs as you on \
-         this PC can use it.\n\n\
-         Changing this takes effect the next time you sign in to this account, and the \
-         sign-in window asks the same question there with this answer already offered."
+        "The official Bitwarden CLI (`bw`) holds your keys in a background process of its own and costs about 118 MB of RAM. \
+         Deskwarden's built-in client talks to your server itself for about 19 MB, but then the key that unlocks your vault is stored in the app, protected by Windows, and unlike a session it never expires, so anyone who can run programs as you on this PC can use it."
     } else {
         // Not a silent no-op under the same label, and not a hidden row. The
         // owner's rule is "disabled if not self-hosted vault to avoid issues
@@ -318,9 +309,16 @@ fn official_crypto_description(self_hosted: bool) -> &'static str {
         // a self-hoster who has not finished setting up wondering where the
         // setting went; a ghosted one with this sentence under it says
         // exactly what would make it available.
-        "Only available on a self-hosted server. On bitwarden.com and bitwarden.eu — and until \
-         Deskwarden knows which server this account is on — the vault always goes through the \
-         official Bitwarden CLI."
+        "On bitwarden.com and bitwarden.eu, and until Deskwarden knows which server this account is on, the vault always goes through the official Bitwarden CLI."
+    }
+}
+
+/// The short line under [`BACKEND_CHOICE_LABEL`].
+fn official_crypto_sub(self_hosted: bool) -> &'static str {
+    if self_hosted {
+        "Applies the next time you sign in"
+    } else {
+        "Only available on a self-hosted server"
     }
 }
 
@@ -414,17 +412,22 @@ const READ_THROUGH_LABEL: &str = "Read from that copy first";
 /// setting that made it meaningless -- see `backend_description`. Ghosted,
 /// it says what would make it available and hands back the stored value
 /// unchanged.
-fn read_through_description(cache_on: bool) -> &'static str {
+fn read_through_sub(cache_on: bool) -> &'static str {
     if cache_on {
-        "On, Deskwarden answers from the encrypted copy before asking your server \u{2014} which is \
-         what makes filling work when the connection to Bitwarden is stopped. Off keeps the \
-         copy on disk for a fast start but always asks the server for what it fills."
+        "Filling works even when Bitwarden is unreachable"
     } else {
-        "Only applies when there is a copy to read \u{2014} the switch above."
+        "Needs the copy above"
     }
 }
 
-/// The description shown under the disk-cache toggle, in its two states.
+/// The tip behind [`READ_THROUGH_LABEL`]: what reading from the copy first
+/// means, and what leaving it off keeps.
+const READ_THROUGH_TIP: &str = "On, Deskwarden answers from the encrypted copy before asking your server, which is what makes filling work when the connection to Bitwarden is stopped. Off keeps the copy on disk for a fast start but always asks the server for what it fills.";
+
+/// The short line under [`DISK_CACHE_LABEL`]: the one fact a user weighs.
+const DISK_CACHE_SUB: &str = "Stays on disk, even while the vault is locked";
+
+/// The tip behind the disk-cache toggle's `?` dot.
 ///
 /// **The wording is the requirement here, not an implementation detail**, and
 /// it is a pure function for exactly that reason: this is the text a user
@@ -440,7 +443,7 @@ fn read_through_description(cache_on: bool) -> &'static str {
 ///  * it names the residual attacker in plain terms rather than implying the
 ///    file is safe from everything;
 ///  * it never uses the word "secure". It describes what gates the file.
-fn disk_cache_description() -> &'static str {
+fn disk_cache_tip() -> &'static str {
     {
         // **This paragraph used to promise a TPM, and the promise was the
         // reason the setting could not be used.**
@@ -459,14 +462,8 @@ fn disk_cache_description() -> &'static str {
         // It still obeys this module's rules for such copy: it names what
         // is in the file, what gates it, and who can read it anyway,
         // without ever using the word "secure".
-        "Deskwarden opens instantly after a restart and autofill works the moment it \
-         starts, instead of waiting for the vault to be fetched again.\n\n\
-         The copy contains your usernames, passwords, notes and two-factor secrets. It \
-         is encrypted with a key kept on this PC and protected by Windows — the same \
-         protection as the key that unlocks your vault. Anyone who can run programs as \
-         you on this PC can read it, and so can someone who takes this disk and knows \
-         your Windows password. It is not deleted when your vault locks — only when you \
-         log out, or after 7 days."
+        "The copy contains your usernames, passwords, notes and two-factor secrets, encrypted with a key kept on this PC and protected by Windows, so anyone who can run programs as you on this PC can read it, and so can someone who takes this disk and knows your Windows password. \
+         It is not deleted when your vault locks, only when you log out or after 7 days."
     }
 }
 
@@ -485,9 +482,8 @@ const PROMPT_LABEL: &str = "Show autofill prompts";
 ///
 /// It now says *any* window rather than a matched one, for the reason on
 /// `PROMPT_LABEL` directly above.
-const PROMPT_DESCRIPTION: &str = "Offer to fill, or to save, when a window that wants a password \
-     comes to the front. Off means nothing opens on its own and CTRL+ALT+B is the only way to \
-     fill. Nothing is ever typed until you ask for it either way.";
+/// The tip behind the row's `?` dot.
+const PROMPT_TIP: &str = "Offers to fill, or to save, when a window that wants a password comes to the front; nothing is typed until you ask. Off means nothing opens on its own and CTRL+ALT+B is the only way to fill.";
 
 const BREACH_LABEL: &str = "Check passwords against known breaches";
 /// **Says what leaves the machine, because something does.** Off by default is
@@ -497,9 +493,9 @@ const BREACH_LABEL: &str = "Check passwords against known breaches";
 /// The k-anonymity bargain -- five hex characters out, thirty-five matched
 /// here -- is what makes the request safe to offer at all, so it is the
 /// description rather than a footnote.
-const BREACH_DESCRIPTION: &str = "Off by default. When on, Deskwarden sends the first 5 \
-     characters of a SHA-1 hash of a password to Have I Been Pwned and matches the rest on this \
-     machine. Your password, and the rest of its hash, never leave your PC.";
+const BREACH_SUB: &str = "Sends part of a hash, never the password";
+/// The tip behind the row's `?` dot.
+const BREACH_TIP: &str = "Off by default. When on, Deskwarden sends the first 5 characters of a SHA-1 hash of a password to Have I Been Pwned and matches the rest on this machine, so your password and the rest of its hash never leave your PC.";
 
 /// The scan card's own heading.
 ///
@@ -519,9 +515,9 @@ const SCAN_RUNNING_BUTTON: &str = "Scanning...";
 /// **Says what a scan costs before it is started**, in requests and in what
 /// leaves the machine, because the button beside it is the one control in
 /// this app that makes hundreds of outbound calls from a single click.
-const SCAN_IDLE_DESCRIPTION: &str = "Checks every saved password against Have I Been Pwned, one \
-     request per distinct password \u{2014} so a vault full of reused passwords is far fewer requests \
-     than it has items. Only the first 5 characters of each hash leave your PC.";
+const SCAN_IDLE_SUB: &str = "One request per distinct password";
+/// The tip behind the row's `?` dot.
+const SCAN_IDLE_TIP: &str = "Checks every saved password against Have I Been Pwned, one request per distinct password, so a vault full of reused passwords is far fewer requests than it has items. Only the first 5 characters of each hash leave your PC.";
 /// The empty state of the history list. A result, not a blank panel: see
 /// `password_health`'s summary for the same argument.
 const SCAN_NO_HISTORY: &str = "No scan has been run yet.";
@@ -549,12 +545,10 @@ const FETCH_ICONS_LABEL: &str = "Show site icons";
 /// worried reader assumes, and it is wrong.
 ///
 /// On by default, and stated in the copy rather than left to
-/// `Settings::default`, the same way `BREACH_DESCRIPTION` states its own
+/// `Settings::default`, the same way `BREACH_TIP` states its own
 /// opposite default.
-const FETCH_ICONS_DESCRIPTION: &str = "On by default. Deskwarden asks the icon service for an \
-     item's site icon by domain name — your own server's if you self-host. It never sends the \
-     username, the password, or which account the item is in. Off shows coloured initials \
-     instead and nothing leaves your PC.";
+/// The tip behind the row's `?` dot.
+const FETCH_ICONS_TIP: &str = "On by default. Deskwarden asks the icon service for an item's site icon by domain name (your own server's if you self-host) and never sends the username, the password or which account the item is in. Off shows coloured initials instead and nothing leaves your PC.";
 
 const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
 /// **Says what ON costs, in the sentence a user would otherwise have to work
@@ -578,8 +572,8 @@ const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
 /// the long form of the same argument and `PRIVACY.md` carries the longest.
 ///
 /// Off by default, and stated in the copy rather than left to
-/// `Settings::default`, the same way `BREACH_DESCRIPTION` and
-/// `FETCH_ICONS_DESCRIPTION` state theirs.
+/// `Settings::default`, the same way `BREACH_TIP` and
+/// `FETCH_ICONS_TIP` state theirs.
 ///
 /// **It no longer says the icon service goes unasked, because that stopped
 /// being true and a switch whose label overstates its reach is worse than no
@@ -597,13 +591,9 @@ const DIRECT_ICONS_LABEL: &str = "Fetch site icons from the sites themselves";
 /// fallback adds no disclosure to any site -- the requests it receives are the
 /// same requests -- so what a site learns is what it always learned, and that
 /// is what is stated.
-const DIRECT_ICONS_DESCRIPTION: &str = "Off by default, and it decides where PUBLIC sites' icons \
-     come from. An address on your own network — 192.168.x.x, 10.x.x.x, localhost — is always \
-     fetched from that address itself, because an icon service out on the internet has no route \
-     to your network and never will. On, your PC asks each site for its own icon first, and the \
-     icon service is asked only about the ones the site itself did not answer. What that costs: \
-     every site you hold an entry for receives a request from your PC, so it learns that an \
-     entry for it exists in your vault and roughly when you looked at it.";
+const DIRECT_ICONS_SUB: &str = "Sites you hold entries for see a request";
+/// The tip behind the row's `?` dot.
+const DIRECT_ICONS_TIP: &str = "Off by default. On, your PC asks each site for its own icon first, and the icon service is asked only about the ones the site itself did not answer, so every site you hold an entry for learns that an entry for it exists in your vault and roughly when you looked at it. An address on your own network (192.168.x.x, 10.x.x.x, localhost) is always fetched from that address itself, whatever this says.";
 
 const LAN_TLS_LABEL: &str = "Trust any certificate on your own network";
 /// **Names the boundary in the label and states the cost in the copy**, which
@@ -629,12 +619,9 @@ const LAN_TLS_LABEL: &str = "Trust any certificate on your own network";
 /// the request still tells it that this vault holds an entry for that
 /// address. That is a small thing and it is not nothing, which is exactly why
 /// it is off by default and why the sentence is here rather than in a doc.
-const LAN_TLS_DESCRIPTION: &str = "Off by default. Only for addresses on your own network — \
-     192.168.x.x, 10.x.x.x, localhost — and only for icons; certificates are always checked \
-     for sites out on the internet, and for everything else this app does. Turn it on if a \
-     server of your own serves its icon over HTTPS with a certificate this PC does not trust. \
-     What that costs: on a network where another machine can answer for that address, it \
-     chooses the picture on that row and learns you hold an entry for it.";
+const LAN_TLS_SUB: &str = "Icons from your own network only";
+/// The tip behind the row's `?` dot.
+const LAN_TLS_TIP: &str = "Off by default. Skips certificate checks for icon requests to addresses on your own network (192.168.x.x, 10.x.x.x, localhost) and never for the internet, so on a network where another machine can answer for that address it chooses the picture on that row and learns you hold an entry for it.";
 
 const BRAND_LOGOS_LABEL: &str = "Show card network logos";
 /// **Says where the images come from, because that is the part a user cannot
@@ -653,23 +640,20 @@ const BRAND_LOGOS_LABEL: &str = "Show card network logos";
 /// careful reader assumes a second one.
 ///
 /// Off by default, and stated in the copy rather than left to
-/// `Settings::default`, the same way `FETCH_ICONS_DESCRIPTION` and
-/// `BREACH_DESCRIPTION` state theirs.
-const BRAND_LOGOS_DESCRIPTION: &str = "Off by default. Draws a card's network mark as that \
-     network's own logo, read from PNG files you put in a brand-marks folder — visa.png, \
-     mastercard.png, amex.png and so on. Deskwarden looks beside your settings first, then \
-     beside the program itself. Nothing is downloaded. Any brand with no image keeps its \
-     printed name.";
+/// `Settings::default`, the same way `FETCH_ICONS_TIP` and
+/// `BREACH_TIP` state theirs.
+const BRAND_LOGOS_SUB: &str = "Uses PNG files you add yourself";
+/// The tip behind the row's `?` dot.
+const BRAND_LOGOS_TIP: &str = "Off by default. Draws a card's network mark from PNG files you put in a brand-marks folder (visa.png, mastercard.png, amex.png and so on), beside your settings or the program itself. Nothing is downloaded, and any brand with no image keeps its printed name.";
 
 /// The v2 sidebar's two looks. On View until slice 7 gives Settings its
 /// General > Look page.
 const SIDEBAR_STYLE_LABEL: &str = "Sidebar";
-const SIDEBAR_STYLE_DESCRIPTION: &str = "Navy or light, beside your vault.";
 
 const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
 /// **Says what ON adds, and what it costs.** Off is the default and is stated
 /// in the copy rather than left to `Settings::default`, exactly as
-/// `BREACH_DESCRIPTION` states its own: these are the two rows on General
+/// `BREACH_TIP` states its own: these are the two rows on General
 /// whose ON state gives something away, and a user reading the pane should
 /// not have to infer either from the pill.
 ///
@@ -684,9 +668,9 @@ const TOTP_SECRET_LABEL: &str = "Show TOTP secrets on the details screen";
 /// the user looking for a row with that name and there is not one. A
 /// description that names a label the app does not paint is worse than a
 /// vague one: the user concludes the setting did not work.
-const TOTP_SECRET_DESCRIPTION: &str = "Off by default. When on, an item's TOTP secret appears \
-     on the details screen as an extra masked row under its TOTP code, revealed by clicking \
-     the eye. The code expires in 30 seconds; the secret behind it never does.";
+const TOTP_SECRET_SUB: &str = "Masked until you click the eye";
+/// The tip behind the row's `?` dot.
+const TOTP_SECRET_TIP: &str = "Off by default. When on, an item's TOTP secret appears on the details screen as an extra masked row under its TOTP code. The code expires in 30 seconds; the secret behind it never does.";
 
 /// The automatic-check row's label.
 ///
@@ -700,7 +684,7 @@ const TOTP_SECRET_DESCRIPTION: &str = "Off by default. When on, an item's TOTP s
 /// So the switch names the half it actually governs, and the button keeps the
 /// words for the thing a user presses. Nothing about either behaviour
 /// changed; the row simply stopped calling itself by the button's name. The
-/// copy underneath it ([`UPDATE_CHECK_DESCRIPTION`]) was already written this
+/// copy underneath it ([`UPDATE_CHECK_TIP`]) was already written this
 /// way -- "Deskwarden asks GitHub" -- so this is the label catching up to its
 /// own description.
 const UPDATE_CHECK_LABEL: &str = "Check for updates automatically";
@@ -713,9 +697,9 @@ const UPDATE_CHECK_LABEL: &str = "Check for updates automatically";
 /// "Nothing about you or your vault" is the accurate claim and is the same
 /// one `PRIVACY.md` makes: the request names this app's own public
 /// repository, not the user.
-const UPDATE_CHECK_DESCRIPTION: &str = "On by default. Deskwarden asks GitHub whether a newer \
-     Deskwarden has been released. The request says nothing about you or your vault. Off means \
-     you will not be told about fixes, including security ones, until you look yourself.";
+const UPDATE_CHECK_SUB: &str = "Asks GitHub; says nothing about you";
+/// The tip behind the row's `?` dot.
+const UPDATE_CHECK_TIP: &str = "On by default. Deskwarden asks GitHub whether a newer Deskwarden has been released, and the request says nothing about you or your vault. Off means you will not be told about fixes, including security ones, until you look yourself.";
 
 
 // --- Clipboard ------------------------------------------------------------
@@ -732,23 +716,23 @@ const CLIPBOARD_MASTER_LABEL: &str = "Take copied secrets back off the clipboard
 /// copied password out of `Win+V` and off the user's other devices are
 /// unconditional and are not on this page as a control. See
 /// `CLIPBOARD_HISTORY_NOTE`, the row that says so in its own words.
-const CLIPBOARD_MASTER_DESCRIPTION: &str = "On by default. Off means a secret you copy stays on \
-     the clipboard until something else replaces it — no timer, and none of the three below. \
-     Keeping copies out of clipboard history is separate and stays on either way.";
+const CLIPBOARD_MASTER_SUB: &str = "Off leaves copied secrets in place";
+/// The tip behind the row's `?` dot.
+const CLIPBOARD_MASTER_TIP: &str = "On by default. Off means a secret you copy stays on the clipboard until something else replaces it, with no timer and none of the three below. Keeping copies out of clipboard history is separate and stays on either way.";
 
 const CLIPBOARD_ON_LOCK_LABEL: &str = "Clear when the vault locks";
 /// Names all four ways the vault locks, because a user who locks by idling
 /// should not have to guess whether the Lock button is the only one meant.
 /// The fourth -- the session being invalidated elsewhere -- is described
 /// rather than named, since "needs_reauth" is not a word on any screen.
-const CLIPBOARD_ON_LOCK_DESCRIPTION: &str = "Locking by hand, from the tray, after idling, or \
-     because the session expired. Deskwarden has no separate sign-out: this switch covers all \
-     of them.";
+const CLIPBOARD_ON_LOCK_SUB: &str = "However the vault locks";
+/// The tip behind the row's `?` dot.
+const CLIPBOARD_ON_LOCK_TIP: &str = "Locking by hand, from the tray, after idling, or because the session expired. Deskwarden has no separate sign-out, so this switch covers all of them.";
 
 const CLIPBOARD_ON_ACCOUNT_LABEL: &str = "Clear when the account changes";
-const CLIPBOARD_ON_ACCOUNT_DESCRIPTION: &str = "Switching to another account, adding one, or \
-     removing one. A credential from the vault you have just left does not follow you to the \
-     next one.";
+const CLIPBOARD_ON_ACCOUNT_SUB: &str = "Switching, adding or removing one";
+/// The tip behind the row's `?` dot.
+const CLIPBOARD_ON_ACCOUNT_TIP: &str = "A credential from the vault you have just left does not follow you to the next one.";
 
 const CLIPBOARD_ON_QUIT_LABEL: &str = "Clear when Deskwarden quits";
 /// **Says what it cannot cover**, because a switch called "when Deskwarden
@@ -756,18 +740,18 @@ const CLIPBOARD_ON_QUIT_LABEL: &str = "Clear when Deskwarden quits";
 /// those ways no in-process arrangement can catch. `PRIVACY.md` makes the same
 /// admission; a page that made the stronger claim would be the one disagreeing
 /// with it.
-const CLIPBOARD_ON_QUIT_DESCRIPTION: &str = "Quitting from the tray, and shutting down to install \
-     an update. A crash, a Task Manager kill or a power cut cannot be caught, and leave the copy \
-     where it is.";
+const CLIPBOARD_ON_QUIT_SUB: &str = "Not after a crash or power cut";
+/// The tip behind the row's `?` dot.
+const CLIPBOARD_ON_QUIT_TIP: &str = "Covers quitting from the tray and shutting down to install an update. A crash, a Task Manager kill or a power cut cannot be caught, and leave the copy where it is.";
 
 const CLIPBOARD_INTERVAL_LABEL: &str = "Clear after";
 /// **States the unit, the range and the resolution**, because all three are
 /// things a user would otherwise discover by being refused. The floor is
 /// stated on screen and not only enforced, exactly as `settings_v2::IDLE_MINUTES_SUB`
 /// states its own.
-const CLIPBOARD_INTERVAL_DESCRIPTION: &str = "Minutes before a copied secret is taken back. \
-     Decimals are fine — 0.5 is thirty seconds, which is the shortest Deskwarden will use, and \
-     60 minutes the longest. One decimal place.";
+const CLIPBOARD_INTERVAL_SUB: &str = "Minutes, from 0.5 to 60";
+/// The tip behind the row's `?` dot.
+const CLIPBOARD_INTERVAL_TIP: &str = "Minutes before a copied secret is taken back. Decimals are fine: 0.5 is thirty seconds, which is the shortest Deskwarden will use, and 60 minutes the longest, to one decimal place.";
 
 /// The row that exists to say a thing is **not** a setting.
 ///
@@ -779,18 +763,18 @@ const CLIPBOARD_INTERVAL_DESCRIPTION: &str = "Minutes before a copied secret is 
 /// in `PRIVACY.md`; this is the one-sentence version, on the page where
 /// somebody would go looking for the switch.
 const CLIPBOARD_HISTORY_LABEL: &str = "Clipboard history and sync are always excluded";
-const CLIPBOARD_HISTORY_NOTE: &str = "A secret you copy is kept out of Windows clipboard history \
-     (Win+V) and is never synced to your other devices. This has no setting and is not affected \
-     by anything above — there is no version of it worth turning off.";
+const CLIPBOARD_HISTORY_NOTE: &str = "Kept out of Win+V history, never synced to other devices";
+/// The tip behind it: why there is no switch.
+const CLIPBOARD_HISTORY_TIP: &str = "This has no setting and is not affected by anything above; there is no version of it worth turning off.";
 
 const CLIPBOARD_RESET_LABEL: &str = "Reset to default";
 /// Says the scope, because "reset to default" on a page inside a preferences
 /// window is otherwise ambiguous between this page and the app. It also says
 /// what the defaults *are*, so the button's effect is legible before it is
 /// pressed rather than only after.
-const CLIPBOARD_RESET_DESCRIPTION: &str = "Puts the five settings on this page back to how they \
-     ship — everything on, one minute. Nothing on any other page is touched, and there is no \
-     confirmation because setting them again is the same five clicks.";
+const CLIPBOARD_RESET_SUB: &str = "Nothing on other pages changes";
+/// The tip behind the row's `?` dot.
+const CLIPBOARD_RESET_TIP: &str = "Puts the five settings on this page back to how they ship: everything on, one minute. There is no confirmation, because setting them again is the same five clicks.";
 const CLIPBOARD_RESET_BUTTON: &str = "Reset";
 
 /// What the interval field says when it refuses an entry.
@@ -923,9 +907,7 @@ const SHORTCUT_UNUSABLE_KEY: &str =
 /// user can find out *why*, and the Shortcuts page is where they come to ask
 /// it, so every one of those four rows says it here and names the one chord
 /// that does answer for an unmatched window.
-const DIRECT_SHORTCUT_NOTE: &str =
-    " Needs a window Deskwarden has matched; with nothing matched it does nothing, and the \
-     fill shortcut above is the one that asks about the window instead.";
+const DIRECT_SHORTCUT_NOTE: &str = "Needs a window Deskwarden has matched; with nothing matched it does nothing, and the fill shortcut above is the one that asks about the window instead.";
 
 /// What the About page says about the account when nobody has published one.
 ///
@@ -1047,9 +1029,7 @@ const UPDATE_DOWNLOADING_BUTTON: &str = "Downloading...";
 const UPDATE_RESTART_BUTTON: &str = "Restart to install";
 const UPDATE_RETRY_BUTTON: &str = "Try again";
 
-const UPDATE_IDLE_DESCRIPTION: &str =
-    "Ask GitHub whether a newer Deskwarden has been released. Nothing is downloaded until you \
-     ask for it.";
+const UPDATE_IDLE_DESCRIPTION: &str = "Asks GitHub; nothing downloads until you ask.";
 const UPDATE_CHECKING_DESCRIPTION: &str = "Asking GitHub for the latest release.";
 const UPDATE_UP_TO_DATE_DESCRIPTION: &str = "This is the latest release.";
 const UPDATE_READY_DESCRIPTION: &str =
@@ -2216,21 +2196,56 @@ fn row_separator(ui: &mut Ui) {
 
 /// A row's `flex: 1` text column: 14px semibold title over a 12px faint line.
 fn row_text(ui: &mut Ui, label: &str, description: &str) {
-    row_text_ink(ui, label, description, false);
+    row_text_ink(ui, label, description, "", false);
 }
 
-/// The v2 row's text column: 16 px semibold title over a 14 px sub.
-fn row_text_ink(ui: &mut Ui, label: &str, description: &str, ghost: bool) {
+/// The v2 row's text column: 16 px semibold title over a 14 px sub. A `tip`
+/// puts the design's `?` dot after the title; hovering it shows the tip.
+///
+/// **The design's rule for a row's copy**: a short title, an optional sub of a
+/// few words, and any explanation in the tip -- a row never carries a
+/// paragraph under its title.
+fn row_text_ink(ui: &mut Ui, label: &str, description: &str, tip: &str, ghost: bool) {
     let p = palette(ui.ctx());
     let (ink, sub_ink) = if ghost { (p.text_ghost, p.text_ghost) } else { (p.ink, p.text_label) };
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-        ui.label(tokens::job(ROW_TITLE, label, ink));
+        if description.is_empty() {
+            // **Most rows have no sub in the design**, and a lone title sits
+            // level with its control rather than at the row's top edge.
+            let title_h = ui.fonts_mut(|f| f.layout_job(tokens::job(ROW_TITLE, label, ink))).size().y;
+            ui.add_space(((CONTROL_MIN_HEIGHT - title_h) / 2.0).max(0.0));
+        }
+        if tip.is_empty() {
+            ui.label(tokens::job(ROW_TITLE, label, ink));
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = TIP_GAP;
+                ui.label(tokens::job(ROW_TITLE, label, ink));
+                crate::kit::tips::help_dot(
+                    ui,
+                    egui::Id::new(("settings-row-tip", label)),
+                    tip,
+                    TIP_WIDTH,
+                    crate::kit::tips::Placement::Above,
+                );
+            });
+        }
         if !description.is_empty() {
             ui.label(sub_job(description, sub_ink));
         }
     });
 }
+
+/// Keeps the tip after the row titled `label` open, for `ui_preview`'s
+/// screenshot of a hovered row. Rows are matched by title.
+pub fn pin_row_tip(ctx: &egui::Context, label: &str) {
+    crate::kit::tips::pin_open(ctx, egui::Id::new(("settings-row-tip", label)));
+}
+
+/// The `?` dot's distance from the title, and its bubble's width.
+const TIP_GAP: f32 = 8.0;
+pub(crate) const TIP_WIDTH: f32 = 320.0;
 
 /// A v2 row title.
 pub(crate) const ROW_TITLE: tokens::Role = tokens::Role { size: 16.0, face: theme::SEMIBOLD, tracking_em: 0.0 };
@@ -2285,22 +2300,24 @@ pub(crate) fn group_title(ui: &mut Ui, title: &str) {
 /// of exactly that height is what makes the centring well-defined. What that
 /// column *contains* is the caller's business, which is why [`status_row`] can
 /// leave the title out without touching any of the above.
-fn control_row(ui: &mut Ui, label: &str, description: &str, control: impl FnOnce(&mut Ui)) {
-    control_row_w(ui, label, description, false, CONTROL_COLUMN_WIDTH, control);
+fn control_row(ui: &mut Ui, label: &str, description: &str, tip: &str, control: impl FnOnce(&mut Ui)) {
+    control_row_tip(ui, label, description, tip, false, CONTROL_COLUMN_WIDTH, control);
 }
 
 /// The one row of the v2 Settings: title and sub on the left, a control
 /// `control_w` wide on the right, vertically centred on the row. `ghost` greys
 /// the text for a row that is present and inert.
-pub(crate) fn control_row_w(
+/// The tip is the `?` dot after the title.
+pub(crate) fn control_row_tip(
     ui: &mut Ui,
     label: &str,
     description: &str,
+    tip: &str,
     ghost: bool,
     control_w: f32,
     control: impl FnOnce(&mut Ui),
 ) {
-    control_row_of(ui, |ui| row_text_ink(ui, label, description, ghost), control_w, control);
+    control_row_of(ui, |ui| row_text_ink(ui, label, description, tip, ghost), control_w, control);
 }
 
 /// A row with **no title over its text** -- the text column is a single line
@@ -2380,19 +2397,19 @@ fn control_row_of(ui: &mut Ui, text: impl FnOnce(&mut Ui), control_w: f32, contr
 /// 3e's settings row: label, description, trailing 40x22 pill. Returns the new
 /// value. The pill is paint-only ([`theme::toggle_pill`]), so the click sense
 /// is allocated here.
-fn toggle_row(ui: &mut Ui, label: &str, description: &str, value: bool) -> bool {
+fn toggle_row(ui: &mut Ui, label: &str, description: &str, tip: &str, value: bool) -> bool {
     let mut next = value;
-    control_row_w(ui, label, description, false, TOGGLE_SIZE.x, |ui| {
+    control_row_tip(ui, label, description, tip, false, TOGGLE_SIZE.x, |ui| {
         controls::switch(ui, &mut next);
     });
     next
 }
 
 /// A row that reports a value rather than editing one (About).
-fn value_row(ui: &mut Ui, label: &str, description: &str, value: &str) {
+fn value_row(ui: &mut Ui, label: &str, description: &str, tip: &str, value: &str) {
     let ink = palette(ui.ctx()).text_nav;
     let width = ui.fonts_mut(|f| f.layout_job(tokens::job(VALUE, value, ink))).size().x.ceil() + 2.0;
-    control_row_w(ui, label, description, false, width, |ui| {
+    control_row_tip(ui, label, description, tip, false, width, |ui| {
         ui.label(tokens::job(VALUE, value, ink));
     });
 }
@@ -2423,13 +2440,14 @@ fn child_toggle_row(
     ui: &mut Ui,
     label: &str,
     description: &str,
+    tip: &str,
     value: bool,
     enabled: bool,
 ) -> bool {
     if enabled {
-        return toggle_row(ui, label, description, value);
+        return toggle_row(ui, label, description, tip, value);
     }
-    control_row_w(ui, label, description, true, TOGGLE_SIZE.x, |ui| {
+    control_row_tip(ui, label, description, tip, true, TOGGLE_SIZE.x, |ui| {
         ui.add_enabled_ui(false, |ui| {
             let mut copy = value;
             controls::switch(ui, &mut copy);
@@ -2445,8 +2463,8 @@ fn child_toggle_row(
 /// an empty right-hand column would read as a field that failed to load, and a
 /// *disabled* toggle would read as a feature that is present and broken. It is
 /// neither: it is a thing that is always on and always will be.
-fn note_row(ui: &mut Ui, label: &str, note: &str) {
-    card_row(ui, |ui| row_text(ui, label, note));
+fn note_row(ui: &mut Ui, label: &str, note: &str, tip: &str) {
+    card_row(ui, |ui| row_text_ink(ui, label, note, tip, false));
 }
 
 /// The **Breaches** page: the consent pill, the scan button, and what previous
@@ -2494,25 +2512,26 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.check_breaches = toggle_row(
             ui,
             BREACH_LABEL,
-            BREACH_DESCRIPTION,
+            BREACH_SUB,
+            BREACH_TIP,
             state.settings.check_breaches,
         );
     });
 
     card(ui, |ui| {
         let stage = state.scan.stage().clone();
-        let description = match &stage {
-            ScanStage::Idle => SCAN_IDLE_DESCRIPTION.to_string(),
+        let (description, tip) = match &stage {
+            ScanStage::Idle => (SCAN_IDLE_SUB.to_string(), SCAN_IDLE_TIP),
             ScanStage::Running { done, total, found, failed } => {
-                crate::breach_scan::progress_wording(*done, *total, *found, *failed)
+                (crate::breach_scan::progress_wording(*done, *total, *found, *failed), "")
             }
             // **The outcome, in `breach_scan`'s own words**, so the sentence
             // on this page and the numbers in `scan_history.json` cannot
             // disagree about what just happened -- and so the failure count
             // is the last thing said, here as everywhere.
-            ScanStage::Finished(record) => crate::breach_scan::outcome_wording(record),
-            ScanStage::NothingToScan => SCAN_NOTHING_DESCRIPTION.to_string(),
-            ScanStage::Unavailable => SCAN_UNAVAILABLE_DESCRIPTION.to_string(),
+            ScanStage::Finished(record) => (crate::breach_scan::outcome_wording(record), ""),
+            ScanStage::NothingToScan => (SCAN_NOTHING_DESCRIPTION.to_string(), ""),
+            ScanStage::Unavailable => (SCAN_UNAVAILABLE_DESCRIPTION.to_string(), ""),
         };
         // A running scan still draws a button -- disabled, and labelled with
         // what is happening -- rather than drawing nothing: a control that
@@ -2523,7 +2542,7 @@ fn draw_breaches(ui: &mut Ui, state: &mut PrefsState) {
         let label = if running { SCAN_RUNNING_BUTTON } else { SCAN_BUTTON };
         let mut clicked = false;
         let width = outline_button_width(ui, label);
-        control_row_w(ui, SCAN_SECTION_LABEL, &description, false, width, |ui| {
+        control_row_tip(ui, SCAN_SECTION_LABEL, &description, tip, false, width, |ui| {
             clicked = scan_button(ui, label, !running);
         });
         if let ScanStage::Running { done, total, .. } = &stage {
@@ -2629,7 +2648,7 @@ const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
 
 /// The description under [`SERVICE_LABEL`], in its two states.
 ///
-/// A pure function, and asserted on by tests, for [`disk_cache_description`]'s
+/// A pure function, and asserted on by tests, for [`disk_cache_tip`]'s
 /// reason exactly: this is the sentence a person reads before deciding to put
 /// a door into their vault, and copy buried in an eframe closure is copy
 /// nothing can reach.
@@ -2640,7 +2659,7 @@ const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
 ///    matters and the one that is easy to get wrong -- an off state that says
 ///    only "off" leaves the decision to the label, and the label is six
 ///    words. Off is also the default, and the copy says so rather than
-///    leaving it to `Settings::default`, the same way `BREACH_DESCRIPTION`
+///    leaving it to `Settings::default`, the same way `BREACH_TIP`
 ///    states its own.
 ///  * **It names what is served, without a euphemism**: usernames, passwords,
 ///    notes and two-factor secrets. Not "vault data". The disk-cache row two
@@ -2651,20 +2670,22 @@ const SERVICE_LABEL: &str = "Serve this vault to programs on this PC";
 ///  * **It says a key is the whole credential.** Every other door into this
 ///    vault asks for the master password; this one does not, and a reader
 ///    who assumes it does has misjudged the entire trade.
-fn service_description(enabled: bool) -> &'static str {
+fn service_tip(enabled: bool) -> &'static str {
     if enabled {
-        "On. Deskwarden is listening on 127.0.0.1 and will hand out decrypted vault items \u{2014} \
-         usernames, passwords, notes and two-factor secrets \u{2014} to any program on this PC that \
-         presents one of the keys below. It never asks for your master password: a key is the \
-         whole credential, so anyone who can read one can use it. Turning this off stops the \
-         endpoint and leaves the keys where they are."
+        "Deskwarden is listening on 127.0.0.1 and hands out decrypted vault items (usernames, passwords, notes and two-factor secrets) to any program on this PC that presents one of the keys below. \
+         It never asks for your master password: a key is the whole credential, so anyone who can read one can use it."
     } else {
-        "Off, which is the default. Turning it on starts a local HTTP endpoint on 127.0.0.1 \
-         that hands out decrypted vault items \u{2014} usernames, passwords, notes and two-factor \
-         secrets \u{2014} to any program on this PC that presents one of the keys you mint below. It \
-         never asks for your master password: a key is the whole credential, so anyone who can \
-         read one can use it. Nothing is listening, and no key opens anything, until you turn \
-         this on."
+        "Turning it on starts a local HTTP endpoint on 127.0.0.1 that hands out decrypted vault items (usernames, passwords, notes and two-factor secrets) to any program on this PC that presents one of the keys you mint below. \
+         It never asks for your master password: a key is the whole credential, so anyone who can read one can use it."
+    }
+}
+
+/// The short line under [`SERVICE_LABEL`], in its two states.
+fn service_sub(enabled: bool) -> &'static str {
+    if enabled {
+        "On, and listening on 127.0.0.1"
+    } else {
+        "Off by default; nothing is listening"
     }
 }
 
@@ -2715,19 +2736,21 @@ const KEYS_NONE: &str = "No keys have been minted, so nothing can reach the serv
                          program needs a key from here before it is answered at all.";
 
 const MINT_SECTION_LABEL: &str = "Mint a key";
-const MINT_SECTION_DESCRIPTION: &str = "A key is shown once, when it is made, and after that only \
-                                        its hash is kept.";
+const MINT_SECTION_DESCRIPTION: &str = "Shown once; only its hash is kept.";
 const NAME_LABEL: &str = "Name";
-const NAME_DESCRIPTION: &str = "Name it after the program that will hold it. The name is how you \
-                                recognise this key in the list, and how you revoke it.";
+const NAME_SUB: &str = "Name it after the program";
+/// The tip behind the row's `?` dot.
+const NAME_TIP: &str = "The name is how you recognise this key in the list, and how you revoke it.";
 const EXPIRY_LABEL: &str = "Expires after";
-const EXPIRY_DESCRIPTION: &str = "Days from now. Leave it empty for a key that never expires \
-                                  and works until you revoke it.";
+const EXPIRY_SUB: &str = "Days from now; empty never expires";
+/// The tip behind the row's `?` dot.
+const EXPIRY_TIP: &str = "Leave it empty for a key that never expires and works until you revoke it.";
 const SUBJECT_LABEL: &str = "What it can reach";
 const ACCESS_LABEL: &str = "What it may do";
 const ITEM_ID_LABEL: &str = "Item id";
-const ITEM_ID_DESCRIPTION: &str = "The id of the one item this key may reach, as it appears in \
-                                   the vault's own links.";
+const ITEM_ID_SUB: &str = "The one item this key may reach";
+/// The tip behind the row's `?` dot.
+const ITEM_ID_TIP: &str = "The id as it appears in the vault's own links.";
 const MINT_BUTTON: &str = "Mint the key";
 
 /// The mint form's field ids, stable across frames for [`STEPPER_FIELD_ID`]'s
@@ -3182,7 +3205,7 @@ impl BackendSwitch {
 /// question "does this need confirming, and what does it cost" is the whole
 /// of this feature, and it is answered here so the tests can put it under
 /// oath without a window, a server or a vault -- the same separation
-/// [`official_crypto_description`] keeps for the copy under the row.
+/// [`official_crypto_tip`] keeps for the copy under the row.
 ///
 /// `None` for a frame where the row handed back what it was given, which is
 /// every frame nobody clicked and every click on the ghosted row: a
@@ -3324,7 +3347,8 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
         let stored = state.settings.use_official_bw_crypto.unwrap_or(true);
         let clicked = backend_choice_row(
             ui,
-            official_crypto_description(self_hosted),
+            official_crypto_sub(self_hosted),
+            official_crypto_tip(self_hosted),
             stored,
             self_hosted,
         );
@@ -3366,7 +3390,8 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
             state.settings.keep_backend_running = toggle_row(
                 ui,
                 BACKEND_LABEL,
-                BACKEND_DESCRIPTION,
+                BACKEND_SUB,
+                BACKEND_TIP,
                 state.settings.keep_backend_running,
             );
         }
@@ -3378,7 +3403,8 @@ fn draw_backend_card(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.keep_ui_loaded = toggle_row(
             ui,
             UI_LOADED_LABEL,
-            UI_LOADED_DESCRIPTION,
+            UI_LOADED_SUB,
+            UI_LOADED_TIP,
             state.settings.keep_ui_loaded,
         );
     });
@@ -3413,7 +3439,8 @@ fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.cache_vault_to_disk = child_toggle_row(
             ui,
             DISK_CACHE_LABEL,
-            disk_cache_description(),
+            DISK_CACHE_SUB,
+            disk_cache_tip(),
             state.settings.cache_vault_to_disk,
             // Always live now: nothing about this row depends on Hello.
             true,
@@ -3425,7 +3452,8 @@ fn draw_disk_cache_card(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.read_through_cache = child_toggle_row(
             ui,
             READ_THROUGH_LABEL,
-            read_through_description(state.settings.cache_vault_to_disk),
+            read_through_sub(state.settings.cache_vault_to_disk),
+            READ_THROUGH_TIP,
             state.settings.read_through_cache,
             state.settings.cache_vault_to_disk,
         );
@@ -3453,19 +3481,21 @@ fn draw_sync_poll_card(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.sync_push = toggle_row(
             ui,
             SYNC_PUSH_LABEL,
-            SYNC_PUSH_DESCRIPTION,
+            SYNC_PUSH_SUB,
+            SYNC_PUSH_TIP,
             state.settings.sync_push,
         );
         row_separator(ui);
         state.settings.sync_polling = toggle_row(
             ui,
             SYNC_POLL_ENABLED_LABEL,
-            SYNC_POLL_ENABLED_DESCRIPTION,
+            SYNC_POLL_ENABLED_SUB,
+            SYNC_POLL_ENABLED_TIP,
             state.settings.sync_polling,
         );
         row_separator(ui);
         let enabled = state.settings.sync_polling;
-        control_row_w(ui, SYNC_POLL_LABEL, SYNC_POLL_DESCRIPTION, false, STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH, |ui| {
+        control_row_tip(ui, SYNC_POLL_LABEL, SYNC_POLL_SUB, SYNC_POLL_TIP, false, STEPPER_STEP_WIDTH * 2.0 + STEPPER_VALUE_WIDTH, |ui| {
             state.settings.sync_poll_minutes = minutes_stepper_with(
                 ui,
                 state.settings.sync_poll_minutes,
@@ -3483,7 +3513,8 @@ fn draw_sharing_card(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.advanced_sharing = toggle_row(
             ui,
             ADVANCED_SHARING_LABEL,
-            ADVANCED_SHARING_DESCRIPTION,
+            ADVANCED_SHARING_SUB,
+            ADVANCED_SHARING_TIP,
             state.settings.advanced_sharing,
         );
     });
@@ -3493,9 +3524,9 @@ fn draw_sharing_card(ui: &mut Ui, state: &mut PrefsState) {
 const ADVANCED_SHARING_LABEL: &str = "Use advanced sharing";
 /// What each position does -- and what the default sends, spelled out,
 /// because the default sends the password.
-const ADVANCED_SHARING_DESCRIPTION: &str =
-    "Choose which fields of a record a Send carries. Off, a Send carries the whole record: \
-     username, password, websites and notes.";
+const ADVANCED_SHARING_SUB: &str = "Off sends the whole record";
+/// The tip behind the row's `?` dot.
+const ADVANCED_SHARING_TIP: &str = "Choose which fields of a record a Send carries. Off, a Send carries the whole record: username, password, websites and notes.";
 
 /// The switch, in the owner's own words for it.
 const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
@@ -3510,23 +3541,21 @@ const SYNC_POLL_ENABLED_LABEL: &str = "Update via polling";
 /// reader who turns this off must not come away thinking the window stops
 /// updating, and a reader who leaves it on must not think it costs a
 /// download every five minutes when it does not.
-const SYNC_POLL_ENABLED_DESCRIPTION: &str =
-    "Check for changes made in other Bitwarden apps while the vault window is open: when you \
-     switch back to it, and on the interval below. With live updates connected, these checks \
-     pause. Off, the vault still updates when the window opens and when you press Sync.";
+const SYNC_POLL_ENABLED_SUB: &str = "Also checks when you switch back";
+/// The tip behind the row's `?` dot.
+const SYNC_POLL_ENABLED_TIP: &str = "Checks for changes made in other Bitwarden apps while the vault window is open, when you switch back to it and on the interval below; with live updates connected these checks pause. Off, the vault still updates when the window opens and when you press Sync.";
 
 /// The live-updates switch, above the polling one.
 const SYNC_PUSH_LABEL: &str = "Live updates from the server";
 /// Says what it does, where it works, and what off means -- the last because
 /// "switch to polling" is the owner's own description of turning it off.
-const SYNC_PUSH_DESCRIPTION: &str =
-    "Keep a connection open so the server can announce changes made in other Bitwarden apps; \
-     the vault window updates within seconds. Needs the built-in client and a server that \
-     supports it. Off, the vault window uses polling below.";
+const SYNC_PUSH_SUB: &str = "Changes arrive within seconds";
+/// The tip behind the row's `?` dot.
+const SYNC_PUSH_TIP: &str = "Keeps a connection open so the server can announce changes made in other Bitwarden apps. Needs the built-in client and a server that supports it; off, the vault window uses polling below.";
 const SYNC_POLL_LABEL: &str = "Check every";
-const SYNC_POLL_DESCRIPTION: &str =
-    "Minutes between checks while the window stays open. Each check downloads the vault, so \
-     a short interval costs more on a large one.";
+const SYNC_POLL_SUB: &str = "Minutes between checks";
+/// The tip behind the row's `?` dot.
+const SYNC_POLL_TIP: &str = "Each check downloads the vault, so a short interval costs more on a large one.";
 
 /// The page's cards, in reading order.
 ///
@@ -3543,7 +3572,8 @@ fn api_cards(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.service_enabled = toggle_row(
             ui,
             SERVICE_LABEL,
-            service_description(state.settings.service_enabled),
+            service_sub(state.settings.service_enabled),
+            service_tip(state.settings.service_enabled),
             state.settings.service_enabled,
         );
     });
@@ -3705,12 +3735,12 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
         });
 
         row_separator(ui);
-        control_row(ui, NAME_LABEL, NAME_DESCRIPTION, |ui| {
+        control_row(ui, NAME_LABEL, NAME_SUB, NAME_TIP, |ui| {
             form_field(ui, NAME_FIELD_ID, &mut state.key_form.name, NAME_FIELD_WIDTH);
         });
 
         row_separator(ui);
-        control_row(ui, EXPIRY_LABEL, EXPIRY_DESCRIPTION, |ui| {
+        control_row(ui, EXPIRY_LABEL, EXPIRY_SUB, EXPIRY_TIP, |ui| {
             form_field(ui, EXPIRY_FIELD_ID, &mut state.key_form.expiry_days, EXPIRY_FIELD_WIDTH);
         });
 
@@ -3739,7 +3769,7 @@ fn draw_mint_form(ui: &mut Ui, state: &mut PrefsState) {
 
         if state.key_form.subject == SubjectChoice::OneItem {
             row_separator(ui);
-            control_row(ui, ITEM_ID_LABEL, ITEM_ID_DESCRIPTION, |ui| {
+            control_row(ui, ITEM_ID_LABEL, ITEM_ID_SUB, ITEM_ID_TIP, |ui| {
                 form_field(ui, ITEM_FIELD_ID, &mut state.key_form.item_id, NAME_FIELD_WIDTH);
             });
         }
@@ -3868,11 +3898,11 @@ fn form_field(ui: &mut Ui, id: &str, buffer: &mut String, width: f32) {
 /// [`child_toggle_row`]'s contract, kept exactly: on an account the built-in
 /// client cannot serve, both cells are inert, the row says why in the row, and
 /// the returned value is the stored one -- so a click writes nothing.
-fn backend_choice_row(ui: &mut Ui, description: &str, official: bool, enabled: bool) -> bool {
+fn backend_choice_row(ui: &mut Ui, description: &str, tip: &str, official: bool, enabled: bool) -> bool {
     let mut next = official;
     card_row(ui, |ui| {
         ui.spacing_mut().item_spacing.y = ROW_TEXT_GAP;
-        row_text_ink(ui, BACKEND_CHOICE_LABEL, description, !enabled);
+        row_text_ink(ui, BACKEND_CHOICE_LABEL, description, tip, !enabled);
         // The cells are a control under the copy, so the air above them is
         // the row's own padding, not the lead between two lines of text.
         ui.add_space(f32::from(ROW_PAD_Y));
@@ -3973,7 +4003,8 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.clear_clipboard = toggle_row(
             ui,
             CLIPBOARD_MASTER_LABEL,
-            CLIPBOARD_MASTER_DESCRIPTION,
+            CLIPBOARD_MASTER_SUB,
+            CLIPBOARD_MASTER_TIP,
             state.settings.clear_clipboard,
         );
         row_separator(ui);
@@ -3983,7 +4014,8 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.clear_clipboard_on_lock = child_toggle_row(
             ui,
             CLIPBOARD_ON_LOCK_LABEL,
-            CLIPBOARD_ON_LOCK_DESCRIPTION,
+            CLIPBOARD_ON_LOCK_SUB,
+            CLIPBOARD_ON_LOCK_TIP,
             state.settings.clear_clipboard_on_lock,
             children_enabled,
         );
@@ -3991,7 +4023,8 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.clear_clipboard_on_account_change = child_toggle_row(
             ui,
             CLIPBOARD_ON_ACCOUNT_LABEL,
-            CLIPBOARD_ON_ACCOUNT_DESCRIPTION,
+            CLIPBOARD_ON_ACCOUNT_SUB,
+            CLIPBOARD_ON_ACCOUNT_TIP,
             state.settings.clear_clipboard_on_account_change,
             children_enabled,
         );
@@ -3999,7 +4032,8 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.clear_clipboard_on_quit = child_toggle_row(
             ui,
             CLIPBOARD_ON_QUIT_LABEL,
-            CLIPBOARD_ON_QUIT_DESCRIPTION,
+            CLIPBOARD_ON_QUIT_SUB,
+            CLIPBOARD_ON_QUIT_TIP,
             state.settings.clear_clipboard_on_quit,
             children_enabled,
         );
@@ -4017,7 +4051,7 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
     // history joins it because it is the other thing on this page that is not
     // a setting.
     card(ui, |ui| {
-        note_row(ui, CLIPBOARD_HISTORY_LABEL, CLIPBOARD_HISTORY_NOTE);
+        note_row(ui, CLIPBOARD_HISTORY_LABEL, CLIPBOARD_HISTORY_NOTE, CLIPBOARD_HISTORY_TIP);
         row_separator(ui);
         // Always live, including while the master switch is off: "put this
         // page back" is exactly what a user who has switched everything off
@@ -4025,7 +4059,7 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
         // with the thing it resets would be unreachable from the state you
         // most want to leave.
         let reset_w = outline_button_width(ui, CLIPBOARD_RESET_BUTTON);
-        control_row_w(ui, CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_DESCRIPTION, false, reset_w, |ui| {
+        control_row_tip(ui, CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_SUB, CLIPBOARD_RESET_TIP, false, reset_w, |ui| {
             if reset_button(ui) {
                 // The whole of the button's behaviour is one pure function on
                 // `Settings`, so "this resets the section and nothing else" is
@@ -4053,17 +4087,17 @@ fn draw_clipboard(ui: &mut Ui, state: &mut PrefsState) {
 fn interval_row(ui: &mut Ui, state: &mut PrefsState, enabled: bool) {
     let description = state
         .clipboard_entry_error
-        .map_or(CLIPBOARD_INTERVAL_DESCRIPTION, |error| error);
+        .map_or(CLIPBOARD_INTERVAL_SUB, |error| error);
     // Two calls rather than a function pointer chosen up front: the two row
     // helpers take a closure, and a `let row = if .. { control_row } else
     // { control_row_ghosted }` cannot be given a type general enough over
     // the closure's lifetime.
     if enabled {
-        control_row_w(ui, CLIPBOARD_INTERVAL_LABEL, description, false, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
+        control_row_tip(ui, CLIPBOARD_INTERVAL_LABEL, description, CLIPBOARD_INTERVAL_TIP, false, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
             interval_field(ui, state, true);
         });
     } else {
-        control_row_w(ui, CLIPBOARD_INTERVAL_LABEL, description, true, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
+        control_row_tip(ui, CLIPBOARD_INTERVAL_LABEL, description, CLIPBOARD_INTERVAL_TIP, true, STEPPER_STEP_WIDTH + STEPPER_VALUE_WIDTH, |ui| {
             interval_field(ui, state, false);
         });
     }
@@ -4288,7 +4322,7 @@ fn shortcut_row(
         (None, false, Some(chord), HotkeyStatus::Unavailable(reason)) => {
             reason.message(&chord.to_string())
         }
-        _ => shortcut_description(which),
+        _ => shortcut_sub(which).to_string(),
     };
     // **The label carries the warning too**, because the label is the line a
     // user scans: a row still headed "Type the password" over a greyed chip is
@@ -4323,7 +4357,7 @@ fn shortcut_row(
         pressed_chip = chord_button(ui, capturing, bound);
     };
     let controls_w = shortcut_controls_width(ui, capturing, bound);
-    control_row_w(ui, &label, &description, broken, controls_w, controls);
+    control_row_tip(ui, &label, &description, shortcut_tip(which), broken, controls_w, controls);
 
     if pressed_clear {
         state.settings.shortcuts.set(which, None);
@@ -4353,22 +4387,25 @@ fn shortcut_row(
 /// place. Four hand-written copies of it is four chances for one row to stop
 /// saying it, and the row that stopped saying it would be the row whose
 /// silence a user could not explain.
-fn shortcut_description(which: crate::app::FillShortcut) -> String {
+fn shortcut_sub(which: crate::app::FillShortcut) -> &'static str {
     use crate::app::FillShortcut;
-    let what = match which {
-        FillShortcut::Picker => {
-            return "Fills the window in front of you. With nothing matched it asks Deskwarden \
-                    about that window instead, which is what makes this the shortcut to reach \
-                    for when nothing happens."
-                .to_string()
-        }
-        FillShortcut::Username => "Types the matched item's username.",
-        FillShortcut::Password => "Types the matched item's password.",
-        FillShortcut::Totp => "Types the matched item's one-time code.",
-        FillShortcut::Sequence => "Types the matched item's own saved auto-type sequence.",
-    };
-    format!("{what}{DIRECT_SHORTCUT_NOTE}")
+    match which {
+        FillShortcut::Picker => "Fills the window in front of you",
+        FillShortcut::Username => "Types the matched item's username",
+        FillShortcut::Password => "Types the matched item's password",
+        FillShortcut::Totp => "Types the matched item's one-time code",
+        FillShortcut::Sequence => "Types the item's saved sign-in steps",
+    }
 }
+
+/// The tip behind a shortcut row: what it does when nothing matched.
+fn shortcut_tip(which: crate::app::FillShortcut) -> &'static str {
+    match which {
+        crate::app::FillShortcut::Picker => PICKER_SHORTCUT_TIP,
+        _ => DIRECT_SHORTCUT_NOTE,
+    }
+}
+const PICKER_SHORTCUT_TIP: &str = "With nothing matched it asks Deskwarden about that window instead, which is what makes this the shortcut to reach for when nothing happens.";
 
 /// The chord chip, as a button: press it and the row starts listening.
 ///
@@ -4697,7 +4734,7 @@ fn account_row(ui: &mut Ui, status: Option<AccountStatus>) {
         // no value is honest here because there is no value -- as opposed to
         // a row with an empty one, which claims there should be.
         None => card_row(ui, |ui| row_text(ui, ACCOUNT_LABEL, &description)),
-        Some(value) => value_row(ui, ACCOUNT_LABEL, &description, &value),
+        Some(value) => value_row(ui, ACCOUNT_LABEL, &description, "", &value),
     }
 }
 
@@ -4759,7 +4796,8 @@ fn draw_updates(ui: &mut Ui, state: &mut PrefsState) {
         state.settings.check_for_updates = toggle_row(
             ui,
             UPDATE_CHECK_LABEL,
-            UPDATE_CHECK_DESCRIPTION,
+            UPDATE_CHECK_SUB,
+            UPDATE_CHECK_TIP,
             state.settings.check_for_updates,
         );
     });
@@ -6406,8 +6444,7 @@ mod tests {
     /// a `ScrollArea` **culls what is outside its viewport** -- so a test
     /// reading `BODY_SIZE` would find the mint button missing and could not
     /// tell that from a mint button that was never drawn. Height only:
-    /// `paint_section_at`'s argument in the other axis, for the same reason
-    /// it exists there.
+    /// The other axis is `hover_tip_in`'s argument.
     const TALL_BODY: Vec2 = Vec2::new(WINDOW_SIZE[0], 1600.0);
 
     /// The instant every test on this page is answered against. A round
@@ -6456,7 +6493,13 @@ mod tests {
         state: &mut PrefsState,
         events: &[egui::Event],
     ) -> Painted {
-        let output = ctx.run_ui(tall_input(events), |ui| {
+        frame_of(ctx, state, tall_input(events))
+    }
+
+    /// One frame of the page for any input -- a size, a clock -- which is how
+    /// the hover tests move time on so a bubble has finished fading in.
+    fn frame_of(ctx: &egui::Context, state: &mut PrefsState, input: egui::RawInput) -> Painted {
+        let output = ctx.run_ui(input, |ui| {
             draw_prefs_body(ui, state);
         });
         let mut painted = Painted::default();
@@ -6515,7 +6558,7 @@ mod tests {
     /// needle that no longer matches anything.
     #[test]
     fn the_built_in_client_row_does_not_say_the_cli_signs_you_in() {
-        let copy = official_crypto_description(true);
+        let copy = official_crypto_tip(true);
         // **The positive control moved with the sentence it anchors.** It
         // used to be "signing in no longer uses the CLI either", which was a
         // clause of the four-paragraph copy the owner asked to shrink. The
@@ -6544,23 +6587,23 @@ mod tests {
     #[test]
     fn the_ui_loaded_row_names_both_halves_of_the_trade() {
         assert!(
-            UI_LOADED_DESCRIPTION.contains("MB"),
+            UI_LOADED_TIP.contains("MB"),
             "the row does not say what it costs, so the memory is a surprise: \
-             {UI_LOADED_DESCRIPTION}"
+             {UI_LOADED_TIP}"
         );
         // **The measured figure, not a round one.** A kept-loaded vault window
         // is ~76 MB of private working set -- Task Manager's "Memory" column,
         // the counter `README.md`'s table publishes. The row said "about
         // 100 MB" and nothing in this repository measures that.
         assert!(
-            UI_LOADED_DESCRIPTION.contains("76 MB"),
-            "the row is off the measured vault-window figure: {UI_LOADED_DESCRIPTION}"
+            UI_LOADED_TIP.contains("76 MB"),
+            "the row is off the measured vault-window figure: {UI_LOADED_TIP}"
         );
         for stale in ["100 MB", "110 MB", "111 MB"] {
             assert!(
-                !UI_LOADED_DESCRIPTION.contains(stale),
+                !UI_LOADED_TIP.contains(stale),
                 "the row is back on {stale}, which nothing in this repository measures: \
-                 {UI_LOADED_DESCRIPTION}"
+                 {UI_LOADED_TIP}"
             );
         }
         // **And it does not claim a second process.** Whether the window has
@@ -6571,16 +6614,16 @@ mod tests {
         // that promised one sent the user looking in Task Manager for a
         // process that is not there.
         assert!(
-            !UI_LOADED_DESCRIPTION.contains("second process"),
+            !UI_LOADED_TIP.contains("second process"),
             "the row promises a second process the built-in client does not always have: \
-             {UI_LOADED_DESCRIPTION}"
+             {UI_LOADED_TIP}"
         );
         assert!(
             UI_LOADED_LABEL.to_lowercase().contains("open"),
             "the row does not say what it buys: {UI_LOADED_LABEL}"
         );
         assert!(
-            UI_LOADED_DESCRIPTION.to_lowercase().contains("lock"),
+            UI_LOADED_TIP.to_lowercase().contains("lock"),
             "the row promises instant opening without saying what still closes the \
              window, so a lock reads as the setting having failed"
         );
@@ -6600,13 +6643,13 @@ mod tests {
     /// doorbell to catch it, which is how it survived several releases.
     #[test]
     fn the_ui_loaded_row_does_not_blame_a_settings_edit_for_the_close() {
-        let copy = UI_LOADED_DESCRIPTION.to_lowercase();
+        let copy = UI_LOADED_TIP.to_lowercase();
         for stale in ["changing these settings", "these settings closes"] {
             assert!(
                 !copy.contains(stale),
                 "the row is back on {stale:?}, which the live settings channel made \
                  false: a delivered edit hides. See `ui_process::on_close`. \
-                 {UI_LOADED_DESCRIPTION}"
+                 {UI_LOADED_TIP}"
             );
         }
         // **The control for the two bans above.** A `contains` over a
@@ -6617,7 +6660,7 @@ mod tests {
         assert!(
             copy.contains("closes it fully"),
             "the control phrase is gone, so the two bans above prove nothing: \
-             {UI_LOADED_DESCRIPTION}"
+             {UI_LOADED_TIP}"
         );
         // **What replaced it: the toggle is what closes the open window.**
         // True in both directions and for different reasons -- off is
@@ -6629,12 +6672,12 @@ mod tests {
             copy.contains("turning this on or off"),
             "the row does not say the toggle itself closes the window that is open, \
              so the first close after switching it on reads as the setting being \
-             broken: {UI_LOADED_DESCRIPTION}"
+             broken: {UI_LOADED_TIP}"
         );
         assert!(
             copy.contains("next time you"),
             "the row does not say when the setting starts working, which is the \
-             half that turns a surprise into an instruction: {UI_LOADED_DESCRIPTION}"
+             half that turns a surprise into an instruction: {UI_LOADED_TIP}"
         );
         // **No stray carriage return.** These sources are CRLF and the
         // copy above is five continued lines; a backslash followed by CRLF
@@ -6643,7 +6686,7 @@ mod tests {
         // reason the direct-icons row gives: writing a CR literal into a
         // CRLF source is the very hazard under test.
         assert!(
-            !UI_LOADED_DESCRIPTION.contains(char::from(13u8)),
+            !UI_LOADED_TIP.contains(char::from(13u8)),
             "a literal carriage return survived a line continuation into the copy"
         );
         // The control: the same check on the label beside it, which is a
@@ -6660,12 +6703,12 @@ mod tests {
     /// Off is the default, and a person who turns this on has decided to put
     /// a door into their vault. The sentence they read while deciding is this
     /// one, so a future edit that quietly drops the uncomfortable half of it
-    /// fails a test rather than shipping -- `disk_cache_description`'s rule,
+    /// fails a test rather than shipping -- `disk_cache_tip`'s rule,
     /// on the row with more at stake.
     #[test]
     fn the_off_copy_says_what_turning_it_on_would_do() {
-        let text = service_description(false);
-        assert!(text.contains("default"), "the copy stopped saying off is the default");
+        let text = service_tip(false);
+        assert!(service_sub(false).contains("default"), "the copy stopped saying off is the default");
         assert!(
             text.contains("127.0.0.1"),
             "the copy does not say an HTTP endpoint appears: {text}"
@@ -6684,7 +6727,7 @@ mod tests {
         );
         // The control: the two states are not the same sentence with a word
         // changed, so asserting on the off one is asserting on something.
-        assert_ne!(text, service_description(true));
+        assert_ne!(text, service_tip(true));
     }
 
     /// The ON copy describes what is happening **now**, in the present tense,
@@ -6692,7 +6735,7 @@ mod tests {
     /// to check is asking "what is this doing", not "what would it do".
     #[test]
     fn the_on_copy_says_the_endpoint_is_live_and_who_it_answers() {
-        let text = service_description(true);
+        let text = service_tip(true);
         assert!(text.contains("listening"), "got {text}");
         assert!(text.contains("127.0.0.1"), "got {text}");
         assert!(
@@ -7033,9 +7076,7 @@ mod tests {
     /// sentence can still change someone's mind.
     #[test]
     fn the_page_says_what_turning_the_service_on_would_do() {
-        let ctx = tall_context();
-        let mut state = api_state();
-        let painted = tall_frame(&ctx, &mut state, &[]);
+        let painted = tip_on(Section::Api, SERVICE_LABEL);
         assert!(
             painted.any_containing("usernames, passwords, notes and two-factor secrets"),
             "the page does not say what would be served: {:?}",
@@ -7456,37 +7497,9 @@ mod tests {
         tall_frame(&ctx, &mut state, &[])
     }
 
-    /// One frame of General on a pane of a given width. `frame` and its
-    /// `raw_input` are pinned to `BODY_SIZE`; the wrapping assertions need
-    /// more than one width, and a row that fits at 1000 points is not thereby
-    /// known to fit at 652.
-    /// One page, painted at an arbitrary width. The long-copy tests below run
-    /// at three widths, and on the page the copy under test is actually on --
-    /// which is no longer the same page for all of them, since the breach row
-    /// moved. A second copy of this harness is how two of them would come to
-    /// disagree about what "the pane" is.
-    fn paint_section_at(section: Section, width: f32) -> Painted {
-        let size = Vec2::new(width, BODY_SIZE.y);
-        let input = |events: &[egui::Event]| egui::RawInput {
-            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
-            events: events.to_vec(),
-            ..Default::default()
-        };
-        let ctx = egui::Context::default();
-        let _ = ctx.run_ui(input(&[]), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(input(&[]), |_ui| {});
-        let mut state = PrefsState::new(Settings::default());
-        state.show(section);
-        let output = ctx.run_ui(input(&[]), |ui| {
-                draw_prefs_body(ui, &mut state);
-            });
-        let mut painted = Painted::default();
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut painted);
-        }
-        painted
-    }
+    // `paint_section_at` is gone: its one family of callers measured the long
+    // descriptions at several widths, and those are hover bubbles now --
+    // `hover_tip_in` takes the size.
 
     /// Every `egui::Key`, for the sweep in
     /// [`every_bindable_key_maps_to_the_code_of_its_own_name`].
@@ -7594,6 +7607,65 @@ mod tests {
         frame(&ctx, &mut state, &[])
     }
 
+    /// Frames that open the `?` tip after `label` on `section`: a few idle
+    /// ones so the layout settles, then the pointer on the dot and a few more.
+    ///
+    /// **A row's explanation is a tip now, not a paragraph under the title**,
+    /// so a test about what a row says reads it the way a user does -- by
+    /// hovering the dot -- and a tip that was never registered is a test that
+    /// fails here rather than one that passes on the constant alone.
+    fn hover_tip(section: Section, settings: Settings, label: &str) -> Painted {
+        hover_tip_in(section, settings, label, TALL_BODY)
+    }
+
+    /// [`hover_tip`] in a window of any size, with a clock that moves so the
+    /// bubble has finished fading in.
+    fn hover_tip_in(section: Section, settings: Settings, label: &str, size: Vec2) -> Painted {
+        let ctx = egui::Context::default();
+        let input = |time: f64, events: &[egui::Event]| egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)),
+            events: events.to_vec(),
+            time: Some(time),
+            ..Default::default()
+        };
+        // Fonts first, as `styled_context` does: a family registered during a
+        // frame is only usable from the next one.
+        let _ = ctx.run_ui(input(0.0, &[]), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(0.1, &[]), |_ui| {});
+        let mut time = 0.1;
+        let mut run = |ctx: &egui::Context, state: &mut PrefsState, events: &[egui::Event]| {
+            time += 0.5;
+            frame_of(ctx, state, input(time, events))
+        };
+        let mut state = PrefsState::new(settings);
+        state.show(section);
+        let mut shown = Painted::default();
+        for _ in 0..3 {
+            shown = run(&ctx, &mut state, &[]);
+        }
+        // The `?` nearest the title: a long title wraps in a narrow pane and
+        // the dot goes with its last line, so it is found, not computed.
+        let at = shown.rect_of(label);
+        let dot = shown
+            .texts
+            .iter()
+            .filter(|(t, _)| t == "?")
+            .map(|(_, rect)| rect.center())
+            .min_by(|a, b| at.distance_to_pos(*a).total_cmp(&at.distance_to_pos(*b)))
+            .expect("the row has a ? dot");
+        let _ = run(&ctx, &mut state, &[egui::Event::PointerMoved(dot)]);
+        for _ in 0..4 {
+            shown = run(&ctx, &mut state, &[]);
+        }
+        shown
+    }
+
+    /// [`hover_tip`] on a default-settings page.
+    fn tip_on(section: Section, label: &str) -> Painted {
+        hover_tip(section, Settings::default(), label)
+    }
+
     // -- the encrypted disk cache row --------------------------------------
 
     /// One frame of a page whose Hello answer is `available`, since that is
@@ -7620,13 +7692,13 @@ mod tests {
     /// fails a test rather than shipping.
     #[test]
     fn the_available_disk_cache_copy_states_the_survives_a_lock_behaviour() {
-        let text = disk_cache_description();
+        let text = disk_cache_tip();
         assert!(text.contains("usernames, passwords, notes and two-factor secrets"));
         assert!(text.contains("not deleted when your vault locks"));
         assert!(text.contains("log out"));
         assert!(text.contains("7 days"));
         assert!(
-            text.contains("Anyone who can run programs as you"),
+            text.contains("anyone who can run programs as you"),
             "the copy stopped naming the residual attacker"
         );
         assert!(
@@ -7650,7 +7722,7 @@ mod tests {
     /// write their vault to disk.
     #[test]
     fn the_disk_cache_copy_claims_no_protection_the_file_does_not_have() {
-        let text = disk_cache_description();
+        let text = disk_cache_tip();
         for lie in ["TPM", "Windows Hello", "Hello"] {
             assert!(
                 !text.contains(lie),
@@ -7723,7 +7795,7 @@ mod tests {
 
     #[test]
     fn the_vault_page_says_what_is_in_the_file_when_hello_is_available() {
-        let painted = paint_vault_with_hello(true);
+        let painted = tip_on(Section::Vault, DISK_CACHE_LABEL);
         assert!(
             painted.any_containing("usernames, passwords, notes and two-factor secrets"),
             "the page does not say what is in the file"
@@ -7885,7 +7957,7 @@ mod tests {
              two rows are a pair of independent switches after all"
         );
         assert!(
-            first.contains(read_through_description(false)),
+            first.contains(read_through_sub(false)),
             "the ghosted child does not say what would make it available, so it reads as a \
              bug rather than as a consequence of the row above; got {:?}",
             first.strings()
@@ -8133,21 +8205,28 @@ mod tests {
         // vault_page` is where it is asserted, and the negative below is what
         // would catch it being drawn on both pages at once.
         assert!(painted.contains("Lock the vault when you step away"));
-        assert!(painted.contains(settings_v2::IDLE_LOCK_SUB), "got {:?}", painted.strings());
+        assert!(
+            tip_on(Section::Lock, AUTO_LOCK_ENABLED_LABEL).contains(settings_v2::IDLE_LOCK_TIP),
+            "the idle-lock row has no tip"
+        );
         assert!(painted.contains("Lock the vault after"));
         // The descriptions too: a row whose right-hand control squeezes the
         // text column to nothing still paints its title, so asserting only on
         // titles would not notice.
         assert!(painted.contains(PROMPT_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(PROMPT_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(tip_on(Section::General, PROMPT_LABEL).contains(PROMPT_TIP), "the prompt row has no tip");
         assert!(
-            PROMPT_DESCRIPTION.contains("CTRL+ALT+B"),
+            PROMPT_TIP.contains("CTRL+ALT+B"),
             "the description has to say what is left when the prompt is off -- otherwise the \
              toggle reads as \"switch autofill off\", which it never is"
         );
         assert!(painted.contains(settings_v2::IDLE_MINUTES_SUB), "got {:?}", painted.strings());
         assert!(
-            settings_v2::IDLE_MINUTES_SUB.contains("One minute is the shortest"),
+            tip_on(Section::Lock, AUTO_LOCK_LABEL).contains(settings_v2::IDLE_MINUTES_TIP),
+            "the minutes row has no tip"
+        );
+        assert!(
+            settings_v2::IDLE_MINUTES_TIP.contains("One minute is the shortest"),
             "the floor has to be stated on screen, not only enforced"
         );
         assert!(
@@ -8536,7 +8615,7 @@ mod tests {
         for text in [
             BREACH_LABEL,
             SCAN_SECTION_LABEL,
-            SCAN_IDLE_DESCRIPTION,
+            SCAN_IDLE_SUB,
             SCAN_BUTTON,
             crate::breach_scan::SCAN_CONSENT_NOTE,
             &SCAN_HISTORY_LABEL.to_uppercase(),
@@ -8547,6 +8626,11 @@ mod tests {
         assert!(
             !painted.contains(SCAN_RUNNING_BUTTON),
             "an idle page paints the running button as well as the idle one"
+        );
+        // What the scan costs is the tip behind the row's `?` dot.
+        assert!(
+            tip_on(Section::Breaches, SCAN_SECTION_LABEL).contains(SCAN_IDLE_TIP),
+            "the idle scan row has no tip saying what leaves the PC"
         );
     }
 
@@ -8680,18 +8764,18 @@ mod tests {
 
     /// **The long copy, at every width this module paints at.**
     ///
-    /// `BREACH_DESCRIPTION` is longer than any other row's, so it is the one
+    /// `BREACH_TIP` is longer than any other row's, so it is the one
     /// that can wrap out of the card or into the row below. Asserted on the
     /// painted galley -- its placed glyphs, its line count and its colour --
     /// rather than on the layout rect the row was allocated, because a row
     /// allocated 570 points and painted 900 wide has a perfectly correct
     /// rect.
     #[test]
-    fn the_breach_description_stays_inside_the_pane() {
+    fn the_breach_tip_stays_inside_the_pane() {
         assert!(
-            BREACH_DESCRIPTION.len() > 200,
+            BREACH_TIP.len() > 200,
             "the copy under test is not the long one, so this test is measuring nothing: {}",
-            BREACH_DESCRIPTION.len()
+            BREACH_TIP.len()
         );
         // Every width the module already paints or measures at: the body's
         // own, and the modal card at both pane sizes `modal_card_rect`'s
@@ -8703,7 +8787,8 @@ mod tests {
         ];
         let mut visited = 0;
         for width in widths {
-            let pane = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, BODY_SIZE.y));
+            // Tall, so the Breaches row is on screen to be hovered.
+            let pane = Rect::from_min_size(Pos2::ZERO, Vec2::new(width, TALL_BODY.y));
             // The positive control, per width: `contains_rect` has to be able
             // to say no here, or every assertion below is vacuous.
             assert!(
@@ -8714,17 +8799,21 @@ mod tests {
                 "`contains_rect` cannot fail at width {width}"
             );
 
-            let painted = paint_section_at(Section::Breaches, width);
-            let ink = painted.ink_of(BREACH_DESCRIPTION);
+            // The longest copy on the page is a hover bubble now, so what
+            // has to hold at every width is that the bubble is whole, wraps,
+            // and stays inside the window whatever the dot's position.
+            let painted = hover_tip_in(Section::Breaches, Settings::default(), BREACH_LABEL, pane.size());
+            assert!(painted.contains(BREACH_SUB), "the row's sub is missing at width {width}");
+            let ink = painted.ink_of(BREACH_TIP);
             assert_eq!(
                 ink.rendered.split_whitespace().collect::<Vec<_>>(),
-                BREACH_DESCRIPTION.split_whitespace().collect::<Vec<_>>(),
-                "the description was elided to fit at width {width}; egui laid {:?}",
+                BREACH_TIP.split_whitespace().collect::<Vec<_>>(),
+                "the tip was elided to fit at width {width}; egui laid {:?}",
                 ink.rendered
             );
             assert!(
                 ink.color.a() > 0,
-                "the description is painted at alpha 0 at width {width}, so every geometry \
+                "the tip is painted at alpha 0 at width {width}, so every geometry \
                  assertion here is reading a shape that is not on screen"
             );
             assert!(
@@ -8735,42 +8824,9 @@ mod tests {
             );
             assert!(
                 pane.contains_rect(ink.rect),
-                "the description is painted at {:?}, outside the {width}-wide pane {pane:?}",
+                "the tip is painted at {:?}, outside the {width}-wide pane {pane:?}",
                 ink.rect
             );
-            // **The rows either side of it, and re-pinned deliberately.**
-            // This list used to name the auto-lock rows as "the row below",
-            // which they were until the site-icons row was inserted between
-            // them. They are no longer adjacent to this description AND, at
-            // the narrowest width here, the taller card now pushes them out
-            // of the painted body altogether -- so `ink_of` panics on them
-            // rather than measuring anything.
-            //
-            // Naming the site-icons row instead is a strengthening rather
-            // than a relaxation: an overlap can only happen between rows that
-            // are actually next to each other, and `FETCH_ICONS_DESCRIPTION`
-            // is the other long one, so this is now the hardest pair on the
-            // card rather than a pair separated by two rows.
-            // **The rows either side of it, re-pinned for the page the row
-            // is actually on now.** Its neighbours used to be the prompt row
-            // above and the site-icons row below; on Breaches it is the first
-            // thing on the page, and what sits under it is the scan card --
-            // whose own description is the other long copy here, so this is
-            // still the hardest pair on the page rather than a pair separated
-            // by two rows.
-            for neighbour in [
-                BREACH_LABEL,
-                SCAN_SECTION_LABEL,
-                SCAN_IDLE_DESCRIPTION,
-                crate::breach_scan::SCAN_CONSENT_NOTE,
-            ] {
-                let other = painted.ink_of(neighbour).rect;
-                assert!(
-                    !ink.rect.intersects(other),
-                    "the description at {:?} overlaps {neighbour:?} at {other:?} at width {width}",
-                    ink.rect
-                );
-            }
             visited += 1;
         }
         assert_eq!(visited, widths.len(), "a width was skipped");
@@ -8937,11 +8993,12 @@ mod tests {
     /// their own network are not what this pill decides.
     #[test]
     fn the_direct_icons_row_says_what_it_costs_and_what_it_does_not_govern() {
-        let painted = paint(Section::View);
+        let painted = tip_on(Section::View, DIRECT_ICONS_LABEL);
         assert!(painted.contains(DIRECT_ICONS_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(DIRECT_ICONS_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(DIRECT_ICONS_SUB), "got {:?}", painted.strings());
+        assert!(painted.contains(DIRECT_ICONS_TIP), "got {:?}", painted.strings());
         assert!(
-            DIRECT_ICONS_DESCRIPTION.contains("Off by default"),
+            DIRECT_ICONS_TIP.contains("Off by default"),
             "the default is stated in the copy, as every other consent row on this page states \
              its own"
         );
@@ -8949,13 +9006,13 @@ mod tests {
         // each site" is a true sentence a reader nods at without
         // understanding what it discloses; this is the sentence that says it.
         assert!(
-            DIRECT_ICONS_DESCRIPTION.contains("an entry for it exists"),
-            "the copy does not say what ON discloses to each site: {DIRECT_ICONS_DESCRIPTION:?}"
+            DIRECT_ICONS_TIP.contains("an entry for it exists"),
+            "the copy does not say what ON discloses to each site: {DIRECT_ICONS_TIP:?}"
         );
         assert!(
-            DIRECT_ICONS_DESCRIPTION.contains("192.168"),
+            DIRECT_ICONS_TIP.contains("192.168"),
             "the copy does not name the addresses this pill does NOT govern, so a user reading \
-             the label would think it did: {DIRECT_ICONS_DESCRIPTION:?}"
+             the label would think it did: {DIRECT_ICONS_TIP:?}"
         );
         // **The promise matches `favicon::icon_source_for`, in both
         // directions.** ON is the site FIRST and the icon service for the
@@ -8964,15 +9021,15 @@ mod tests {
         // logs, and one who is told only "the icon service is asked" has no
         // idea what the switch is for.
         assert!(
-            DIRECT_ICONS_DESCRIPTION.contains("asks each site for its own icon first"),
-            "the copy does not say that ON asks the site FIRST: {DIRECT_ICONS_DESCRIPTION:?}"
+            DIRECT_ICONS_TIP.contains("asks each site for its own icon first"),
+            "the copy does not say that ON asks the site FIRST: {DIRECT_ICONS_TIP:?}"
         );
         assert!(
-            DIRECT_ICONS_DESCRIPTION
+            DIRECT_ICONS_TIP
                 .contains("the icon service is asked only about the ones the site itself did not \
                            answer"),
             "the copy does not say the icon service still answers for the sites that did not: \
-             {DIRECT_ICONS_DESCRIPTION:?}"
+             {DIRECT_ICONS_TIP:?}"
         );
         // **The sentence this row used to carry, forbidden by name.** "the
         // icon service is not asked for any of them" described a direct-ONLY
@@ -8980,9 +9037,9 @@ mod tests {
         // no favicon at a fixed path. A switch whose label overstates its
         // reach is worse than no switch, and this is the exact overstatement.
         assert!(
-            !DIRECT_ICONS_DESCRIPTION.contains("not asked for any of them"),
+            !DIRECT_ICONS_TIP.contains("not asked for any of them"),
             "the copy still promises the icon service goes unasked, which \
-             `favicon::IconSource::DirectThenProxy` makes false: {DIRECT_ICONS_DESCRIPTION:?}"
+             `favicon::IconSource::DirectThenProxy` makes false: {DIRECT_ICONS_TIP:?}"
         );
         // **No stray carriage return, and this is not paranoia.** These
         // sources are CRLF and Rust's string line-continuation is a
@@ -8997,7 +9054,7 @@ mod tests {
         // under test here, and this spelling has nothing in it that a
         // line-ending pass can mangle.
         assert!(
-            !DIRECT_ICONS_DESCRIPTION.contains(char::from(13u8)),
+            !DIRECT_ICONS_TIP.contains(char::from(13u8)),
             "a literal carriage return survived a line continuation into the copy"
         );
         assert!(
@@ -9007,18 +9064,18 @@ mod tests {
         // The control: the same check on a neighbour that has always been
         // fine, so a `contains` that could never be true is not what is
         // passing here.
-        assert!(FETCH_ICONS_DESCRIPTION.contains("On by default"));
+        assert!(FETCH_ICONS_TIP.contains("On by default"));
         // The house rule, as a test: this page never calls anything secure.
         assert!(
-            !DIRECT_ICONS_DESCRIPTION.to_ascii_lowercase().contains("secure"),
-            "the copy calls something secure: {DIRECT_ICONS_DESCRIPTION:?}"
+            !DIRECT_ICONS_TIP.to_ascii_lowercase().contains("secure"),
+            "the copy calls something secure: {DIRECT_ICONS_TIP:?}"
         );
         // The instrument: an ink lookup that panics on a double paint, with a
         // real rect, so `contains` above is not reading a zero-size ghost.
         let ink = painted.ink_of(DIRECT_ICONS_LABEL);
         assert!(ink.rect.height() > 0.0 && ink.rect.width() > 0.0, "the label has no box: {:?}", ink.rect);
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(DIRECT_ICONS_DESCRIPTION);
+        let desc = painted.ink_of(DIRECT_ICONS_TIP);
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
         // And it sits under the switch it is a child of, read off the paint.
         let master = painted.ink_of(FETCH_ICONS_LABEL).rect;
@@ -9093,20 +9150,21 @@ mod tests {
     /// a brand with no image is not a blank -- it keeps its word.
     #[test]
     fn the_network_logos_row_says_where_the_images_come_from_and_what_happens_without_them() {
-        let painted = paint(Section::View);
+        let painted = tip_on(Section::View, BRAND_LOGOS_LABEL);
         assert!(painted.contains(BRAND_LOGOS_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(BRAND_LOGOS_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(BRAND_LOGOS_SUB), "got {:?}", painted.strings());
+        assert!(painted.contains(BRAND_LOGOS_TIP), "got {:?}", painted.strings());
         assert!(
-            BRAND_LOGOS_DESCRIPTION.contains("brand-marks"),
+            BRAND_LOGOS_TIP.contains("brand-marks"),
             "the copy has to name the folder: with none named, a user turns this on, sees no \
              change whatever, and has nothing to act on"
         );
         assert!(
-            BRAND_LOGOS_DESCRIPTION.contains("Off by default"),
+            BRAND_LOGOS_TIP.contains("Off by default"),
             "the default is stated in the copy, as every other row's is"
         );
         assert!(
-            BRAND_LOGOS_DESCRIPTION.contains("Nothing is downloaded"),
+            BRAND_LOGOS_TIP.contains("Nothing is downloaded"),
             "on a page whose neighbouring row IS a network request, silence here reads as a \
              second one"
         );
@@ -9186,7 +9244,7 @@ mod tests {
             general.strings()
         );
         assert!(
-            !general.contains(UPDATE_CHECK_DESCRIPTION),
+            !general.contains(UPDATE_CHECK_TIP),
             "General still carries the update row's copy: {:?}",
             general.strings()
         );
@@ -9227,7 +9285,7 @@ mod tests {
     /// costs. A missed security fix has no symptom.
     #[test]
     fn the_update_check_row_says_what_turning_it_off_costs() {
-        let painted = paint(Section::Updates);
+        let painted = tip_on(Section::Updates, UPDATE_CHECK_LABEL);
         assert!(painted.contains(UPDATE_CHECK_LABEL), "got {:?}", painted.strings());
         // The label is not the button's words. Both are on this page now, a
         // card apart, and two identical strings -- one a switch and one a
@@ -9238,14 +9296,15 @@ mod tests {
             "the automatic-check switch and the manual-check button are painted on one page and \
              must not read as the same thing twice"
         );
-        assert!(painted.contains(UPDATE_CHECK_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(UPDATE_CHECK_SUB), "got {:?}", painted.strings());
+        assert!(painted.contains(UPDATE_CHECK_TIP), "got {:?}", painted.strings());
         assert!(
-            UPDATE_CHECK_DESCRIPTION.contains("security"),
+            UPDATE_CHECK_TIP.contains("security"),
             "the copy has to name what is lost by turning this off; a missed security fix is \
              invisible, so the pane is the only place the user can learn it"
         );
         assert!(
-            UPDATE_CHECK_DESCRIPTION.contains("On by default"),
+            UPDATE_CHECK_TIP.contains("On by default"),
             "on-by-default is stated in `Settings::default` and has to be stated on screen too"
         );
         let ink = painted.ink_of(UPDATE_CHECK_LABEL);
@@ -9255,7 +9314,7 @@ mod tests {
             ink.rect
         );
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(UPDATE_CHECK_DESCRIPTION);
+        let desc = painted.ink_of(UPDATE_CHECK_TIP);
         assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
     }
@@ -9265,21 +9324,21 @@ mod tests {
     /// (the credential).
     #[test]
     fn the_site_icons_row_says_the_domain_is_what_is_sent() {
-        let painted = paint(Section::View);
+        let painted = tip_on(Section::View, FETCH_ICONS_LABEL);
         assert!(painted.contains(FETCH_ICONS_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(FETCH_ICONS_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(FETCH_ICONS_TIP), "got {:?}", painted.strings());
         assert!(
-            FETCH_ICONS_DESCRIPTION.contains("domain"),
+            FETCH_ICONS_TIP.contains("domain"),
             "the copy has to name what is actually sent; \"downloads icons\" describes the \
              feature and hides the cost"
         );
         assert!(
-            FETCH_ICONS_DESCRIPTION.contains("password"),
+            FETCH_ICONS_TIP.contains("password"),
             "the copy has to say what is NOT sent -- \"it sends the website to Bitwarden\" is \
              what a worried reader assumes, and it is wrong"
         );
         assert!(
-            FETCH_ICONS_DESCRIPTION.contains("On by default"),
+            FETCH_ICONS_TIP.contains("On by default"),
             "on-by-default is stated in `Settings::default` and has to be stated on screen too \
              -- this is the one network row here that is on unless it is turned off"
         );
@@ -9292,7 +9351,7 @@ mod tests {
             ink.rect
         );
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(FETCH_ICONS_DESCRIPTION);
+        let desc = painted.ink_of(FETCH_ICONS_TIP);
         assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
     }
@@ -9419,23 +9478,24 @@ mod tests {
     /// painted in the clear.
     #[test]
     fn the_totp_secret_row_says_what_it_turns_on_and_that_it_is_off_by_default() {
-        let painted = paint(Section::View);
+        let painted = tip_on(Section::View, TOTP_SECRET_LABEL);
         assert!(painted.contains(TOTP_SECRET_LABEL), "got {:?}", painted.strings());
-        assert!(painted.contains(TOTP_SECRET_DESCRIPTION), "got {:?}", painted.strings());
+        assert!(painted.contains(TOTP_SECRET_SUB), "got {:?}", painted.strings());
+        assert!(painted.contains(TOTP_SECRET_TIP), "got {:?}", painted.strings());
         assert!(
             TOTP_SECRET_LABEL.contains("TOTP secret"),
             "the label has to name the thing it reveals, not just say \"secret\""
         );
         assert!(
-            TOTP_SECRET_DESCRIPTION.contains("Off by default"),
+            TOTP_SECRET_TIP.contains("Off by default"),
             "off-by-default is stated in `Settings::default` and has to be stated on screen too"
         );
         assert!(
-            TOTP_SECRET_DESCRIPTION.contains("masked"),
+            TOTP_SECRET_TIP.contains("masked"),
             "turning this on adds a MASKED row; copy that implied a seed appears in the clear would be wrong"
         );
         assert!(
-            TOTP_SECRET_DESCRIPTION.contains("details screen"),
+            TOTP_SECRET_TIP.contains("details screen"),
             "the copy has to say WHERE the row appears"
         );
         // **The row is labelled `TOTP` on that screen, and the copy said
@@ -9445,11 +9505,11 @@ mod tests {
         // failure this pins: the user goes looking for a row called "one-time
         // code", does not find one, and concludes the pill did nothing.
         assert!(
-            !TOTP_SECRET_DESCRIPTION.to_ascii_lowercase().contains("one-time code"),
-            "the details screen labels that row \"TOTP\", not \"one-time code\": {TOTP_SECRET_DESCRIPTION:?}"
+            !TOTP_SECRET_TIP.to_ascii_lowercase().contains("one-time code"),
+            "the details screen labels that row \"TOTP\", not \"one-time code\": {TOTP_SECRET_TIP:?}"
         );
         assert!(
-            TOTP_SECRET_DESCRIPTION.contains("TOTP code"),
+            TOTP_SECRET_TIP.contains("TOTP code"),
             "the copy has to name the row it appears under, as that row is labelled"
         );
         // The instrument: an ink lookup that panics on a double paint, with a
@@ -9457,7 +9517,7 @@ mod tests {
         let ink = painted.ink_of(TOTP_SECRET_LABEL);
         assert!(ink.rect.height() > 0.0 && ink.rect.width() > 0.0, "the label has no box: {:?}", ink.rect);
         assert!(ink.color.a() > 0, "the label is painted at alpha {}", ink.color.a());
-        let desc = painted.ink_of(TOTP_SECRET_DESCRIPTION);
+        let desc = painted.ink_of(TOTP_SECRET_TIP);
         assert!(desc.color.a() > 0, "the description is painted at alpha {}", desc.color.a());
         assert!(desc.rows >= 2, "a description this long should wrap; it took {} row(s)", desc.rows);
     }
@@ -9754,19 +9814,19 @@ mod tests {
         let painted = paint(Section::Clipboard);
         for text in [
             CLIPBOARD_MASTER_LABEL,
-            CLIPBOARD_MASTER_DESCRIPTION,
+            CLIPBOARD_MASTER_SUB,
             CLIPBOARD_ON_LOCK_LABEL,
-            CLIPBOARD_ON_LOCK_DESCRIPTION,
+            CLIPBOARD_ON_LOCK_SUB,
             CLIPBOARD_ON_ACCOUNT_LABEL,
-            CLIPBOARD_ON_ACCOUNT_DESCRIPTION,
+            CLIPBOARD_ON_ACCOUNT_SUB,
             CLIPBOARD_ON_QUIT_LABEL,
-            CLIPBOARD_ON_QUIT_DESCRIPTION,
+            CLIPBOARD_ON_QUIT_SUB,
             CLIPBOARD_INTERVAL_LABEL,
-            CLIPBOARD_INTERVAL_DESCRIPTION,
+            CLIPBOARD_INTERVAL_SUB,
             CLIPBOARD_HISTORY_LABEL,
             CLIPBOARD_HISTORY_NOTE,
             CLIPBOARD_RESET_LABEL,
-            CLIPBOARD_RESET_DESCRIPTION,
+            CLIPBOARD_RESET_SUB,
             CLIPBOARD_RESET_BUTTON,
         ] {
             assert!(
@@ -9774,6 +9834,18 @@ mod tests {
                 "{text:?} was not painted; got {:?}",
                 painted.strings()
             );
+        }
+        // Every explanation is the tip behind its row's `?` dot.
+        for (label, tip) in [
+            (CLIPBOARD_MASTER_LABEL, CLIPBOARD_MASTER_TIP),
+            (CLIPBOARD_ON_LOCK_LABEL, CLIPBOARD_ON_LOCK_TIP),
+            (CLIPBOARD_ON_ACCOUNT_LABEL, CLIPBOARD_ON_ACCOUNT_TIP),
+            (CLIPBOARD_ON_QUIT_LABEL, CLIPBOARD_ON_QUIT_TIP),
+            (CLIPBOARD_INTERVAL_LABEL, CLIPBOARD_INTERVAL_TIP),
+            (CLIPBOARD_HISTORY_LABEL, CLIPBOARD_HISTORY_TIP),
+            (CLIPBOARD_RESET_LABEL, CLIPBOARD_RESET_TIP),
+        ] {
+            assert!(tip_on(Section::Clipboard, label).contains(tip), "{label:?} has no tip");
         }
         // The default interval, in minutes, is on screen -- so the field shows
         // the value in effect rather than an empty box.
@@ -9795,42 +9867,42 @@ mod tests {
     #[test]
     fn the_clipboard_copy_states_the_floor_the_ceiling_and_what_is_not_switchable() {
         assert!(
-            CLIPBOARD_INTERVAL_DESCRIPTION.contains("0.5")
-                && CLIPBOARD_INTERVAL_DESCRIPTION.contains("thirty seconds"),
+            CLIPBOARD_INTERVAL_TIP.contains("0.5")
+                && CLIPBOARD_INTERVAL_TIP.contains("thirty seconds"),
             "the floor has to be stated on screen, in both forms, not only enforced"
         );
         assert!(
-            CLIPBOARD_INTERVAL_DESCRIPTION.contains("60 minutes"),
+            CLIPBOARD_INTERVAL_TIP.contains("60 minutes"),
             "the ceiling has to be stated on screen, or a user meets it by being refused"
         );
         assert!(
-            CLIPBOARD_INTERVAL_DESCRIPTION.contains("One decimal place"),
+            CLIPBOARD_INTERVAL_TIP.contains("one decimal place"),
             "the resolution has to be stated, or `1.25` is refused for an unstated reason"
         );
         assert!(
-            CLIPBOARD_MASTER_DESCRIPTION.contains("Off means"),
+            CLIPBOARD_MASTER_TIP.contains("Off means"),
             "the master switch's copy has to say what OFF does -- off is the state that \
              withdraws a protection"
         );
         assert!(
-            CLIPBOARD_MASTER_DESCRIPTION.contains("clipboard history")
-                && CLIPBOARD_HISTORY_NOTE.contains("no setting"),
+            CLIPBOARD_MASTER_TIP.contains("clipboard history")
+                && CLIPBOARD_HISTORY_TIP.contains("no setting"),
             "the history exclusion has to be named as always-on in both places, or this page \
              reads as governing it"
         );
         assert!(
-            CLIPBOARD_ON_QUIT_DESCRIPTION.contains("crash")
-                && CLIPBOARD_ON_QUIT_DESCRIPTION.contains("power cut"),
+            CLIPBOARD_ON_QUIT_TIP.contains("crash")
+                && CLIPBOARD_ON_QUIT_TIP.contains("power cut"),
             "the quit switch has to say what it cannot cover, or it promises more than \
              PRIVACY.md does"
         );
         assert!(
-            CLIPBOARD_ON_LOCK_DESCRIPTION.contains("no separate sign-out"),
+            CLIPBOARD_ON_LOCK_TIP.contains("no separate sign-out"),
             "the lock switch has to say it is also the logout case, since there is no logout \
              switch and a reader will look for one"
         );
         assert!(
-            CLIPBOARD_RESET_DESCRIPTION.contains("Nothing on any other page"),
+            CLIPBOARD_RESET_SUB.contains("other pages"),
             "the reset button has to state its scope, or `Reset to default` inside a \
              preferences window is ambiguous between this page and the app"
         );
@@ -10355,7 +10427,7 @@ mod tests {
         // paragraph was still painted somewhere would be the same lie with no
         // label on it.
         assert!(
-            !direct.contains(BACKEND_DESCRIPTION),
+            !direct.contains(BACKEND_SUB),
             "the row is hidden but its description is still on the page"
         );
 
@@ -10370,7 +10442,7 @@ mod tests {
         ] {
             let painted = paint_vault_for(server, use_official);
             assert!(
-                painted.contains(BACKEND_LABEL) && painted.contains(BACKEND_DESCRIPTION),
+                painted.contains(BACKEND_LABEL) && painted.contains(BACKEND_SUB),
                 "{why} is served by `bw serve`, so this row decides something and must be \
                  drawn saying so; got {:?}",
                 painted.strings()
@@ -10685,7 +10757,7 @@ mod tests {
     #[test]
     fn the_built_in_vault_page_names_no_subprocess() {
         let painted = paint_vault_for(Some("self"), false);
-        let switch_copy = official_crypto_description(true);
+        let switch_copy = official_crypto_tip(true);
         let exempt = [BACKEND_CHOICE_LABEL, OFFICIAL_CHOICE, BUILT_IN_CHOICE, switch_copy];
         let offending: Vec<&str> = painted
             .strings()
@@ -11270,7 +11342,7 @@ mod tests {
         // clients in the order the cells are drawn in, which is the same
         // claim about the same possible inversion: a reader who matches the
         // first sentence to the first cell must be matching the right pair.
-        let copy = official_crypto_description(true);
+        let copy = official_crypto_tip(true);
         let official = copy
             .find("The official Bitwarden CLI")
             .expect("the copy no longer describes the official CLI");
@@ -11320,10 +11392,10 @@ mod tests {
     /// measured anywhere in this repository agrees with it.
     ///
     /// And it checks that the copy does NOT demand a restart, which is the
-    /// sentence 0.15.4 made false. See [`official_crypto_description`].
+    /// sentence 0.15.4 made false. See [`official_crypto_tip`].
     #[test]
     fn the_backend_rows_copy_states_the_gain_the_cost_and_the_restart() {
-        let copy = official_crypto_description(true);
+        let copy = official_crypto_tip(true);
         // Both clients named, in the copy as well as on the cells. A
         // description that named only one would put the other back in the
         // unnamed position the on/off pill gave it.
@@ -11370,9 +11442,10 @@ mod tests {
         // would be clicking is the one that decides where their master key
         // lives.
         assert!(
-            copy.contains("next time you sign in to this account"),
+            official_crypto_sub(true).contains("next time you sign in"),
             "the copy does not say when the change takes effect, so a user who presses a \
-             cell and sees nothing happen presses it again: {copy:?}"
+             cell and sees nothing happen presses it again: {:?}",
+            official_crypto_sub(true)
         );
         // **And it no longer says the wrong moment.** `settle_the_vault_backend`
         // used to run only at startup; since 0.15.4 a sign-in re-settles the
@@ -11386,8 +11459,8 @@ mod tests {
         // The disabled twin says what would make it available, and does not
         // repeat the trade -- there is nothing to weigh on a server this
         // backend will not serve.
-        let ghosted = official_crypto_description(false);
-        assert!(ghosted.contains("Only available on a self-hosted server"));
+        let ghosted = official_crypto_tip(false);
+        assert!(official_crypto_sub(false).contains("Only available on a self-hosted server"));
         assert!(
             !ghosted.contains("19 MB") && !ghosted.contains("118 MB"),
             "the unavailable row offers a trade the user cannot take: {ghosted:?}"
@@ -11678,27 +11751,41 @@ mod tests {
     /// and this page is where they ask.
     #[test]
     fn a_direct_shortcut_says_it_needs_a_matched_window() {
-        let painted =
-            paint_shortcuts(&Settings::default(), [crate::hotkey::HotkeyStatus::Armed; 5]);
-        let explained = painted
-            .strings()
-            .iter()
-            .filter(|t| t.contains("with nothing matched it does nothing"))
-            .count();
-        assert_eq!(
-            explained, 4,
-            "{explained} rows explain what a direct action does with nothing matched, not 4 \
-             -- a shortcut that is silent AND unexplained is exactly the failure the whole \
-             status column exists to prevent: {:?}",
-            painted.strings()
-        );
+        // The four direct rows keep the sentence as the tip behind their `?`
+        // dot, so it is read the way a user reads it: by hovering.
+        let page = paint_tall(Section::Shortcuts);
+        // A row is titled with its suffix while its chord is not working,
+        // and that is process-wide state this test does not own.
+        let titled = |which: crate::app::FillShortcut| {
+            [which.label().to_string(), format!("{}{SHORTCUT_UNAVAILABLE_SUFFIX}", which.label())]
+                .into_iter()
+                .find(|label| page.contains(label))
+                .expect("the shortcut's row")
+        };
+        for which in [
+            crate::app::FillShortcut::Username,
+            crate::app::FillShortcut::Password,
+            crate::app::FillShortcut::Totp,
+            crate::app::FillShortcut::Sequence,
+        ] {
+            let painted = tip_on(Section::Shortcuts, &titled(which));
+            assert!(
+                painted.any_containing("with nothing matched it does nothing"),
+                "the {} row does not say what it does with nothing matched -- a shortcut that \
+                 is silent AND unexplained is exactly the failure the whole status column \
+                 exists to prevent: {:?}",
+                which.label(),
+                painted.strings()
+            );
+        }
         // ...and the picker's row does NOT say it, because the picker is the
         // one that answers for an unmatched window.
+        let picker = tip_on(Section::Shortcuts, &titled(crate::app::FillShortcut::Picker));
         assert!(
-            painted.any_containing("it asks Deskwarden"),
+            picker.any_containing("it asks Deskwarden"),
             "the picker's row does not say that it is the one that answers for an unmatched \
              window, so the four rows above point at nothing: {:?}",
-            painted.strings()
+            picker.strings()
         );
     }
 
@@ -14115,9 +14202,14 @@ mod modal_tests {
         // which is the same frame once more on a viewport tall enough that
         // the Local API page's scroll region culls nothing. All five are
         // tests; the production callers are still the two shells.
+        //
+        // **Seven since slice 15e**: `paint_section_at`, the one that drew
+        // a chosen width, went with the long descriptions it measured
+        // (they are hover bubbles now, measured through `frame_of`, which
+        // `tall_frame` calls).
         assert_eq!(
             source.match_indices(body_calls).count(),
-            8,
+            7,
             "the number of `draw_prefs_body` sites changed; if a THIRD production caller \
              was added, confirm it is a shell and not a second form"
         );

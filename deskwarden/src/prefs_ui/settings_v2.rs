@@ -242,13 +242,13 @@ fn body(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
         Page::Notifications => not_yet(
             ui,
             "Notification choices are not available yet",
-            "Choosing which events tell you something arrives in a later release.",
+            "Arrives in a later release",
         ),
         Page::ImportExport => import_export(ui),
         Page::Devices => not_yet(
             ui,
             "The device list is not available yet",
-            "Seeing and signing out your other devices arrives in a later release.",
+            "Arrives in a later release",
         ),
         Page::Shortcuts => shortcuts(ui, state),
         Page::Account => account(ui, state),
@@ -267,30 +267,30 @@ fn general(ui: &mut Ui, state: &mut PrefsState) {
             if state.startup.is_some() {
                 kit_card::row_rule(ui);
             }
-            value_row(ui, KEEP_RUNNING_LABEL, KEEP_RUNNING_SUB, KEEP_RUNNING_VALUE);
+            value_row(ui, KEEP_RUNNING_LABEL, "", KEEP_RUNNING_TIP, KEEP_RUNNING_VALUE);
         });
     });
     group(ui, Some("Look"), |ui| {
         card(ui, |ui| {
             use crate::kit::tokens::{SidebarStyle, TextSize, ThemeChoice};
             let now = if state.settings.sidebar_style == SidebarStyle::Navy { 0 } else { 1 };
-            if let Some(picked) = segment_row(ui, prefs::SIDEBAR_STYLE_LABEL, prefs::SIDEBAR_STYLE_DESCRIPTION, &["Navy", "Light"], now) {
+            if let Some(picked) = segment_row(ui, prefs::SIDEBAR_STYLE_LABEL, "", "", &["Navy", "Light"], now) {
                 state.settings.sidebar_style = if picked == 0 { SidebarStyle::Navy } else { SidebarStyle::Light };
             }
             kit_card::row_rule(ui);
             let themes = [ThemeChoice::Light, ThemeChoice::Dark, ThemeChoice::System];
             let now = themes.iter().position(|t| *t == state.settings.theme).unwrap_or(0);
-            if let Some(picked) = segment_row(ui, THEME_LABEL, "", &["Light", "Dark", "System"], now) {
+            if let Some(picked) = segment_row(ui, THEME_LABEL, "", "", &["Light", "Dark", "System"], now) {
                 state.settings.theme = themes[picked];
             }
             kit_card::row_rule(ui);
             let sizes = [TextSize::Default, TextSize::Large, TextSize::Larger];
             let now = sizes.iter().position(|t| *t == state.settings.text_size).unwrap_or(0);
-            if let Some(picked) = segment_row(ui, TEXT_SIZE_LABEL, "", &["Default", "Large", "Larger"], now) {
+            if let Some(picked) = segment_row(ui, TEXT_SIZE_LABEL, "", "", &["Default", "Large", "Larger"], now) {
                 state.settings.text_size = sizes[picked];
             }
             kit_card::row_rule(ui);
-            if button_row(ui, LANGUAGE_LABEL, "", LANGUAGE_VALUE, false) {
+            if button_row(ui, LANGUAGE_LABEL, "", "", LANGUAGE_VALUE, false) {
                 crate::kit::toast::show(ui.ctx(), LANGUAGE_TOAST);
             }
         });
@@ -305,10 +305,10 @@ fn startup_rows(ui: &mut Ui, state: &mut PrefsState) {
         return;
     };
     let mut open = now.open_at_sign_in;
-    switch_row(ui, OPEN_AT_SIGN_IN_LABEL, "", &mut open, true);
+    switch_row(ui, OPEN_AT_SIGN_IN_LABEL, "", "", &mut open, true);
     kit_card::row_rule(ui);
     let mut tray = if now.open_at_sign_in { now.in_tray } else { state.tray_when_opened };
-    switch_row(ui, START_IN_TRAY_LABEL, START_IN_TRAY_SUB, &mut tray, now.open_at_sign_in);
+    switch_row(ui, START_IN_TRAY_LABEL, "", "", &mut tray, now.open_at_sign_in);
     let wanted = crate::autostart_repair::Startup { open_at_sign_in: open, in_tray: tray };
     if open == now.open_at_sign_in && (tray == now.in_tray || !now.open_at_sign_in) {
         return;
@@ -326,19 +326,22 @@ fn startup_rows(ui: &mut Ui, state: &mut PrefsState) {
 /// The Startup rows' wording (spec C 2.4).
 pub const OPEN_AT_SIGN_IN_LABEL: &str = "Open when I sign in to Windows";
 pub const START_IN_TRAY_LABEL: &str = "Start in the system tray";
-const START_IN_TRAY_SUB: &str = "Start hidden; open the window from the tray icon";
 /// Closing the window only ever hides it: the tray keeps autofill running.
 pub const KEEP_RUNNING_LABEL: &str = "Keep running when I close the window";
-const KEEP_RUNNING_SUB: &str = "Autofill only works while Deskwarden is running. Closing the window just hides it.";
+/// The design's tip for this row, word for word.
+const KEEP_RUNNING_TIP: &str = "Autofill only works while Deskwarden is running. Closing the window just hides it.";
 const KEEP_RUNNING_VALUE: &str = "Always";
 const STARTUP_FAILED_TOAST: &str = "Could not change the Windows startup entry";
 /// The Security rows' wording (spec C 2.4).
-pub const IDLE_LOCK_SUB: &str = "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
-pub const IDLE_MINUTES_SUB: &str = "Minutes of no activity. One minute is the shortest.";
+pub const IDLE_LOCK_TIP: &str = "Off means the vault stays unlocked until you lock it yourself or quit Deskwarden.";
+pub const IDLE_MINUTES_SUB: &str = "Minutes of no activity";
+pub const IDLE_MINUTES_TIP: &str = "One minute is the shortest.";
 pub const LOCK_ON_SLEEP_LABEL: &str = "Lock when the computer sleeps";
 pub const LOCK_ON_SCREEN_LOCK_LABEL: &str = "Lock when I lock my screen";
 pub const HIDE_ON_SHARE_LABEL: &str = "Hide passwords while I share my screen";
-const HIDE_ON_SHARE_SUB: &str = "The whole window stays out of Teams, Zoom or Meet screen sharing, even if you press reveal.";
+/// The design's tip, kept to what the app does: the whole window (not only
+/// the passwords) stays out of the shared picture.
+const HIDE_ON_SHARE_TIP: &str = "The whole window stays out of Teams, Zoom or Meet screen sharing, even if you press reveal.";
 /// The Look rows' wording (spec C 2.4).
 pub const THEME_LABEL: &str = "Theme";
 pub const TEXT_SIZE_LABEL: &str = "Text size";
@@ -350,12 +353,12 @@ pub const LANGUAGE_TOAST: &str = "More languages are on the way";
 fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
     group(ui, Some("Suggestions"), |ui| {
         card(ui, |ui| {
-            switch_row(ui, prefs::PROMPT_LABEL, prefs::PROMPT_DESCRIPTION, &mut state.settings.prompt_on_match, true);
+            switch_row(ui, prefs::PROMPT_LABEL, "", prefs::PROMPT_TIP, &mut state.settings.prompt_on_match, true);
         });
     });
     group(ui, Some("Sign-in steps"), |ui| {
         card(ui, |ui| {
-            if button_row(ui, DEFAULT_STEPS_LABEL, DEFAULT_STEPS_SUB, DEFAULT_STEPS_VALUE, false) {
+            if button_row(ui, DEFAULT_STEPS_LABEL, DEFAULT_STEPS_SUB, "", DEFAULT_STEPS_VALUE, false) {
                 crate::kit::toast::show(ui.ctx(), DEFAULT_STEPS_TOAST);
             }
         });
@@ -364,7 +367,7 @@ fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
         card(ui, |ui| {
             // The spec's wording: the keys joined by a space (`Ctrl Alt B`).
             let chord = prefs::chord_keys(false, state.settings.shortcuts.picker).join(" ");
-            if button_row(ui, FILL_SHORTCUT_LABEL, FILL_SHORTCUT_SUB, &chord, false) {
+            if button_row(ui, FILL_SHORTCUT_LABEL, FILL_SHORTCUT_SUB, "", &chord, false) {
                 *page = Page::Shortcuts;
             }
         });
@@ -376,6 +379,8 @@ fn autofill(ui: &mut Ui, state: &mut PrefsState, page: &mut Page) {
 /// steps of one login are edited on that login's Edit page.
 pub const DEFAULT_STEPS_LABEL: &str = "Default sign-in steps";
 const DEFAULT_STEPS_VALUE: &str = "Standard";
+/// The design says "Username, Tab, password, Enter"; the standard steps here
+/// type no Enter, so the sub says what they really type.
 const DEFAULT_STEPS_SUB: &str = "Username, Tab, password";
 pub const DEFAULT_STEPS_TOAST: &str = "Change steps for one login from its Edit page";
 
@@ -393,25 +398,25 @@ fn security(ui: &mut Ui, state: &mut PrefsState) {
         // One card in this page's row style: the idle lock, its minutes,
         // and the two away events (the 0.x Lock card's rows, folded in).
         card(ui, |ui| {
-            switch_row(ui, prefs::AUTO_LOCK_ENABLED_LABEL, IDLE_LOCK_SUB, &mut state.settings.auto_lock_enabled, true);
+            switch_row(ui, prefs::AUTO_LOCK_ENABLED_LABEL, "", IDLE_LOCK_TIP, &mut state.settings.auto_lock_enabled, true);
             kit_card::row_rule(ui);
             let enabled = state.settings.auto_lock_enabled;
             let stepper_w = prefs::STEPPER_STEP_WIDTH * 2.0 + prefs::STEPPER_VALUE_WIDTH;
-            row(ui, prefs::AUTO_LOCK_LABEL, IDLE_MINUTES_SUB, !enabled, stepper_w, |ui| {
+            row(ui, prefs::AUTO_LOCK_LABEL, IDLE_MINUTES_SUB, IDLE_MINUTES_TIP, !enabled, stepper_w, |ui| {
                 state.settings.auto_lock_minutes =
                     prefs::minutes_stepper(ui, state.settings.auto_lock_minutes, &mut state.auto_lock_text, enabled);
             });
             kit_card::row_rule(ui);
             let s = &mut state.settings;
-            switch_row(ui, LOCK_ON_SLEEP_LABEL, "", &mut s.lock_on_sleep, true);
+            switch_row(ui, LOCK_ON_SLEEP_LABEL, "", "", &mut s.lock_on_sleep, true);
             kit_card::row_rule(ui);
-            switch_row(ui, LOCK_ON_SCREEN_LOCK_LABEL, "", &mut s.lock_on_screen_lock, true);
+            switch_row(ui, LOCK_ON_SCREEN_LOCK_LABEL, "", "", &mut s.lock_on_screen_lock, true);
         });
     });
     group(ui, Some("Privacy"), |ui| {
         prefs::draw_clipboard(ui, state);
         card(ui, |ui| {
-            switch_row(ui, HIDE_ON_SHARE_LABEL, HIDE_ON_SHARE_SUB, &mut state.settings.hide_on_screen_share, true);
+            switch_row(ui, HIDE_ON_SHARE_LABEL, "", HIDE_ON_SHARE_TIP, &mut state.settings.hide_on_screen_share, true);
         });
     });
     group(ui, Some("Breaches"), |ui| prefs::draw_breaches(ui, state));
@@ -421,17 +426,17 @@ fn vault(ui: &mut Ui, state: &mut PrefsState) {
     group(ui, Some("Display"), |ui| {
         card(ui, |ui| {
             let s = &mut state.settings;
-            switch_row(ui, prefs::FETCH_ICONS_LABEL, prefs::FETCH_ICONS_DESCRIPTION, &mut s.fetch_icons, true);
+            switch_row(ui, prefs::FETCH_ICONS_LABEL, "", prefs::FETCH_ICONS_TIP, &mut s.fetch_icons, true);
             kit_card::row_rule(ui);
             let icons_on = s.fetch_icons;
-            switch_row(ui, prefs::DIRECT_ICONS_LABEL, prefs::DIRECT_ICONS_DESCRIPTION, &mut s.fetch_icons_direct, icons_on);
+            switch_row(ui, prefs::DIRECT_ICONS_LABEL, prefs::DIRECT_ICONS_SUB, prefs::DIRECT_ICONS_TIP, &mut s.fetch_icons_direct, icons_on);
             kit_card::row_rule(ui);
             let direct_on = icons_on && s.fetch_icons_direct;
-            switch_row(ui, prefs::LAN_TLS_LABEL, prefs::LAN_TLS_DESCRIPTION, &mut s.icons_ignore_tls_on_private_hosts, direct_on);
+            switch_row(ui, prefs::LAN_TLS_LABEL, prefs::LAN_TLS_SUB, prefs::LAN_TLS_TIP, &mut s.icons_ignore_tls_on_private_hosts, direct_on);
             kit_card::row_rule(ui);
-            switch_row(ui, prefs::BRAND_LOGOS_LABEL, prefs::BRAND_LOGOS_DESCRIPTION, &mut s.use_brand_logos, true);
+            switch_row(ui, prefs::BRAND_LOGOS_LABEL, prefs::BRAND_LOGOS_SUB, prefs::BRAND_LOGOS_TIP, &mut s.use_brand_logos, true);
             kit_card::row_rule(ui);
-            switch_row(ui, prefs::TOTP_SECRET_LABEL, prefs::TOTP_SECRET_DESCRIPTION, &mut s.reveal_totp_seed, true);
+            switch_row(ui, prefs::TOTP_SECRET_LABEL, prefs::TOTP_SECRET_SUB, prefs::TOTP_SECRET_TIP, &mut s.reveal_totp_seed, true);
         });
     });
     group(ui, Some("Opening the vault"), |ui| {
@@ -446,7 +451,7 @@ fn generator(ui: &mut Ui, state: &mut PrefsState) {
             let g = &mut state.settings.generator;
             let modes = [GeneratorMode::Password, GeneratorMode::Passphrase, GeneratorMode::Pin];
             let now = modes.iter().position(|m| *m == g.mode).unwrap_or(0);
-            if let Some(picked) = segment_row(ui, "Make new passwords as", "", &["Password", "Passphrase", "PIN"], now) {
+            if let Some(picked) = segment_row(ui, "Make new passwords as", "", "", &["Password", "Passphrase", "PIN"], now) {
                 g.mode = modes[picked];
             }
             kit_card::row_rule(ui);
@@ -455,11 +460,11 @@ fn generator(ui: &mut Ui, state: &mut PrefsState) {
                 GeneratorMode::Passphrase => format!("{} words", g.words),
                 GeneratorMode::Pin => format!("{} digits", g.pin_length),
             };
-            value_row(ui, "Length", "", &length);
+            value_row(ui, "Length", "", "", &length);
             kit_card::row_rule(ui);
-            switch_row(ui, "Include symbols", "", &mut g.symbols, true);
+            switch_row(ui, "Include symbols", "", "", &mut g.symbols, true);
             kit_card::row_rule(ui);
-            switch_row(ui, "Avoid look-alike characters", "", &mut g.avoid_lookalikes, true);
+            switch_row(ui, "Avoid look-alike characters", "", "", &mut g.avoid_lookalikes, true);
         });
     });
 }
@@ -478,21 +483,21 @@ fn account(ui: &mut Ui, state: &mut PrefsState) {
 fn about(ui: &mut Ui, state: &mut PrefsState) {
     group(ui, None, |ui| {
         card(ui, |ui| {
-            value_row(ui, "Version", "Unofficial, and unaffiliated with Bitwarden, Inc.", &prefs::version_line());
+            value_row(ui, "Version", "Unofficial, and unaffiliated with Bitwarden, Inc.", "", &prefs::version_line());
         });
     });
     group(ui, Some("Updates"), |ui| prefs::draw_updates(ui, state));
     group(ui, Some("Support"), |ui| {
         card(ui, |ui| {
-            if button_row(ui, HELP_LABEL, "How Deskwarden works, in your browser", "Open", false) {
+            if button_row(ui, HELP_LABEL, "", "", "Open", false) {
                 crate::vault_window::webbrowser_open(HELP_URL);
             }
             kit_card::row_rule(ui);
-            if button_row(ui, FEEDBACK_LABEL, "Tell us what is missing or broken, in your browser", "Write", false) {
+            if button_row(ui, FEEDBACK_LABEL, "", "", "Write", false) {
                 crate::vault_window::webbrowser_open(FEEDBACK_URL);
             }
             kit_card::row_rule(ui);
-            if button_row(ui, LOGS_LABEL, LOGS_SUB, "Copy", false) {
+            if button_row(ui, LOGS_LABEL, "", LOGS_TIP, "Copy", false) {
                 match log_location() {
                     Some(path) => {
                         ui.ctx().copy_text(path);
@@ -511,7 +516,9 @@ pub const FEEDBACK_LABEL: &str = "Send feedback";
 pub const LOGS_LABEL: &str = "Diagnostic logs";
 const HELP_URL: &str = "https://github.com/denis-platonov/deskwarden#readme";
 const FEEDBACK_URL: &str = "https://github.com/denis-platonov/deskwarden/issues/new";
-const LOGS_SUB: &str = "Copies where the log file is, not what is in it";
+/// The design's tip says logs never hold passwords; this screen cannot vouch
+/// for every line, so the tip says what the button really does.
+const LOGS_TIP: &str = "Copies where the log file is, not what is in it. Read it before you share it.";
 pub const LOGS_COPIED_TOAST: &str = "Log file location copied";
 pub const LOGS_MISSING_TOAST: &str = "There is no log file yet";
 
@@ -531,8 +538,9 @@ fn import_export(ui: &mut Ui) {
         card(ui, |ui| {
             if button_row(
                 ui,
-                "Import passwords",
-                "From Bitwarden, 1Password, Keeper, LastPass, Chrome or Edge, or any CSV file",
+                "Import from another app",
+                "1Password, Keeper, LastPass, Chrome or a CSV file",
+                "Bitwarden and Edge exports work too.",
                 "Import\u{2026}",
                 false,
             ) {
@@ -544,7 +552,7 @@ fn import_export(ui: &mut Ui) {
 
 fn not_yet(ui: &mut Ui, title: &str, sub: &str) {
     group(ui, None, |ui| {
-        card(ui, |ui| row(ui, title, sub, true, 0.0, |_| {}));
+        card(ui, |ui| row(ui, title, sub, "", true, 0.0, |_| {}));
     });
 }
 
@@ -568,17 +576,18 @@ fn card(ui: &mut Ui, add: impl FnOnce(&mut Ui)) {
     prefs::card(ui, add);
 }
 
-/// The row frame: title and optional sub on the left, a control `control_w`
-/// wide on the right. One implementation, shared with the panes in the parent
+/// The row frame: title, an optional `?` tip dot and an optional sub on the
+/// left (the design's rule: a few words of sub at most, the explanation in the
+/// tip), and a control `control_w` wide on the right. One implementation, shared with the panes in the parent
 /// module, so every row on every page is the same row.
-fn row(ui: &mut Ui, title: &str, sub: &str, ghost: bool, control_w: f32, control: impl FnOnce(&mut Ui)) {
-    prefs::control_row_w(ui, title, sub, ghost, control_w, control);
+fn row(ui: &mut Ui, title: &str, sub: &str, tip: &str, ghost: bool, control_w: f32, control: impl FnOnce(&mut Ui)) {
+    prefs::control_row_tip(ui, title, sub, tip, ghost, control_w, control);
 }
 
 /// `sw`: a switch bound to a setting. With `enabled` false it is painted
 /// inert and `value` is left alone.
-fn switch_row(ui: &mut Ui, title: &str, sub: &str, value: &mut bool, enabled: bool) {
-    row(ui, title, sub, !enabled, 50.0, |ui| {
+fn switch_row(ui: &mut Ui, title: &str, sub: &str, tip: &str, value: &mut bool, enabled: bool) {
+    row(ui, title, sub, tip, !enabled, 50.0, |ui| {
         if enabled {
             controls::switch(ui, value);
         } else {
@@ -591,32 +600,32 @@ fn switch_row(ui: &mut Ui, title: &str, sub: &str, value: &mut bool, enabled: bo
 }
 
 /// `sg`: a segmented control; the index the user picked this frame.
-fn segment_row(ui: &mut Ui, title: &str, sub: &str, options: &[&str], selected: usize) -> Option<usize> {
+fn segment_row(ui: &mut Ui, title: &str, sub: &str, tip: &str, options: &[&str], selected: usize) -> Option<usize> {
     let width = controls::segmented_width(ui.ctx(), options, controls::SEG_SETTINGS);
     let mut picked = None;
-    row(ui, title, sub, false, width, |ui| picked = controls::segmented(ui, options, selected, controls::SEG_SETTINGS));
+    row(ui, title, sub, tip, false, width, |ui| picked = controls::segmented(ui, options, selected, controls::SEG_SETTINGS));
     picked
 }
 
 /// `bt`: an outline button; whether it was clicked.
-fn button_row(ui: &mut Ui, title: &str, sub: &str, label: &str, _danger: bool) -> bool {
+fn button_row(ui: &mut Ui, title: &str, sub: &str, tip: &str, label: &str, _danger: bool) -> bool {
     let width = controls::button_width(ui.ctx(), ButtonKind::Outline, controls::ROW, label, false);
     let mut clicked = false;
-    row(ui, title, sub, false, width, |ui| {
+    row(ui, title, sub, tip, false, width, |ui| {
         clicked = controls::button(ui, ButtonKind::Outline, controls::ROW, label, None).clicked();
     });
     clicked
 }
 
 /// `va`: a read-only value.
-fn value_row(ui: &mut Ui, title: &str, sub: &str, value: &str) {
-    prefs::value_row(ui, title, sub, value);
+fn value_row(ui: &mut Ui, title: &str, sub: &str, tip: &str, value: &str) {
+    prefs::value_row(ui, title, sub, tip, value);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::kit::testing::{self, click_at};
+    use crate::kit::testing::{self, click_at, hover_at};
     use crate::settings::Settings;
 
     // Tall, because a label below the fold is not painted at all.
@@ -838,6 +847,72 @@ mod tests {
         let at = painted.texts.iter().find(|(t, _, _)| t == DEFAULT_STEPS_VALUE).expect("the value button").2.center();
         fixture.frame(click_at(at));
         assert_eq!(crate::kit::toast::current(&fixture.ctx).as_deref(), Some(DEFAULT_STEPS_TOAST));
+    }
+
+    /// The `?` dot nearest the row titled `title`.
+    fn dot_after(painted: &testing::Painted, title: &str) -> Pos2 {
+        let at = painted.texts.iter().find(|(t, _, _)| t == title).unwrap_or_else(|| panic!("no {title:?} painted")).2;
+        painted
+            .texts
+            .iter()
+            .filter(|(t, _, _)| t == "?")
+            .map(|(_, _, rect)| rect.center())
+            .min_by(|a, b| at.distance_to_pos(*a).total_cmp(&at.distance_to_pos(*b)))
+            .expect("a ? dot")
+    }
+
+    #[test]
+    fn a_rows_tip_is_a_dot_after_its_title_that_shows_the_text_on_hover() {
+        // The design's rule: the explanation is behind a `?`, not under the
+        // title. Keep running is the design's own example, word for word.
+        let mut fixture = Fixture::new(Page::General);
+        let idle = fixture.settle();
+        assert!(idle.text(KEEP_RUNNING_TIP).is_none(), "the tip is painted without a hover");
+        let title = idle.texts.iter().find(|(t, _, _)| t == KEEP_RUNNING_LABEL).expect("the title").2;
+        let dot = dot_after(&idle, KEEP_RUNNING_LABEL);
+        assert!(dot.x > title.right(), "the dot is not after the title: {dot:?} vs {title:?}");
+        assert!((dot.y - title.center().y).abs() < 10.0, "the dot is not on the title's line");
+        fixture.frame(hover_at(dot));
+        let shown = fixture.settle();
+        assert!(shown.text(KEEP_RUNNING_TIP).is_some(), "hovering the dot showed nothing");
+        // A row with no tip paints no dot of its own.
+        let mut fixture = Fixture::new(Page::Generator);
+        assert!(fixture.settle().texts.iter().all(|(t, _, _)| t != "?"), "the Generator rows carry no tips");
+    }
+
+    #[test]
+    fn no_settings_row_keeps_a_paragraph_under_its_title() {
+        // The design's rule for a sub: a few words. Long copy is a tip. The
+        // status lines (refusals, scan and update stages) are not row copy,
+        // and the pages are painted in their ordinary state.
+        for page in Page::ALL {
+            // The Shortcuts rows say WHY a chord is not working, a status
+            // that depends on what the process has registered; their
+            // ordinary state is pinned in `prefs_ui`'s tests.
+            if page == Page::Shortcuts {
+                continue;
+            }
+            let mut fixture = Fixture::new(page);
+            fixture.state.settings.use_official_bw_crypto = Some(false);
+            let painted = fixture.settle();
+            for (text, _, rect) in &painted.texts {
+                if text.split_whitespace().count() > 14 {
+                    // Long text on the page must be a tip bubble (never
+                    // painted here without a hover) or a status or empty
+                    // state, which the allow-list below names.
+                    let allowed = [
+                        crate::breach_scan::SCAN_CONSENT_NOTE,
+                        prefs::KEYS_NONE,
+                    ];
+                    assert!(
+                        allowed.contains(&text.as_str()),
+                        "a {}-word line is painted on {:?} at {rect:?}: {text:?}",
+                        text.split_whitespace().count(),
+                        page.label()
+                    );
+                }
+            }
+        }
     }
 
     #[test]

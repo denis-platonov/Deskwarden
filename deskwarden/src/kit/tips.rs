@@ -60,6 +60,17 @@ fn inside(rect: Rect, window: Rect) -> Rect {
     rect.translate(Vec2::new(dx, dy))
 }
 
+/// Holds the bubble of the dot with `id` open as if the pointer rested on it.
+/// For `ui_preview`, which has no pointer to hover with, so a screenshot can
+/// show the bubble the design shows on hover.
+pub fn pin_open(ctx: &egui::Context, id: egui::Id) {
+    ctx.data_mut(|d| d.insert_temp(id.with("help-pinned"), true));
+}
+
+fn pinned(ctx: &egui::Context, id: egui::Id) -> bool {
+    ctx.data(|d| d.get_temp::<bool>(id.with("help-pinned"))).unwrap_or(false)
+}
+
 /// The 18 px `?` dot. Hovering it shows `text` in a `width`-wide bubble on
 /// the `placement` side.
 pub fn help_dot(ui: &mut Ui, id: egui::Id, text: &str, width: f32, placement: Placement) -> Response {
@@ -76,7 +87,7 @@ pub fn help_dot_sized(ui: &mut Ui, id: egui::Id, text: &str, width: f32, placeme
     });
     ui.painter().galley(rect.center() - glyph.size() / 2.0, glyph, p.text_icon);
     let clock = id.with("help-bubble");
-    if response.hovered() {
+    if response.hovered() || pinned(ui.ctx(), id) {
         let shown = motion::progress(ui.ctx(), clock, 0.0, 0.16, EASE_OUT);
         paint_help_bubble_at(ui, rect, text, width, placement, motion::tip(shown));
     } else {
