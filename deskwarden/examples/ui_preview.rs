@@ -703,6 +703,9 @@ enum Surface {
     SettingsSecurityPrivacy,
     SettingsSecurityBreaches,
     SettingsVaultBackend,
+    /// Settings > Vault with the `?` tip of the direct-icons row open, the way
+    /// the design shows it on hover.
+    SettingsVaultTip,
     /// **The read pane's header WITH a favicon**, which no shot has ever
     /// covered.
     ///
@@ -1022,6 +1025,7 @@ const ALL: &[Surface] = &[
     Surface::SettingsSecurityPrivacy,
     Surface::SettingsSecurityBreaches,
     Surface::SettingsVaultBackend,
+    Surface::SettingsVaultTip,
     Surface::LoginDetailFavicon,
     Surface::VaultRail,
     Surface::VaultHealth,
@@ -1169,6 +1173,7 @@ impl Surface {
             Surface::SettingsSecurityPrivacy => "settings_security_privacy",
             Surface::SettingsSecurityBreaches => "settings_security_breaches",
             Surface::SettingsVaultBackend => "settings_vault_backend",
+            Surface::SettingsVaultTip => "settings_vault_tip",
             Surface::LoginDetailFavicon => "detail_login_favicon",
             Surface::VaultRail => "vault_rail",
             Surface::VaultHealth => "vault_password_health",
@@ -1418,7 +1423,8 @@ impl Surface {
             | Surface::SettingsAbout
             | Surface::SettingsSecurityPrivacy
             | Surface::SettingsSecurityBreaches
-            | Surface::SettingsVaultBackend => egui::vec2(1280.0 - 252.0, 820.0),
+            | Surface::SettingsVaultBackend
+            | Surface::SettingsVaultTip => egui::vec2(1280.0 - 252.0, 820.0),
             // `vault_window::mod`'s `SIDEBAR_WIDTH`, spelled out for the same
             // reason as the two above, and the shipped window's own height --
             // the rail is measured against the window's floor, so a preview
@@ -1614,6 +1620,7 @@ fn main() -> eframe::Result {
             Surface::SettingsSecurityPrivacy,
             Surface::SettingsSecurityBreaches,
             Surface::SettingsVaultBackend,
+            Surface::SettingsVaultTip,
         ]
     } else if list {
         vec![Surface::VaultList]
@@ -2189,7 +2196,8 @@ impl eframe::App for Preview {
             | Surface::SettingsAbout
             | Surface::SettingsSecurityPrivacy
             | Surface::SettingsSecurityBreaches
-            | Surface::SettingsVaultBackend) => {
+            | Surface::SettingsVaultBackend
+            | Surface::SettingsVaultTip) => {
                 self.draw_settings_page(root, surface);
             }
             Surface::ModalNewItem => {
@@ -2813,6 +2821,7 @@ impl Preview {
             Surface::SettingsSecurityBreaches => (Page::Security, Some(1330.0)),
             Surface::SettingsVault => (Page::Vault, None),
             Surface::SettingsVaultBackend => (Page::Vault, Some(720.0)),
+            Surface::SettingsVaultTip => (Page::Vault, None),
             Surface::SettingsShortcuts => (Page::Shortcuts, None),
             Surface::SettingsAutofill => (Page::Autofill, None),
             Surface::SettingsApps => (Page::Apps, None),
@@ -2869,6 +2878,11 @@ impl Preview {
                 ..Default::default()
             };
             prefs_ui::security_score::offer(root.ctx(), &report);
+        }
+        if matches!(surface, Surface::SettingsVaultTip) {
+            // No pointer to hover with: hold the bubble open on the row the
+            // design would be hovered on.
+            prefs_ui::pin_row_tip(root.ctx(), "Fetch site icons from the sites themselves");
         }
         let _ = draw(root, &mut state, &mut page);
     }
