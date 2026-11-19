@@ -10,6 +10,7 @@ use super::sidebar::{FilterSource, OutOfVault, SidebarFilter};
 use crate::card_brand::{brand_for_number, CardBrand};
 use crate::theme;
 use crate::vault_bridge::{Folder, ItemKind, VaultItem};
+use crate::kit::logos::{Bank, Mark, Net};
 use crate::kit::{self, motion, tokens};
 use eframe::egui::{self, CornerRadius, Margin, RichText, Sense, Stroke};
 use std::collections::HashMap;
@@ -803,6 +804,35 @@ pub fn card_network(item: &VaultItem) -> Option<CardBrand> {
     let prefix: String =
         card.number.as_ref()?.chars().filter(char::is_ascii_digit).take(8).collect();
     brand_for_number(&prefix)
+}
+
+/// The network mark a card shows (design 1e): [`card_network`]'s answer as a
+/// [`Net`], with **Mir added**. Mir is not one of Bitwarden's ten brands, so
+/// it can be read only off the digits: a card with no stored brand, or the
+/// brand "Other" (which says "not one of the ten"), and a Mir number is a Mir.
+/// A card whose stored brand names another network keeps it.
+pub fn card_net(item: &VaultItem) -> Option<Net> {
+    if ItemKind::of(item) != ItemKind::Card {
+        return None;
+    }
+    let card = item.card.as_ref()?;
+    let prefix = || -> String {
+        card.number.as_ref().map(|n| n.chars().filter(char::is_ascii_digit).take(8).collect()).unwrap_or_default()
+    };
+    match card.brand.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+        None => Net::for_number(&prefix()),
+        Some(stored) => match CardBrand::from_canonical(stored) {
+            Some(CardBrand::Other) => Net::for_number(&prefix()).filter(|n| *n == Net::Mir),
+            Some(brand) => Net::from_brand(brand),
+            None => None,
+        },
+    }
+}
+
+/// The bank an item is for (design 1e): a card's `deskwarden:bank-domain`, or
+/// a login's website, when either is one of the banks that have a mark.
+pub fn item_bank(item: &VaultItem) -> Option<Bank> {
+    crate::favicon::icon_domain_for(item).as_deref().and_then(Bank::for_domain)
 }
 
 /// The row's title suffix for `item`, exactly as painted: `(*4545)`.
@@ -2328,8 +2358,14 @@ pub(crate) fn row_look(item: &VaultItem, icon: Option<&egui::TextureHandle>) -> 
     if let Some((bg, fg)) = crate::item_icon::chosen_colours(item) {
         return kit::avatar::Look::Initials { text: initials(&item.name), bg, fg };
     }
-    if let Some((label, bg, italic)) = card_network(item).and_then(kit::avatar::network) {
-        return kit::avatar::Look::Brand { label: label.to_string(), bg, italic };
+    // Design 1e: a bank is the main badge and the card's network a chip on
+    // it; with no bank the network is the badge.
+    let net = card_net(item);
+    if let Some(bank) = item_bank(item) {
+        return kit::avatar::Look::Brand { mark: Mark::Bank(bank), chip: net };
+    }
+    if let Some(net) = net {
+        return kit::avatar::Look::Brand { mark: Mark::Net(net), chip: None };
     }
     if let Some(texture) = icon {
         return kit::avatar::Look::Favicon(texture.clone());
@@ -4719,6 +4755,57 @@ mod row_tile_tests {
 
 
     // ---- brand logos on the row ----------------------------------------
+
+    fn with_site(mut item: VaultItem, uri: &str) -> VaultItem {
+        item.login.get_or_insert_with(Default::default).uris =
+            vec![crate::vault_bridge::UriEntry { uri: Some(uri.to_string()), other: serde_json::Map::new() }];
+        item
+    }
+
+    #[test]
+    fn a_mir_number_badges_as_mir_but_a_stored_brand_still_wins() {
+        assert_eq!(card_net(&card_numbered("A", "2200 1234 5678 9012")), Some(Net::Mir));
+        // "Other" says "none of the ten", which Mir is not.
+        let mut other = card_numbered("A", "2200123456789012");
+        other.card.as_mut().unwrap().brand = Some("Other".to_string());
+        assert_eq!(card_net(&other), Some(Net::Mir));
+        let mut other = card_numbered("A", "4111111111111111");
+        other.card.as_mut().unwrap().brand = Some("Other".to_string());
+        assert_eq!(card_net(&other), None);
+        let mut visa = card_numbered("A", "2200123456789012");
+        visa.card.as_mut().unwrap().brand = Some("Visa".to_string());
+        assert_eq!(card_net(&visa), Some(Net::Visa));
+        assert_eq!(card_net(&card_branded("A", "Amex")), Some(Net::Amex));
+        assert_eq!(card_net(&login("L", "a@b.c")), None);
+    }
+
+    #[test]
+    fn a_bank_is_read_from_a_cards_bank_domain_or_a_logins_website() {
+        let card = crate::vault_bridge::with_custom_field(&card_branded("Corp", "Visa"), crate::favicon::BANK_DOMAIN_FIELD, "chase.com");
+        assert_eq!(item_bank(&card), Some(Bank::Chase));
+        assert_eq!(item_bank(&with_site(login("Chase Business", "me"), "https://secure.chase.com/login")), Some(Bank::Chase));
+        assert_eq!(item_bank(&with_site(login("Other", "me"), "https://example.com")), None);
+        assert_eq!(item_bank(&card_branded("Bare", "Visa")), None);
+    }
+
+    #[test]
+    fn the_row_look_puts_the_bank_first_with_the_network_as_a_chip() {
+        use crate::kit::avatar::Look;
+        let card = crate::vault_bridge::with_custom_field(&card_branded("Corp", "Visa"), crate::favicon::BANK_DOMAIN_FIELD, "chase.com");
+        match row_look(&card, None) {
+            Look::Brand { mark, chip } => assert_eq!((mark, chip), (Mark::Bank(Bank::Chase), Some(Net::Visa))),
+            _ => panic!("a bank tile"),
+        }
+        match row_look(&card_branded("Plain", "Mastercard"), None) {
+            Look::Brand { mark, chip } => assert_eq!((mark, chip), (Mark::Net(Net::Mastercard), None)),
+            _ => panic!("a network tile"),
+        }
+        match row_look(&with_site(login("Revolut", "me"), "https://www.revolut.com"), None) {
+            Look::Brand { mark, chip } => assert_eq!((mark, chip), (Mark::Bank(Bank::Revolut), None)),
+            _ => panic!("a bank tile"),
+        }
+        assert!(matches!(row_look(&login("Ledgerline", "me"), None), Look::Initials { .. }));
+    }
 
     #[test]
     fn the_network_is_read_from_the_brand_first_and_the_digits_only_after() {
@@ -7867,10 +7954,28 @@ mod v2_list_tests {
         let tile = avatars(&p)[0];
         let visa = p.rects.iter().find(|r| r.rect == tile).unwrap();
         assert_eq!(visa.fill, Color32::from_rgb(0x1a, 0x1f, 0x71), "Visa's own navy");
-        let (_, ink, label) = p.text("VISA").expect("the network's label on its tile");
+        // Visa has a bundled mark: a white picture inside the tile, no label.
+        assert!(p.text("VISA").is_none(), "the mark replaces the label");
+        let glyph = p
+            .rects
+            .iter()
+            .find(|r| r.rect != tile && tile.contains_rect(r.rect) && r.fill == Color32::WHITE)
+            .expect("the network's mark on its tile");
+        assert!(glyph.rect.width() <= 36.0 + 0.01 && glyph.rect.height() <= 14.0 + 0.01, "{:?}", glyph.rect);
+        assert!(p.text("\u{2022}\u{2022}\u{2022}\u{2022} 4821").is_some(), "the masked last four");
+    }
+
+    #[test]
+    fn a_network_without_a_bundled_mark_keeps_its_text_tile() {
+        let items = [card("Mir card", "2200123456789012")];
+        let ctx = testing::ctx();
+        let (p, _) = List::of(&items).draw(&ctx, 0.0, vec![]);
+        let tile = avatars(&p)[0];
+        let ground = p.rects.iter().find(|r| r.rect == tile).unwrap();
+        assert_eq!(ground.fill, Color32::from_rgb(0x0f, 0x75, 0x4e), "Mir's own green");
+        let (_, ink, label) = p.text("MIR").expect("the label on the tile");
         assert_eq!(*ink, Color32::WHITE);
         assert!(tile.contains(label.center()));
-        assert!(p.text("\u{2022}\u{2022}\u{2022}\u{2022} 4821").is_some(), "the masked last four");
     }
 
     #[test]

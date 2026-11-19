@@ -3811,7 +3811,7 @@ pub fn draw_detail_read(
         DetailBody::Card => {
             match card_pane_fields(item) {
                 Some(fields) => {
-                    card_hero(ui, &fields, super::item_list::card_network(item), reveal, &mut action);
+                    card_hero(ui, &fields, super::item_list::card_network(item), super::item_list::card_net(item), reveal, &mut action);
                     ui.add_space(CARD_GAP);
                     card_field_card(ui, &fields, super::item_list::card_network(item), reveal, &mut action, vault);
                 }
@@ -7292,12 +7292,14 @@ fn gradient_rounded_rect(rect: egui::Rect, radius: f32, b: egui::Color32, ink: e
 
 /// Spec 3.3's card hero: the card's face, 440x258 at radius 22 in its
 /// network's colour, with the chip, the number and its eye, and the holder,
-/// expiry and code with the code's own eye. The bank and linked-login pill
-/// are slice 13's.
+/// expiry and code with the code's own eye. Design 1e adds the bank's mark at
+/// the top left and the network's mark at the bottom right, and the face's
+/// colour is the bank's, else the network's, else the navy.
 fn card_hero(
     ui: &mut egui::Ui,
     fields: &CardFields,
     network: Option<CardBrand>,
+    net: Option<crate::kit::logos::Net>,
     reveal: &mut RevealState,
     action: &mut DetailAction,
 ) {
@@ -7309,9 +7311,11 @@ fn card_hero(
     // The design draws the face at 440; a narrower pane gets the same face
     // at its own size, everything on it scaled by `k`.
     let k = width / 440.0;
-    let b = network
-        .and_then(kit::avatar::network)
-        .map_or(egui::Color32::from_rgb(0x14, 0x30, 0x7a), |(_, bg, _)| bg);
+    let bank = fields.bank.as_deref().and_then(crate::kit::logos::Bank::for_domain);
+    let b = bank
+        .map(|bank| bank.colour())
+        .or_else(|| net.map(|n| n.colour()))
+        .unwrap_or(egui::Color32::from_rgb(0x14, 0x30, 0x7a));
     ui.painter().add(
         egui::Shadow { offset: [0, 18], blur: 40, spread: 0, color: egui::Color32::from_rgba_unmultiplied(20, 26, 48, 71) }
             .as_shape(rect, CornerRadius::same(22)),
@@ -7334,6 +7338,19 @@ fn card_hero(
         2.0,
         egui::Color32::from_white_alpha(191),
     );
+    // The bank's mark, top left (image 62 x 24, else its name at 18/900).
+    if let Some(bank) = bank {
+        use crate::kit::logos::{paint_aligned, Label, Mark};
+        paint_aligned(
+            ui.painter(),
+            egui::pos2(inner.left(), inner.top() + 12.0 * k),
+            egui::Align::Min,
+            egui::vec2(62.0 * k, 24.0 * k),
+            18.0 * k,
+            Mark::Bank(bank),
+            Label::Long,
+        );
+    }
     // The chip.
     let chip = egui::Rect::from_min_size(egui::pos2(inner.left(), inner.top() + (28.0 + 18.0) * k), egui::vec2(46.0 * k, 34.0 * k));
     ui.painter().rect(chip, CornerRadius::same(7), egui::Color32::from_rgb(0xde, 0xbb, 0x57), Stroke::new(1.0, egui::Color32::from_black_alpha(31)), egui::StrokeKind::Inside);
@@ -7391,7 +7408,7 @@ fn card_hero(
     // The columns share the room left of the network's box. Expires and the
     // code keep their natural widths; the holder takes what is left, and an
     // overlong name ends in an ellipsis rather than pushing them off.
-    let limit = if network.is_some() { inner.right() - 76.0 * k - 8.0 * k } else { inner.right() };
+    let limit = if net.is_some() { inner.right() - 76.0 * k - 8.0 * k } else { inner.right() };
     let natural = |label: &str, value: &str| galley(label_role, label, faint).size().x.max(galley(value_role, value, white).size().x);
     let others = natural(HERO_EXPIRES, &columns[1].1) + natural(HERO_CODE, &columns[2].1) + (16.0 * 2.0 + 32.0) * k;
     let holder_room = (limit - inner.left() - others).max(24.0 * k);
@@ -7420,11 +7437,28 @@ fn card_hero(
         }
         x += w + (16.0 + if label == HERO_CODE { 32.0 } else { 0.0 }) * k;
     }
-    if let Some(brand) = network {
-        let word = galley(tokens::Role { size: 20.0 * k, face: theme::EXTRABOLD, tracking_em: 0.02 }, brand.wordmark(), white);
-        let size = word.size();
-        let at = egui::pos2(inner.right() - (76.0 * k + size.x) / 2.0, inner.bottom() - 17.0 * k - size.y / 2.0);
-        ui.painter().galley(at, word, white);
+    // The network's mark, in a 76 x 34 box at the right: the user's own
+    // picture if they supplied one, else the bundled mark (78 x 30, at most
+    // 86% of the box), else the name at 20/900.
+    if let Some(net) = net {
+        let middle = egui::pos2(inner.right(), inner.bottom() - 17.0 * k);
+        match network.filter(|brand| crate::card_mark::has_logo(ui, *brand)) {
+            Some(brand) => {
+                crate::card_mark::paint_mark(ui, brand, 26.0 * k, egui::Align2::RIGHT_CENTER, middle);
+            }
+            None => {
+                use crate::kit::logos::{paint_aligned, Label, Mark};
+                paint_aligned(
+                    ui.painter(),
+                    middle,
+                    egui::Align::Max,
+                    egui::vec2(76.0 * k * 0.86, 30.0 * k),
+                    20.0 * k,
+                    Mark::Net(net),
+                    Label::Long,
+                );
+            }
+        }
     }
     let _ = p;
 }
@@ -18392,7 +18426,9 @@ mod tests {
             for word in [HERO_HOLDER, HERO_EXPIRES, HERO_CODE] {
                 assert!(f.painted(word), "the hero has no {word}: {:?}", f.strings());
             }
-            assert!(f.painted("John Doe") && f.painted(CardBrand::Visa.wordmark()));
+            assert!(f.painted("John Doe"));
+            // Visa is drawn as its bundled mark, so its name is not set in type.
+            assert!(!f.painted("VISA"), "{:?}", f.strings());
             assert!(!f.painted("123"), "the code is masked on the face");
             // The field card under it: Expires and Security code on one row.
             let expires = f.rect_of(EXPIRY_LABEL);
@@ -18524,18 +18560,20 @@ mod tests {
         fn long_card_values_stay_on_the_face() {
             let mut item = a_full_card();
             item.card.as_mut().unwrap().cardholder_name = Some("MAXIMILIANA OKONKWO-FERNANDEZ".into());
-            item.card.as_mut().unwrap().number = Some("4111111111111111111".to_string().into());
+            // Mir, which has no bundled mark, so the face sets its name in type.
+            item.card.as_mut().unwrap().brand = None;
+            item.card.as_mut().unwrap().number = Some("2200111111111111111".to_string().into());
             for width in [MIN_PANE, PANE] {
                 let f = Pane::wide(width).tall().idle(&item, &TotpState::NoSecret);
                 let visa = f
                     .texts
                     .iter()
-                    .filter(|(t, _)| t == CardBrand::Visa.wordmark())
+                    .filter(|(t, _)| t == "MIR")
                     .map(|(_, r)| *r)
                     .max_by(|a, b| a.width().total_cmp(&b.width()))
                     .expect("the face's network word");
                 for (text, rect) in &f.texts {
-                    if rect.top() > visa.top() - 40.0 && rect.bottom() < visa.bottom() + 40.0 && text != CardBrand::Visa.wordmark() && rect.left() < visa.left() {
+                    if rect.top() > visa.top() - 40.0 && rect.bottom() < visa.bottom() + 40.0 && text != "MIR" && rect.left() < visa.left() {
                         assert!(rect.right() <= visa.left() + 0.5, "at {width}: {text:?} runs into the network word");
                     }
                 }

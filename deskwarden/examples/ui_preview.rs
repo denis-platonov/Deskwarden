@@ -645,6 +645,11 @@ enum Surface {
     /// Every piece is drawn through `kit`'s own calls, so nothing here is a
     /// second drawing that could drift.
     KitSheet,
+    /// **Design 1e's reference sheet**: every network and bank tile as the
+    /// vault list draws it (44pt), the detail header's 72pt tiles with a
+    /// network chip on a bank, and the text-fallback tiles beside them.
+    /// Drawn through `kit::avatar::paint`, the call every row makes.
+    CardLogos,
     /// **The v2 shell, whole**: the real rail (navy), the real top bar, and
     /// the 0.15 list and detail panes beneath it, at design 1a's 1280x820.
     VaultShellNavy,
@@ -925,6 +930,7 @@ const ALL: &[Surface] = &[
     Surface::VaultListKinds,
     Surface::ItemKindMarks,
     Surface::KitSheet,
+    Surface::CardLogos,
     Surface::VaultShellNavy,
     Surface::VaultShellLight,
     Surface::VaultSplash,
@@ -1037,6 +1043,7 @@ impl Surface {
             Surface::VaultListKinds => "vault_item_list_kinds",
             Surface::ItemKindMarks => "item_kind_marks",
             Surface::KitSheet => "kit_sheet",
+            Surface::CardLogos => "card_logos",
             Surface::VaultShellNavy => "vault_shell_navy",
             Surface::VaultShellLight => "vault_shell_light",
             Surface::VaultSplash => "vault_splash",
@@ -1237,6 +1244,7 @@ impl Surface {
             // A sheet, not a pane: its size is what the sheet needs.
             Surface::ItemKindMarks => egui::vec2(LIST_WIDTH, 360.0),
             Surface::KitSheet => egui::vec2(1280.0, 900.0),
+            Surface::CardLogos => egui::vec2(1000.0, 520.0),
             Surface::VaultShellNavy
             | Surface::VaultShellLight
             | Surface::VaultSplash
@@ -1891,6 +1899,7 @@ impl eframe::App for Preview {
             Surface::VaultListKinds => self.draw_vault_list_kinds(root),
             Surface::ItemKindMarks => draw_item_kind_marks(root),
             Surface::KitSheet => draw_kit_sheet(root),
+            Surface::CardLogos => draw_card_logos(root),
             Surface::VaultShellNavy => {
                 self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false)
             }
@@ -3813,6 +3822,39 @@ fn rehearsal_view() -> scratch_window::RehearsalView {
 /// other, and from the letters a login still shows".
 /// **The v2 kit sheet**: everything slice 1 of the 1.0 redesign built, drawn
 /// through `kit`'s own calls, to hold beside the design (artboards 1a and 1c).
+fn draw_card_logos(root: &mut egui::Ui) {
+    use deskwarden::kit::avatar::{paint, Look};
+    use deskwarden::kit::logos::{Mark, Net, BANKS, NETS};
+    use egui::{vec2, Rect};
+    let area = root.max_rect();
+    root.painter().rect_filled(area, egui::CornerRadius::ZERO, egui::Color32::WHITE);
+    let ink = egui::Color32::from_rgb(0x20, 0x1e, 0x1d);
+    let faint = egui::Color32::from_rgb(0x8a, 0x87, 0x85);
+    let label = |ui: &egui::Ui, at: egui::Pos2, text: &str| {
+        ui.painter().text(at, egui::Align2::LEFT_TOP, text, egui::FontId::proportional(12.0), ink);
+    };
+    label(root, area.min + vec2(24.0, 16.0), "Card networks (44pt list tile, 72pt detail tile)");
+    for (i, net) in NETS.into_iter().enumerate() {
+        let x = 24.0 + i as f32 * 94.0;
+        let list = Rect::from_min_size(area.min + vec2(x, 44.0), vec2(44.0, 44.0));
+        paint(root.painter(), list, &Look::Brand { mark: Mark::Net(net), chip: None }, 12);
+        let detail = Rect::from_min_size(area.min + vec2(x, 100.0), vec2(72.0, 72.0));
+        paint(root.painter(), detail, &Look::Brand { mark: Mark::Net(net), chip: None }, 20);
+        label(root, area.min + vec2(x, 180.0), net.name());
+        root.painter().text(area.min + vec2(x, 196.0), egui::Align2::LEFT_TOP, net.rule(), egui::FontId::proportional(9.0), faint);
+    }
+    label(root, area.min + vec2(24.0, 232.0), "Banks, with the card's network as a chip");
+    for (i, bank) in BANKS.into_iter().enumerate() {
+        let x = 24.0 + i as f32 * 94.0;
+        let chip = [Net::Visa, Net::Mastercard, Net::Amex, Net::Mir][i % 4];
+        let list = Rect::from_min_size(area.min + vec2(x, 264.0), vec2(44.0, 44.0));
+        paint(root.painter(), list, &Look::Brand { mark: Mark::Bank(bank), chip: Some(chip) }, 12);
+        let detail = Rect::from_min_size(area.min + vec2(x, 320.0), vec2(72.0, 72.0));
+        paint(root.painter(), detail, &Look::Brand { mark: Mark::Bank(bank), chip: Some(chip) }, 20);
+        label(root, area.min + vec2(x, 410.0), bank.name());
+    }
+}
+
 fn draw_kit_sheet(root: &mut egui::Ui) {
     use deskwarden::kit::{card, controls, icon, tips, toast, tokens};
     use egui::{pos2, vec2, CornerRadius, Rect, UiBuilder};

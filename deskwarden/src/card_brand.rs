@@ -373,6 +373,21 @@ fn digits_of(number: &str) -> String {
     number.chars().filter(char::is_ascii_digit).collect()
 }
 
+/// Whether `number` is a Mir card: 2200 through 2204 (Mir cards run 16 to 19
+/// digits; a number is recognised as soon as its four-digit prefix is typed).
+///
+/// **Not a [`CardBrand`]**: Mir is not in Bitwarden's list of ten, so a stored
+/// brand can never say it and [`brand_for_number`] never returns it -- a
+/// vault written here would otherwise carry a brand no other client knows.
+/// Only the badge ([`crate::kit::logos::Net::for_number`]) uses this. The
+/// range sits just below Mastercard's 2221-2720, so the two never overlap.
+pub fn is_mir_number(number: &str) -> bool {
+    digits_of(number)
+        .get(..4)
+        .and_then(|head| head.parse::<u32>().ok())
+        .is_some_and(|head| (2200..=2204).contains(&head))
+}
+
 /// The network a number belongs to, or `None`.
 ///
 /// **`None` is a correct answer and a wrong brand is not.** A number being
@@ -520,6 +535,20 @@ pub fn code_mask_for(code: &str, brand: Option<CardBrand>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mir_is_2200_through_2204_and_never_a_stored_brand() {
+        for n in ["2200123456789012", "2201 0000", "2202", "2203-0000", "2204999999999999999"] {
+            assert!(is_mir_number(n), "{n}");
+            // Detection by number never yields a Bitwarden brand for it.
+            assert_eq!(brand_for_number(n), None, "{n}");
+        }
+        for n in ["2205000000000000", "2199000000000000", "2221000000000009", "220", "", "4200000000000000"] {
+            assert!(!is_mir_number(n), "{n}");
+        }
+        // Mastercard's own 2221-2720 range is untouched.
+        assert_eq!(brand_for_number("2221000000000009"), Some(CardBrand::Mastercard));
+    }
 
     #[test]
     fn each_network_is_recognised_by_its_own_prefix() {
