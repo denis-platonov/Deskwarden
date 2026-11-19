@@ -83,6 +83,13 @@ use crate::send::{SendClock, SendError, SendSummary};
 use crate::theme;
 use eframe::egui::{self, CornerRadius, Margin};
 
+mod shared_page;
+
+/// The Shared page's own title: a word only the pane paints (the rail row is
+/// "Sent"), which the window's reachability tests look for to know the PANE
+/// drew and not just the row that leads to it.
+pub use shared_page::TITLE as SHARED_TITLE;
+
 /// The one line of subtext under the heading. **It is what makes the excluded
 /// scope honest rather than hidden**: this screen shows every Send, including
 /// the kinds this app will never be able to make, and the user is told where
@@ -1383,11 +1390,6 @@ pub const RECEIVED_EMPTY_DETAIL: &str =
 /// not know" and "there is nothing" look alike.
 pub const NOTHING_PICKED: &str = "Pick a Send to see its link, its views and its dates.";
 pub const NOTHING_PICKED_RECEIVED: &str = "Pick a row to see when it arrived and where it went.";
-/// [`NOTHING_PICKED`] once person shares are in the list, which it would
-/// otherwise leave out. 6c draws no empty pane, so these words are this
-/// app's, in [`NOTHING_PICKED`]'s shape.
-const NOTHING_PICKED_WITH_SHARES: &str = "Pick a Send to see its link, or a share to see who has the record.";
-
 /// Which of the two SHARING screens this pane is drawing, and -- for the
 /// account's own Sends -- which of design 5b's sub-filters is in force.
 ///
@@ -1417,14 +1419,6 @@ impl SendView<'_> {
         }
     }
 
-    /// The sentence under the strip: what this app can do with a Send on the
-    /// unfiltered screen, and what the sub-filter selects on a filtered one.
-    fn gloss(&self) -> &'static str {
-        match self {
-            SendView::Mine(scope) => scope.gloss().unwrap_or(SCOPE_SUBTEXT),
-            SendView::Received(_) => RECEIVED_SCOPE_SUBTEXT,
-        }
-    }
 }
 
 /// The `Shared with me` screen's own scope line, in [`SCOPE_SUBTEXT`]'s
@@ -1578,59 +1572,41 @@ pub fn scope_empty_headline(scope: crate::vault_window::sidebar::SendScope) -> S
 /// worked out.
 pub const SCOPE_EMPTY_DETAIL: &str = "Your other Sends are still on the Sends row above.";
 
-/// Draws the whole Sends screen -- design 5b's list column and detail pane --
-/// and reports what was clicked.
+/// Draws the whole Sends screen -- spec A 4's **Shared page**, a grid of cards,
+/// and spec B 7's **Send detail modal** over it -- and reports what was
+/// pressed. The drawing is `shared_page`'s; this is the screen's door.
 ///
-/// # The layout, and how much of it is the vault's own
+/// # What replaced what
 ///
-/// 5b's caption is `SAME LIST + DETAIL AS THE VAULT`, and the shape here is
-/// literally that: an `egui::Panel::left` of `vault_window::LIST_WIDTH`
-/// against a `theme::CANVAS` frame with no inner margin, exactly as the item
-/// list's own panel is built, and the detail drawn on what is left. The panel
-/// is nested inside the central panel rather than declared beside the item
-/// list's, which is what keeps `vault_window::run`'s own panel census -- and
-/// the source pin that requires `Panel::left("vault-item-list")` to appear
-/// exactly once -- saying what they say today.
+/// 0.15 drew two columns: a list of rows beside a detail pane, the second
+/// painted into hand-measured rectangles. The v2 design has one page of cards
+/// (two to a row, one on a narrow window) and a modal a card opens, which is
+/// how every other detail in the redesign works, and `shared_page` is that.
+/// Everything the old screen could do is still done from the same
+/// [`SendUiAction`]s -- see its module doc.
 ///
-/// What is NOT shared is the drawing of a row: an item row is an icon, a
-/// name, a username and a kebab over a `VaultItem`, and a Send row is an
-/// initials tile, a name, a subtitle and a state pill over something that is
-/// not a `VaultItem` and shares no id with one. Threading a second kind of
-/// subject through `draw_item_list` would put a `match` on "which of two
-/// unrelated things is this" inside every one of its cells, which is the
-/// forcing-Sends-through-the-item-pane that this screen's rail flags exist to
-/// prevent. The GEOMETRY is shared, by constant, and the contents are not.
+/// # `notice` spans the page
 ///
-/// # `notice` spans both columns
-///
-/// It is drawn above the panel, at the pane's full width, because it is a
-/// message about the SCREEN and not about either column. Putting it inside
-/// the list column would have squeezed a sentence into 390pt beside the
-/// failure headline that is already there; putting it in the detail would
-/// have made it disappear behind a Send's own detail.
-///
-/// `notice` is the message the window's single inline band is showing this
-/// frame, already chosen by `vault_window::inline_notice` -- this function
-/// does not decide which of the window's messages wins, it only paints the
-/// one it is handed.
+/// It is drawn above it, at full width, because it is a message about the
+/// SCREEN. `notice` is the message the window's single inline band is showing
+/// this frame, already chosen by `vault_window::inline_notice` -- this
+/// function does not decide which of the window's messages wins, it only
+/// paints the one it is handed.
 ///
 /// # Eight parameters, and no clock among them
 ///
-/// `view` and `selected` joined when the screen grew a detail pane: which of
-/// the two SHARING screens is up and which of its rows the detail is
-/// describing. Both are the window's state and not this pane's -- a selection
-/// that reset every time the user glanced at Password health would be a
-/// detail pane that could not be left and returned to. `people` joined with
-/// design 6c, for the same reason: the shares and the stop the user is in
-/// the middle of are the window's `share_ui::SharingPane`, and what a press
-/// here asks of it goes back out through `people.asked` -- the verdict stays
-/// the Sends' own, one action, for `apply_send_action`.
+/// `view` and `selected` are the window's state and not this pane's: which of
+/// the two SHARING screens is up and which card's modal is open. A selection
+/// that reset every time the user glanced at Password health would be a modal
+/// that could not be left and returned to. `people` joined with design 6c, for
+/// the same reason: the shares and the stop the user is in the middle of are
+/// the window's `share_ui::SharingPane`, and what a press here asks of it goes
+/// back out through `people.asked` -- the verdict stays the Sends' own, one
+/// action, for `apply_send_action`.
 ///
-/// **It used to take a clock and a zone as well**, and a composer with its
-/// draft. The clock and the zone were the composer's: every date the list and
-/// the detail print is already worded by [`pane_state`], which is handed both,
-/// before this function sees a row. With the composer gone, nothing drawn
-/// here reads the time at all.
+/// Every date the page and the modal print is already worded by
+/// [`pane_state`], which is handed the clock and the zone before this function
+/// sees a row, so nothing drawn here reads the time at all.
 // Draw entry point: its arguments are the state it paints; a bundle would only move them.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_send_pane(
@@ -1640,11 +1616,10 @@ pub fn draw_send_pane(
     delete: SendDeleteView<'_>,
     // Which SHARING screen, and which sub-filter. See [`SendView`].
     view: SendView<'_>,
-    // **Which row the detail pane is describing.** `&mut` and the window's,
-    // exactly like the item list's `selected_id`: the list column writes it,
-    // the detail column resolves it, and a selection naming a row that is no
-    // longer in the list draws the "nothing picked" pane rather than a stale
-    // one.
+    // **Which card's modal is open.** `&mut` and the window's, exactly like
+    // the item list's `selected_id`: a card writes it, the modal resolves it
+    // and clears it when closed, and a selection naming a row that is no
+    // longer listed draws no modal rather than a stale one.
     selected: &mut Option<String>,
     // The vault's records and their icons, for the tiles: a Send made from a
     // record wears that record's tile. See [`RecordTiles`].
@@ -1666,10 +1641,10 @@ pub fn draw_send_pane(
     // identical line in the band and again under the headline, which reads
     // as two failures.
     //
-    // The list column's own rendering wins, because it is the richer one: it
-    // has the headline, the "could not check" line for an ambiguous failure,
-    // and Try again. A notice that is *not* the failure being drawn (a move
-    // or generate error arriving while the list is up) is still shown.
+    // The page's own rendering wins, because it is the richer one: it has the
+    // headline, the "could not check" line for an ambiguous failure, and Try
+    // again. A notice that is *not* the failure being drawn (a move or
+    // generate error arriving while the cards are up) is still shown.
     let notice = match (notice, state) {
         (Some(n), SendPaneState::Failed { message, .. }) if n == message => None,
         (n, _) => n,
@@ -1680,525 +1655,15 @@ pub fn draw_send_pane(
         }
     }
 
-    egui::Panel::left("vault-send-list")
-        .exact_size(crate::vault_window::LIST_WIDTH)
-        .resizable(false)
-        // NO INNER MARGIN, for the item list's own reason: this column is a
-        // white strip spanning its full width over a list area with a
-        // different padding beneath, and one panel margin cannot be both.
-        .frame(egui::Frame::new().fill(theme::CANVAS))
-        .show(ui, |ui| {
-            if let Some(reported) = draw_send_list(ui, state, &view, delete, selected, records, people) {
-                action = reported;
-            }
-        });
-
-    if let Some(reported) =
-        draw_send_detail(ui, state, &view, delete, selected, records, people)
-    {
-        // **The detail column wins an ambiguous frame.** Every destructive
-        // control on this screen is in it, and the list column's own
-        // controls -- Try again, and picking a row -- are the ones a user
-        // cannot mean by accident to have swallowed. Same rule as
-        // `draw_row`'s old ordering, one layer out.
+    // **The Shared page** (spec A 4) and, over it, the Send detail modal
+    // (spec B 7): one column of cards where 0.15 had a list and a detail
+    // pane. Whatever the page or its modal reports wins the frame.
+    if let Some(reported) = shared_page::draw(ui, state, &view, delete, selected, records, people) {
         action = reported;
     }
 
     SendUiVerdict::seal(action)
 }
-
-/// Design 5b's list column: a strip that names the cut in force, the sentence
-/// under it, and the rows.
-///
-/// Returns the action **the strip** reported. Picking a row is not an action:
-/// it is a write to `selected`, exactly as an item row writes `selected_id`,
-/// because there is nothing for `vault_window` to do about it.
-fn draw_send_list(
-    ui: &mut egui::Ui,
-    state: &SendPaneState,
-    view: &SendView<'_>,
-    delete: SendDeleteView<'_>,
-    selected: &mut Option<String>,
-    records: RecordTiles<'_>,
-    // Design 6c's person shares, one row per record and person, and 6d's
-    // records from people on `Shared with me`. Only rows are read here; the
-    // Stop sharing two-step is the detail's.
-    people: &mut super::share_ui::PeopleRows<'_>,
-) -> Option<SendUiAction> {
-    let mut action: Option<SendUiAction> = None;
-    let width = ui.available_width();
-
-    // **The shares this column lists: on the unfiltered row only.** The
-    // sub-rows are Send states -- Waiting, Opened, Used, Ended -- and a share
-    // is in none of them, so "All" is the one row a share belongs to (plan
-    // decision 12), and `Shared with me` is another screen.
-    let shares: &[super::share_ui::ShareRow] = match view {
-        SendView::Mine(crate::vault_window::sidebar::SendScope::All) => people.shares,
-        _ => &[],
-    };
-
-    // How many rows this column is about to draw, decided BEFORE the strip so
-    // the strip can say it. `None` where the count is not a fact this app has
-    // -- an unanswered or failed fetch -- which is the same rule the rail's
-    // badge follows, on the same list.
-    //
-    // **With the Sends unknown and shares listed, the shares are counted** --
-    // the rail's own partial count (`sidebar`'s Sent row: unknown Sends with
-    // no shares stay unknown, unknown Sends with shares count the shares),
-    // so the strip and the badge beside it say one number.
-    let counted: Option<usize> = match (view, state) {
-        (SendView::Received(rows), _) => Some(rows.len() + people.received.len()),
-        (SendView::Mine(scope), SendPaneState::Rows(rows)) => {
-            Some(rows_in_scope(rows, *scope).len() + shares.len())
-        }
-        (SendView::Mine(_), SendPaneState::Empty) => Some(shares.len()),
-        (SendView::Mine(_), _) if !shares.is_empty() => Some(shares.len()),
-        (SendView::Mine(_), _) => None,
-    };
-
-    // --- the strip ------------------------------------------------------
-    //
-    // **The records list's own strip, drawn by the records list's own
-    // function** -- `item_list::list_strip`: its white tile, its 12pt of
-    // padding round a row the search box's height, and its 1pt hairline at
-    // its foot. This was a second strip built here by hand, 56pt tall against
-    // that one's 58, and the owner saw the two headers were not one thing
-    // when the columns swapped. What is in it is this screen's: 5b's heading,
-    // the count, and the sort -- no buttons. A Send is made from a record
-    // ("for simplicity let's just send from the record itself"), so `New
-    // Send` went; and the list is asked for again whenever the screen is
-    // opened, so `Refresh` went with it.
-    //
-    // The list butts straight against it, for `draw_item_list`'s reason:
-    // egui adds `item_spacing.y` after each allocation AS it is made, so the
-    // spacing is zeroed before the strip is drawn and put back after it --
-    // leaving `LIST_PAD` the only space above the first row, as it is on the
-    // records list. It was 8pt more here, which is part of why the two
-    // columns did not line up.
-    let spacing = ui.spacing().item_spacing.y;
-    ui.spacing_mut().item_spacing.y = 0.0;
-    let strip = super::item_list::list_strip(ui, |ui| {
-        ui.allocate_exact_size(
-            egui::vec2(ui.available_width(), theme::SEARCH_FIELD_HEIGHT),
-            egui::Sense::hover(),
-        )
-        .0
-    });
-    ui.spacing_mut().item_spacing.y = spacing;
-    let eyebrow = ui.painter().layout_job(theme::letterspaced(
-        view.heading(),
-        theme::EYEBROW_PX,
-        theme::BOLD,
-        theme::EYEBROW_TRACKING,
-        theme::TEXT_MUTED,
-    ));
-    let eyebrow_size = eyebrow.size();
-    ui.painter().galley(
-        egui::pos2(strip.left(), strip.center().y - eyebrow_size.y / 2.0),
-        eyebrow,
-        theme::TEXT_MUTED,
-    );
-    // The count, beside the word it counts. `badge_text` rather than a local
-    // `match`, so an unanswered list draws the rail's own en dash here too
-    // and the two readouts cannot disagree about what "not known" looks like.
-    //
-    // **`Shared with me` counts RECORDS, not sends.** Those rows are imports
-    // this app wrote down; calling them "3 sends" beside the heading SHARED
-    // WITH ME says the user published three, which is the opposite of what
-    // that screen is about. It is the kind of slip a picture catches and a
-    // rect assertion never can.
-    //
-    // **And a list with shares in it counts ITEMS** (6c's strip: "9 items"):
-    // "3 sends" over two Sends and a person share would call the share a
-    // link, which is the one thing 6e's tiles say it is not.
-    let (one, many) = match view {
-        SendView::Received(_) => (RECORD_NOUN, RECORDS_NOUN),
-        SendView::Mine(_) if !shares.is_empty() => (ITEM_NOUN, ITEMS_NOUN),
-        SendView::Mine(_) => (SEND_NOUN, SENDS_NOUN),
-    };
-    let noun = match counted {
-        Some(1) => format!("1 {one}"),
-        Some(n) => format!("{n} {many}"),
-        None => format!("{} {many}", crate::vault_window::sidebar::UNKNOWN_COUNT),
-    };
-    // At the records header's own type size -- `theme::SEARCH_TEXT_PX`, the
-    // search box's -- rather than a 12px of this strip's own.
-    let strip_font = egui::FontId::new(theme::SEARCH_TEXT_PX, egui::FontFamily::Proportional);
-    ui.painter().text(
-        egui::pos2(strip.left() + eyebrow_size.x + STRIP_GAP, strip.center().y),
-        egui::Align2::LEFT_CENTER,
-        &noun,
-        strip_font.clone(),
-        theme::TEXT_GHOST,
-    );
-    if let SendView::Mine(_) = view {
-        ui.painter().text(
-            egui::pos2(strip.right(), strip.center().y),
-            egui::Align2::RIGHT_CENTER,
-            NEWEST_LABEL,
-            strip_font,
-            theme::TEXT_FAINT,
-        );
-    }
-
-    // --- the standing explanations, UNDER the column --------------------
-    //
-    // **They used to sit between the strip and the first row, and that is the
-    // change here.** Two wrapped grey paragraphs above the list came to some
-    // seventy points of prose at the top of a 390pt column: the first thing
-    // the eye met on this screen was a help note, and the rows -- the whole
-    // subject of the column -- began a third of the way down it. Design 5b's
-    // list column goes strip, then rows, with nothing in between, and the
-    // item list this column swaps places with does the same.
-    //
-    // They are not deleted, because both are true and both are things a user
-    // has to be told: this app cannot make a file Send, and it cannot edit
-    // one. They are demoted to a footnote, which is what a standing statement
-    // about a feature's edges is. The rail already does exactly this with
-    // "Locks in 11:42" -- a line the column always carries, at the bottom,
-    // at 11px in `TEXT_GHOST` -- so this is the window's own existing rule for
-    // "true, and not what you came here for", not a new one invented to get
-    // the prose out of the way.
-    let text_width = (width - LIST_PAD * 2.0).max(0.0);
-    // The `FILE` explanation only when there is a tag on screen to explain.
-    // The gloss above says what this app does with Sends; this says what the
-    // tag on a row in front of the user means, and a list with no such row
-    // has no tag to explain.
-    let file_note = matches!(view, SendView::Mine(scope)
-        if matches!(state, SendPaneState::Rows(rows)
-            if rows_in_scope(rows, *scope).iter().any(|r| r.is_file)));
-    //
-    // **The notes are LAID OUT before the panel is opened, and the panel is
-    // given their exact height.** A `Panel::bottom` left to size itself takes
-    // its height from what it drew, which is a frame late: on the first frame
-    // of a screen it uses a default and clips whatever does not fit. That is
-    // not a test artefact -- it is what a user sees the first time they open
-    // this screen -- and it is why the second note went missing under a paint
-    // harness that draws one frame. Measuring first is this file's standing
-    // discipline for exactly this class of bug.
-    let note_font = egui::FontId::new(NOTE_PX, egui::FontFamily::Proportional);
-    //
-    // Once a person share is listed, 6c's own note replaces 5b's: it names
-    // both things the list holds and where each is made.
-    //
-    // And on `Shared with me`, once a record from a person is listed, 6d's
-    // own note replaces 5b's for the same reason: the list holds two kinds
-    // now, and the note says what each is. A sharer being waited on counts:
-    // the note is what says where an accepted invitation's records arrive.
-    let gloss = if !shares.is_empty() {
-        SHARES_SUBTEXT
-    } else if matches!(view, SendView::Received(_)) && !(people.received.is_empty() && people.waiting.is_empty()) {
-        RECEIVED_PEOPLE_SUBTEXT
-    } else {
-        view.gloss()
-    };
-    let mut notes: Vec<std::sync::Arc<egui::Galley>> = vec![ui.painter().layout(
-        gloss.to_string(),
-        note_font.clone(),
-        theme::TEXT_GHOST,
-        text_width,
-    )];
-    if file_note {
-        notes.push(ui.painter().layout(
-            FILE_SEND_EXPLANATION.to_string(),
-            note_font,
-            theme::TEXT_GHOST,
-            text_width,
-        ));
-    }
-    let notes_height: f32 = notes.iter().map(|g| g.size().y).sum::<f32>()
-        + NOTE_GAP * (notes.len() - 1) as f32;
-    egui::Panel::bottom("send-list-note")
-        .exact_size(LIST_PAD * 3.0 + NOTE_RULE + notes_height)
-        .resizable(false)
-        .frame(egui::Frame::new().fill(theme::CANVAS))
-        .show_separator_line(false)
-        .show(ui, |ui| {
-            let area = ui.available_rect_before_wrap();
-            let p = ui.painter();
-            // A hairline over the footnote, so it reads as a note under the
-            // column rather than as a sentence that has come adrift from the
-            // last row. The rail's own footer does not need one because the
-            // rail's rows end in a flexed gap; a scrolled list ends wherever
-            // the scrolling stopped.
-            p.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::pos2(area.left() + LIST_PAD, area.top() + LIST_PAD),
-                    egui::vec2((area.width() - LIST_PAD * 2.0).max(0.0), NOTE_RULE),
-                ),
-                CornerRadius::ZERO,
-                theme::HAIRLINE,
-            );
-            let mut y = area.top() + LIST_PAD + NOTE_RULE + LIST_PAD;
-            for galley in notes {
-                let height = galley.size().y;
-                p.galley(egui::pos2(area.left() + LIST_PAD, y), galley, theme::TEXT_GHOST);
-                y += height + NOTE_GAP;
-            }
-        });
-
-    // --- the rows -------------------------------------------------------
-    ui.add_space(LIST_PAD);
-    let row_width = (width - LIST_PAD * 2.0).max(0.0);
-    // **The records list's own list frame, around the rows.** The rows were
-    // `LIST_PAD` narrower than the column but started flush against its left
-    // edge, so they sat 10pt left of where a record's row sits; the frame
-    // puts that padding on the left, and -- exactly as `draw_item_list` does
-    // -- the right padding IS the scroll bar's lane (`scrollbar_in_gutter`),
-    // painted only when the rows overflow, so the rows keep one width.
-    //
-    // `eyebrows` is how many of Shared with me's group eyebrows (mock 6d)
-    // stand among the rows: each is one more item in the list and its height,
-    // counted so the scroll bar is decided on what is really drawn.
-    //
-    // `extra` is the height of rows of another shape among them -- Paste an
-    // invite link's row and the waiting lines, each with its gap after it
-    // (`share_ui::paste_and_waiting_height`) -- for the same reason.
-    let rows_area = |ui: &mut egui::Ui, rows: usize, eyebrows: usize, extra: f32, body: &mut dyn FnMut(&mut egui::Ui)| {
-        egui::Frame::new()
-            .inner_margin(Margin { left: LIST_PAD as i8, right: 0, top: 0, bottom: LIST_PAD as i8 })
-            .show(ui, |ui| {
-                let content = rows as f32 * ROW_HEIGHT
-                    + eyebrows as f32 * super::share_ui::group_eyebrow_height(ui)
-                    + (rows + eyebrows).saturating_sub(1) as f32 * LIST_ROW_GAP
-                    + extra;
-                theme::scrollbar_in_gutter(ui, LIST_PAD);
-                if content < ui.available_height() {
-                    theme::hide_scrollbar(ui);
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt("send-list")
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = LIST_ROW_GAP;
-                        ui.add_space(0.0);
-                        body(ui);
-                    });
-            });
-    };
-    // **The shares, above a Sends fetch that has not answered or has
-    // failed.** They come from the daemon's `/sharing` view by a route of
-    // their own, so a Sends list still loading -- which it is on EVERY visit,
-    // since leaving the screen drops the answer -- or one that failed says
-    // nothing about them, and hiding them would contradict both the rail
-    // (which counts them while the Sends are unknown) and the detail pane
-    // (which keeps showing a picked one). The rows are `rows_area`'s, in the
-    // same frame at the same place; what differs is that the scroll area
-    // shrinks to them and stops [`LIST_STATUS_ROOM`] short of the column's
-    // foot, so the spinner or the failure under them is never pushed off it.
-    let shares_above = |ui: &mut egui::Ui, body: &mut dyn FnMut(&mut egui::Ui)| {
-        egui::Frame::new()
-            .inner_margin(Margin { left: LIST_PAD as i8, right: 0, top: 0, bottom: 0 })
-            .show(ui, |ui| {
-                let content = shares.len() as f32 * ROW_HEIGHT
-                    + shares.len().saturating_sub(1) as f32 * LIST_ROW_GAP;
-                let room = (ui.available_height() - LIST_STATUS_ROOM).max(ROW_HEIGHT);
-                theme::scrollbar_in_gutter(ui, LIST_PAD);
-                if content <= room {
-                    theme::hide_scrollbar(ui);
-                }
-                egui::ScrollArea::vertical()
-                    .id_salt("send-list-shares")
-                    .auto_shrink([false, true])
-                    .max_height(room)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = LIST_ROW_GAP;
-                        ui.add_space(0.0);
-                        body(ui);
-                    });
-            });
-    };
-    // The list pane's empty states, set as spec 3.1's placeholders are: a
-    // centred column 48 down, a 17/700 line and a 15 px line under it.
-    let headline = |ui: &mut egui::Ui, head: &str, detail: &str, colour: egui::Color32| {
-        ui.add_space(48.0);
-        ui.vertical_centered(|ui| {
-            ui.spacing_mut().item_spacing.y = 8.0;
-            ui.label(theme::bold(head, 17.0).color(colour));
-            ui.add(egui::Label::new(egui::RichText::new(detail).size(15.0).color(theme::TEXT_FAINT)).wrap());
-        });
-    };
-
-    match view {
-        // **Mock 6d: FROM PEOPLE, then IMPORTED FROM SENDS.** The records
-        // people share with this account first -- live, and theirs -- then
-        // the imports, which are the user's own copies. The eyebrows are
-        // drawn only where there are two groups to tell apart: an account
-        // nobody shares with keeps the list it always had, and one with no
-        // imports gets no eyebrow over nothing.
-        //
-        // **Paste an invite link is the first row** (official-path spec
-        // §4.1), where sharing is available, and the accepted-but-unfinished
-        // sharers' waiting lines follow it: both are about what is ON ITS
-        // WAY, above what is here. Nothing is picked for the user any more:
-        // there is no invitation pane to open beside the list.
-        SendView::Received(rows) => {
-            let leads = people.paste.is_some() || !people.waiting.is_empty();
-            if rows.is_empty() && people.received.is_empty() && people.waiting.is_empty() {
-                // Nothing listed: the box, if offered, over the empty
-                // screen's words -- which are still true.
-                if people.paste.is_some() {
-                    ui.add_space(LIST_PAD);
-                    egui::Frame::new()
-                        .inner_margin(Margin { left: LIST_PAD as i8, right: 0, top: 0, bottom: 0 })
-                        .show(ui, |ui| super::share_ui::draw_paste_and_waiting(ui, people, row_width));
-                }
-                headline(ui, RECEIVED_EMPTY_HEADLINE, RECEIVED_EMPTY_DETAIL, theme::INK);
-            } else {
-                let received = people.received.len();
-                // 6d's IMPORTED FROM SENDS stands over the imports whenever
-                // anything from people -- records, a sharer being waited on --
-                // is listed above them.
-                let from_people = received > 0 || !people.waiting.is_empty();
-                let two_groups = !rows.is_empty() && from_people;
-                let eyebrows = usize::from(received > 0) + usize::from(two_groups);
-                // The paste row's and the waiting lines' own height and the
-                // gaps between them, and the one gap joining them to whatever
-                // is listed under them.
-                let others = rows.len() + received + eyebrows;
-                let lead = super::share_ui::paste_and_waiting_height(people, LIST_ROW_GAP)
-                    + if others > 0 && leads { LIST_ROW_GAP } else { 0.0 };
-                rows_area(ui, rows.len() + received, eyebrows, lead, &mut |ui| {
-                    super::share_ui::draw_paste_and_waiting(ui, people, row_width);
-                    if let Some(open) = super::share_ui::draw_received_group(ui, people, row_width, ROW_HEIGHT, selected, records) {
-                        action = Some(open);
-                    }
-                    if two_groups {
-                        super::share_ui::group_eyebrow(ui, row_width, super::share_ui::FROM_SENDS_EYEBROW);
-                    }
-                    for row in rows.iter() {
-                        draw_received_row(ui, row, row_width, selected);
-                    }
-                });
-            }
-        }
-        SendView::Mine(scope) => match state {
-            SendPaneState::Loading => {
-                if !shares.is_empty() {
-                    shares_above(ui, &mut |ui| {
-                        for share in shares {
-                            draw_share_row(ui, share, row_width, selected, records);
-                        }
-                    });
-                }
-                ui.add_space(LIST_PAD);
-                ui.indent("send-loading", |ui| {
-                    ui.horizontal(|ui| {
-                        ui.add(egui::Spinner::new().size(16.0).color(theme::BLUE));
-                        ui.add_space(8.0);
-                        ui.label(
-                            egui::RichText::new(LOADING_LABEL).size(13.0).color(theme::TEXT_FAINT),
-                        );
-                    });
-                });
-            }
-            // An account with no Sends and a share still has a list: "You
-            // have no Sends" over a share row would be true and read as
-            // "nothing here".
-            SendPaneState::Empty if !shares.is_empty() => {
-                rows_area(ui, shares.len(), 0, 0.0, &mut |ui| {
-                    for share in shares {
-                        draw_share_row(ui, share, row_width, selected, records);
-                    }
-                });
-            }
-            SendPaneState::Empty => headline(ui, EMPTY_HEADLINE, EMPTY_DETAIL, theme::INK),
-            SendPaneState::Failed { message, ambiguous } => {
-                // A failure draws NO Sends row area at all, and never reuses
-                // the empty state's words. Both are asserted over painted
-                // glyphs. The shares above it are not the failed fetch's --
-                // see `shares_above`.
-                if !shares.is_empty() {
-                    shares_above(ui, &mut |ui| {
-                        for share in shares {
-                            draw_share_row(ui, share, row_width, selected, records);
-                        }
-                    });
-                }
-                ui.add_space(LIST_PAD);
-                ui.indent("send-failed", |ui| {
-                    ui.set_width(text_width);
-                    ui.label(
-                        egui::RichText::new(FAILED_HEADLINE)
-                            .size(14.0)
-                            .color(theme::ERROR)
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(message.as_str()).size(12.0).color(theme::TEXT_MUTED),
-                    );
-                    if *ambiguous {
-                        ui.add_space(4.0);
-                        ui.label(
-                            egui::RichText::new(AMBIGUOUS_DETAIL)
-                                .size(12.0)
-                                .color(theme::TEXT_MUTED),
-                        );
-                    }
-                    ui.add_space(10.0);
-                    // The design system's secondary, like every other control
-                    // on this screen now. It used to be a bare `egui::Button`
-                    // at 12px -- one more place where a screen built out of
-                    // egui defaults looked like it came from a different
-                    // application than the one around it.
-                    if theme::secondary_button(ui, TRY_AGAIN_LABEL).clicked() {
-                        action = Some(SendUiAction::Refresh);
-                    }
-                });
-            }
-            SendPaneState::Rows(rows) => {
-                let in_scope = rows_in_scope(rows, *scope);
-                if in_scope.is_empty() && shares.is_empty() {
-                    // The account has Sends; this sub-row has none. A third
-                    // sentence, deliberately -- see `scope_empty_headline`.
-                    let head = scope_empty_headline(*scope);
-                    headline(ui, &head, SCOPE_EMPTY_DETAIL, theme::INK);
-                } else {
-                    rows_area(ui, in_scope.len() + shares.len(), 0, 0.0, &mut |ui| {
-                        // **Shares first** (plan decision 12). 6c interleaves
-                        // the two by date, and a share has no server date to
-                        // interleave by -- only this PC's record of it, which
-                        // a share made elsewhere does not have -- so the
-                        // shares lead, newest first among themselves, and the
-                        // Sends keep their own order under them.
-                        for share in shares {
-                            draw_share_row(ui, share, row_width, selected, records);
-                        }
-                        for row in &in_scope {
-                            draw_row(ui, row, row_width, delete, selected, records);
-                        }
-                    });
-                }
-            }
-        },
-    }
-
-    action
-}
-
-/// The gap between the strip's eyebrow and the count beside it: 5b's own
-/// `gap: 10px`.
-const STRIP_GAP: f32 = 10.0;
-/// The row container's `padding: 10px`: the records list's own
-/// `LIST_PADDING`, read rather than spelled, for the reason the row
-/// geometry below is.
-const LIST_PAD: f32 = super::item_list::LIST_PADDING;
-/// The `gap: 6px` between two rows -- the records list's.
-const LIST_ROW_GAP: f32 = super::item_list::ROW_GAP;
-/// What the shares listed above a loading or failed Sends fetch leave free
-/// at the column's foot: the failure block at its tallest -- the headline, a
-/// two-line message, the ambiguous line and Try again, with their gaps --
-/// plus the pad above it. More shares than leave that room free are
-/// scrolled, rather than pushing the spinner or Try again off the column.
-const LIST_STATUS_ROOM: f32 = 160.0;
-/// The list column's footnote: the rail's own footer size, because it is the
-/// same kind of line in the same kind of place. See the footnote's own
-/// argument in [`draw_send_list`].
-const NOTE_PX: f32 = 11.0;
-/// The gap between the two footnotes, and the hairline above them.
-const NOTE_GAP: f32 = 3.0;
-const NOTE_RULE: f32 = 1.0;
 
 /// What the strip's count counts, on each of the two screens this pane draws.
 ///
@@ -2209,459 +1674,11 @@ pub const SEND_NOUN: &str = "send";
 pub const SENDS_NOUN: &str = "sends";
 pub const RECORD_NOUN: &str = "record";
 pub const RECORDS_NOUN: &str = "records";
-/// The Sent list's count once person shares are in it (6c's "9 items").
-const ITEM_NOUN: &str = "item";
-const ITEMS_NOUN: &str = "items";
 /// The failure's own retry, and the one way to ask for the list again without
 /// leaving the screen. **Not "Refresh"**, which is what the strip's own button
 /// said before it went: this one sits under a sentence explaining what went
 /// wrong, and "Refresh" under an error reads as a suggestion that nothing did.
 pub const TRY_AGAIN_LABEL: &str = "Try again";
-
-/// One Send in the list column. **No controls at all**, which is design 5b's
-/// own row and the resolution of a departure this file used to carry.
-///
-/// # The pill is right-aligned now, and the departure is gone
-///
-/// The note that used to sit here said the pill led the second line "and the
-/// design right-aligns it", because Copy link and Delete already owned this
-/// row's right edge and a pill placed in that column would be pushed off the
-/// pane at `MIN_VAULT_WINDOW_SIZE` or would move every time the row changed
-/// mode. Both halves of that argument were about controls that are no longer
-/// here: 5b puts Revoke in the detail pane, this screen now has one, and the
-/// row's right edge is free. So the pill is where the design puts it, the
-/// departure is deleted rather than restated, and the row has nothing in it
-/// that can be pushed off by a narrower window -- the name and subtitle are
-/// clipped against the pill's left edge instead.
-///
-/// # Picking is the row's whole interaction
-///
-/// The entire band is one click target, like an item row, and what it does is
-/// write `selected`. Nothing destructive is reachable from here at all, which
-/// is worth more than the click it saves: the row that is under the pointer
-/// while a list refreshes is not the row the user was reading a moment ago,
-/// and this screen's one unrecoverable action used to be two pixels from it.
-///
-/// The one state the row still shows for itself is a revoke in flight, in
-/// place of its subtitle. A Send being deleted while the user looks at
-/// another one would otherwise change nothing anywhere they can see.
-fn draw_row(
-    ui: &mut egui::Ui,
-    row: &SendRow,
-    width: f32,
-    delete: SendDeleteView<'_>,
-    selected: &mut Option<String>,
-    records: RecordTiles<'_>,
-) {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let picked = selected.as_deref() == Some(row.id.as_str()) && !row.id.is_empty();
-    if response.clicked() && !row.id.is_empty() {
-        *selected = Some(row.id.clone());
-    }
-
-    // **Design 5b's `opacity: 0.72`, and it is a property of the ROW.**
-    //
-    // 5b draws its Expired and Revoked rows at 72% of everything -- tile,
-    // name, subtitle, border and pill together -- and that is what makes its
-    // list read as a list rather than as five identical bands: the links that
-    // are still live come forward because the ones that are over have
-    // stepped back. Drawn at full strength, as this row was, "Remote Desktop
-    // -- Bastion" has exactly the same weight as the Send somebody is about
-    // to open, and the column has no shape at all.
-    //
-    // **Except when it is picked**, which 5b never had to decide because 5b's
-    // picked row happens to be live. A receded row whose detail pane is up is
-    // a row the user is looking AT, and fading the one thing they selected
-    // reads as the app having lost track of it. So a selection restores the
-    // row to full strength; nothing else does.
-    let ended = matches!(
-        row.state,
-        crate::send::SendState::Expired | crate::send::SendState::Revoked
-    );
-    let fade = if ended && !picked { theme::ENDED_ROW_OPACITY } else { 1.0 };
-    let dim = |colour: egui::Color32| theme::faded(colour, fade);
-
-    // A clone, so the tile below can be drawn by a child `Ui` while the rest
-    // of the row is still being painted through this.
-    let painter = ui.painter().clone();
-    let painter = &painter;
-    // **The design's selected-row shadow, from `theme` and not from a second
-    // spelling.** The item list has drawn one under its picked row since
-    // design 2b; this row, rebuilt by hand, had none -- so two rows in the
-    // same column of the same window lifted differently under the same
-    // gesture. See `theme::SELECTED_ROW_SHADOW`.
-    if picked {
-        painter.add(
-            theme::SELECTED_ROW_SHADOW.as_shape(rect, CornerRadius::same(ROW_RADIUS)),
-        );
-    }
-    painter.rect_filled(rect, CornerRadius::same(ROW_RADIUS), theme::CARD);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(ROW_RADIUS),
-        egui::Stroke::new(1.0, dim(if picked { theme::BLUE } else { theme::HAIRLINE })),
-        egui::StrokeKind::Inside,
-    );
-
-    let small_font =
-        egui::FontId::new(super::item_list::SUBTITLE_SIZE, egui::FontFamily::Proportional);
-
-    // The pill first: it is right-aligned, and its measured width is what
-    // bounds how far the name and the subtitle may run. Measured through
-    // `state_pill_width` before anything is drawn, which is the same
-    // reserve-then-fill order every control on this row used to follow and
-    // the reason none of them was ever pushed off the pane.
-    //
-    // The tone is faded with the rest of the row, through `theme::faded_pill`
-    // rather than by picking paler colours: an `Expired` pill in a fifth set
-    // of greys would be a fifth thing to keep true, and the design's rule is
-    // one opacity over the whole band.
-    let tone = theme::faded_pill(state_tone(row.state), fade);
-    let label = state_label(row.state);
-    let pill_width = theme::state_pill_width(painter, tone, label);
-    theme::state_pill(
-        painter,
-        egui::pos2(rect.right() - ROW_INSET - pill_width, rect.center().y),
-        tone,
-        label,
-    );
-    let text_right = rect.right() - ROW_INSET - pill_width - ROW_TEXT_GAP;
-
-    // The tile, where the records row puts its tile, drawn by the records
-    // row's own function -- the record's favicon when this Send was made from
-    // a record that has one. See [`paint_send_tile`].
-    let tile = row_tile_rect(rect);
-    paint_send_tile(ui, tile, records, row.sent.as_ref().map(|s| s.item_id.as_str()), &row.name, picked, fade);
-
-    let text_left = tile.right() + ROW_TEXT_GAP;
-    let text_area = egui::Rect::from_min_max(
-        egui::pos2(text_left, rect.top()),
-        egui::pos2(text_right.max(text_left), rect.bottom()),
-    );
-    let clip = painter.with_clip_rect(text_area.intersect(ui.clip_rect()));
-    // The records row's text column, measured by the records row's own
-    // function: the name over the subtitle, `TITLE_GAP_Y` apart, the pair
-    // centred on the band.
-    let column_top = rect.center().y
-        - super::item_list::text_column_height(ui, "subtitle", picked) / 2.0;
-    let name_height = ui.ctx().fonts_mut(|f| {
-        f.row_height(&egui::FontId::new(
-            super::item_list::TITLE_SIZE,
-            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
-        ))
-    });
-    let subtitle_top = column_top + name_height + super::item_list::TITLE_GAP_Y;
-
-    let name_rect = clip.text(
-        egui::pos2(text_area.left(), column_top),
-        egui::Align2::LEFT_TOP,
-        &row.name,
-        // **`SEMIBOLD` unselected, not the plain proportional face**, which is
-        // the single most visible way this row differed from the item row it
-        // shares a column with. 5b's row name is `font-weight: 600` and
-        // `item_list`'s is `theme::semibold` at the same 13px; this one was
-        // `FontFamily::Proportional`, i.e. Regular. Laid side by side, the
-        // vault's names read as the subjects of their rows and the Sends'
-        // read as captions -- with every rectangle on both rows measured
-        // identically. A weight is not a measurement, which is exactly why
-        // no rect assertion ever saw it.
-        egui::FontId::new(
-            super::item_list::TITLE_SIZE,
-            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
-        ),
-        dim(if picked { theme::BLUE_DEEP } else { theme::INK }),
-    );
-    if row.is_file {
-        // Beside the name, never instead of the row. See the module docs: an
-        // unlisted public link is one the user cannot revoke from here and
-        // does not know is there.
-        let tag_rect = clip.text(
-            egui::pos2(name_rect.right() + 10.0 + TAG_PAD_X, name_rect.center().y),
-            egui::Align2::LEFT_CENTER,
-            FILE_TAG,
-            small_font.clone(),
-            dim(theme::TEXT_MUTED),
-        );
-        clip.rect_stroke(
-            tag_rect.expand2(egui::vec2(TAG_PAD_X, 2.0)),
-            CornerRadius::same(4),
-            egui::Stroke::new(1.0, dim(theme::HAIRLINE)),
-            egui::StrokeKind::Outside,
-        );
-    }
-
-    // The subtitle, or the progress word while this row's own `bw send
-    // delete` runs. Replaced rather than joined, for the reason the row's
-    // second line has always been replaced: a row that says both "3 of 10
-    // views" and "Revoking..." is a row whose subject is ambiguous at the
-    // moment it matters most.
-    let revoking = delete.in_flight == Some(row.id.as_str()) && !row.id.is_empty();
-    // **`TEXT_FAINT`, not `TEXT_GHOST`.** 5b's row subtitle is `#7d7979`,
-    // which is `TEXT_FAINT`; `TEXT_GHOST` (`#9b9797`) is the design's colour
-    // for a COUNT beside a rail row, not for the line that says what a Send
-    // is. The item row beside this one has always used `TEXT_FAINT` for its
-    // username, so this was a second way the two columns disagreed about what
-    // a secondary line looks like -- one step fainter, on every row, with the
-    // name one weight lighter above it.
-    let (second, colour) = if revoking {
-        (delete.busy_label(), theme::TEXT_MUTED)
-    } else {
-        (row.expiry.as_str(), theme::TEXT_FAINT)
-    };
-    clip.text(
-        egui::pos2(text_area.left(), subtitle_top),
-        egui::Align2::LEFT_TOP,
-        second,
-        small_font,
-        dim(colour),
-    );
-}
-
-/// One `Shared with me` row. The same band, the same tile and the same
-/// picking as [`draw_row`], with no state pill: a received record has no
-/// lifetime this app can read -- it is a note that an import happened -- and
-/// a pill here would be a state invented to fill the column.
-fn draw_received_row(
-    ui: &mut egui::Ui,
-    row: &ReceivedRow,
-    width: f32,
-    selected: &mut Option<String>,
-) {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, ROW_HEIGHT), egui::Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let picked = selected.as_deref() == Some(row.key.as_str());
-    if response.clicked() {
-        *selected = Some(row.key.clone());
-    }
-    let painter = ui.painter().clone();
-    let painter = &painter;
-    // The same selection treatment the Send row and the item row wear; see
-    // `theme::SELECTED_ROW_SHADOW`.
-    if picked {
-        painter.add(
-            theme::SELECTED_ROW_SHADOW.as_shape(rect, CornerRadius::same(ROW_RADIUS)),
-        );
-    }
-    painter.rect_filled(rect, CornerRadius::same(ROW_RADIUS), theme::CARD);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(ROW_RADIUS),
-        egui::Stroke::new(1.0, if picked { theme::BLUE } else { theme::HAIRLINE }),
-        egui::StrokeKind::Inside,
-    );
-    let tile = row_tile_rect(rect);
-    paint_send_tile(ui, tile, RecordTiles::default(), None, &row.name, picked, 1.0);
-    let text_area = egui::Rect::from_min_max(
-        egui::pos2(tile.right() + ROW_TEXT_GAP, rect.top()),
-        egui::pos2(rect.right() - ROW_INSET, rect.bottom()),
-    );
-    let clip = painter.with_clip_rect(text_area.intersect(ui.clip_rect()));
-    let column_top = rect.center().y
-        - super::item_list::text_column_height(ui, "subtitle", picked) / 2.0;
-    let name_height = ui.ctx().fonts_mut(|f| {
-        f.row_height(&egui::FontId::new(
-            super::item_list::TITLE_SIZE,
-            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
-        ))
-    });
-    // `SEMIBOLD`/`TEXT_FAINT`, exactly as `draw_row` above and as the item
-    // row beside both: a received record is a row in the same column, and
-    // there is no reason for it to be typeset a third way.
-    clip.text(
-        egui::pos2(text_area.left(), column_top),
-        egui::Align2::LEFT_TOP,
-        &row.name,
-        egui::FontId::new(
-            super::item_list::TITLE_SIZE,
-            egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
-        ),
-        if picked { theme::BLUE_DEEP } else { theme::INK },
-    );
-    clip.text(
-        egui::pos2(text_area.left(), column_top + name_height + super::item_list::TITLE_GAP_Y),
-        egui::Align2::LEFT_TOP,
-        &row.when,
-        egui::FontId::new(super::item_list::SUBTITLE_SIZE, egui::FontFamily::Proportional),
-        theme::TEXT_FAINT,
-    );
-}
-
-/// **One person share** (design 6c): the record's tile, its name, a person
-/// mark before "to anna@example.com · Shared", and the share pill at the
-/// right edge.
-///
-/// **[`draw_row`]'s band, every number of it** -- the height, the inset, the
-/// radius, the picked edge and shadow, the tile drawn by the records list's
-/// own function in the records list's own place, and the two-line text
-/// column measured by `item_list::text_column_height`. The owner compares
-/// this column with the records list rect for rect, and a share row built to
-/// its own numbers would be the third row shape in one column. What is the
-/// share's own is what 6c says tells the two kinds apart: the person mark on
-/// the second line, and the share pill -- 5-point corners and a person where
-/// a Send pill is a stadium with a dot (`theme::share_pill`).
-///
-/// No fade: a share has no ended state that stays in the list -- a stopped
-/// share is gone from the view -- so 5b's receded row has nothing to say here.
-/// A person who is no longer receiving says so in their pill.
-fn draw_share_row(
-    ui: &mut egui::Ui,
-    share: &super::share_ui::ShareRow,
-    width: f32,
-    selected: &mut Option<String>,
-    records: RecordTiles<'_>,
-) {
-    let _ = draw_person_row(
-        ui,
-        PersonRow {
-            key: &share.key,
-            item_id: &share.item_id,
-            name: &share.name,
-            subtitle: &share.subtitle,
-            pill: Some(share.pill()),
-            hover: None,
-        },
-        width,
-        ROW_HEIGHT,
-        selected,
-        records,
-    );
-}
-
-/// **What a row about a record and a person says**: the Sent list's share
-/// row (6c) and Shared with me's received record (6d) are this one shape.
-pub(crate) struct PersonRow<'a> {
-    /// The selection key the row writes to `selected` when clicked.
-    pub(crate) key: &'a str,
-    /// The record, for its tile.
-    pub(crate) item_id: &'a str,
-    pub(crate) name: &'a str,
-    /// The words after the person mark: "to anna@example.com · Shared",
-    /// "from denis@example.com · view-only".
-    pub(crate) subtitle: &'a str,
-    /// The share pill at the right edge -- a share's state. `None` for a
-    /// received record, whose one state the subtitle already says.
-    pub(crate) pill: Option<theme::SharePillKind>,
-    /// The row's hover words, if any: a received record whose sharer is
-    /// unverified carries the spec's tooltip (fix round 1, m7).
-    pub(crate) hover: Option<&'a str>,
-}
-
-/// **One row about a record and a person** -- [`draw_share_row`]'s whole
-/// drawing, shared with `share_ui::draw_received_group` so mock 6d's FROM
-/// PEOPLE rows and 6c's share rows are one row shape, which is the mock's
-/// own markup (both are its `.row` with a person-marked `.rs`). Answers
-/// whether it was clicked; the pick is written to `selected` here, as every
-/// row in this column writes it.
-pub(crate) fn draw_person_row(
-    ui: &mut egui::Ui,
-    row: PersonRow<'_>,
-    width: f32,
-    height: f32,
-    selected: &mut Option<String>,
-    records: RecordTiles<'_>,
-) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let picked = selected.as_deref() == Some(row.key);
-    if response.clicked() {
-        *selected = Some(row.key.to_string());
-    }
-    let painter = ui.painter().clone();
-    let painter = &painter;
-    if picked {
-        painter.add(
-            theme::SELECTED_ROW_SHADOW.as_shape(rect, CornerRadius::same(ROW_RADIUS)),
-        );
-    }
-    painter.rect_filled(rect, CornerRadius::same(ROW_RADIUS), theme::CARD);
-    painter.rect_stroke(
-        rect,
-        CornerRadius::same(ROW_RADIUS),
-        egui::Stroke::new(1.0, if picked { theme::BLUE } else { theme::HAIRLINE }),
-        egui::StrokeKind::Inside,
-    );
-
-    // The pill first, right-aligned, for `draw_row`'s reason: its measured
-    // width is what bounds the name and the subtitle. With no pill (a
-    // received record) the text runs to the row's own inset.
-    let text_right = match row.pill {
-        Some(kind) => {
-            let pill_width = theme::share_pill_width(painter, kind);
-            theme::share_pill(
-                painter,
-                egui::pos2(rect.right() - ROW_INSET - pill_width, rect.center().y),
-                kind,
-            );
-            rect.right() - ROW_INSET - pill_width - ROW_TEXT_GAP
-        }
-        None => rect.right() - ROW_INSET,
-    };
-
-    // A share IS a record, so it wears the record's tile -- its favicon when
-    // the cache has one, as the Send made from it does in the row below.
-    let tile = row_tile_rect(rect);
-    paint_send_tile(ui, tile, records, Some(row.item_id), row.name, picked, 1.0);
-
-    let text_left = tile.right() + ROW_TEXT_GAP;
-    let text_area = egui::Rect::from_min_max(
-        egui::pos2(text_left, rect.top()),
-        egui::pos2(text_right.max(text_left), rect.bottom()),
-    );
-    let clip = painter.with_clip_rect(text_area.intersect(ui.clip_rect()));
-    let title_font = egui::FontId::new(
-        super::item_list::TITLE_SIZE,
-        egui::FontFamily::Name(if picked { theme::BOLD } else { theme::SEMIBOLD }.into()),
-    );
-    let column_top = rect.center().y
-        - super::item_list::text_column_height(ui, "subtitle", picked) / 2.0;
-    let name_height = ui.ctx().fonts_mut(|f| f.row_height(&title_font));
-    let subtitle_top = column_top + name_height + super::item_list::TITLE_GAP_Y;
-    clip.text(
-        egui::pos2(text_area.left(), column_top),
-        egui::Align2::LEFT_TOP,
-        row.name,
-        title_font,
-        if picked { theme::BLUE_DEEP } else { theme::INK },
-    );
-    // 6c's `.rs svg`: a 10-point person, `margin-right: 4px`, on the
-    // subtitle's own line -- centred on the line the subtitle font lays, so
-    // the mark and the words share a middle rather than a top.
-    let subtitle_font =
-        egui::FontId::new(super::item_list::SUBTITLE_SIZE, egui::FontFamily::Proportional);
-    let subtitle_height = ui.ctx().fonts_mut(|f| f.row_height(&subtitle_font));
-    let mark = egui::Rect::from_min_size(
-        egui::pos2(text_area.left(), subtitle_top + (subtitle_height - SHARE_MARK) / 2.0),
-        egui::Vec2::splat(SHARE_MARK),
-    );
-    theme::paint_person_mark(&clip, mark, theme::TEXT_FAINT);
-    clip.text(
-        egui::pos2(mark.right() + SHARE_MARK_GAP, subtitle_top),
-        egui::Align2::LEFT_TOP,
-        row.subtitle,
-        subtitle_font,
-        theme::TEXT_FAINT,
-    );
-    let clicked = response.clicked();
-    if let Some(tip) = row.hover {
-        let _ = response.on_hover_text(tip);
-    }
-    clicked
-}
-
-/// 6c's `ic('person', 10, ..)` before a share row's subtitle, and its
-/// `margin-right: 4px`.
-const SHARE_MARK: f32 = 10.0;
-const SHARE_MARK_GAP: f32 = 4.0;
 
 /// **The records this screen's tiles are drawn from**: the vault's items and
 /// the icon cache's textures, both the window's, both borrowed.
@@ -2691,15 +1708,6 @@ impl<'a> RecordTiles<'a> {
         let id = item_id?;
         self.items.iter().find(|item| item.id == id)
     }
-}
-
-/// Where a row's tile goes: the records row's own place for it, one border
-/// and one padding in from the band's left edge and centred on its height.
-fn row_tile_rect(row: egui::Rect) -> egui::Rect {
-    egui::Rect::from_min_size(
-        egui::pos2(row.left() + ROW_INSET, row.center().y - ROW_TILE / 2.0),
-        egui::Vec2::splat(ROW_TILE),
-    )
 }
 
 /// One tile, in `tile`, **drawn by `item_list::row_tile`** -- the records
@@ -2750,144 +1758,7 @@ fn paint_send_tile(
     }
 }
 
-/// **Row geometry: the records row's, every number of it.**
-///
-/// This row was its own: 54pt with a 32pt tile, drawn to design 5b's CSS,
-/// beside a records row of 62pt with a 40pt one -- in the column the two
-/// lists swap places in. The owner's report was that a Send's row was not a
-/// record's row, down to the tile not sitting where a record's does. So the
-/// height, the padding, the border, the radius, the tile and the gap beside
-/// it are `item_list`'s own constants, read here and not restated, and the
-/// tile is drawn by `item_list::row_tile` -- the records list's own tile.
-const ROW_HEIGHT: f32 = super::item_list::ROW_TILE_HEIGHT;
-/// The row's `padding: 10px 12px` inside its 1pt border: where the tile, the
-/// text and the pill start, measured from the band's own edge.
-const ROW_PAD_X: f32 = super::item_list::ROW_PAD_X;
-const ROW_INSET: f32 = super::item_list::ROW_BORDER + ROW_PAD_X;
-const ROW_RADIUS: u8 = super::item_list::ROW_RADIUS;
-/// The tile, and the `gap: 11px` beside it -- also the gap between the text
-/// block and the state pill, so the row has one rhythm rather than two.
-const ROW_TILE: f32 = super::item_list::AVATAR_SIZE;
-const ROW_TEXT_GAP: f32 = super::item_list::ROW_GAP_X;
-/// The gap between two controls in a row.
-const BUTTON_GAP: f32 = 8.0;
-/// The gap between the row's name and its FILE tag, and between the tag's
-/// text and its own outline.
-const TAG_PAD_X: f32 = 6.0;
-
-/// Design 5b's detail pane, and the half of 5c that this client can stand
-/// behind.
-///
-/// # What is here
-///
-/// A header strip -- the initials tile, the name, what kind of Send it is and
-/// its state pill -- over an action row, over the link's own facts: the
-/// address, what opening it needs, the views against their cap, and BOTH
-/// dates. 5c's opening claim, "whether it was used is the question people
-/// actually have", is answered on the first line of the body in words rather
-/// than left to a pill.
-///
-/// # What is deliberately NOT here, and why it is not an empty box
-///
-/// **5c's per-access timeline.** Its entries read `Password revealed - 15:01
-/// - Edge on Windows - Berlin, DE - 84.13....` and there is no per-access
-///   record in a Bitwarden Send at all: no time of any particular open, no user
-///   agent, no address, no geolocation. Having them would mean the owner's
-///   server logging every access with an IP, which is their decision about
-///   their service and not a gap in this screen.
-///
-/// So there is **no Activity card**. A card headed `ACTIVITY` with nothing
-/// under it is worse than its absence twice over: it reads as a load that
-/// failed, and it promises a feature that no amount of work on this screen
-/// can deliver. What stands in its place is [`SendRow::activity`], one
-/// sentence carrying the part of 5c's premise that IS derivable -- how many
-/// opens happened and what is left -- positioned where 5c put its headline.
-///
-/// **5b's `Extend` is here now, and not where 5b draws it.** It has an edit
-/// path at last -- the Send read back whole and written back whole with its
-/// dates a week later, on either backend -- so it is a button that can do
-/// its job. 5b puts it at the end of the `Expires` row; it sits in the header
-/// beside `Revoke` instead, with the Send's other actions, because that is
-/// the one row of controls this pane measures to fit at the smallest window
-/// and a button inside a card row is one it does not.
-///
-/// **5b's `created` date** is not in `SendSummary` and is not invented. The
-/// subtitle says what kind of Send it is instead.
-fn draw_send_detail(
-    ui: &mut egui::Ui,
-    state: &SendPaneState,
-    view: &SendView<'_>,
-    delete: SendDeleteView<'_>,
-    selected: &mut Option<String>,
-    records: RecordTiles<'_>,
-    people: &mut super::share_ui::PeopleRows<'_>,
-) -> Option<SendUiAction> {
-    let mut action: Option<SendUiAction> = None;
-
-    match view {
-        SendView::Mine(scope) => {
-            // **A share key opens the share's own detail** (design 6c) --
-            // when that share is still listed. A key naming a share that has
-            // gone (a stop that brought the record home gave it a new id, so
-            // the key the window holds names nothing now) falls through to
-            // the Sends' resolution below, which finds no Send by it and
-            // draws the prompt: "nothing picked" is what is true.
-            //
-            // The slice is copied out of `people` first, so the row borrowed
-            // from it outlives the `&mut people` the detail writes its
-            // question into. Scoped to "All" as the list is.
-            let shares: &[super::share_ui::ShareRow] =
-                if *scope == crate::vault_window::sidebar::SendScope::All { people.shares } else { &[] };
-            if let Some(share) = selected.as_deref().and_then(|key| shares.iter().find(|s| s.key == key)) {
-                return draw_share_detail(ui, share, people, records);
-            }
-            let rows: &[SendRow] = match state {
-                SendPaneState::Rows(rows) => rows,
-                _ => &[],
-            };
-            let in_scope = rows_in_scope(rows, *scope);
-            // Resolved against the rows IN SCOPE rather than against the
-            // whole list, so a selection made on one sub-row and still held
-            // after the user clicks another cannot describe a Send that is
-            // not in the column beside it. The pane then reads as "nothing
-            // picked", which is what is true.
-            let picked = selected
-                .as_deref()
-                .and_then(|id| in_scope.iter().copied().find(|row| row.id == id));
-            match picked {
-                // **An instruction is only drawn when it can be followed.**
-                // "Pick a Send to see its link" beside a column that says
-                // "You have no Sends" is a direction to do something the
-                // screen has just said is impossible, and it was the loudest
-                // thing on that screen. With no rows in scope the list
-                // column's own sentence is the whole answer and this column
-                // stays out of its way. It is not a blank pane for a blank
-                // pane's sake -- the reason `detail_prompt` exists at all is
-                // that a blank column beside a FULL list reads as a load that
-                // failed, and that case is unchanged.
-                None if in_scope.is_empty() && shares.is_empty() => {}
-                None if shares.is_empty() => detail_prompt(ui, NOTHING_PICKED),
-                None => detail_prompt(ui, NOTHING_PICKED_WITH_SHARES),
-                Some(row) => action = draw_send_card(ui, row, delete, records),
-            }
-        }
-        SendView::Received(rows) => {
-            let picked =
-                selected.as_deref().and_then(|key| rows.iter().find(|row| row.key == key));
-            match picked {
-                // The same rule as the SHARING screen's: nothing to pick,
-                // nothing telling you to pick it.
-                None if rows.is_empty() => {}
-                None => detail_prompt(ui, NOTHING_PICKED_RECEIVED),
-                Some(row) => draw_received_detail(ui, row),
-            }
-        }
-    }
-    action
-}
-
-/// The detail column with nothing picked. **Words on the canvas, not a blank
-/// column**; see [`NOTHING_PICKED`].
+/// Spec B 7's caution band: what it says, and its button.
 pub const SEEN_TITLE: &str = "Someone has seen this password";
 pub const SEEN_BODY: &str = "Change it once they're done.";
 pub const CHANGE_PASSWORD: &str = "Change password";
@@ -2898,1161 +1769,6 @@ pub fn password_was_seen(row: &SendRow) -> bool {
         && row.sent.as_ref().is_some_and(|sent| {
             !sent.item_id.is_empty() && sent.fields.iter().any(|f| f == super::record_ui::PASSWORD_LABEL)
         })
-}
-
-/// Spec B §7's caution band; the item to edit when Change password is
-/// pressed.
-fn seen_password_warning(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
-    let ink = egui::Color32::from_rgb(0x7a, 0x4f, 0x05);
-    let edge = egui::Color32::from_rgb(0xf2, 0xd9, 0x9b);
-    let mut pressed = false;
-    egui::Frame::new()
-        .fill(egui::Color32::from_rgb(0xfe, 0xf6, 0xe7))
-        .stroke(egui::Stroke::new(1.0, edge))
-        .corner_radius(CornerRadius::same(16))
-        .inner_margin(Margin::symmetric(16, 14))
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.vertical(|ui| {
-                    ui.label(theme::bold(SEEN_TITLE, 15.0).color(ink));
-                    ui.label(egui::RichText::new(SEEN_BODY).size(14.0).color(ink));
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let button = egui::Button::new(theme::bold(CHANGE_PASSWORD, 14.0).color(ink))
-                        .fill(theme::CARD)
-                        .stroke(egui::Stroke::new(1.0, edge))
-                        .corner_radius(CornerRadius::same(11))
-                        .min_size(egui::vec2(0.0, 40.0));
-                    pressed = ui.add(button).clicked();
-                });
-            });
-        });
-    pressed.then(|| row.sent.as_ref().map(|s| s.item_id.clone())).flatten()
-}
-
-fn detail_prompt(ui: &mut egui::Ui, text: &str) {
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
-        .show(ui, |ui| {
-            ui.label(egui::RichText::new(text).size(13.0).color(theme::TEXT_FAINT));
-        });
-}
-
-/// The whole detail for one Send: header strip, actions, and the link's
-/// facts. Returns the action the actions row reported.
-fn draw_send_card(
-    ui: &mut egui::Ui,
-    row: &SendRow,
-    delete: SendDeleteView<'_>,
-    records: RecordTiles<'_>,
-) -> Option<SendUiAction> {
-    let mut action: Option<SendUiAction> = None;
-    let width = ui.available_width();
-
-    // The three states, decided ONCE and here, exactly as the row used to
-    // decide them: `is` compares the id this pane is describing with the id
-    // the window is holding, so a confirmation raised for one Send cannot be
-    // answered while another is on screen.
-    let has_id = !row.id.is_empty();
-    let revoking = has_id && delete.in_flight == Some(row.id.as_str());
-    let confirming = has_id && !revoking && delete.confirming == Some(row.id.as_str());
-
-    // --- how the header is laid out, decided before anything is painted ---
-    //
-    // **5b puts the actions ON the header line, right-aligned beside the
-    // title**, and this pane put them on a row of their own underneath. That
-    // one difference is most of why the detail column read as a stack of
-    // fields rather than as a page: 5b's header is one band -- who this is,
-    // what state it is in, and what you can do about it, left to right --
-    // and ours was a band, then a toolbar, then a sentence, then a card.
-    //
-    // It was not an arbitrary choice. At `MIN_VAULT_WINDOW_SIZE` this column
-    // is 298pt, its content box is 250, and 5b's own arrangement does not fit
-    // in it at any padding: a 42pt tile plus a title worth reading plus three
-    // controls is well past 250. So the answer is both, chosen by measurement
-    // rather than by picking one and living with it at the other end -- which
-    // is the same rule the `Views` meter and the card's label column already
-    // follow on this screen.
-    let labels = action_labels(row);
-    let content = (width - DETAIL_PAD_X_F * 2.0).max(0.0);
-    let action_pad = action_pad_for(ui, &labels, content);
-    let actions_width = actions_total(ui, &labels, action_pad);
-    // Inline only if the title still gets a readable run after the tile, the
-    // actions and the gap between the two columns. `TITLE_MIN_ROOM` is what
-    // "readable" means here and is argued at its own definition.
-    //
-    // Never while a revoke is running: that state draws a sentence where the
-    // controls were (see below), and a sentence is not a right-aligned row.
-    let inline = !revoking
-        && HEADER_TILE + ROW_TEXT_GAP + TITLE_MIN_ROOM + HEADER_ACTION_GAP + actions_width
-            <= content;
-
-    // --- header strip ---------------------------------------------------
-    let strip_height = if inline {
-        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK
-    } else {
-        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK + ACTION_ROW_GAP + theme::ACTION_BUTTON_HEIGHT
-    };
-    let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
-    {
-        // A clone, so the tile can be drawn by a child `Ui` mid-block.
-        let p = ui.painter().clone();
-        let p = &p;
-        p.rect_filled(strip, CornerRadius::ZERO, theme::CARD);
-        p.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(strip.left(), strip.bottom() - 1.0),
-                egui::pos2(strip.right(), strip.bottom()),
-            ),
-            CornerRadius::ZERO,
-            theme::HAIRLINE,
-        );
-        let block_top = strip.top() + DETAIL_PAD_Y_F;
-        let tile = egui::Rect::from_min_size(
-            egui::pos2(
-                strip.left() + DETAIL_PAD_X_F,
-                block_top + (HEADER_BLOCK - HEADER_TILE) / 2.0,
-            ),
-            egui::Vec2::splat(HEADER_TILE),
-        );
-        // The record's own tile, as its read pane draws it, when the Send
-        // was made from one that has an icon; its monogram otherwise.
-        paint_send_tile(ui, tile, records, row.sent.as_ref().map(|s| s.item_id.as_str()), &row.name, true, 1.0);
-
-        let text_left = tile.right() + ROW_TEXT_GAP;
-        // The text column stops where the actions begin when they are on this
-        // line, and at the pane's padding when they are not.
-        let text_right = strip.right()
-            - DETAIL_PAD_X_F
-            - if inline { actions_width + HEADER_ACTION_GAP } else { 0.0 };
-        let clip = p.with_clip_rect(
-            egui::Rect::from_min_max(
-                egui::pos2(text_left, strip.top()),
-                egui::pos2(text_right.max(text_left), strip.bottom()),
-            )
-            .intersect(ui.clip_rect()),
-        );
-        // **Elided, not clipped**, which is `elided`'s whole argument applied
-        // to the one run on this screen that had escaped it. A clipped galley
-        // keeps its full width, so at 298pt "Office WiFi -- Guest" was drawn
-        // at its natural size and simply stopped at the pane edge, with no
-        // ellipsis and no way for the reader to know a word had gone. The
-        // card rows below have been elided since they were written; the
-        // 21px title, the biggest run in the pane, was not.
-        let title = elided(
-            &clip,
-            &row.name,
-            egui::FontId::new(TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
-            theme::INK,
-            (text_right - text_left).max(0.0),
-        );
-        clip.galley(egui::pos2(text_left, block_top), title, theme::INK);
-        // The subtitle line: what kind of Send this is, then its pill. 5b
-        // reads "Send - created 16 Aug, 14:20" here and this client has no
-        // creation date, so the slot says the one thing it does know -- and
-        // it is the same fact the list row's `FILE` tag carries, spelled out
-        // where there is room for it.
-        let sub_y = block_top + TITLE_LINE + SUBTITLE_GAP + theme::PILL_HEIGHT / 2.0;
-        let kind = if row.sent.is_some() {
-            RECORD_SEND_KIND
-        } else if row.is_file {
-            FILE_SEND_KIND
-        } else {
-            TEXT_SEND_KIND
-        };
-        let kind_rect = clip.text(
-            egui::pos2(text_left, sub_y),
-            egui::Align2::LEFT_CENTER,
-            kind,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            theme::TEXT_FAINT,
-        );
-        theme::state_pill(
-            &clip,
-            egui::pos2(kind_rect.right() + STRIP_GAP, sub_y),
-            state_tone(row.state),
-            state_label(row.state),
-        );
-    }
-
-    // --- the actions -----------------------------------------------------
-    //
-    // Inline: 5b's own composition, right-aligned on the header line and
-    // centred on the header block. Stacked: their own row under it, at the
-    // pane's left padding, which is the only arrangement that fits 250pt.
-    let action_y = if inline {
-        strip.top() + DETAIL_PAD_Y_F + (HEADER_BLOCK - theme::ACTION_BUTTON_HEIGHT) / 2.0
-    } else {
-        strip.top() + DETAIL_PAD_Y_F + HEADER_BLOCK + ACTION_ROW_GAP
-    };
-    let slot_at = |x: f32, w: f32| {
-        egui::Rect::from_min_size(
-            egui::pos2(x, action_y),
-            egui::vec2(w, theme::ACTION_BUTTON_HEIGHT),
-        )
-    };
-    let x0 = if inline {
-        strip.right() - DETAIL_PAD_X_F - actions_width
-    } else {
-        strip.left() + DETAIL_PAD_X_F
-    };
-    if revoking {
-        // **No widget of any kind**, which is the rule this screen has always
-        // followed here: a disabled button is still a button the layout has
-        // to hold, and sense-less controls in this window have a history of
-        // coming back to life after a re-layout.
-        //
-        // `inline` is false whenever this is true -- see its definition --
-        // so this sentence always has the second row to itself and can never
-        // be laid over the title.
-        ui.painter().text(
-            egui::pos2(strip.left() + DETAIL_PAD_X_F, action_y + theme::ACTION_BUTTON_HEIGHT / 2.0),
-            egui::Align2::LEFT_CENTER,
-            delete.busy_label(),
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            theme::TEXT_MUTED,
-        );
-    } else {
-        // **Design 5b's two: `Open record` and a red `Revoke`.** Revoke's
-        // rectangle is measured from its own label and Cancel is drawn in
-        // exactly that rectangle while the confirmation is up, so a second
-        // rapid click where Revoke was lands on Cancel -- the mis-click
-        // defence this header has always had. `Open record` steps back while
-        // the confirmation is up, for the same reason the switch used to: a
-        // question about destroying one thing is not the moment for another
-        // control beside it.
-        let mut x = x0;
-        let open_rect = row.sent.as_ref().map(|_| {
-            let w = theme::action_button_width(ui.painter(), OPEN_RECORD_LABEL, action_pad);
-            let rect = slot_at(x, w);
-            x = rect.right() + BUTTON_GAP;
-            rect
-        });
-        // **Extend, beside Revoke and before it**: the ordinary action reads
-        // first and the one that takes something away reads last. It steps
-        // back during the confirmation for `Open record`'s reason, and keeps
-        // its slot so Cancel stays exactly where Revoke was.
-        let extend_rect = row.extendable.then(|| {
-            let w = theme::action_button_width(ui.painter(), EXTEND_LABEL, action_pad);
-            let rect = slot_at(x, w);
-            x = rect.right() + BUTTON_GAP;
-            rect
-        });
-        let revoke_w = theme::action_button_width(ui.painter(), REVOKE_LABEL, action_pad);
-        let revoke_rect = slot_at(x, revoke_w);
-        let opened = match (&row.sent, open_rect) {
-            (Some(sent), Some(rect)) if !confirming => {
-                theme::action_button(ui, rect, OPEN_RECORD_LABEL, theme::ActionTone::Secondary)
-                    .clicked()
-                    .then(|| SendUiAction::OpenRecord(sent.item_id.clone()))
-            }
-            _ => None,
-        };
-        let extended = match extend_rect {
-            Some(rect) if !confirming => {
-                let pressed =
-                    theme::action_button(ui, rect, EXTEND_LABEL, theme::ActionTone::Secondary)
-                        .on_hover_text(extend_hint())
-                        .clicked();
-                (pressed && has_id)
-                    .then(|| SendUiAction::Extend { id: row.id.clone(), name: row.name.clone() })
-            }
-            _ => None,
-        };
-        let opened = extended.or(opened);
-        let destructive = if confirming {
-            theme::action_button(ui, revoke_rect, CANCEL_LABEL, theme::ActionTone::Secondary)
-                .clicked()
-                .then_some(SendUiAction::CancelDelete)
-        } else {
-            let asked =
-                theme::action_button(ui, revoke_rect, REVOKE_LABEL, theme::ActionTone::Destructive)
-                    .clicked();
-            (asked && has_id).then(|| SendUiAction::AskDelete(row.id.clone()))
-        };
-        // The destructive control wins an ambiguous frame, as it always has.
-        action = destructive.or(opened);
-    }
-
-    // --- the body --------------------------------------------------------
-    //
-    // **The cursor is put back at the foot of the strip first.** `Ui::put`
-    // does not merely draw at a rect, it advances the cursor to that rect's
-    // bottom -- and every control above is put INSIDE a band this function
-    // already allocated, so the last one moves the cursor BACKWARDS, from the
-    // strip's foot to the action row's. The body then opened flush against
-    // the header's hairline with its own 18pt top margin swallowed, which is
-    // visible in a picture and invisible in every rect assertion (the margin
-    // was applied; it was applied from the wrong place).
-    ui.advance_cursor_after_rect(strip);
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("send-detail")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    // **The first line, and 5c's own subject.** Replaced by
-                    // the confirmation's question while one is up rather than
-                    // joined to it, for the reason this screen's second line
-                    // has always been replaced: a pane that says both "1 view
-                    // left" and "Revoke this link for good?" is a pane whose
-                    // subject is ambiguous at the moment it matters most.
-                    if confirming {
-                        ui.label(
-                            theme::semibold(CONFIRM_PROMPT, ANSWER_LINE_PX).color(theme::ERROR),
-                        );
-                        ui.add_space(10.0);
-                        // **The destructive button, here rather than on the
-                        // action row.** Three things separate it from the
-                        // Cancel that now occupies Delete's pixels: a
-                        // different rectangle, a different row, and a
-                        // different container. It also sits directly under
-                        // the question it answers, which the old layout could
-                        // not manage -- and it is what lets the whole
-                        // confirmation fit at `MIN_VAULT_WINDOW_SIZE`, where
-                        // four controls on one 250pt row do not.
-                        //
-                        // **`theme::destructive_button`, the app's own solid
-                        // red.** It was a bare `egui::Button` with red text,
-                        // which is the same look Delete wears one step
-                        // earlier -- so the escalation from "are you sure?"
-                        // to "yes, destroy it" was carried entirely by the
-                        // wording. This module already spends the filled red
-                        // on exactly this meaning; see `destructive_button`,
-                        // whose own doc argues why the second step must not
-                        // be blue and must not be quiet.
-                        let confirmed = theme::destructive_button(ui, CONFIRM_LABEL).clicked();
-                        if confirmed && has_id {
-                            // Cancel wins if both somehow report in one
-                            // frame: the safe answer to an ambiguous frame on
-                            // a destructive control is not to destroy.
-                            if action != Some(SendUiAction::CancelDelete) {
-                                action = Some(SendUiAction::ConfirmDelete {
-                                    id: row.id.clone(),
-                                    name: row.name.clone(),
-                                });
-                            }
-                        }
-                        ui.add_space(14.0);
-                    }
-                    // **Design 5b's three cards.** The link; what went, when
-                    // this PC filed it; and what happened to it -- 5c's
-                    // answer line first, then the facts a Send keeps.
-                    if let Some(url) = draw_link_card(ui, row) {
-                        action = Some(SendUiAction::CopyLink(url));
-                    }
-                    if let Some(sent) = &row.sent {
-                        ui.add_space(CARD_STACK_GAP);
-                        draw_shared_card(ui, sent);
-                    }
-                    ui.add_space(CARD_STACK_GAP);
-                    draw_activity_card(ui, row);
-                    if false {
-                        // **5c's own treatment for 5c's own line.** 5c opens
-                        // "Whether it was used is the question people
-                        // actually have -- so it is the first line, not a log
-                        // entry", and it draws that line at `font-size: 14px;
-                        // font-weight: 700`. This pane drew it at 13px
-                        // Regular, which is the size and weight of a caption:
-                        // the biggest claim on the screen was typeset as the
-                        // smallest thing on it, sitting under a header and
-                        // above a card that both outweighed it. One step up
-                        // in size and one in weight is the whole change, and
-                        // it is what makes the eye land on the answer rather
-                        // than on the `LINK` slab below.
-                        ui.label(
-                            theme::semibold(row.activity.as_str(), ANSWER_LINE_PX)
-                                .color(theme::INK),
-                        );
-                    }
-                });
-        });
-
-    // Spec B §7: an opened Send that carried the password asks for it to be
-    // changed.
-    if password_was_seen(row) {
-        ui.add_space(14.0);
-        if let Some(item_id) = seen_password_warning(ui, row) {
-            action = Some(SendUiAction::ChangePassword(item_id));
-        }
-    }
-
-    action
-}
-
-/// The detail for one received record.
-///
-/// Two facts and no invented third. What a `ReceivedRow` knows is its name,
-/// when it arrived and whether the item it created survives -- see
-/// [`crate::receive_history`], which argues at length why it must not know
-/// the link it came from.
-fn draw_received_detail(ui: &mut egui::Ui, row: &ReceivedRow) {
-    let width = ui.available_width();
-    let strip_height = DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK;
-    let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
-    {
-        // A clone, so the tile can be drawn by a child `Ui` mid-block.
-        let p = ui.painter().clone();
-        let p = &p;
-        p.rect_filled(strip, CornerRadius::ZERO, theme::CARD);
-        p.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(strip.left(), strip.bottom() - 1.0),
-                egui::pos2(strip.right(), strip.bottom()),
-            ),
-            CornerRadius::ZERO,
-            theme::HAIRLINE,
-        );
-        let block_top = strip.top() + DETAIL_PAD_Y_F;
-        let tile = egui::Rect::from_min_size(
-            egui::pos2(
-                strip.left() + DETAIL_PAD_X_F,
-                block_top + (HEADER_BLOCK - HEADER_TILE) / 2.0,
-            ),
-            egui::Vec2::splat(HEADER_TILE),
-        );
-        paint_send_tile(ui, tile, RecordTiles::default(), None, &row.name, true, 1.0);
-        let text_left = tile.right() + ROW_TEXT_GAP;
-        let clip = p.with_clip_rect(
-            egui::Rect::from_min_max(
-                egui::pos2(text_left, strip.top()),
-                egui::pos2((strip.right() - DETAIL_PAD_X_F).max(text_left), strip.bottom()),
-            )
-            .intersect(ui.clip_rect()),
-        );
-        clip.text(
-            egui::pos2(text_left, block_top),
-            egui::Align2::LEFT_TOP,
-            &row.name,
-            egui::FontId::new(TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
-            theme::INK,
-        );
-        clip.text(
-            egui::pos2(text_left, block_top + TITLE_LINE + SUBTITLE_GAP + 8.0),
-            egui::Align2::LEFT_CENTER,
-            RECEIVED_KIND,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            theme::TEXT_FAINT,
-        );
-    }
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("received-detail")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    // The one derived fact, first and in words, for the same
-                    // reason a Send's activity sentence is first: a row that
-                    // silently points at nothing is the failure this screen
-                    // has to avoid.
-                    let (sentence, colour) = if row.still_in_vault {
-                        (RECEIVED_ITEM_PRESENT, theme::INK)
-                    } else {
-                        (RECEIVED_ITEM_GONE, theme::TEXT_MUTED)
-                    };
-                    // [`ANSWER_LINE_PX`], like the Send pane's own first
-                    // line: the two panes swap places in this column and a
-                    // reader should not be able to tell which one they are
-                    // looking at from the type alone.
-                    ui.label(theme::semibold(sentence, ANSWER_LINE_PX).color(colour));
-                    ui.add_space(14.0);
-                    let short = if row.still_in_vault { IN_VAULT_YES } else { IN_VAULT_NO };
-                    draw_fact_card(
-                        ui,
-                        RECEIVED_CARD_TITLE,
-                        None,
-                        &[(ARRIVED_ROW, CardValue::Plain(&row.when)), (IN_VAULT_ROW, CardValue::Plain(short))],
-                        // No caution band: a record somebody shared WITH this
-                        // user carries no claim about who else has seen it.
-                        // See [`draw_link_card`], where there is one.
-                        false,
-                    );
-                });
-        });
-}
-
-/// **A person share's own detail** (design 6c): 5b's pane with LINK and
-/// ACTIVITY replaced by PERSON and WHAT THEY SEE, and "its header keeps 5b's
-/// layout: Open record, then the red Stop sharing."
-///
-/// **Built from [`draw_send_card`]'s parts, not beside them**: the same strip,
-/// tile, 21px title and subtitle line with its pill; the same measured
-/// header that puts the controls on the title's line when they fit and under
-/// it when they do not; the same fact card. The two panes take turns in one
-/// column, and the owner compares them the way he compares the rows.
-///
-/// # Stop sharing is the app's two-step, and asks the window
-///
-/// Step one arms the question (`PeopleAsk::Stop`); the question stands over
-/// the cards with "Remove from their vault" under it, as a Send's revoke
-/// does; Cancel takes Stop sharing's own rectangle -- both labels are
-/// measured in every state, `action_labels`'s contract -- so a second rapid
-/// click where Stop sharing was lands on Cancel. Open record steps back while
-/// the question is up (6c's confirm caption). Nothing here stops anything:
-/// every press goes out through `people.asked`, and the window sends the one
-/// `SharingCall::Stop` the SHARING card sends too.
-///
-/// While the stop runs, the controls' row says so and holds no widget, the
-/// revoke's rule.
-///
-/// Open record is the Sent screen's own [`SendUiAction::OpenRecord`], with
-/// the id the view lists NOW -- so a record that came home under a new id is
-/// opened by that id, and one that has gone is left alone by the window.
-fn draw_share_detail(
-    ui: &mut egui::Ui,
-    share: &super::share_ui::ShareRow,
-    people: &mut super::share_ui::PeopleRows<'_>,
-    records: RecordTiles<'_>,
-) -> Option<SendUiAction> {
-    use super::share_ui::{self as sharing, PeopleAsk};
-    let mut action: Option<SendUiAction> = None;
-    let width = ui.available_width();
-    let key = share.key.as_str();
-    let stopping = people.stopping.as_deref() == Some(key);
-    let confirming = !stopping && people.confirming.as_deref() == Some(key);
-
-    // --- how the header is laid out, measured first (see `draw_send_card`) ---
-    let labels = [OPEN_RECORD_LABEL, sharing::STOP_LABEL];
-    let content = (width - DETAIL_PAD_X_F * 2.0).max(0.0);
-    let action_pad = action_pad_for(ui, &labels, content);
-    let actions_width = actions_total(ui, &labels, action_pad);
-    let inline = !stopping
-        && HEADER_TILE + ROW_TEXT_GAP + TITLE_MIN_ROOM + HEADER_ACTION_GAP + actions_width
-            <= content;
-    let strip_height = if inline {
-        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK
-    } else {
-        DETAIL_PAD_Y_F * 2.0 + HEADER_BLOCK + ACTION_ROW_GAP + theme::ACTION_BUTTON_HEIGHT
-    };
-    let (strip, _) = ui.allocate_exact_size(egui::vec2(width, strip_height), egui::Sense::hover());
-    {
-        let p = ui.painter().clone();
-        let p = &p;
-        p.rect_filled(strip, CornerRadius::ZERO, theme::CARD);
-        p.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(strip.left(), strip.bottom() - 1.0),
-                egui::pos2(strip.right(), strip.bottom()),
-            ),
-            CornerRadius::ZERO,
-            theme::HAIRLINE,
-        );
-        let block_top = strip.top() + DETAIL_PAD_Y_F;
-        let tile = egui::Rect::from_min_size(
-            egui::pos2(
-                strip.left() + DETAIL_PAD_X_F,
-                block_top + (HEADER_BLOCK - HEADER_TILE) / 2.0,
-            ),
-            egui::Vec2::splat(HEADER_TILE),
-        );
-        paint_send_tile(ui, tile, records, Some(&share.item_id), &share.name, true, 1.0);
-        let text_left = tile.right() + ROW_TEXT_GAP;
-        let text_right = strip.right()
-            - DETAIL_PAD_X_F
-            - if inline { actions_width + HEADER_ACTION_GAP } else { 0.0 };
-        let clip = p.with_clip_rect(
-            egui::Rect::from_min_max(
-                egui::pos2(text_left, strip.top()),
-                egui::pos2(text_right.max(text_left), strip.bottom()),
-            )
-            .intersect(ui.clip_rect()),
-        );
-        let title = elided(
-            &clip,
-            &share.name,
-            egui::FontId::new(TITLE_PX, egui::FontFamily::Name(theme::BOLD.into())),
-            theme::INK,
-            (text_right - text_left).max(0.0),
-        );
-        clip.galley(egui::pos2(text_left, block_top), title, theme::INK);
-        // 6c's `.dsub`: "Shared with a person", then the share pill -- where
-        // a Send's pane says what kind of Send it is and wears its state.
-        let sub_y = block_top + TITLE_LINE + SUBTITLE_GAP + theme::PILL_HEIGHT / 2.0;
-        let kind_rect = clip.text(
-            egui::pos2(text_left, sub_y),
-            egui::Align2::LEFT_CENTER,
-            sharing::SHARED_WITH_A_PERSON,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            theme::TEXT_FAINT,
-        );
-        theme::share_pill(&clip, egui::pos2(kind_rect.right() + STRIP_GAP, sub_y), share.pill());
-    }
-
-    // --- the actions ---
-    let action_y = if inline {
-        strip.top() + DETAIL_PAD_Y_F + (HEADER_BLOCK - theme::ACTION_BUTTON_HEIGHT) / 2.0
-    } else {
-        strip.top() + DETAIL_PAD_Y_F + HEADER_BLOCK + ACTION_ROW_GAP
-    };
-    let x0 = if inline { strip.right() - DETAIL_PAD_X_F - actions_width } else { strip.left() + DETAIL_PAD_X_F };
-    if stopping {
-        ui.painter().text(
-            egui::pos2(strip.left() + DETAIL_PAD_X_F, action_y + theme::ACTION_BUTTON_HEIGHT / 2.0),
-            egui::Align2::LEFT_CENTER,
-            sharing::STOPPING_LABEL,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-            theme::TEXT_MUTED,
-        );
-    } else {
-        let slot = |x: f32, label: &str| {
-            egui::Rect::from_min_size(
-                egui::pos2(x, action_y),
-                egui::vec2(theme::action_button_width(ui.painter(), label, action_pad), theme::ACTION_BUTTON_HEIGHT),
-            )
-        };
-        let open_rect = slot(x0, OPEN_RECORD_LABEL);
-        let stop_rect = slot(open_rect.right() + BUTTON_GAP, sharing::STOP_LABEL);
-        if !confirming
-            && theme::action_button(ui, open_rect, OPEN_RECORD_LABEL, theme::ActionTone::Secondary).clicked()
-        {
-            action = Some(SendUiAction::OpenRecord(share.item_id.clone()));
-        }
-        if confirming {
-            if theme::action_button(ui, stop_rect, sharing::CANCEL_BUTTON, theme::ActionTone::Secondary).clicked() {
-                people.asked = Some(PeopleAsk::CancelStop);
-            }
-        } else if theme::action_button(ui, stop_rect, sharing::STOP_LABEL, theme::ActionTone::Destructive)
-            .on_hover_text(sharing::STOP_HOVER)
-            .clicked()
-        {
-            people.asked = Some(PeopleAsk::Stop(key.to_string()));
-        }
-    }
-
-    // --- the body: the question, PERSON, WHAT THEY SEE, and a sentence ---
-    //
-    // The cursor goes back to the strip's foot first, for `draw_send_card`'s
-    // reason: every control above was put inside a band already allocated.
-    ui.advance_cursor_after_rect(strip);
-    egui::Frame::new()
-        .inner_margin(Margin::symmetric(DETAIL_PAD_X, DETAIL_PAD_Y))
-        .show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("share-detail")
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if confirming {
-                        ui.add(
-                            egui::Label::new(
-                                theme::semibold(sharing::stop_question(&share.name, &share.email), ANSWER_LINE_PX)
-                                    .color(theme::ERROR),
-                            )
-                            .wrap(),
-                        );
-                        ui.add_space(4.0);
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(sharing::STOP_HINT).size(11.0).color(theme::TEXT_FAINT))
-                                .wrap(),
-                        );
-                        ui.add_space(10.0);
-                        // Cancel wins an ambiguous frame, as on the revoke:
-                        // the safe answer on a destructive control is not to
-                        // destroy.
-                        if theme::destructive_button(ui, sharing::REMOVE_LABEL).clicked()
-                            && people.asked != Some(PeopleAsk::CancelStop)
-                        {
-                            people.asked = Some(PeopleAsk::ConfirmStop(key.to_string()));
-                        }
-                        ui.add_space(14.0);
-                    }
-                    let since = share.since.as_deref().unwrap_or(sharing::SINCE_UNKNOWN);
-                    // A person who holds the record has a copy that follows
-                    // the edits; one who does not yet (or any more) has no
-                    // copy, and the row says where they stand instead.
-                    let copy = if share.state == crate::rest::sharing::PersonState::Shared {
-                        (sharing::THEIR_COPY_ROW, CardValue::Plain(sharing::FOLLOWS_EDITS))
-                    } else {
-                        (sharing::STATUS_ROW, CardValue::Plain(share.state_words()))
-                    };
-                    draw_fact_card(
-                        ui,
-                        sharing::PERSON_CARD_TITLE,
-                        None,
-                        &[
-                            (sharing::SHARED_WITH_ROW, CardValue::Plain(&share.email)),
-                            (sharing::SINCE_ROW, CardValue::Plain(since)),
-                            (sharing::ACCESS_ROW, CardValue::Plain(sharing::VIEW_ONLY)),
-                            copy,
-                        ],
-                        false,
-                    );
-                    ui.add_space(CARD_STACK_GAP);
-                    draw_fact_card(
-                        ui,
-                        sharing::WHAT_THEY_SEE_TITLE,
-                        Some(sharing::WHOLE_RECORD),
-                        &[
-                            (sharing::CAN_ROW, CardValue::Plain(sharing::CAN_VALUE)),
-                            (sharing::CANNOT_ROW, CardValue::Plain(sharing::CANNOT_VALUE)),
-                        ],
-                        false,
-                    );
-                    // **At the foot**, for the SHARING card's reason: a
-                    // sentence arriving while the pointer is on "Remove from
-                    // their vault" must not push the button away. The
-                    // engine's sentence -- shown here, logged nowhere.
-                    if let Some(notice) = people.notice.as_deref() {
-                        ui.add_space(CARD_STACK_GAP);
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(notice).size(12.0).color(theme::ERROR)).wrap(),
-                        );
-                    }
-                });
-        });
-    action
-}
-
-/// What one row of a fact card shows in its value column.
-///
-/// An enum rather than three functions, because the three differ only in what
-/// goes in one rectangle and the rectangle is computed identically for all of
-/// them -- which is the property that keeps every card on this screen on one
-/// label column.
-enum CardValue<'a> {
-    /// Ordinary text.
-    Plain(&'a str),
-    /// A URL: monospace, and struck through with a marker beside it once the
-    /// link is dead. 5b draws exactly this.
-    Address { url: &'a str, dead: bool },
-    /// A count against a cap, with the design's 90x4 bar. `None` for a cap is
-    /// "as often as they like", which has no denominator and therefore no
-    /// bar: a full bar would say the opposite of what it means.
-    Views { used: u32, cap: Option<u32> },
-}
-
-/// Design 5b's `Link` card: everything about the link itself, one fact per
-/// row, on one label column.
-fn draw_link_card(ui: &mut egui::Ui, row: &SendRow) -> Option<String> {
-    let opens_with = if row.has_password { PASSWORD_SEGMENT } else { LINK_ONLY };
-    let address = if row.access_url.is_empty() {
-        CardValue::Plain(ADDRESS_MISSING)
-    } else {
-        CardValue::Address {
-            url: row.access_url.as_str(),
-            dead: !row.state.is_live(),
-        }
-    };
-    let mut rows = vec![(ADDRESS_ROW, address)];
-    if let Some(recipient) = row.sent.as_ref().map(|s| s.recipient.as_str()).filter(|r| !r.is_empty()) {
-        rows.push((RECIPIENT_ROW, CardValue::Plain(recipient)));
-    }
-    rows.push((OPENS_WITH_ROW, CardValue::Plain(opens_with)));
-    rows.push((VIEWS_ROW, CardValue::Views { used: row.access_count, cap: row.max_access_count }));
-    rows.push((EXPIRES_ROW, CardValue::Plain(row.expires.as_str())));
-    // **The address row's Copy is the only way to copy a link now** -- the
-    // header's `Copy link` gave way to design 5b's two buttons -- so it is
-    // drawn wherever the link still answers.
-    draw_fact_card(ui, LINK_CARD_TITLE, None, &rows, false)
-        .then(|| row.access_url.clone())
-        .filter(|url| !url.is_empty())
-}
-
-/// Design 5b's `WHAT WAS SHARED`: the fields that went, as pills, and a
-/// sentence naming what did not.
-fn draw_shared_card(ui: &mut egui::Ui, sent: &SentFacts) {
-    let width = ui.available_width();
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .stroke(egui::Stroke::new(1.0, theme::HAIRLINE))
-        .corner_radius(CornerRadius::same(CARD_RADIUS))
-        .show(ui, |ui| {
-            ui.set_width(width - 2.0);
-            let (header, _) =
-                ui.allocate_exact_size(egui::vec2(width - 2.0, CARD_HEADER_HEIGHT), egui::Sense::hover());
-            let eyebrow = ui.painter().layout_job(theme::letterspaced(
-                SHARED_CARD_TITLE,
-                theme::EYEBROW_PX,
-                theme::BOLD,
-                theme::EYEBROW_TRACKING,
-                theme::TEXT_MUTED,
-            ));
-            let eyebrow_height = eyebrow.size().y;
-            ui.painter().galley(
-                egui::pos2(header.left() + CARD_PAD_X, header.center().y - eyebrow_height / 2.0),
-                eyebrow,
-                theme::TEXT_MUTED,
-            );
-            ui.painter().rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(header.left(), header.bottom() - 1.0),
-                    header.right_bottom(),
-                ),
-                CornerRadius::ZERO,
-                theme::HAIRLINE,
-            );
-            egui::Frame::new()
-                .inner_margin(Margin::symmetric(CARD_PAD_X as i8, 12))
-                .show(ui, |ui| {
-                    ui.set_width(width - 2.0 - CARD_PAD_X * 2.0);
-                    let pills: Vec<(&str, bool)> =
-                        sent.fields.iter().map(|f| (f.as_str(), f == "Password")).collect();
-                    ui.horizontal_wrapped(|ui| {
-                        field_pills(ui, &pills);
-                        if let Some(rest) = not_included(&sent.fields) {
-                            ui.add_space(4.0);
-                            ui.label(egui::RichText::new(rest).size(12.0).color(theme::TEXT_FAINT));
-                        }
-                    });
-                });
-        });
-}
-
-/// Design 5b's `ACTIVITY`, from what a Send keeps: 5c's answer line, how many
-/// times it was opened, when it stops answering and when it goes -- with the
-/// caution band when somebody has opened it. There is no per-view timeline;
-/// a Bitwarden Send keeps a count and nothing about who or when.
-fn draw_activity_card(ui: &mut egui::Ui, row: &SendRow) {
-    draw_fact_card(
-        ui,
-        ACTIVITY_CARD_TITLE,
-        Some(row.activity.as_str()),
-        &[
-            (OPENED_ROW, CardValue::Views { used: row.access_count, cap: row.max_access_count }),
-            (EXPIRES_ROW, CardValue::Plain(row.expires.as_str())),
-            (DELETED_ROW, CardValue::Plain(row.deletes.as_str())),
-        ],
-        row.access_count > 0,
-    );
-}
-
-/// The gap between the detail pane's stacked cards.
-const CARD_STACK_GAP: f32 = 14.0;
-/// Above and below a card's lead line.
-const CARD_LEAD_PAD_Y: f32 = 12.0;
-
-/// One card: an eyebrow band over a run of label/value rows.
-///
-/// Painted into explicitly-allocated bands rather than built out of nested
-/// layouts, for this file's standing reason -- and because the label column
-/// has to be ONE width down the whole card, which a per-row layout can only
-/// achieve by every row agreeing to measure the same thing.
-/// `caution` adds design 5c's amber band along the card's bottom edge; see
-/// [`draw_link_card`], which is the one caller that ever passes `true`.
-fn draw_fact_card(
-    ui: &mut egui::Ui,
-    title: &str,
-    // A bold first line under the eyebrow -- 5c's answer, on the activity
-    // card -- or `None`.
-    lead: Option<&str>,
-    rows: &[(&str, CardValue<'_>)],
-    caution: bool,
-) -> bool {
-    let mut copied = false;
-    let width = ui.available_width();
-    // The band is LAID OUT before the card is allocated, for the list
-    // column's footnote's reason one screen over: its two lines wrap, so its
-    // height is a measurement and not a constant, and a card allocated to a
-    // guess would either crop the sentence or leave a gap under it.
-    let band = caution.then(|| caution_lines(ui, width));
-    let band_height = band.as_ref().map_or(0.0, |lines| caution_height(lines));
-    // **Wrapped, not elided**: the lead is 5c's answer, and an answer cut to
-    // "Opened 3 times. 7 views le..." at a narrow pane has lost its second
-    // half. Laid out before the card is allocated, for the caution band's
-    // reason: its height is a measurement.
-    let lead_galley = lead.map(|lead| {
-        ui.painter().layout(
-            lead.to_string(),
-            egui::FontId::new(ANSWER_LINE_PX - 1.0, egui::FontFamily::Name(theme::BOLD.into())),
-            theme::INK,
-            (width - CARD_PAD_X * 2.0).max(0.0),
-        )
-    });
-    let lead_height = lead_galley.as_ref().map_or(0.0, |g| g.size().y + CARD_LEAD_PAD_Y * 2.0);
-    let height =
-        CARD_HEADER_HEIGHT + lead_height + CARD_ROW_HEIGHT * rows.len() as f32 + band_height;
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
-    let p = ui.painter();
-    p.rect_filled(rect, CornerRadius::same(CARD_RADIUS), theme::CARD);
-    let header_bottom = rect.top() + CARD_HEADER_HEIGHT;
-    let eyebrow = p.layout_job(theme::letterspaced(
-        title,
-        theme::EYEBROW_PX,
-        theme::BOLD,
-        theme::EYEBROW_TRACKING,
-        theme::TEXT_MUTED,
-    ));
-    let eyebrow_height = eyebrow.size().y;
-    p.galley(
-        egui::pos2(
-            rect.left() + CARD_PAD_X,
-            rect.top() + (CARD_HEADER_HEIGHT - eyebrow_height) / 2.0,
-        ),
-        eyebrow,
-        theme::TEXT_MUTED,
-    );
-    p.rect_filled(
-        egui::Rect::from_min_max(
-            egui::pos2(rect.left(), header_bottom - 1.0),
-            egui::pos2(rect.right(), header_bottom),
-        ),
-        CornerRadius::ZERO,
-        theme::HAIRLINE,
-    );
-
-    // **One label column for the whole card, and it shrinks with the pane
-    // rather than pushing the value off it.** 5b's own 120 is a third of its
-    // card; at `MIN_VAULT_WINDOW_SIZE` this card is 250 wide, where a fixed
-    // 120 would leave 116 for an address. The clamp keeps it readable at both
-    // ends instead of picking one.
-    if let Some(galley) = lead_galley {
-        p.galley(
-            egui::pos2(rect.left() + CARD_PAD_X, header_bottom + CARD_LEAD_PAD_Y),
-            galley,
-            theme::INK,
-        );
-    }
-    let header_bottom = header_bottom + lead_height;
-    let label_width = (width * CARD_LABEL_SHARE).clamp(CARD_LABEL_MIN, CARD_LABEL_MAX);
-    let value_left = rect.left() + CARD_PAD_X + label_width + CARD_GAP;
-    let value_right = rect.right() - CARD_PAD_X;
-    let label_font = egui::FontId::new(12.0, egui::FontFamily::Proportional);
-    let value_font = egui::FontId::new(13.0, egui::FontFamily::Proportional);
-    for (index, (label, value)) in rows.iter().enumerate() {
-        let top = header_bottom + CARD_ROW_HEIGHT * index as f32;
-        let middle = top + CARD_ROW_HEIGHT / 2.0;
-        if index > 0 {
-            p.rect_filled(
-                egui::Rect::from_min_max(
-                    egui::pos2(rect.left() + CARD_PAD_X, top),
-                    egui::pos2(rect.right() - CARD_PAD_X, top + 1.0),
-                ),
-                CornerRadius::ZERO,
-                theme::CARD_TINT,
-            );
-        }
-        // Every run in this card is ELIDED to its own column rather than
-        // clipped by a rect. See `elided`: a clipped galley keeps its full
-        // width, so the pane looks identical whether it fits or not, and the
-        // reader is shown a string that has quietly lost its end.
-        let label_galley =
-            elided(p, label, label_font.clone(), theme::TEXT_FAINT, label_width);
-        p.galley(
-            egui::pos2(rect.left() + CARD_PAD_X, middle - label_galley.size().y / 2.0),
-            label_galley,
-            theme::TEXT_FAINT,
-        );
-        let cell = egui::Rect::from_min_max(
-            egui::pos2(value_left, top),
-            egui::pos2(value_right.max(value_left), top + CARD_ROW_HEIGHT),
-        );
-        let clip = p.with_clip_rect(cell.intersect(ui.clip_rect()));
-        match value {
-            CardValue::Plain(text) => {
-                let galley =
-                    elided(&clip, text, value_font.clone(), theme::INK, cell.width());
-                clip.galley(
-                    egui::pos2(cell.left(), middle - galley.size().y / 2.0),
-                    galley,
-                    theme::INK,
-                );
-            }
-            CardValue::Address { url, dead } => {
-                // The marker is placed FIRST and the address is clipped
-                // against it, so a long URL is cut off rather than run
-                // underneath the word that says it no longer works.
-                let mut right = cell.right();
-                if !*dead {
-                    // The link's own Copy, where it still answers.
-                    let marker = clip.text(
-                        egui::pos2(cell.right(), middle),
-                        egui::Align2::RIGHT_CENTER,
-                        COPY_MARKER,
-                        egui::FontId::new(12.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-                        theme::BLUE_DEEP,
-                    );
-                    let pressed = ui.interact(
-                        marker.expand(4.0),
-                        egui::Id::new("send-address-copy").with(*url),
-                        egui::Sense::click(),
-                    );
-                    if pressed.hovered() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    }
-                    copied = pressed.clicked();
-                    right = marker.left() - CARD_GAP;
-                }
-                if *dead {
-                    let marker = clip.text(
-                        egui::pos2(cell.right(), middle),
-                        egui::Align2::RIGHT_CENTER,
-                        DEAD_MARKER,
-                        egui::FontId::new(12.0, egui::FontFamily::Proportional),
-                        theme::TEXT_GHOST,
-                    );
-                    right = marker.left() - CARD_GAP;
-                }
-                let colour = if *dead { theme::TEXT_GHOST } else { theme::INK };
-                // **Elided with the design's own ellipsis, not clipped.** 5b
-                // prints `send.deskwarden.app/g7HqK2...`, and the difference
-                // matters more here than it would anywhere else on this
-                // screen: a URL cut off by a clip rect is a complete-looking
-                // address that is not the address, and the whole subject of
-                // this row is which link this is. The ellipsis says the
-                // reader is not seeing all of it; Copy link is what gets the
-                // rest.
-                let galley = elided(
-                    &clip,
-                    url,
-                    egui::FontId::new(12.0, egui::FontFamily::Monospace),
-                    colour,
-                    (right - cell.left()).max(0.0),
-                );
-                let size = galley.size();
-                let at = egui::pos2(cell.left(), middle - size.y / 2.0);
-                clip.galley(at, galley, colour);
-                if *dead {
-                    clip.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(at.x, middle - 0.5),
-                            egui::pos2(at.x + size.x, middle + 0.5),
-                        ),
-                        CornerRadius::ZERO,
-                        theme::TEXT_GHOST,
-                    );
-                }
-            }
-            CardValue::Views { used, cap } => {
-                let text = match cap {
-                    Some(cap) => format!("{used} of {cap}"),
-                    None if *used == 0 => NO_VIEW_LIMIT.to_string(),
-                    None => format!("{used} \u{00b7} {}", NO_VIEW_LIMIT.to_lowercase()),
-                };
-                let galley = elided(
-                    &clip,
-                    &text,
-                    egui::FontId::new(13.0, egui::FontFamily::Name(theme::BOLD.into())),
-                    theme::INK,
-                    cell.width(),
-                );
-                let size = galley.size();
-                let at = egui::pos2(cell.left(), middle - size.y / 2.0);
-                clip.galley(at, galley, theme::INK);
-                let drawn = egui::Rect::from_min_size(at, size);
-                // The bar only where there is a denominator to fill, and only
-                // where it fits. A bar squeezed to nothing at the minimum
-                // window size would be a rectangle that says a fraction it is
-                // too small to show.
-                if let Some(cap) = cap {
-                    let room = cell.right() - drawn.right() - CARD_GAP;
-                    if room >= VIEW_BAR_MIN {
-                        let bar_width = room.min(VIEW_BAR_WIDTH);
-                        let track = egui::Rect::from_min_size(
-                            egui::pos2(drawn.right() + CARD_GAP, middle - VIEW_BAR_HEIGHT / 2.0),
-                            egui::vec2(bar_width, VIEW_BAR_HEIGHT),
-                        );
-                        clip.rect_filled(track, CornerRadius::same(2), theme::HAIRLINE);
-                        // Saturating, and clamped: a server reporting more
-                        // opens than the cap must not paint a bar wider than
-                        // its own track.
-                        let fraction = if *cap == 0 {
-                            1.0
-                        } else {
-                            (f64::from(*used) / f64::from(*cap)).clamp(0.0, 1.0) as f32
-                        };
-                        clip.rect_filled(
-                            egui::Rect::from_min_size(
-                                track.min,
-                                egui::vec2(track.width() * fraction, VIEW_BAR_HEIGHT),
-                            ),
-                            CornerRadius::same(2),
-                            theme::BLUE,
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    // --- design 5c's caution band, along the card's bottom edge ----------
-    if let Some(lines) = band {
-        let top = header_bottom + CARD_ROW_HEIGHT * rows.len() as f32;
-        let band_rect =
-            egui::Rect::from_min_max(egui::pos2(rect.left(), top), rect.right_bottom());
-        // Only the BOTTOM corners are rounded: this band is the foot of the
-        // card, not a card of its own, and a fully rounded tint inside a
-        // rounded card leaves two crescents of white in the corners.
-        p.rect_filled(
-            band_rect,
-            CornerRadius { nw: 0, ne: 0, sw: CARD_RADIUS, se: CARD_RADIUS },
-            theme::CAUTION_WASH,
-        );
-        p.rect_filled(
-            egui::Rect::from_min_max(
-                egui::pos2(rect.left(), top),
-                egui::pos2(rect.right(), top + 1.0),
-            ),
-            CornerRadius::ZERO,
-            theme::HAIRLINE,
-        );
-        // 5c's `width: 15; height: 15` triangle, through the theme's own
-        // glyph rather than a second drawing of one.
-        theme::paint_warning_glyph(
-            p,
-            egui::Rect::from_min_size(
-                egui::pos2(band_rect.left() + CARD_PAD_X, top + CAUTION_PAD_Y + 1.0),
-                egui::Vec2::splat(CAUTION_GLYPH),
-            ),
-            theme::CAUTION_MARK,
-        );
-        let mut y = top + CAUTION_PAD_Y;
-        let x = band_rect.left() + CARD_PAD_X + CAUTION_GLYPH + CAUTION_GLYPH_GAP;
-        for line in lines {
-            let height = line.size().y;
-            p.galley(egui::pos2(x, y), line, theme::CAUTION_INK);
-            y += height + CAUTION_LINE_GAP;
-        }
-    }
-
-    // **The border last, over everything.** It used to be stroked straight
-    // after the fill, which was fine while nothing else reached the card's
-    // edge; the caution band does, and a band painted over its own card's
-    // outline is a tint that runs off the rounded corner.
-    p.rect_stroke(
-        rect,
-        CornerRadius::same(CARD_RADIUS),
-        egui::Stroke::new(1.0, theme::HAIRLINE),
-        egui::StrokeKind::Inside,
-    );
-    copied
-}
-
-/// Design 5c's caution band, laid out to `width`.
-///
-/// Separate from the drawing for the reason every measurement on this screen
-/// is: the card that holds the band has to be allocated at its full height
-/// before anything is painted into it, and these two lines WRAP -- at 298pt
-/// the detail column leaves them about 190pt, which is three lines rather
-/// than two.
-fn caution_lines(ui: &egui::Ui, width: f32) -> Vec<std::sync::Arc<egui::Galley>> {
-    let text_width =
-        (width - CARD_PAD_X * 2.0 - CAUTION_GLYPH - CAUTION_GLYPH_GAP).max(1.0);
-    let p = ui.painter();
-    vec![
-        p.layout(
-            CAUTION_HEADLINE.to_string(),
-            egui::FontId::new(CAUTION_PX, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-            theme::CAUTION_INK,
-            text_width,
-        ),
-        p.layout(
-            CAUTION_ADVICE.to_string(),
-            egui::FontId::new(CAUTION_PX, egui::FontFamily::Proportional),
-            theme::CAUTION_INK,
-            text_width,
-        ),
-    ]
-}
-
-/// How tall the band those lines go in has to be.
-fn caution_height(lines: &[std::sync::Arc<egui::Galley>]) -> f32 {
-    let text: f32 = lines.iter().map(|g| g.size().y).sum::<f32>()
-        + CAUTION_LINE_GAP * (lines.len().saturating_sub(1)) as f32;
-    // The glyph is never the taller of the two, but saying so out loud costs
-    // nothing and is what stops a one-line band cropping its own icon.
-    CAUTION_PAD_Y * 2.0 + text.max(CAUTION_GLYPH)
 }
 
 /// One line of `text` laid out to fit `max_width`, with an ellipsis where it
@@ -4084,46 +1800,6 @@ fn elided(
         overflow_character: Some('\u{2026}'),
     };
     painter.layout_job(job)
-}
-
-/// The **slots** the detail header's action row occupies, in the order it
-/// draws them.
-///
-/// **Its own function, because the row's WIDTH has to be known before the
-/// strip that holds the row is allocated**, and the labels are what the width
-/// is measured from. It is the same reserve-then-fill discipline every cell
-/// on this screen follows, one level further out: here the thing being
-/// reserved is not a slot but the shape of the whole header -- see
-/// `draw_send_card` on why the actions sit on the title's line when they fit
-/// and under it when they do not.
-///
-/// # It measures three slots always, and that is the whole contract
-///
-/// Two of the three are sometimes not DRAWN -- the switch leaves while a
-/// confirmation is up or when the Send has no id, and Delete is replaced by
-/// Cancel -- and the row still reserves every one of them. That rule is not
-/// new and it is not cosmetic: the mis-click defence on this screen is that a
-/// second rapid click where Delete was lands on **Cancel**, which is true
-/// only while those two rectangles are equal, and equal rectangles require an
-/// equal row width on both frames.
-///
-/// So this returns the same three widths in every state, measured from
-/// `REVOKE_LABEL` rather than from whichever of Delete/Cancel is showing.
-/// Returning only the visible labels is a real bug and was briefly written:
-/// it moved the right-aligned row's origin between the two frames and pushed
-/// Cancel clean off the pane.
-fn action_labels(row: &SendRow) -> Vec<&'static str> {
-    // Design 5b's header: `Open record` beside a red `Revoke`, and `Open
-    // record` only where there is a record to open.
-    let mut labels = Vec::with_capacity(3);
-    if row.sent.is_some() {
-        labels.push(OPEN_RECORD_LABEL);
-    }
-    if row.extendable {
-        labels.push(EXTEND_LABEL);
-    }
-    labels.push(REVOKE_LABEL);
-    labels
 }
 
 /// Design 5b's `Extend`: the Send's dates, `send::EXTEND_BY_DAYS` later.
@@ -4173,128 +1849,6 @@ pub fn not_included(fields: &[String]) -> Option<String> {
     }
 }
 
-/// What a row of `labels` occupies at `pad`, gaps included.
-fn actions_total(ui: &egui::Ui, labels: &[&str], pad: f32) -> f32 {
-    if labels.is_empty() {
-        return 0.0;
-    }
-    let sum: f32 =
-        labels.iter().map(|l| theme::action_button_width(ui.painter(), l, pad)).sum();
-    sum + BUTTON_GAP * (labels.len() - 1) as f32
-}
-
-/// The widest padding at which this row of controls still fits `room`.
-///
-/// **Padding is the first thing given up, and the only thing**, which is
-/// `theme::action_button_width`'s own argument applied here: the detail
-/// column is 250pt of content at `MIN_VAULT_WINDOW_SIZE`, three controls at
-/// 5b's `padding: 0 14px` come to 258, and something has to go. Shrinking a
-/// LABEL hides what the control does. Shrinking the HEIGHT would make these
-/// a different component from the identical controls on a wider window, which
-/// is precisely the drift this screen is being repaired for. Shrinking the
-/// padding leaves a button that is visibly the same button, slightly tighter
-/// -- and only on the window sizes that cannot hold the comfortable one.
-///
-/// The floor is returned even when it does not fit, because a row that does
-/// not fit must still be drawn at its smallest rather than vanish: this pane
-/// has no narrower window to fall back to, and a missing Delete is worse than
-/// a cramped one. Nothing is painted outside the pane either way -- the
-/// labels are laid out inside their own rects.
-fn action_pad_for(ui: &egui::Ui, labels: &[&str], room: f32) -> f32 {
-    const LADDER: [f32; 4] = [theme::ACTION_BUTTON_PAD_X, 12.0, 10.0, ACTION_PAD_FLOOR];
-    for pad in LADDER {
-        if actions_total(ui, labels, pad) <= room {
-            return pad;
-        }
-    }
-    ACTION_PAD_FLOOR
-}
-
-/// The tightest an action button is ever drawn; see [`action_pad_for`].
-const ACTION_PAD_FLOOR: f32 = 8.0;
-
-/// Design 5b's `padding: 18px 24px` on the detail pane's header strip and on
-/// its body.
-///
-/// `i8` because that is what `egui::Margin`'s fields are; the painted
-/// geometry wants the `f32`, so both spellings are here and derived from one
-/// another rather than written twice.
-const DETAIL_PAD_X: i8 = 24;
-const DETAIL_PAD_Y: i8 = 18;
-const DETAIL_PAD_X_F: f32 = DETAIL_PAD_X as f32;
-const DETAIL_PAD_Y_F: f32 = DETAIL_PAD_Y as f32;
-/// The header's initials tile: 5b's `width: 42px; height: 42px`.
-const HEADER_TILE: f32 = 42.0;
-/// The title's own line box at [`TITLE_PX`], and the gap under it before the
-/// subtitle -- 5b's `gap: 4px` on the header's text column.
-const TITLE_PX: f32 = 21.0;
-const TITLE_LINE: f32 = 26.0;
-const SUBTITLE_GAP: f32 = 4.0;
-/// The header's text block: a title line, the gap, and a pill. The tile is
-/// centred on it, which is why the block and not the tile is the height the
-/// strip is built from -- at 42 the tile is shorter than its own text column,
-/// and hanging the column off the tile is what left one of them floating in
-/// the item detail's header before this window learnt the lesson.
-const HEADER_BLOCK: f32 = TITLE_LINE + SUBTITLE_GAP + theme::PILL_HEIGHT;
-/// The gap between the header's text block and the action row under it, on
-/// the windows too narrow to put the actions on the title's own line.
-const ACTION_ROW_GAP: f32 = 12.0;
-/// 5b's `gap: 14px` between the header's text column and the controls at its
-/// right edge.
-const HEADER_ACTION_GAP: f32 = 14.0;
-/// The narrowest run the title may be left with before the actions are moved
-/// off its line and onto their own.
-///
-/// **160 is roughly twenty characters at [`TITLE_PX`]**, which is where a
-/// name stops being a name and becomes an ellipsis with a hint in front of
-/// it. The number is a judgement and is written here rather than inlined so
-/// it can be argued with: below it, 5b's one-band header is worse than the
-/// two-row arrangement it replaces, because the whole point of that band is
-/// that the thing on the left is identifiable.
-const TITLE_MIN_ROOM: f32 = 160.0;
-
-/// The size and weight of the **one sentence** each detail pane opens with --
-/// a Send's activity, a received record's whereabouts, and the destructive
-/// confirmation that replaces the first of them.
-///
-/// 5c's own `font-size: 14px; font-weight: 700` for the line it argues is the
-/// question people actually have. Named, and shared by the three, because
-/// they occupy the same slot in the same column and a reader should not be
-/// able to tell which pane they are looking at from the type alone. It is
-/// [`theme::semibold`] rather than 5c's 700 for the reason every heading in
-/// this app is: 700 is the weight this design system spends on a SELECTED
-/// row's name and on a pill, and a sentence in it would outweigh the header
-/// above it.
-const ANSWER_LINE_PX: f32 = 14.0;
-
-/// Card geometry, measured as a border box from 5b's own CSS.
-///
-/// The header declares `padding: 11px 16px` on a 12px line (~15pt box) inside
-/// a 1px border: 1 + 11 + 15 + 11 = 38. A row declares `padding: 13px 16px`
-/// on a 13px line (~16pt box): 13 + 16 + 13 = 42. **The page is content-box**,
-/// so the padding does not eat the line and the border is extra -- which is
-/// the arithmetic this screen has been re-measured for before.
-const CARD_HEADER_HEIGHT: f32 = 38.0;
-const CARD_ROW_HEIGHT: f32 = 42.0;
-const CARD_PAD_X: f32 = 16.0;
-const CARD_RADIUS: u8 = 10;
-/// 5b's `gap: 14px` between a card row's label and its value.
-const CARD_GAP: f32 = 14.0;
-/// The label column: 5b's 120 on a 470pt card is just over a quarter, and
-/// this pane is 250 wide at the app's minimum. See [`draw_fact_card`].
-const CARD_LABEL_SHARE: f32 = 0.30;
-const CARD_LABEL_MIN: f32 = 68.0;
-const CARD_LABEL_MAX: f32 = 120.0;
-/// Design 5c's caution band: `padding: 13px 16px`, a 15px warning triangle
-/// with the design's `gap: 9px` beside it, two 12px lines `gap: 6px` apart.
-/// The horizontal padding is [`CARD_PAD_X`], because the band is a foot of
-/// the card and its text has to stand on the same column as the labels above.
-const CAUTION_PAD_Y: f32 = 13.0;
-const CAUTION_GLYPH: f32 = 15.0;
-const CAUTION_GLYPH_GAP: f32 = 9.0;
-const CAUTION_LINE_GAP: f32 = 6.0;
-const CAUTION_PX: f32 = 12.0;
-
 /// What design 5c's band says, in the one form this client can support.
 ///
 /// **5c says "This password has been seen by someone else" and this cannot**,
@@ -4307,12 +1861,6 @@ const CAUTION_PX: f32 = 12.0;
 pub const CAUTION_HEADLINE: &str = "Somebody has opened this link.";
 pub const CAUTION_ADVICE: &str =
     "Treat whatever it held as known to them. If it was a password, change it.";
-
-/// 5b's view meter: `width: 90px; height: 4px; border-radius: 2px`.
-const VIEW_BAR_WIDTH: f32 = 90.0;
-const VIEW_BAR_HEIGHT: f32 = 4.0;
-/// Below this there is no bar at all; see [`draw_fact_card`].
-const VIEW_BAR_MIN: f32 = 32.0;
 
 /// The detail header's subtitle: what kind of Send this is. 5b's slot for
 /// "Send - created ...", carrying the one half of that this client holds.
@@ -6295,6 +3843,12 @@ mod paint_tests {
         /// Every textured rectangle -- a favicon is the only picture this
         /// screen paints, and it paints no string and no plain fill.
         images: Vec<egui::Rect>,
+        /// Runs painted with a line through them.
+        struck: Vec<String>,
+        /// Where in `text_rects` the Send detail modal's own words begin: the
+        /// scrim is painted after the page and before the dialog, so what
+        /// follows it is the modal's. `None` when no modal was up.
+        dialog_from: Option<usize>,
     }
 
     impl Painted {
@@ -6331,28 +3885,52 @@ mod paint_tests {
             self.rects_of_exact(label).len()
         }
 
-        /// Runs of exactly `label` painted in the LIST column, and in the
-        /// DETAIL pane, told apart by which side of `LIST_WIDTH` they fall.
+        /// Runs of exactly `label` painted on the PAGE (the cards), and in
+        /// the Send detail MODAL over it, told apart by where the scrim fell
+        /// in the paint order.
         ///
-        /// **The two columns draw some of the same words** -- 5b puts the
-        /// state pill in the list and again in the detail header -- so a
-        /// whole-pane count can no longer say where a thing is. These are
-        /// what the layout assertions ask instead, and they are more precise
-        /// than the counts they replaced rather than less: "the pill is in
-        /// the list" and "the pill is in the detail" are two claims where
-        /// there used to be one.
+        /// **The page and the modal draw some of the same words** -- a card
+        /// and the modal of the same Send both carry its pill -- so a
+        /// whole-screen count cannot say where a thing is. "The pill is on
+        /// the card" and "the pill is on the modal" are two claims.
         fn in_list(&self, label: &str) -> usize {
-            self.rects_of_exact(label)
-                .iter()
-                .filter(|r| r.center().x < crate::vault_window::LIST_WIDTH)
-                .count()
+            let end = self.dialog_from.unwrap_or(self.text_rects.len());
+            self.text_rects[..end].iter().filter(|(t, _)| t == label).count()
         }
 
         fn in_detail(&self, label: &str) -> usize {
-            self.rects_of_exact(label)
-                .iter()
-                .filter(|r| r.center().x >= crate::vault_window::LIST_WIDTH)
-                .count()
+            let from = self.dialog_from.unwrap_or(self.text_rects.len());
+            self.text_rects[from..].iter().filter(|(t, _)| t == label).count()
+        }
+
+        /// Every run the modal painted.
+        fn dialog_text_rects(&self) -> impl Iterator<Item = &(String, egui::Rect)> {
+            let from = self.dialog_from.unwrap_or(self.text_rects.len());
+            self.text_rects[from..].iter()
+        }
+
+        /// The rect of the modal's run of exactly `label`.
+        fn dialog_rect_of(&self, label: &str) -> egui::Rect {
+            self.dialog_text_rects()
+                .find(|(t, _)| t == label)
+                .map(|(_, r)| *r)
+                .unwrap_or_else(|| panic!("{label:?} was not painted in the modal: {:?}", self.text))
+        }
+
+        /// Where a click on `label` lands: the modal's runs when it has any
+        /// (the scrim is over the page), the page's otherwise.
+        fn rects_clickable(&self, label: &str) -> Vec<egui::Rect> {
+            let modal: Vec<egui::Rect> =
+                self.dialog_text_rects().filter(|(t, _)| t == label).map(|(_, r)| *r).collect();
+            if modal.is_empty() {
+                self.text_rects[..self.dialog_from.unwrap_or(self.text_rects.len())]
+                    .iter()
+                    .filter(|(t, _)| t == label)
+                    .map(|(_, r)| *r)
+                    .collect()
+            } else {
+                modal
+            }
         }
 
         /// The **smallest** filled rectangle containing `inner`, and its fill
@@ -6384,11 +3962,24 @@ mod paint_tests {
     fn collect(shape: &egui::Shape, out: &mut Painted) {
         match shape {
             egui::Shape::Text(text) => {
+                if text.galley.job.sections.iter().any(|s| s.format.strikethrough.width > 0.0) {
+                    out.struck.push(text.galley.text().to_owned());
+                }
                 out.text.push(text.galley.text().to_owned());
                 out.text_rects
                     .push((text.galley.text().to_owned(), text.visual_bounding_rect()));
             }
             egui::Shape::Rect(rect) => {
+                // The scrim: a window-sized rectangle in the dialog's blue-grey
+                // at some strength up to its own (it fades in, so the first
+                // frames are fainter than `modal::SCRIM`).
+                let scrim = rect.rect.min == egui::Pos2::ZERO
+                    && rect.rect.width() >= 600.0
+                    && rect.fill.a() > 0
+                    && rect.fill.a() <= crate::kit::modal::SCRIM.a();
+                if scrim && out.dialog_from.is_none() {
+                    out.dialog_from = Some(out.text_rects.len());
+                }
                 out.rects.push(rect.rect);
                 out.fills.push((rect.rect, rect.fill));
                 out.strokes.push((rect.rect, rect.stroke.color));
@@ -6403,6 +3994,20 @@ mod paint_tests {
             }
             _ => {}
         }
+    }
+
+    /// Runs `f` for three frames and answers the last one's output. **A
+    /// dialog's card is an anchored `Area`, invisible on its first pass**, so
+    /// a harness that draws once never sees the modal the page opened.
+    fn warm_run(
+        ctx: &egui::Context,
+        input: impl Fn() -> egui::RawInput,
+        mut f: impl FnMut(&mut egui::Ui),
+    ) -> egui::FullOutput {
+        for _ in 0..2 {
+            let _ = ctx.run_ui(input(), |ui| f(ui));
+        }
+        ctx.run_ui(input(), |ui| f(ui))
     }
 
     /// Runs `draw_send_pane` in a pane of `size` and returns everything it
@@ -6464,7 +4069,7 @@ mod paint_tests {
 
         let mut selected = picked;
         let mut action = SendUiAction::None;
-        let output = ctx.run_ui(input(), |ui| {
+        let output = warm_run(&ctx, input, |ui| {
             action = draw_send_pane(ui, state, notice, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
 
@@ -6627,7 +4232,7 @@ mod paint_tests {
     fn access_cards() -> [(&'static str, egui::Vec2); 2] {
         [
             ("the roomy card", ROOMY_ACCESS_CARD),
-            ("the narrowest card", egui::vec2(min_detail_width() - DETAIL_PAD_X_F * 2.0, 1600.0)),
+            ("the narrowest card", egui::vec2(min_detail_width() - 48.0, 1600.0)),
         ]
     }
 
@@ -7104,78 +4709,6 @@ mod paint_tests {
         pane_state(Some(&Ok(vec![send])), &FixedClock(NOW), &UTC)
     }
 
-    /// **Every one of design §5c's four states paints its own pill, in its
-    /// own ground, at the design's size.**
-    ///
-    /// Measured rather than merely found, for this module's stated reason: a
-    /// label at zero size satisfies "the word is on screen" and is invisible.
-    /// So each case reads the filled rectangle BEHIND the word -- which is
-    /// the pill itself -- and checks its height, its fill and that it is
-    /// wider than the word it wraps.
-    #[test]
-    fn each_state_paints_the_designs_own_pill_and_not_the_toolbar_readout() {
-        use crate::send::SendState;
-        for state in [
-            SendState::Waiting,
-            SendState::Used,
-            SendState::Expired,
-            SendState::Revoked,
-        ] {
-            let word = state_label(state);
-            let tone = state_tone(state);
-            let (painted, _) = paint(&one_row(state), None, min_pane_size());
-            // **Twice, and that is 5b's own arrangement**: the pill is in the
-            // list row and again in the detail header of the Send that row
-            // describes. Asserted as one in each column rather than as "two
-            // somewhere", so a pane that drew both in the same place would
-            // fail here instead of passing a total.
-            assert_eq!(
-                painted.in_list(word),
-                1,
-                "{state:?} painted its word {} times in the list column, not once: {:?}",
-                painted.in_list(word),
-                painted.text
-            );
-            assert_eq!(
-                painted.in_detail(word),
-                1,
-                "{state:?} is not on the pill in its own detail header: {:?}",
-                painted.text
-            );
-            let (rect, fill) = painted.control_under(word);
-            assert_eq!(
-                fill, tone.fill,
-                "the {state:?} pill is filled {fill:?}, not the design's {:?}",
-                tone.fill
-            );
-            assert!(
-                (rect.height() - theme::PILL_HEIGHT).abs() < 0.51,
-                "the {state:?} pill is {} tall, not the design's {}. The design declares \
-                 `padding: 3px 8px` inside a `1px` border on a content-box page, so the box \
-                 is the line plus six plus two -- writing the padding sum alone is the \
-                 measurement slip this screen keeps being re-measured for",
-                rect.height(),
-                theme::PILL_HEIGHT
-            );
-            let word_rect = painted.rect_of(word).expect("the word was counted above");
-            assert!(
-                rect.width() > word_rect.width() + theme::PILL_PAD_X,
-                "the {state:?} pill is {} wide around a {} word -- it is not wrapping it",
-                rect.width(),
-                word_rect.width()
-            );
-            // **And it is not `theme::status_pill`.** That widget is 28 tall
-            // and unfilled; either property alone would be a pill the design
-            // does not have.
-            assert_ne!(
-                fill,
-                egui::Color32::TRANSPARENT,
-                "the {state:?} pill has no ground, which is `status_pill`'s treatment and not \
-                 this one's"
-            );
-        }
-    }
-
     /// **`Used` is the only state with a mark that is not a dot, and two of
     /// the four have no mark at all.**
     ///
@@ -7208,161 +4741,6 @@ mod paint_tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), 4, "two states are drawn with the same word: {words:?}");
-    }
-
-    /// **The pill is at the row's own right edge, clear of the words, and
-    /// still inside the pane at the minimum window size.**
-    ///
-    /// # This test replaces a departure rather than restating it
-    ///
-    /// Its ancestor asserted the opposite arrangement -- the pill LEADING the
-    /// second line, with the expiry after it -- and its doc said so: "the one
-    /// place this screen departs from 5b, which right-aligns the pill". That
-    /// departure had one argument and it was entirely about controls: Copy
-    /// link and Delete owned this row's right edge, and a pill placed in that
-    /// column would be pushed off the pane at `MIN_VAULT_WINDOW_SIZE` or
-    /// would move every time the row changed mode.
-    ///
-    /// 5b puts those controls in the detail pane, this screen now has one,
-    /// and the row has no controls at all -- so the argument is spent and the
-    /// design's own placement is taken. What is pinned here is the property
-    /// the departure was protecting, at the design's geometry: the pill is
-    /// right-aligned, it does not collide with the words, and the column it
-    /// sits in is not one a narrow window can push it out of.
-    #[test]
-    fn the_row_puts_its_pill_at_its_own_right_edge() {
-        let state = one_row(crate::send::SendState::Waiting);
-        let size = min_pane_size();
-        let (painted, _) = paint(&state, None, size);
-        let (pill, _) = painted.control_under(WAITING_LABEL);
-        // The LIST column's copy of the name -- it is painted again in the
-        // detail header, and the pill this test is about is the row's.
-        let name = *painted
-            .rects_of_exact("SAP Production")
-            .iter()
-            .find(|r| r.center().x < crate::vault_window::LIST_WIDTH)
-            .expect("the row painted no name at all, so there is nothing for the pill to clear");
-        assert!(
-            pill.left() >= name.right(),
-            "the name ends at {} and the pill starts at {} -- they overlap",
-            name.right(),
-            pill.left()
-        );
-        // Right-aligned: the pill's right edge sits exactly one `ROW_PAD_X`
-        // in from the row's own right edge.
-        //
-        // **Measured off the row's painted card, not off a chain of
-        // constants.** `LIST_WIDTH` minus this padding minus that one is
-        // arithmetic a test can get right while the pane gets it wrong -- and
-        // it did: the panel keeps a hairline of its own, so the row is 10pt
-        // narrower than the constants predict. What the design actually says
-        // is "the pill is `padding` in from the row", and that is a statement
-        // about the row.
-        let card = painted
-            .fills
-            .iter()
-            .filter(|(rect, fill)| {
-                *fill == theme::CARD
-                    && (rect.height() - ROW_HEIGHT).abs() < 0.51
-                    && rect.center().x < crate::vault_window::LIST_WIDTH
-            })
-            .map(|(rect, _)| *rect)
-            .next()
-            .expect("the list column painted no row card at all");
-        assert!(
-            (card.right() - pill.right() - ROW_PAD_X).abs() < 2.0,
-            "the pill ends at {} on a row that ends at {} -- that is {}pt of padding, not the \
-             design's {ROW_PAD_X}",
-            pill.right(),
-            card.right(),
-            card.right() - pill.right()
-        );
-        // ...and it is inside the pane at the floor, which is the assertion
-        // the old left-leading placement was bought to guarantee.
-        assert!(
-            pill.right() <= size.x,
-            "the pill ends at {} on a {}pt pane -- it is off the screen",
-            pill.right(),
-            size.x
-        );
-    }
-
-    /// **The pill STAYS while the row's own revoke runs, and the subtitle is
-    /// what changes.**
-    ///
-    /// Its ancestor asserted the opposite -- that the pill left while the row
-    /// was confirming or working -- because the confirmation used to be ON
-    /// the row, and a row saying "Revoke this link for good?" and "Waiting"
-    /// at once had two subjects. The confirmation is in the detail pane now,
-    /// so the row has no second subject to be ambiguous with, and hiding the
-    /// state of a Send at the moment it is being destroyed would remove the
-    /// one thing that tells the user which row they are losing.
-    ///
-    /// What is unchanged is the rule underneath: the row's second line is
-    /// REPLACED rather than joined. `DELETING_LABEL` takes the subtitle's
-    /// place, and the expiry is not printed beside it.
-    #[test]
-    fn the_row_keeps_its_pill_while_its_own_revoke_runs() {
-        let state = one_row(crate::send::SendState::Waiting);
-        // Control: the resting row has its pill and its subtitle.
-        let (resting, _) = paint(&state, None, min_pane_size());
-        assert_eq!(resting.in_list(WAITING_LABEL), 1, "control: the resting row has no pill");
-        assert!(!resting.has(DELETING_LABEL), "control: a resting row says it is being revoked");
-
-        let revoking = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: false };
-        let (painted, _) = paint_with(&state, None, min_pane_size(), revoking);
-        assert_eq!(
-            painted.in_list(WAITING_LABEL),
-            1,
-            "the row lost the pill that says which Send is being revoked: {:?}",
-            painted.text
-        );
-        assert!(
-            painted.has(DELETING_LABEL),
-            "the row does not say a revoke is running: {:?}",
-            painted.text
-        );
-        assert!(
-            !painted.has("Expires in"),
-            "the row printed its expiry BESIDE the progress word rather than instead of it: \
-             {:?}",
-            painted.text
-        );
-    }
-
-    /// **The `FILE` tag is explained, and only where there is one.**
-    ///
-    /// A three-letter tag beside a name says a row is different and not how,
-    /// and the difference that matters is that the row's two buttons still
-    /// work. The control is on the second half: a list of text Sends must NOT
-    /// carry the sentence, or this test would pass over a pane that printed
-    /// it unconditionally and told every user about a restriction they had
-    /// not met.
-    #[test]
-    fn a_file_send_in_the_list_is_explained_and_a_list_without_one_is_not() {
-        let with_a_file = SendPaneState::Rows(vec![
-            summary_row("a text Send", false),
-            summary_row("report.pdf", true),
-        ]);
-        let (painted, _) = paint(&with_a_file, None, min_pane_size());
-        assert!(
-            painted.has(FILE_SEND_EXPLANATION),
-            "a file Send was listed with nothing saying what its tag means: {:?}",
-            painted.text
-        );
-        // The control: the tag itself is there too, so the sentence is
-        // explaining something the user can actually see.
-        assert!(painted.has(FILE_TAG), "the row carried no FILE tag to explain");
-
-        let text_only = SendPaneState::Rows(vec![summary_row("a text Send", false)]);
-        let (painted, _) = paint(&text_only, None, min_pane_size());
-        assert!(
-            !painted.has(FILE_SEND_EXPLANATION),
-            "a list of text Sends was told about a restriction it has not met"
-        );
-        // The control for THAT: the pane really painted, so the absence above
-        // is about this sentence and not about an empty screen.
-        assert!(painted.has(SCOPE_SUBTEXT), "nothing was painted at all: {:?}", painted.text);
     }
 
     /// A `SendRow` for the two assertions above.
@@ -7420,102 +4798,6 @@ mod paint_tests {
             !RECEIVE_NEEDS_THE_CLI.contains("file"),
             "the receive sentence has picked up the file restriction"
         );
-    }
-
-    /// The subtext is on screen at the minimum window size. It is the whole
-    /// of what makes the excluded scope honest, and a line that only appears
-    /// on a wide window is a line most users never read.
-    #[test]
-    fn the_scope_subtext_is_painted_at_the_minimum_window_size() {
-        let (painted, _) = paint(&rows(3), None, min_pane_size());
-        assert!(painted.has(SCOPE_SUBTEXT), "the scope line was not painted: {:?}", painted.text);
-        let rect = painted.rect_of(SCOPE_SUBTEXT).expect("no rect for the scope line");
-        assert!(rect.width() > 1.0 && rect.height() > 1.0, "the scope line was drawn at {rect:?}");
-    }
-
-    /// **Six rows, not two, and every one of them can be picked into a
-    /// detail pane whose three controls all fit at the minimum window size.**
-    ///
-    /// # What this asserts now, and why it is the same property
-    ///
-    /// Its ancestor counted six Copy link buttons, one per row, because that
-    /// is where the control was. Design 5b puts the controls in the detail
-    /// pane, so there is one Copy link on screen -- and the property that
-    /// mattered has not moved: **no row is drawn without a reachable way to
-    /// get its link back**. That is now two claims instead of one, and both
-    /// are made here: every row is really painted (a pane that drew only the
-    /// first few passed every assertion written against a two-row fixture,
-    /// which this codebase has shipped once), and picking ANY of them puts
-    /// that row's controls in the detail pane, inside the pane, at a real
-    /// size.
-    ///
-    /// The loop over all six is what makes the second claim worth anything. A
-    /// detail pane that only worked for the first row would satisfy a
-    /// single-pick test exactly as a list that drew only the first few rows
-    /// satisfied the old two-row one.
-    #[test]
-    fn every_row_can_be_picked_into_a_working_detail_pane_at_the_minimum_window_size() {
-        let size = min_pane_size();
-        let state = rows(6);
-        let (painted, _) = paint(&state, None, size);
-        // COUNT FIRST. A row pushed off the pane is culled entirely, so it
-        // comes back as nothing at all -- reading geometry before counting
-        // would read the geometry of the rows that survived. The seventh
-        // occurrence is the picked row's name in the detail header.
-        assert_eq!(painted.count("send-number-"), 7, "painted names: {:?}", painted.text);
-        assert_eq!(painted.count(FILE_TAG), 3, "the file rows lost their tag");
-
-        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
-        for index in 0..6 {
-            let (picked, _) = paint_picking(
-                &state,
-                None,
-                size,
-                SendDeleteView::default(),
-                Some(format!("id{index}")),
-            );
-            for label in [REVOKE_LABEL, COPY_MARKER] {
-                let found = picked.rects_of_exact(label);
-                assert_eq!(
-                    found.len(),
-                    1,
-                    "row {index} was picked and {label:?} was painted {} times: {:?}",
-                    found.len(),
-                    picked.text
-                );
-                let rect = found[0];
-                // A control drawn at zero size has passed both a presence
-                // assertion and an in-pane assertion in this codebase before;
-                // only a glyph-level size check caught it.
-                assert!(
-                    rect.width() > 4.0 && rect.height() > 4.0,
-                    "{label:?} is {rect:?} on row {index}"
-                );
-                assert!(
-                    pane.contains_rect(rect),
-                    "{label:?} at {rect:?} is outside the {pane:?} pane at the minimum window \
-                     size -- the detail column is {}pt wide there, which is what the action \
-                     row has to fit in",
-                    min_detail_width()
-                );
-                // ...and inside the DETAIL column, not spilling back over the
-                // list. The three are laid out left to right from the
-                // detail's own content edge, and a regression that measured
-                // them against the whole pane would put the first one under
-                // the rows.
-                assert!(
-                    rect.left() >= crate::vault_window::LIST_WIDTH,
-                    "{label:?} at {rect:?} starts left of the detail column's edge at {}",
-                    crate::vault_window::LIST_WIDTH
-                );
-            }
-            // The detail really is describing THAT row, not the first one.
-            assert!(
-                picked.in_detail(&format!("send-number-{index}")) == 1,
-                "row {index} was picked and the detail header names something else: {:?}",
-                picked.text
-            );
-        }
     }
 
     /// Empty and failed do not share a single word on screen.
@@ -7628,19 +4910,14 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
 
-        let output = ctx.run_ui(base(), |ui| {
+        let output = warm_run(&ctx, base, |ui| {
             let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let mut painted = Painted::default();
         for clipped in &output.shapes {
             collect(&clipped.shape, &mut painted);
         }
-        let targets: Vec<egui::Rect> = painted
-            .text_rects
-            .iter()
-            .filter(|(t, _)| t == label)
-            .map(|(_, r)| *r)
-            .collect();
+        let targets: Vec<egui::Rect> = painted.rects_clickable(label);
         assert!(
             targets.len() > nth,
             "only {} widgets labelled {label:?} were painted, so clicking the {nth}th would \
@@ -7678,49 +4955,6 @@ mod paint_tests {
             action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         action
-    }
-
-    /// **A row with no URL cannot clear the clipboard.** `parse_send_list`
-    /// rejects a *missing* `accessUrl` but accepts `""`, so this row shape is
-    /// reachable from a real server answer. The button is still painted --
-    /// the row keeps its shape -- but pressing it reports nothing, because
-    /// `CopyLink("")` reaches `copy_secret("")`, which empties the clipboard
-    /// and then tells the user it copied a link.
-    #[test]
-    fn a_row_whose_url_is_empty_paints_its_button_but_copies_nothing() {
-        let state = SendPaneState::Rows(vec![SendRow {
-            sent: None,
-            id: "id-no-url".into(),
-            name: "no url".into(),
-            expiry: "Expires in 7 days".into(),
-            is_file: false,
-            access_url: String::new(),
-            state: crate::send::SendState::Waiting,
-            // The facts the detail pane draws, at the shape a live, untouched
-            // Send really has. Spelled out rather than defaulted: a `Default`
-            // on `SendRow` would be a row that describes no Send at all, and
-            // this file's whole subject is states that must not be
-            // mistakable for one another.
-            access_count: 0,
-            max_access_count: None,
-            has_password: false,
-            activity: "Nobody has opened this link. The link works, as often as they like."
-                .to_string(),
-            expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
-            deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
-            extendable: true,
-        }]);
-        let (painted, _) = paint(&state, None, min_pane_size());
-        // **A Send with no link offers no Copy at all**, and says why in the
-        // address row -- a Copy that copied `""` would clear the clipboard
-        // and report success.
-        assert_eq!(painted.count_exact(COPY_MARKER), 0, "a row with no link offered Copy");
-        assert!(painted.has(ADDRESS_MISSING), "the missing link is not said: {:?}", painted.text);
-        assert_eq!(
-            painted.count_exact(REVOKE_LABEL),
-            1,
-            "control: the detail was not drawn at all, so the absence above proves nothing"
-        );
     }
 
     /// **A failure is not printed twice.** The window turns a failed fetch
@@ -7761,36 +4995,6 @@ mod paint_tests {
         assert_eq!(painted.count(message.as_str()), 1);
     }
 
-    /// **Copy link copies the row the detail pane is describing.** Tried on
-    /// the *last* row of six as well as the first, because a wrong-row bug
-    /// that reaches for index 0 is invisible when the test only picks the
-    /// first one.
-    ///
-    /// The control moved -- there is one Copy link now, in the detail header,
-    /// where 5b puts it -- and the property is unchanged and is what is
-    /// asserted: everything the action carries is read off the Send the pane
-    /// is showing and off nothing else, so no lookup on the far side can
-    /// resolve to a different one.
-    #[test]
-    fn copy_link_reports_the_url_of_the_send_the_pane_is_showing() {
-        let state = rows(6);
-        let SendPaneState::Rows(model) = &state else { panic!("not rows") };
-        for index in [0usize, 3, 5] {
-            let expected = model[index].access_url.clone();
-            assert_eq!(
-                click_nth_picking(
-                    &state,
-                    SendDeleteView::default(),
-                    Some(model[index].id.clone()),
-                    COPY_MARKER,
-                    0,
-                ),
-                SendUiAction::CopyLink(expected.clone()),
-                "Copy did not report {expected} while row {index} was picked"
-            );
-        }
-    }
-
     #[test]
     fn a_failure_can_be_retried_from_the_pane_itself() {
         let state = SendPaneState::Failed {
@@ -7812,7 +5016,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(base(), |_ui| {});
         let state = SendPaneState::Empty;
-        let output = ctx.run_ui(base(), |ui| {
+        let output = warm_run(&ctx, base, |ui| {
             let _ = draw_send_pane(ui, &state, Some("a message"), SendDeleteView::default(), SendView::Mine(ALL_SENDS), &mut None, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
         });
         let mut painted = Painted::default();
@@ -7853,383 +5057,7 @@ mod paint_tests {
 
     // ---- the revoke affordance, step 4 -----------------------------------
 
-    /// Presses the pane at an EXACT position and returns what it reported.
-    ///
-    /// Separate from [`click_nth_with`] because the mis-click test below has
-    /// to click a remembered *pixel* rather than a label: the whole question
-    /// there is what is under the pointer after the pane has been redrawn,
-    /// and looking the target up by name a second time is precisely the step
-    /// a mis-clicking user does not take.
-    fn click_at_with(
-        state: &SendPaneState,
-        delete: SendDeleteView<'_>,
-        pos: egui::Pos2,
-    ) -> SendUiAction {
-        let mut selected = first_row_id(state);
-        let size = min_pane_size();
-        let ctx = egui::Context::default();
-        let base = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            ..Default::default()
-        };
-        let _ = ctx.run_ui(base(), |_ui| {});
-        theme::apply(&ctx);
-        let _ = ctx.run_ui(base(), |_ui| {});
-        let _ = ctx.run_ui(base(), |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
-        });
-        let press = egui::RawInput {
-            events: vec![
-                egui::Event::PointerMoved(pos),
-                egui::Event::PointerButton {
-                    pos,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: Default::default(),
-                },
-            ],
-            ..base()
-        };
-        let _ = ctx.run_ui(press, |ui| {
-            let _ = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
-        });
-        let release = egui::RawInput {
-            events: vec![egui::Event::PointerButton {
-                pos,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: Default::default(),
-            }],
-            ..base()
-        };
-        let mut action = SendUiAction::None;
-        let _ = ctx.run_ui(release, |ui| {
-            action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), &mut selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action();
-        });
-        action
-    }
-
-    /// Where the `nth` widget labelled `label` was painted, in the pane drawn
-    /// with `delete`.
-    fn rect_of_nth(state: &SendPaneState, delete: SendDeleteView<'_>, label: &str, nth: usize) -> egui::Rect {
-        let (painted, _) = paint_with(state, None, min_pane_size(), delete);
-        let targets: Vec<egui::Rect> = painted
-            .text_rects
-            .iter()
-            .filter(|(t, _)| t == label)
-            .map(|(_, r)| *r)
-            .collect();
-        assert!(
-            targets.len() > nth,
-            "only {} widgets labelled {label:?} were painted, so there is no {nth}th to locate",
-            targets.len()
-        );
-        targets[nth]
-    }
-
-    /// **Every row can be revoked, and the first click revokes nothing.**
-    ///
-    /// Both halves matter and the second is the requirement: `bw send delete`
-    /// takes a public link down and there is no undo, so a control that acted
-    /// on one click would be a control that destroys on a mis-aim.
-    ///
-    /// Its ancestor counted six Delete buttons because the control was on the
-    /// row; 5b puts it in the detail pane, so the first half is now "every
-    /// row leads to one" -- checked by picking each of the two ends and
-    /// pressing what appears. What did not change at all is the second half.
-    #[test]
-    fn every_send_can_be_revoked_and_the_first_click_only_asks() {
-        let state = rows(6);
-        let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
-        assert_eq!(
-            painted.count_exact(REVOKE_LABEL),
-            1,
-            "the picked Send has no Delete button, or the rows grew one each: {:?}",
-            painted.text
-        );
-        // Nothing destructive is even OFFERED before the first click.
-        assert!(
-            !painted.has(CONFIRM_LABEL),
-            "the destructive button is painted before anything was asked: {:?}",
-            painted.text
-        );
-
-        for nth in [0usize, 5] {
-            let action = click_nth_picking(
-                &state,
-                SendDeleteView::default(),
-                Some(format!("id{nth}")),
-                REVOKE_LABEL,
-                0,
-            );
-            assert_eq!(
-                action,
-                SendUiAction::AskDelete(format!("id{nth}")),
-                "Delete did not ask about row {nth} while row {nth} was picked"
-            );
-        }
-    }
-
-    /// **The confirmation belongs to exactly one Send, and it is the one that
-    /// was asked about.**
-    ///
-    /// Two claims, and the second is the one that moved. It used to be "the
-    /// confirmation is on one ROW and the other three keep their Delete
-    /// buttons", which was a statement about a list of controls this screen
-    /// no longer has. What replaces it is stronger: the confirmation is
-    /// raised against an id, so **picking a different Send while one is armed
-    /// shows that Send's ordinary controls and no confirmation at all** --
-    /// which is the property the row-level count was standing in for.
-    #[test]
-    fn only_the_send_asked_about_shows_the_confirmation() {
-        let state = rows(4);
-        let armed = SendDeleteView { confirming: Some("id2"), in_flight: None, extending: false };
-        let (painted, _) =
-            paint_picking(&state, None, min_pane_size(), armed, Some("id2".to_string()));
-        assert_eq!(
-            painted.count_exact(CONFIRM_LABEL),
-            1,
-            "the destructive button is painted {} times, not once: {:?}",
-            painted.count_exact(CONFIRM_LABEL),
-            painted.text
-        );
-        assert_eq!(
-            painted.count_exact(CANCEL_LABEL),
-            1,
-            "the way out of the confirmation is not painted exactly once"
-        );
-        assert_eq!(
-            painted.count_exact(REVOKE_LABEL),
-            0,
-            "the armed Send kept its Delete button beside the confirmation, so the two steps \
-             are one click apart again"
-        );
-        assert!(
-            painted.has(CONFIRM_PROMPT),
-            "the Send that is about to be revoked does not say what that means: {:?}",
-            painted.text
-        );
-
-        // A DIFFERENT Send, with the same confirmation still armed on `id2`:
-        // ordinary controls, no question, nothing destructive offered.
-        let (other, _) =
-            paint_picking(&state, None, min_pane_size(), armed, Some("id0".to_string()));
-        assert_eq!(
-            other.count_exact(CONFIRM_LABEL) + other.count_exact(CANCEL_LABEL),
-            0,
-            "a confirmation raised on id2 is showing over id0: {:?}",
-            other.text
-        );
-        assert_eq!(
-            other.count_exact(REVOKE_LABEL),
-            1,
-            "the Send that is NOT being confirmed lost its own controls: {:?}",
-            other.text
-        );
-        assert!(!other.has(CONFIRM_PROMPT), "the question followed the selection: {:?}", other.text);
-
-        // And it answers for its own Send and no other.
-        assert_eq!(
-            click_nth_picking(&state, armed, Some("id2".to_string()), CONFIRM_LABEL, 0),
-            SendUiAction::ConfirmDelete {
-                id: "id2".to_string(),
-                name: "send-number-2".to_string(),
-            },
-            "the confirmation answered for a Send other than the one it was asked about"
-        );
-    }
-
-    /// **THE MIS-CLICK DEFENCE, as a click on a remembered pixel.**
-    ///
-    /// A user who double-clicks Delete, or who clicks it twice because the
-    /// first click did not seem to register, puts the second click at the
-    /// same coordinates as the first. Those coordinates must not be a
-    /// destructive control on the redrawn frame. They are `Cancel`, and this
-    /// asserts it the only way that means anything: by clicking the position
-    /// the first click was made at, without looking anything up again.
-    #[test]
-    fn a_second_click_where_delete_was_cancels_and_never_destroys() {
-        let state = rows(3);
-        let idle = SendDeleteView::default();
-        // The pane describes the FIRST row, which is what `click_at_with`
-        // picks, so the button this remembers is that Send's own.
-        let where_delete_was = rect_of_nth(&state, idle, REVOKE_LABEL, 0).center();
-
-        // The first click arms the confirmation for that Send.
-        assert_eq!(
-            click_at_with(&state, idle, where_delete_was),
-            SendUiAction::AskDelete("id0".to_string()),
-            "control: the remembered position is not the Delete button of the Send on screen"
-        );
-
-        // The second click, at the very same pixel, on the redrawn pane.
-        let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
-        let second = click_at_with(&state, armed, where_delete_was);
-        assert_eq!(
-            second,
-            SendUiAction::CancelDelete,
-            "the pixel the Delete button occupied does something other than cancel once the \
-             confirmation is up -- a double-click on Delete would revoke a public link with \
-             no decision taken"
-        );
-        assert!(
-            !matches!(second, SendUiAction::ConfirmDelete { .. }),
-            "a second click at the Delete button's own position REVOKED the Send"
-        );
-
-        // And the destructive button is really somewhere else, so the
-        // assertion above is about geometry and not about a button that was
-        // never drawn.
-        let confirm = rect_of_nth(&state, armed, CONFIRM_LABEL, 0);
-        assert!(
-            !confirm.contains(where_delete_was),
-            "control: the destructive button covers the Delete button's own position \
-             ({confirm:?} contains {where_delete_was:?}), so cancelling there is an accident \
-             of hit-testing order rather than a layout decision"
-        );
-    }
-
-    /// **A Send whose revoke is running has no control on it at all**, so a
-    /// second click cannot start a second `bw send delete` for a Send that is
-    /// already being revoked.
-    ///
-    /// The absence is asserted twice over, and the second is what closes it:
-    /// no widget is painted in the action row, AND every pixel across that
-    /// row reports nothing. A single sample can miss a control by ten pixels,
-    /// and "no button" has to be true of the whole strip.
-    ///
-    /// The progress word is in **two** places now, and both are deliberate:
-    /// the detail's action row, where the controls were, and the list row's
-    /// own second line -- because a user who picks a different Send while one
-    /// is being destroyed would otherwise see nothing anywhere about it.
-    #[test]
-    fn a_send_being_revoked_has_no_buttons_and_says_so() {
-        let state = rows(3);
-        let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: false };
-        let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
-
-        assert_eq!(
-            painted.in_detail(DELETING_LABEL),
-            1,
-            "the detail pane does not say that anything is happening: {:?}",
-            painted.text
-        );
-        assert_eq!(
-            painted.in_list(DELETING_LABEL),
-            1,
-            "the row of the Send being revoked does not say so, so a user looking at another \
-             Send sees nothing at all: {:?}",
-            painted.text
-        );
-        for label in [REVOKE_LABEL, OPEN_RECORD_LABEL, CONFIRM_LABEL] {
-            assert_eq!(
-                painted.count_exact(label),
-                0,
-                "{label:?} is still painted for a Send that is already being revoked: {:?}",
-                painted.text
-            );
-        }
-
-        // Every pixel of the action row reports nothing. Swept across the
-        // detail column rather than at one point.
-        let line = painted
-            .rects_of_exact(DELETING_LABEL)
-            .into_iter()
-            .find(|r| r.center().x >= crate::vault_window::LIST_WIDTH)
-            .expect("counted above");
-        let detail_left = crate::vault_window::LIST_WIDTH;
-        let span = min_pane_size().x - detail_left;
-        for x in [0.05f32, 0.2, 0.4, 0.6, 0.8, 0.95] {
-            let pos = egui::pos2(detail_left + span * x, line.center().y);
-            assert_eq!(
-                click_at_with(&state, busy, pos),
-                SendUiAction::None,
-                "a click at {pos:?} on a Send that is already being revoked reported an action"
-            );
-        }
-    }
-
-    /// A Send whose id did not survive the parse cannot be revoked, for the
-    /// reason a row with no URL cannot be copied: the button keeps the row's
-    /// shape, and the action it would report is refused.
-    #[test]
-    fn a_row_with_no_id_paints_its_button_but_revokes_nothing() {
-        let state = SendPaneState::Rows(vec![SendRow {
-            sent: None,
-            id: String::new(),
-            name: "no id".into(),
-            expiry: "Expires in 7 days".into(),
-            is_file: false,
-            access_url: "https://send.bitwarden.com/#/x".into(),
-            state: crate::send::SendState::Waiting,
-            // The facts the detail pane draws, at the shape a live, untouched
-            // Send really has. Spelled out rather than defaulted: a `Default`
-            // on `SendRow` would be a row that describes no Send at all, and
-            // this file's whole subject is states that must not be
-            // mistakable for one another.
-            access_count: 0,
-            max_access_count: None,
-            has_password: false,
-            activity: "Nobody has opened this link. The link works, as often as they like."
-                .to_string(),
-            expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
-            deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
-            extendable: true,
-        }]);
-        assert_eq!(
-            click_nth_with(&state, SendDeleteView::default(), REVOKE_LABEL, 0),
-            SendUiAction::None,
-            "a row with no id asked to revoke something `bw` could not name"
-        );
-    }
-
     // ---- design 5b's Extend ------------------------------------------------
-
-    /// **Extend is on the detail header, fits at the smallest window, and
-    /// reports the Send it was pressed on in one step.** The action carries
-    /// the id and the name off the Send on screen, for `ConfirmDelete`'s
-    /// reasons, and it is `Extend` -- the mutant this exists against is a
-    /// button wired to the revoke beside it.
-    #[test]
-    fn extend_reports_the_send_it_was_pressed_on_in_one_step() {
-        let state = rows(3);
-        let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
-        assert_eq!(painted.in_detail(EXTEND_LABEL), 1, "no Extend on the detail: {:?}", painted.text);
-        assert_eq!(painted.in_list(EXTEND_LABEL), 0, "Extend leaked into the list column");
-        let at = painted.rects_of_exact(EXTEND_LABEL)[0];
-        assert!(
-            at.width() > 0.0 && at.right() <= min_pane_size().x,
-            "Extend does not fit in the detail pane at the smallest window: {at:?}"
-        );
-        assert_eq!(
-            click_nth_with(&state, SendDeleteView::default(), EXTEND_LABEL, 0),
-            SendUiAction::Extend { id: "id0".to_string(), name: "send-number-0".to_string() },
-            "Extend did not report an Extend of the Send on screen"
-        );
-    }
-
-    /// **While a revoke is being asked about, Extend steps back; while an
-    /// Extend runs, the Send says so and offers nothing.** The first is
-    /// `Open record`'s rule during the confirmation; the second is the
-    /// revoke's own busy state with its own word, so "Revoking..." is never
-    /// painted over a Send that is being made to last longer.
-    #[test]
-    fn extend_steps_back_for_the_question_and_its_busy_send_says_extending() {
-        let state = rows(3);
-        let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
-        let (asking, _) = paint_with(&state, None, min_pane_size(), armed);
-        assert_eq!(asking.count_exact(EXTEND_LABEL), 0, "Extend beside a question about destroying");
-        assert_eq!(asking.count_exact(CANCEL_LABEL), 1, "control: the question is not up");
-
-        let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: true };
-        let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
-        assert_eq!(painted.in_detail(EXTENDING_LABEL), 1, "the detail does not say: {:?}", painted.text);
-        assert_eq!(painted.in_list(EXTENDING_LABEL), 1, "the row does not say: {:?}", painted.text);
-        assert_eq!(painted.count_exact(DELETING_LABEL), 0, "an Extend is described as a revoke");
-        for label in [EXTEND_LABEL, REVOKE_LABEL, OPEN_RECORD_LABEL] {
-            assert_eq!(painted.count_exact(label), 0, "{label:?} is offered while the Extend runs");
-        }
-    }
 
     /// **A Send that lasts forever is not offered Extend** -- the arithmetic
     /// leaves "never" where it is, so the press would report a week that
@@ -8258,7 +5086,7 @@ mod paint_tests {
         let forever = pane_state(Some(&Ok(vec![send(never, "")])), &FixedClock(NOW), &UTC);
         let (painted, _) = paint_with(&forever, None, min_pane_size(), SendDeleteView::default());
         assert_eq!(painted.count_exact(EXTEND_LABEL), 0, "{:?}", painted.text);
-        assert_eq!(painted.count_exact(REVOKE_LABEL), 1, "control: the detail pane is not up");
+        assert_eq!(painted.in_detail(REVOKE_LABEL), 1, "control: the modal is not up");
     }
 
     // ---- the records list's shape ----------------------------------------------
@@ -8348,7 +5176,7 @@ mod paint_tests {
             .flat_map(|t| items.iter().map(move |item| (item.id.clone(), t.clone())))
             .collect();
         let mut selected = first_row_id(state);
-        let output = ctx.run_ui(input(), |ui| {
+        let output = warm_run(&ctx, input, |ui| {
             let _ = draw_send_pane(
                 ui,
                 state,
@@ -8366,167 +5194,6 @@ mod paint_tests {
             collect(&clipped.shape, &mut painted);
         }
         painted
-    }
-
-    /// The pieces of a list column's header and first row, **as painted**:
-    /// the strip, its hairline, the row's band and its tile.
-    ///
-    /// `strip`, `hairline` and `row_edge` were read by the records-list
-    /// comparison slice 3 retired with the v1 rows; task 5 redraws the Sent
-    /// list in v2 and its tests with it.
-    #[allow(dead_code)]
-    struct ListShape {
-        strip: egui::Rect,
-        hairline: egui::Rect,
-        row: egui::Rect,
-        row_edge: egui::Color32,
-        tile: egui::Rect,
-    }
-
-    fn list_shape(painted: &Painted, what: &str) -> ListShape {
-        let in_column = |r: &egui::Rect| r.center().x < crate::vault_window::LIST_WIDTH;
-        let strip = painted
-            .fills
-            .iter()
-            .filter(|(r, fill)| *fill == theme::CARD && r.top() <= 0.5 && in_column(r))
-            .map(|(r, _)| *r)
-            .reduce(egui::Rect::union)
-            .unwrap_or_else(|| panic!("{what}: no white header strip at the column's top"));
-        let hairline = painted
-            .fills
-            .iter()
-            .filter(|(r, fill)| {
-                *fill == theme::HAIRLINE && in_column(r) && (r.bottom() - strip.bottom()).abs() < 0.5
-            })
-            .map(|(r, _)| *r)
-            .next()
-            .unwrap_or_else(|| panic!("{what}: no hairline at the strip's foot"));
-        let row = painted
-            .fills
-            .iter()
-            .filter(|(r, fill)| {
-                *fill == theme::CARD && in_column(r) && r.top() > strip.bottom() && r.height() > 40.0
-            })
-            .map(|(r, _)| *r)
-            .next()
-            .unwrap_or_else(|| panic!("{what}: no row band under the strip"));
-        // The band's edge, whichever shape carries it: a `Frame` paints fill
-        // and stroke as one rect, a painter as two.
-        let row_edge = painted
-            .strokes
-            .iter()
-            .filter(|(r, edge)| {
-                (r.min - row.min).length() < 0.51
-                    && (r.max - row.max).length() < 0.51
-                    && *edge != egui::Color32::TRANSPARENT
-            })
-            .map(|(_, edge)| *edge)
-            .next()
-            .unwrap_or_else(|| panic!("{what}: the row band has no edge"));
-        let tile = painted
-            .strokes
-            .iter()
-            .filter(|(r, _)| {
-                row.contains_rect(*r) && (r.width() - r.height()).abs() < 0.5 && r.width() > 20.0
-            })
-            .map(|(r, _)| *r)
-            .next()
-            .unwrap_or_else(|| panic!("{what}: no square tile inside the row"));
-        ListShape { strip, hairline, row, row_edge, tile }
-    }
-
-    /// **The tile sits in the middle of its row**, one border and one padding
-    /// in from the band's left edge -- which is where the records row puts
-    /// its tile, and which the Sent row's 32pt tile was not.
-    #[test]
-    fn a_sends_tile_is_centred_in_its_row() {
-        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
-        let record = a_record("rec-1", "SAP Production");
-        let shape = list_shape(
-            &paint_sent_with(&a_send_made_from(&record), size, |_| (Vec::new(), None)),
-            "the Sent list",
-        );
-        assert!(
-            (shape.tile.center().y - shape.row.center().y).abs() < 0.51,
-            "the tile's centre is at {} in a row centred at {}",
-            shape.tile.center().y,
-            shape.row.center().y
-        );
-        let inset = crate::vault_window::item_list::ROW_BORDER + crate::vault_window::item_list::ROW_PAD_X;
-        assert!(
-            (shape.tile.left() - shape.row.left() - inset).abs() < 0.51,
-            "the tile starts {}pt into its row, not the records row's {inset}",
-            shape.tile.left() - shape.row.left()
-        );
-        assert!(
-            (shape.row.bottom() - shape.tile.bottom() - (shape.tile.top() - shape.row.top())).abs() < 0.51,
-            "the tile has more room above it than below"
-        );
-    }
-
-    /// **A Send made from a record wears that record's icon**, in its row and
-    /// at the head of its detail -- where the owner saw `2X` -- and falls back
-    /// to the monogram only when the record has no icon.
-    #[test]
-    fn a_send_made_from_a_record_with_an_icon_wears_the_icon() {
-        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
-        let record = a_record("rec-1", "23000268.xyz");
-        let state = a_send_made_from(&record);
-
-        let with_icon = paint_sent_with(&state, size, |ctx| (vec![record.clone()], Some(a_texture(ctx))));
-        let row = list_shape(&with_icon, "the Sent list");
-        let in_row: Vec<&egui::Rect> =
-            with_icon.images.iter().filter(|r| row.tile.expand(0.5).contains_rect(**r)).collect();
-        assert_eq!(in_row.len(), 1, "the row's tile holds no picture: {:?}", with_icon.images);
-        assert!(
-            with_icon.images.iter().any(|r| r.center().x > crate::vault_window::LIST_WIDTH),
-            "the detail header's tile holds no picture: {:?}",
-            with_icon.images
-        );
-        assert!(
-            !with_icon.text.iter().any(|t| t == &crate::vault_window::item_list::initials(&record.name)),
-            "the monogram was painted as well as the icon: {:?}",
-            with_icon.text
-        );
-
-        // The control: the same Send, its record with no icon, is the
-        // monogram -- so the picture above came from the record's icon and
-        // from nothing else.
-        let without = paint_sent_with(&state, size, |_| (vec![record.clone()], None));
-        assert!(without.images.is_empty(), "a picture with no icon: {:?}", without.images);
-        assert!(
-            without.text.iter().any(|t| t == &crate::vault_window::item_list::initials(&record.name)),
-            "no monogram when the record has no icon: {:?}",
-            without.text
-        );
-    }
-
-    /// **A Send somebody has opened says `Opened`, in a pill that is not
-    /// `Waiting`'s** -- on its row, which is where the owner looked and saw
-    /// `Waiting` over a link opened twice.
-    ///
-    /// The tone is held apart from both of its neighbours: not `Waiting`'s
-    /// blue, which is the colour of "nobody has looked", and not `Used`'s
-    /// tick, which is the mark of a link that is spent.
-    #[test]
-    fn an_opened_send_says_opened_in_its_own_pill() {
-        use crate::send::SendState;
-        let painted = paint(&one_row(SendState::Opened), None, min_pane_size()).0;
-        assert_eq!(painted.in_list(OPENED_LABEL), 1, "the row's pill: {:?}", painted.text);
-        assert_eq!(painted.in_list(WAITING_LABEL), 0, "an opened link still says Waiting");
-
-        let opened = state_tone(SendState::Opened);
-        let waiting = state_tone(SendState::Waiting);
-        let used = state_tone(SendState::Used);
-        assert_ne!(opened.fill, waiting.fill, "Opened is painted in Waiting's colour");
-        assert!(
-            matches!(opened.mark, theme::PillMark::Dot(_)),
-            "an opened link is still live, and the dot is the live mark"
-        );
-        assert!(
-            matches!(used.mark, theme::PillMark::Check(_)),
-            "control: Used no longer carries the tick that sets it apart from Opened"
-        );
     }
 
     /// The two steps do not share a word, so the second click is a decision
@@ -8566,232 +5233,13 @@ mod paint_tests {
     fn detail_of(send: SendSummary) -> (Painted, SendUiAction) {
         let id = send.id.clone();
         let state = pane_state(Some(&Ok(vec![send])), &FixedClock(NOW), &UTC);
-        paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), Some(id))
+        paint_picking(&state, None, TALL_WINDOW, SendDeleteView::default(), Some(id))
     }
 
-    /// **Design 5b's `Link` card, every row of it, at the minimum window
-    /// size.**
-    ///
-    /// The card is what the detail pane is FOR, so its rows are pinned by
-    /// name and by value rather than by "a card was drawn": a pane that lost
-    /// one row would otherwise pass every assertion about the others.
-    ///
-    /// **Both dates, and they are different dates.** `expiration_date` is
-    /// when the link stops answering and `deletion_date` is when the record
-    /// goes; the fixture puts three days between them precisely so a pane
-    /// that printed one date twice fails here.
-    #[test]
-    fn the_detail_pane_draws_the_link_card_at_the_minimum_window_size() {
-        let (painted, _) = detail_of(a_fully_described_send());
-        // The Link card's own rows, once each; `Opened` and `Deleted` are the
-        // Activity card's; `Expires` is on both, because it is both "how long
-        // the link answers" and a date in what happened to it. `Opened` is
-        // painted twice in the detail for this Send, and the second is not a
-        // card's: the fixture has been opened, so the header's pill says so.
-        assert_eq!(OPENED_ROW, OPENED_LABEL, "control: the row and the pill are one word");
-        for (label, times) in [
-            (LINK_CARD_TITLE, 1),
-            (ADDRESS_ROW, 1),
-            (OPENS_WITH_ROW, 1),
-            (VIEWS_ROW, 1),
-            (OPENED_ROW, 2),
-            (EXPIRES_ROW, 2),
-            (DELETED_ROW, 1),
-        ] {
-            assert_eq!(
-                painted.in_detail(label),
-                times,
-                "the detail cards do not draw {label:?} {times} time(s): {:?}",
-                painted.text
-            );
-        }
-        // The address itself, and the two facts beside it.
-        assert!(
-            painted.has("https://send.bitwarden.com/#/g7HqK2"),
-            "the detail pane does not show the link it is about: {:?}",
-            painted.text
-        );
-        assert_eq!(
-            painted.count_exact(PASSWORD_SEGMENT),
-            1,
-            "a Send that needs a password does not say so in its `Opens with` row: {:?}",
-            painted.text
-        );
-        assert!(
-            painted.has("3 of 10"),
-            "the views row does not say the count against its cap: {:?}",
-            painted.text
-        );
-
-        // **Two different dates, in the two rows that mean two different
-        // things.** Asserted as painted strings rather than as fields, so a
-        // pane that wired both rows to one date fails.
-        let expires = painted
-            .text
-            .iter()
-            .find(|t| t.contains("17 Aug 2026"))
-            .unwrap_or_else(|| panic!("no expiry date was painted: {:?}", painted.text));
-        let deletes = painted
-            .text
-            .iter()
-            .find(|t| t.contains("20 Aug 2026"))
-            .unwrap_or_else(|| panic!("no deletion date was painted: {:?}", painted.text));
-        assert_ne!(
-            expires, deletes,
-            "the Expires and Deleted rows print the same string, so one of the two dates is \
-             not being read -- which is how a link that already 404s comes to be described \
-             as live"
-        );
-
-        // Nothing spilled out of the pane at the floor.
-        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, min_pane_size());
-        for (text, rect) in &painted.text_rects {
-            assert!(
-                rect.left() >= -0.5 && rect.right() <= pane.right() + 0.5,
-                "{text:?} was painted at {rect:?}, outside the {pane:?} pane at the minimum \
-                 window size"
-            );
-        }
-    }
-
-    /// **A Send with no password says what opening it needs, in the
-    /// affirmative.**
-    ///
-    /// The row is never blank and never says "no password": what the reader
-    /// wants to know is what the recipient has to have, and for most Sends
-    /// this app makes the answer is "the link, and that is all".
-    #[test]
-    fn the_opens_with_row_says_what_the_recipient_needs() {
-        let (with, _) = detail_of(a_fully_described_send());
-        assert_eq!(with.count_exact(PASSWORD_SEGMENT), 1);
-        assert_eq!(with.count_exact(LINK_ONLY), 0);
-
-        let (without, _) =
-            detail_of(SendSummary { has_password: false, ..a_fully_described_send() });
-        assert_eq!(
-            without.count_exact(LINK_ONLY),
-            1,
-            "a Send whose link is the whole credential leaves the row blank: {:?}",
-            without.text
-        );
-        assert_eq!(without.count_exact(PASSWORD_SEGMENT), 0);
-    }
-
-    /// **A dead link is struck through and said to be dead**, which is 5b's
-    /// own treatment -- and it is the STATE that decides, not the date: a
-    /// Send whose views are spent is exactly as unopenable as one that
-    /// expired.
-    #[test]
-    fn a_dead_links_address_is_struck_through_and_marked() {
-        // Live: no marker.
-        let (live, _) = detail_of(a_fully_described_send());
-        assert_eq!(
-            live.count_exact(DEAD_MARKER),
-            0,
-            "a live link is marked dead: {:?}",
-            live.text
-        );
-
-        // Views spent. Nothing about the DATES changed.
-        let used = SendSummary { access_count: 10, ..a_fully_described_send() };
-        assert_eq!(
-            crate::send::send_state(&used, &FixedClock(NOW)),
-            crate::send::SendState::Used,
-            "control: the fixture is not in the state this test is about"
-        );
-        let (painted, _) = detail_of(used);
-        assert_eq!(
-            painted.count_exact(DEAD_MARKER),
-            1,
-            "a Send whose views are spent still presents its link as working: {:?}",
-            painted.text
-        );
-        // The strike is a thin filled rect over the address, so it is found
-        // by geometry: a line no taller than two points, lying across the
-        // middle of the URL that was painted.
-        let url = painted
-            .rect_of("https://send.bitwarden.com")
-            .expect("the address was not painted at all");
-        assert!(
-            painted.fills.iter().any(|(rect, _)| {
-                rect.height() <= 2.0
-                    && rect.width() > 10.0
-                    && (rect.center().y - url.center().y).abs() < 4.0
-                    && rect.left() >= url.left() - 2.0
-            }),
-            "nothing is struck through the dead address at {url:?}: the pane says `dead` \
-             beside a link that still reads as ordinary text"
-        );
-    }
-
-    /// **The Activity card holds what a Send keeps, and invents nothing.**
-    ///
-    /// 5c wants a per-access timeline -- "Password revealed - 15:01 - Edge on
-    /// Windows - Berlin, DE" -- and a Bitwarden Send carries no per-access
-    /// record at all. This card used to be absent for that reason; it is
-    /// design 5b's third card now, at the owner's word, filled only with
-    /// what a Send does keep: 5c's answer as its first line, the view count,
-    /// and the two dates. The timeline's words stay absent.
-    #[test]
-    fn the_activity_card_answers_5cs_question_and_invents_no_timeline() {
-        let (painted, _) = detail_of(a_fully_described_send());
-        assert_eq!(painted.in_detail(ACTIVITY_CARD_TITLE), 1, "no Activity card: {:?}", painted.text);
-        for absent in ["Berlin", "Edge", "Password revealed", "Link sent"] {
-            assert!(
-                !painted.has(absent),
-                "the detail pane paints {absent:?} -- there is no per-access record in a \
-                 Bitwarden Send, so this is an invention"
-            );
-        }
-        // 5c's own question, answered in words.
-        assert!(
-            painted.has("Opened 3 times"),
-            "the pane does not say whether the link was used, which 5c's own subtitle calls \
-             the question people actually have: {:?}",
-            painted.text
-        );
-        assert!(
-            painted.has("7 views left"),
-            "the pane does not say what is left of the budget: {:?}",
-            painted.text
-        );
-    }
-
-    /// **Nothing is picked, and the pane says so in words.**
-    #[test]
-    fn a_detail_pane_with_nothing_picked_says_so() {
-        let state = rows(3);
-        let (painted, _) =
-            paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), None);
-        assert!(
-            painted.has(NOTHING_PICKED),
-            "the detail column is blank with nothing picked, which reads as a load that \
-             failed: {:?}",
-            painted.text
-        );
-        for control in [COPY_MARKER, REVOKE_LABEL, OPEN_RECORD_LABEL] {
-            assert_eq!(
-                painted.count_exact(control),
-                0,
-                "{control:?} is drawn with no Send picked, so it would act on nothing"
-            );
-        }
-        // A selection naming a row that is not in the list is the same state,
-        // not a stale pane.
-        let (stale, _) = paint_picking(
-            &state,
-            None,
-            min_pane_size(),
-            SendDeleteView::default(),
-            Some("id-that-is-gone".to_string()),
-        );
-        assert!(
-            stale.has(NOTHING_PICKED),
-            "a selection naming a Send that is no longer in the list draws something other \
-             than the nothing-picked pane: {:?}",
-            stale.text
-        );
-    }
+    /// A window as wide as the app's minimum and tall enough for the whole
+    /// modal, for the assertions about what the modal SAYS rather than where
+    /// it scrolls.
+    const TALL_WINDOW: egui::Vec2 = egui::vec2(688.0, 1300.0);
 
     // ---- design 5b's SHARING sub-filters, on the pane ----
 
@@ -8864,7 +5312,7 @@ mod paint_tests {
         theme::apply(&ctx);
         let _ = ctx.run_ui(input(), |_ui| {});
         let mut selected = None;
-        let output = ctx.run_ui(input(), |ui| {
+        let output = warm_run(&ctx, input, |ui| {
             draw_send_pane(
                 ui,
                 state,
@@ -8882,58 +5330,6 @@ mod paint_tests {
             collect(&clipped.shape, &mut painted);
         }
         painted
-    }
-
-    /// **Each sub-row lists exactly the Sends its badge counts, and `Ended`
-    /// really is the two states merged.**
-    ///
-    /// The rows the pane lists and the number the rail prints go through ONE
-    /// predicate -- `SendScope::admits` -- and this is what says so from the
-    /// painted side: a scope that listed more than it counted would show a
-    /// name here that its own sub-row does not admit.
-    #[test]
-    fn each_sharing_sub_filter_lists_exactly_what_its_badge_counts() {
-        use crate::send::SendState;
-        use crate::vault_window::sidebar::SendScope;
-        let state = one_of_each_state();
-        for (scope, expected) in [
-            (SendScope::All, vec!["send-waiting", "send-used", "send-expired", "send-revoked"]),
-            (SendScope::Waiting, vec!["send-waiting"]),
-            (SendScope::Used, vec!["send-used"]),
-            // The merge, and the whole of what makes `Ended` a row rather
-            // than a rename of either state.
-            (SendScope::Ended, vec!["send-expired", "send-revoked"]),
-        ] {
-            let painted = paint_scope(&state, scope);
-            for name in ["send-waiting", "send-used", "send-expired", "send-revoked"] {
-                let wanted = expected.contains(&name);
-                assert_eq!(
-                    painted.in_list(name) == 1,
-                    wanted,
-                    "under {scope:?} the list {} {name:?}, and it should {}: {:?}",
-                    if wanted { "does not show" } else { "shows" },
-                    if wanted { "" } else { "not" },
-                    painted.text
-                );
-            }
-            // The strip names the cut in force, so a user who clicked `Ended`
-            // and then reads `Revoked` on a pill has the bridge on screen.
-            assert!(
-                painted.has(scope.eyebrow()),
-                "the list strip does not name the {scope:?} cut it is showing: {:?}",
-                painted.text
-            );
-        }
-
-        // The counts the rail would draw, over the same four Sends and the
-        // same predicate.
-        let counts = crate::vault_window::sidebar::SendCounts::over([
-            SendState::Waiting,
-            SendState::Used,
-            SendState::Expired,
-            SendState::Revoked,
-        ]);
-        assert_eq!((counts.waiting, counts.used, counts.ended, counts.all), (1, 1, 2, 4));
     }
 
     /// **An empty sub-row does NOT say "you have no Sends".**
@@ -9078,7 +5474,7 @@ mod paint_tests {
         let _ = ctx.run_ui(input(), |_ui| {});
         let mut selected = picked;
         let state = SendPaneState::Loading;
-        let output = ctx.run_ui(input(), |ui| {
+        let output = warm_run(&ctx, input, |ui| {
             draw_send_pane(
                 ui,
                 // **`Loading`, deliberately.** The received screen asks no
@@ -9103,59 +5499,6 @@ mod paint_tests {
         (painted, selected)
     }
 
-    /// **`Shared with me` lists what was imported, and its detail says where
-    /// the item went.**
-    ///
-    /// Including the one thing this screen must never do: draw the Sends
-    /// list's own states. It shares a pane with them and reads a local file
-    /// instead of a fetch, so a `Loading` spinner or a `Refresh` button here
-    /// would be the account's Sends leaking into a screen that is not about
-    /// them.
-    #[test]
-    fn the_shared_with_me_screen_lists_imports_and_says_where_each_went() {
-        let history = crate::receive_history::ReceiveHistory {
-            entries: vec![
-                a_received_record(NOW - 3_600_000, "SAP Production", "item-here"),
-                a_received_record(NOW - 7_200_000, "Office WiFi", "item-gone"),
-            ],
-        };
-        let items = vec![vault_item("item-here")];
-        let rows = received_rows(&history, &items, &FixedClock(NOW), &UTC);
-
-        let listed = paint_received(&rows, None);
-        assert!(listed.has(RECEIVED_HEADING), "the strip does not name this screen: {:?}", listed.text);
-        assert_eq!(listed.in_list("SAP Production"), 1);
-        assert_eq!(listed.in_list("Office WiFi"), 1);
-        assert!(listed.has(NOTHING_PICKED_RECEIVED), "nothing picked and nothing said");
-        // The Sends list's own machinery is nowhere on this screen.
-        for leaked in [LOADING_LABEL, SCOPE_SUBTEXT] {
-            assert!(
-                !listed.has(leaked),
-                "{leaked:?} is drawn on the `Shared with me` screen, which asks the server \
-                 nothing: {:?}",
-                listed.text
-            );
-        }
-
-        // The item that survived, and the one that did not.
-        let present = paint_received(&rows, Some("item-here".to_string()));
-        assert!(
-            present.has(RECEIVED_ITEM_PRESENT),
-            "a record whose item is still in the vault does not say so: {:?}",
-            present.text
-        );
-        assert_eq!(present.in_detail(IN_VAULT_YES), 1);
-        assert!(present.has(ARRIVED_ROW), "the detail does not say when it arrived");
-
-        let gone = paint_received(&rows, Some("item-gone".to_string()));
-        assert!(
-            gone.has(RECEIVED_ITEM_GONE),
-            "a record whose item has been deleted points at nothing and says nothing: {:?}",
-            gone.text
-        );
-        assert_eq!(gone.in_detail(IN_VAULT_NO), 1);
-    }
-
     /// **An empty `Shared with me` is a claim, and it is a true one.**
     ///
     /// Unlike the Sends list there is no fetch behind this screen, so there
@@ -9173,73 +5516,6 @@ mod paint_tests {
              claim about a different thing: {:?}",
             painted.text
         );
-    }
-
-    /// **Mock 6d's list: FROM PEOPLE, then IMPORTED FROM SENDS**, top to
-    /// bottom, the strip counting both -- and the person row wears the
-    /// Sent list's own row band, so the column is one row shape.
-    #[test]
-    fn shared_with_me_puts_records_from_people_above_the_imports() {
-        use crate::vault_window::share_ui::{ReceivedShareRow, FROM_PEOPLE_EYEBROW, FROM_SENDS_EYEBROW};
-        let history = crate::receive_history::ReceiveHistory {
-            entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
-        };
-        let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
-        let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
-        let painted = paint_received_with(&rows, &people, None);
-        let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
-        assert!(top(FROM_PEOPLE_EYEBROW) < top("Acme VPN"));
-        assert!(top("Acme VPN") < top(FROM_SENDS_EYEBROW));
-        assert!(top(FROM_SENDS_EYEBROW) < top("SAP Production"));
-        assert!(painted.has("from denis@x.io \u{b7} view-only"), "{:?}", painted.text);
-        assert!(painted.has(&format!("2 {RECORDS_NOUN}")), "the strip counts both groups: {:?}", painted.text);
-        // 6d's `.lnote` in place of 5b's line, as 6c's replaces it on Sent;
-        // and 5b's line where nobody shares anything.
-        assert!(painted.has(RECEIVED_PEOPLE_SUBTEXT) && !painted.has(RECEIVED_SCOPE_SUBTEXT), "{:?}", painted.text);
-        let imports_only = paint_received_with(&rows, &[], None);
-        assert!(imports_only.has(RECEIVED_SCOPE_SUBTEXT) && !imports_only.has(RECEIVED_PEOPLE_SUBTEXT));
-        // The same height as the import row under it: one row shape.
-        let band = |label: &str| painted.fills.iter().filter(|(r, c)| *c == theme::CARD && r.contains(painted.rect_of(label).expect("text").center())).map(|(r, _)| r.height()).fold(f32::INFINITY, f32::min);
-        assert_eq!(band("Acme VPN"), band("SAP Production"));
-
-        // Records from people and no imports: the group alone -- no empty
-        // sentence, and no IMPORTED FROM SENDS eyebrow over nothing.
-        let alone = paint_received_with(&[], &people, None);
-        assert!(alone.has("Acme VPN"));
-        assert!(!alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
-        assert!(!alone.has(FROM_SENDS_EYEBROW), "an eyebrow over no rows: {:?}", alone.text);
-    }
-
-    /// **Paste an invite link leads Shared with me** (official-path spec
-    /// §4.1), above FROM PEOPLE; the strip counts records and not the box;
-    /// nothing is picked for the user; with nothing listed but the box, the
-    /// empty screen's words stand under it; and a sharer being waited on
-    /// alone is a list with its line in it, never the empty screen.
-    #[test]
-    fn paste_an_invite_link_leads_shared_with_me() {
-        use crate::vault_window::share_ui::{self as sharing, PeopleRows, ReceivedShareRow};
-        let history = crate::receive_history::ReceiveHistory {
-            entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
-        };
-        let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
-        let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
-        let mut people = PeopleRows { received: &from_people, paste: Some(zeroize::Zeroizing::new(String::new())), ..PeopleRows::none() };
-        let (painted, selected) = paint_received_people(&rows, &mut people, None);
-        assert_eq!(selected, None, "nothing is picked for the user");
-        let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
-        assert!(top(sharing::PASTE_ACCEPT_LABEL) < top(sharing::FROM_PEOPLE_EYEBROW));
-        assert!(painted.has(&format!("2 {RECORDS_NOUN}")), "the box is not a record: {:?}", painted.text);
-
-        let mut box_only = PeopleRows { paste: Some(zeroize::Zeroizing::new(String::new())), ..PeopleRows::none() };
-        let (alone, _) = paint_received_people(&[], &mut box_only, None);
-        assert!(alone.has(sharing::PASTE_ACCEPT_LABEL), "{:?}", alone.text);
-        assert!(alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
-
-        let waiting = [crate::rest::sharing::WaitingEntry { organization_id: "org-x".into(), from: "denis@x.io".into(), verified: true }];
-        let mut only_waiting = PeopleRows { waiting: &waiting, ..PeopleRows::none() };
-        let (painted, _) = paint_received_people(&[], &mut only_waiting, None);
-        assert!(painted.has(&sharing::waiting_line("denis@x.io")), "{:?}", painted.text);
-        assert!(!painted.has(RECEIVED_EMPTY_HEADLINE), "{:?}", painted.text);
     }
 
     /// **The activity sentence says what happened and what is left, and never
@@ -9348,123 +5624,6 @@ mod paint_tests {
         egui::vec2(1240.0 - crate::vault_window::SIDEBAR_WIDTH, 740.0)
     }
 
-    /// The rect of a run of exactly `label` in the DETAIL column.
-    fn detail_rect(painted: &Painted, label: &str) -> egui::Rect {
-        painted
-            .rects_of_exact(label)
-            .into_iter()
-            .find(|r| r.center().x >= crate::vault_window::LIST_WIDTH)
-            .unwrap_or_else(|| {
-                panic!("{label:?} was not painted in the detail column: {:?}", painted.text)
-            })
-    }
-
-    /// **Design 5b's header is ONE band, and it is one band whenever it can
-    /// be.**
-    ///
-    /// 5b draws the detail pane's controls on the title's own line, right
-    /// aligned; this pane drew them on a row of their own underneath, which
-    /// is most of why the column read as a stack of parts rather than as a
-    /// page. It cannot always: at `MIN_VAULT_WINDOW_SIZE` the column is 298pt
-    /// and 5b's arrangement does not fit at any padding. So the rule is
-    /// measured, and this is the test that says the measurement really
-    /// switches -- a `let inline = true` would pass half of it and a
-    /// `let inline = false` the other half.
-    #[test]
-    fn the_detail_actions_share_the_title_line_when_there_is_room_and_take_their_own_when_there_is_not()
-    {
-        let state = one_row(crate::send::SendState::Waiting);
-
-        let (roomy, _) = paint(&state, None, roomy_pane_size());
-        let copy = detail_rect(&roomy, REVOKE_LABEL);
-        let title = detail_rect(&roomy, "SAP Production");
-        let pill = detail_rect(&roomy, WAITING_LABEL);
-        assert!(
-            copy.left() > title.right(),
-            "with room to spare the actions are not beside the title: Copy link at {copy:?}, \
-             title at {title:?}"
-        );
-        assert!(
-            copy.center().y < pill.bottom(),
-            "with room to spare the actions still sit BELOW the header block rather than on \
-             its line: Copy link centred at y={}, the pill ends at y={}",
-            copy.center().y,
-            pill.bottom()
-        );
-
-        let (tight, _) = paint(&state, None, min_pane_size());
-        let copy = detail_rect(&tight, REVOKE_LABEL);
-        let pill = detail_rect(&tight, WAITING_LABEL);
-        assert!(
-            copy.center().y > pill.bottom(),
-            "at the minimum window size the actions were squeezed onto the title's line, \
-             where 5b's own arrangement does not fit: Copy link centred at y={}, the pill \
-             ends at y={}",
-            copy.center().y,
-            pill.bottom()
-        );
-        // And the row is still INSIDE the pane, which is the whole reason the
-        // padding shrinks rather than the labels.
-        let right = min_pane_size().x;
-        {
-            let label = REVOKE_LABEL;
-            let rect = detail_rect(&tight, label);
-            assert!(
-                rect.right() <= right,
-                "{label:?} runs past the right edge of a {right}pt pane: {rect:?}"
-            );
-        }
-    }
-
-    /// **Cancel lands in Delete's exact rectangle at BOTH widths.**
-    ///
-    /// The mis-click defence on this screen is that a second rapid click
-    /// where Delete was lands on Cancel, and that holds only while the two
-    /// rectangles are equal. It is asserted here at both ends because the
-    /// header now measures its own row: a measurement that counted only the
-    /// VISIBLE controls -- Cancel replaces Delete and the switch leaves --
-    /// made the right-aligned row narrower on the confirming frame and slid
-    /// Cancel away from Delete's pixels. That bug was written, and this is
-    /// what found it. See [`action_labels`].
-    #[test]
-    fn cancel_stands_exactly_where_delete_was_at_both_pane_widths() {
-        let state = one_row(crate::send::SendState::Waiting);
-        for size in [roomy_pane_size(), min_pane_size()] {
-            let (before, _) = paint_with(&state, None, size, SendDeleteView::default());
-            let (during, _) = paint_with(
-                &state,
-                None,
-                size,
-                SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false },
-            );
-            let delete = detail_rect(&before, REVOKE_LABEL);
-            let cancel = detail_rect(&during, CANCEL_LABEL);
-            let delete_box = before
-                .fill_behind(delete)
-                .expect("Delete has no button behind it")
-                .0;
-            let cancel_box = during
-                .fill_behind(cancel)
-                .expect("Cancel has no button behind it")
-                .0;
-            // **The whole rectangle, not its centre.** A button eight points
-            // taller than the one it replaces has the same centre and is not
-            // the same target -- which is exactly the defect this test found
-            // on its first run: egui wrapped `Cancel` inside a slot measured
-            // for `Delete` and grew the button to fit. See
-            // `theme::action_button`'s wrap mode.
-            assert!(
-                (delete_box.min - cancel_box.min).length() < 0.5
-                    && (delete_box.max - cancel_box.max).length() < 0.5,
-                "at a {}pt pane Delete's button is at {:?} and Cancel's at {:?} -- the \
-                 second of two rapid clicks where Delete was no longer lands on Cancel",
-                size.x,
-                delete_box,
-                cancel_box
-            );
-        }
-    }
-
     /// **Design 5b's `opacity: 0.72`: a Send whose link is over steps back,
     /// and a live one does not.**
     ///
@@ -9535,146 +5694,6 @@ mod paint_tests {
         }
     }
 
-    /// **The standing notes are a footnote, under the rows.**
-    ///
-    /// They used to sit between the strip and the first row -- some seventy
-    /// points of grey prose at the top of the column, so the first thing the
-    /// eye met on this screen was a help note and the rows began a third of
-    /// the way down. 5b's list column goes strip, then rows. The sentences
-    /// are still here, because both are true and both are things a user has
-    /// to be told; they are simply no longer the headline.
-    #[test]
-    fn the_standing_notes_sit_below_the_rows_rather_than_above_them() {
-        let state = rows(3);
-        for size in [roomy_pane_size(), min_pane_size()] {
-            let (painted, _) = paint(&state, None, size);
-            let note = painted
-                .rect_of(SCOPE_SUBTEXT)
-                .unwrap_or_else(|| panic!("the standing note vanished: {:?}", painted.text));
-            let first = painted
-                .rect_of("send-number-0")
-                .expect("the first row was not painted");
-            assert!(
-                note.top() > first.bottom(),
-                "at a {}pt pane the standing note is still above the first row: note at \
-                 {note:?}, first row at {first:?}",
-                size.x
-            );
-            // And it really is at the FOOT of the column rather than merely
-            // after the rows: nothing of the list is drawn below it.
-            assert!(
-                note.bottom() <= size.y + 1.0,
-                "the note is drawn off the bottom of the pane: {note:?} in {size:?}"
-            );
-        }
-    }
-
-    /// **Design 5c's caution band, on exactly the Sends that have been
-    /// opened.**
-    ///
-    /// The band is the one part of 5c's history block this client can stand
-    /// behind -- it is a reading of `accessCount` and names no time, browser
-    /// or city. The half that is easy to lose is the second: a pane that drew
-    /// it unconditionally would warn every user about every link, including
-    /// the ones nobody has touched, which is how a warning stops being read.
-    #[test]
-    fn a_send_that_has_been_opened_is_cautioned_and_an_untouched_one_is_not() {
-        let opened = one_row(crate::send::SendState::Used);
-        let untouched = one_row(crate::send::SendState::Waiting);
-        for size in [roomy_pane_size(), min_pane_size()] {
-            let (painted, _) = paint(&opened, None, size);
-            assert!(
-                painted.has(CAUTION_HEADLINE),
-                "at a {}pt pane a Send somebody has opened says nothing about it: {:?}",
-                size.x,
-                painted.text
-            );
-            let text = painted.rect_of(CAUTION_HEADLINE).expect("just asserted");
-            let (band, fill) = painted
-                .fill_behind(text)
-                .expect("the caution sentence has no band behind it");
-            assert_eq!(
-                fill,
-                theme::CAUTION_WASH,
-                "the caution sentence is on something other than the design's amber ground"
-            );
-            assert!(
-                band.right() <= size.x + 1.0 && band.left() >= crate::vault_window::LIST_WIDTH,
-                "the caution band is not inside the detail column: {band:?} in {size:?}"
-            );
-
-            let (painted, _) = paint(&untouched, None, size);
-            assert!(
-                !painted.has(CAUTION_HEADLINE),
-                "at a {}pt pane a link nobody has opened is warned about anyway: {:?}",
-                size.x,
-                painted.text
-            );
-            // The control for that absence: the pane really drew, so what is
-            // missing is the band and not the screen.
-            assert!(painted.has(LINK_CARD_TITLE), "nothing was painted at all");
-        }
-    }
-
-    /// **The detail title is elided, not clipped.**
-    ///
-    /// `elided`'s whole argument, applied to the one run on this screen that
-    /// had escaped it: a clipped galley keeps its full width, so a 21px name
-    /// at 298pt was laid out at its natural size and simply stopped at the
-    /// pane edge -- a complete-looking title that is not the title, with
-    /// nothing to say a word had gone.
-    #[test]
-    fn a_long_detail_title_ends_in_an_ellipsis_inside_the_pane() {
-        use crate::send::SendSummary;
-        let send = SendSummary {
-            id: "id0".to_string(),
-            name: "Remote Desktop \u{2014} Bastion \u{2014} contractor access, third quarter"
-                .to_string(),
-            access_url: "https://send.bitwarden.com/#/x".to_string(),
-            deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
-            is_file: false,
-            max_access_count: None,
-            access_count: 0,
-            disabled: false,
-            expiration_date: String::new(),
-            has_password: false,
-        };
-        let state = pane_state(Some(&Ok(vec![send])), &FixedClock(NOW), &UTC);
-        for size in [roomy_pane_size(), min_pane_size()] {
-            let (painted, _) = paint(&state, None, size);
-            // The DETAIL header's copy of the name. Found by its column
-            // rather than by its size, because the list row draws the very
-            // same string and the two are told apart by where they are.
-            let (text, rect) = painted
-                .text_rects
-                .iter()
-                .filter(|(t, r)| {
-                    t.starts_with("Remote Desktop")
-                        && r.center().x >= crate::vault_window::LIST_WIDTH
-                })
-                .max_by(|a, b| a.1.width().partial_cmp(&b.1.width()).expect("finite"))
-                .cloned()
-                .unwrap_or_else(|| panic!("no title was painted: {:?}", painted.text));
-            assert!(
-                rect.right() <= size.x + 1.0,
-                "at a {}pt pane the title runs past the edge: {text:?} at {rect:?}",
-                size.x
-            );
-            // At the minimum size this name cannot fit at 21px, so what is
-            // being asserted there is that the reader is TOLD it was cut. At
-            // the roomy size it may well fit, and a test that demanded an
-            // ellipsis would be demanding a defect.
-            if !text.ends_with("quarter") {
-                assert!(
-                    text.ends_with('\u{2026}'),
-                    "at a {}pt pane the title was cut short with no ellipsis to say so: \
-                     {text:?}",
-                    size.x
-                );
-            }
-        }
-    }
-
     // ---- person shares in the Sent list (design 6c) -------------------------------
 
     use crate::rest::sharing::PersonState;
@@ -9715,7 +5734,7 @@ mod paint_tests {
         let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
         theme::apply(&ctx);
         let tiles = RecordTiles { items: records, icons: None };
-        let _ = ctx.run_ui(input(Vec::new()), |ui| {
+        let _ = warm_run(&ctx, || input(Vec::new()), |ui| {
             let _ = draw_send_pane(ui, state, None, SendDeleteView::default(), SendView::Mine(ALL_SENDS), selected, tiles, people)
                 .into_action();
         });
@@ -9740,100 +5759,562 @@ mod paint_tests {
         ]
     }
 
-    /// Every row band the list column painted, top-down: a white fill exactly
-    /// one records row tall.
-    fn list_rows(painted: &Painted) -> Vec<egui::Rect> {
-        let mut rows: Vec<egui::Rect> = painted
+
+    // ====================================================================
+    // The Shared page (spec A 4) and the Send detail modal (spec B 7)
+    //
+    // The page is a grid of cards; a card opens a modal. `in_list` counts
+    // what the PAGE painted and `in_detail` what the MODAL painted (see
+    // `Painted`), so the old column vocabulary still reads true: a picked
+    // Send's words are in "the detail".
+    // ====================================================================
+
+    /// The card (a white 18-radius rect) a name sits on, on the page.
+    fn card_of(painted: &Painted, name: &str) -> egui::Rect {
+        let text = painted
+            .rects_of_exact(name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{name:?} was not painted: {:?}", painted.text));
+        painted
             .fills
             .iter()
-            .filter(|(r, fill)| {
-                *fill == theme::CARD
-                    && r.center().x < crate::vault_window::LIST_WIDTH
-                    && (r.height() - ROW_HEIGHT).abs() < 0.5
-            })
+            .filter(|(r, fill)| *fill == theme::CARD && r.width() > 200.0 && r.contains_rect(text))
             .map(|(r, _)| *r)
-            .collect();
-        rows.sort_by(|a, b| a.top().total_cmp(&b.top()));
-        rows.dedup_by(|a, b| (a.min - b.min).length() < 0.5);
-        rows
+            .min_by(|a, b| (a.width() * a.height()).total_cmp(&(b.width() * b.height())))
+            .unwrap_or_else(|| panic!("{name:?} is on no card"))
     }
 
-    /// **A share row is a Send row's shape** (design 6c in 5b's column): the
-    /// same band, the same tile in the same place, the name on the same line
-    /// -- measured off what each PAINTS, the records-list parity rule this
-    /// column already holds -- and it is listed first. What sets it apart is
-    /// what 6c says does: the person mark's subtitle and a share pill, the
-    /// filled blue of Shared rather than a Send's stadium state pill.
+    /// [`click_nth_picking`], also answering the selection the click left.
+    fn click_picking_sel(
+        state: &SendPaneState,
+        delete: SendDeleteView<'_>,
+        picked: Option<String>,
+        label: &str,
+        nth: usize,
+    ) -> (SendUiAction, Option<String>) {
+        let mut selected = picked;
+        let size = min_pane_size();
+        let ctx = egui::Context::default();
+        let base = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(base(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(base(), |_ui| {});
+        let draw = |ui: &mut egui::Ui, selected: &mut Option<String>| {
+            draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), selected, RecordTiles::default(), &mut crate::vault_window::share_ui::PeopleRows::none()).into_action()
+        };
+        let output = warm_run(&ctx, base, |ui| {
+            let _ = draw(ui, &mut selected);
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        let targets = painted.rects_clickable(label);
+        assert!(targets.len() > nth, "only {} widgets labelled {label:?} were painted: {:?}", targets.len(), painted.text);
+        let pos = targets[nth].center();
+        let events = press_at(pos);
+        let mut action = SendUiAction::None;
+        let _ = ctx.run_ui(egui::RawInput { events: events[..2].to_vec(), ..base() }, |ui| {
+            let _ = draw(ui, &mut selected);
+        });
+        let _ = ctx.run_ui(egui::RawInput { events: events[2..].to_vec(), ..base() }, |ui| {
+            action = draw(ui, &mut selected);
+        });
+        (action, selected)
+    }
+
     #[test]
-    fn a_share_row_is_drawn_to_a_send_rows_shape_and_listed_first() {
-        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+    fn each_state_paints_its_own_pill_on_its_card_and_on_its_modal() {
+        use crate::send::SendState;
+        for state in [SendState::Waiting, SendState::Used, SendState::Expired, SendState::Revoked] {
+            let word = state_label(state);
+            let tone = state_tone(state);
+            let (painted, _) = paint(&one_row(state), None, min_pane_size());
+            assert_eq!(painted.in_list(word), 1, "{state:?}: the card's pill: {:?}", painted.text);
+            assert_eq!(painted.in_detail(word), 1, "{state:?}: the modal header's pill: {:?}", painted.text);
+            let (rect, fill) = painted.control_under(word);
+            assert_eq!(fill.a(), tone.fill.a().min(fill.a()), "control: {fill:?}");
+            let word_rect = painted.rects_of_exact(word)[0];
+            // Spec A 4: 13 bold, padding `5 11`, fully round.
+            assert!(
+                (rect.width() - word_rect.width() - 22.0).abs() < 4.0,
+                "the {state:?} pill is {} wide around a {} word: not the design's 11 either side",
+                rect.width(),
+                word_rect.width()
+            );
+            assert!((24.0..=28.0).contains(&rect.height()), "the {state:?} pill is {} tall", rect.height());
+        }
+        // Opened is its own state and its own colours (a live link, seen).
+        let painted = paint(&one_row(SendState::Opened), None, min_pane_size()).0;
+        assert_eq!(painted.in_list(OPENED_LABEL), 1, "{:?}", painted.text);
+        assert_eq!(painted.in_list(WAITING_LABEL), 0, "an opened link still says Waiting");
+        assert_ne!(state_tone(SendState::Opened).fill, state_tone(SendState::Waiting).fill);
+    }
+
+    #[test]
+    fn a_cards_pill_sits_inside_its_card_and_clear_of_its_name() {
+        let state = one_row(crate::send::SendState::Waiting);
+        let (painted, _) = paint(&state, None, min_pane_size());
+        let card = card_of(&painted, "SAP Production");
+        let (pill, _) = painted.control_under(WAITING_LABEL);
+        let name = painted.rects_of_exact("SAP Production")[0];
+        assert!(card.contains_rect(pill), "the pill leaves its card: {pill:?} in {card:?}");
+        assert!(pill.left() >= name.right(), "the name ends at {} and the pill starts at {}", name.right(), pill.left());
+        assert!(
+            card.right() - pill.right() >= 20.0,
+            "the pill is {}pt from the card's edge: it shares the line with the chevron, 20pt in",
+            card.right() - pill.right()
+        );
+    }
+
+    #[test]
+    fn the_page_lists_every_send_as_a_card_and_says_which_are_files() {
+        let state = rows(6);
+        let (painted, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), None);
+        for i in 0..6 {
+            assert_eq!(painted.in_list(&format!("send-number-{i}")), 1, "card {i}: {:?}", painted.text);
+        }
+        assert_eq!(painted.count("File Send"), 3, "the file Sends say so on their card: {:?}", painted.text);
+        // Two to a row at this width, and the cards of one row share a top.
+        let a = card_of(&painted, "send-number-0");
+        let b = card_of(&painted, "send-number-1");
+        let c = card_of(&painted, "send-number-2");
+        assert!((a.top() - b.top()).abs() < 0.5 && b.left() > a.right(), "{a:?} {b:?}");
+        assert!(c.top() > a.bottom(), "the third card starts a new row: {a:?} {c:?}");
+        assert!((b.left() - a.right() - 16.0).abs() < 0.5, "the grid's gap is 16: {a:?} {b:?}");
+        assert!(painted.has(shared_page::TITLE), "the page's title");
+        assert!(painted.has(shared_page::SUB), "the page's sub-line");
+    }
+
+    #[test]
+    fn a_live_card_offers_copy_link_and_revoke_and_an_ended_one_offers_neither() {
+        let live = paint_picking(&one_row(crate::send::SendState::Waiting), None, min_pane_size(), SendDeleteView::default(), None).0;
+        assert_eq!(live.count_exact(COPY_LINK_LABEL), 1, "{:?}", live.text);
+        assert_eq!(live.count_exact(REVOKE_LABEL), 1, "{:?}", live.text);
+        for state in [crate::send::SendState::Used, crate::send::SendState::Expired, crate::send::SendState::Revoked] {
+            let ended = paint_picking(&one_row(state), None, min_pane_size(), SendDeleteView::default(), None).0;
+            assert_eq!(ended.count_exact(COPY_LINK_LABEL), 0, "{state:?} offers Copy link on its card");
+            assert_eq!(ended.count_exact(REVOKE_LABEL), 0, "{state:?} offers Revoke on its card");
+        }
+    }
+
+    #[test]
+    fn a_cards_copy_link_reports_the_url_of_its_own_send() {
+        let state = rows(6);
+        let SendPaneState::Rows(model) = &state else { panic!("not rows") };
+        for index in [0usize, 1] {
+            let (action, selected) =
+                click_picking_sel(&state, SendDeleteView::default(), None, COPY_LINK_LABEL, index);
+            assert_eq!(action, SendUiAction::CopyLink(model[index].access_url.clone()), "card {index}");
+            assert_eq!(selected, None, "Copy link does not also open the modal");
+        }
+    }
+
+    #[test]
+    fn a_cards_revoke_asks_about_that_send_and_opens_its_modal_for_the_answer() {
+        let state = rows(4);
+        for index in [0usize, 1] {
+            let (action, selected) = click_picking_sel(&state, SendDeleteView::default(), None, REVOKE_LABEL, index);
+            assert_eq!(action, SendUiAction::AskDelete(format!("id{index}")));
+            assert_eq!(selected, Some(format!("id{index}")), "the question is asked in the modal");
+        }
+    }
+
+    #[test]
+    fn pressing_a_card_opens_the_modal_of_that_send() {
+        let state = rows(4);
+        let (action, selected) = click_picking_sel(&state, SendDeleteView::default(), None, "send-number-2", 0);
+        assert_eq!(action, SendUiAction::None);
+        assert_eq!(selected.as_deref(), Some("id2"));
+        let (painted, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), selected);
+        assert_eq!(painted.in_detail("send-number-2"), 1, "the modal names the Send: {:?}", painted.text);
+        assert_eq!(painted.in_detail("send-number-0"), 0);
+    }
+
+    #[test]
+    fn a_card_whose_url_is_empty_copies_nothing() {
+        let state = SendPaneState::Rows(vec![SendRow {
+            sent: None,
+            id: "id-no-url".into(),
+            name: "no url".into(),
+            expiry: "Expires in 7 days".into(),
+            is_file: false,
+            access_url: String::new(),
+            state: crate::send::SendState::Waiting,
+            access_count: 0,
+            max_access_count: None,
+            has_password: false,
+            activity: "Nobody has opened this link. The link works, as often as they like.".to_string(),
+            expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
+            deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
+            extendable: true,
+        }]);
+        assert_eq!(
+            click_picking_sel(&state, SendDeleteView::default(), None, COPY_LINK_LABEL, 0).0,
+            SendUiAction::None,
+            "a Send with no link put an empty string on the clipboard"
+        );
+        let (painted, _) = paint(&state, None, min_pane_size());
+        assert!(painted.has(ADDRESS_MISSING), "the missing link is not said: {:?}", painted.text);
+        assert_eq!(painted.in_detail(COPY_LINK_LABEL), 1, "control: the modal was not drawn");
+    }
+
+    #[test]
+    fn a_send_with_no_id_asks_to_revoke_nothing() {
+        let state = SendPaneState::Rows(vec![SendRow {
+            sent: None,
+            id: String::new(),
+            name: "no id".into(),
+            expiry: "Expires in 7 days".into(),
+            is_file: false,
+            access_url: "https://send.bitwarden.com/#/x".into(),
+            state: crate::send::SendState::Waiting,
+            access_count: 0,
+            max_access_count: None,
+            has_password: false,
+            activity: "Nobody has opened this link. The link works, as often as they like.".to_string(),
+            expires: NO_EXPIRY_OF_ITS_OWN.to_string(),
+            deletes: "17 Aug 2026, 00:00 \u{00b7} in 7 days".to_string(),
+            extendable: true,
+        }]);
+        let (painted, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), None);
+        assert_eq!(painted.count_exact(REVOKE_LABEL), 0, "a card with no id offered Revoke: {:?}", painted.text);
+        assert_eq!(painted.count_exact(COPY_LINK_LABEL), 0, "a card with no id offered actions");
+    }
+
+    #[test]
+    fn the_modal_copies_the_link_of_the_send_it_is_showing() {
+        let state = rows(6);
+        let SendPaneState::Rows(model) = &state else { panic!("not rows") };
+        for index in [0usize, 3, 5] {
+            let expected = model[index].access_url.clone();
+            assert_eq!(
+                click_nth_picking(&state, SendDeleteView::default(), Some(model[index].id.clone()), COPY_LINK_LABEL, 0),
+                SendUiAction::CopyLink(expected.clone()),
+                "Copy link did not report {expected} while row {index} was picked"
+            );
+        }
+    }
+
+    #[test]
+    fn a_picked_send_can_be_revoked_and_the_first_click_only_asks() {
+        let state = rows(6);
+        let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
+        assert_eq!(painted.in_detail(REVOKE_LABEL), 1, "the picked Send's modal has no Revoke: {:?}", painted.text);
+        assert!(!painted.has(CONFIRM_LABEL), "the destructive button is painted before anything was asked");
+        for nth in [0usize, 5] {
+            let action =
+                click_nth_picking(&state, SendDeleteView::default(), Some(format!("id{nth}")), REVOKE_LABEL, 0);
+            assert_eq!(action, SendUiAction::AskDelete(format!("id{nth}")), "row {nth}");
+        }
+    }
+
+    #[test]
+    fn only_the_send_asked_about_shows_the_confirmation() {
+        let state = rows(4);
+        let armed = SendDeleteView { confirming: Some("id2"), in_flight: None, extending: false };
+        let (painted, _) = paint_picking(&state, None, min_pane_size(), armed, Some("id2".to_string()));
+        assert_eq!(painted.count_exact(CONFIRM_LABEL), 1, "{:?}", painted.text);
+        assert_eq!(painted.count_exact(CANCEL_LABEL), 1, "the way out of the confirmation is not painted once");
+        assert_eq!(painted.in_detail(REVOKE_LABEL), 0, "the armed Send kept its Revoke beside the question");
+        assert!(painted.has(CONFIRM_PROMPT), "the question is not asked: {:?}", painted.text);
+
+        let (other, _) = paint_picking(&state, None, min_pane_size(), armed, Some("id0".to_string()));
+        assert_eq!(other.count_exact(CONFIRM_LABEL) + other.count_exact(CANCEL_LABEL), 0, "id2's question is over id0");
+        assert_eq!(other.in_detail(REVOKE_LABEL), 1, "the Send that is NOT being asked about lost its Revoke");
+        assert!(!other.has(CONFIRM_PROMPT), "the question followed the selection");
+
+        assert_eq!(
+            click_nth_picking(&state, armed, Some("id2".to_string()), CONFIRM_LABEL, 0),
+            SendUiAction::ConfirmDelete { id: "id2".to_string(), name: "send-number-2".to_string() },
+            "the confirmation answered for a Send other than the one it was asked about"
+        );
+    }
+
+    #[test]
+    fn a_send_being_revoked_says_so_on_its_card_and_its_modal_and_has_no_buttons() {
+        let state = rows(3);
+        let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: false };
+        let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
+        assert_eq!(painted.in_detail(DELETING_LABEL), 1, "the modal does not say anything is happening: {:?}", painted.text);
+        assert_eq!(painted.in_list(DELETING_LABEL), 1, "the card of the Send being revoked does not say so: {:?}", painted.text);
+        for label in [REVOKE_LABEL, OPEN_RECORD_LABEL, CONFIRM_LABEL, EXTEND_LABEL] {
+            assert_eq!(painted.in_detail(label), 0, "{label:?} is offered on a Send already being revoked");
+        }
+        let card = card_of(&painted, "send-number-0");
+        assert!(
+            !painted.rects_of_exact(REVOKE_LABEL).iter().any(|r| card.contains_rect(*r)),
+            "the busy card kept its Revoke"
+        );
+        assert_eq!(painted.in_list("Expires in"), 0, "the card printed its expiry BESIDE the progress word");
+    }
+
+    #[test]
+    fn extend_reports_the_send_it_was_pressed_on_in_one_step() {
+        let state = rows(3);
+        let (painted, _) = paint_with(&state, None, min_pane_size(), SendDeleteView::default());
+        assert_eq!(painted.in_detail(EXTEND_LABEL), 1, "no Extend on the modal: {:?}", painted.text);
+        assert_eq!(painted.in_list(EXTEND_LABEL), 0, "Extend leaked onto the cards");
+        assert_eq!(
+            click_nth_with(&state, SendDeleteView::default(), EXTEND_LABEL, 0),
+            SendUiAction::Extend { id: "id0".to_string(), name: "send-number-0".to_string() }
+        );
+    }
+
+    #[test]
+    fn extend_steps_back_for_the_question_and_a_busy_send_says_extending() {
+        let state = rows(3);
+        let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
+        let (asking, _) = paint_with(&state, None, min_pane_size(), armed);
+        assert_eq!(asking.in_detail(EXTEND_LABEL), 0, "Extend beside a question about destroying");
+        assert_eq!(asking.count_exact(CANCEL_LABEL), 1, "control: the question is not up");
+
+        let busy = SendDeleteView { confirming: None, in_flight: Some("id0"), extending: true };
+        let (painted, _) = paint_with(&state, None, min_pane_size(), busy);
+        assert_eq!(painted.in_detail(EXTENDING_LABEL), 1, "{:?}", painted.text);
+        assert_eq!(painted.in_list(EXTENDING_LABEL), 1, "{:?}", painted.text);
+        assert_eq!(painted.count_exact(DELETING_LABEL), 0, "an Extend is described as a revoke");
+        for label in [EXTEND_LABEL, REVOKE_LABEL, OPEN_RECORD_LABEL] {
+            assert_eq!(painted.in_detail(label), 0, "{label:?} is offered while the Extend runs");
+        }
+    }
+
+    #[test]
+    fn the_modal_says_what_the_link_is_and_what_has_happened_to_it() {
+        let (painted, _) = detail_of(a_fully_described_send());
+        for (label, times) in [(ADDRESS_ROW, 1), (OPENS_WITH_ROW, 1), (VIEWS_ROW, 1), (EXPIRES_ROW, 1), (DELETED_ROW, 1), ("Opens", 1), ("Link", 1), ("Includes", 1), ("Activity", 1)] {
+            assert_eq!(painted.in_detail(label), times, "the modal does not draw {label:?} {times} time(s): {:?}", painted.text);
+        }
+        assert!(painted.has("https://send.bitwarden.com/#/g7HqK2"), "the link: {:?}", painted.text);
+        assert_eq!(painted.count_exact(PASSWORD_SEGMENT), 1, "a password Send does not say so: {:?}", painted.text);
+        assert!(painted.has("3 of 10"), "the count against its cap: {:?}", painted.text);
+        let expires = painted.text.iter().find(|t| t.contains("17 Aug 2026")).expect("an expiry date");
+        let deletes = painted.text.iter().find(|t| t.contains("20 Aug 2026")).expect("a deletion date");
+        assert_ne!(expires, deletes, "the Expires and Deleted rows print one date, so one of the two is not being read");
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, TALL_WINDOW);
+        for (text, rect) in painted.dialog_text_rects() {
+            assert!(
+                pane.contains_rect(rect.shrink(0.5)),
+                "{text:?} was painted at {rect:?}, outside the {pane:?} window at the minimum size"
+            );
+        }
+    }
+
+    #[test]
+    fn the_opens_with_row_says_what_the_recipient_needs() {
+        let (with, _) = detail_of(a_fully_described_send());
+        assert_eq!(with.count_exact(PASSWORD_SEGMENT), 1);
+        assert_eq!(with.count_exact(LINK_ONLY), 0);
+        let (without, _) = detail_of(SendSummary { has_password: false, ..a_fully_described_send() });
+        assert_eq!(without.count_exact(LINK_ONLY), 1, "{:?}", without.text);
+        assert_eq!(without.count_exact(PASSWORD_SEGMENT), 0);
+    }
+
+    #[test]
+    fn a_dead_links_address_is_struck_through_and_marked() {
+        let (live, _) = detail_of(a_fully_described_send());
+        assert_eq!(live.count_exact(DEAD_MARKER), 0, "a live link is marked dead: {:?}", live.text);
+        let used = SendSummary { access_count: 10, ..a_fully_described_send() };
+        assert_eq!(crate::send::send_state(&used, &FixedClock(NOW)), crate::send::SendState::Used, "control");
+        let (painted, _) = detail_of(used);
+        assert_eq!(painted.count_exact(DEAD_MARKER), 1, "a spent Send still presents its link as working: {:?}", painted.text);
+        assert!(
+            painted.struck.iter().any(|t| t.starts_with("https://send.bitwarden.com")),
+            "nothing is struck through the dead address: {:?}",
+            painted.struck
+        );
+        assert!(live.struck.is_empty(), "a live link is struck through: {:?}", live.struck);
+    }
+
+    #[test]
+    fn the_activity_answers_whether_it_was_used_and_invents_no_timeline() {
+        let (painted, _) = detail_of(a_fully_described_send());
+        assert_eq!(painted.in_detail("Activity"), 1, "no Activity: {:?}", painted.text);
+        for absent in ["Berlin", "Edge", "Password revealed"] {
+            assert!(!painted.has(absent), "the modal paints {absent:?}: a Bitwarden Send keeps no per-open record");
+        }
+        assert!(painted.has("Opened 3 times"), "{:?}", painted.text);
+        assert!(painted.has("7 views left"), "{:?}", painted.text);
+        let SendPaneState::Rows(rows) = pane_state(Some(&Ok(vec![a_fully_described_send()])), &FixedClock(NOW), &UTC) else {
+            panic!("not rows")
+        };
+        let events = shared_page::activity_events(&rows[0]);
+        assert_eq!(events.first().map(|e| e.0.as_str()), Some("Created by you"));
+        assert!(events.iter().any(|e| e.0 == "Opened 3 times" && e.1 == "3 of 10 opens"), "{events:?}");
+        assert!(events.last().is_some_and(|e| e.0 == "The link stops working"), "{events:?}");
+    }
+
+    #[test]
+    fn an_opened_password_send_is_cautioned_in_the_modal_and_an_untouched_one_is_not() {
+        let with_password = |state| match one_row(state) {
+            SendPaneState::Rows(mut rows) => {
+                rows[0].sent = Some(SentFacts { recipient: String::new(), item_id: "item-1".into(), fields: vec!["Password".into()] });
+                SendPaneState::Rows(rows)
+            }
+            other => other,
+        };
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let mut window = Session::new(size, Some("id0".to_string()));
+            let painted = window.settle(&with_password(crate::send::SendState::Opened), SendDeleteView::default(), &mut PeopleRows::none(), &[]);
+            assert_eq!(painted.in_detail(SEEN_TITLE), 1, "at {}pt: {:?}", size.x, painted.text);
+            let text = painted.dialog_rect_of(SEEN_TITLE);
+            let (band, fill) = painted.fill_behind(text).expect("the caution has no band behind it");
+            assert_eq!(fill, theme::CAUTION_WASH, "the caution is not on the amber ground");
+            assert!(band.right() <= size.x + 1.0 && band.left() >= 0.0, "{band:?}");
+            assert_eq!(
+                click_nth_picking(&with_password(crate::send::SendState::Opened), SendDeleteView::default(), Some("id0".into()), CHANGE_PASSWORD, 0),
+                SendUiAction::ChangePassword("item-1".into()),
+                "Change password does not open the record's edit"
+            );
+            let (quiet, _) = paint(&with_password(crate::send::SendState::Waiting), None, size);
+            assert!(!quiet.has(SEEN_TITLE), "a link nobody has opened is warned about anyway");
+        }
+    }
+
+    #[test]
+    fn a_long_name_ends_in_an_ellipsis_on_the_card_and_in_the_modal() {
+        let send = SendSummary {
+            id: "id0".to_string(),
+            name: "Remote Desktop \u{2014} Bastion \u{2014} contractor access, third quarter, and then some more words".to_string(),
+            access_url: "https://send.bitwarden.com/#/x".to_string(),
+            deletion_date: "2026-08-17T00:00:00.000Z".to_string(),
+            is_file: false,
+            max_access_count: None,
+            access_count: 0,
+            disabled: false,
+            expiration_date: String::new(),
+            has_password: false,
+        };
+        let state = pane_state(Some(&Ok(vec![send])), &FixedClock(NOW), &UTC);
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let (painted, _) = paint(&state, None, size);
+            let names: Vec<_> = painted.text_rects.iter().filter(|(t, _)| t.starts_with("Remote Desktop")).collect();
+            assert!(names.len() >= 2, "the card and the modal both name it: {:?}", painted.text);
+            for (text, rect) in names {
+                assert!(rect.right() <= size.x + 1.0, "at {}pt the name runs past the edge: {text:?} at {rect:?}", size.x);
+                // Laid out to fit (with its ellipsis), not painted full width
+                // and clipped: the whole name at 17pt bold is wider than this.
+                assert!(rect.width() < 520.0, "at {}pt the name was not shortened: {text:?} at {rect:?}", size.x);
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_picked_draws_no_modal_and_a_stale_pick_draws_none_either() {
+        let state = rows(3);
+        let (painted, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), None);
+        assert_eq!(painted.in_detail(REVOKE_LABEL) + painted.in_detail(EXTEND_LABEL), 0, "a modal with nothing picked");
+        assert_eq!(painted.dialog_text_rects().count(), 0, "{:?}", painted.text);
+        let (stale, _) = paint_picking(&state, None, min_pane_size(), SendDeleteView::default(), Some("id-that-is-gone".to_string()));
+        assert_eq!(stale.dialog_text_rects().count(), 0, "a selection naming a Send that is gone draws a modal: {:?}", stale.text);
+    }
+
+    #[test]
+    fn a_modal_that_is_taller_than_the_window_scrolls_and_keeps_its_buttons_on_screen() {
+        let send = SendSummary { access_count: 3, ..a_fully_described_send() };
+        let state = pane_state(Some(&Ok(vec![send])), &FixedClock(NOW), &UTC);
+        let size = egui::vec2(688.0, 430.0);
+        let (painted, _) = paint_picking(&state, None, size, SendDeleteView::default(), Some("id-detail".to_string()));
+        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        for label in [REVOKE_LABEL, COPY_LINK_LABEL, EXTEND_LABEL] {
+            let at = painted.dialog_rect_of(label);
+            assert!(pane.contains_rect(at), "{label:?} at {at:?} is off a {size:?} window");
+        }
+    }
+
+    #[test]
+    fn a_send_made_from_a_record_with_an_icon_wears_it_on_its_card_and_its_modal() {
+        let size = min_pane_size();
+        let record = a_record("rec-1", "23000268.xyz");
+        let state = a_send_made_from(&record);
+        let with_icon = paint_sent_with(&state, size, |ctx| (vec![record.clone()], Some(a_texture(ctx))));
+        assert!(with_icon.images.len() >= 2, "the card's and the modal's tiles hold no picture: {:?}", with_icon.images);
+        assert!(
+            !with_icon.text.iter().any(|t| t == &crate::vault_window::item_list::initials(&record.name)),
+            "the monogram was painted as well as the icon: {:?}",
+            with_icon.text
+        );
+        let without = paint_sent_with(&state, size, |_| (vec![record.clone()], None));
+        assert!(without.images.is_empty(), "a picture with no icon: {:?}", without.images);
+        assert!(
+            without.text.iter().any(|t| t == &crate::vault_window::item_list::initials(&record.name)),
+            "no monogram when the record has no icon: {:?}",
+            without.text
+        );
+    }
+
+    #[test]
+    fn the_standing_notes_sit_below_the_cards_and_a_file_is_explained_only_when_listed() {
+        let state = SendPaneState::Rows(vec![summary_row("a text Send", false), summary_row("report.pdf", true)]);
+        let size = egui::vec2(688.0, 900.0);
+        let (painted, _) = paint_picking(&state, None, size, SendDeleteView::default(), None);
+        let note = painted.rect_of(SCOPE_SUBTEXT).unwrap_or_else(|| panic!("the standing note vanished: {:?}", painted.text));
+        let card = card_of(&painted, "report.pdf");
+        assert!(note.top() > card.bottom(), "the note is above the cards: {note:?} {card:?}");
+        assert!(painted.has(FILE_SEND_EXPLANATION), "a file Send was listed with nothing saying what it means");
+        let text_only = SendPaneState::Rows(vec![summary_row("a text Send", false)]);
+        let (painted, _) = paint_picking(&text_only, None, size, SendDeleteView::default(), None);
+        assert!(!painted.has(FILE_SEND_EXPLANATION), "a list of text Sends was told about a restriction it has not met");
+        assert!(painted.has(SCOPE_SUBTEXT));
+    }
+
+    #[test]
+    fn each_sharing_sub_filter_lists_exactly_what_its_badge_counts() {
+        use crate::send::SendState;
+        use crate::vault_window::sidebar::SendScope;
+        let state = one_of_each_state();
+        for (scope, expected) in [
+            (SendScope::All, vec!["send-waiting", "send-used", "send-expired", "send-revoked"]),
+            (SendScope::Waiting, vec!["send-waiting"]),
+            (SendScope::Used, vec!["send-used"]),
+            (SendScope::Ended, vec!["send-expired", "send-revoked"]),
+        ] {
+            let painted = paint_scope(&state, scope);
+            for name in ["send-waiting", "send-used", "send-expired", "send-revoked"] {
+                let wanted = expected.contains(&name);
+                assert_eq!(painted.in_list(name) == 1, wanted, "under {scope:?} {name:?}: {:?}", painted.text);
+            }
+            let title = if scope == SendScope::All { shared_page::TITLE } else { scope.label() };
+            assert!(painted.has(title), "the page does not name the {scope:?} cut it shows: {:?}", painted.text);
+        }
+        let counts = crate::vault_window::sidebar::SendCounts::over([SendState::Waiting, SendState::Used, SendState::Expired, SendState::Revoked]);
+        assert_eq!((counts.waiting, counts.used, counts.ended, counts.all), (1, 1, 2, 4));
+    }
+
+    // ---- person shares -----------------------------------------------------
+
+    #[test]
+    fn a_share_is_a_card_listed_before_the_sends_and_wears_a_share_pill() {
         let record = a_record("rec-1", "SAP Production");
         let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
         let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
-        let (painted, _) = paint_sharing(
-            &a_send_made_from(&record),
-            &mut people,
-            &mut None,
-            std::slice::from_ref(&record),
-            size,
-            Vec::new(),
-        );
-        let rows = list_rows(&painted);
-        assert_eq!(rows.len(), 2, "one share and one Send: {rows:?}");
-        let (share, send) = (rows[0], rows[1]);
-        assert_eq!(share.width(), send.width(), "the share row is not a Send row's width");
-        assert_eq!(share.left(), send.left());
-        assert!(
-            (send.top() - share.bottom() - LIST_ROW_GAP).abs() < 0.51,
-            "the two rows are not one list's gap apart: {share:?} {send:?}"
-        );
-
-        // The tile, and the name beside it, at one offset in both bands.
-        let tile_in = |row: egui::Rect| {
-            painted
-                .strokes
-                .iter()
-                .map(|(r, _)| *r)
-                .find(|r| row.contains_rect(*r) && (r.width() - r.height()).abs() < 0.5 && r.width() > 20.0)
-                .unwrap_or_else(|| panic!("no tile in {row:?}"))
-        };
-        let (share_tile, send_tile) = (tile_in(share), tile_in(send));
-        assert!(((share_tile.min - share.min) - (send_tile.min - send.min)).length() < 0.51, "{share_tile:?} vs {send_tile:?}");
-        assert_eq!(share_tile.size(), send_tile.size());
-        let names: Vec<egui::Rect> = painted
+        let size = min_pane_size();
+        let (painted, _) = paint_sharing(&a_send_made_from(&record), &mut people, &mut None, std::slice::from_ref(&record), size, Vec::new());
+        let cards: Vec<egui::Rect> = painted
             .text_rects
             .iter()
-            .filter(|(t, r)| t == &record.name && r.center().x < crate::vault_window::LIST_WIDTH)
+            .filter(|(t, _)| t == &record.name)
             .map(|(_, r)| *r)
             .collect();
-        assert_eq!(names.len(), 2, "{:?}", painted.text);
-        let (share_name, send_name) = if names[0].top() < names[1].top() { (names[0], names[1]) } else { (names[1], names[0]) };
-        assert!((share_name.left() - send_name.left()).abs() < 0.51);
-        assert!(((share_name.top() - share.top()) - (send_name.top() - send.top())).abs() < 1.01);
-
-        // 6c's own marks: the subtitle, and a share pill in Shared's blue.
+        assert_eq!(cards.len(), 2, "one share and one Send: {:?}", painted.text);
+        assert!(cards[0].top() <= cards[1].top() && cards[0].left() < cards[1].left(), "the share leads: {cards:?}");
         assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 1, "{:?}", painted.text);
-        assert_eq!(painted.in_list(theme::SharePillKind::Shared.label()), 1);
         let pill = theme::SharePillKind::Shared.tone();
+        let share_card = card_of(&painted, &record.name);
         assert!(
-            painted
-                .fills
-                .iter()
-                .any(|(r, f)| *f == pill.fill && share.contains_rect(*r) && (r.height() - theme::PILL_HEIGHT).abs() < 0.5),
-            "the share row wears no share pill"
+            painted.fills.iter().any(|(r, f)| *f == pill.fill && share_card.contains_rect(*r)),
+            "the share card wears no share pill"
         );
-        assert!(
-            !painted.fills.iter().any(|(r, f)| *f == pill.fill && send.contains_rect(*r)),
-            "control: the Send row wears Shared's blue as well, so the fill says nothing"
-        );
-        assert!(painted.has("2 items"), "a share is not a Send, so the count is of items: {:?}", painted.text);
+        assert!(painted.has("Since 14 Sep"), "{:?}", painted.text);
     }
 
-    /// **A share's own detail** (mock 6c): PERSON and WHAT THEY SEE, Open
-    /// record, and a red Stop sharing that only ASKS -- picked from its row.
     #[test]
-    fn a_shares_detail_shows_the_person_and_stops_in_two_steps() {
-        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
+    fn a_shares_modal_shows_the_person_and_stops_in_two_steps() {
+        let size = min_pane_size();
         let record = a_record("rec-1", "Acme VPN");
         let state = a_send_made_from(&record);
         let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
@@ -9841,17 +6322,14 @@ mod paint_tests {
         let records = std::slice::from_ref(&record);
         let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
 
-        // Picked from its row, which is the first.
         let mut selected = None;
         let (painted, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
-        let row = list_rows(&painted)[0];
-        let _ = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(row.center()));
-        assert_eq!(selected.as_deref(), Some(key.as_str()), "the share row did not pick itself");
+        let card = card_of(&painted, "Acme VPN");
+        let _ = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(card.center_top() + egui::vec2(0.0, 30.0)));
+        assert_eq!(selected.as_deref(), Some(key.as_str()), "the share card did not pick itself");
 
         let (painted, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
         for words in [
-            share_ui::PERSON_CARD_TITLE,
-            share_ui::WHAT_THEY_SEE_TITLE,
             share_ui::SHARED_WITH_A_PERSON,
             share_ui::VIEW_ONLY,
             share_ui::FOLLOWS_EDITS,
@@ -9861,25 +6339,355 @@ mod paint_tests {
             OPEN_RECORD_LABEL,
             share_ui::STOP_LABEL,
         ] {
-            assert_eq!(painted.in_detail(words), 1, "{words:?} in the detail: {:?}", painted.text);
+            assert_eq!(painted.in_detail(words), 1, "{words:?} in the modal: {:?}", painted.text);
         }
         assert_eq!(painted.in_detail(REVOKE_LABEL), 0, "a share has no link to revoke");
 
-        let open = painted.rects_of_exact(OPEN_RECORD_LABEL)[0].center();
+        let open = painted.dialog_rect_of(OPEN_RECORD_LABEL).center();
         let (_, action) = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(open));
         assert_eq!(action, SendUiAction::OpenRecord(record.id.clone()));
         assert_eq!(people.asked, None);
 
-        let stop = painted.rects_of_exact(share_ui::STOP_LABEL)[0].center();
+        let stop = painted.dialog_rect_of(share_ui::STOP_LABEL).center();
         let (_, action) = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(stop));
         assert_eq!(people.asked, Some(PeopleAsk::Stop(key.clone())), "step one asks, and nothing else");
         assert_eq!(action, SendUiAction::None);
     }
 
-    /// **Step two** (mock 6c, confirm): the red question over the cards,
-    /// Cancel in Stop sharing's own slot, Open record gone, and "Remove from
-    /// their vault" as the one way through. And while the stop runs, the
-    /// header says so and offers nothing.
+    #[test]
+    fn a_shares_modal_says_what_went_wrong_at_its_foot() {
+        let record = a_record("rec-1", "Acme VPN");
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::WaitingAccept)];
+        let mut people = PeopleRows { shares: &shares, notice: Some(share_ui::BUSY.to_string()), ..PeopleRows::none() };
+        let mut selected = Some(shares[0].key.clone());
+        let (painted, _) =
+            paint_sharing(&a_send_made_from(&record), &mut people, &mut selected, std::slice::from_ref(&record), TALL_WINDOW, Vec::new());
+        assert_eq!(painted.in_detail(share_ui::BUSY), 1, "no notice: {:?}", painted.text);
+        let notice = painted.dialog_rect_of(share_ui::BUSY);
+        let facts = painted.dialog_rect_of(share_ui::CAN_ROW);
+        assert!(notice.top() > facts.top(), "the sentence is not under the facts");
+        assert_eq!(painted.in_detail(share_ui::FOLLOWS_EDITS), 0);
+        assert_eq!(painted.in_detail(share_ui::STATUS_ROW), 1, "{:?}", painted.text);
+    }
+
+    #[test]
+    fn a_gone_share_draws_no_modal_and_shares_list_only_on_all() {
+        let record = a_record("rec-1", "Acme VPN");
+        let records = std::slice::from_ref(&record);
+        let size = min_pane_size();
+        let mut people = PeopleRows::none();
+        let mut selected = Some(share_ui::share_key("the-old-id", "anna@x.io"));
+        let (painted, _) = paint_sharing(&a_send_made_from(&record), &mut people, &mut selected, records, size, Vec::new());
+        assert_eq!(painted.dialog_text_rects().count(), 0, "{:?}", painted.text);
+
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
+        let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
+        let (painted, _) = paint_sharing(&SendPaneState::Empty, &mut people, &mut None, records, size, Vec::new());
+        assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 1, "an account with no Sends still lists its share");
+        assert!(!painted.has(EMPTY_HEADLINE), "{:?}", painted.text);
+        assert!(painted.has(SHARES_SUBTEXT) || painted.has(SCOPE_SUBTEXT), "{:?}", painted.text);
+
+        let waiting_only = paint_scope_with(&a_send_made_from(&record), crate::vault_window::sidebar::SendScope::Waiting, &mut people);
+        assert_eq!(waiting_only.in_list("to anna@x.io \u{b7} Shared"), 0, "a share on a Send-state sub-row");
+    }
+
+    /// [`paint_scope`] with person shares handed to the pane.
+    fn paint_scope_with(
+        state: &SendPaneState,
+        scope: crate::vault_window::sidebar::SendScope,
+        people: &mut PeopleRows<'_>,
+    ) -> Painted {
+        let size = min_pane_size();
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+        let _ = ctx.run_ui(input(), |_ui| {});
+        theme::apply(&ctx);
+        let _ = ctx.run_ui(input(), |_ui| {});
+        let output = warm_run(&ctx, input, |ui| {
+            let _ = draw_send_pane(ui, state, None, SendDeleteView::default(), SendView::Mine(scope), &mut None, RecordTiles::default(), people).into_action();
+        });
+        let mut painted = Painted::default();
+        for clipped in &output.shapes {
+            collect(&clipped.shape, &mut painted);
+        }
+        painted
+    }
+
+    #[test]
+    fn shares_are_listed_while_the_sends_load_and_after_they_fail() {
+        let record = a_record("rec-1", "Acme VPN");
+        let records = std::slice::from_ref(&record);
+        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
+        let failed = SendPaneState::Failed { message: "bw is not signed in.".to_string(), ambiguous: true };
+        for size in [egui::vec2(1028.0, 740.0), min_pane_size()] {
+            for (state, status) in [(&SendPaneState::Loading, LOADING_LABEL), (&failed, TRY_AGAIN_LABEL)] {
+                let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
+                let (painted, _) = paint_sharing(state, &mut people, &mut None, records, size, Vec::new());
+                assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 1, "{status:?}: the share is not listed: {:?}", painted.text);
+                let card = card_of(&painted, "Acme VPN");
+                let words = painted.rect_of(status).unwrap_or_else(|| panic!("no {status:?}: {:?}", painted.text));
+                assert!(words.top() > card.bottom(), "{status:?} is not under the share");
+                assert!(words.bottom() <= size.y, "{status:?} is pushed off a {}pt window", size.y);
+
+                let mut none = PeopleRows::none();
+                let (bare, _) = paint_sharing(state, &mut none, &mut None, records, size, Vec::new());
+                assert_eq!(bare.in_list("to anna@x.io \u{b7} Shared"), 0);
+                assert!(bare.has(status));
+            }
+        }
+    }
+
+    // ---- Shared with me ------------------------------------------------------
+
+    #[test]
+    fn shared_with_me_lists_imports_as_cards_and_says_where_each_went() {
+        let history = crate::receive_history::ReceiveHistory {
+            entries: vec![
+                a_received_record(NOW - 3_600_000, "SAP Production", "item-here"),
+                a_received_record(NOW - 7_200_000, "Office WiFi", "item-gone"),
+            ],
+        };
+        let items = vec![vault_item("item-here")];
+        let rows = received_rows(&history, &items, &FixedClock(NOW), &UTC);
+
+        let listed = paint_received(&rows, None);
+        assert!(listed.has(shared_page::RECEIVED_TITLE), "the page does not name itself: {:?}", listed.text);
+        assert_eq!(listed.in_list("SAP Production"), 1);
+        assert_eq!(listed.in_list("Office WiFi"), 1);
+        assert_eq!(listed.in_list("In your vault"), 1);
+        assert_eq!(listed.in_list("Gone"), 1);
+        assert_eq!(listed.dialog_text_rects().count(), 0, "a modal with nothing picked");
+        for leaked in [LOADING_LABEL, SCOPE_SUBTEXT] {
+            assert!(!listed.has(leaked), "{leaked:?} is drawn on `Shared with me`, which asks the server nothing: {:?}", listed.text);
+        }
+
+        let present = paint_received(&rows, Some("item-here".to_string()));
+        assert!(present.has(RECEIVED_ITEM_PRESENT), "{:?}", present.text);
+        assert_eq!(present.in_detail(IN_VAULT_YES), 1);
+        assert!(present.has(ARRIVED_ROW));
+
+        let gone = paint_received(&rows, Some("item-gone".to_string()));
+        assert!(gone.has(RECEIVED_ITEM_GONE), "{:?}", gone.text);
+        assert_eq!(gone.in_detail(IN_VAULT_NO), 1);
+    }
+
+    #[test]
+    fn an_empty_shared_with_me_says_nothing_has_arrived_and_the_scope_line_is_its_own() {
+        let painted = paint_received(&[], None);
+        assert!(painted.has(RECEIVED_EMPTY_HEADLINE), "{:?}", painted.text);
+        assert!(painted.has(RECEIVED_SCOPE_SUBTEXT));
+    }
+
+    #[test]
+    fn shared_with_me_puts_records_from_people_above_the_imports_and_opens_them() {
+        use crate::vault_window::share_ui::{ReceivedShareRow, FROM_PEOPLE_EYEBROW, FROM_SENDS_EYEBROW};
+        let history = crate::receive_history::ReceiveHistory {
+            entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
+        };
+        let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
+        let people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
+        let painted = paint_received_with(&rows, &people, None);
+        let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
+        assert!(top(FROM_PEOPLE_EYEBROW) < top("Acme VPN"));
+        assert!(top("Acme VPN") < top(FROM_SENDS_EYEBROW));
+        assert!(top(FROM_SENDS_EYEBROW) < top("SAP Production"));
+        assert!(painted.has("from denis@x.io \u{b7} view-only"), "{:?}", painted.text);
+        assert!(painted.has(RECEIVED_PEOPLE_SUBTEXT) && !painted.has(RECEIVED_SCOPE_SUBTEXT), "{:?}", painted.text);
+        let imports_only = paint_received_with(&rows, &[], None);
+        assert!(imports_only.has(RECEIVED_SCOPE_SUBTEXT) && !imports_only.has(RECEIVED_PEOPLE_SUBTEXT));
+
+        let alone = paint_received_with(&[], &people, None);
+        assert!(alone.has("Acme VPN"));
+        assert!(!alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
+        assert!(!alone.has(FROM_SENDS_EYEBROW), "an eyebrow over no rows: {:?}", alone.text);
+
+        // A press on a record from a person opens it in the vault, as the
+        // 0.15 row did, and picks nothing (the vault is where it is read).
+        let at = card_of(&painted, "Acme VPN").center_top() + egui::vec2(0.0, 30.0);
+        let mut people_rows = PeopleRows { received: &people, ..PeopleRows::none() };
+        let (action, selected) = press_received(&rows, &mut people_rows, at);
+        assert_eq!(action, SendUiAction::OpenRecord("r9".into()));
+        assert_eq!(selected, None);
+    }
+
+    /// Presses `at` on the `Shared with me` page and answers the action and
+    /// the selection it left.
+    fn press_received(rows: &[ReceivedRow], people: &mut PeopleRows<'_>, at: egui::Pos2) -> (SendUiAction, Option<String>) {
+        let size = min_pane_size();
+        let ctx = egui::Context::default();
+        let input = |events: Vec<egui::Event>| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(Vec::new()), |_ui| {});
+        theme::apply(&ctx);
+        let mut selected = None;
+        let state = SendPaneState::Loading;
+        let mut run = |events: Vec<egui::Event>, selected: &mut Option<String>| {
+            let mut action = SendUiAction::None;
+            let _ = ctx.run_ui(input(events), |ui| {
+                action = draw_send_pane(ui, &state, None, SendDeleteView::default(), SendView::Received(rows), selected, RecordTiles::default(), people).into_action();
+            });
+            action
+        };
+        let _ = run(Vec::new(), &mut selected);
+        let events = press_at(at);
+        let _ = run(events[..2].to_vec(), &mut selected);
+        let action = run(events[2..].to_vec(), &mut selected);
+        (action, selected)
+    }
+
+    #[test]
+    fn organisations_that_share_with_you_are_told_apart_by_a_hairline() {
+        use crate::vault_window::share_ui::ReceivedShareRow;
+        let row = |id: &str, org: &str| ReceivedShareRow { key: format!("recv:{id}"), item_id: id.into(), name: id.into(), from: "boss@x.io".into(), verified: false, organization_id: org.into() };
+        let hairlines = |rows: &[ReceivedShareRow]| {
+            paint_received_with(&[], rows, None)
+                .fills
+                .iter()
+                .filter(|(r, f)| *f == crate::kit::tokens::Palette::LIGHT.hairline && r.height() <= 1.5 && r.width() > 100.0)
+                .count()
+        };
+        let one = hairlines(&[row("a", "org-1"), row("b", "org-1")]);
+        let two = hairlines(&[row("a", "org-1"), row("b", "org-2")]);
+        assert_eq!(two, one + 1, "one hairline between the two organisations' records");
+    }
+
+    #[test]
+    fn paste_an_invite_link_leads_shared_with_me() {
+        use crate::vault_window::share_ui::{self as sharing, PeopleRows, ReceivedShareRow};
+        let history = crate::receive_history::ReceiveHistory {
+            entries: vec![a_received_record(NOW - 3_600_000, "SAP Production", "item-here")],
+        };
+        let rows = received_rows(&history, &[vault_item("item-here")], &FixedClock(NOW), &UTC);
+        let from_people = [ReceivedShareRow { key: "recv:r9".into(), item_id: "r9".into(), name: "Acme VPN".into(), from: "denis@x.io".into(), verified: true, organization_id: "org-x".into() }];
+        let mut people = PeopleRows { received: &from_people, paste: Some(zeroize::Zeroizing::new(String::new())), ..PeopleRows::none() };
+        let (painted, selected) = paint_received_people(&rows, &mut people, None);
+        assert_eq!(selected, None, "nothing is picked for the user");
+        let top = |label: &str| painted.rect_of(label).unwrap_or_else(|| panic!("no {label:?} in {:?}", painted.text)).top();
+        assert!(top(sharing::PASTE_ACCEPT_LABEL) < top(sharing::FROM_PEOPLE_EYEBROW));
+
+        let mut box_only = PeopleRows { paste: Some(zeroize::Zeroizing::new(String::new())), ..PeopleRows::none() };
+        let (alone, _) = paint_received_people(&[], &mut box_only, None);
+        assert!(alone.has(sharing::PASTE_ACCEPT_LABEL), "{:?}", alone.text);
+        assert!(alone.has(RECEIVED_EMPTY_HEADLINE), "{:?}", alone.text);
+
+        let waiting = [crate::rest::sharing::WaitingEntry { organization_id: "org-x".into(), from: "denis@x.io".into(), verified: true }];
+        let mut only_waiting = PeopleRows { waiting: &waiting, ..PeopleRows::none() };
+        let (painted, _) = paint_received_people(&[], &mut only_waiting, None);
+        assert!(painted.has(&sharing::waiting_line("denis@x.io")), "{:?}", painted.text);
+        assert!(!painted.has(RECEIVED_EMPTY_HEADLINE), "{:?}", painted.text);
+    }
+
+    /// **One window across frames**, for what depends on the frame before: a
+    /// dialog's card shows on its second pass, and a question that joins the
+    /// modal keeps the height the modal had at rest.
+    struct Session {
+        ctx: egui::Context,
+        size: egui::Vec2,
+        selected: Option<String>,
+        /// Seconds; a second a frame, so a fade or a pop is over by the next.
+        clock: f64,
+    }
+
+    impl Session {
+        fn new(size: egui::Vec2, selected: Option<String>) -> Self {
+            let ctx = egui::Context::default();
+            let input = || egui::RawInput { screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)), ..Default::default() };
+            let _ = ctx.run_ui(input(), |_ui| {});
+            theme::apply(&ctx);
+            Self { ctx, size, selected, clock: 0.0 }
+        }
+
+        /// One frame with `events`.
+        fn frame(
+            &mut self,
+            state: &SendPaneState,
+            delete: SendDeleteView<'_>,
+            people: &mut PeopleRows<'_>,
+            records: &[crate::vault_bridge::VaultItem],
+            events: Vec<egui::Event>,
+        ) -> (Painted, SendUiAction) {
+            self.clock += 1.0;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+                time: Some(self.clock),
+                events,
+                ..Default::default()
+            };
+            let mut action = SendUiAction::None;
+            let selected = &mut self.selected;
+            let tiles = RecordTiles { items: records, icons: None };
+            let output = self.ctx.run_ui(input, |ui| {
+                action = draw_send_pane(ui, state, None, delete, SendView::Mine(ALL_SENDS), selected, tiles, people).into_action();
+            });
+            let mut painted = Painted::default();
+            for clipped in &output.shapes {
+                collect(&clipped.shape, &mut painted);
+            }
+            (painted, action)
+        }
+
+        /// Six quiet frames (an anchored card is placed by the size it had the
+        /// frame before, and a scrolled body takes a few to find its own), the
+        /// last one's paint.
+        fn settle(
+            &mut self,
+            state: &SendPaneState,
+            delete: SendDeleteView<'_>,
+            people: &mut PeopleRows<'_>,
+            records: &[crate::vault_bridge::VaultItem],
+        ) -> Painted {
+            for _ in 0..5 {
+                let _ = self.frame(state, delete, people, records, Vec::new());
+            }
+            self.frame(state, delete, people, records, Vec::new()).0
+        }
+    }
+
+    #[test]
+    fn cancel_stands_exactly_where_revoke_was_at_both_window_sizes() {
+        let state = one_row(crate::send::SendState::Waiting);
+        for size in [roomy_pane_size(), min_pane_size()] {
+            let mut window = Session::new(size, Some("id0".to_string()));
+            let mut none = PeopleRows::none();
+            let before = window.settle(&state, SendDeleteView::default(), &mut none, &[]);
+            let revoke = before.fill_behind(before.dialog_rect_of(REVOKE_LABEL)).expect("Revoke has no button").0;
+            let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
+            let during = window.settle(&state, armed, &mut none, &[]);
+            let cancel = during.fill_behind(during.dialog_rect_of(CANCEL_LABEL)).expect("Cancel has no button").0;
+            assert!(
+                (revoke.min - cancel.min).length() < 0.5 && (revoke.max - cancel.max).length() < 0.5,
+                "at {}pt Revoke is {revoke:?} and Cancel {cancel:?}: the question grew the dialog and moved the buttons",
+                size.x
+            );
+        }
+    }
+
+    #[test]
+    fn a_second_click_where_revoke_was_cancels_and_never_destroys() {
+        let state = rows(3);
+        let mut window = Session::new(min_pane_size(), Some("id0".to_string()));
+        let mut none = PeopleRows::none();
+        let before = window.settle(&state, SendDeleteView::default(), &mut none, &[]);
+        let where_revoke_was = before.dialog_rect_of(REVOKE_LABEL).center();
+        let armed = SendDeleteView { confirming: Some("id0"), in_flight: None, extending: false };
+        let during = window.settle(&state, armed, &mut none, &[]);
+        assert!(
+            !during.dialog_rect_of(CONFIRM_LABEL).contains(where_revoke_was),
+            "control: the destructive button covers Revoke's place"
+        );
+        let (_, action) = window.frame(&state, armed, &mut none, &[], press_at(where_revoke_was));
+        assert_eq!(
+            action,
+            SendUiAction::CancelDelete,
+            "the pixel Revoke occupied does something other than cancel once the question is up -- a \
+             double-click on Revoke would delete a public link with no decision taken"
+        );
+        assert!(!matches!(action, SendUiAction::ConfirmDelete { .. }));
+    }
+
     #[test]
     fn stopping_a_share_asks_first_and_cancel_takes_the_stops_place() {
         let record = a_record("rec-1", "Acme VPN");
@@ -9887,150 +6695,42 @@ mod paint_tests {
         let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
         let key = shares[0].key.clone();
         let records = std::slice::from_ref(&record);
-        for size in [egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0), min_pane_size()] {
-            let mut selected = Some(key.clone());
+        for size in [egui::vec2(1028.0, 740.0), min_pane_size()] {
+            let mut window = Session::new(size, Some(key.clone()));
             let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
-            let (at_rest, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
-            let stop_rect = at_rest.rects_of_exact(share_ui::STOP_LABEL)[0];
-            assert!(stop_rect.right() <= size.x + 0.5, "Stop sharing runs off a {}pt pane", size.x);
+            let at_rest = window.settle(&state, SendDeleteView::default(), &mut people, records);
+            let stop_rect = at_rest.dialog_rect_of(share_ui::STOP_LABEL);
+            assert!(stop_rect.right() <= size.x + 0.5, "Stop sharing runs off a {}pt window", size.x);
 
             people.confirming = Some(key.clone());
-            let (asking, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
+            let asking = window.settle(&state, SendDeleteView::default(), &mut people, records);
             assert!(asking.has(&share_ui::stop_question("Acme VPN", "anna@x.io")), "{:?}", asking.text);
             assert_eq!(asking.in_detail(share_ui::REMOVE_LABEL), 1);
             assert_eq!(asking.in_detail(OPEN_RECORD_LABEL), 0, "Open record steps back while the question is up");
             assert_eq!(asking.in_detail(share_ui::STOP_LABEL), 0);
-            let (cancel_button, _) = asking.control_under(share_ui::CANCEL_BUTTON);
-            let (stop_button, _) = at_rest.control_under(share_ui::STOP_LABEL);
+            let cancel_button = asking.fill_behind(asking.dialog_rect_of(share_ui::CANCEL_BUTTON)).expect("Cancel has no button").0;
+            let stop_button = at_rest.fill_behind(stop_rect).expect("Stop has no button").0;
             assert!(
                 (cancel_button.min - stop_button.min).length() < 0.51 && (cancel_button.max - stop_button.max).length() < 0.51,
                 "Cancel is not in Stop sharing's slot at {}pt: {cancel_button:?} vs {stop_button:?}",
                 size.x
             );
 
-            let remove = asking.rects_of_exact(share_ui::REMOVE_LABEL)[0].center();
-            let _ = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(remove));
+            let remove = asking.dialog_rect_of(share_ui::REMOVE_LABEL).center();
+            people.asked = None;
+            let _ = window.frame(&state, SendDeleteView::default(), &mut people, records, press_at(remove));
             assert_eq!(people.asked, Some(PeopleAsk::ConfirmStop(key.clone())));
-            let cancel = asking.rects_of_exact(share_ui::CANCEL_BUTTON)[0].center();
-            let _ = paint_sharing(&state, &mut people, &mut selected, records, size, press_at(cancel));
+            let cancel = asking.dialog_rect_of(share_ui::CANCEL_BUTTON).center();
+            people.asked = None;
+            let _ = window.frame(&state, SendDeleteView::default(), &mut people, records, press_at(cancel));
             assert_eq!(people.asked, Some(PeopleAsk::CancelStop));
 
             people.confirming = None;
             people.stopping = Some(key.clone());
-            let (running, _) = paint_sharing(&state, &mut people, &mut selected, records, size, Vec::new());
+            let running = window.settle(&state, SendDeleteView::default(), &mut people, records);
             assert_eq!(running.in_detail(share_ui::STOPPING_LABEL), 1, "{:?}", running.text);
             for control in [share_ui::STOP_LABEL, share_ui::CANCEL_BUTTON, OPEN_RECORD_LABEL, share_ui::REMOVE_LABEL] {
                 assert_eq!(running.in_detail(control), 0, "{control:?} is offered while the stop runs");
-            }
-        }
-    }
-
-    /// **A sentence about the share on screen is said on it**, at the foot of
-    /// its detail -- a stop that failed, or one refused while another write
-    /// ran.
-    #[test]
-    fn a_shares_detail_says_what_went_wrong_at_its_foot() {
-        let record = a_record("rec-1", "Acme VPN");
-        let shares = [a_share_of(&record, "anna@x.io", PersonState::WaitingAccept)];
-        let mut people = PeopleRows { shares: &shares, notice: Some(share_ui::BUSY.to_string()), ..PeopleRows::none() };
-        let mut selected = Some(shares[0].key.clone());
-        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
-        let (painted, _) =
-            paint_sharing(&a_send_made_from(&record), &mut people, &mut selected, std::slice::from_ref(&record), size, Vec::new());
-        let notice = painted.rect_of(share_ui::BUSY).unwrap_or_else(|| panic!("no notice: {:?}", painted.text));
-        let card = painted.rect_of(share_ui::WHAT_THEY_SEE_TITLE).expect("the last card");
-        assert!(notice.top() > card.top(), "the sentence is not at the foot");
-        // A person still waiting has no copy to follow edits: the row says
-        // where they stand instead.
-        assert_eq!(painted.in_detail(share_ui::FOLLOWS_EDITS), 0);
-        assert_eq!(painted.in_detail(share_ui::STATUS_ROW), 1, "{:?}", painted.text);
-    }
-
-    /// **A share that has gone leaves the prompt, not a blank pane** -- a
-    /// stop that brought the record home gave it a new id, and the key the
-    /// window still holds names nothing. And the shares are listed only on
-    /// the unfiltered row, and with no Send at all.
-    #[test]
-    fn a_gone_share_leaves_the_prompt_and_shares_list_only_on_all() {
-        let record = a_record("rec-1", "Acme VPN");
-        let records = std::slice::from_ref(&record);
-        let size = egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0);
-        let mut people = PeopleRows::none();
-        let mut selected = Some(share_ui::share_key("the-old-id", "anna@x.io"));
-        let (painted, _) = paint_sharing(&a_send_made_from(&record), &mut people, &mut selected, records, size, Vec::new());
-        assert_eq!(painted.in_detail(NOTHING_PICKED), 1, "{:?}", painted.text);
-
-        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
-        let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
-        let (painted, _) = paint_sharing(&SendPaneState::Empty, &mut people, &mut None, records, size, Vec::new());
-        assert_eq!(list_rows(&painted).len(), 1, "an account with no Sends still lists its share");
-        assert!(!painted.has(EMPTY_HEADLINE), "{:?}", painted.text);
-        assert!(painted.has("1 item"), "{:?}", painted.text);
-        assert_eq!(
-            painted.in_detail(NOTHING_PICKED_WITH_SHARES),
-            1,
-            "a list to pick from, and nothing picked -- in words that name the shares"
-        );
-        assert!(painted.has(SHARES_SUBTEXT), "6c's note under a list with a share: {:?}", painted.text);
-
-        // A sub-row is a Send state, and a share has none.
-        let ctx = egui::Context::default();
-        let input = || egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-            ..Default::default()
-        };
-        let _ = ctx.run_ui(input(), |_ui| {});
-        theme::apply(&ctx);
-        let state = a_send_made_from(&record);
-        let output = ctx.run_ui(input(), |ui| {
-            let _ = draw_send_pane(
-                ui,
-                &state,
-                None,
-                SendDeleteView::default(),
-                SendView::Mine(crate::vault_window::sidebar::SendScope::Waiting),
-                &mut None,
-                RecordTiles { items: records, icons: None },
-                &mut people,
-            )
-            .into_action();
-        });
-        let mut painted = Painted::default();
-        for clipped in &output.shapes {
-            collect(&clipped.shape, &mut painted);
-        }
-        assert_eq!(painted.in_list("to anna@x.io \u{b7} Shared"), 0, "a share on a Send-state sub-row");
-    }
-
-    /// **The shares do not wait for the Sends.** They come from the daemon's
-    /// view, not from `bw send list`, so a Sends fetch still out -- which it
-    /// is on every visit -- or one that failed lists them all the same,
-    /// above its spinner or its failure, and the strip counts them as the
-    /// rail does. With no share, both states are what they always were.
-    #[test]
-    fn shares_are_listed_while_the_sends_load_and_after_they_fail() {
-        let record = a_record("rec-1", "Acme VPN");
-        let records = std::slice::from_ref(&record);
-        let shares = [a_share_of(&record, "anna@x.io", PersonState::Shared)];
-        let failed = SendPaneState::Failed { message: "bw is not signed in.".to_string(), ambiguous: true };
-        for size in [egui::vec2(crate::vault_window::LIST_WIDTH + 600.0, 700.0), min_pane_size()] {
-            for (state, status) in [(&SendPaneState::Loading, LOADING_LABEL), (&failed, TRY_AGAIN_LABEL)] {
-                let mut people = PeopleRows { shares: &shares, ..PeopleRows::none() };
-                let (painted, _) = paint_sharing(state, &mut people, &mut None, records, size, Vec::new());
-                let rows = list_rows(&painted);
-                assert_eq!(rows.len(), 1, "{status:?}: the share is not listed: {:?}", painted.text);
-                let words = painted.rect_of(status).unwrap_or_else(|| panic!("no {status:?}: {:?}", painted.text));
-                assert!(words.top() > rows[0].bottom(), "{status:?} is not under the share");
-                assert!(words.bottom() <= size.y, "{status:?} is pushed off a {}pt column", size.y);
-                assert!(painted.has("1 item"), "{status:?}: the strip does not count the share: {:?}", painted.text);
-
-                // The control: the same state with no share lists no row and
-                // counts nothing it does not know.
-                let mut none = PeopleRows::none();
-                let (bare, _) = paint_sharing(state, &mut none, &mut None, records, size, Vec::new());
-                assert!(list_rows(&bare).is_empty());
-                assert!(bare.has(status));
-                assert!(!bare.has("1 item"));
             }
         }
     }

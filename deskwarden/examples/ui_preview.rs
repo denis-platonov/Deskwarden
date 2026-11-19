@@ -579,6 +579,15 @@ enum Surface {
     /// "something is missing", it is "the same pane reads differently", and
     /// only the pair shows that.
     SendsNarrow,
+    /// The Send detail modal with its revoke question standing (spec B 7):
+    /// Copy link and Extend held back, Cancel where Revoke was.
+    SendsConfirm,
+    /// A person share's modal (design 6c).
+    SendsShare,
+    /// The same modal with Stop sharing's question up.
+    SendsShareStop,
+    /// Shared with me with records from people above the imported Sends.
+    SendsPeople,
     /// **The vault window's item list**, at the exact width the window gives
     /// it, with a card of every network this app can name in it.
     ///
@@ -675,6 +684,20 @@ enum Surface {
     ModalEmptyTrash,
     /// The forget-a-person confirmation over the shell.
     ModalForget,
+    /// The people-sharing dialog (design 6a), asking, invited, and asking
+    /// the organisation question.
+    ModalShare,
+    ModalShareInvited,
+    ModalShareQuestion,
+    /// The record import form, fetched and asking about a name collision.
+    ModalRecordImport,
+    /// The in-form password generator, and with its options open.
+    ModalGenerator,
+    ModalGeneratorOptions,
+    /// The running-window picker, one row staged.
+    ModalAppPicker,
+    /// The fill-rule (sequence) builder.
+    ModalSequence,
     /// The Add 2FA modal while the screen is being read.
     ModalTotpScanning,
     /// The Add 2FA modal asking which camera to use.
@@ -1002,6 +1025,14 @@ const ALL: &[Surface] = &[
     Surface::ModalIcon,
     Surface::ModalEmptyTrash,
     Surface::ModalForget,
+    Surface::ModalShare,
+    Surface::ModalShareInvited,
+    Surface::ModalShareQuestion,
+    Surface::ModalRecordImport,
+    Surface::ModalGenerator,
+    Surface::ModalGeneratorOptions,
+    Surface::ModalAppPicker,
+    Surface::ModalSequence,
     Surface::ModalTotpScanning,
     Surface::ModalTotpCameras,
     Surface::ModalImportSource,
@@ -1039,6 +1070,10 @@ const ALL: &[Surface] = &[
     Surface::SendsEmpty,
     Surface::SendsReceived,
     Surface::SendsNarrow,
+    Surface::SendsConfirm,
+    Surface::SendsShare,
+    Surface::SendsShareStop,
+    Surface::SendsPeople,
     Surface::Rehearsal,
     Surface::VaultSetupSpinner,
     Surface::FirstWindowLoading,
@@ -1150,6 +1185,14 @@ impl Surface {
             Surface::ModalIcon => "modal_icon_pick",
             Surface::ModalEmptyTrash => "modal_empty_trash",
             Surface::ModalForget => "modal_forget",
+            Surface::ModalShare => "modal_share",
+            Surface::ModalShareInvited => "modal_share_invited",
+            Surface::ModalShareQuestion => "modal_share_question",
+            Surface::ModalRecordImport => "modal_record_import",
+            Surface::ModalGenerator => "modal_password_generator",
+            Surface::ModalGeneratorOptions => "modal_password_generator_options",
+            Surface::ModalAppPicker => "modal_app_window_picker",
+            Surface::ModalSequence => "modal_sequence_builder",
             Surface::ModalTotpScanning => "totp_add_scanning",
             Surface::ModalTotpCameras => "totp_add_cameras",
             Surface::ModalImportSource => "modal_import_source",
@@ -1187,6 +1230,10 @@ impl Surface {
             Surface::SendsEmpty => "sends_empty",
             Surface::SendsReceived => "sends_received",
             Surface::SendsNarrow => "sends_narrow",
+            Surface::SendsConfirm => "sends_confirm",
+            Surface::SendsShare => "sends_share",
+            Surface::SendsShareStop => "sends_share_stop",
+            Surface::SendsPeople => "sends_people",
             Surface::Rehearsal => "rehearsal",
             Surface::VaultSetupSpinner => "vault_setup_spinner",
             Surface::FirstWindowLoading => "first_window_loading",
@@ -1404,6 +1451,14 @@ impl Surface {
             | Surface::ModalIcon
             | Surface::ModalEmptyTrash
             | Surface::ModalForget
+            | Surface::ModalShare
+            | Surface::ModalShareInvited
+            | Surface::ModalShareQuestion
+            | Surface::ModalRecordImport
+            | Surface::ModalGenerator
+            | Surface::ModalGeneratorOptions
+            | Surface::ModalAppPicker
+            | Surface::ModalSequence
             | Surface::ModalTotpScanning
             | Surface::ModalTotpCameras
             | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
@@ -1446,6 +1501,10 @@ impl Surface {
             Surface::SendsSelected
             | Surface::SendsList
             | Surface::SendsEmpty
+            | Surface::SendsConfirm
+            | Surface::SendsShare
+            | Surface::SendsShareStop
+            | Surface::SendsPeople
             | Surface::SendsReceived => egui::vec2(SENDS_WIDTH, PANE_HEIGHT),
             Surface::SendsNarrow => egui::vec2(SENDS_NARROW_WIDTH, SENDS_NARROW_HEIGHT),
             // The viewport's own inner size, read off the module that builds
@@ -1509,6 +1568,9 @@ impl Surface {
         )
     }
 }
+
+/// The person the Sends previews share a record with.
+const SHARE_EMAIL: &str = "anna@example.com";
 
 fn main() -> eframe::Result {
     let arg = |name: &str| std::env::args().any(|a| a == name);
@@ -1597,6 +1659,14 @@ fn main() -> eframe::Result {
             Surface::ModalIcon,
             Surface::ModalEmptyTrash,
             Surface::ModalForget,
+            Surface::ModalShare,
+            Surface::ModalShareInvited,
+            Surface::ModalShareQuestion,
+            Surface::ModalRecordImport,
+            Surface::ModalGenerator,
+            Surface::ModalGeneratorOptions,
+            Surface::ModalAppPicker,
+            Surface::ModalSequence,
             Surface::ModalTotpScanning,
             Surface::ModalTotpCameras,
             Surface::ModalImportSource,
@@ -1635,6 +1705,10 @@ fn main() -> eframe::Result {
             Surface::SendsEmpty,
             Surface::SendsReceived,
             Surface::SendsNarrow,
+            Surface::SendsConfirm,
+            Surface::SendsShare,
+            Surface::SendsShareStop,
+            Surface::SendsPeople,
         ]
     } else if edit {
         // Pristine first, because that is the picture the report was about;
@@ -1808,6 +1882,8 @@ fn main() -> eframe::Result {
                 // detail draws the present-tense sentence; the row below it
                 // in the same picture is the one whose item has gone.
                 sends_received_selected: Some("list-0001".to_string()),
+                sends_confirm_selected: Some("send-wifi".to_string()),
+                sends_share_selected: Some(format!("share:list-0001:{SHARE_EMAIL}")),
                 sends_none_selected: None,
                 window_height: 0.0,
                 login_variant: LoginVariant::Plain,
@@ -1936,6 +2012,8 @@ struct Preview {
     sends_selected: Option<String>,
     sends_narrow_selected: Option<String>,
     sends_received_selected: Option<String>,
+    sends_confirm_selected: Option<String>,
+    sends_share_selected: Option<String>,
     /// The two shots that are pictures of a column with NOTHING picked. A
     /// field rather than a temporary, because the pane takes `&mut` and a
     /// temporary would be a place a click could write to that nothing ever
@@ -2210,6 +2288,14 @@ impl eframe::App for Preview {
             | Surface::ModalIcon
             | Surface::ModalEmptyTrash
             | Surface::ModalForget
+            | Surface::ModalShare
+            | Surface::ModalShareInvited
+            | Surface::ModalShareQuestion
+            | Surface::ModalRecordImport
+            | Surface::ModalGenerator
+            | Surface::ModalGeneratorOptions
+            | Surface::ModalAppPicker
+            | Surface::ModalSequence
             | Surface::ModalTotpScanning
             | Surface::ModalTotpCameras) => {
                 use deskwarden::vault_window::{delete_modal, folder_modal, icon_modal, record_ui, trash_modal};
@@ -2235,6 +2321,75 @@ impl eframe::App for Preview {
                     Surface::ModalForget => {
                         let names = vec!["Ledgerline".to_string(), "Northwind Mail".to_string()];
                         let _ = record_ui::draw_forget_confirm(&ctx, "anna@northwind.example", &names);
+                    }
+                    Surface::ModalShare | Surface::ModalShareInvited | Surface::ModalShareQuestion => {
+                        use deskwarden::vault_window::share_ui::{SharePreview, SharePreviewStage};
+                        let stage = match surface {
+                            Surface::ModalShare => SharePreviewStage::Asking,
+                            Surface::ModalShareInvited => SharePreviewStage::Invited,
+                            _ => SharePreviewStage::Question,
+                        };
+                        SharePreview::new(stage).draw(&ctx);
+                    }
+                    Surface::ModalRecordImport => {
+                        let mut state = record_ui::RecordImport::opening();
+                        state.draft.link = "https://vault.northwind.example/#/send/Q2x1/ZkxN".to_string();
+                        state.fetched = Some(Ok(deskwarden::record::Record {
+                            name: "Ledgerline".to_string(),
+                            username: Some("a.novak@ledgerline.com".to_string()),
+                            password: Some(zeroize::Zeroizing::new("hunter2".to_string())),
+                            uri: Some("https://app.ledgerline.eu".to_string()),
+                            notes: None,
+                            totp_sealed: None,
+                            not_after: None,
+                        }));
+                        let collision = deskwarden::record::import::Collision::SameName { existing_id: "list-0001".to_string() };
+                        let now = send::FixedClock(PREVIEW_MILLIS);
+                        let _ = record_ui::draw_import_modal(&ctx, &mut state, &collision, &now);
+                    }
+                    Surface::ModalGenerator | Surface::ModalGeneratorOptions => {
+                        detail_edit::preview_generator_modal(
+                            &ctx,
+                            "k7#Qm2vP9xL!tR4wZb8",
+                            matches!(surface, Surface::ModalGeneratorOptions),
+                        );
+                    }
+                    Surface::ModalAppPicker => {
+                        let row = |title: &str, exe: &str, hwnd: isize| detail_edit::AppWindowRow {
+                            title: title.to_string(),
+                            exe_name: exe.to_string(),
+                            exe_path: format!("C:\\Program Files\\{exe}"),
+                            hosted: false,
+                            pid: 100 + hwnd as u32,
+                            hwnd,
+                        };
+                        let windows = vec![
+                            row("SAP Logon 760", "saplogon.exe", 1),
+                            row("Remote Desktop Connection", "mstsc.exe", 2),
+                            row("Ledgerline Desktop", "ledgerline.exe", 3),
+                            row("Postgres admin", "pgadmin4.exe", 4),
+                            row("Notepad", "notepad.exe", 5),
+                        ];
+                        detail_edit::preview_app_window_picker(&ctx, windows, Some(2));
+                    }
+                    Surface::ModalSequence => {
+                        use deskwarden::vault_window::sequence_builder;
+                        let edit_login = item(EDIT_LOGIN_JSON);
+                        let mut draft = sequence_builder::SequenceDraft::for_item(&edit_login, "Work", "SAP GUI for Windows")
+                            .expect("the 8a fixture carries an app binding");
+                        let palette = vec![
+                            deskwarden::key_sequence::FieldRef::Username,
+                            deskwarden::key_sequence::FieldRef::Password,
+                        ];
+                        let totp = deskwarden::vault_window::detail::TotpState::NoSecret;
+                        let source = deskwarden::key_sequence::ResolveSource {
+                            username: "a.novak@ledgerline.com",
+                            password: "correct-horse-battery",
+                            custom: Vec::new(),
+                            totp: &totp,
+                        };
+                        let mut apps = deskwarden::app_identity::AppIdentityCache::default();
+                        let _ = sequence_builder::draw_sequence_builder(root, &mut draft, &palette, &source, None, &mut apps);
                     }
                     Surface::ModalTotpCameras => {
                         let mut state = TotpAdd::opening("1", "Ledgerline", false);
@@ -2306,6 +2461,10 @@ impl eframe::App for Preview {
             | Surface::SendsList
             | Surface::SendsEmpty
             | Surface::SendsReceived
+            | Surface::SendsConfirm
+            | Surface::SendsShare
+            | Surface::SendsShareStop
+            | Surface::SendsPeople
             | Surface::SendsNarrow => self.draw_sends(root, self.current()),
             Surface::Rehearsal => self.draw_rehearsal(root),
             Surface::VaultSetupSpinner => self.draw_vault_setup_spinner(root),
@@ -3609,7 +3768,26 @@ impl Preview {
             &send::FixedClock(PREVIEW_MILLIS),
             &PREVIEW_ZONE,
         );
-        let view = if matches!(surface, Surface::SendsReceived) {
+        // The people the pane is told about: one person share, and one record
+        // somebody shares with this account.
+        let shares = vec![deskwarden::vault_window::share_ui::ShareRow {
+            key: format!("share:list-0001:{SHARE_EMAIL}"),
+            item_id: "list-0001".to_string(),
+            name: "Ledgerline".to_string(),
+            email: SHARE_EMAIL.to_string(),
+            state: deskwarden::rest::sharing::PersonState::Shared,
+            subtitle: format!("to {SHARE_EMAIL} \u{b7} Shared"),
+            since: Some("14 Sep".to_string()),
+        }];
+        let from_people = vec![deskwarden::vault_window::share_ui::ReceivedShareRow {
+            key: "recv:list-0002".to_string(),
+            item_id: "list-0002".to_string(),
+            name: "Northwind Mail".to_string(),
+            from: "denis@example.com".to_string(),
+            verified: true,
+            organization_id: "org-1".to_string(),
+        }];
+        let view = if matches!(surface, Surface::SendsReceived | Surface::SendsPeople) {
             send_ui::SendView::Received(&received)
         } else {
             send_ui::SendView::Mine(sidebar::SendScope::All)
@@ -3620,6 +3798,8 @@ impl Preview {
             Surface::SendsSelected => &mut self.sends_selected,
             Surface::SendsNarrow => &mut self.sends_narrow_selected,
             Surface::SendsReceived => &mut self.sends_received_selected,
+            Surface::SendsConfirm => &mut self.sends_confirm_selected,
+            Surface::SendsShare | Surface::SendsShareStop => &mut self.sends_share_selected,
             // `SendsList` and `SendsEmpty` are the pictures of a column with
             // nothing picked, so they are handed a selection that is None and
             // stays None -- a field of their own would be a field nothing
@@ -3629,17 +3809,31 @@ impl Preview {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(theme::CANVAS))
             .show(root, |ui| {
+                let delete = if matches!(surface, Surface::SendsConfirm) {
+                    send_ui::SendDeleteView { confirming: Some("send-wifi"), ..send_ui::SendDeleteView::default() }
+                } else {
+                    send_ui::SendDeleteView::default()
+                };
+                use deskwarden::vault_window::share_ui::PeopleRows;
+                let mut people = match surface {
+                    Surface::SendsShare => PeopleRows::with_shares(&shares),
+                    Surface::SendsShareStop => {
+                        PeopleRows::with_shares(&shares).confirming_stop(&format!("share:list-0001:{SHARE_EMAIL}"))
+                    }
+                    Surface::SendsPeople => PeopleRows::with_received(&from_people),
+                    // No daemon behind the other shots: no person share.
+                    _ => PeopleRows::none(),
+                };
                 let verdict = send_ui::draw_send_pane(
                     ui,
                     &state,
                     None,
-                    send_ui::SendDeleteView::default(),
+                    delete,
                     view,
                     selected,
                     // No vault behind the preview: every tile a monogram.
                     send_ui::RecordTiles::default(),
-                    // No daemon behind it either: no person share to list.
-                    &mut deskwarden::vault_window::share_ui::PeopleRows::none(),
+                    &mut people,
                 );
                 // Taken and thrown away: a preview has no window to act on.
                 // See the doc above for why it must not simply be dropped.

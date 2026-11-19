@@ -753,74 +753,9 @@ pub enum RecordUiAction {
     Cancel,
 }
 
-/// The card either form sits in, **and the rectangle it measured out to**.
-///
-/// The rect is new and it is what [`theme::modal_corner_mark`] needs: the
-/// dismiss ✕ is inset from the CARD's right-hand edge, and that edge is not
-/// the content column's plus the margin on these two cards. The import form
-/// sets a 360-wide maximum and overflows it, painting a 449-wide card around a
-/// 336-wide column, so arithmetic off the column would have put the mark a
-/// hundred points adrift of the corner. The frame has just measured itself and
-/// can simply say.
-/// It is `theme::form_card` and no longer a `Frame` spelled out here, and
-/// that swap is the whole of what this function now is.
-///
-/// **Why it moved.** §5a's composer is a bordered, rounded, SHADOWED card in
-/// three bands -- a header closed by a hairline, a padded body, a tinted
-/// footer -- and what stood here was white-on-white with an 8px radius and no
-/// edge at all. The Sends screen's text composer had written out the same
-/// four lines independently, so the two composers agreed only by coincidence,
-/// and the coincidence was that neither was §5a. One function draws the card
-/// now; `theme::form_card` argues every part of it.
-fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> (egui::Rect, R) {
-    theme::form_card(ui, add)
-}
-
-/// Either form's first band, answering with **the rectangle the heading
-/// occupies** -- the line the dismiss ✕ is hung on once [`card`] has measured
-/// itself.
-///
-/// The 8-point space this used to follow itself with is gone: the header is a
-/// band now, and what separates it from the first control is its own padding
-/// and the hairline under it rather than a gap.
-fn heading(ui: &mut egui::Ui, text: &str) -> egui::Rect {
-    theme::form_card_header(ui, text)
-}
-
-/// The top strip of either form: what `draw_export_modal` and
-/// `draw_import_modal` hand [`theme::modal_drag_handle`] as the band the card
-/// is dragged by.
-///
-/// It is now exactly [`theme::FORM_CARD_HEADER_HEIGHT`] -- the header band,
-/// to the hairline that closes it -- rather than a number of this file's own.
-/// The band is a real strip with nothing in it but the title, which is
-/// precisely what a drag handle wants, and a handle measured off anything
-/// else is how one ends up over a text field.
-const FORM_HEADER_HEIGHT: f32 = theme::FORM_CARD_HEADER_HEIGHT;
-
 fn note(ui: &mut egui::Ui, text: &str, colour: egui::Color32) {
     ui.add(egui::Label::new(egui::RichText::new(text).size(13.0).color(colour)).wrap());
 }
-
-/// The tick list's own box, from design §5a: `border: 1px solid #eae7e7;
-/// border-radius: 10px`.
-///
-/// **The list carries no padding of its own**, and that is the change that
-/// made these rows §5a's. Its rows declare `padding: 10px 12px` and its rule
-/// runs edge to edge between them; a padded list would inset that rule and
-/// leave a hairline floating inside a box. So the padding is
-/// [`INCLUDE_PAD_X`]/[`INCLUDE_PAD_Y`], applied per row, and the three
-/// constants that spent it here -- a list padding and a gap split either side
-/// of the rule -- are gone with the column of `egui::Checkbox`es they were
-/// measured for.
-const TICK_LIST_RADIUS: u8 = 10;
-
-/// The monogram tile beside the record's name in §5a's `RECORD` chip.
-///
-/// 32, the design's own, and the same tile `item_list` draws a row with --
-/// the point of the chip is that it is recognisably the row the composer was
-/// opened from.
-const RECORD_CHIP_TILE: f32 = 32.0;
 
 /// Design §5a's picked-record chip: a monogram tile and the record's name, in
 /// a blue-wash box edged in [`theme::BLUE_EDGE`].
@@ -853,34 +788,27 @@ const RECORD_CHIP_TILE: f32 = 32.0;
 /// this chip exactly -- 6a's `.rchip` is §5a's -- and which calls this rather
 /// than a copy of it, so the two modals name their record one way.
 pub(crate) fn record_chip(ui: &mut egui::Ui, item_name: &str, kind_and_folder: &str) {
+    let p = crate::kit::tokens::palette(ui.ctx());
     egui::Frame::new()
-        .fill(theme::BLUE_WASH)
-        .stroke(egui::Stroke::new(1.0, theme::BLUE_EDGE))
-        .corner_radius(CornerRadius::same(TICK_LIST_RADIUS))
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .fill(p.secondary_hover)
+        .corner_radius(CornerRadius::same(14))
+        .inner_margin(egui::Margin::symmetric(14, 12))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                theme::avatar(ui, &theme::initials(item_name), RECORD_CHIP_TILE, true);
-                ui.add_space(11.0);
+                theme::avatar(ui, &theme::initials(item_name), 40.0, true);
+                ui.add_space(12.0);
                 // **Two lines, which is §5a's own shape.** The name, and
                 // under it what the record IS and where it lives -- `Login ·
-                // Engineering` in the design. One line was all this drew, and
-                // the owner's verdict on the card as a whole was "very plain
-                // and not even close to this design".
-                //
-                // The second line is the READ pane's subtitle, the same two
-                // facts in the same order, so the chip reads as the row the
-                // composer was opened from rather than as a new naming of it.
+                // Engineering` in the design. The second line is the READ
+                // pane's subtitle, the same two facts in the same order, so
+                // the chip reads as the row the composer was opened from
+                // rather than as a new naming of it.
                 ui.vertical(|ui| {
                     ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.label(theme::semibold(item_name, 13.0).color(theme::BLUE_DEEP));
+                    ui.label(theme::bold(item_name, 16.0).color(p.ink));
                     if !kind_and_folder.is_empty() {
-                        ui.label(
-                            egui::RichText::new(kind_and_folder)
-                                .size(11.0)
-                                .color(theme::TEXT_MUTED),
-                        );
+                        ui.label(egui::RichText::new(kind_and_folder).size(14.0).color(p.text_faint));
                     }
                 });
             });
@@ -1055,212 +983,130 @@ pub fn draw_import_form(
     in_flight: bool,
     now: &dyn crate::send::SendClock,
 ) -> RecordUiAction {
+    use crate::kit::controls::{self, ButtonKind, ButtonSize};
+    use crate::kit::modal::{note as modal_note, Tone};
+    let p = crate::kit::tokens::palette(ui.ctx());
     let mut action = RecordUiAction::None;
     let enabled = !in_flight;
-    let (card_rect, title) = card(ui, |ui| {
-        let title = heading(ui, IMPORT_HEADING);
-        let ok = theme::form_card_body(ui, |ui| {
-            ui.add_enabled_ui(enabled, |ui| {
-                theme::hinted_field(ui, &mut draft.link, LINK_HINT, false)
-            });
-            ui.add_space(4.0);
-            note(ui, LINK_NOTE, theme::TEXT_FAINT);
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let width = ui.available_width();
 
-            let ok = match record {
-                Some(Err(refusal)) => {
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new(refusal_sentence(refusal)).size(12.0).color(theme::ERROR),
-                    );
-                    None
-                }
-                Some(Ok(record)) => Some(record),
-                None => None,
-            };
-
-            if let Some(record) = ok {
-                ui.add_space(10.0);
-                note(ui, WILL_IMPORT_HEADING, theme::TEXT_MUTED);
-                ui.add_space(2.0);
-                // Names only. Never a value; see `fields_present`.
-                for name in fields_present(record) {
-                    note(ui, name, theme::TEXT_SECONDARY);
-                }
-
-                if let Some(stale) = stale_note(record, now) {
-                    ui.add_space(8.0);
-                    note(ui, &stale, theme::TEXT_MUTED);
-                }
-
-                if needs_passphrase(record) {
-                    ui.add_space(8.0);
-                    ui.add_enabled_ui(enabled, |ui| {
-                        theme::hinted_field(ui, &mut draft.passphrase, IMPORT_PASSPHRASE_HINT, true)
-                    });
-                }
-
-                if let Collision::SameName { .. } = collision {
-                    ui.add_space(10.0);
-                    ui.label(
-                        egui::RichText::new(collision_prompt(&record.name))
-                            .size(12.0)
-                            .color(theme::INK),
-                    );
-                    ui.add_space(4.0);
-                    // **One control with two positions, and not two buttons.**
-                    //
-                    // This was a `ui.horizontal` of two `egui::Button`s with
-                    // `.selected()` on whichever was chosen -- separated by
-                    // egui's item spacing, each with its own outline, each 160
-                    // points wide whatever its label said. That is the exact
-                    // shape `theme::segmented_control`'s own documentation
-                    // records this app moving away from, and the Sends composer's
-                    // lifetime row was moved off it a pass ago; this prompt was
-                    // the last `.selected()` pair left in the two record forms.
-                    //
-                    // It matters more here than it did there. This is the one
-                    // question in this whole feature whose wrong answer destroys
-                    // data the user already had, and `.selected()` paints the
-                    // chosen button in egui's own selection fill with
-                    // [`theme::INK`] over it -- a grey that is easy to miss at a
-                    // glance across two identical 160-point boxes. The segmented
-                    // run fills the answer in force with [`theme::BLUE`] behind
-                    // white, which is the weight this app gives a primary button
-                    // and is the weight "you are about to replace an item" should
-                    // have.
-                    //
-                    // **Neither cell is lit until the user lights one.**
-                    // `draft.choice` starts `None`, both `selected` flags are
-                    // therefore `false`, and there is no `unwrap_or` here and
-                    // must not be: `import_can_proceed` refuses while the choice
-                    // is `None`, and a default would answer a question nobody
-                    // was asked.
-                    let choices = [
-                        (CREATE_SECOND_LABEL, CollisionChoice::CreateSecond),
-                        (REPLACE_LABEL, CollisionChoice::Replace),
-                    ];
-                    let segments: Vec<theme::Segment<'_>> = choices
-                        .iter()
-                        .map(|(label, choice)| theme::Segment {
-                            label,
-                            selected: draft.choice == Some(*choice),
-                        })
-                        .collect();
-                    // `segmented_control_disabled` and not `add_enabled`, for the
-                    // reason that split exists: the inert run senses hover only,
-                    // so while an import is running there is no path by which a
-                    // cell can be pressed, and the answer already given stays
-                    // legible in the wash rather than greying away.
-                    if enabled {
-                        if let Some(index) = theme::segmented_control(ui, &segments) {
-                            draft.choice = Some(choices[index].1);
-                        }
-                    } else {
-                        theme::segmented_control_disabled(ui, &segments);
-                    }
-                }
-            }
-            // Handed back out of the body band because the footer's own refusal
-            // sentence is a fact about what the link fetched.
-            ok
-        });
-
-        let problem = import_problem(ok, draft, collision);
-        let can_proceed = import_can_proceed(ok, draft, collision, in_flight);
-        // **The import footer is the design system's two buttons**, and until
-        // this pass it was neither -- two bare `egui::Button`s differing only
-        // in the colour of their text and the width of their box, the exact
-        // defect the export form's footer was fixed for one pass earlier.
-        // The two modals are opened from the same window, sit in the same
-        // card frame and answer the same shape of question; leaving one on
-        // the design system and one off it made them look like they came from
-        // different applications, for no reason anybody could name.
-        //
-        // **Which button is the primary moved, and that is the point of
-        // doing this rather than swapping the widgets.** `Fetch` was drawn
-        // first and in [`theme::TEXT_MUTED`], and `IMPORT_SUBMIT_LABEL` --
-        // the press that actually creates an item -- was drawn second in
-        // plain ink. The create is the answer this form is FOR, so it takes
-        // the filled primary and `Fetch` takes the outlined secondary, which
-        // is exactly the arrangement `EXPORT_SUBMIT_LABEL` and
-        // `EXPORT_CANCEL_LABEL` have on the other card.
-        //
-        // The order stays `Fetch` then create, because that is the order the
-        // steps happen in: you cannot import a record you have not fetched,
-        // and a footer that put the second step first would read as a form
-        // you could submit straight away. `primary_button_enabled` carries
-        // the greying, so the create is visibly not pressable until
-        // `import_can_proceed` says it is.
-        //
-        // These are `theme::BUTTON_HEIGHT`'s 32 and not this file's old 26 --
-        // see `draw_export_form`'s footer, where that argument is made once.
-        //
-        // **And in §5a's footer BAND**, for the export card's reason: these
-        // two cards are opened from the same window and sit in the same
-        // frame, so one of them growing a banded footer and the other keeping
-        // a row of buttons at the end of its body would be the same
-        // divergence this pass exists to close, one card over.
-        theme::form_card_footer(ui, |ui| {
-            let mut beside = false;
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled_ui(enabled && !draft.link.trim().is_empty(), |ui| {
-                        theme::secondary_button(ui, FETCH_LABEL)
-                    })
-                    .inner
-                    .clicked()
-                {
-                    action = RecordUiAction::FetchLink;
-                }
-                ui.add_space(theme::FORM_FOOTER_GAP);
-                if theme::primary_button_enabled(ui, IMPORT_SUBMIT_LABEL, None, can_proceed)
-                    .clicked()
-                {
-                    action = RecordUiAction::SubmitImport;
-                }
-                // **No standing note on this card**, and the absence is the
-                // decision: `APPEARS_IN_SENDS` answers "where does the thing
-                // I am publishing end up", and this form publishes nothing --
-                // it pulls a record INTO the vault. The slot carries the
-                // refusal when there is one and is empty when there is not,
-                // rather than being filled with a sentence invented to
-                // occupy it.
-                if let Some(problem) = problem {
-                    if theme::form_footer_note_width(ui, problem) + theme::FORM_FOOTER_GAP
-                        <= ui.available_width()
-                    {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            theme::form_footer_note(ui, problem);
-                        });
-                        beside = true;
-                    }
-                }
-            });
-            if let Some(problem) = problem {
-                if !beside {
-                    ui.add_space(theme::FORM_FOOTER_GAP);
-                    theme::form_footer_note(ui, problem);
-                }
-            }
-        });
-        title
+    // The link, and what it is for.
+    ui.add_enabled_ui(enabled, |ui| {
+        crate::kit::input::text(ui, egui::Id::new((IMPORT_ID, "link")), &mut draft.link, LINK_HINT, false, width)
     });
-    // **On this card the ✕ is the ONLY way out**, which makes it the one mark
-    // in this pass that is a fix rather than a consistency. This form has no
-    // Cancel button -- the export's footer has one, this one's holds `Fetch`
-    // and the create -- and neither this function nor `vault_window::mod`
-    // binds Escape for it. `mod` has always had the `RecordUiAction::Cancel`
-    // arm that closes the card; nothing in the form ever produced one, so a
-    // user who opened `Import from a Send...` and changed their mind had no
-    // gesture at all that put it away. This is that gesture, and it reports
-    // the arm that was already waiting for it.
-    //
-    // Gated on `enabled` for the export card's reason, which is the same one:
-    // a `bw send receive` in flight is a child writing into state that goes
-    // away with the card.
-    if theme::modal_corner_mark_gated(ui, card_rect, title, enabled) {
-        action = RecordUiAction::Cancel;
+    ui.add_space(8.0);
+    ui.add(egui::Label::new(egui::RichText::new(LINK_NOTE).size(14.0).color(p.text_faint)).wrap());
+
+    let ok = match record {
+        Some(Err(refusal)) => {
+            ui.add_space(14.0);
+            modal_note(ui, Tone::Danger, &refusal_sentence(refusal));
+            None
+        }
+        Some(Ok(record)) => Some(record),
+        None => None,
+    };
+
+    if let Some(record) = ok {
+        ui.add_space(18.0);
+        // What will be imported: names only. Never a value; see
+        // `fields_present`.
+        egui::Frame::new()
+            .fill(p.secondary_hover)
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin::symmetric(16, 14))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing.y = 4.0;
+                ui.label(theme::bold(WILL_IMPORT_HEADING, 15.0).color(p.ink));
+                for name in fields_present(record) {
+                    ui.label(egui::RichText::new(name).size(14.0).color(p.text_nav));
+                }
+                if let Some(stale) = stale_note(record, now) {
+                    ui.add_space(4.0);
+                    ui.add(egui::Label::new(egui::RichText::new(&stale).size(14.0).color(p.text_faint)).wrap());
+                }
+            });
+
+        if needs_passphrase(record) {
+            ui.add_space(14.0);
+            let id = egui::Id::new((IMPORT_ID, "passphrase"));
+            let mut revealed = ui.data(|d| d.get_temp::<bool>(id.with("reveal"))).unwrap_or(false);
+            ui.add_enabled_ui(enabled, |ui| {
+                crate::kit::input::secret(
+                    ui,
+                    id,
+                    &mut draft.passphrase,
+                    &mut revealed,
+                    IMPORT_PASSPHRASE_HINT,
+                    width,
+                    crate::kit::input::SIGN_IN,
+                )
+            });
+            ui.data_mut(|d| d.insert_temp(id.with("reveal"), revealed));
+        }
+
+        if let Collision::SameName { .. } = collision {
+            ui.add_space(18.0);
+            ui.add(
+                egui::Label::new(theme::bold(collision_prompt(&record.name), 15.0).color(p.ink)).wrap(),
+            );
+            ui.add_space(10.0);
+            // **One control with two positions, and not two buttons**, and
+            // **neither cell is lit until the user lights one.**
+            // `draft.choice` starts `None`, so no cell is selected, and there
+            // is no `unwrap_or` here and must not be: `import_can_proceed`
+            // refuses while the choice is `None`, and a default would answer
+            // a question nobody was asked. This is the one question in the
+            // feature whose wrong answer destroys data the user already had.
+            let choices = [
+                (CREATE_SECOND_LABEL, CollisionChoice::CreateSecond),
+                (REPLACE_LABEL, CollisionChoice::Replace),
+            ];
+            let labels = [choices[0].0, choices[1].0];
+            let selected = choices.iter().position(|(_, c)| draft.choice == Some(*c)).unwrap_or(usize::MAX);
+            // An import running leaves the answer already given legible and
+            // senses nothing.
+            let picked = ui.add_enabled_ui(enabled, |ui| controls::segmented(ui, &labels, selected, controls::SEG_SETTINGS)).inner;
+            if let Some(index) = picked {
+                draft.choice = Some(choices[index].1);
+            }
+        }
     }
+
+    let problem = import_problem(ok, draft, collision);
+    let can_proceed = import_can_proceed(ok, draft, collision, in_flight);
+    if let Some(problem) = problem {
+        ui.add_space(14.0);
+        ui.add(egui::Label::new(egui::RichText::new(problem).size(14.0).color(p.text_faint)).wrap());
+    }
+
+    // **The two answers.** The create is what this form is FOR, so it takes
+    // the filled primary and `Fetch` the outline; the order stays `Fetch`
+    // then create, because that is the order the steps happen in -- a footer
+    // that put the second first would read as a form you could submit before
+    // fetching anything.
+    ui.add_space(22.0);
+    const ANSWER: ButtonSize = ButtonSize { height: 48.0, pad_x: 18.0, radius: 14, font_px: 16.0 };
+    ui.spacing_mut().item_spacing.x = 10.0;
+    let can_fetch = enabled && !draft.link.trim().is_empty();
+    ui.columns(2, |columns| {
+        if columns[0]
+            .add_enabled_ui(can_fetch, |ui| controls::button_filling(ui, ButtonKind::Outline, ANSWER, FETCH_LABEL))
+            .inner
+            .clicked()
+        {
+            action = RecordUiAction::FetchLink;
+        }
+        if columns[1]
+            .add_enabled_ui(can_proceed, |ui| controls::button_filling(ui, ButtonKind::Primary, ANSWER, IMPORT_SUBMIT_LABEL))
+            .inner
+            .clicked()
+        {
+            action = RecordUiAction::SubmitImport;
+        }
+    });
     action
 }
 
@@ -1426,29 +1272,6 @@ pub fn create_link_id() -> egui::Id {
 pub fn copy_link_id() -> egui::Id {
     egui::Id::new("share-copy-link")
 }
-
-/// **Design §5a's own 690**, measured off the design rather than described from
-/// it.
-///
-/// The number that stood here was 360, under a doc saying "§5a's composer is a
-/// narrow column". It is not one. §5a is a 690-point figure and the card fills
-/// it, and 330 points of missing width is most of what the owner was looking
-/// at when they said the built card was not the design: every §5a include row
-/// is `[tick] [name -------- flex] [value]`, and at 360 there is no value
-/// column left for the address, the masked password or `3 apps` to sit in --
-/// so they crowd the name instead of aligning down a right edge. The Access
-/// rows lose the same way: a 96-point label column and a 14-point gap out of
-/// 336 of content leaves the control less than two thirds of the row.
-///
-/// It fits the smallest window this app opens. `settings::MIN_VAULT_WINDOW_SIZE`
-/// is 900 x 600 and this card is centred in the WINDOW, not in the detail
-/// column, so 690 leaves 105 points either side.
-///
-/// **This does not reopen the Expires dropdown**, which
-/// `send_ui::draw_access_block` argues at length: that decision is about NINE
-/// choices not fitting a segmented run, and nine cells sized to their own
-/// labels do not fit 544 points any more than they fit 226.
-const MODAL_WIDTH: f32 = 690.0;
 
 
 /// [`draw_export_form`] over a dimmed scrim, centred, for `vault_window::mod`
@@ -1879,28 +1702,36 @@ pub fn draw_import_modal(
     collision: &Collision,
     now: &dyn crate::send::SendClock,
 ) -> RecordUiAction {
-    theme::modal_scrim(ctx, egui::Area::new(egui::Id::new("record-import-scrim")));
-
-    theme::movable_modal(ctx, egui::Area::new(egui::Id::new("record-import-modal")))
-        .show(ctx, |ui| {
-            theme::modal_drag_handle(ui, FORM_HEADER_HEIGHT);
-            ui.set_max_width(MODAL_WIDTH);
-            let action = draw_import_form(
-                ui,
-                &mut state.draft,
-                state.fetched.as_ref(),
-                collision,
-                state.in_flight,
-                now,
-            );
-            if let Some(why) = &state.failure {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new(why).size(12.0).color(theme::ERROR));
-            }
-            action
-        })
-        .inner
+    use crate::kit::modal::{Dialog, ModalOutcome};
+    // The ✕, the scrim and Escape are this card's only way out (it has no
+    // Cancel button: its footer holds Fetch and the create), and they are
+    // refused while a `bw send receive` is in flight -- a child writing into
+    // state that goes away with the card.
+    let busy = state.in_flight;
+    let (outcome, action) = Dialog::new(IMPORT_ID, IMPORT_WIDTH).title(IMPORT_HEADING).esc_closes(!busy).show(ctx, |ui| {
+        let action = draw_import_form(
+            ui,
+            &mut state.draft,
+            state.fetched.as_ref(),
+            collision,
+            state.in_flight,
+            now,
+        );
+        if let Some(why) = &state.failure {
+            ui.add_space(14.0);
+            crate::kit::modal::note(ui, crate::kit::modal::Tone::Danger, why);
+        }
+        action
+    });
+    match (action, outcome) {
+        (RecordUiAction::None, ModalOutcome::Closed) if !busy => RecordUiAction::Cancel,
+        (action, _) => action,
+    }
 }
+
+/// The import dialog's id; its scrim is `"record-import-scrim"`.
+pub const IMPORT_ID: &str = "record-import";
+const IMPORT_WIDTH: f32 = 560.0;
 
 #[cfg(test)]
 mod tests {
@@ -2806,6 +2637,127 @@ mod paint_tests {
     /// The import form paints the field **names** of a record it was given,
     /// and none of the values.
     #[test]
+    fn a_refusal_is_painted_as_the_sentence_that_names_it() {
+        let mut draft =
+            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
+        let refused: Result<Record, RecordRefusal> =
+            Err(RecordRefusal::UnknownField("surprise".to_string()));
+        let painted = paint(|ui| {
+            draw_import_form(ui, &mut draft, Some(&refused), &Collision::Fresh, false, &FixedClock(NOW));
+        });
+        assert!(painted.has("surprise"), "the refused field was not named: {:?}", painted.text);
+        assert!(
+            !painted.has(WILL_IMPORT_HEADING),
+            "a refused payload was previewed as if it had been read: {:?}",
+            painted.text
+        );
+        for name in [USERNAME_LABEL, PASSWORD_LABEL, SEALED_SEED_LABEL] {
+            assert!(!painted.has(name), "{name} was previewed for a payload that was refused");
+        }
+    }
+
+    /// The import's two answers are the v2 kit's: 48 high, the create the
+    /// filled blue primary and `Fetch` the outline, `Fetch` first because
+    /// that is the order the steps happen in.
+    #[test]
+    fn the_import_footer_wears_the_v2_buttons() {
+        let record = Record {
+            name: "SAP Production".to_string(),
+            username: Some("dplatonov".to_string()),
+            password: None,
+            uri: None,
+            notes: None,
+            totp_sealed: None,
+            not_after: None,
+        };
+        let mut draft =
+            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
+        let fetched = Ok(record);
+        assert!(
+            import_can_proceed(fetched.as_ref().ok(), &draft, &Collision::Fresh, false),
+            "the fixture wants a proceedable draft, or the fill below is a disabled one"
+        );
+        let painted = paint(|ui| {
+            draw_import_form(ui, &mut draft, Some(&fetched), &Collision::Fresh, false, &FixedClock(NOW));
+        });
+        let create = painted.rect_of(IMPORT_SUBMIT_LABEL).expect("the create is painted");
+        let fetch = painted.rect_of(FETCH_LABEL).expect("Fetch is painted");
+        // The primary's own fill is behind the label (its shadow is another,
+        // fainter one the same size).
+        let blue = painted
+            .fills
+            .iter()
+            .find(|(r, f)| *f == theme::BLUE && r.contains_rect(create))
+            .map(|(r, _)| *r)
+            .expect("the import's create is not the filled primary. It is the answer this card is FOR");
+        assert_eq!(blue.height(), 48.0, "the v2 answer buttons are 48 high");
+        let (outline, outline_fill) = painted.button_under(FETCH_LABEL);
+        assert_eq!(outline_fill, theme::CARD, "`Fetch` is not the outlined secondary");
+        assert_eq!(outline.height(), 48.0, "the two answers are different heights");
+        assert!(
+            fetch.left() < create.left(),
+            "the create is drawn before the fetch, so the card reads as something you could \
+             submit before fetching anything"
+        );
+    }
+
+    /// The collision question is ONE segmented run with two cells and
+    /// **neither lit until the user lights one**: replacing is the one press
+    /// in this feature that destroys data the user already had.
+    #[test]
+    fn the_collision_prompt_is_one_segmented_run_and_not_two_buttons() {
+        let record = Record {
+            name: "SAP Production".to_string(),
+            username: Some("dplatonov".to_string()),
+            password: None,
+            uri: None,
+            notes: None,
+            totp_sealed: None,
+            not_after: None,
+        };
+        let fetched = Ok(record);
+        let collision = Collision::SameName { existing_id: "item-1".to_string() };
+        let palette = crate::kit::tokens::Palette::LIGHT;
+
+        let mut untouched =
+            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
+        let before = paint(|ui| {
+            draw_import_form(ui, &mut untouched, Some(&fetched), &collision, false, &FixedClock(NOW));
+        });
+        for label in [CREATE_SECOND_LABEL, REPLACE_LABEL] {
+            let (_, fill) = before.button_under(label);
+            assert_eq!(
+                fill, palette.hover,
+                "{label:?} is lifted with nothing chosen. `draft.choice` starts `None` and no \
+                 frame may turn that into a default"
+            );
+        }
+        let (first, _) = before.button_under(CREATE_SECOND_LABEL);
+        let (second, _) = before.button_under(REPLACE_LABEL);
+        // One track holds both: the same cell is drawn behind neither, and
+        // the two labels sit on one line.
+        assert!(
+            (first.center().y - second.center().y).abs() < 0.5,
+            "the two offers are not on one run: {first:?} {second:?}"
+        );
+
+        let mut replacing = ImportDraft {
+            link: "https://send.example/#/x".to_string(),
+            choice: Some(CollisionChoice::Replace),
+            ..Default::default()
+        };
+        let after = paint(|ui| {
+            draw_import_form(ui, &mut replacing, Some(&fetched), &collision, false, &FixedClock(NOW));
+        });
+        let chosen = after.rect_of(REPLACE_LABEL).expect("painted");
+        assert!(
+            after.fills.iter().any(|(r, f)| *f == palette.card && r.contains_rect(chosen) && r.width() < 300.0),
+            "the chosen answer is not the lifted white cell"
+        );
+        assert_eq!(after.button_under(CREATE_SECOND_LABEL).1, palette.hover);
+    }
+
+    #[test]
     fn the_import_form_paints_names_and_never_values() {
         static SEALED: OnceLock<crate::record::SealedSeed> = OnceLock::new();
         let record = Record {
@@ -2852,178 +2804,6 @@ mod paint_tests {
         assert!(painted.has(REPLACE_LABEL));
         assert!(painted.has(NEEDS_COLLISION_CHOICE), "{:?}", painted.text);
         assert_eq!(draft.choice, None, "a frame chose an answer on the user's behalf");
-    }
-
-    /// A refused payload is painted as its own sentence, not as a shrug.
-    #[test]
-    fn a_refusal_is_painted_as_the_sentence_that_names_it() {
-        let mut draft =
-            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
-        let refused: Result<Record, RecordRefusal> =
-            Err(RecordRefusal::UnknownField("surprise".to_string()));
-        let painted = paint(|ui| {
-            draw_import_form(ui, &mut draft, Some(&refused), &Collision::Fresh, false, &FixedClock(NOW));
-        });
-        assert!(painted.has("surprise"), "the refused field was not named: {:?}", painted.text);
-        assert!(
-            !painted.has(WILL_IMPORT_HEADING),
-            "a refused payload was previewed as if it had been read: {:?}",
-            painted.text
-        );
-        // And no field-name line either: the preview is the whole thing that
-        // must not appear, not just its heading.
-        for name in [USERNAME_LABEL, PASSWORD_LABEL, SEALED_SEED_LABEL] {
-            assert!(!painted.has(name), "{name} was previewed for a payload that was refused");
-        }
-        // Control on the same fixture: the form did draw, so the absences
-        // above are not the absences of a blank frame.
-        assert!(painted.has(IMPORT_HEADING), "{:?}", painted.text);
-    }
-
-    /// **The import footer is a primary beside a secondary, and the CREATE is
-    /// the primary.**
-    ///
-    /// The twin of `the_export_footer_wears_the_design_systems_two_buttons`,
-    /// and it exists because the two cards were left in different states: the
-    /// export footer was moved onto the design system a pass ago and this one
-    /// was not, so two modals opened from one window looked like they came
-    /// from two applications. The fill is also the whole of the fix -- both
-    /// buttons here used to be bare `egui::Button`s differing only in the
-    /// colour of their text, which no test could see.
-    #[test]
-    fn the_import_footer_wears_the_design_systems_two_buttons() {
-        // A fetched record with no collision and no seal, so the create is
-        // LIVE: a disabled primary is faded toward the window colour and this
-        // test would then be asserting the fade.
-        let record = Record {
-            name: "SAP Production".to_string(),
-            username: Some("dplatonov".to_string()),
-            password: None,
-            uri: None,
-            notes: None,
-            totp_sealed: None,
-            not_after: None,
-        };
-        let mut draft =
-            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
-        let fetched = Ok(record);
-        assert!(
-            import_can_proceed(fetched.as_ref().ok(), &draft, &Collision::Fresh, false),
-            "the fixture wants a proceedable draft, or the fill below is a disabled one"
-        );
-        let painted = paint(|ui| {
-            draw_import_form(
-                ui,
-                &mut draft,
-                Some(&fetched),
-                &Collision::Fresh,
-                false,
-                &FixedClock(NOW),
-            );
-        });
-
-        let (submit, submit_fill) = painted.button_under(IMPORT_SUBMIT_LABEL);
-        assert_eq!(
-            submit_fill,
-            theme::BLUE,
-            "the import's create is not the design system's filled primary. It is the answer \
-             this card is FOR, and it used to be the second of two identical boxes while \
-             `Fetch` -- a step on the way -- was drawn first"
-        );
-        assert_eq!(submit.height(), theme::BUTTON_HEIGHT);
-
-        let (fetch, fetch_fill) = painted.button_under(FETCH_LABEL);
-        assert_eq!(
-            fetch_fill,
-            theme::CARD,
-            "`Fetch` is not the design system's outlined secondary"
-        );
-        assert_eq!(fetch.height(), theme::BUTTON_HEIGHT, "the two answers are different heights");
-        assert_ne!(
-            submit_fill, fetch_fill,
-            "the import footer's two answers paint the same fill, which is the exact defect \
-             this pass fixed on the export footer"
-        );
-        // `Fetch` comes first, because that is the order the steps happen in.
-        assert!(
-            fetch.left() < submit.left(),
-            "the create is drawn before the fetch, so the card reads as something you could \
-             submit before fetching anything"
-        );
-    }
-
-    /// **The collision prompt is one segmented run, and the answer in force
-    /// is filled blue.**
-    ///
-    /// This is the one question in this feature whose wrong answer destroys
-    /// an item the user already had, and it was drawn as two `.selected()`
-    /// buttons -- egui's own grey selection fill over two identical
-    /// 160-point boxes. The three facts below are the ones that tell a
-    /// segmented run from a pair of buttons, and all three are invisible to a
-    /// test that only reads glyphs.
-    #[test]
-    fn the_collision_prompt_is_one_segmented_run_and_not_two_buttons() {
-        let record = Record {
-            name: "SAP Production".to_string(),
-            username: Some("dplatonov".to_string()),
-            password: None,
-            uri: None,
-            notes: None,
-            totp_sealed: None,
-            not_after: None,
-        };
-        let fetched = Ok(record);
-        let collision = Collision::SameName { existing_id: "item-1".to_string() };
-
-        // Nothing chosen: neither cell may be lit.
-        let mut untouched =
-            ImportDraft { link: "https://send.example/#/x".to_string(), ..Default::default() };
-        let before = paint(|ui| {
-            draw_import_form(ui, &mut untouched, Some(&fetched), &collision, false, &FixedClock(NOW));
-        });
-        for label in [CREATE_SECOND_LABEL, REPLACE_LABEL] {
-            let (cell, fill) = before.button_under(label);
-            assert_eq!(
-                cell.height(),
-                theme::SEGMENT_HEIGHT,
-                "{label:?} is not a segmented-control cell -- it is {}pt tall against the \
-                 run's {}",
-                cell.height(),
-                theme::SEGMENT_HEIGHT
-            );
-            assert_ne!(
-                fill,
-                theme::BLUE,
-                "{label:?} is lit with nothing chosen. `draft.choice` starts `None` and no \
-                 frame may turn that into a default: replacing is the one press in this \
-                 feature that destroys data the user already had"
-            );
-        }
-        let (first, _) = before.button_under(CREATE_SECOND_LABEL);
-        let (second, _) = before.button_under(REPLACE_LABEL);
-        let gap = second.left() - first.right();
-        assert!(
-            gap.abs() <= theme::SEGMENT_SEAM + 0.5,
-            "the two offers are {gap}pt apart, so they are two buttons in a row rather than \
-             one control with two positions"
-        );
-
-        // Replace chosen: that cell, and only that cell, is filled blue.
-        let mut replacing = ImportDraft {
-            link: "https://send.example/#/x".to_string(),
-            choice: Some(CollisionChoice::Replace),
-            ..Default::default()
-        };
-        let after = paint(|ui| {
-            draw_import_form(ui, &mut replacing, Some(&fetched), &collision, false, &FixedClock(NOW));
-        });
-        assert_eq!(
-            after.button_under(REPLACE_LABEL).1,
-            theme::BLUE,
-            "the chosen answer is not filled in the design's blue, so the press that replaces \
-             an item is as quiet on screen as the one that does not"
-        );
-        assert_ne!(after.button_under(CREATE_SECOND_LABEL).1, theme::BLUE);
     }
 
     // -----------------------------------------------------------------------
@@ -3087,109 +2867,49 @@ mod paint_tests {
         ]
     }
 
-    /// Every line segment a frame laid down.
-    fn segments(output: &egui::FullOutput) -> Vec<[egui::Pos2; 2]> {
-        fn walk(shape: &egui::Shape, out: &mut Vec<[egui::Pos2; 2]>) {
-            match shape {
-                egui::Shape::LineSegment { points, .. } => out.push(*points),
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut out = Vec::new();
-        for clipped in &output.shapes {
-            walk(&clipped.shape, &mut out);
-        }
-        out
-    }
-
-    /// Where the dismiss ✕ crosses on a card, found from the paint alone.
-    ///
-    /// The mark draws no galley, so it is two diagonals exactly
-    /// [`theme::CLOSE_MARK_SPAN`] across -- and nothing else on either of
-    /// these forms strokes a diagonal at all.
-    fn dismiss_mark(output: &egui::FullOutput) -> egui::Pos2 {
-        let arms: Vec<[egui::Pos2; 2]> = segments(output)
-            .into_iter()
-            .filter(|[a, b]| {
-                ((b.x - a.x).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
-                    && ((b.y - a.y).abs() - theme::CLOSE_MARK_SPAN).abs() < 0.01
-            })
-            .collect();
-        assert_eq!(
-            arms.len(),
-            2,
-            "the card strokes {} arms the size of a ✕; it needs exactly two, and none is a \
-             modal with no mark in its corner",
-            arms.len()
-        );
-        let centre = arms[0][0].lerp(arms[0][1], 0.5);
-        assert!(
-            (arms[1][0].lerp(arms[1][1], 0.5) - centre).length() < 0.01,
-            "the two arms do not cross, so this is not a ✕"
-        );
-        centre
-    }
-
-    /// The mark is [`theme::MODAL_CLOSE_INSET`] off the card's own right-hand
-    /// edge, where the card's rect is the one egui measured for the modal's
-    /// `Area` -- not a number re-derived here from the form's padding.
-    fn assert_shared_inset(ctx: &egui::Context, area: &str, at: egui::Pos2) {
-        let card = egui::AreaState::load(ctx, egui::Id::new(area))
-            .expect("the modal has never been drawn")
-            .rect();
-        let box_right = at.x + theme::CLOSE_MARK_HIT / 2.0;
-        assert!(
-            (card.right() - box_right - theme::MODAL_CLOSE_INSET).abs() < 0.5,
-            "on {area} the mark's hit box ends {} points inside the card, not \
-             `theme::MODAL_CLOSE_INSET`'s {}",
-            card.right() - box_right,
-            theme::MODAL_CLOSE_INSET
-        );
-    }
-
-    /// **The import card's ✕ is drawn, and pressing it cancels.**
-    ///
-    /// On this card the mark is not a consistency but a FIX. The import form
-    /// has no Cancel button -- its footer holds `Fetch` and the create -- and
-    /// nothing binds Escape for it, so before this mark existed a user who
-    /// opened `Import from a Send...` and changed their mind had no gesture at
-    /// all that put the card away. `vault_window::mod` has always had the
-    /// `RecordUiAction::Cancel` arm that closes it; nothing ever produced one.
+    /// The import card's ✕, its scrim and Escape are its ONLY ways out (it has
+    /// no Cancel button) and each reports Cancel -- except while a fetch is in
+    /// flight, when none does.
     #[test]
-    fn the_import_cards_dismiss_mark_is_drawn_and_cancels() {
+    fn the_import_cards_ways_out_cancel() {
         let ctx = modal_context();
         let mut state = RecordImport::opening();
-        let run = |events: &[egui::Event], state: &mut RecordImport| {
+        let frame = |t: f64, events: &[egui::Event], state: &mut RecordImport| {
             let mut action = RecordUiAction::None;
-            let output = ctx.run_ui(modal_input(events), |ui| {
-                action = draw_import_modal(
-                    ui.ctx(),
-                    state,
-                    &Collision::Fresh,
-                    &FixedClock(NOW),
-                );
+            let input = egui::RawInput { time: Some(t), ..modal_input(events) };
+            let _ = ctx.run_ui(input, |ui| {
+                action = draw_import_modal(ui.ctx(), state, &Collision::Fresh, &FixedClock(NOW));
             });
-            (action, output)
+            action
         };
+        for t in 0..4 {
+            let idle = frame(f64::from(t), &[], &mut state);
+            assert_eq!(idle, RecordUiAction::None, "the card reported a press with no input");
+        }
+        let mark = ctx
+            .read_response(crate::kit::modal::close_id(IMPORT_ID))
+            .expect("the card draws its close mark")
+            .rect
+            .center();
+        let action = frame(5.0, &modal_click(mark), &mut state);
+        assert_eq!(action, RecordUiAction::Cancel, "the import card's ✕ at {mark:?} reported nothing");
 
-        let _ = run(&[], &mut state);
-        let (idle, drawn) = run(&[], &mut state);
-        assert_eq!(idle, RecordUiAction::None, "the card reported a press with no input");
-        let at = dismiss_mark(&drawn);
-        assert_shared_inset(&ctx, "record-import-modal", at);
+        let esc = [egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }];
+        assert_eq!(frame(6.0, &esc, &mut state), RecordUiAction::Cancel, "Escape leaves the card");
 
-        let (action, _) = run(&modal_click(at), &mut state);
-        assert_eq!(
-            action,
-            RecordUiAction::Cancel,
-            "the import card's ✕ at {at:?} reported nothing -- and it is this card's only way \
-             out, so a dead mark here is a modal a user cannot leave"
-        );
+        // A `bw send receive` in flight: nothing closes it.
+        state.in_flight = true;
+        for t in 7..10 {
+            let _ = frame(f64::from(t), &[], &mut state);
+        }
+        assert_eq!(frame(10.0, &esc, &mut state), RecordUiAction::None, "Escape closed a card with a fetch in flight");
+        assert_eq!(frame(11.0, &modal_click(mark), &mut state), RecordUiAction::None, "the ✕ closed a card with a fetch in flight");
     }
 }
 

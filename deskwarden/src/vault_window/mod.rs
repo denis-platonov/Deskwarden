@@ -34072,8 +34072,10 @@ mod send_delete_wiring {
         let find = |output: &egui::FullOutput, needle: &str| -> Option<egui::Rect> {
             labels(output).into_iter().find(|(t, _)| t == needle).map(|(_, r)| r)
         };
+        // The LAST run of a label: with a modal up it is the topmost one, and
+        // the page's own card of the same words is behind the scrim.
         let locate = |output: &egui::FullOutput, needle: &str| -> egui::Pos2 {
-            find(output, needle).map(|r| r.center()).unwrap_or_else(|| {
+            labels(output).into_iter().rfind(|(t, _)| t == needle).map(|(_, r)| r.center()).unwrap_or_else(|| {
                 panic!(
                     "the window painted no {needle:?} to press, so this test cannot reach \
                      what it is about at all. What was painted: {:?}",
@@ -34334,7 +34336,13 @@ mod send_delete_wiring {
         // still there is still described. Its button is not underneath the
         // card either -- so a click there reaches the control rather than the
         // overlay.
-        let delete_rect = find(&showing, send_ui::REVOKE_LABEL).unwrap_or_else(|| {
+        // The modal's Revoke (the topmost run): the Send is still listed, so
+        // its modal is still open over the page.
+        let delete_rect = labels(&showing)
+            .into_iter()
+            .rfind(|(t, _)| t == send_ui::REVOKE_LABEL)
+            .map(|(_, r)| r)
+            .unwrap_or_else(|| {
             panic!(
                 "control: no Delete button is on screen with the report card up, so there is \
                  nothing to press. What was painted: {:?}",
@@ -34377,7 +34385,18 @@ mod send_delete_wiring {
         // the fetch set to fail. And it is left by the failed pane's own
         // `Try again`, pressed on the real window with the failure showing.
         FRAME_LIST_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
-        let vault_at = locate(&armed_again, "All items");
+        // The Send's modal is up over the whole window, rail included, as it
+        // is for a user -- who closes it with Escape before going elsewhere.
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run_ui(egui::RawInput { events: vec![escape], ..input() }, |ui| frame_fn(ui));
+        let closed = ctx.run_ui(input(), |ui| frame_fn(ui));
+        let vault_at = locate(&closed, "All items");
         let away = click(&ctx, &mut frame_fn, vault_at);
         let sends_at = locate(&away, sidebar::SENDS_ROW_LABEL);
         let failed = click(&ctx, &mut frame_fn, sends_at);
@@ -34532,8 +34551,10 @@ mod send_delete_wiring {
         let find = |output: &egui::FullOutput, needle: &str| -> Option<egui::Rect> {
             labels(output).into_iter().find(|(t, _)| t == needle).map(|(_, r)| r)
         };
+        // The LAST run of a label: with a modal up it is the topmost one, and
+        // the page's own card of the same words is behind the scrim.
         let locate = |output: &egui::FullOutput, needle: &str| -> egui::Pos2 {
-            find(output, needle).map(|r| r.center()).unwrap_or_else(|| {
+            labels(output).into_iter().rfind(|(t, _)| t == needle).map(|(_, r)| r.center()).unwrap_or_else(|| {
                 panic!(
                     "the window painted no {needle:?} to press. What was painted: {:?}",
                     texts(output)
@@ -35266,8 +35287,11 @@ mod send_delete_wiring {
     }
 
     fn matrix_locate(state: ReachableState, output: &egui::FullOutput, needle: &str) -> egui::Pos2 {
-        matrix_find(output, needle)
-            .map(|r| r.center())
+        // The topmost run: a modal's, when one is up (see `locate` above).
+        matrix_labels(output)
+            .into_iter()
+            .rfind(|(t, _)| t == needle)
+            .map(|(_, r)| r.center())
             .unwrap_or_else(|| {
                 panic!(
                     "in state {state:?} the window painted no {needle:?} to press, so this \
@@ -35295,6 +35319,32 @@ mod send_delete_wiring {
     //
     // Kept as a dead helper it would be a proximity rule nothing enforces,
     // sitting beside a layout with no proximity left in it.
+
+    /// Closes the Send detail modal if one is up, the way a user does: Escape.
+    /// The modal is over the whole window, rail included, so nothing in the
+    /// rail can be pressed until it is gone. A frame with no modal up is
+    /// answered as it came (Escape is not sent where it would mean something
+    /// else, such as clearing the search box).
+    fn matrix_close_the_modal(
+        ctx: &egui::Context,
+        frame_fn: &mut dyn FnMut(&mut egui::Ui),
+        output: egui::FullOutput,
+    ) -> egui::FullOutput {
+        // "Activity" is a word only the modal paints.
+        if matrix_find(&output, "Activity").is_none() {
+            return output;
+        }
+        let escape = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run_ui(egui::RawInput { events: vec![escape], ..matrix_input() }, |ui| frame_fn(ui));
+        let _ = ctx.run_ui(matrix_input(), |ui| frame_fn(ui));
+        ctx.run_ui(matrix_input(), |ui| frame_fn(ui))
+    }
 
     fn matrix_frame(
         ctx: &egui::Context,
@@ -36168,7 +36218,7 @@ mod send_delete_wiring {
         // exists -- which is true in every state, including the ones where
         // the window body is blank.
         assert_ne!(
-            send_ui::SENDS_HEADING,
+            send_ui::SHARED_TITLE,
             sidebar::SENDS_ROW_LABEL,
             "the Sends pane's own heading and the sidebar row that leads to it are the same \
              string again, so finding it below no longer proves the PANE painted -- it is \
@@ -36184,14 +36234,14 @@ mod send_delete_wiring {
         //    !show_sends` and the pane by the gate, and the user is left
         //    looking at an empty window for the rest of the session.
         assert!(
-            matrix_find(&output, send_ui::SENDS_HEADING).is_some(),
+            matrix_find(&output, send_ui::SHARED_TITLE).is_some(),
             "in state {state:?} the Sends row was pressed and the Sends PANE never painted \
              its own heading ({:?}) -- only the sidebar row that leads to it is on screen. \
              The SENDS SCREEN is blank: the item list is skipped because `show_sends` is \
              true and the pane was not asked for, so the window keeps its sidebar and its \
              detail-pane placeholder and the user has no Sends feature at all. What was \
              painted: {:?}",
-            send_ui::SENDS_HEADING,
+            send_ui::SHARED_TITLE,
             matrix_texts(&output)
         );
 
@@ -36305,6 +36355,7 @@ mod send_delete_wiring {
         //    it was" is a different answer in each half.
         FRAME_LIST_WITHHOLDS.store(false, std::sync::atomic::Ordering::SeqCst);
         FRAME_LIST_FAILS.store(true, std::sync::atomic::Ordering::SeqCst);
+        let output = matrix_close_the_modal(&ctx, &mut frame_fn, output);
         let vault_at = matrix_locate(state, &output, "All items");
         let away = matrix_click(&ctx, &mut frame_fn, vault_at);
         let sends_at = matrix_locate(state, &away, sidebar::SENDS_ROW_LABEL);
@@ -36362,7 +36413,7 @@ mod send_delete_wiring {
             &mut frame_fn,
             matrix_locate(state, &output, FRAME_SECOND_SEND_NAME),
         );
-        let copy_at = matrix_locate(state, &second_picked, send_ui::COPY_MARKER);
+        let copy_at = matrix_locate(state, &second_picked, send_ui::COPY_LINK_LABEL);
         let (after_copy, copied) = matrix_click_watching_the_clipboard(&ctx, &mut frame_fn, copy_at);
         assert_eq!(
             copied.suppressed,
@@ -36449,7 +36500,18 @@ mod send_delete_wiring {
         //     every round trip through one sidebar row while every other row
         //     preserved it.
         if matches!(state, ReachableState::SearchTyped) {
-            let vault_at = matrix_locate(state, &disarmed, "All items");
+            // The Send's modal is up over the whole window, rail included, as
+            // it is for a user -- who closes it with Escape before going on.
+            let escape = egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            };
+            let _ = ctx.run_ui(egui::RawInput { events: vec![escape], ..matrix_input() }, |ui| frame_fn(ui));
+            let closed = matrix_frame(&ctx, &mut frame_fn);
+            let vault_at = matrix_locate(state, &closed, "All items");
             let back = matrix_click(&ctx, &mut frame_fn, vault_at);
             assert!(
                 matrix_find(&back, "zq").is_some(),
