@@ -217,31 +217,6 @@ pub fn selected_row(focused: Option<usize>, count: usize) -> usize {
     }
 }
 
-/// **How many matches design 2a is ever about: one.**
-///
-/// This is the card the daemon opens when the vault has *a* login for the app
-/// in front of the user, and [`rows`] paints that one account's fill choices.
-/// The heading used to be handed the ROW count, so a single account offering
-/// four ways to be typed announced itself as "4 matches" -- four accounts,
-/// which the user does not have and the card is not showing. The egui card it
-/// replaced read "1 match" for the same state, and this is that number where
-/// the heading can be pinned to it. The choices are not matches; they are one
-/// match's ways of being typed, and the card lists them under the account they
-/// belong to.
-pub const MATCHES: usize = 1;
-
-/// The card's header line: `"1 match"` / `"4 matches"`.
-///
-/// **Counts accounts, not rows.** See [`MATCHES`], which is what the card
-/// passes it.
-pub fn match_count_label(matches: usize) -> String {
-    if matches == 1 {
-        "1 match".to_string()
-    } else {
-        format!("{matches} matches")
-    }
-}
-
 /// What the user did with the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -346,15 +321,6 @@ pub fn run_with(
 /// exactly why that card could never be raised safely.
 pub const PROMPT_CARD_TITLE: &str = "Deskwarden autofill";
 
-/// The `Enter` chip in the footer, and the word beside it.
-pub const ENTER_SHORTCUT: &str = "ENTER";
-/// What Enter does.
-pub const FILL_LABEL: &str = "Fill";
-/// The `Esc` chip in the footer, and the word beside it.
-pub const ESC_SHORTCUT: &str = "ESC";
-/// What Esc does.
-pub const DISMISS_LABEL: &str = "Dismiss";
-
 /// **Puts design 2a on screen and answers which row the user picked** --
 /// `None` if they dismissed it.
 ///
@@ -411,53 +377,33 @@ pub static REAL: PromptCalls = PromptCalls {
 // defect shape.
 // ---------------------------------------------------------------------------
 
-/// The card's width, and so the window's. The same
-/// [`crate::picker_prompt::WIDTH`], because it is the same kind of card in the
-/// same place on screen and two frameless daemon cards of different widths
+/// The card's width, and so the window's: design 1b's Fill panel, 400.
+/// [`crate::picker_prompt::WIDTH`] is the same number, because the two are the
+/// same panel in two states and two frameless daemon cards of different widths
 /// read as two different programs.
-pub const WIDTH: i32 = 380;
+pub const WIDTH: i32 = crate::panel_draw::LIST_W;
 
-/// Content inset, and the top margin. `picker_prompt`'s.
-const MARGIN_X: i32 = 16;
-const MARGIN_TOP: i32 = 16;
+/// The header's inset and top margin (design D 1.3: `pad 14 16 10`).
+const MARGIN_X: i32 = crate::panel_draw::HEADER_PAD_X;
+const MARGIN_TOP: i32 = crate::panel_draw::HEADER_PAD_TOP;
 
-/// One choice row.
-///
-/// **Shorter than [`crate::picker_prompt`]'s 44**, and it is a different kind
-/// of row now: the picker's rows are two lines and an icon gutter, and these
-/// are one line each -- the way this account can be typed. Who is being typed
-/// is said once, above them, in the account block. The height the card gives
-/// back here is very nearly the height the brand lockup and that block cost
-/// it, so the card is the same size it was.
-const ROW_H: i32 = 32;
+/// One choice row: an account tile with the design's padding round it. Each row
+/// names **what pressing it will type** on its bold line and **whose** it is on
+/// the faint line under it.
+const ROW_H: i32 = crate::panel_draw::ROW_H;
+/// The gap between two rows (D 1.3: `gap 2`).
+const ROW_GAP: i32 = crate::panel_draw::ROW_GAP;
+/// How far one row is from the next.
+const ROW_PITCH: i32 = ROW_H + ROW_GAP;
 
-/// The account block's initials tile, and the gap between it and the two lines
-/// beside it. The tile's box is the same square [`crate::win32_draw::draw_row`]
-/// leaves as a gutter on the picker's rows, so the account's text column and
-/// the picker's start at the same inset from a card edge.
-const AVATAR_BOX: i32 = 40;
-const AVATAR_GAP: i32 = 10;
+/// The gap between the header and the list (D 1.3: `10`).
+const HEADER_GAP: i32 = 10;
+/// The gap between the `?` badge and the ✕ beside it.
+const HEADER_BUTTON_GAP: i32 = 8;
 
-/// How far into a choice row its label starts.
-///
-/// **The account block's text column, exactly**, so the four choices line up
-/// under the username they belong to rather than under its avatar. A choice
-/// row has no avatar of its own -- the account has one, and it is the same
-/// account on every row.
-const CHOICE_TEXT_INSET: i32 = AVATAR_BOX + AVATAR_GAP;
-
-/// The footer strip's height: the two keyboard hints and nothing else.
-const FOOTER_H: i32 = 30;
-
-/// The `ENTER` and `ESC` chips' boxes, and the gap between a chip and the word
-/// it explains.
-const ENTER_CHIP_W: i32 = 46;
-const ESC_CHIP_W: i32 = 34;
-const CHIP_GAP: i32 = 5;
-/// The gap between the `Fill` hint and the `Dismiss` one.
-const HINT_GAP: i32 = 14;
-/// The `Fill` word's lane.
-const FILL_W: i32 = 30;
+/// The `Enter` chip the 0.15 footer drew, kept as the word the notice card's
+/// button borrows.
+pub const ENTER_SHORTCUT: &str = "ENTER";
 
 /// One rectangle of the card, in logical pixels from the window's top left.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -485,128 +431,72 @@ impl Box2 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     pub window: Box2,
-    /// The brand lockup's shield, and the wordmark beside it. **The card had
-    /// no brand at all after the port**, although it is the surface that opens
-    /// unbidden over whatever the user is typing into: the egui card carried
-    /// `theme::card_header`'s shield and letterspaced DESKWARDEN, and a
-    /// frameless always-on-top window that appears over another app's password
-    /// field and offers to type into it has to say whose window it is. The
-    /// compact lockup, not the login window's -- see
-    /// [`crate::win32_draw::draw_card_lockup`].
+    /// The brand lockup's shield, and "Deskwarden" beside it. **Not optional**:
+    /// a frameless always-on-top window that appears over another app's
+    /// password field and offers to type into it has to say whose window it is.
     pub mark: Box2,
     pub wordmark: Box2,
-    /// The account's initials tile.
-    pub avatar: Box2,
-    /// **The username**, in the card's bold line -- the account whose password
-    /// the choices below will type. See [`Row::account`].
-    pub account: Box2,
-    /// The faint line under it: the item, and the app it fills.
-    pub context: Box2,
-    /// The match count, **right-aligned on the lockup's line**, which is where
-    /// the egui card put it.
-    pub title: Box2,
+    /// The `?` badge, and the key-hint tooltip it opens (D 1.3).
+    pub help: Box2,
+    pub tip: Box2,
     pub close_glyph: Box2,
-    pub header_rule: Box2,
-    pub footer_rule: Box2,
-    /// The tinted band the hints sit on.
-    pub footer: Box2,
     /// The whole list area. Individual rows are [`row_at`].
     pub list: Box2,
-    pub enter_chip: Box2,
-    pub fill: Box2,
-    pub esc_chip: Box2,
-    pub dismiss: Box2,
 }
 
 /// The card's geometry, for a list `rows` rows tall.
 ///
-/// **Sized to the rows it will really draw**, and not to [`ROW_CAP`]. Unlike
-/// the picker, whose two steps share one live window and must not move a
-/// button out from under a pointer, this card has one shape decided once in
-/// `open` and never transitions -- so a window sized for four rows showing one
-/// would simply be a band of bare card under it.
+/// **Sized to the rows it will really draw**, and not to [`ROW_CAP`]: this
+/// card has one shape decided once in `open` and never transitions.
 ///
 /// `rows.max(1)`: a card with no rows is not a shorter card. The overlay
 /// always paints at least one row -- with no choices it paints the matched
 /// credential row it has always painted -- and a zero-row height would clip
 /// that row off a window the user cannot scroll.
 pub fn layout(rows: usize) -> Layout {
-    let content_w = WIDTH - 2 * MARGIN_X;
     let rows = rows.max(1).min(ROW_CAP) as i32;
 
-    let lockup = crate::win32_draw::card_lockup();
+    let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
         Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    let close_glyph = Box2 { x: WIDTH - MARGIN_X - 20, y: MARGIN_TOP - 2, w: 20, h: 20 };
-    // The count, right-aligned into whatever the lockup and the ✕ leave. It is
-    // drawn `DT_RIGHT`, so a lane wider than the word is not a gap.
-    let title = Box2 {
-        x: wordmark.right() + 8,
-        y: MARGIN_TOP,
-        w: (close_glyph.x - 6) - (wordmark.right() + 8),
-        h: lockup.mark_h,
+    let close = crate::panel_draw::CLOSE;
+    let close_glyph = Box2 {
+        x: WIDTH - MARGIN_X - close,
+        y: mark.y + (mark.h - close) / 2,
+        w: close,
+        h: close,
     };
-
-    // The account block: who is about to be typed, said once, above the ways
-    // to type them.
-    let avatar =
-        Box2 { x: MARGIN_X, y: mark.bottom() + lockup.gap_below, w: AVATAR_BOX, h: AVATAR_BOX };
-    let text_x = avatar.right() + AVATAR_GAP;
-    let text_w = MARGIN_X + content_w - text_x;
-    let account = Box2 { x: text_x, y: avatar.y + 2, w: text_w, h: 19 };
-    let context = Box2 { x: text_x, y: account.bottom() + 1, w: text_w, h: 16 };
-
-    let header_rule = Box2 { x: 0, y: avatar.bottom() + 12, w: WIDTH, h: 1 };
+    let badge = crate::panel_draw::HELP;
+    let help = Box2 {
+        x: close_glyph.x - HEADER_BUTTON_GAP - badge,
+        y: mark.y + (mark.h - badge) / 2,
+        w: badge,
+        h: badge,
+    };
+    let (tx, ty, tw, th) = crate::panel_draw::tip_box(
+        (help.x, help.y, help.right(), help.bottom()),
+        WIDTH,
+        crate::panel_draw::FILL_KEY_HINTS.len(),
+    );
+    let tip = Box2 { x: tx, y: ty, w: tw, h: th };
 
     let list = Box2 {
-        x: MARGIN_X,
-        y: header_rule.bottom() + 6,
-        w: content_w,
-        h: ROW_H * rows,
+        x: crate::panel_draw::LIST_PAD_X,
+        y: mark.bottom() + HEADER_GAP,
+        w: WIDTH - 2 * crate::panel_draw::LIST_PAD_X,
+        h: ROW_H * rows + ROW_GAP * (rows - 1),
     };
+    let window =
+        Box2 { x: 0, y: 0, w: WIDTH, h: list.bottom() + crate::panel_draw::LIST_PAD_BOTTOM };
 
-    let footer_rule = Box2 { x: 0, y: list.bottom() + 6, w: WIDTH, h: 1 };
-    let footer = Box2 { x: 0, y: footer_rule.bottom(), w: WIDTH, h: FOOTER_H };
-
-    let enter_chip =
-        Box2 { x: MARGIN_X, y: footer.y, w: ENTER_CHIP_W, h: FOOTER_H };
-    let fill = Box2 { x: enter_chip.right() + CHIP_GAP, y: footer.y, w: FILL_W, h: FOOTER_H };
-    let esc_chip =
-        Box2 { x: fill.right() + HINT_GAP, y: footer.y, w: ESC_CHIP_W, h: FOOTER_H };
-    let dismiss = Box2 {
-        x: esc_chip.right() + CHIP_GAP,
-        y: footer.y,
-        w: MARGIN_X + content_w - (esc_chip.right() + CHIP_GAP),
-        h: FOOTER_H,
-    };
-
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: footer.bottom() };
-
-    Layout {
-        window,
-        mark,
-        wordmark,
-        avatar,
-        account,
-        context,
-        title,
-        close_glyph,
-        header_rule,
-        footer_rule,
-        footer,
-        list,
-        enter_chip,
-        fill,
-        esc_chip,
-        dismiss,
-    }
+    Layout { window, mark, wordmark, help, tip, close_glyph, list }
 }
 
 /// Row `index` of a card laid out for `rows` rows.
 pub fn row_at(rows: usize, index: usize) -> Box2 {
     let list = layout(rows).list;
-    Box2 { x: list.x, y: list.y + ROW_H * index as i32, w: list.w, h: ROW_H }
+    Box2 { x: list.x, y: list.y + ROW_PITCH * index as i32, w: list.w, h: ROW_H }
 }
 
 /// **Where the card actually goes**, given the anchor the caller computed and
@@ -681,8 +571,7 @@ static ROWS: std::sync::Mutex<Vec<Row>> = std::sync::Mutex::new(Vec::new());
 /// here exhausts the table over a session rather than over a run.
 mod win32 {
     use super::{
-        Box2, Event, PromptWindow, Row, CHOICE_TEXT_INSET, DISMISS_LABEL, ENTER_SHORTCUT,
-        ESC_SHORTCUT, FILL_LABEL, GONE, PENDING, PROMPT_CARD_TITLE, ROWS, ROW_CAP,
+        Box2, Event, PromptWindow, Row, GONE, PENDING, PROMPT_CARD_TITLE, ROWS, ROW_CAP,
     };
     use std::ffi::c_void;
     use std::sync::atomic::{AtomicI32, AtomicIsize, Ordering};
@@ -692,29 +581,43 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
-        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
-        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DRAW_TEXT_FORMAT, DT_CENTER,
-        DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_BOLD,
-        FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY,
-        TRANSPARENT,
+        CreateFontIndirectW, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect,
+        GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC,
+        SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY, DT_END_ELLIPSIS, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
+        LOGPIXELSX, PAINTSTRUCT, SRCCOPY, TRANSPARENT,
     };
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        GetFocus, SetFocus, TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallWindowProcW, CreateWindowExW, DefWindowProcW, DestroyWindow, DispatchMessageW,
-        GetClientRect, GetDlgItem, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW, PeekMessageW,
+        GetClientRect, GetDlgItem, GetParent, GetWindowLongPtrW, IsDialogMessageW, LoadCursorW,
+        PeekMessageW,
         RegisterClassW, SendMessageW, SetForegroundWindow, SetWindowDisplayAffinity,
         SetWindowLongPtrW, ShowWindow, TranslateMessage, BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW,
-        CS_VREDRAW, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_SHOW,
+        CS_VREDRAW, GWLP_WNDPROC, HMENU, IDC_ARROW, MSG, PM_REMOVE, SW_HIDE, SW_SHOW,
         WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND, WM_DESTROY,
         WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST, WM_PAINT, WM_QUIT, WM_SETFONT,
-        WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
+        WNDCLASSW, WS_CHILD, WS_DISABLED, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP, WS_VISIBLE,
     };
 
-    use crate::win32_draw::{draw_card_lockup, draw_hint_chip, draw_text, rgb};
+    use crate::panel_draw;
+    use crate::win32_draw::{draw_text, rgb};
 
     /// Row `i` is control `ID_ROW + i`.
     const ID_ROW: usize = 100;
+    /// The key-hint tooltip: a hidden, disabled child that is shown over the
+    /// list while the pointer is on the `?` badge. A child window is what can
+    /// lie **above** the row controls; the parent's own paint cannot.
+    const ID_TIP: usize = 199;
+
+    /// `WM_MOUSELEAVE`, which `TrackMouseEvent` posts. Named here because the
+    /// `windows` crate files it under a feature this crate does not enable.
+    const WM_MOUSELEAVE: u32 = 0x02A3;
+
+    /// Whether the pointer is on the `?` badge, and so the tooltip is up.
+    static HELP_HOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     const CLASS_NAME: PCWSTR = w!("DeskwardenAutofillPrompt");
 
@@ -777,59 +680,43 @@ mod win32 {
         }
     }
 
-    fn mono(px: i32) -> HFONT {
-        unsafe {
-            let mut lf = LOGFONTW {
-                lfHeight: -scale(px),
-                lfWeight: FW_NORMAL.0 as i32,
-                lfQuality: CLEARTYPE_QUALITY,
-                ..Default::default()
-            };
-            for (i, ch) in crate::theme::GDI_MONO_FACE.encode_utf16().take(31).enumerate() {
-                lf.lfFaceName[i] = ch;
-            }
-            CreateFontIndirectW(&lf)
-        }
-    }
-
     /// Every face the card paints with, created at open and destroyed at
     /// close. Kept together so `close` cannot leak one by forgetting it.
     struct Fonts {
-        /// The lockup's wordmark: `theme::CARD_HEADER_WORD_PX` in the bold
-        /// cut, which is what `theme::card_header` letterspaces "DESKWARDEN"
-        /// in.
+        /// The wordmark: "Deskwarden" at 15/800 (design D 1.3).
         brand: HFONT,
-        /// The match count. The design's card header sets its right-hand
-        /// status at the wordmark's size in `theme::TEXT_GHOST`, quieter than
-        /// the lockup beside it -- it is a count, not a heading, and this card
-        /// no longer has a heading at all now that the account block says what
-        /// the card is about.
-        title: HFONT,
+        /// A row's bold line, 16/700.
         name: HFONT,
+        /// A row's faint line, 14.
         user: HFONT,
+        /// The avatar's initials, 14/700.
         avatar: HFONT,
-        hint: HFONT,
-        prose: HFONT,
+        /// The `Enter` badge, 13/700.
+        badge: HFONT,
+        /// The `?` badge, 12/800.
+        help: HFONT,
+        /// The tooltip, 14.
+        tip: HFONT,
     }
 
     impl Fonts {
         fn build() -> Self {
-            use crate::theme::{BOLD, REGULAR, SEMIBOLD};
+            use crate::theme::{BOLD, EXTRABOLD, REGULAR};
             Fonts {
-                brand: font(BOLD, crate::win32_draw::card_lockup().word_px),
-                title: font(REGULAR, crate::win32_draw::card_lockup().word_px),
-                name: font(SEMIBOLD, 13),
-                user: font(REGULAR, 11),
-                avatar: font(SEMIBOLD, 11),
-                hint: mono(crate::theme::CHIP_TEXT_PX as i32),
-                prose: font(REGULAR, 11),
+                brand: font(EXTRABOLD, panel_draw::WORD_PX),
+                name: font(BOLD, panel_draw::ROW_NAME_PX),
+                user: font(REGULAR, panel_draw::ROW_SUB_PX),
+                avatar: font(BOLD, panel_draw::ROW_SUB_PX),
+                badge: font(BOLD, panel_draw::BADGE_PX),
+                help: font(EXTRABOLD, panel_draw::PILL_PX),
+                tip: font(REGULAR, panel_draw::TIP_PX),
             }
         }
 
         fn destroy(&self) {
             unsafe {
                 for f in
-                    [self.brand, self.title, self.name, self.user, self.avatar, self.hint, self.prose]
+                    [self.brand, self.name, self.user, self.avatar, self.badge, self.help, self.tip]
                 {
                     let _ = DeleteObject(f);
                 }
@@ -955,6 +842,14 @@ mod win32 {
             };
             subclass(control);
         }
+
+        // The key-hint tooltip, created last so it is the topmost child, and
+        // hidden until the pointer is on the `?`.
+        match tip_child(window, l.tip) {
+            Some(tip) => subclass_tip(tip),
+            None => return abandon(window),
+        }
+        HELP_HOT.store(false, Ordering::SeqCst);
 
         unsafe {
             let _ = ShowWindow(window, SW_SHOW);
@@ -1289,6 +1184,20 @@ mod win32 {
                 if HOVERED.swap(0, Ordering::SeqCst) != 0 {
                     repaint_all(window);
                 }
+                // The `?` badge is painted by this window, so its hover is
+                // decided here: the tooltip is up exactly while the pointer is
+                // on it.
+                let x = (lparam.0 & 0xffff) as i16 as i32;
+                let y = ((lparam.0 >> 16) & 0xffff) as i16 as i32;
+                let on_badge = crate::win32_draw::on_close_glyph(x, y, help_rect());
+                if on_badge {
+                    track_leave(window);
+                }
+                set_help(window, on_badge);
+                LRESULT(0)
+            }
+            WM_MOUSELEAVE => {
+                set_help(window, false);
                 LRESULT(0)
             }
             WM_COMMAND => {
@@ -1356,6 +1265,13 @@ mod win32 {
                 if HOVERED.swap(id, Ordering::SeqCst) != id {
                     repaint(control);
                 }
+                // A row under the pointer is not the `?` badge: take the
+                // tooltip down.
+                if HELP_HOT.load(Ordering::SeqCst) {
+                    if let Ok(parent) = GetParent(control) {
+                        set_help(parent, false);
+                    }
+                }
                 LRESULT(0)
             }
             _ => {
@@ -1401,10 +1317,121 @@ mod win32 {
         )
     }
 
+    /// The `?` badge's rect in DEVICE pixels, for the hover test.
+    fn help_rect() -> RECT {
+        dev(super::layout(row_count()).help)
+    }
+
+    fn dev(b: Box2) -> RECT {
+        RECT {
+            left: scale(b.x),
+            top: scale(b.y),
+            right: scale(b.right()),
+            bottom: scale(b.bottom()),
+        }
+    }
+
+    /// Asks Windows for a `WM_MOUSELEAVE` when the pointer leaves the window, so
+    /// a tooltip raised by the badge cannot outlive the pointer.
+    fn track_leave(window: HWND) {
+        unsafe {
+            let mut request = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: window,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut request);
+        }
+    }
+
+    /// Puts the tooltip up or takes it down, repainting only on a change.
+    fn set_help(window: HWND, hot: bool) {
+        if HELP_HOT.swap(hot, Ordering::SeqCst) == hot {
+            return;
+        }
+        unsafe {
+            if let Ok(tip) = GetDlgItem(window, ID_TIP as i32) {
+                let _ = ShowWindow(tip, if hot { SW_SHOW } else { SW_HIDE });
+            }
+        }
+        repaint(window);
+    }
+
+    /// The tooltip child: no text, not visible, not a tab stop and **disabled**,
+    /// so it can never take focus or a click.
+    fn tip_child(parent: HWND, at: Box2) -> Option<HWND> {
+        unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("BUTTON"),
+                w!(""),
+                WINDOW_STYLE(WS_CHILD.0 | WS_DISABLED.0 | BS_PUSHBUTTON as u32),
+                scale(at.x),
+                scale(at.y),
+                scale(at.w),
+                scale(at.h),
+                parent,
+                HMENU(ID_TIP as *mut c_void),
+                None,
+                None,
+            )
+        }
+        .ok()
+    }
+
+    fn subclass_tip(tip: HWND) {
+        unsafe {
+            SetWindowLongPtrW(tip, GWLP_WNDPROC, tip_proc as *const () as isize);
+        }
+    }
+
+    /// The tooltip paints itself and is transparent to the pointer, so moving
+    /// down off the badge onto the list reaches the row beneath it.
+    unsafe extern "system" fn tip_proc(
+        tip: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_ERASEBKGND => LRESULT(1),
+            WM_PAINT => {
+                paint_tip(tip);
+                LRESULT(0)
+            }
+            // `HTTRANSPARENT`.
+            WM_NCHITTEST => LRESULT(-1),
+            _ => DefWindowProcW(tip, msg, wparam, lparam),
+        }
+    }
+
+    fn paint_tip(tip: HWND) {
+        unsafe {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(tip, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(tip, &mut rc);
+            let guard = FONTS.lock();
+            if let Some(fonts) = guard.as_ref().ok().and_then(|slot| slot.as_ref()) {
+                // The ground behind the tooltip's rounded corners is the card.
+                fill_rect(hdc, rc, crate::theme::CARD);
+                panel_draw::draw_key_tooltip(
+                    hdc,
+                    rc,
+                    fonts.tip,
+                    &panel_draw::FILL_KEY_HINTS,
+                    DPI_PERCENT.load(Ordering::SeqCst),
+                );
+            }
+            drop(guard);
+            let _ = EndPaint(tip, &ps);
+        }
+    }
+
     // ---- painting ----------------------------------------------------------
 
-    /// The card's own surface: the header, the two hairlines, the footer's
-    /// tint and its two hints. Every row paints itself.
+    /// The card's own surface: the header. Every row paints itself.
     fn paint(window: HWND) {
         unsafe {
             let mut ps = PAINTSTRUCT::default();
@@ -1423,61 +1450,26 @@ mod win32 {
             let fonts = guard.as_ref().ok().and_then(|slot| slot.as_ref());
             let count = row_count();
             let l = super::layout(count);
-            let dpi = DPI_PERCENT.load(Ordering::SeqCst);
 
             // The window IS the card, so its whole client area is
             // `theme::CARD`.
             fill_rect(mem, client, crate::theme::CARD);
-            fill_box(mem, l.footer, crate::theme::CARD_TINT);
-            fill_box(mem, l.header_rule, crate::theme::HAIRLINE);
-            fill_box(mem, l.footer_rule, crate::theme::HAIRLINE);
             SetBkMode(mem, TRANSPARENT);
 
             if let Some(fonts) = fonts {
-                paint_lockup(mem, &l, fonts.brand);
-                // **The count of ACCOUNTS, which on this card is always one.**
-                // `count` is the number of fill choices, and handing it here is
-                // exactly the bug `super::MATCHES` documents.
-                text_right(
+                let dev = |b: Box2| RECT {
+                    left: scale(b.x),
+                    top: scale(b.y),
+                    right: scale(b.right()),
+                    bottom: scale(b.bottom()),
+                };
+                panel_draw::draw_lockup(mem, dev(l.mark), dev(l.wordmark), fonts.brand);
+                panel_draw::draw_help_badge(
                     mem,
-                    fonts.title,
-                    l.title,
-                    &super::match_count_label(super::MATCHES),
-                    crate::theme::TEXT_GHOST,
+                    dev(l.help),
+                    fonts.help,
+                    HELP_HOT.load(Ordering::SeqCst),
                 );
-
-                // The account block: WHO is about to be typed. Painted on the
-                // window rather than in a row, because it is the same account
-                // for every row and the rows say what will be typed, not whom.
-                let rows_now = view();
-                if let Some(row) = rows_now.first() {
-                    let avatar = RECT {
-                        left: scale(l.avatar.x),
-                        top: scale(l.avatar.y),
-                        right: scale(l.avatar.right()),
-                        bottom: scale(l.avatar.bottom()),
-                    };
-                    paint_avatar(mem, avatar, &row.account, fonts.avatar, false);
-                    text(mem, fonts.name, l.account, &row.account, crate::theme::INK);
-                    text(mem, fonts.user, l.context, &row.context, crate::theme::TEXT_FAINT);
-                }
-
-                // `Enter Fill` and `Esc Dismiss`. Both chips are
-                // `win32_draw`'s, so they are the same chip every other card
-                // draws, and the words beside them are the hints' own.
-                for (chip, word, label) in [
-                    (l.enter_chip, l.fill, (ENTER_SHORTCUT, FILL_LABEL)),
-                    (l.esc_chip, l.dismiss, (ESC_SHORTCUT, DISMISS_LABEL)),
-                ] {
-                    let rc = RECT {
-                        left: scale(chip.x),
-                        top: scale(chip.y),
-                        right: scale(chip.right()),
-                        bottom: scale(chip.bottom()),
-                    };
-                    draw_hint_chip(mem, rc, label.0, fonts.hint, dpi);
-                    text(mem, fonts.prose, word, label.1, crate::theme::TEXT_FAINT);
-                }
             }
 
             paint_close_glyph(mem, l.close_glyph);
@@ -1526,7 +1518,7 @@ mod win32 {
             SetBkMode(mem, TRANSPARENT);
 
             if let (Some(fonts), Some(row)) = (fonts, rows.get(index)) {
-                paint_choice(mem, whole, &row.primary, selected, hovered, fonts, dpi);
+                paint_choice(mem, whole, row, selected, hovered, fonts, dpi);
             }
             drop(guard);
 
@@ -1538,117 +1530,83 @@ mod win32 {
         }
     }
 
-    /// The brand lockup, through [`crate::win32_draw::draw_card_lockup`] --
-    /// the crate's one mark painter, which `unlock_prompt` also draws through.
-    /// What is this card's own is only the logical-to-device conversion, which
-    /// no other card's `Box2` type can share.
-    fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
-        let dev = |b: Box2| RECT {
-            left: scale(b.x),
-            top: scale(b.y),
-            right: scale(b.right()),
-            bottom: scale(b.bottom()),
-        };
-        let tracking = scale(crate::win32_draw::card_lockup().tracking);
-        draw_card_lockup(hdc, dev(l.mark), dev(l.wordmark), font, tracking);
-    }
-
-    /// **One choice row: a single line saying what pressing it will type.**
+    /// **One choice row, as design 1b draws an account row**: the account's
+    /// tile, a bold line saying what pressing the row will type, the account
+    /// under it, and on the selected row the blue `Enter` badge.
     ///
-    /// Not [`crate::win32_draw::draw_row`], and that is the point rather than
-    /// an omission: that painter draws a name over a username with a square
-    /// icon gutter beside them, which is right for the picker's list of
-    /// ACCOUNTS and wrong for a list of ways to type ONE account. The account
-    /// is named once, above, and these rows are indented to its text column so
-    /// they read as belonging to it.
-    ///
-    /// The background fills the whole row -- including the indent -- before
-    /// any text, so hover and selection never hug just the text; that
-    /// half-width highlight was reported as a defect on the vault window's
-    /// menu. Every GDI object created here is restored and deleted before
-    /// returning.
+    /// The background is a rounded wash over the whole row -- the tile's
+    /// padding included -- so hover and selection never hug just the text.
+    /// Every GDI object created here is restored and deleted before returning.
     fn paint_choice(
         hdc: HDC,
         rect: RECT,
-        label: &str,
+        row: &Row,
         selected: bool,
         hovered: bool,
         fonts: &Fonts,
         dpi: i32,
     ) {
         unsafe {
-            let fill = if selected {
-                crate::theme::BLUE_WASH
+            if selected {
+                panel_draw::round_rect(
+                    hdc,
+                    rect,
+                    scale(panel_draw::ROW_RADIUS),
+                    crate::theme::BLUE_WASH,
+                    None,
+                );
             } else if hovered {
-                crate::theme::CARD_TINT
-            } else {
-                crate::theme::CARD
-            };
-            fill_rect(hdc, rect, fill);
+                panel_draw::round_rect(
+                    hdc,
+                    rect,
+                    scale(panel_draw::ROW_RADIUS),
+                    crate::theme::WINDOW_BG,
+                    None,
+                );
+            }
 
-            // The chip first, so the label's lane can stop short of it:
-            // `DT_END_ELLIPSIS` truncates against the rect it is given, and a
-            // label drawn to the row's own edge would run under the chip.
+            // The badge first, so the text lane can stop short of it:
+            // `DT_END_ELLIPSIS` truncates against the rect it is given.
             let lane = if selected {
-                draw_hint_chip(hdc, rect, ENTER_SHORTCUT, fonts.hint, dpi)
+                panel_draw::draw_enter_badge(hdc, rect, fonts.badge, dpi)
             } else {
                 0
             };
 
+            let tile = RECT {
+                left: rect.left + scale(panel_draw::ROW_PAD_X),
+                top: rect.top + scale(panel_draw::ROW_PAD_Y),
+                right: rect.left + scale(panel_draw::ROW_PAD_X + panel_draw::AVATAR),
+                bottom: rect.top + scale(panel_draw::ROW_PAD_Y + panel_draw::AVATAR),
+            };
+            // **`initials` can legitimately answer an empty string** -- see
+            // `win32_draw::draw_text`, which is what keeps that from taking the
+            // daemon down.
+            panel_draw::draw_avatar(
+                hdc,
+                tile,
+                &crate::theme::initials(&row.account),
+                fonts.avatar,
+                panel_draw::avatar_colours(0),
+                dpi,
+            );
+
+            let left = tile.right + scale(panel_draw::ROW_TEXT_GAP);
+            let right = rect.right - crate::theme::TEXT_CLIP_INSET as i32 - lane;
+            let line = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
+            let mid = tile.top + (tile.bottom - tile.top) * 11 / 20;
             SetBkMode(hdc, TRANSPARENT);
+
             SetTextColor(hdc, rgb(crate::theme::INK));
             let old_font = SelectObject(hdc, fonts.name);
-            let mut rc = RECT {
-                left: rect.left + scale(CHOICE_TEXT_INSET),
-                top: rect.top,
-                right: rect.right - crate::theme::TEXT_CLIP_INSET as i32 - lane,
-                bottom: rect.bottom,
-            };
-            draw_text(
-                hdc,
-                label,
-                &mut rc,
-                DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
-            );
+            let mut rc = RECT { left, top: tile.top, right, bottom: mid };
+            draw_text(hdc, &row.primary, &mut rc, line);
             SelectObject(hdc, old_font);
-        }
-    }
 
-    /// The initials tile, centred in the square box it is given.
-    fn paint_avatar(hdc: HDC, row: RECT, name: &str, font: HFONT, selected: bool) {
-        unsafe {
-            let gutter = row.bottom - row.top;
-            let side = scale(28);
-            let x = row.left + (gutter - side) / 2;
-            let y = row.top + (gutter - side) / 2;
-            let (fill, ink) = if selected {
-                (crate::theme::BLUE, crate::theme::CARD)
-            } else {
-                (crate::theme::CANVAS, crate::theme::TEXT_SECONDARY)
-            };
-            let brush = CreateSolidBrush(rgb(fill));
-            let pen = CreatePen(PS_SOLID, 1, rgb(crate::theme::BORDER_STRONG));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let radius = scale(8) * 2;
-            let _ = RoundRect(hdc, x, y, x + side, y + side, radius, radius);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, rgb(ink));
-            let old_font = SelectObject(hdc, font);
-            // **`initials` can legitimately answer an empty string** -- it
-            // takes the first letters of a name's words, and a name made
-            // entirely of punctuation has none. That is a live path to the
-            // empty run, so the tile is drawn through `win32_draw::draw_text`
-            // like everything else; it simply comes out blank instead of
-            // taking the daemon down with an access violation at address 0x2.
-            let initials = crate::theme::initials(name);
-            let mut rc = RECT { left: x, top: y, right: x + side, bottom: y + side };
-            draw_text(hdc, &initials, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
+            let old_font = SelectObject(hdc, fonts.user);
+            let mut rc = RECT { left, top: mid, right, bottom: tile.bottom };
+            draw_text(hdc, &row.account, &mut rc, line);
             SelectObject(hdc, old_font);
         }
     }
@@ -1656,19 +1614,7 @@ mod win32 {
     /// The header's close glyph, drawn as two strokes because no bundled face
     /// has it at this weight.
     fn paint_close_glyph(hdc: HDC, at: Box2) {
-        unsafe {
-            use windows::Win32::Graphics::Gdi::{LineTo, MoveToEx};
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(crate::theme::TEXT_FAINT));
-            let old = SelectObject(hdc, pen);
-            let (x, y, w, h) = (scale(at.x), scale(at.y), scale(at.w), scale(at.h));
-            let pad = w / 3;
-            let _ = MoveToEx(hdc, x + pad, y + pad, None);
-            let _ = LineTo(hdc, x + w - pad, y + h - pad);
-            let _ = MoveToEx(hdc, x + w - pad, y + pad, None);
-            let _ = LineTo(hdc, x + pad, y + h - pad);
-            SelectObject(hdc, old);
-            let _ = DeleteObject(pen);
-        }
+        panel_draw::draw_close_x(hdc, dev(at), scale(1).max(1), crate::theme::TEXT_FAINT);
     }
 
     fn fill_rect(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {
@@ -1676,72 +1622,6 @@ mod win32 {
             let brush = CreateSolidBrush(rgb(colour));
             FillRect(hdc, &rc, brush);
             let _ = DeleteObject(brush);
-        }
-    }
-
-    /// [`fill_rect`], for a **logical** rectangle.
-    fn fill_box(hdc: HDC, at: Box2, colour: eframe::egui::Color32) {
-        fill_rect(
-            hdc,
-            RECT {
-                left: scale(at.x),
-                top: scale(at.y),
-                right: scale(at.right()),
-                bottom: scale(at.bottom()).max(scale(at.y) + 1),
-            },
-            colour,
-        );
-    }
-
-    /// One run of text, left-aligned and vertically centred in `at`.
-    fn text(hdc: HDC, font: HFONT, at: Box2, run: &str, colour: eframe::egui::Color32) {
-        text_aligned(hdc, font, at, run, colour, DT_LEFT)
-    }
-
-    /// [`text`], right-aligned. The match count and nothing else: it is the one
-    /// run on this card the design hangs off the right edge.
-    fn text_right(hdc: HDC, font: HFONT, at: Box2, run: &str, colour: eframe::egui::Color32) {
-        text_aligned(hdc, font, at, run, colour, DT_RIGHT)
-    }
-
-    /// **`DT_END_ELLIPSIS` on every run**, because two of them -- the account
-    /// line and the context under it -- are the user's own strings, and this
-    /// card cannot grow and cannot scroll. A name cut through a letter at the
-    /// box's edge reads as a rendering fault; one ending in "..." reads as
-    /// there being more.
-    fn text_aligned(
-        hdc: HDC,
-        font: HFONT,
-        at: Box2,
-        run: &str,
-        colour: eframe::egui::Color32,
-        align: DRAW_TEXT_FORMAT,
-    ) {
-        unsafe {
-            let old = SelectObject(hdc, font);
-            SetTextColor(hdc, rgb(colour));
-            let mut rc = RECT {
-                left: scale(at.x),
-                top: scale(at.y),
-                right: scale(at.right()),
-                bottom: scale(at.bottom()),
-            };
-            // `win32_draw::draw_text`, not `DrawTextW`: an empty run through
-            // the raw call is an access violation at address 0x2 that kills
-            // the whole daemon without a log line, and this card is where the
-            // second occurrence was found -- the account line and the context
-            // under it are the user's own strings and either can be empty.
-            //
-            // `DT_NOPREFIX`: these are the app's own words and a user's own
-            // account name, in which an `&` is an ampersand and never a
-            // mnemonic that would be drawn as an underscore.
-            draw_text(
-                hdc,
-                run,
-                &mut rc,
-                align | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
-            );
-            SelectObject(hdc, old);
         }
     }
 }
@@ -2075,32 +1955,6 @@ mod tests {
         assert_eq!(rows(APP, "x", Some("y"), &over).len(), ROW_CAP);
     }
 
-    /// **The heading counts what its word says.**
-    ///
-    /// The regression: the card handed this its ROW count, so one account
-    /// offering four ways to be typed announced "4 matches" -- four accounts,
-    /// which the user does not have and the card was not showing. The egui
-    /// card read "1 match" for the same state.
-    #[test]
-    fn the_heading_counts_accounts_and_this_card_only_ever_has_one() {
-        assert_eq!(match_count_label(1), "1 match");
-        assert_eq!(match_count_label(4), "4 matches");
-        assert_eq!(
-            MATCHES, 1,
-            "design 2a is the card for ONE matched account; the rows under the account block are \
-             that account's fill choices and not further matches"
-        );
-        assert_eq!(
-            match_count_label(MATCHES),
-            "1 match",
-            "the card's heading no longer reads `1 match` for the one account it is about"
-        );
-        // And the heading does not move with the choice list, at any length.
-        for choices in 1..=ROW_CAP {
-            assert_eq!(match_count_label(MATCHES), "1 match", "{choices} choices moved the count");
-        }
-    }
-
     /// **The row wearing the `Enter` chip is the row Enter fills.**
     #[test]
     fn the_selected_row_is_the_one_enter_takes() {
@@ -2177,8 +2031,9 @@ mod tests {
             assert_eq!(l.window.w, WIDTH);
             assert_eq!((l.window.x, l.window.y), (0, 0));
 
-            // **The brand lockup**, which the port had dropped entirely.
-            let lockup = crate::win32_draw::card_lockup();
+            // **The brand lockup**, which a card that opens unbidden over
+            // another app's password field has to carry.
+            let lockup = crate::panel_draw::lockup();
             assert_eq!(
                 (l.mark.x, l.mark.y),
                 (MARGIN_X, MARGIN_TOP),
@@ -2193,72 +2048,50 @@ mod tests {
             );
             assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
             assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
-            // The count shares the lockup's line, the way the egui card set it.
-            assert!(
-                l.wordmark.right() <= l.title.x,
-                "the match count is drawn over the wordmark"
-            );
-            assert!(l.title.w > 0, "the match count has no lane left to be drawn in");
-            assert_eq!(l.title.y, l.mark.y, "the match count has left the lockup's line");
+            assert!(l.wordmark.right() <= l.help.x, "the wordmark runs under the `?` badge");
 
-            // **The account block: the username, and what it fills.** This is
-            // the card's whole purpose -- see `Row::account`.
-            assert!(
-                l.mark.bottom() <= l.avatar.y,
-                "the account block runs into the brand lockup above it"
-            );
-            assert_eq!(l.avatar.x, MARGIN_X);
-            assert_eq!(l.avatar.w, l.avatar.h, "the initials tile is not square");
-            assert!(l.avatar.right() < l.account.x, "the username is drawn over its own tile");
-            assert_eq!(
-                l.account.x, l.context.x,
-                "the username and the line under it start at different insets"
-            );
-            assert!(l.account.bottom() <= l.context.y, "the account block's two lines overlap");
-            assert!(
-                l.context.bottom() <= l.header_rule.y,
-                "the account block's second line falls through the header rule"
-            );
-            assert_eq!(
-                l.account.right(),
-                WIDTH - MARGIN_X,
-                "the account block's text lane does not run to the card's own margin"
-            );
-            assert_eq!(
-                l.account.x - l.avatar.right(),
-                AVATAR_GAP,
-                "control: the account block's text no longer sits one `AVATAR_GAP` off its tile, \
-                 so the choice indent derived from those two columns means something else now"
-            );
-            assert_eq!(
-                l.list.x + CHOICE_TEXT_INSET,
-                l.account.x,
-                "a choice row's label does not line up with the username it belongs to"
-            );
-
-            assert!(l.title.right() <= l.close_glyph.x, "the header text runs under the ✕");
+            // The header's two buttons sit on the lockup's line, inside the
+            // card's margin, and do not touch.
+            assert!(l.help.right() < l.close_glyph.x, "the `?` badge touches the close glyph");
             assert!(
                 l.close_glyph.right() <= l.window.right() - MARGIN_X,
                 "the close glyph has crossed the card's right margin"
             );
-            assert!(l.header_rule.bottom() <= l.list.y);
-            assert_eq!(l.list.x, MARGIN_X);
+            assert_eq!(l.help.w, crate::panel_draw::HELP);
+            assert_eq!(l.help.w, l.help.h, "the `?` badge is not a circle");
+
+            // The tooltip lies on the card and clears the badge it explains.
+            assert!(l.tip.x >= 0 && l.tip.right() <= l.window.right(), "the tooltip left the card");
+            assert!(l.tip.right() <= l.help.x, "the tooltip covers its own badge");
+            assert!(
+                l.tip.bottom() <= l.window.bottom(),
+                "a {count}-row card is too short to hold the key-hint tooltip"
+            );
+
+            assert!(l.mark.bottom() <= l.list.y, "the list runs into the header");
+            assert_eq!(l.list.x, crate::panel_draw::LIST_PAD_X);
             assert_eq!(
                 l.list.right(),
-                WIDTH - MARGIN_X,
+                WIDTH - crate::panel_draw::LIST_PAD_X,
                 "the list does not sit inside the card's margins"
             );
             assert_eq!(
                 l.list.h,
-                ROW_H * count as i32,
+                ROW_H * count as i32 + ROW_GAP * (count as i32 - 1),
                 "the list is not sized to the rows it will draw"
             );
+            assert_eq!(
+                l.window.bottom(),
+                l.list.bottom() + crate::panel_draw::LIST_PAD_BOTTOM,
+                "the card has a band under its last row that is not the design's padding"
+            );
 
-            // Every row is inside the list, adjacent, and none overlaps.
+            // Every row is inside the list, one gap apart, and none overlaps.
             for index in 0..count {
                 let row = row_at(count, index);
                 assert_eq!(row.x, l.list.x);
                 assert_eq!(row.w, l.list.w);
+                assert_eq!(row.h, ROW_H);
                 assert!(row.y >= l.list.y, "row {index} starts above the list");
                 assert!(
                     row.bottom() <= l.list.bottom(),
@@ -2270,36 +2103,23 @@ mod tests {
                 if index > 0 {
                     assert_eq!(
                         row.y,
-                        row_at(count, index - 1).bottom(),
-                        "rows {} and {index} overlap or leave a gap",
+                        row_at(count, index - 1).bottom() + ROW_GAP,
+                        "rows {} and {index} overlap or are not one design gap apart",
                         index - 1
                     );
                 }
             }
-
-            assert!(l.list.bottom() <= l.footer_rule.y);
-            assert_eq!(
-                l.footer.y,
-                l.footer_rule.bottom(),
-                "the footer's tint does not start at its rule"
-            );
-            assert_eq!(
-                l.footer.bottom(),
-                l.window.bottom(),
-                "the footer's tint stops short of the card's bottom edge, leaving a band of the \
-                 card's own colour under it"
-            );
-            assert!(l.enter_chip.right() < l.fill.x, "the `Fill` word sits on its own chip");
-            assert!(l.fill.right() < l.esc_chip.x, "the two footer hints overlap");
-            assert!(l.esc_chip.right() < l.dismiss.x);
-            assert!(
-                l.dismiss.right() <= l.window.right() - MARGIN_X,
-                "the footer hint has crossed the card's right margin"
-            );
-            assert!(l.dismiss.w > 0, "the footer hint has no room for its word");
             checked += 1;
         }
         assert_eq!(checked, ROW_CAP);
+    }
+
+    /// A row is the design's account row: its tile and the padding round it.
+    #[test]
+    fn a_row_is_the_designs_account_row() {
+        assert_eq!(ROW_H, 64);
+        assert_eq!(ROW_GAP, 2);
+        assert_eq!(WIDTH, 400, "design D 1.3's Fill panel is 400 wide");
     }
 
     /// **The window grows by exactly one row per row**, so a card asked for
@@ -2309,7 +2129,7 @@ mod tests {
         for count in 2..=ROW_CAP {
             assert_eq!(
                 layout(count).window.h - layout(count - 1).window.h,
-                ROW_H,
+                ROW_PITCH,
                 "the {count}-row card is not one row taller than the {}-row one",
                 count - 1
             );
@@ -2341,9 +2161,9 @@ mod tests {
     #[test]
     fn the_cards_words_are_the_ones_it_promises() {
         assert_eq!(ENTER_SHORTCUT, "ENTER");
-        assert_eq!(FILL_LABEL, "Fill");
-        assert_eq!(ESC_SHORTCUT, "ESC");
-        assert_eq!(DISMISS_LABEL, "Dismiss");
+        // The panel's own key hints, which the `?` badge opens.
+        assert_eq!(crate::panel_draw::ENTER_LABEL, "Enter");
+        assert!(crate::panel_draw::FILL_KEY_HINTS.iter().any(|l| l.contains("Esc")));
     }
 
     /// **The title is this window's own.**

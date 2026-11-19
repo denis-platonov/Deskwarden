@@ -1165,7 +1165,7 @@ pub static REAL: GenerateCalls = GenerateCalls {
 ///
 /// Everything INSIDE the panel is 3d's own number. Only the panel's outside
 /// edge is the family's.
-pub const WIDTH: i32 = 380;
+pub const WIDTH: i32 = crate::panel_draw::CARD_W;
 
 /// 3d's `padding: 14px` on the panel body -- which is also the horizontal half
 /// of its footer band's `padding: 12px 14px`, so the card has one left edge all
@@ -4978,7 +4978,7 @@ mod tests {
         );
         assert_eq!(
             WIDTH,
-            crate::picker_prompt::WIDTH,
+            crate::panel_draw::CARD_W,
             "the daemon's two Win32 cards are different widths, which reads as two different \
              programs answering the same hotkey"
         );

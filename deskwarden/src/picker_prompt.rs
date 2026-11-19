@@ -709,7 +709,7 @@ pub static REAL: PickerCalls = PickerCalls {
 /// The card's width, and so the window's. Narrower than
 /// `unlock_prompt::WIDTH`: that card holds a 470px form, this one holds a list
 /// whose longest line is an item name.
-pub const WIDTH: i32 = 380;
+pub const WIDTH: i32 = crate::panel_draw::LIST_W;
 
 /// Content inset, and the top margin.
 const MARGIN_X: i32 = 16;

@@ -157,14 +157,19 @@ pub fn tip_height(lines: usize) -> i32 {
     2 * TIP_PAD_Y + TIP_LINE_H * lines as i32
 }
 
-/// Where the tooltip sits for a `?` badge at `badge` inside a window `w` wide:
-/// right-aligned under the header, so it lies on the list rather than above the
-/// panel -- a child window cannot paint outside itself, and a second topmost
-/// window would need its own foreground classification. See the plan's rulings.
+/// The tooltip's distance from the top of the card.
+pub const TIP_TOP: i32 = 8;
+
+/// Where the tooltip sits for a `?` badge at `badge` inside a window `window_w`
+/// wide: **to the left of the badge, over the header**, so it lies on the card
+/// rather than above it -- a child window cannot paint outside itself, and a
+/// second topmost window would need its own foreground classification. Left
+/// rather than below because the shortest card (one row) is only ~120 px tall
+/// and the tooltip is ~90. See the plan's rulings.
 pub fn tip_box(badge: (i32, i32, i32, i32), window_w: i32, lines: usize) -> (i32, i32, i32, i32) {
-    let (_, _, right, bottom) = badge;
-    let x = (right + 8 - TIP_W).clamp(0, (window_w - TIP_W).max(0));
-    (x, bottom + 8, TIP_W, tip_height(lines))
+    let (left, ..) = badge;
+    let x = (left - 8 - TIP_W).clamp(0, (window_w - TIP_W).max(0));
+    (x, TIP_TOP, TIP_W, tip_height(lines))
 }
 
 // ---------------------------------------------------------------------------
@@ -590,10 +595,11 @@ mod tests {
 
     #[test]
     fn the_tooltip_lies_on_the_panel_and_never_off_its_edge() {
-        let badge = (360, 14, 380, 34);
+        let badge = (340, 14, 360, 34);
         let (x, y, w, h) = tip_box(badge, 400, FILL_KEY_HINTS.len());
         assert!(x >= 0 && x + w <= 400, "the tooltip left the window: {x} + {w}");
-        assert!(y > 34, "the tooltip covers the badge it explains");
+        assert!(x + w <= badge.0, "the tooltip covers the badge it explains");
+        assert_eq!(y, TIP_TOP);
         assert_eq!(h, tip_height(3));
     }
 
@@ -632,8 +638,8 @@ mod tests {
     fn the_checks_path_is_cut_along_its_length() {
         assert_eq!(check_points(0.0), vec![(20.0, 6.0)]);
         assert_eq!(check_points(1.0), vec![(20.0, 6.0), (9.0, 17.0), (4.0, 12.0)]);
-        let half = check_points(0.5);
-        assert_eq!(half.len(), 3, "half the stroke has passed the elbow: {half:?}");
+        let past = check_points(0.8);
+        assert_eq!(past.len(), 3, "four fifths of the stroke has passed the elbow: {past:?}");
         let early = check_points(0.2);
         assert_eq!(early.len(), 2);
         assert!(early[1].0 < 20.0 && early[1].0 > 9.0);

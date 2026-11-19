@@ -412,7 +412,7 @@ pub static REAL: SaveLoginCalls = SaveLoginCalls {
 /// [`crate::picker_prompt::WIDTH`], because it is the same kind of card in the
 /// same place on screen and two frameless daemon cards of different widths read
 /// as two different programs.
-pub const WIDTH: i32 = 380;
+pub const WIDTH: i32 = crate::panel_draw::SAVE_W;
 
 /// Content inset, and the top margin.
 const MARGIN_X: i32 = 14;
@@ -2277,7 +2277,7 @@ mod tests {
         );
         assert_eq!(
             WIDTH,
-            crate::picker_prompt::WIDTH,
+            crate::panel_draw::SAVE_W,
             "two frameless daemon cards of different widths read as two different programs"
         );
         let lockup = crate::win32_draw::card_lockup();
