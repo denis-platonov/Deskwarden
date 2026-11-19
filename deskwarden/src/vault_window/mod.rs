@@ -25,6 +25,7 @@ pub mod send_ui;
 pub mod share_ui;
 pub mod sequence_builder;
 pub mod sign_in_steps;
+pub mod trash_modal;
 pub mod sidebar;
 pub mod splash;
 pub mod totp_add;
@@ -1531,6 +1532,8 @@ pub fn build_frame_with_search(
     let mut totp_add_state: Option<totp_add::TotpAdd> = None;
     // Spec B §5: the New item chooser is up.
     let mut new_item_chooser = false;
+    // Spec C §3: "Empty trash?" is up.
+    let mut empty_trash_asked = false;
     // Spec B §4: the command palette is up, with its query.
     let mut palette_state: Option<palette::PaletteState> = None;
     // **Design 6b's overlay, while it is up.**
@@ -3817,6 +3820,7 @@ pub fn build_frame_with_search(
                                 (spawn_sync)(sync_tx.clone(), session_token.to_string());
                             }
                         }
+                        ItemListAction::EmptyTrash => empty_trash_asked = true,
                         ItemListAction::None => {}
                     }
                 });
@@ -7869,6 +7873,35 @@ pub fn build_frame_with_search(
         // `may_edit` for a received record (spec 6.9): a code is a write to
         // the record, and CTRL+SHIFT+2 reaches here without the pane that
         // draws no ⏱ for one.
+        if empty_trash_asked {
+            let trashed: Vec<String> = trash_list.items.as_deref().unwrap_or_default().iter().map(|i| i.id.clone()).collect();
+            match trash_modal::draw(ui.ctx(), trashed.len()) {
+                trash_modal::EmptyTrashAnswer::Open => {}
+                trash_modal::EmptyTrashAnswer::Cancel => empty_trash_asked = false,
+                trash_modal::EmptyTrashAnswer::Confirm => {
+                    empty_trash_asked = false;
+                    // One purge per item, stopping at the first refusal; the
+                    // list is re-read either way, so it shows what is left.
+                    let mut failed = None;
+                    for id in &trashed {
+                        if let Err(e) = cache.purge_item(id) {
+                            log::warn!("emptying the trash: failed to purge item {id}: {e:?}");
+                            flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                            failed = Some(e);
+                            break;
+                        }
+                    }
+                    trash_list.invalidate();
+                    if selected_id.as_ref().is_some_and(|id| trashed.contains(id)) {
+                        selected_id = None;
+                    }
+                    crate::kit::toast::show(
+                        ui.ctx(),
+                        if failed.is_some() { "Couldn't empty the whole trash" } else { trash_modal::EMPTIED_TOAST },
+                    );
+                }
+            }
+        }
         if new_item_chooser {
             match new_item_modal::draw(ui.ctx()) {
                 new_item_modal::ChooserAnswer::Picked(kind) => {
@@ -21032,11 +21065,17 @@ mod out_of_vault_wiring_tests {
         );
         assert_eq!(
             production().matches(concat!("cache.purge_", "item(")).count(),
-            1,
+            2,
             "the permanent delete is called from somewhere other than the confirmation \
              handler, so the one irreversible action in this window can happen without \
              the question being asked"
         );
+        // Two: the delete modal's, and Empty trash's -- behind its own
+        // confirmation (slice 6), checked here by position.
+        let prod = production();
+        let confirm = prod.find(concat!("trash_modal::EmptyTrashAnswer::", "Confirm => {")).expect("the Empty trash confirm arm");
+        let purge = prod[confirm..].find(concat!("cache.purge_", "item(")).expect("Empty trash purges inside its confirm arm");
+        assert!(purge < 600, "Empty trash's purge is not inside its confirm arm");
         assert!(
             body.contains(concat!("cache.purge_", "item(")),
             "the confirmation handler does not purge, so \"Delete forever\" is a modal \

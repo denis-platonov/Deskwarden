@@ -8517,6 +8517,24 @@ fn totp_no_code_row(ui: &mut egui::Ui) {
 /// Days between an RFC3339 `revisionDate` (as `bw serve` sends it) and now.
 /// `None` on anything unparseable -- the caller shows "Updated recently"
 /// rather than a wrong number.
+/// The day number (days since 1970-01-01) of an RFC 3339 date's
+/// `YYYY-MM-DD` prefix.
+pub(crate) fn date_days(date: &str) -> Option<i64> {
+    let date_part = date.get(0..10)?;
+    let mut parts = date_part.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: i64 = parts.next()?.parse().ok()?;
+    let day: i64 = parts.next()?.parse().ok()?;
+    Some(days_from_civil(year, month, day))
+}
+
+/// Today's day number, by the system clock.
+pub(crate) fn today_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |now| (now.as_secs() / 86400) as i64)
+}
+
 fn days_since(revision_date: &str) -> Option<i64> {
     // A minimal RFC3339 date parse: only the `YYYY-MM-DD` prefix is needed
     // for a day-granularity "N days ago", so this avoids pulling in a full

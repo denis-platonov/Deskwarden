@@ -70,6 +70,8 @@ pub enum ItemListAction {
     DismissMoveError,
     /// The offline banner's Retry: sync now.
     RetrySync,
+    /// Spec C §3's "Empty trash": the window asks, then purges every item.
+    EmptyTrash,
     /// An entry of some row's right-click menu was chosen.
     ///
     /// The item's id is carried rather than left to `selected_id`, even
@@ -1036,6 +1038,52 @@ pub fn list_placeholder(
 /// window's ambient cadence is `FRAME_INTERVAL` (500ms), at which a spinner
 /// does not animate so much as twitch. It is asked for only in the `Loading`
 /// arm; the other two are static text with nothing to drive.
+pub const TRASH_NOTE: &str = "Items stay here for 30 days, then they're gone for good.";
+pub const EMPTY_TRASH: &str = "Empty trash";
+pub const TRASH_EMPTY: &str = "Trash is empty";
+pub const TRASH_EMPTY_DETAIL: &str = "Deleted items wait here for 30 days.";
+
+pub fn empty_trash_id() -> egui::Id {
+    egui::Id::new("list-empty-trash")
+}
+
+/// The note, and (with something to empty) the button; true when pressed.
+fn trash_band(ui: &mut egui::Ui, any: bool) -> bool {
+    let p = tokens::palette(ui.ctx());
+    let mut pressed = false;
+    egui::Frame::new().inner_margin(Margin { left: 24, right: 24, top: 0, bottom: 12 }).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let size = kit::controls::ButtonSize { height: 36.0, pad_x: 14.0, radius: 11, font_px: 14.0 };
+            let button_w = if any {
+                kit::controls::button_width(ui.ctx(), kit::controls::ButtonKind::Danger, size, EMPTY_TRASH, false) + 10.0
+            } else {
+                0.0
+            };
+            let room = (ui.available_width() - button_w).max(40.0);
+            ui.add_sized(
+                egui::vec2(room, 36.0),
+                egui::Label::new(tokens::job(tokens::BODY, TRASH_NOTE, p.text_faint)).wrap(),
+            );
+            if any {
+                let button = kit::controls::button(ui, kit::controls::ButtonKind::Danger, size, EMPTY_TRASH, None);
+                let _ = ui.interact(button.rect, empty_trash_id(), egui::Sense::hover());
+                pressed = button.clicked();
+            }
+        });
+    });
+    pressed
+}
+
+fn draw_trash_empty(ui: &mut egui::Ui) {
+    let p = tokens::palette(ui.ctx());
+    ui.vertical_centered(|ui| {
+        ui.add_space(48.0);
+        ui.spacing_mut().item_spacing.y = 8.0;
+        ui.label(tokens::job(PLACEHOLDER_TITLE, TRASH_EMPTY, p.ink));
+        ui.label(tokens::job(tokens::BODY, TRASH_EMPTY_DETAIL, p.text_faint));
+    });
+}
+
 fn draw_list_placeholder(ui: &mut egui::Ui, placeholder: ListPlaceholder) {
     let p = tokens::palette(ui.ctx());
     ui.vertical_centered(|ui| {
@@ -1152,6 +1200,7 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "sequence-builder-scrim",
     "delete-confirm-scrim",
     "detail-edit-discard-scrim",
+    "empty-trash-scrim",
     "folder-edit-scrim",
     "icon-pick-scrim",
     "launch-confirm-scrim",
@@ -1461,6 +1510,11 @@ pub fn draw_item_list(
     if let Some(kind) = list_header(ui, title, filtered.len()) {
         action = kind;
     }
+    // Spec C §3: the trash's 30-day line, and Empty trash while it holds
+    // anything.
+    if *filter == SidebarFilter::Trash && trash_band(ui, !filtered.is_empty()) {
+        action = ItemListAction::EmptyTrash;
+    }
     if offline && offline_banner(ui) {
         action = ItemListAction::RetrySync;
     }
@@ -1543,7 +1597,11 @@ pub fn draw_item_list(
                 filtered.len(),
                 searching,
             ) {
-                draw_list_placeholder(ui, placeholder);
+                if *filter == SidebarFilter::Trash && placeholder == ListPlaceholder::Empty {
+                    draw_trash_empty(ui);
+                } else {
+                    draw_list_placeholder(ui, placeholder);
+                }
                 // No scroll area ran, so the remembered offset would be last
                 // frame's -- from a scope that is not on screen any more.
                 // Zeroed, so the first arrow key after this list refills
@@ -2280,7 +2338,21 @@ pub(crate) fn row_look(item: &VaultItem, icon: Option<&egui::TextureHandle>) -> 
 }
 
 /// A row's subtitle: a card's masked last four, or the login's username.
+/// Spec C §3: a trashed row says when it went, from `deletedDate`.
+pub(crate) fn deleted_line(item: &VaultItem, today: i64) -> Option<String> {
+    let deleted = item.other.get("deletedDate")?.as_str()?;
+    let days = (today - super::detail::date_days(deleted)?).max(0);
+    Some(match days {
+        0 => "Deleted today".to_string(),
+        1 => "Deleted yesterday".to_string(),
+        n => format!("Deleted {n} days ago"),
+    })
+}
+
 pub(crate) fn row_subtitle(item: &VaultItem) -> String {
+    if let Some(line) = deleted_line(item, super::detail::today_days()) {
+        return line;
+    }
     if let Some(last) = card_last_four(item) {
         return format!("\u{2022}\u{2022}\u{2022}\u{2022} {last}");
     }
@@ -4971,7 +5043,12 @@ mod row_tile_tests {
         row: usize,
         filter: SidebarFilter,
     ) -> Painted {
-        let at = row_centre(items, row);
+        let mut at = row_centre(items, row);
+        // The Trash draws its 30-day band (36 high, 12 under it) above the
+        // rows, which `row_centre`'s live-vault frame does not.
+        if filter == SidebarFilter::Trash {
+            at.y += 48.0;
+        }
         paint_core(
             items,
             None,
@@ -5043,7 +5120,11 @@ mod row_tile_tests {
             &open_menu_under(items, folders.clone(), row, filter.clone()),
             label,
         );
-        let at = row_centre(items, row);
+        let mut at = row_centre(items, row);
+        // The Trash's band, as in `open_menu_with`.
+        if filter == SidebarFilter::Trash {
+            at.y += 48.0;
+        }
         let mut frames = click_frames(at, egui::PointerButton::Secondary);
         let mut entry_click = click_frames(entry, egui::PointerButton::Primary);
         // The MEASURED frame has to be the one the click resolves on. egui
@@ -7862,5 +7943,35 @@ mod v2_list_tests {
         let (done, _) = logins().draw(&ctx, 2.1, vec![]);
         assert_eq!(avatars(&done), rest, "at rest where the rows belong");
         assert!(done.repaint_delay > std::time::Duration::from_secs(1), "a settled list asks for nothing: {:?}", done.repaint_delay);
+    }
+}
+
+#[cfg(test)]
+mod trash_tests {
+    //! Spec C §3.
+    use super::*;
+
+    fn trashed(deleted: &str) -> VaultItem {
+        serde_json::from_value(serde_json::json!({
+            "id": "1", "name": "Old router", "type": 2, "deletedDate": deleted
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn trashed_rows_say_when_they_were_deleted() {
+        let today = super::super::detail::date_days("2026-11-19").unwrap();
+        assert_eq!(deleted_line(&trashed("2026-11-19T08:00:00Z"), today).as_deref(), Some("Deleted today"));
+        assert_eq!(deleted_line(&trashed("2026-11-18T08:00:00Z"), today).as_deref(), Some("Deleted yesterday"));
+        assert_eq!(deleted_line(&trashed("2026-11-07T08:00:00Z"), today).as_deref(), Some("Deleted 12 days ago"));
+        let live: VaultItem = serde_json::from_value(serde_json::json!({ "id": "2", "name": "x", "type": 2 })).unwrap();
+        assert_eq!(deleted_line(&live, today), None, "a live item says nothing of the kind");
+    }
+
+    #[test]
+    fn an_empty_trash_says_so() {
+        let ctx = crate::kit::testing::ctx();
+        let p = crate::kit::testing::frame(&ctx, 0.0, egui::vec2(380.0, 400.0), vec![], |ui| draw_trash_empty(ui));
+        assert!(p.text(TRASH_EMPTY).is_some() && p.text(TRASH_EMPTY_DETAIL).is_some());
     }
 }
