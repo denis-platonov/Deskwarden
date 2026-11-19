@@ -315,6 +315,12 @@ enum Surface {
     /// and legible as a list of names, and a chip row that wrapped into an
     /// unreadable block would satisfy every geometry assertion in the suite.
     EditSparseAdding,
+    /// The v2 editor creating a login: no About, no Move to trash.
+    EditNewLogin,
+    /// The v2 editor with the avatar menu open.
+    EditAvatarMenu,
+    /// The v2 editor's sign-in steps, half way through a test.
+    EditStepsTesting,
     /// The record composer -- the Send export form and its seed warning.
     RecordComposer,
     /// **Design 6c/6d**: the by-hand "add a one-time code" form, with a URI
@@ -791,9 +797,11 @@ const PANE_HEIGHT: f32 = 740.0;
 /// defects with it; this is the same measurement for the same reason.
 const EDIT_NARROW_WIDTH: f32 = 900.0 - 212.0 - 390.0;
 
-/// The window floor's own height, i.e. `MIN_VAULT_WINDOW_SIZE.1`. The pane
-/// gets all of it -- the vault window's chrome is drawn inside the viewport.
-const EDIT_NARROW_HEIGHT: f32 = 600.0;
+
+/// The v2 editor's width in the wide window: the window less the rail.
+const EDITOR_WIDTH: f32 = 1280.0 - 252.0;
+/// The v2 editor at its floor.
+const EDITOR_NARROW_WIDTH: f32 = 678.0;
 
 /// The Sends screen's own width: the whole window less the rail.
 ///
@@ -854,6 +862,9 @@ const ALL: &[Surface] = &[
     Surface::EditWebsites,
     Surface::EditSparse,
     Surface::EditSparseAdding,
+    Surface::EditNewLogin,
+    Surface::EditAvatarMenu,
+    Surface::EditStepsTesting,
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
     Surface::TotpAddPicker,
@@ -940,6 +951,9 @@ impl Surface {
             Surface::EditWebsites => "edit_websites",
             Surface::EditSparse => "edit_sparse",
             Surface::EditSparseAdding => "edit_sparse_adding",
+            Surface::EditNewLogin => "edit_new_login",
+            Surface::EditAvatarMenu => "edit_avatar_menu",
+            Surface::EditStepsTesting => "edit_steps_testing",
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
             Surface::TotpAddPicker => "totp_add_picker",
@@ -1068,10 +1082,10 @@ impl Surface {
             // preview stretched until everything fits answers "does it all
             // fit" with a yes the user never sees. What falls below the fold
             // here falls below the fold there.
-            Surface::EditLogin | Surface::EditLoginDirty => {
-                egui::vec2(PANE_WIDTH, PANE_HEIGHT)
-            }
-            Surface::EditLoginNarrow => egui::vec2(EDIT_NARROW_WIDTH, EDIT_NARROW_HEIGHT),
+            // v2: the editor is the window under the top bar, less the rail.
+            Surface::EditLogin | Surface::EditLoginDirty => egui::vec2(EDITOR_WIDTH, 820.0),
+            // The editor's floor (window floor less the rail): one column.
+            Surface::EditLoginNarrow => egui::vec2(EDITOR_NARROW_WIDTH, 820.0),
             // **Taller than the shipped pane, for `EditWebsites`' stated
             // reason**: the list this surface exists to show sits under the
             // password box on the SECOND card, and at the pane's own 740 it is
@@ -1104,6 +1118,11 @@ impl Surface {
             Surface::RecordComposer => egui::vec2(PANE_WIDTH, 900.0),
             Surface::EditSparse => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::EditSparseAdding => egui::vec2(PANE_WIDTH, 900.0),
+            // The v2 editor takes the window under the top bar: the wide
+            // window's width less the rail, tall enough for the two columns.
+            Surface::EditNewLogin | Surface::EditAvatarMenu | Surface::EditStepsTesting => {
+                egui::vec2(EDITOR_WIDTH, 820.0)
+            }
             // The shipped window is 1000x780 with a 40px chrome bar on top;
             // this draws the BODY, which is what `draw_prefs_body` is, so the
             // page lays out against exactly the width it has in the app.
@@ -1320,6 +1339,9 @@ fn main() -> eframe::Result {
             Surface::EditCardNarrow,
             Surface::EditWebsites,
             Surface::EditSparse,
+            Surface::EditNewLogin,
+            Surface::EditAvatarMenu,
+            Surface::EditStepsTesting,
         ]
     } else if totp {
         // 6a first, because it is the door; then 6d in the three states of
@@ -1698,6 +1720,19 @@ impl eframe::App for Preview {
             Surface::EditWebsites => self.draw_pane(root, PaneKind::EditWebsites),
             Surface::EditSparse => self.draw_pane(root, PaneKind::EditSparse(false)),
             Surface::EditSparseAdding => self.draw_pane(root, PaneKind::EditSparse(true)),
+            Surface::EditNewLogin => self.draw_pane(root, PaneKind::EditNew),
+            Surface::EditAvatarMenu => {
+                detail_edit::open_avatar_menu(root.ctx());
+                self.draw_pane(root, PaneKind::EditLogin(false))
+            }
+            Surface::EditStepsTesting => {
+                let sequence = self.fixtures.clean_draft.app.as_ref().map(|a| a.sequence.clone()).unwrap_or_default();
+                if !root.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("preview-steps-started")).unwrap_or(false)) {
+                    deskwarden::vault_window::sign_in_steps::play_test_from(root.ctx(), &sequence, 1.4);
+                    root.ctx().data_mut(|d| d.insert_temp(egui::Id::new("preview-steps-started"), true));
+                }
+                self.draw_pane(root, PaneKind::EditLogin(false))
+            }
             Surface::RecordComposer => self.draw_pane(root, PaneKind::Composer),
             Surface::TotpAddConfirm => self.draw_pane(root, PaneKind::TotpAdd),
             Surface::TotpAddPicker => self.draw_pane(root, PaneKind::TotpPicker),
@@ -1846,6 +1881,8 @@ enum PaneKind {
     EditWebsites,
     /// The edit form of a sparse identity, with the Add menu open or shut.
     EditSparse(bool),
+    /// The v2 editor creating a login.
+    EditNew,
     /// The Send record composer.
     Composer,
     /// The "add a one-time code" form, mid-confirmation.
@@ -2997,6 +3034,22 @@ impl Preview {
                         0,
                         &deskwarden::rest::organizations::Audience::Personal,
                         &fixtures.totp,
+                        None,
+                    );
+                }
+                PaneKind::EditNew => {
+                    let mut draft = EditDraft::empty_of(deskwarden::vault_bridge::ItemKind::Login);
+                    draft.name = "Ledgerline".into();
+                    let _ = detail_edit::draw_detail_edit(
+                        ui,
+                        &mut draft,
+                        &fixtures.folders,
+                        true,
+                        &mut fixtures.apps,
+                        None,
+                        0,
+                        &deskwarden::rest::organizations::Audience::Personal,
+                        &TotpState::NoSecret,
                         None,
                     );
                 }

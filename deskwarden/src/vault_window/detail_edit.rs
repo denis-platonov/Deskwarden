@@ -4577,6 +4577,11 @@ pub enum AvatarRow {
     Remove,
 }
 
+/// Opens the header's avatar menu (for previews: a shot of the menu open).
+pub fn open_avatar_menu(ctx: &egui::Context) {
+    egui::Popup::open_id(ctx, edit_control_id(EditControl::Avatar).with("popup"));
+}
+
 pub(crate) fn avatar_row_id(row: AvatarRow) -> egui::Id {
     egui::Id::new(("edit-avatar-menu", row))
 }

@@ -162,6 +162,15 @@ struct Run {
     done: bool,
 }
 
+/// Starts a test of `sequence` as if Test was pressed `elapsed` seconds ago
+/// (for previews: a shot of the test mid-run).
+pub fn play_test_from(ctx: &egui::Context, sequence: &str, elapsed: f64) {
+    if let Some(steps) = parse(sequence) {
+        let now = ctx.input(|i| i.time);
+        ctx.data_mut(|d| d.insert_temp(run_id(), Run { started: now - elapsed, steps, done: false }));
+    }
+}
+
 pub fn chip_remove_id(index: usize) -> egui::Id {
     egui::Id::new(("sign-in-step-remove", index))
 }
