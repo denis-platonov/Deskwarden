@@ -6064,27 +6064,27 @@ fn update_button(ui: &mut Ui, label: &str, enabled: bool) -> bool {
     enabled && response.clicked()
 }
 
-/// **Five pages that could not be drawn have been removed instead.**
-///
-/// `draw_not_yet` used to live here: a card whose whole content was one
-/// sentence saying nothing on the page was configurable. It was the honest
-/// treatment -- deliberately not a disabled toggle, a "coming soon" badge, or
-/// a greyed-out copy of 3e'''s controls, all three of which read as a feature
-/// that is present and broken -- and that argument still stands wherever a
-/// surface must show an absence (`loading_ui` and `vault_disk_cache` both
-/// cite it). But a *nav row* is not such a surface. It is a promise that a
-/// decision lives behind it, and the honest sentence was being reached by a
-/// click the row had mis-sold. Autofill, Native apps and Security are gone;
-/// so are Shortcuts (one read-only chip, now [`fill_hotkey_row`] on General)
-/// and Sync & account (two rows of prose, neither of them a setting).
-///
-/// `draw_sync_and_account`'''s second row was a signpost saying the backend
-/// switch had moved to [`Section::Vault`]. **It went with the page, and that
-/// is not an oversight.** A signpost only works from the place the reader is
-/// standing; with the page they would have stood on gone from the nav, there
-/// is nowhere left to read it from. The nav does the signpost'''s job now --
-/// Vault is one row below Breaches, above the fold, named in the word the
-/// sentence used.
+// **Five pages that could not be drawn have been removed instead.**
+//
+// `draw_not_yet` used to live here: a card whose whole content was one
+// sentence saying nothing on the page was configurable. It was the honest
+// treatment -- deliberately not a disabled toggle, a "coming soon" badge, or
+// a greyed-out copy of 3e'''s controls, all three of which read as a feature
+// that is present and broken -- and that argument still stands wherever a
+// surface must show an absence (`loading_ui` and `vault_disk_cache` both
+// cite it). But a *nav row* is not such a surface. It is a promise that a
+// decision lives behind it, and the honest sentence was being reached by a
+// click the row had mis-sold. Autofill, Native apps and Security are gone;
+// so are Shortcuts (one read-only chip, now [`fill_hotkey_row`] on General)
+// and Sync & account (two rows of prose, neither of them a setting).
+//
+// `draw_sync_and_account`'''s second row was a signpost saying the backend
+// switch had moved to [`Section::Vault`]. **It went with the page, and that
+// is not an oversight.** A signpost only works from the place the reader is
+// standing; with the page they would have stood on gone from the nav, there
+// is nowhere left to read it from. The nav does the signpost'''s job now --
+// Vault is one row below Breaches, above the fold, named in the word the
+// sentence used.
 
 // ---------------------------------------------------------------------------
 // Window
@@ -8052,7 +8052,6 @@ mod tests {
 
     /// UTC, so every painted date in these tests is exact wherever the suite
     /// runs. The page itself uses `local_time::SystemZone`.
-
     fn zone() -> crate::local_time::FixedOffset {
         crate::local_time::FixedOffset(0)
     }
@@ -8924,8 +8923,10 @@ mod tests {
     #[test]
     fn the_ghosted_backend_pill_does_not_change_the_setting_when_clicked() {
         let ctx = tall_context();
-        let mut settings = Settings::default();
-        settings.use_official_bw_crypto = Some(false);
+        let settings = Settings {
+            use_official_bw_crypto: Some(false),
+            ..Settings::default()
+        };
         let mut state = PrefsState::new(settings);
         state.section = Section::Vault;
         state.show_account_source(|| {
@@ -10949,8 +10950,10 @@ mod tests {
     /// neither alone decides it.
     fn paint_vault_for(server: Option<&'static str>, use_official: bool) -> Painted {
         let ctx = tall_context();
-        let mut settings = Settings::default();
-        settings.use_official_bw_crypto = Some(use_official);
+        let settings = Settings {
+            use_official_bw_crypto: Some(use_official),
+            ..Settings::default()
+        };
         let mut state = PrefsState::new(settings);
         state.section = Section::Vault;
         state.show_account_source(match server {
@@ -11556,8 +11559,10 @@ mod tests {
     /// subprocess is not drawn.
     fn paint_vault_copy(hello: bool, self_hosted: bool, use_official: bool) -> Painted {
         let ctx = tall_context();
-        let mut settings = Settings::default();
-        settings.use_official_bw_crypto = Some(use_official);
+        let settings = Settings {
+            use_official_bw_crypto: Some(use_official),
+            ..Settings::default()
+        };
         let mut state = PrefsState::new(settings);
         state.section = Section::Vault;
         state.show_hello_available(if hello { || true } else { || false });

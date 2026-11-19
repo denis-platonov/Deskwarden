@@ -1404,7 +1404,7 @@ mod tests {
     /// transcript panel, the acts and a footer.
     #[test]
     fn the_window_is_sized_for_the_surface() {
-        assert!(SCRATCH_WIDTH >= 420.0 && SCRATCH_HEIGHT >= 360.0);
+        const { assert!(SCRATCH_WIDTH >= 420.0 && SCRATCH_HEIGHT >= 360.0) };
     }
 
     /// **Every act reads as a sentence, and the three kinds read differently.**

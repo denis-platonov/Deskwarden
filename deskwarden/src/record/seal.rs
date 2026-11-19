@@ -283,12 +283,16 @@ mod tests {
         // is the line that would have to be deliberately edited to undo that
         // reasoning, rather than a comment that could be ignored.
         assert_eq!(SEAL_KDF, "argon2id");
-        assert!(
-            ARGON2_MEMORY_KIB >= 19 * 1024,
-            "the memory cost is what an attacker's custom hardware has to pay; \
-             {ARGON2_MEMORY_KIB} KiB is below the recommended 19 MiB"
-        );
-        assert!(ARGON2_PASSES >= 2);
+        // (A const assertion cannot interpolate, so the message names the
+        // constant instead of printing it.)
+        const {
+            assert!(
+                ARGON2_MEMORY_KIB >= 19 * 1024,
+                "the memory cost is what an attacker's custom hardware has to pay; \
+                 ARGON2_MEMORY_KIB is below the recommended 19 MiB"
+            );
+            assert!(ARGON2_PASSES >= 2);
+        }
     }
 
     #[test]

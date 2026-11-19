@@ -27,8 +27,11 @@ pub struct ForegroundEvent {
     pub title: String,
 }
 
+/// The registered foreground-change callback.
+type ForegroundCallback = Box<dyn FnMut(ForegroundEvent)>;
+
 thread_local! {
-    static CALLBACK: RefCell<Option<Box<dyn FnMut(ForegroundEvent)>>> = RefCell::new(None);
+    static CALLBACK: RefCell<Option<ForegroundCallback>> = RefCell::new(None);
 }
 
 pub fn watch_foreground_windows(

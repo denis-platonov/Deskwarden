@@ -6609,8 +6609,10 @@ fn probe_ink_at(
     probe: &str,
 ) -> (f32, f32) {
     ctx.fonts_mut(|f| {
-        let mut job = egui::text::LayoutJob::default();
-        job.wrap = egui::text::TextWrapping::no_max_width();
+        let mut job = egui::text::LayoutJob {
+            wrap: egui::text::TextWrapping::no_max_width(),
+            ..egui::text::LayoutJob::default()
+        };
         job.append(
             probe,
             0.0,
@@ -7563,8 +7565,10 @@ fn field_box(ui: &mut Ui, value: &mut String, shape: FieldShape<'_>) -> (Respons
     // `detail::title_text` and `totp_add::secret_field` reach for one.
     let password = shape.password;
     let mut layouter = |ui: &Ui, buffer: &dyn egui::TextBuffer, wrap: f32| {
-        let mut job = egui::text::LayoutJob::default();
-        job.wrap = egui::text::TextWrapping::no_max_width();
+        let mut job = egui::text::LayoutJob {
+            wrap: egui::text::TextWrapping::no_max_width(),
+            ..egui::text::LayoutJob::default()
+        };
         let _ = wrap;
         // **Masked here, because a custom layouter is handed the RAW text.**
         // egui masks inside its DEFAULT layouter only (`mask_if_password`),
@@ -7948,17 +7952,16 @@ pub fn form_card_header_marked(ui: &mut Ui, title: &str, plane: bool) -> Rect {
     }
 }
 
+/// A card header's optional mark: its width and the painter that draws it.
+type CardMark<'a> = (f32, &'a dyn Fn(&egui::Painter, Rect));
+
 /// **The one header band**, with whichever mark the card wears before its
 /// title: `(size, painter)`, or none. [`form_card_header_marked`]'s plane
 /// and [`form_card_header_share`]'s person-with-a-plus both come through
 /// here, so the two title bands cannot come apart by a point --
 /// `all_four_bands_ask_the_rule_rather_than_the_narrow_constant` counts ONE
 /// header asking for its padding, and a second copy of this body was a fifth.
-fn form_card_header_with(
-    ui: &mut Ui,
-    title: &str,
-    mark: Option<(f32, &dyn Fn(&egui::Painter, Rect))>,
-) -> Rect {
+fn form_card_header_with(ui: &mut Ui, title: &str, mark: Option<CardMark<'_>>) -> Rect {
     let line = egui::Frame::new()
         .inner_margin(Margin::symmetric(form_card_pad_x(ui.available_width()), FORM_CARD_PAD_Y))
         .show(ui, |ui| {
@@ -14847,7 +14850,7 @@ mod modal_card_tests {
         // A bleed of zero is what the bug WAS, and it would satisfy an
         // equality against a border of zero -- so the border is asserted to
         // exist as well.
-        assert!(MODAL_STROKE > 0.0, "the card has no border for the bands to cover");
+        const { assert!(MODAL_STROKE > 0.0, "the card has no border for the bands to cover") };
     }
 
     /// **And the geometry the arithmetic describes**: the band really does
@@ -15591,10 +15594,12 @@ mod form_card_padding_tests {
         // And the threshold is a threshold rather than a range: one point
         // under it is the narrow answer.
         assert_eq!(form_card_pad_x(FORM_CARD_WIDE_AT - 1.0), FORM_CARD_PAD_X);
-        assert!(
-            FORM_CARD_PAD_X_WIDE > FORM_CARD_PAD_X,
-            "the wide answer is meant to be the roomier one"
-        );
+        const {
+            assert!(
+                FORM_CARD_PAD_X_WIDE > FORM_CARD_PAD_X,
+                "the wide answer is meant to be the roomier one"
+            )
+        };
     }
 
     /// **Every band of the card asks the RULE**, and none of them still holds
@@ -15641,10 +15646,12 @@ mod form_card_padding_tests {
         assert_eq!(section_card_pad_x(SECTION_CARD_WIDE_AT - 1.0), SECTION_CARD_PAD_X);
         assert_eq!(section_card_pad_x(288.0), SECTION_CARD_PAD_X);
         assert_eq!(SECTION_CARD_PAD_X_WIDE, 16, "§8a's `padding: 11px 16px`");
-        assert!(
-            SECTION_CARD_PAD_X_WIDE > SECTION_CARD_PAD_X,
-            "the wide answer is meant to be the roomier one"
-        );
+        const {
+            assert!(
+                SECTION_CARD_PAD_X_WIDE > SECTION_CARD_PAD_X,
+                "the wide answer is meant to be the roomier one"
+            )
+        };
     }
 }
 

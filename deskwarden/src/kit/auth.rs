@@ -225,6 +225,8 @@ pub fn error_chip(ui: &mut Ui, text: &str, width: f32) {
 }
 
 /// A full-width button (the sign-in screen's Log in is the form's width).
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn wide_button(
     ui: &mut Ui,
     kind: crate::kit::controls::ButtonKind,

@@ -1458,12 +1458,14 @@ fn scroll_offset_for_row(row: usize, offset: f32, viewport_height: f32) -> Optio
 /// `sidebar::badge_text` exists to keep out of the badge one control to the
 /// left. The rows themselves are drawn from `unwrap_or(&[])`, because there
 /// is genuinely nothing to draw either way.
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_item_list(
     ui: &mut egui::Ui,
     items: Option<&[VaultItem]>,
     folders: &[Folder],
     filter: &SidebarFilter,
-    search: &mut String,
+    search: &mut str,
     selected_id: &mut Option<String>,
     icons: &IconCache,
     // See `menu_entries`' own parameter. Read by the rows' right-click menus
@@ -2021,6 +2023,8 @@ pub(crate) fn list_strip<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -
 /// Design 2b's `padding: 12px` on the list header strip.
 pub(crate) const LIST_STRIP_PAD: i8 = 12;
 
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 fn item_row(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -3720,10 +3724,10 @@ mod row_tile_tests {
     /// A row tile on a list that FITS: the pane minus the list frame's
     /// `padding: 10px` on each side.
     const TILE_WIDTH: f32 = PANE_WIDTH - 2.0 * LIST_PADDING;
-    /// **There is no second tile width.** The bar is drawn inside the
-    /// padding and reserves nothing extra, so a list that scrolls lays its
-    /// tiles out exactly like one that fits -- pinned by
-    /// `the_tiles_keep_one_width_whether_or_not_the_list_can_scroll`.
+    // **There is no second tile width.** The bar is drawn inside the
+    // padding and reserves nothing extra, so a list that scrolls lays its
+    // tiles out exactly like one that fits -- pinned by
+    // `the_tiles_keep_one_width_whether_or_not_the_list_can_scroll`.
 
     // -----------------------------------------------------------------
     // Design 5d -- the `shared` pill

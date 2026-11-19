@@ -3306,8 +3306,10 @@ mod tests {
     /// stop that left others on it, or failed, says nothing.
     #[test]
     fn a_stop_that_moved_the_record_home_hands_over_its_new_id() {
-        let mut pane = SharingPane::default();
-        pane.stopping = Some(("s1".into(), "anna@x.io".into()));
+        let mut pane = SharingPane {
+            stopping: Some(("s1".into(), "anna@x.io".into())),
+            ..SharingPane::default()
+        };
         apply(&mut pane, SharingReport::Stopped { email: "anna@x.io".into(), result: Ok(Some("p-new".into())) }, 0.0);
         assert_eq!(pane.take_moved_home(), Some(("s1".to_string(), "p-new".to_string())));
         assert_eq!(pane.take_moved_home(), None, "handed over once");
@@ -3385,8 +3387,10 @@ mod tests {
     /// thread starts -- with or without a line to the daemon.
     #[test]
     fn share_anyway_needs_the_fingerprint_that_was_shown_and_carries_its_hash() {
-        let mut pane = SharingPane::default();
-        pane.view = Some(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![("r1", vec!["eve@x.io"])]));
+        let mut pane = SharingPane {
+            view: Some(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![("r1", vec!["eve@x.io"])])),
+            ..SharingPane::default()
+        };
         assert!(pane.share_anyway("eve@x.io").is_none(), "no fingerprint fetched yet");
         apply(&mut pane, SharingReport::Fingerprint { email: "eve@x.io".into(), result: Ok(fingerprint("ab12")) }, 0.0);
         assert_eq!(pane.fingerprint.as_ref().map(|(e, f)| (e.as_str(), f.phrase.as_str())), Some(("eve@x.io", "cobalt-hinge-lantern-mossy-quill")));
@@ -3439,8 +3443,10 @@ mod tests {
     /// screen for one frame. Only a new write clears it.
     #[test]
     fn a_failed_writes_sentence_outlives_the_view_read_it_causes() {
-        let mut pane = SharingPane::default();
-        pane.view = Some(SharingView { available: true, ..SharingView::default() });
+        let mut pane = SharingPane {
+            view: Some(SharingView { available: true, ..SharingView::default() }),
+            ..SharingPane::default()
+        };
         apply(&mut pane, SharingReport::LinkAccepted(Err("Couldn't stop sharing.".into())), 0.0);
         assert!(pane.wants_view(0.0));
         let (tx, rx) = mpsc::channel();
@@ -3564,8 +3570,10 @@ mod tests {
     /// view stale.
     #[test]
     fn a_second_write_while_one_is_running_is_refused_out_loud() {
-        let mut pane = SharingPane::default();
-        pane.view = Some(view(vec![], vec![]));
+        let mut pane = SharingPane {
+            view: Some(view(vec![], vec![])),
+            ..SharingPane::default()
+        };
         let (tx, rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let line = dead_line();
@@ -3888,8 +3896,10 @@ mod tests {
         assert_eq!(dialog.adopt, Some(a_question()));
         assert!(!pane.busy, "the write slot is free while the user answers");
 
-        let mut pane = SharingPane::default();
-        pane.busy = true;
+        let mut pane = SharingPane {
+            busy: true,
+            ..SharingPane::default()
+        };
         apply(&mut pane, asked(), 1.0);
         assert!(pane.notice.as_deref().is_some_and(|n| n.contains("Acme VPN")), "{:?}", pane.notice);
     }
@@ -4065,8 +4075,10 @@ mod tests {
     #[test]
     fn a_failed_forget_is_said_in_the_dialog_that_asked_and_nowhere_else() {
         let failed = || SharingReport::Forgot(Err("Couldn't stop sharing Wi-Fi.".into()));
-        let mut pane = SharingPane::default();
-        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        let mut pane = SharingPane {
+            dialog: Some(ShareDialog::opening("r1", "Acme VPN")),
+            ..SharingPane::default()
+        };
         pane.begin_forget("anna@x.io", true);
         apply(&mut pane, failed(), 0.0);
         let dialog = pane.dialog.as_ref().expect("open");
@@ -4074,8 +4086,10 @@ mod tests {
         assert!(!dialog.forget_asked, "answered: the flag is spent");
         assert!(pane.notice.is_none());
 
-        let mut pane = SharingPane::default();
-        pane.dialog = Some(ShareDialog::opening("r1", "Acme VPN"));
+        let mut pane = SharingPane {
+            dialog: Some(ShareDialog::opening("r1", "Acme VPN")),
+            ..SharingPane::default()
+        };
         pane.begin_forget("anna@x.io", false);
         apply(&mut pane, failed(), 0.0);
         assert!(pane.dialog.as_ref().is_some_and(|d| d.error.is_none()), "the composer's forget is not this dialog's");
@@ -4112,8 +4126,10 @@ mod tests {
     /// it; the answer is said as a toast or a notice instead.
     #[test]
     fn an_answer_does_not_land_in_a_dialog_that_did_not_ask() {
-        let mut pane = SharingPane::default();
-        pane.dialog = Some(ShareDialog::opening("r2", "Wi-Fi"));
+        let mut pane = SharingPane {
+            dialog: Some(ShareDialog::opening("r2", "Wi-Fi")),
+            ..SharingPane::default()
+        };
         apply(&mut pane, SharingReport::Shared { email: "carol@x.io".into(), item_name: "Acme VPN".into(), result: Ok(ShareResult::Invited) }, 0.0);
         assert!(pane.dialog.as_ref().is_some_and(|d| d.invited.is_none()));
         assert!(pane.toast.is_some());
@@ -4394,8 +4410,10 @@ mod tests {
     /// -- either way -- frees the slot.
     #[test]
     fn a_fingerprint_request_keeps_the_notice_and_holds_its_own_slot() {
-        let mut pane = SharingPane::default();
-        pane.notice = Some("Couldn't stop sharing.".into());
+        let mut pane = SharingPane {
+            notice: Some("Couldn't stop sharing.".into()),
+            ..SharingPane::default()
+        };
         let (tx, rx) = mpsc::channel();
         let ctx = egui::Context::default();
         let line = dead_line();
@@ -4470,8 +4488,10 @@ mod tests {
     /// is kept.
     #[test]
     fn a_moved_state_drops_the_fingerprint_shown_for_the_state_before() {
-        let mut pane = SharingPane::default();
-        pane.view = Some(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![("r1", vec!["eve@x.io"])]));
+        let mut pane = SharingPane {
+            view: Some(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![("r1", vec!["eve@x.io"])])),
+            ..SharingPane::default()
+        };
         apply(&mut pane, SharingReport::Fingerprint { email: "Eve@X.io".into(), result: Ok(fingerprint("ab12")) }, 0.0);
         apply(&mut pane, SharingReport::View(Ok(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![("r1", vec!["eve@x.io"])]))), 1.0);
         assert!(pane.fingerprint.is_some(), "nothing moved: the words stay");
@@ -4481,8 +4501,10 @@ mod tests {
 
         // Shown for a person the view did not list yet: the view that first
         // lists them has moved them too.
-        let mut pane = SharingPane::default();
-        pane.view = Some(view(vec![], vec![]));
+        let mut pane = SharingPane {
+            view: Some(view(vec![], vec![])),
+            ..SharingPane::default()
+        };
         apply(&mut pane, SharingReport::Fingerprint { email: "eve@x.io".into(), result: Ok(fingerprint("ab12")) }, 0.0);
         apply(&mut pane, SharingReport::View(Ok(view(vec![("eve@x.io", PersonState::KeyChanged, None)], vec![]))), 1.0);
         assert!(pane.fingerprint.is_none());
@@ -4550,9 +4572,11 @@ mod tests {
     #[test]
     fn the_read_pane_is_handed_the_notice_and_the_fetch() {
         let item: VaultItem = serde_json::from_value(serde_json::json!({ "id": "r1", "name": "Acme VPN" })).expect("item");
-        let mut pane = SharingPane::default();
-        pane.notice = Some("no".into());
-        pane.fingerprinting = Some("anna@x.io".into());
+        let mut pane = SharingPane {
+            notice: Some("no".into()),
+            fingerprinting: Some("anna@x.io".into()),
+            ..SharingPane::default()
+        };
         let people = people_sharing(&pane, true, &item, &[]);
         assert_eq!(people.notice, Some("no"));
         assert_eq!(people.fingerprinting, Some("anna@x.io"));
@@ -4888,8 +4912,10 @@ mod tests {
     /// Escape is No.
     #[test]
     fn accept_asks_before_joining_and_escape_says_no() {
-        let mut pane = SharingPane::default();
-        pane.paste = Zeroizing::new("hello".into());
+        let mut pane = SharingPane {
+            paste: Zeroizing::new("hello".into()),
+            ..SharingPane::default()
+        };
         ask_to_join(&mut pane);
         assert_eq!(pane.join_asking, None);
         assert_eq!(pane.notice.as_deref(), Some(crate::invite_link::LinkError::NotAnInviteLink.sentence()));

@@ -5732,8 +5732,10 @@ mod generator_prefs_tests {
         let dir = std::env::temp_dir().join(format!("dw-genprefs-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("settings.json");
-        let mut first = Settings::default();
-        first.check_breaches = true;
+        let first = Settings {
+            check_breaches: true,
+            ..Settings::default()
+        };
         first.save(&path).unwrap();
         let prefs = GeneratorPrefs { mode: crate::generator_mode::GeneratorMode::Passphrase, words: 7, ..GeneratorPrefs::default() };
         Settings::persist_generator(&path, &prefs).unwrap();

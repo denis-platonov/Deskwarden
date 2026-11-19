@@ -2512,13 +2512,15 @@ fn secret_field(ui: &mut egui::Ui, typed: &mut String) -> egui::Response {
         egui::vec2(outer.width() - (SECRET_BOX_STROKE + SECRET_BOX_PAD_X) * 2.0, row),
     );
     let mut layouter = |ui: &egui::Ui, buffer: &dyn egui::TextBuffer, _wrap: f32| {
-        let mut job = egui::text::LayoutJob::default();
         // `no_max_width`, because this is a single-line field: 6d's box says
         // `word-break: break-all` for a URI too long to show, but a wrap
         // inside a one-line `TextEdit` puts the caret on a row the box is not
         // tall enough to paint. The overflow scrolls instead, which is what
         // every other field in this app does with a long value.
-        job.wrap = egui::text::TextWrapping::no_max_width();
+        let mut job = egui::text::LayoutJob {
+            wrap: egui::text::TextWrapping::no_max_width(),
+            ..egui::text::LayoutJob::default()
+        };
         job.append(
             buffer.as_str(),
             0.0,

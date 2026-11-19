@@ -111,11 +111,14 @@ pub enum Outcome {
     Unavailable,
 }
 
+/// Opens the card for an app name at an anchor.
+pub type OpenLockedFn = fn(&str, Option<(f32, f32)>) -> Option<LockedWindow>;
+
 /// The Win32 half, as `fn` pointers so [`run_with`] can be driven without a
 /// desktop. Nothing here decides anything.
 pub struct LockedCalls {
     /// Lays out and shows the card for this app name, at this anchor.
-    pub open: fn(&str, Option<(f32, f32)>) -> Option<LockedWindow>,
+    pub open: OpenLockedFn,
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on the **top-level**
     /// window, called before the first `next`. Windows refuses it on a child
     /// control with `E_INVALIDARG`.
@@ -1511,6 +1514,8 @@ mod tests {
     fn every_exit_path_closes_the_window() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static CLOSED: AtomicUsize = AtomicUsize::new(0);
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let paths: [(fn(LockedWindow) -> Event, Outcome, LockedAnswer); 3] = [
             (|_| Event::Cancel, Outcome::Dismissed, LockedAnswer::Dismissed),
             (|_| Event::Closed, Outcome::Dismissed, LockedAnswer::Dismissed),

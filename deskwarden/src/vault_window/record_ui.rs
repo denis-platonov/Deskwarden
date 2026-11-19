@@ -1465,6 +1465,8 @@ const MODAL_WIDTH: f32 = 690.0;
 /// second one built differently is two modals that dim, layer and swallow
 /// clicks two ways. Nothing about the form itself moves in here: every
 /// decision it paints is still [`export_problem`]'s and [`warning_is_shown`]'s.
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_export_modal(
     ctx: &egui::Context,
     state: &mut RecordSend,

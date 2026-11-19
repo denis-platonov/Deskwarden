@@ -1631,6 +1631,8 @@ pub const SCOPE_EMPTY_DETAIL: &str = "Your other Sends are still on the Sends ro
 /// the detail print is already worded by [`pane_state`], which is handed both,
 /// before this function sees a row. With the composer gone, nothing drawn
 /// here reads the time at all.
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_send_pane(
     ui: &mut egui::Ui,
     state: &SendPaneState,
@@ -5861,8 +5863,10 @@ mod tests {
     /// from a previous visit must not be the failure the next visit shows.
     #[test]
     fn a_late_failure_is_dropped_just_as_a_late_success_is() {
-        let mut fetch = SendFetch::default();
-        fetch.in_flight = true;
+        let mut fetch = SendFetch {
+            in_flight: true,
+            ..SendFetch::default()
+        };
         let tag = fetch.generation();
         fetch.invalidate();
         assert!(!fetch.apply_answer(tag, Err(SendError::Offline)));
@@ -11833,6 +11837,8 @@ mod source_pins {
         let refused = super::super::send_fetch_thread::real_send_list(TOKEN);
         // Plain strings, deliberately: what this test is about is what the
         // CHILD would have been given, not the recorder's own shape.
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let attempts: Vec<(Option<usize>, Vec<String>, Vec<(String, Option<String>)>)> = probe
             .attempts()
             .into_iter()
@@ -15397,11 +15403,7 @@ mod frame_promptness {
         /// block -- see [`the_first_painted_frame_returns_promptly`].
         pre_styled: bool,
         /// The stub `VaultFrameEnv::load` is built from.
-        load: fn(
-            Arc<VaultCache>,
-            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
-            VaultLoadRequest,
-        ),
+        load: crate::vault_window::VaultLoadSpawner,
         /// How many frames to drive before reading the result.
         frames: usize,
         /// Whether to press the sidebar's **Sends** row partway through. The
@@ -16229,6 +16231,8 @@ mod frame_promptness {
         // Plain strings, deliberately: the recorded type belongs to
         // `job_object`, and what this test is about is what the CHILD would
         // have been given, not the recorder's shape.
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let attempts: Vec<(Vec<String>, Vec<(String, Option<String>)>)> = probe
             .attempts()
             .into_iter()

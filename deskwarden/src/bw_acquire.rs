@@ -840,6 +840,14 @@ impl CliSetupState {
 
 // ---- the seam ---------------------------------------------------------------
 
+/// [`download_artefact`]'s shape: bounded agent, artefact, destination, progress callback.
+type DownloadFn = fn(
+    &StallBounded,
+    &BwArtefact,
+    &Path,
+    &dyn Fn(u64, Option<u64>),
+) -> Result<PathBuf, AcquireRefusal>;
+
 /// The `fn`-pointer seam, same shape and same discipline as
 /// [`crate::updater::UpdaterEnv`].
 ///
@@ -865,12 +873,7 @@ pub struct BwAcquireEnv {
     /// [`resolve_artefact`]: which release, which asset, which digest.
     resolve: fn(&TotalBounded) -> Result<BwArtefact, AcquireRefusal>,
     /// [`download_artefact`]: stream it to a temp file and check the digest.
-    download: fn(
-        &StallBounded,
-        &BwArtefact,
-        &Path,
-        &dyn Fn(u64, Option<u64>),
-    ) -> Result<PathBuf, AcquireRefusal>,
+    download: DownloadFn,
     /// [`extract_bw_exe`]: pull `bw.exe` out of the archive, into temp.
     extract: fn(&Path, &Path) -> Result<PathBuf, AcquireRefusal>,
     /// [`verify_is_bitwardens`]: the load-bearing check, run on the extracted
@@ -1682,12 +1685,7 @@ mod tests {
         let env = BwAcquireEnv::production();
         let present: fn() -> Option<PathBuf> = resolve_present_and_trusted;
         let resolve: fn(&TotalBounded) -> Result<BwArtefact, AcquireRefusal> = resolve_artefact;
-        let download: fn(
-            &StallBounded,
-            &BwArtefact,
-            &Path,
-            &dyn Fn(u64, Option<u64>),
-        ) -> Result<PathBuf, AcquireRefusal> = download_artefact;
+        let download: DownloadFn = download_artefact;
         let extract: fn(&Path, &Path) -> Result<PathBuf, AcquireRefusal> = extract_bw_exe;
         let verify: fn(&Path) -> Result<(), AcquireRefusal> = verify_is_bitwardens;
         let install: fn(&Path) -> Result<PathBuf, AcquireRefusal> = install_at_the_resolver_path;

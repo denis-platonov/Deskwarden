@@ -4966,8 +4966,8 @@ mod tests {
                 }
                 let hashes = h - r - 1;
                 if fresh && at(h) == '"' {
-                    for k in i..=h {
-                        push(chars[k], true, &mut out);
+                    for &c in &chars[i..=h] {
+                        push(c, true, &mut out);
                     }
                     i = h + 1;
                     while i < n {
@@ -4979,8 +4979,8 @@ mod tests {
                                 got += 1;
                             }
                             if got == hashes {
-                                for m in i..k {
-                                    push(chars[m], true, &mut out);
+                                for &c in &chars[i..k] {
+                                    push(c, true, &mut out);
                                 }
                                 i = k;
                                 break;

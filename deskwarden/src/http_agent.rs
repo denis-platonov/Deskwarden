@@ -150,6 +150,8 @@ pub fn bounded_total(connect: Duration, total: Duration) -> TotalBounded {
 /// `ureq` copies it into each request's head, which this crate does not own
 /// and cannot wipe -- the limit `rest::api::RestClient::sync` states for its
 /// own bearer.
+// The middleware closure's `ureq::Error` is large; the shape is ureq's, not ours.
+#[allow(clippy::result_large_err)]
 pub fn bounded_total_with_bearer(
     connect: Duration,
     total: Duration,

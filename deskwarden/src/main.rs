@@ -5203,6 +5203,8 @@ fn offer_the_remembered_record<A: UiAutomationFiller, B: SendInputFiller>(
     }
 }
 
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 fn process_foreground_event<A: UiAutomationFiller, B: SendInputFiller>(
     event: &window_watch::ForegroundEvent,
     cache: &VaultCache,
@@ -17971,6 +17973,10 @@ mod tests {
              token and a live `bw serve`, and `main`'s \"closed without a session\" check \
              is the only thing that would have noticed"
         );
+        // The loop is kept over a single entry rather than inlined because the
+        // ordering claim is about every blocking call in `produce`, not about
+        // this particular one.
+        #[allow(clippy::single_element_loop)]
         for later in [
             // `vault.as_ref()` and not `vault`: `produce` holds an
             // `Arc<dyn VaultBackend>` since the backend seam landed, and this
@@ -17980,9 +17986,6 @@ mod tests {
             concat!("wait_for_vault", "_ready(vault.as_ref(), schedule)"),
             // The `bw status` that used to be the second entry here is gone
             // -- see `the_startup_worker_spawns_nothing_to_name_the_account`.
-            // One entry rather than two, and the loop is kept rather than
-            // inlined because the ordering claim is about every blocking call
-            // in `produce`, not about this particular one.
         ] {
             let at = body
                 .find(later)
@@ -24734,11 +24737,13 @@ mod tests {
                 "the startup-failure code sits outside the bitfield precisely so it cannot be \
                  read as an outcome"
             );
-            assert!(
-                UI_COULD_NOT_START > UI_RESULT_CODE_CEILING,
-                "control: the startup-failure code has moved inside the bitfield's range, so \
-                 a failed launch now reads as a result"
-            );
+            const {
+                assert!(
+                    UI_COULD_NOT_START > UI_RESULT_CODE_CEILING,
+                    "control: the startup-failure code has moved inside the bitfield's range, so \
+                     a failed launch now reads as a result"
+                )
+            };
         }
 
         #[test]
@@ -36217,7 +36222,6 @@ mod bw_serve_gate {
 /// whose server URL is self-hosted, and the tests that want that arm supply a
 /// temp config directory with no key file in it, which is the arm that does
 /// no I/O beyond one `read` that fails.
-
 #[cfg(test)]
 mod vault_backend_choice_tests {
     use super::*;

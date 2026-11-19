@@ -69,6 +69,8 @@ impl<'a> Dialog<'a> {
         self
     }
 
+    // A builder setter for the card's sub-line, not `std::ops::Sub`.
+    #[allow(clippy::should_implement_trait)]
     pub fn sub(mut self, sub: &'a str) -> Self {
         self.sub = Some(sub);
         self

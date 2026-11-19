@@ -2619,6 +2619,14 @@ pub trait PromptPresenter {
     ) -> locked_card::LockedAnswer;
 }
 
+/// The overlay's `show` seam: query, matched app, anchor and choices in, the picked row out.
+type OverlayShowFn = fn(
+    &str,
+    Option<&crate::prompt_card::OverlayMatch>,
+    Option<(f32, f32)>,
+    &[FillChoice],
+) -> Option<FillChoice>;
+
 /// A [`PromptPresenter`] that is nothing but the two functions it forwards to.
 ///
 /// **Function pointers rather than a hand-written `impl` per presenter**, so
@@ -2630,12 +2638,7 @@ pub struct FnPresenter {
     /// Asked where the overlay for this window, at this row count, goes.
     pub position: fn(isize, usize) -> Option<(f32, f32)>,
     /// Asked to put it on screen; answers which row the user picked.
-    pub show: fn(
-        &str,
-        Option<&crate::prompt_card::OverlayMatch>,
-        Option<(f32, f32)>,
-        &[FillChoice],
-    ) -> Option<FillChoice>,
+    pub show: OverlayShowFn,
     /// Asked to put the remembered-record card on screen; answers which row
     /// the user took. See [`PromptPresenter::show_recall`].
     #[allow(clippy::type_complexity)]
@@ -12035,6 +12038,8 @@ mod recall_tests {
     struct RecallRecorder {
         asked_rows: std::cell::Cell<Option<usize>>,
         asked_about: std::cell::Cell<Option<isize>>,
+        // test recorder field; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         shown: std::cell::RefCell<Vec<(String, Option<String>, Option<(f32, f32)>)>>,
         offered: std::cell::RefCell<Vec<Vec<FillChoice>>>,
         answer: Option<RecallRow>,

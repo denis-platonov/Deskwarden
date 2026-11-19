@@ -468,6 +468,9 @@ impl std::fmt::Display for Target {
 // mocks
 // ---------------------------------------------------------------------------
 
+/// Builds a response body from the request it answers.
+type BodyFromRequest = Arc<dyn Fn(&Request) -> Vec<u8> + Send + Sync>;
+
 /// What a mock answers with.
 ///
 /// The second variant is not a convenience: `vault_bridge`'s `bw serve` PUT
@@ -478,7 +481,7 @@ impl std::fmt::Display for Target {
 #[derive(Clone)]
 enum ResponseBody {
     Fixed(Vec<u8>),
-    FromRequest(Arc<dyn Fn(&Request) -> Vec<u8> + Send + Sync>),
+    FromRequest(BodyFromRequest),
 }
 
 impl ResponseBody {

@@ -934,7 +934,7 @@ pub fn build_frame_with_search(
     // network round-trip, and running it inline on this thread -- as it used
     // to -- froze the entire vault window (no repaint, no input) for however
     // long the sync took.
-    let (sync_tx, sync_rx): (mpsc::Sender<Result<(), String>>, Receiver<Result<(), String>>) = mpsc::channel();
+    let (sync_tx, sync_rx) = mpsc::channel::<Result<(), String>>();
     // True from the moment a sync starts until its outcome arrives, so a
     // second click can't start a second concurrent sync -- same guard
     // `main.rs` uses for its update-apply flow.
@@ -1011,10 +1011,7 @@ pub fn build_frame_with_search(
     // `vault_load_step`, which is the one place nobody was going to write
     // it. A snapshot arrives here as the single value
     // `snapshot_unless_superseded` built under one lock acquisition.
-    let (vault_tx, vault_rx): (
-        mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
-        Receiver<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
-    ) = mpsc::channel();
+    let (vault_tx, vault_rx) = mpsc::channel::<VaultLoadMsg>();
     // The generation of the most recently spawned `spawn_vault_load` call.
     // Incremented immediately before every spawn (both below and at the
     // post-sync reload further down) so it always names the newest spawn;
@@ -1285,10 +1282,7 @@ pub fn build_frame_with_search(
         mpsc::channel();
     // `Option` inside the `Ok`: `None` is a fetch that completed against a
     // vault session this window has since left. See `spawn_aux_load`.
-    let (aux_tx, aux_rx): (
-        mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
-        Receiver<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
-    ) = mpsc::channel();
+    let (aux_tx, aux_rx) = mpsc::channel::<AuxLoadMsg>();
     // Seeded, not blank: see the `initial_search` parameter. It is an ordinary
     // `String` from here on and the user can clear or edit it like any other,
     // which is the whole of what "the query is a starting point, not a mode"
@@ -1434,10 +1428,7 @@ pub fn build_frame_with_search(
     // against, so a poll issued before a reload could be applied after it
     // and undo the reload's re-arm (review 15's Minor 5) -- see
     // `totp_poll_result_is_current`.
-    let (totp_tx, totp_rx): (
-        mpsc::Sender<(u64, String, Result<Option<String>, VaultError>)>,
-        Receiver<(u64, String, Result<Option<String>, VaultError>)>,
-    ) = mpsc::channel();
+    let (totp_tx, totp_rx) = mpsc::channel::<(u64, String, Result<Option<String>, VaultError>)>();
     // True from the moment a poll thread is spawned until its result is
     // drained. Gates `should_start_totp_poll` so a `bw serve` that never
     // answers can pile up at most one outstanding poll thread rather than a
@@ -8913,11 +8904,7 @@ pub struct VaultFrameEnv {
     /// auto-sync on the window's first real frame and the Sync button.
     sync: fn(mpsc::Sender<Result<(), String>>, String),
     /// `spawn_vault_load` in production -- the window's initial load.
-    load: fn(
-        std::sync::Arc<VaultCache>,
-        mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
-        VaultLoadRequest,
-    ),
+    load: VaultLoadSpawner,
     /// `send_fetch_thread::spawn_send_list` in production -- the Sends
     /// screen's one fetch, started by the frame that first draws that screen.
     ///
@@ -11295,9 +11282,12 @@ type AuxLoadSpawn = fn(
     OutOfVault,
     u64,
     crate::vault_cache::VaultEra,
-    mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
+    mpsc::Sender<AuxLoadMsg>,
 );
 
+// The whole signature is pinned character for character by
+// `every_frame_env_seam_has_a_whole_body_pin`, so the message tuple stays spelled out.
+#[allow(clippy::type_complexity)]
 fn spawn_aux_load(
     cache: std::sync::Arc<VaultCache>,
     which: OutOfVault,
@@ -11314,9 +11304,10 @@ fn spawn_aux_load(
     });
 }
 
-/// **The Sends' backend as an interface with two implementations**, and the
-/// one place in this window that chooses between them.
 mod backend_tasks {
+    //! **The Sends' backend as an interface with two implementations**, and the
+    //! one place in this window that chooses between them.
+    //!
     //! # Why this module exists
     //!
     //! Six of this window's actions -- the Sends list, create, revoke and
@@ -11728,8 +11719,9 @@ mod backend_tasks {
     }
 }
 
-/// The Sends fetch's thread boundary, **with the blocking call sealed in**.
 mod send_fetch_thread {
+    //! The Sends fetch's thread boundary, **with the blocking call sealed in**.
+    //!
     //! This module is a privacy boundary and that is its entire reason for
     //! existing. Two rounds of source pins over the previous shape were
     //! defeated by *hoisting* -- moving the blocking call to a position the
@@ -11938,11 +11930,20 @@ mod send_fetch_thread {
 
 }
 
+/// What a vault load sends back: its generation and the snapshot or the failure.
+type VaultLoadMsg = (u64, Result<VaultSnapshot, VaultLoadFailure>);
+/// What an out-of-vault fetch sends back: generation, which fetch, and the items
+/// (`None` for a fetch that completed against a session the window has left).
+type AuxLoadMsg = (u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>);
+/// The vault-load spawner seam (`spawn_vault_load` in production).
+type VaultLoadSpawner = fn(std::sync::Arc<VaultCache>, mpsc::Sender<VaultLoadMsg>, VaultLoadRequest);
+
 /// The Sends channel's sending half. Named because three signatures carry it.
 type SendListSender = mpsc::Sender<send_channel::SendListAnswer>;
 
-/// The Sends channel's **receiving** half, as a type that cannot be waited on.
 mod send_channel {
+    //! The Sends channel's **receiving** half, as a type that cannot be waited on.
+    //!
     //! A privacy boundary around one `Receiver`, and that is its entire
     //! reason for existing.
     //!
@@ -12380,8 +12381,9 @@ fn drain_export(rx: &Receiver<ExportReport>, export: &mut ExportState) {
     }
 }
 
-/// The vault export's off-thread half, and its job.
 mod export_thread {
+    //! The vault export's off-thread half, and its job.
+    //!
     //! **Everything about an export that blocks lives in here, and the frame
     //! closure's only entry point is [`spawn_export`].** There are two
     //! blocking things and the frame may wait on neither: the shell's save
@@ -13147,8 +13149,9 @@ fn drain_send_delete(
     }
 }
 
-/// The revoke's off-thread half, and its job.
 mod send_delete_thread {
+    //! The revoke's off-thread half, and its job.
+    //!
     //! **Everything about a revoke that blocks lives in here, and the frame
     //! closure's only entry point is [`spawn_send_delete`]** -- `mod
     //! export_thread`'s shape, for `mod send_fetch_thread`'s reason.
@@ -13752,8 +13755,9 @@ fn drain_send_create(
     }
 }
 
-/// The create's off-thread half, and its job.
 mod send_create_thread {
+    //! The create's off-thread half, and its job.
+    //!
     //! **Everything about a create that blocks lives in here, and the frame
     //! closure's only entry point is [`spawn_send_create`]** -- `mod
     //! send_delete_thread`'s shape, for `mod send_fetch_thread`'s reason.
@@ -13870,6 +13874,8 @@ impl AuxLoadError {
     }
 }
 
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 fn draw_read_arm(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -14062,6 +14068,8 @@ fn totp_poll_result_is_current(
 /// `folders`/`vault_loading`/`selected_id`/`sync_status` all left exactly as
 /// they were, since the newer spawn's own result is what should determine
 /// them instead.
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 fn apply_vault_load_result(
     generation: u64,
     latest_generation: u64,
@@ -30756,11 +30764,7 @@ mod export_wiring {
         // taken -- a signature drift is a compile error here rather than a
         // silently different address.
         let real_sync: fn(mpsc::Sender<Result<(), String>>, String) = spawn_vault_sync;
-        let real_load: fn(
-            Arc<VaultCache>,
-            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
-            VaultLoadRequest,
-        ) = spawn_vault_load;
+        let real_load: VaultLoadSpawner = spawn_vault_load;
         let real_send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>) =
             send_fetch_thread::spawn_send_list;
         let real_export: ExportSpawn = export_thread::spawn_export;
@@ -30999,11 +31003,7 @@ mod export_wiring {
             "control: a different function of the same signature compares EQUAL to the \
              production sync spawner, so the `sync` assertion is vacuous"
         );
-        let load_decoy: fn(
-            Arc<VaultCache>,
-            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
-            VaultLoadRequest,
-        ) = not_the_load_spawner;
+        let load_decoy: VaultLoadSpawner = not_the_load_spawner;
         let (name, same) = seam!(load, load_decoy);
         assert_eq!(name, "load", "control: `seam!` misnames `load`");
         assert!(
@@ -31859,7 +31859,7 @@ mod export_wiring {
         _: OutOfVault,
         _: u64,
         _: crate::vault_cache::VaultEra,
-        _: mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
+        _: mpsc::Sender<AuxLoadMsg>,
     ) {
         unreachable!("never called -- the aux-load decoy exists only to have an address");
     }
@@ -37247,8 +37247,10 @@ mod send_delete_wiring {
             other => panic!("a panicked revoke reported {other:?}"),
         }
         // And the drain really clears the flag on it.
-        let mut delete = SendDeleteState::default();
-        delete.in_flight = Some("send-id-42".to_string());
+        let mut delete = SendDeleteState {
+            in_flight: Some("send-id-42".to_string()),
+            ..SendDeleteState::default()
+        };
         let mut fetch = send_ui::SendFetch::default();
         let (tx2, rx2): (SendDeleteSender, Receiver<SendDeleteReport>) = mpsc::channel();
         tx2.send(report).expect("alive");
@@ -38804,11 +38806,7 @@ mod frame_env_seam {
     /// its own arguments.
     pub(super) fn stubbed(
         sync: fn(mpsc::Sender<Result<(), String>>, String),
-        load: fn(
-            std::sync::Arc<VaultCache>,
-            mpsc::Sender<(u64, Result<VaultSnapshot, VaultLoadFailure>)>,
-            VaultLoadRequest,
-        ),
+        load: VaultLoadSpawner,
         send_list: fn(egui::Context, SendListSender, u64, zeroize::Zeroizing<String>),
         settings_path: Option<std::path::PathBuf>,
     ) -> VaultFrameEnv {
@@ -38879,7 +38877,7 @@ mod frame_env_seam {
         which: OutOfVault,
         generation: u64,
         _: crate::vault_cache::VaultEra,
-        tx: mpsc::Sender<(u64, OutOfVault, Result<Option<Vec<VaultItem>>, AuxLoadError>)>,
+        tx: mpsc::Sender<AuxLoadMsg>,
     ) {
         let _ = tx.send((generation, which, Ok(Some(Vec::new()))));
     }
@@ -40749,11 +40747,13 @@ mod send_create_wiring {
                  them really would silently never fire"
             );
         }
-        assert!(
-            SEND_RECORD_MODIFIERS.shift,
-            "the record chord no longer carries SHIFT, so it and the sequence builder's \
-             CTRL+S are the same chord on the same key"
-        );
+        const {
+            assert!(
+                SEND_RECORD_MODIFIERS.shift,
+                "the record chord no longer carries SHIFT, so it and the sequence builder's \
+                 CTRL+S are the same chord on the same key"
+            )
+        };
         assert_eq!(
             binds_the_s_key(&code, key),
             1,

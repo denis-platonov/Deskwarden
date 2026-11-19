@@ -175,7 +175,6 @@ impl DaemonLink {
 
     /// One long-poll of the daemon's change feed, as
     /// [`crate::rest::notifications::HubListener::following`] asks for it.
-    #[must_use]
     pub fn feed_poll(&self) -> crate::rest::notifications::FollowPoll {
         // The agent outlives each poll and is bounded above the feed's own
         // long-poll, so a quiet feed answers before the request times out.

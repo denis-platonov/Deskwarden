@@ -5133,6 +5133,8 @@ mod lock_transition_tests {
     /// answers `None` (the failed-rebuild path, which needs no
     /// `VaultFrameHandles` -- there is no way to build one from this module),
     /// and nothing here spawns a process, opens a window or touches disk.
+    // test constructor; the `impl FnOnce` return shape is the point
+    #[allow(clippy::type_complexity)]
     fn a_lock_under_test(
         relocked: &Rc<RefCell<bool>>,
     ) -> InWindowLock<

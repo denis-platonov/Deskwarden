@@ -481,10 +481,10 @@ pub fn extend(
     }
 }
 
-/// `pub` for the same reason [`crate::rest::crypto::tests`] is: `rest::api`
-/// needs a `MappedSend` fixture, and a `MappedSend` has no constructor but
-/// [`encrypt_plan`] -- which is the whole point of the type. Sharing the
-/// plan fixture is a narrower door than a second constructor.
+// `pub` for the same reason [`crate::rest::crypto::tests`] is: `rest::api`
+// needs a `MappedSend` fixture, and a `MappedSend` has no constructor but
+// [`encrypt_plan`] -- which is the whole point of the type. Sharing the
+// plan fixture is a narrower door than a second constructor.
 // ---- the three the vault window calls ---------------------------------------
 
 /// The client and the live session for the account this process is serving.

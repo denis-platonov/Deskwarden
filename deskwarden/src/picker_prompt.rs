@@ -4400,10 +4400,12 @@ mod card_tests {
         // The card's search box is still design 2b's, and the field is still
         // the list's card: nothing here grew a size of its own.
         assert_eq!(SEARCH_H as f32, crate::theme::SEARCH_FIELD_HEIGHT);
-        assert!(
-            FIELD_PAD_X > 0 && FIELD_PAD_X < SEARCH_H,
-            "the field's inner inset is not an inset at all"
-        );
+        const {
+            assert!(
+                FIELD_PAD_X > 0 && FIELD_PAD_X < SEARCH_H,
+                "the field's inner inset is not an inset at all"
+            )
+        };
     }
 
     /// Search mode says what it is and what to do.

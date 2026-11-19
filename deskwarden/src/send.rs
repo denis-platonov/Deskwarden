@@ -4627,6 +4627,8 @@ mod tests {
     #[test]
     fn every_way_a_bw_run_can_end_is_classified() {
         // (why, exit code, stdout, stderr, expected arm, expected ambiguity)
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let rows: [(&str, Option<i32>, &str, &str, &str, bool); 10] = [
             (
                 "exit 0 with output nothing can read: a Send PROBABLY EXISTS",

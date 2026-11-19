@@ -5063,10 +5063,12 @@ mod tests {
         assert_eq!((BADGE_TICK, BADGE_TICK_STROKE), (13.0, 2.8));
         assert_eq!(BADGE_TEXT_PX, 12.0);
         assert_eq!(BADGE_OFFSET, 34.0);
-        assert!(
-            BADGE_OFFSET > BADGE_HEIGHT,
-            "the badge would overlap the selection it is announcing"
-        );
+        const {
+            assert!(
+                BADGE_OFFSET > BADGE_HEIGHT,
+                "the badge would overlap the selection it is announcing"
+            )
+        };
 
         // `right: 6px; bottom: 6px; padding: 3px 7px; border-radius: 5px;
         // font-size: 11px`, on `rgba(32, 30, 29, 0.86)` -- 0.86 * 255 = 219.3.

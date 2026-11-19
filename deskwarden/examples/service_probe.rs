@@ -126,6 +126,8 @@ fn main() {
     let mut all_held = true;
     for (label, keys) in scenarios {
         println!("{label}:");
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let requests: Vec<(&str, &str, Option<String>, u16, Vec<&str>)> = vec![
             ("no credential", "/list/object/items", None, 401, vec!["login-1", "card-1"]),
             (

@@ -280,6 +280,9 @@ pub enum Event {
     Generate,
 }
 
+/// Opens the card for this form at an anchor.
+pub type OpenSaveFn = fn(&SaveLoginForm, Option<(f32, f32)>) -> Option<SaveWindow>;
+
 /// The Win32 half, as `fn` pointers so [`run_with`] can be driven without a
 /// desktop. Nothing here decides anything; every decision lives in
 /// [`run_with`].
@@ -290,7 +293,7 @@ pub struct SaveLoginCalls {
     /// **It takes the whole form, not a name**: coming back from design 3d the
     /// card must open on the username the user already typed and the password
     /// 3d just produced, with the caret where a user would expect it.
-    pub open: fn(&SaveLoginForm, Option<(f32, f32)>) -> Option<SaveWindow>,
+    pub open: OpenSaveFn,
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on the **top-level**
     /// window, called before the first `next` -- see the module doc. Windows
     /// refuses it on a child control with `E_INVALIDARG`, and the top-level

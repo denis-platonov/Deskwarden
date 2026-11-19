@@ -1900,6 +1900,8 @@ fn group(ui: &mut egui::Ui, label: &str, dim: bool, field: impl FnOnce(&mut egui
 /// are not drawn either (the CLI has no password-hint API, and "Log out" is
 /// the same primitive). The Hello stage appears once quick unlock is enrolled
 /// (`hello.enrolled`).
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_login_window(
     ui: &mut egui::Ui,
     status: BwStatus,
@@ -4572,7 +4574,7 @@ mod resize_zone_tests {
         // Not decoration: a corner is a two-axis target reachable no other
         // way, and at `RESIZE_BAND` it is a 6x6 square in the very pixel the
         // window ends.
-        assert!(RESIZE_CORNER > RESIZE_BAND);
+        const { assert!(RESIZE_CORNER > RESIZE_BAND) };
     }
 }
 
@@ -5464,6 +5466,8 @@ mod login_entry_point_tests {
         // caller that could take one without the other is a caller that can
         // record a session for an account it cannot name. `add_account` is
         // exactly that caller -- it used to run a `bw status` to find out.
+        // the type is the assertion: it pins the signature of the two entry points
+        #[allow(clippy::type_complexity)]
         let cancellable: fn(Option<(&Path, &Account)>, bool) -> Option<SignedInSession> =
             run_login_flow_for;
         let fatal: fn(Option<(&Path, &Account)>, bool) -> String = run_login_flow;

@@ -1420,6 +1420,9 @@ struct FolderList {
 /// structs the read path deserializes into ([`CardData`], [`IdentityData`]),
 /// so the wire key names have exactly one definition and the create and edit
 /// paths cannot drift apart.
+// The variants are plain owned strings that callers build and match by value; boxing
+// the larger ones would ripple through every caller for no measurable gain.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum NewItem {
     Login {

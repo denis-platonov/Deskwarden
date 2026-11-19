@@ -161,9 +161,11 @@ fn signer_certificate(path_w: &[u16]) -> Result<(Option<String>, Option<String>)
             .map_err(|e| format!("could not read the signer info ({e})"))?;
 
             let signer = &*(buffer.as_ptr() as *const CMSG_SIGNER_INFO);
-            let mut find = CERT_INFO::default();
-            find.Issuer = signer.Issuer;
-            find.SerialNumber = signer.SerialNumber;
+            let find = CERT_INFO {
+                Issuer: signer.Issuer,
+                SerialNumber: signer.SerialNumber,
+                ..CERT_INFO::default()
+            };
 
             let cert = CertFindCertificateInStore(
                 store,

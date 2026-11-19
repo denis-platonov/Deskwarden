@@ -1270,6 +1270,9 @@ pub(crate) mod tests {
 
     /// A hub on `127.0.0.1` that runs `script` once per connection, in
     /// order, and reports what each connection sent it.
+    // The handshake callback's `ErrorResponse` is tungstenite's own large type.
+    // The boxed script type is spelled once, here, and read nowhere else.
+    #[allow(clippy::result_large_err, clippy::type_complexity)]
     fn hub(
         scripts: Vec<Box<dyn FnOnce(&mut tungstenite::WebSocket<TcpStream>) + Send>>,
         refuse_first: bool,

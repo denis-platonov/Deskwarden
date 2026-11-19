@@ -949,7 +949,9 @@ mod tests {
 
     #[test]
     fn the_done_card_outlives_its_animation() {
-        assert!(DONE_TOTAL_MS > DONE_DRAW_DELAY_MS + DONE_DRAW_MS);
-        assert!(DONE_TOTAL_MS < 3000, "a confirmation that lingers is an interruption");
+        const {
+            assert!(DONE_TOTAL_MS > DONE_DRAW_DELAY_MS + DONE_DRAW_MS);
+            assert!(DONE_TOTAL_MS < 3000, "a confirmation that lingers is an interruption");
+        }
     }
 }

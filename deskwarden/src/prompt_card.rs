@@ -241,12 +241,15 @@ pub enum Outcome {
     Unavailable,
 }
 
+/// Opens the card for these rows at an anchor.
+pub type OpenPromptFn = fn(&[Row], Option<(f32, f32)>) -> Option<PromptWindow>;
+
 /// The Win32 half, as `fn` pointers so [`run_with`] can be driven without a
 /// desktop. Nothing here decides anything.
 pub struct PromptCalls {
     /// Lays out and shows the card for these rows, at this anchor. `None` if
     /// it could not be put on screen.
-    pub open: fn(&[Row], Option<(f32, f32)>) -> Option<PromptWindow>,
+    pub open: OpenPromptFn,
     /// `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)` on the **top-level**
     /// window, called before the first `next`. Windows refuses it on a child
     /// control with `E_INVALIDARG`, and the top-level flag covers every child
@@ -1542,6 +1545,8 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static CLOSED: AtomicUsize = AtomicUsize::new(0);
 
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let paths: [(fn(PromptWindow) -> Event, Outcome); 3] = [
             (|_| Event::Cancel, Outcome::Cancelled),
             (|_| Event::Closed, Outcome::Cancelled),

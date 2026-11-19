@@ -3028,6 +3028,8 @@ fn header_tags(item: &VaultItem, view_only: bool) -> Vec<crate::kit::card::TagKi
     tags
 }
 
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_detail_read(
     ui: &mut egui::Ui,
     item: &VaultItem,
@@ -5983,6 +5985,8 @@ fn row(
 /// bug the user reported: over the eye and over the website link the tile
 /// still offered to copy. See the `hovered()` gate below for what egui does
 /// instead and why the gate has to be on the call.
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 fn copy_row(
     ui: &mut egui::Ui,
     label: &str,
@@ -13159,6 +13163,8 @@ mod tests {
     #[test]
     fn a_card_is_empty_exactly_when_every_field_it_renders_is() {
         assert!(card_fields(&CardData::default()).is_empty());
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let one_field_at_a_time: [(&str, Box<dyn Fn(&mut CardData)>); 5] = [
             ("cardholder", Box::new(|c: &mut CardData| c.cardholder_name = Some("John Doe".into()))),
             ("brand", Box::new(|c: &mut CardData| c.brand = Some("visa".into()))),
@@ -13179,8 +13185,10 @@ mod tests {
                  under a \"No card details on this item.\" note: {fields:?}"
             );
         }
-        let mut code_only = CardData::default();
-        code_only.code = Some("123".to_string().into());
+        let code_only = CardData {
+            code: Some("123".to_string().into()),
+            ..CardData::default()
+        };
         assert!(
             !card_fields(&code_only).is_empty(),
             "a card carrying only its security code was called empty"
@@ -13579,6 +13587,8 @@ mod tests {
     fn an_ssh_key_is_empty_exactly_when_every_field_it_renders_is() {
         use crate::vault_bridge::SshKeyData;
         assert!(ssh_key_fields(&SshKeyData::default()).is_empty());
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let one_at_a_time: [(&str, Box<dyn Fn(&mut SshKeyData)>); 3] = [
             ("public key", Box::new(|s: &mut SshKeyData| s.public_key = Some(PUBLIC_KEY.into()))),
             ("fingerprint", Box::new(|s: &mut SshKeyData| s.key_fingerprint = Some(FINGERPRINT.into()))),
@@ -14476,10 +14486,12 @@ mod tests {
     #[test]
     fn the_minimum_detail_pane_is_the_window_minimum_less_both_side_panels() {
         assert_eq!(MIN_PANE, 298.0);
-        assert!(
-            MIN_PANE < PANE,
-            "the minimum-width test is laying out a WIDER pane than the ordinary one"
-        );
+        const {
+            assert!(
+                MIN_PANE < PANE,
+                "the minimum-width test is laying out a WIDER pane than the ordinary one"
+            )
+        };
     }
 
     /// **A received record is view-only** (mock 6d): the subtitle says who
@@ -15535,8 +15547,8 @@ mod tests {
         "\u{2022}".repeat(secret.chars().count())
     }
 
-    /// The `LOGIN CREDENTIALS` card's own box, so the two passes can be
-    /// compared on HEIGHT and not merely on which strings appeared.
+    // The `LOGIN CREDENTIALS` card's own box, so the two passes can be
+    // compared on HEIGHT and not merely on which strings appeared.
     // **`login_card` was here.** Every caller was a test about the one-time
     // code or its seed, and both rows moved to a card of their own -- see
     // `totp_card` below, which is what they ask for now.
@@ -16733,11 +16745,11 @@ mod tests {
         );
     }
 
-    /// ------------------------------------------------------------------
-    /// The copy confirmation ("Password copied"), the user's request:
-    /// "when clicked on password - it gets copied but you don't know what
-    /// happened - should be like 5 seconds tooltip".
-    /// ------------------------------------------------------------------
+    // ------------------------------------------------------------------
+    // The copy confirmation ("Password copied"), the user's request:
+    // "when clicked on password - it gets copied but you don't know what
+    // happened - should be like 5 seconds tooltip".
+    // ------------------------------------------------------------------
 
     /// **One name per copyable chord, and no two the same.**
     ///

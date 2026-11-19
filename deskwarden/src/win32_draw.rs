@@ -626,6 +626,8 @@ pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonS
 /// Every GDI object created here (brush, pen, font selection) is restored
 /// and deleted before returning -- a leaked `HBRUSH` in a repaint path
 /// exhausts the handle table over a long-running daemon.
+// GDI draw helper: geometry and colour arguments.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_button_with_shortcut(
     hdc: HDC,
     rect: RECT,
@@ -1407,6 +1409,8 @@ pub struct RowState {
 ///
 /// Every GDI object created here is restored and deleted before returning,
 /// matching [`draw_button`] -- this also runs in the daemon's repaint path.
+// GDI draw helper: geometry and colour arguments.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_row(
     hdc: HDC,
     rect: RECT,

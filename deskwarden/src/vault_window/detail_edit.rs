@@ -11116,30 +11116,30 @@ fn sharing_line(audience: &crate::rest::organizations::Audience) -> Option<Strin
     })
 }
 
-/// **The sections rail is gone, and this is where it was.**
-///
-/// A 212-point left column listing every card, with counts, a dirty dot, a
-/// `Changed` list and the form's shortcuts under it. §8a draws one
-/// (`grid-template-columns: 212px 1fr`), and it was built from that.
-///
-/// The owner took it out: "remove sections panel - that one is jsut our nav
-/// menu that wasn't exactly designed". §8a is a WHOLE WINDOW and its rail is
-/// that window's navigation; this form is a pane in a window that already has
-/// a sidebar and an item list down its left-hand side, so the rail was a
-/// third column of chrome in the same direction -- and the one thing it could
-/// do that they cannot, jumping to a card, is a scroll the user can do with
-/// the wheel they already have their hand on.
-///
-/// **What went with it, and what did not.** Gone: the entries, their counts,
-/// the `SECTIONS` heading, the `Changed` list, the shortcut footnote, and the
-/// click-to-scroll machinery that carried a request between frames. Kept: the
-/// `Changed` MARK on each card, which was never the rail's -- it is
-/// `theme::section_card_header`'s, and that function's own doc argues for it
-/// on exactly this ground, that a dirty state visible only in a column that
-/// is only sometimes on screen is a dirty state the user cannot rely on.
-///
-/// The cards now start at the pane's own margin, which is why the gutter that
-/// held them off the rail's hairline went too.
+// **The sections rail is gone, and this is where it was.**
+//
+// A 212-point left column listing every card, with counts, a dirty dot, a
+// `Changed` list and the form's shortcuts under it. §8a draws one
+// (`grid-template-columns: 212px 1fr`), and it was built from that.
+//
+// The owner took it out: "remove sections panel - that one is jsut our nav
+// menu that wasn't exactly designed". §8a is a WHOLE WINDOW and its rail is
+// that window's navigation; this form is a pane in a window that already has
+// a sidebar and an item list down its left-hand side, so the rail was a
+// third column of chrome in the same direction -- and the one thing it could
+// do that they cannot, jumping to a card, is a scroll the user can do with
+// the wheel they already have their hand on.
+//
+// **What went with it, and what did not.** Gone: the entries, their counts,
+// the `SECTIONS` heading, the `Changed` list, the shortcut footnote, and the
+// click-to-scroll machinery that carried a request between frames. Kept: the
+// `Changed` MARK on each card, which was never the rail's -- it is
+// `theme::section_card_header`'s, and that function's own doc argues for it
+// on exactly this ground, that a dirty state visible only in a column that
+// is only sometimes on screen is a dirty state the user cannot rely on.
+//
+// The cards now start at the pane's own margin, which is why the gutter that
+// held them off the rail's hairline went too.
 
 /// 8a's three `ITEM` captions. Constants because the grid arm and the stacked
 /// arm both draw them and the tests read them, and three spellings of one
@@ -11651,6 +11651,8 @@ const NO_CHANGES_NOTE: &str = "No changes yet";
 /// widget have to agree on it.
 const AVOID_AMBIGUOUS: &str = "Avoid lookalikes (0/O, 1/l)";
 
+// Draw entry point: its arguments are the state it paints; a bundle would only move them.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_detail_edit(
     ui: &mut egui::Ui,
     draft: &mut EditDraft,
@@ -17001,7 +17003,6 @@ mod generator_row_tests {
         apps: &mut AppIdentityCache,
         events: &[egui::Event],
     ) -> (EditAction, Painted) {
-        let apps = apps;
         let mut action = EditAction::None;
         let output = ctx.run_ui(raw_input(events), |ui| {
             action = draw_detail_edit(ui, draft, &[], false, apps, None, 0, &crate::rest::organizations::Audience::Personal, &detail::TotpState::NoSecret, None);
@@ -21405,15 +21406,16 @@ mod sequence_builder_tests {
         // Two frames: egui grants focus at the END of the frame the click
         // arrives in, so text sent in that same frame goes nowhere.
         let _ = frame(&ctx, PANE, &mut draft, &item, &live_code(), &click(field.center()));
-        let mut events: Vec<egui::Event> = Vec::new();
-        events.push(egui::Event::Key {
-            key: egui::Key::End,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::default(),
-        });
-        events.push(egui::Event::Text("{TAB}{PASSWORD}".to_string()));
+        let events: Vec<egui::Event> = vec![
+            egui::Event::Key {
+                key: egui::Key::End,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::Text("{TAB}{PASSWORD}".to_string()),
+        ];
         let after = frame(&ctx, PANE, &mut draft, &item, &live_code(), &events);
         assert_eq!(draft.app.as_ref().unwrap().sequence, "{USERNAME}{TAB}{PASSWORD}");
         // **And the parsed list is NOT under the field.** 4c ends in a
@@ -23665,7 +23667,7 @@ mod edit_pane_layout_tests {
         // flag wired to the wrong row visible here rather than a coincidence.
         let pane = Vec2::new(WIDE_PANE_WIDTH, 2400.0);
         let ctx = styled_context(pane);
-        for row in 0..OLD_PASSWORDS.len() {
+        for (row, _) in OLD_PASSWORDS.iter().enumerate() {
             let mut draft = EditDraft::from_item(&item);
             draft.history_open = true;
             draft.history_reveal[row] = true;
@@ -29954,6 +29956,8 @@ mod draft_dirtiness_tests {
     /// report the wrong word and nothing else would notice.
     #[test]
     fn a_change_is_named_after_the_field_that_moved() {
+        // one-off test table; an alias would only be read here
+        #[allow(clippy::type_complexity)]
         let cases: Vec<(&str, fn(&mut EditDraft))> = vec![
             ("Name", |d| d.name = "Renamed".to_string()),
             ("Folder", |d| d.folder_id = Some("f2".to_string())),
