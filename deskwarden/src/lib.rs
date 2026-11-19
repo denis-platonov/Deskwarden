@@ -77,6 +77,7 @@ pub mod fill_recall;
 pub mod fill_stats;
 pub mod foreground;
 pub mod generate_prompt;
+pub mod generator_mode;
 pub mod hello;
 pub mod hotkey;
 pub mod http_agent;
