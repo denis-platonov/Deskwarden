@@ -4535,6 +4535,50 @@ pub enum EditAction {
     /// Spec B 1.4 I's "Move to trash": the read pane's Delete, from the
     /// editor (0.15's confirmation and soft delete).
     Delete,
+    /// Spec B 1.2: the avatar takes swatch `n` of [`AVATAR_SWATCHES`],
+    /// written to the item's `deskwarden:icon` at once, as 0.15's icon
+    /// choices are.
+    SetIconColour(usize),
+    /// Spec B 1.2: the avatar takes the matched app's own icon.
+    UseAppIcon,
+}
+
+/// Spec B 1.2's eight swatches, background and type.
+pub const AVATAR_SWATCHES: [(&str, &str); 8] = [
+    ("#1b3fa0", "#ffffff"),
+    ("#14307a", "#ffffff"),
+    ("#3b74e8", "#ffffff"),
+    ("#dbe4f7", "#14307a"),
+    ("#201e1d", "#ffffff"),
+    ("#e8f3ec", "#17673a"),
+    ("#fef6e7", "#8a5a06"),
+    ("#eceae7", "#201e1d"),
+];
+
+/// What choosing swatch `index` stores.
+pub fn swatch_choice(index: usize) -> crate::item_icon::IconChoice {
+    let (bg, fg) = AVATAR_SWATCHES[index.min(AVATAR_SWATCHES.len() - 1)];
+    crate::item_icon::IconChoice::Colour { bg: bg.into(), fg: fg.into() }
+}
+
+pub const AVATAR_UPLOAD: &str = "Upload image";
+pub const AVATAR_UPLOAD_SUB: &str = "PNG, JPG or SVG";
+pub const AVATAR_APP: &str = "Use the app's icon";
+pub const AVATAR_APP_NONE: &str = "Add an app first";
+pub const AVATAR_APP_FIRST_TOAST: &str = "Add an app under Fills in first";
+pub const AVATAR_COLOUR: &str = "COLOUR";
+pub const AVATAR_REMOVE: &str = "Remove image";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AvatarRow {
+    Upload,
+    App,
+    Swatch(usize),
+    Remove,
+}
+
+pub(crate) fn avatar_row_id(row: AvatarRow) -> egui::Id {
+    egui::Id::new(("edit-avatar-menu", row))
 }
 
 /// Spec B 1.4 I.
@@ -5465,6 +5509,84 @@ fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, creating: bool) {
     }
     ui.data_mut(|d| d.insert_temp(typed_id.with("text"), typed));
     ui.add_space(4.0);
+}
+
+/// Spec B 1.2's avatar menu, 300 wide: the two image rows, the colour
+/// swatches and (when there is something to remove) Remove image.
+fn avatar_menu(
+    ui: &mut egui::Ui,
+    app: Option<&str>,
+    colour: Option<(egui::Color32, egui::Color32)>,
+    removable: bool,
+) -> Option<AvatarRow> {
+    let p = crate::kit::tokens::palette(ui.ctx());
+    ui.set_width(300.0);
+    let mut picked = None;
+    let row = |ui: &mut egui::Ui, which: AvatarRow, title: &str, sub: Option<&str>, glyph: &str, tile: egui::Color32, ink: egui::Color32| {
+        let height = if sub.is_some() { 56.0 } else { 46.0 };
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(ui.available_width(), height), egui::Sense::click());
+        let _ = ui.interact(rect, avatar_row_id(which), egui::Sense::hover());
+        if response.hovered() {
+            let wash = if which == AvatarRow::Remove { theme::DANGER_WASH } else { egui::Color32::from_rgb(0xf3, 0xf2, 0xf0) };
+            ui.painter().rect_filled(rect, egui::CornerRadius::same(12), wash);
+        }
+        let tile_rect = egui::Rect::from_min_size(rect.left_center() + egui::vec2(12.0, -17.0), egui::Vec2::splat(34.0));
+        ui.painter().rect_filled(tile_rect, egui::CornerRadius::same(10), tile);
+        crate::kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(tile_rect.center(), egui::Vec2::splat(17.0)), glyph, 2.0, ink);
+        let x = tile_rect.right() + 12.0;
+        let title_ink = if which == AvatarRow::Remove { theme::ERROR } else { p.ink };
+        let font = egui::FontId::new(15.0, egui::FontFamily::Name(theme::SEMIBOLD.into()));
+        match sub {
+            Some(sub) => {
+                ui.painter().text(egui::pos2(x, rect.center().y - 1.0), egui::Align2::LEFT_BOTTOM, title, font, title_ink);
+                ui.painter().text(egui::pos2(x, rect.center().y + 1.0), egui::Align2::LEFT_TOP, sub, egui::FontId::new(13.0, egui::FontFamily::Name(theme::SEMIBOLD.into())), p.text_label);
+            }
+            None => {
+                ui.painter().text(egui::pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, title, font, title_ink);
+            }
+        }
+        response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
+    };
+    if row(ui, AvatarRow::Upload, AVATAR_UPLOAD, Some(AVATAR_UPLOAD_SUB), crate::kit::icon::glyph::CAMERA, theme::BLUE_WASH, theme::BLUE) {
+        picked = Some(AvatarRow::Upload);
+    }
+    let from = app.map(|name| format!("From {name}"));
+    if row(ui, AvatarRow::App, AVATAR_APP, Some(from.as_deref().unwrap_or(AVATAR_APP_NONE)), crate::kit::icon::glyph::APPS, egui::Color32::from_rgb(0xf1, 0xf0, 0xee), egui::Color32::from_rgb(0x4a, 0x47, 0x45)) {
+        picked = Some(AvatarRow::App);
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.add_space(12.0);
+        ui.label(egui::RichText::new(AVATAR_COLOUR).size(12.0).color(egui::Color32::from_rgb(0x9b, 0x97, 0x97)).family(egui::FontFamily::Name(theme::EXTRABOLD.into())));
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.add_space(12.0);
+        ui.spacing_mut().item_spacing.x = 8.0;
+        for (index, (bg, fg)) in AVATAR_SWATCHES.iter().enumerate() {
+            let (Some(bg), Some(_fg)) = (crate::item_icon::hex_colour(bg), crate::item_icon::hex_colour(fg)) else { continue };
+            let (rect, response) = ui.allocate_exact_size(egui::Vec2::splat(28.0), egui::Sense::click());
+            let _ = ui.interact(rect, avatar_row_id(AvatarRow::Swatch(index)), egui::Sense::hover());
+            let selected = colour.is_some_and(|(c, _)| c == bg);
+            if selected {
+                ui.painter().circle_stroke(rect.center(), 16.0, egui::Stroke::new(2.0, theme::BLUE));
+            }
+            let r = if response.hovered() { 15.5 } else { 14.0 };
+            ui.painter().circle_filled(rect.center(), r, bg);
+            ui.painter().circle_stroke(rect.center(), r, egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(32, 30, 29, 20)));
+            if response.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                picked = Some(AvatarRow::Swatch(index));
+            }
+        }
+    });
+    ui.add_space(10.0);
+    if removable {
+        let (line, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().rect_filled(line.shrink2(egui::vec2(4.0, 0.0)), 0.0, egui::Color32::from_rgb(0xf1, 0xef, 0xec));
+        if row(ui, AvatarRow::Remove, AVATAR_REMOVE, None, crate::kit::icon::glyph::TRASH, theme::DANGER_WASH, theme::ERROR) {
+            picked = Some(AvatarRow::Remove);
+        }
+    }
+    picked
 }
 
 /// Spec B 1.4 I's button: 50 high, radius 14, a red outline and red type,
@@ -10480,9 +10602,11 @@ fn edit_header(
     } else {
         egui::Rect::from_min_size(egui::pos2(back_rect.right() - 4.0, row.top()), egui::vec2(0.0, 64.0))
     };
-    let look = match icon {
-        Some(texture) => kit::avatar::Look::Favicon(texture.clone()),
-        None => {
+    let chosen = item.and_then(crate::item_icon::chosen_colours);
+    let look = match (chosen, icon) {
+        (Some((bg, fg)), _) => kit::avatar::Look::Initials { text: super::item_list::initials(&draft.name), bg, fg },
+        (None, Some(texture)) => kit::avatar::Look::Favicon(texture.clone()),
+        (None, None) => {
             let (bg, fg) = kit::avatar::initials_colours(&draft.name);
             kit::avatar::Look::Initials { text: super::item_list::initials(&draft.name), bg, fg }
         }
@@ -10501,19 +10625,26 @@ fn edit_header(
         .interact(avatar.union(badge), edit_control_id(EditControl::Avatar), egui::Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand);
     kit::tips::hint(ui, &avatar_response, "Change image", &[]);
-    if let Some(rows) = item.and_then(super::item_list::icon_menu) {
+    // Spec B 1.2's menu. Each choice is written to the saved item at once
+    // (0.15's rule for icons), so a new item has none to offer yet.
+    if let Some(saved) = item {
+        let app = draft.app.as_ref().filter(|app| app.bound).map(|app| {
+            if app.title.is_empty() { app.process.clone() } else { app.title.clone() }
+        });
+        let removable = crate::item_icon::has_icon_field(saved) && crate::item_icon::chosen_icon(saved).is_some();
+        let colour = crate::item_icon::chosen_colours(saved);
         egui::Popup::menu(&avatar_response)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
             .show(|ui| {
-                for row in &rows {
-                    if super::item_list::menu_command(ui, row) {
-                        match &row.command {
-                            super::item_list::RowCommand::RefreshIcon => action = EditAction::RefreshIcon,
-                            super::item_list::RowCommand::SelectIcon => action = EditAction::SelectIcon,
-                            super::item_list::RowCommand::ClearIcon => action = EditAction::ClearIcon,
-                            other => log::warn!("the icon menu offered {other:?}, which is not an icon action; the click was dropped"),
-                        }
+                if let Some(picked) = avatar_menu(ui, app.as_deref(), colour, removable) {
+                    match picked {
+                        AvatarRow::Upload => action = EditAction::SelectIcon,
+                        AvatarRow::App if app.is_some() => action = EditAction::UseAppIcon,
+                        AvatarRow::App => kit::toast::show(ui.ctx(), AVATAR_APP_FIRST_TOAST),
+                        AvatarRow::Swatch(index) => action = EditAction::SetIconColour(index),
+                        AvatarRow::Remove => action = EditAction::ClearIcon,
                     }
+                    ui.close();
                 }
             });
     }
@@ -31706,6 +31837,84 @@ mod v2_editor_tests {
             );
         });
         (action, p)
+    }
+
+    /// Opens the avatar menu on a saved item and answers the frame after.
+    fn open_avatar_menu(ctx: &egui::Context, draft: &mut EditDraft, item: &VaultItem) {
+        let wide = egui::vec2(1200.0, 1600.0);
+        let _ = draw_saved(ctx, 0.0, wide, draft, item, false, vec![]);
+        let avatar = control(ctx, EditControl::Avatar);
+        let _ = draw_saved(ctx, 0.1, wide, draft, item, false, click_at(avatar.center()));
+        let _ = draw_saved(ctx, 0.2, wide, draft, item, false, vec![]);
+        let _ = draw_saved(ctx, 0.3, wide, draft, item, false, vec![]);
+    }
+
+    fn pick_avatar_row(ctx: &egui::Context, draft: &mut EditDraft, item: &VaultItem, row: AvatarRow) -> EditAction {
+        let at = ctx.read_response(avatar_row_id(row)).unwrap_or_else(|| panic!("no {row:?} in the menu")).rect;
+        draw_saved(ctx, 0.4, egui::vec2(1200.0, 1600.0), draft, item, false, click_at(at.center())).0
+    }
+
+    #[test]
+    fn choosing_a_colour_stores_it_in_the_icon_field() {
+        let item = a_saved_login();
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&item);
+        open_avatar_menu(&ctx, &mut draft, &item);
+        assert_eq!(pick_avatar_row(&ctx, &mut draft, &item, AvatarRow::Swatch(2)), EditAction::SetIconColour(2));
+        // What the window writes for it: the icon field, as JSON.
+        let value = swatch_choice(2).to_field_value();
+        assert_eq!(value, r##"{"kind":"colour","bg":"#3b74e8","fg":"#ffffff"}"##);
+        let written = crate::vault_bridge::with_custom_field(&item, crate::item_icon::ICON_FIELD_NAME, &value);
+        assert_eq!(
+            crate::item_icon::chosen_colours(&written),
+            Some((egui::Color32::from_rgb(0x3b, 0x74, 0xe8), egui::Color32::WHITE))
+        );
+    }
+
+    #[test]
+    fn the_list_and_detail_wear_the_chosen_colour() {
+        let item = crate::vault_bridge::with_custom_field(
+            &a_saved_login(),
+            crate::item_icon::ICON_FIELD_NAME,
+            &swatch_choice(5).to_field_value(),
+        );
+        let ctx = testing::ctx();
+        let texture = ctx.load_texture("favicon", egui::ColorImage::filled([4, 4], egui::Color32::RED), Default::default());
+        // `row_look` is the list's and the read pane header's avatar.
+        match super::super::item_list::row_look(&item, Some(&texture)) {
+            crate::kit::avatar::Look::Initials { bg, fg, .. } => {
+                assert_eq!((bg, fg), (egui::Color32::from_rgb(0xe8, 0xf3, 0xec), egui::Color32::from_rgb(0x17, 0x67, 0x3a)));
+            }
+            _ => panic!("the chosen colour lost to the website's icon"),
+        }
+    }
+
+    #[test]
+    fn remove_image_clears_the_override_and_the_colour() {
+        let item = crate::vault_bridge::with_custom_field(
+            &a_saved_login(),
+            crate::item_icon::ICON_FIELD_NAME,
+            &swatch_choice(1).to_field_value(),
+        );
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&item);
+        open_avatar_menu(&ctx, &mut draft, &item);
+        assert_eq!(pick_avatar_row(&ctx, &mut draft, &item, AvatarRow::Remove), EditAction::ClearIcon);
+        // The window's ClearIcon writes the field empty: no colour, no image.
+        let cleared = crate::vault_bridge::with_custom_field(&item, crate::item_icon::ICON_FIELD_NAME, "");
+        assert!(crate::item_icon::chosen_icon(&cleared).is_none());
+        assert!(crate::item_icon::chosen_colours(&cleared).is_none());
+    }
+
+    #[test]
+    fn use_the_apps_icon_needs_an_app_first() {
+        let item = a_saved_login();
+        let ctx = testing::ctx();
+        let mut draft = EditDraft::from_item(&item);
+        draft.app = None;
+        open_avatar_menu(&ctx, &mut draft, &item);
+        assert_eq!(pick_avatar_row(&ctx, &mut draft, &item, AvatarRow::App), EditAction::None);
+        assert_eq!(crate::kit::toast::current(&ctx).as_deref(), Some(AVATAR_APP_FIRST_TOAST));
     }
 
     /// Spec B 1.4 F-I: Custom fields, About (with the password history's

@@ -149,6 +149,11 @@ pub enum IconChoice {
     /// short of.
     #[serde(rename = "png")]
     Png { png: String },
+    /// Spec B 1.2's colour swatch: initials on `bg` in `fg`, both `#rrggbb`.
+    /// A build that predates it cannot read the value and keeps the item's
+    /// ordinary icon.
+    #[serde(rename = "colour")]
+    Colour { bg: String, fg: String },
 }
 
 impl IconChoice {
@@ -170,7 +175,7 @@ impl IconChoice {
     pub fn url(&self) -> Option<&str> {
         match self {
             IconChoice::Url { url } => Some(url),
-            IconChoice::Png { .. } => None,
+            IconChoice::Png { .. } | IconChoice::Colour { .. } => None,
         }
     }
 
@@ -404,6 +409,35 @@ pub fn choice_from_image_bytes(bytes: &[u8]) -> Result<IconChoice, IconRefusal> 
 /// defended with a test that would have to reach inside the read to see the
 /// difference. The rule itself IS tested -- `an_oversized_file_is_refused_
 /// before_it_is_decoded` kills the mutation of the check that decides.
+/// A chosen icon from straight RGBA pixels (the matched app's own icon).
+pub fn choice_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<IconChoice, IconRefusal> {
+    let encoded = encode_png(width, height, rgba).ok_or(IconRefusal::NotAnImage)?;
+    if encoded.len() > MAX_STORED_ICON_BYTES {
+        return Err(IconRefusal::TooBigToStore);
+    }
+    let mut png = String::with_capacity(encoded.len().div_ceil(3) * 4);
+    crate::record::seal::base64_into(&mut png, &encoded);
+    Ok(IconChoice::Png { png })
+}
+
+/// The colours a [`IconChoice::Colour`] names, if `item` chose one.
+pub fn chosen_colours(item: &VaultItem) -> Option<(eframe::egui::Color32, eframe::egui::Color32)> {
+    let IconChoice::Colour { bg, fg } = chosen_icon(item)? else {
+        return None;
+    };
+    Some((hex_colour(&bg)?, hex_colour(&fg)?))
+}
+
+/// `#rrggbb` as a colour.
+pub fn hex_colour(text: &str) -> Option<eframe::egui::Color32> {
+    let hex = text.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let byte = |i: usize| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok();
+    Some(eframe::egui::Color32::from_rgb(byte(0)?, byte(2)?, byte(4)?))
+}
+
 pub fn read_icon_file(path: &std::path::Path) -> Result<IconChoice, IconRefusal> {
     if let Ok(meta) = std::fs::metadata(path) {
         if meta.len() > MAX_PICKED_ICON_BYTES as u64 {

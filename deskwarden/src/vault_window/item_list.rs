@@ -620,129 +620,6 @@ pub(super) fn out_of_vault_entries(out: OutOfVault) -> Vec<MenuEntry> {
     }
 }
 
-/// **The icon group**: the rows of the [`ICON_LABEL`] submenu, in the order
-/// they are read, or `None` when there is no icon action at all and the
-/// submenu should not be offered.
-///
-/// One function and one read of the item's icon field, because the three
-/// entries are three answers to one question and deriving them separately is
-/// how a menu comes to offer "Refresh icon" and "Use the automatic icon" for
-/// two different ideas of what this item's icon is.
-///
-/// **`pub(super)` so the detail pane's kebab builds its Icon submenu from
-/// this exact function rather than from its own copy**, which is the rule
-/// [`move_menu`] and [`out_of_vault_entries`] already follow and is here for
-/// their reason. The two surfaces offer the same three acts on the same item,
-/// and everything that shapes the list -- which of the three appear, in what
-/// order, and that none of them is ever greyed -- is a decision rather than
-/// rendering. A second implementation of it in `detail.rs` would be invisible
-/// while it agreed and undiagnosable when it stopped: both menus would look
-/// right, and only an item in one of the states below would show the two
-/// disagreeing, with the stale list being whichever one the reader was not
-/// looking at. See `detail::draw_detail_read`, which maps each [`RowCommand`]
-/// here to the `DetailAction` it reports.
-///
-/// **`None` rather than an empty list, and no "there is nothing here"
-/// sentence.** [`MoveMenu::Empty`] says one for folders because a vault with
-/// no folders is a state a user is really in and can really act on; this
-/// function has no such state to describe -- "Select icon..." below is
-/// unconditional -- and an empty-handed submenu would be a control promising
-/// something behind it. Answering `None` moves the decision to one place and
-/// leaves both renderers with a list they can draw without asking.
-///
-/// ## "Select icon..." -- always
-///
-/// Every live item, of every kind, whether or not it has an automatic icon
-/// and whether or not it already has a chosen one. This is deliberately
-/// UNLIKE "Refresh icon": a secure note has no site to have an icon of, which
-/// is exactly why being able to give it one is worth something, and an item
-/// that already has a chosen icon is the item most likely to want a different
-/// one. There is no state in which this entry would do nothing.
-///
-/// ## "Use the automatic icon" -- only when a field is there to remove
-///
-/// Absent, not greyed, `MenuCommand::enabled`'s rule: an item with no chosen
-/// icon is already using the automatic one, so a greyed line would be
-/// explaining the absence of a problem.
-///
-/// Keyed on `item_icon::has_icon_field` and NOT on `item_icon::chosen_icon`,
-/// and the difference is the whole point of there being two functions. They
-/// disagree on exactly one item -- one whose field holds a value this build
-/// cannot parse -- and that item is the one that most needs the way out: it
-/// is wearing its automatic icon already, its field says otherwise, and
-/// keying this entry on the readable answer would have hidden the only
-/// control that could reconcile them.
-///
-/// ## "Refresh icon" -- for the automatic icon, and for a chosen URL
-///
-/// **What Refresh means in this app has never changed: forget the copy and
-/// ask again.** So it appears exactly where there is something to ask again,
-/// and the chosen icon decides which:
-///
-///  * **No chosen icon** -- unchanged from before this feature: present when
-///    `favicon::icon_authority_for` answers, absent otherwise.
-///  * **A chosen URL** -- present. The bytes came off a host that can change
-///    them, and a user who updates the logo at that URL needs a way to say
-///    so; without this entry their only route would be clearing the choice
-///    and setting the same URL again.
-///  * **A chosen file** -- ABSENT. The bytes are ON the item. There is no
-///    copy to forget and no host to ask: re-reading the field produces the
-///    identical picture, so the entry would be a visible control that
-///    provably does nothing, which is the failure this file's comments keep
-///    naming.
-///
-/// **The three designs rejected, and why each is worse.**
-///
-///  * *Refresh clears the chosen icon.* This was the tempting one, because it
-///    makes Refresh "work" on every item. It is the worst of the three: the
-///    entry's wording promises a re-fetch and it would instead destroy a
-///    deliberate choice, with no confirmation, on a menu where the only
-///    destructive entries are two-click confirmed. A user reaching for
-///    Refresh out of habit would lose the picture they picked and have no
-///    idea why.
-///  * *Refresh greyed with a reason on a file-backed item.* Better, and still
-///    wrong for the reason `menu_entries`' own comment gives about a secure
-///    note: a greyed line invites the user to wonder what they have to change
-///    to enable it, and the answer -- "nothing; there is nothing to refresh"
-///    -- is not something a disabled row can say. Absent is the honest shape
-///    for "no such action exists here", and this menu already uses it.
-///  * *Refresh re-fetches the item's automatic icon even though a chosen one
-///    wins.* It would appear to do nothing (the chosen icon still wins) while
-///    quietly making a request to the icon proxy for a host the user thought
-///    they had taken out of the loop. Silent and contrary to the feature's
-///    whole promise.
-pub(super) fn icon_menu(item: &VaultItem) -> Option<Vec<MenuCommand>> {
-    let chosen = crate::item_icon::chosen_icon(item);
-    let refreshable = match &chosen {
-        // A chosen URL is re-askable; a chosen picture is not.
-        Some(choice) => choice.url().is_some(),
-        // **ABSENT, not greyed, for an item with no icon domain** -- so a
-        // secure note, an identity, an SSH key, a login with no URI and a
-        // card with no `deskwarden:bank-domain` all get a menu that never
-        // mentions refreshing. Such a row draws a monogram because there is
-        // no site to have an icon OF, and a disabled "Refresh icon" on a
-        // secure note would invite the user to wonder what icon it meant.
-        // `icon_authorities_for` is asked rather than a `kind ==` test of its
-        // own, so the one function that decides "does this item have an
-        // automatic icon at all" decides it here too -- the same seam that
-        // let cards grow icons without this file knowing cards exist.
-        None => !crate::favicon::icon_authorities_for(item).is_empty(),
-    };
-    let mut rows = Vec::new();
-    if refreshable {
-        rows.push(plain_command(REFRESH_ICON_LABEL, RowCommand::RefreshIcon));
-    }
-    rows.push(plain_command(SELECT_ICON_LABEL, RowCommand::SelectIcon));
-    if crate::item_icon::has_icon_field(item) {
-        rows.push(plain_command(CLEAR_ICON_LABEL, RowCommand::ClearIcon));
-    }
-    // Unreachable today -- the push above is unconditional -- and written as
-    // a test of the list rather than as `Some(rows)` so that the day someone
-    // puts a condition on "Select icon..." they get "no Icon entry" rather
-    // than a submenu that opens onto nothing. See [`MenuEntry::Icon`].
-    (!rows.is_empty()).then_some(rows)
-}
-
 /// A plain, clickable command: enabled, with nothing to explain.
 ///
 /// Split out of [`enabled_command`] when the icon group became a submenu.
@@ -2388,6 +2265,10 @@ pub(crate) fn row_look(item: &VaultItem, icon: Option<&egui::TextureHandle>) -> 
     if let Some((label, bg, italic)) = card_network(item).and_then(kit::avatar::network) {
         return kit::avatar::Look::Brand { label: label.to_string(), bg, italic };
     }
+    // Spec B 1.2: a chosen colour wins over the website's icon.
+    if let Some((bg, fg)) = crate::item_icon::chosen_colours(item) {
+        return kit::avatar::Look::Initials { text: initials(&item.name), bg, fg };
+    }
     if let Some(texture) = icon {
         return kit::avatar::Look::Favicon(texture.clone());
     }
@@ -2975,30 +2856,6 @@ mod menu_entry_tests {
             .collect()
     }
 
-    /// What the icon menu offers for `item`, in order -- or an empty list
-    /// when it is offered nothing at all.
-    ///
-    /// **Asked of `icon_menu` and not of a drawn menu**, which is the change
-    /// that came with the group moving to the edit pane's pencil badge. It
-    /// used to dig the rows out of `menu_entries`' `MenuEntry::Icon`; no menu
-    /// in THIS file carries them any more, so reading one would make every
-    /// assertion below vacuously true. The decision never moved -- see
-    /// `icon_menu`, still the one answer to "which of the three does this
-    /// item get" -- so the tests follow it rather than the door it is behind.
-    ///
-    /// The `None` and the empty list are collapsed on purpose: every
-    /// assertion here reads the WHOLE list, so neither can be mistaken for
-    /// the other's absence of a particular row. Which of the two an item
-    /// really gets is `icon_menu`'s own `Option`, pinned separately by
-    /// `the_icon_submenu_is_never_offered_empty`.
-    fn icon_rows(item: &VaultItem) -> Vec<String> {
-        icon_menu(item)
-            .unwrap_or_default()
-            .iter()
-            .map(|row| row.label.clone())
-            .collect()
-    }
-
     fn move_menu_of(entries: &[MenuEntry]) -> MoveMenu {
         entries
             .iter()
@@ -3069,7 +2926,6 @@ mod menu_entry_tests {
                 "Delete",
             ]
         );
-        assert_eq!(icon_rows(&full_login()), vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL]);
     }
 
     /// The two menus for an item that is NOT in the live vault, whole.
@@ -3305,7 +3161,6 @@ mod menu_entry_tests {
             enabled_labels(&entries),
             vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
         );
-        assert_eq!(icon_rows(&of_kind(Some(3))), vec![SELECT_ICON_LABEL]);
     }
 
     /// **Renamed from `..._the_same_four_as_a_card` when "Select icon..."
@@ -3325,12 +3180,6 @@ mod menu_entry_tests {
         assert_eq!(
             enabled_labels(&entries),
             vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"]
-        );
-        assert_eq!(
-            icon_rows(&of_kind(Some(2))),
-            icon_rows(&of_kind(Some(3))),
-            "a note and a card no longer get the same icon submenu, which is the half of \
-             \"the same five\" the top-level list cannot see"
         );
     }
 
@@ -3406,86 +3255,6 @@ mod menu_entry_tests {
         );
     }
 
-    /// **"Refresh icon" is ABSENT, not greyed, for an item with no icon.**
-    ///
-    /// The rule `MenuCommand::enabled`'s doc states, applied to a new entry:
-    /// this one is "Copy TOTP"-shaped (nothing to act on, so nothing to
-    /// offer) rather than "Edit"-shaped (the obvious action, withheld, and
-    /// therefore owed a reason). A greyed "Refresh icon" on a secure note
-    /// would invite the user to wonder which icon it meant.
-    ///
-    /// Whole lists rather than `contains`, and a live control in the same
-    /// test: `full_login` DOES offer it, so a build that had dropped the
-    /// entry altogether cannot pass the negative half.
-    #[test]
-    fn refresh_icon_is_absent_for_every_item_with_no_icon_domain() {
-        // The SUBMENU's list now, not the top-level one: the entry moved a
-        // level down and reading the outer list here would make both halves
-        // below vacuously true against a build that offered it.
-        let live =
-            |item: &VaultItem| icon_rows(item);
-        assert!(
-            live(&full_login()).contains(&REFRESH_ICON_LABEL.to_string()),
-            "the live control failed: an item that DOES have a domain was offered no refresh, \
-             so the absences below prove nothing"
-        );
-
-        // A login whose only URI is one `authority_from_uri` refuses --
-        // `androidapp://` names no host this app could fetch from.
-        let app_only = VaultItem {
-            login: Some(LoginData {
-                uris: vec![UriEntry {
-                    uri: Some("androidapp://com.ledgerline.app".into()),
-                    other: serde_json::Map::new(),
-                }],
-                ..full_login().login.unwrap()
-            }),
-            ..of_kind(Some(1))
-        };
-        for (what, item) in [
-            ("a secure note", of_kind(Some(2))),
-            ("a card with no bank domain", of_kind(Some(3))),
-            ("an identity", of_kind(Some(4))),
-            ("an SSH key", of_kind(Some(5))),
-            ("a login with no URI at all", of_kind(Some(1))),
-            ("a login whose only URI names no host", app_only),
-        ] {
-            assert!(
-                !live(&item).contains(&REFRESH_ICON_LABEL.to_string()),
-                "{what} was offered \"{REFRESH_ICON_LABEL}\", which would refresh nothing: {:?}",
-                live(&item)
-            );
-        }
-    }
-
-    /// The entry follows `favicon::icon_authority_for` and not the item's
-    /// KIND, which is the whole reason it asks that function.
-    ///
-    /// A card carrying `deskwarden:bank-domain` has an icon -- that is the
-    /// seam `icon_domain_for` exists for -- so it gets the entry, while the
-    /// card two tests up, with no such field, does not. A `kind == Login`
-    /// test would have been green against every other assertion in this file.
-    #[test]
-    fn a_card_with_a_bank_domain_is_offered_the_refresh_its_icon_can_use() {
-        let mut card = of_kind(Some(3));
-        card.fields.push(crate::vault_bridge::VaultField {
-            name: Some(crate::favicon::BANK_DOMAIN_FIELD.to_string()),
-            value: Some(Zeroizing::new("chase.com".into())),
-            other: serde_json::Map::new(),
-        });
-        let entries = menu_entries(&card, &[], FilterSource::LiveVault, false);
-        assert_eq!(
-            labels(&entries),
-            vec!["Edit", MOVE_TO_FOLDER_LABEL, "Archive", "Delete"],
-            "a card with a bank domain got something other than the agreed menu"
-        );
-        assert_eq!(
-            icon_rows(&card),
-            vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL],
-            "a card with a bank domain did not get the entry, or got something else with it"
-        );
-    }
-
     // ---- "Select icon..." and "Use the automatic icon" -------------------
     //
     // `icon_menu` decides all three icon entries from one read of the
@@ -3507,69 +3276,6 @@ mod menu_entry_tests {
                 .expect("a good URL")
                 .to_field_value(),
         )
-    }
-
-    fn chosen_picture(item: &VaultItem) -> VaultItem {
-        with_icon_field(
-            item,
-            &crate::item_icon::IconChoice::Png { png: "AAAA".into() }.to_field_value(),
-        )
-    }
-
-    /// **"Select icon..." is offered on every live item, of every kind** --
-    /// including the ones that get no "Refresh icon" because they have no
-    /// automatic icon at all. That difference is the entry's whole point: a
-    /// secure note has no site, which is exactly why being able to give it a
-    /// picture is worth something.
-    #[test]
-    fn every_live_item_is_offered_select_icon_whatever_its_kind() {
-        let mut app_only = of_kind(Some(1));
-        app_only.login = Some(LoginData {
-            uris: vec![UriEntry {
-                uri: Some("androidapp://com.example".into()),
-                other: serde_json::Map::new(),
-            }],
-            ..full_login().login.unwrap()
-        });
-        for (what, item) in [
-            ("a full login", full_login()),
-            ("a card", of_kind(Some(3))),
-            ("a secure note", of_kind(Some(2))),
-            ("an identity", of_kind(Some(4))),
-            ("an SSH key", of_kind(Some(5))),
-            ("a login with no URI at all", of_kind(Some(1))),
-            ("a login whose only URI names no host", app_only),
-        ] {
-            let entries = icon_rows(&item);
-            assert!(
-                entries.contains(&SELECT_ICON_LABEL.to_string()),
-                "{what} was offered no way to choose its own icon: {entries:?}"
-            );
-        }
-    }
-
-    /// **The submenu is never opened onto nothing.** `icon_menu` answers
-    /// `None` rather than an empty list, and this is the claim that lets both
-    /// renderers draw a submenu without deciding what an empty one means --
-    /// see `MenuEntry::Icon`, which argues why the answer is "no entry at
-    /// all" rather than `MoveMenu::Empty`'s sentence.
-    ///
-    /// Every kind, and both halves: that something is offered, and that what
-    /// is offered is not the empty list. A `Some(vec![])` satisfies neither
-    /// an `is_some` check alone nor a `contains` probe, which is exactly the
-    /// shape this is written against.
-    #[test]
-    fn the_icon_submenu_is_never_offered_empty() {
-        for item_type in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(9)] {
-            let item = of_kind(item_type);
-            let rows = icon_menu(&item)
-                .unwrap_or_else(|| panic!("type {item_type:?} was offered no Icon submenu"));
-            assert!(
-                !rows.is_empty(),
-                "type {item_type:?} was offered an Icon submenu with nothing in it, which is a \
-                 control promising something behind it"
-            );
-        }
     }
 
     /// **No row menu offers an icon entry any more, whatever the source.**
@@ -3600,152 +3306,6 @@ mod menu_entry_tests {
                 !entries.iter().any(|e| matches!(e, MenuEntry::Icon(_))),
                 "{source:?} carries an Icon entry that `labels` cannot see"
             );
-        }
-    }
-
-    /// **"Use the automatic icon" appears only when there is a field to
-    /// remove**, and it is keyed on the field's PRESENCE rather than on it
-    /// parsing.
-    ///
-    /// The unreadable case is the one that matters: such an item is already
-    /// wearing its automatic icon while its field claims otherwise, and
-    /// keying this entry on `chosen_icon` would have hidden the only control
-    /// that could reconcile the two -- from the one user who is stuck.
-    #[test]
-    fn the_clear_entry_follows_the_field_being_there_and_not_it_parsing() {
-        let plain = full_login();
-        assert!(
-            !icon_rows(&plain)
-                .contains(&CLEAR_ICON_LABEL.to_string()),
-            "an item with no chosen icon was offered a way to un-choose one"
-        );
-        for (what, item) in [
-            ("a chosen URL", chosen_url(&plain)),
-            ("a chosen picture", chosen_picture(&plain)),
-            ("a value this build cannot read", with_icon_field(&plain, "not json at all")),
-            ("a shape from a later build", with_icon_field(&plain, r#"{"kind":"svg"}"#)),
-        ] {
-            let entries = icon_rows(&item);
-            assert!(
-                entries.contains(&CLEAR_ICON_LABEL.to_string()),
-                "an item with {what} was offered no way back to the automatic icon: {entries:?}"
-            );
-        }
-    }
-
-    /// **Refresh follows what there is to re-ask.**
-    ///
-    /// Three cases, and the third is the decision: a chosen picture has no
-    /// copy to forget and no host to ask, so re-reading the field produces
-    /// the identical picture. Absent rather than greyed, `MenuCommand::
-    /// enabled`'s rule -- a disabled row invites the user to work out what to
-    /// change, and the answer is "nothing; there is nothing to refresh",
-    /// which a disabled row cannot say.
-    #[test]
-    fn refresh_is_offered_for_a_chosen_url_and_never_for_a_chosen_picture() {
-        let login = full_login();
-        let has_refresh = |item: &VaultItem| {
-            icon_rows(item)
-                .contains(&REFRESH_ICON_LABEL.to_string())
-        };
-        assert!(has_refresh(&login), "the live control: an ordinary login can refresh its icon");
-        assert!(
-            has_refresh(&chosen_url(&login)),
-            "an item whose icon comes off a URL cannot re-ask that URL, so a logo the user \
-             updated at that address can never reach them"
-        );
-        assert!(
-            !has_refresh(&chosen_picture(&login)),
-            "an item whose picture is ON it was offered a refresh, which would forget a copy \
-             that does not exist and re-read the identical bytes"
-        );
-        // A picture on an item that has NO automatic icon either: the same
-        // answer, reached by a different route through `icon_menu`.
-        assert!(!has_refresh(&chosen_picture(&of_kind(Some(2)))));
-        // And an UNREADABLE field falls all the way back to the automatic
-        // rule, because that is what such an item is wearing.
-        assert!(has_refresh(&with_icon_field(&login, "not json at all")));
-        assert!(!has_refresh(&with_icon_field(&of_kind(Some(2)), "not json at all")));
-    }
-
-    /// The whole menu for an item that has a chosen picture -- the outer
-    /// list and the submenu both, which is where the two rules above meet:
-    /// Refresh gone, Select present, the way back directly under it.
-    ///
-    /// **The outer list is asserted as well as the inner one, and that is the
-    /// half that would otherwise have been lost in the fold.** With the three
-    /// entries a level down, a top-level assertion is what says the icon
-    /// group takes exactly one line of this menu -- which is the whole reason
-    /// the user asked for the submenu.
-    #[test]
-    fn an_item_with_a_chosen_picture_gets_the_agreed_menu() {
-        let entries = menu_entries(
-            &chosen_picture(&full_login()),
-            &[],
-            FilterSource::LiveVault,
-            false,
-        );
-        assert_eq!(
-            labels(&entries),
-            vec![
-                "Copy username",
-                "Copy password",
-                "Copy TOTP",
-                "Open website",
-                "Edit",
-                MOVE_TO_FOLDER_LABEL,
-                "Archive",
-                "Delete",
-            ]
-        );
-        assert_eq!(
-            icon_rows(&chosen_picture(&full_login())),
-            vec![SELECT_ICON_LABEL, CLEAR_ICON_LABEL]
-        );
-    }
-
-    /// And for a chosen URL, which keeps Refresh at the head of the group --
-    /// three rows in the submenu and still one line of the menu itself.
-    #[test]
-    fn an_item_with_a_chosen_url_gets_the_agreed_menu() {
-        let entries =
-            menu_entries(&chosen_url(&full_login()), &[], FilterSource::LiveVault, false);
-        assert_eq!(
-            labels(&entries),
-            vec![
-                "Copy username",
-                "Copy password",
-                "Copy TOTP",
-                "Open website",
-                "Edit",
-                MOVE_TO_FOLDER_LABEL,
-                "Archive",
-                "Delete",
-            ]
-        );
-        assert_eq!(
-            icon_rows(&chosen_url(&full_login())),
-            vec![REFRESH_ICON_LABEL, SELECT_ICON_LABEL, CLEAR_ICON_LABEL]
-        );
-    }
-
-    /// Every row of the submenu is enabled wherever it appears. None of the
-    /// three has a state in which it would do nothing -- which is the test
-    /// that would fail if one of them were ever greyed instead of hidden.
-    ///
-    /// It walks the submenu's own rows rather than the top-level entries: the
-    /// three are `MenuCommand`s inside `MenuEntry::Icon` now, so a loop over
-    /// `MenuEntry::Command` would find none of them and pass over any menu at
-    /// all.
-    #[test]
-    fn neither_icon_entry_is_ever_greyed() {
-        for item in [full_login(), chosen_url(&full_login()), chosen_picture(&of_kind(Some(2)))] {
-            let rows = icon_menu(&item).expect("every live item gets an Icon submenu");
-            assert!(!rows.is_empty(), "the submenu was empty, so nothing below was checked");
-            for row in &rows {
-                assert!(row.enabled, "{:?} is greyed", row.label);
-                assert_eq!(row.disabled_reason, None);
-            }
         }
     }
 
@@ -3817,7 +3377,6 @@ mod menu_entry_tests {
         );
         // Empty strings where the credentials should be do not make the item
         // iconless: it still carries the URI the automatic icon is read off.
-        assert_eq!(icon_rows(&empty), vec![SELECT_ICON_LABEL]);
     }
 
     #[test]

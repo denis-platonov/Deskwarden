@@ -6015,6 +6015,40 @@ pub fn build_frame_with_search(
                             EditAction::AddTotp => {
                                 add_totp_asked = true;
                             }
+                            // **The avatar menu's colour and app icon** (spec
+                            // B 1.2), written to the item at once like 0.15's
+                            // icon choices -- see the ClearIcon row command.
+                            ref action @ (EditAction::SetIconColour(_) | EditAction::UseAppIcon) => {
+                                let choice = match action {
+                                    EditAction::SetIconColour(index) => Some(detail_edit::swatch_choice(*index)),
+                                    _ => draft
+                                        .app
+                                        .as_ref()
+                                        .filter(|app| app.bound && !app.path.is_empty())
+                                        .and_then(|app| crate::icon::extract_small_icon(&app.path))
+                                        .and_then(|icon| {
+                                            crate::item_icon::choice_from_rgba(icon.width as usize, icon.height as usize, &icon.rgba).ok()
+                                        }),
+                                };
+                                match (selected_item.as_ref(), choice) {
+                                    (Some(item), Some(choice)) => {
+                                        let written = crate::vault_bridge::with_custom_field(
+                                            item,
+                                            crate::item_icon::ICON_FIELD_NAME,
+                                            &choice.to_field_value(),
+                                        );
+                                        match cache.update_item(&written) {
+                                            Ok(saved) => apply_icon_write(&saved, &mut items, &mut favicon_requested, &mut icons),
+                                            Err(e) => {
+                                                log::warn!("failed to set the avatar on item {}: {e:?}", item.id);
+                                                flag_reauth_if_unauthorized(ui.ctx(), &needs_reauth_for_closure, &e);
+                                            }
+                                        }
+                                    }
+                                    (Some(_), None) => crate::kit::toast::show(ui.ctx(), "That app's icon could not be read"),
+                                    (None, _) => {}
+                                }
+                            }
                             // **Move to trash** (spec B 1.4 I): the read
                             // pane's Delete -- the same modal, the same soft
                             // delete.
@@ -6628,6 +6662,11 @@ pub fn build_frame_with_search(
                             EditAction::AddTotp => log::warn!(
                                 "the create form asked to scan a one-time code for an item \
                                  that does not exist yet"
+                            ),
+                            // Unreachable: a create's avatar has no menu (its
+                            // choices write to a saved item).
+                            EditAction::SetIconColour(_) | EditAction::UseAppIcon => log::warn!(
+                                "the create form asked to set the avatar of an item that does not exist yet"
                             ),
                             // Unreachable: a create draws no Move to trash.
                             EditAction::Delete => log::warn!(
