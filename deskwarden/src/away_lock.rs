@@ -202,6 +202,18 @@ pub const fn locks_the_vault(
     leaving && wants_locking && session_is_unlocked
 }
 
+/// Settings > Security > Locking: whether the user's two switches allow this
+/// event to lock. Asked in addition to [`locks_the_vault`], never instead of
+/// it, so turning a switch on can not lock a vault that auto-lock "Never"
+/// says to leave open.
+#[must_use]
+pub const fn switched_on(event: AwayEvent, lock_on_sleep: bool, lock_on_screen_lock: bool) -> bool {
+    match event {
+        AwayEvent::WorkstationLocked => lock_on_screen_lock,
+        AwayEvent::Suspending => lock_on_sleep,
+    }
+}
+
 /// **Which of this process's windows receives the notifications.** Pure, over
 /// the window list `foreground::Desktop::own_windows` already produces.
 ///
@@ -294,6 +306,14 @@ pub fn register_on_this_process() -> Option<SessionNotifications> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn each_event_answers_to_its_own_switch() {
+        assert!(switched_on(AwayEvent::Suspending, true, false));
+        assert!(!switched_on(AwayEvent::Suspending, false, true));
+        assert!(switched_on(AwayEvent::WorkstationLocked, false, true));
+        assert!(!switched_on(AwayEvent::WorkstationLocked, true, false));
+    }
 
     /// The constants above are spelled by value so [`away_event`] can be a
     /// function over two integers. That is only safe if they are the same

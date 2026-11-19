@@ -171,6 +171,123 @@ pub fn repair_logon_entry() {
     }
 }
 
+/// The word a logon entry carries when the user asked for a window at
+/// sign-in rather than the tray (Settings > General > "Start in the system
+/// tray" off). `main`'s `launch_intent` ignores arguments it does not know,
+/// so this launches as an ordinary user launch; and because it makes the
+/// whole value no longer "a quoted path to this exe",
+/// [`repaired_value`] leaves it alone rather than putting the tray flag back.
+pub const WINDOW_FLAG: &str = "--window";
+
+/// The two switches of Settings > General > Startup, as the logon entry
+/// says them. **The registry is the only copy**: the installer writes it, and
+/// nothing in `settings.json` can disagree with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Startup {
+    /// "Open when I sign in to Windows": a Run value exists.
+    pub open_at_sign_in: bool,
+    /// "Start in the system tray": the value carries [`AUTOSTART_FLAG`].
+    pub in_tray: bool,
+}
+
+/// What the Run value says, `None` being "no value".
+#[must_use]
+pub fn startup_of(current: Option<&str>) -> Startup {
+    match current {
+        None => Startup { open_at_sign_in: false, in_tray: false },
+        Some(value) => Startup { open_at_sign_in: true, in_tray: value.contains(AUTOSTART_FLAG) },
+    }
+}
+
+/// The Run value that says `startup`, `None` meaning "remove the value".
+#[must_use]
+pub fn startup_value(startup: Startup, our_exe: &std::path::Path) -> Option<String> {
+    if !startup.open_at_sign_in {
+        return None;
+    }
+    let flag = if startup.in_tray { AUTOSTART_FLAG } else { WINDOW_FLAG };
+    Some(format!("\"{}\" {flag}", our_exe.display()))
+}
+
+const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE: &str = "Deskwarden";
+
+/// Reads the logon entry's raw value.
+fn read_run_value() -> Option<String> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+    };
+    let subkey = HSTRING::from(RUN_KEY);
+    let name = HSTRING::from(RUN_VALUE);
+    unsafe {
+        let mut key = HKEY::default();
+        RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, KEY_READ, &mut key).ok().ok()?;
+        let mut len: u32 = 0;
+        let sized = RegQueryValueExW(key, PCWSTR(name.as_ptr()), None, None, None, Some(&mut len));
+        let mut out = None;
+        if sized.is_ok() && len > 0 {
+            let mut buf = vec![0u8; len as usize];
+            let mut got = len;
+            if RegQueryValueExW(key, PCWSTR(name.as_ptr()), None, None, Some(buf.as_mut_ptr()), Some(&mut got)).is_ok() {
+                let wide: Vec<u16> =
+                    buf.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|c| *c != 0).collect();
+                out = Some(String::from_utf16_lossy(&wide));
+            }
+        }
+        let _ = RegCloseKey(key);
+        out
+    }
+}
+
+/// The startup switches as they stand now. Reads the registry.
+#[must_use]
+pub fn read_startup() -> Startup {
+    startup_of(read_run_value().as_deref())
+}
+
+/// Writes the startup switches to the logon entry. A test copy
+/// (`DESKWARDEN_PROFILE`) never touches the installed copy's entry. Returns
+/// whether the entry now says what was asked.
+pub fn write_startup(startup: Startup) -> bool {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::System::Registry::{
+        RegCloseKey, RegDeleteValueW, RegOpenKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ,
+    };
+    if !crate::app_profile::touches_the_installed_copy() {
+        log::info!("{}", crate::app_profile::installed_copy_refusal("changes the logon entry"));
+        return false;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let subkey = HSTRING::from(RUN_KEY);
+    let name = HSTRING::from(RUN_VALUE);
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, PCWSTR(subkey.as_ptr()), 0, KEY_SET_VALUE, &mut key).is_err() {
+            return false;
+        }
+        let done = match startup_value(startup, &exe) {
+            Some(value) => {
+                let value = HSTRING::from(value.as_str());
+                let bytes = std::slice::from_raw_parts(value.as_ptr().cast::<u8>(), (value.len() + 1) * 2);
+                RegSetValueExW(key, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(bytes)).is_ok()
+            }
+            // Deleting a value that is not there is the state asked for.
+            None => {
+                let gone = RegDeleteValueW(key, PCWSTR(name.as_ptr()));
+                gone.is_ok() || gone == windows::Win32::Foundation::ERROR_FILE_NOT_FOUND
+            }
+        };
+        let _ = RegCloseKey(key);
+        if !done {
+            log::warn!("the logon entry could not be changed to {startup:?}");
+        }
+        done
+    }
+}
+
 /// Whether two paths name the same file, for the purposes above.
 ///
 /// Case-insensitive because Windows paths are, and compared after
@@ -190,6 +307,52 @@ mod tests {
     use std::path::Path;
 
     const EXE: &str = r"C:\Users\someone\AppData\Local\deskwarden\deskwarden.exe";
+
+    const SOME_EXE: &str = r"C:\Apps\Deskwarden.exe";
+
+    #[test]
+    fn a_missing_value_is_off_and_a_flagged_one_is_the_tray() {
+        assert_eq!(startup_of(None), Startup { open_at_sign_in: false, in_tray: false });
+        let tray = format!("\"{SOME_EXE}\" {AUTOSTART_FLAG}");
+        assert_eq!(startup_of(Some(&tray)), Startup { open_at_sign_in: true, in_tray: true });
+        let window = format!("\"{SOME_EXE}\" {WINDOW_FLAG}");
+        assert_eq!(startup_of(Some(&window)), Startup { open_at_sign_in: true, in_tray: false });
+        // A bare value is a window at sign-in, until the repair flags it.
+        assert_eq!(startup_of(Some(&format!("\"{SOME_EXE}\""))), Startup { open_at_sign_in: true, in_tray: false });
+    }
+
+    #[test]
+    fn what_is_written_reads_back_as_what_was_asked() {
+        for open_at_sign_in in [false, true] {
+            for in_tray in [false, true] {
+                let asked = Startup { open_at_sign_in, in_tray };
+                let value = startup_value(asked, Path::new(SOME_EXE));
+                assert_eq!(value.is_some(), open_at_sign_in);
+                let back = startup_of(value.as_deref());
+                // "In the tray" with no entry is not a thing; it reads as off.
+                assert_eq!(back.open_at_sign_in, open_at_sign_in);
+                if open_at_sign_in {
+                    assert_eq!(back.in_tray, in_tray);
+                }
+            }
+        }
+    }
+
+    /// The window-at-sign-in value must survive the repair that adds the
+    /// tray flag to a bare value, or the switch would flip itself back.
+    #[test]
+    fn the_repair_leaves_a_window_at_sign_in_alone() {
+        let value = startup_value(Startup { open_at_sign_in: true, in_tray: false }, Path::new(SOME_EXE)).unwrap();
+        assert_eq!(repaired_value(Some(&value), Path::new(SOME_EXE)), None);
+    }
+
+    #[test]
+    fn main_does_not_interpret_the_window_word() {
+        // `launch_intent` must not treat the word as a refusal: it reads only
+        // `--ui`, `--service` and the autostart flag.
+        let main_rs = include_str!("main.rs");
+        assert!(!main_rs.contains(&format!("\"{WINDOW_FLAG}\"")), "main.rs now interprets {WINDOW_FLAG}; revisit the startup entry");
+    }
 
     /// **The defect.** A value written before the flag existed, pointing at
     /// this exe. Every sign-in from one of these draws a window in the daemon

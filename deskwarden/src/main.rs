@@ -8962,7 +8962,11 @@ fn lock_after_walking_away(
     // everything except the largest decrypted thing there was.
     ui: &mut UiWindows,
 ) {
-    if !deskwarden::away_lock::locks_the_vault(
+    if !deskwarden::away_lock::switched_on(
+        away,
+        est.settings.lock_on_sleep,
+        est.settings.lock_on_screen_lock,
+    ) || !deskwarden::away_lock::locks_the_vault(
         away,
         est.settings.auto_lock(),
         !est.token.is_empty(),

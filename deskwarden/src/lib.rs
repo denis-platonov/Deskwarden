@@ -156,6 +156,8 @@ pub mod scratch_window;
 /// The only OS-touching part of "scan a region of my screen"; everything
 /// downstream of it is a pure function.
 pub mod screen_capture;
+/// Hides the vault window from screen sharing (Settings > Security).
+pub mod screen_share;
 /// The second-factor prompt: the stage between the sign-in card and the
 /// spinner. Its state, its copy and its pure decisions -- and never a
 /// `Challenge`, which stays on the sign-in worker thread.
@@ -214,6 +216,7 @@ pub mod test_scratch;
 /// [`test_http`] above, and for the same reason.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_vault;
+pub mod system_theme;
 pub mod theme;
 pub mod tray;
 pub mod update_panel;
