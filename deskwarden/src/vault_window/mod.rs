@@ -5231,6 +5231,15 @@ pub fn build_frame_with_search(
                             let login = item.login.as_ref();
                             match action {
                                 DetailAction::Edit => mode = DetailMode::Edit(EditDraft::from_item(item)),
+                                // Spec decision 3: Fill answers with where to
+                                // click -- the filling itself is the hotkey's.
+                                DetailAction::Fill => {
+                                    crate::kit::toast::show(ui.ctx(), &detail::fill_toast(item));
+                                }
+                                // The folder chip: that folder's items.
+                                DetailAction::ShowFolder(id) => {
+                                    filter = SidebarFilter::Folder(id);
+                                }
                                 // **5d.** The Send is re-found from the list
                                 // by the record's name -- the same link the
                                 // card was drawn from, asked again rather than
@@ -8917,6 +8926,8 @@ fn detail_action_exposes_secrets(action: &DetailAction) -> bool {
         | DetailAction::EditSequence
         | DetailAction::Edit => true,
         DetailAction::None
+        | DetailAction::Fill
+        | DetailAction::ShowFolder(_)
         | DetailAction::OpenWebsite(_)
         | DetailAction::Delete
         | DetailAction::ToggleFavorite(_)
@@ -23656,10 +23667,10 @@ mod draw_read_arm_tests {
             let item = an_item(item_type_for(kind));
             let (_, texts) = run_read_arm(&item, None, false);
             assert!(
-                texts.contains(&kind.label()),
+                texts.contains(&crate::vault_window::detail::header_kind_label(kind)),
                 "{kind:?}: the read arm painted no {:?} subtitle, so `draw_detail_read` \
                  was not reached for it; painted: {texts:?}",
-                kind.label()
+                crate::vault_window::detail::header_kind_label(kind)
             );
             // NO "Delete" ASSERTION HERE ANY MORE. `2616427` moved Edit and
             // Delete behind the header's kebab menu, so neither paints until
@@ -23744,8 +23755,7 @@ mod draw_read_arm_tests {
         // arm has to prove is only that the NAME it was handed arrived, which
         // is the second run.
         assert!(
-            texts.contains(&"Login · ".to_string())
-                && texts.contains(&"Engineering".to_string()),
+            texts.contains(&"Login".to_string()) && texts.contains(&"Engineering".to_string()),
             "the read arm painted no `<kind> · <folder>` subtitle for an item in a \
              folder; painted: {texts:?}"
         );
@@ -34835,7 +34845,9 @@ mod send_delete_wiring {
                 egui::Pos2::ZERO,
                 // Tall enough for the v2 rail's 44pt rows: the matrix clicks
                 // folder rows, which an 800pt window now scrolls out of view.
-                egui::vec2(1100.0, 2000.0),
+                // The design's 1280 wide: the detail pane then has room for the
+                // header's worded Fill / Share / Edit (narrower, they are squares).
+                egui::vec2(1280.0, 2000.0),
             )),
             ..Default::default()
         }
@@ -34864,18 +34876,6 @@ mod send_delete_wiring {
         matrix_labels(output).iter().filter(|(t, _)| t == needle).count()
     }
 
-    /// This frame's whole shape tree, for the controls that paint no string
-    /// and so cannot be found by [`matrix_locate`].
-    ///
-    /// **One tree, not one probe per clipped shape.** A mark can be split
-    /// across clip rects, and `theme::icon_probe`'s pairing rules (the
-    /// envelope's flap inside its body, the ✕'s two arms consecutive) are
-    /// stated over a single walk. Same rule, for the same reason, as
-    /// `detail.rs`'s `Pane::frame`.
-    fn matrix_shapes(output: &egui::FullOutput) -> egui::Shape {
-        egui::Shape::Vec(output.shapes.iter().map(|c| c.shape.clone()).collect())
-    }
-
     /// Where the detail header's **"Send a record" envelope** is, to press it.
     ///
     /// A shape lookup and not a text one, because that control paints no
@@ -34888,16 +34888,8 @@ mod send_delete_wiring {
     /// second one is added, and it would leave the test it feeds unable to
     /// tell "the control is gone" from "there are two".
     fn matrix_locate_envelope(state: ReachableState, output: &egui::FullOutput) -> egui::Pos2 {
-        let found = crate::theme::icon_probe::envelopes(&matrix_shapes(output));
-        assert_eq!(
-            found.len(),
-            1,
-            "in state {state:?} the window painted {} \"Send a record\" envelopes, not one, \
-             so this test cannot say which control it is pressing. What was painted: {:?}",
-            found.len(),
-            matrix_texts(output)
-        );
-        found[0].0.center()
+        // v2: the record composer opens from the header's Share.
+        matrix_locate(state, output, crate::vault_window::detail::SHARE_LABEL)
     }
 
     /// Where the detail header's **close ✕** is, to press it. See
@@ -34907,18 +34899,16 @@ mod send_delete_wiring {
     /// `icon_probe::pane_close_marks` matches on `theme`'s own
     /// `PANE_CLOSE_ARM` alone, so a count of one is also the evidence that
     /// the two marks are still telling themselves apart.
-    fn matrix_locate_pane_close(state: ReachableState, output: &egui::FullOutput) -> egui::Pos2 {
-        let found = crate::theme::icon_probe::pane_close_marks(&matrix_shapes(output));
-        assert_eq!(
-            found.len(),
-            1,
-            "in state {state:?} the window painted {} detail-pane close marks, not one -- \
-             either the pane is not drawing one, or the titlebar's window-close is being \
-             found as it. What was painted: {:?}",
-            found.len(),
-            matrix_texts(output)
-        );
-        found[0].0.center()
+    fn matrix_locate_pane_close(state: ReachableState, ctx: &egui::Context, output: &egui::FullOutput) -> egui::Pos2 {
+        // v2: Close paints no words, so it is found by its id.
+        ctx.read_response(crate::vault_window::detail::header_control_id(crate::vault_window::detail::HeaderControl::Close))
+            .map(|r| r.rect.center())
+            .unwrap_or_else(|| {
+                panic!(
+                    "in state {state:?} the window drew no detail-pane Close. What was painted: {:?}",
+                    matrix_texts(output)
+                )
+            })
     }
 
     fn matrix_locate(state: ReachableState, output: &egui::FullOutput, needle: &str) -> egui::Pos2 {
@@ -35442,10 +35432,9 @@ mod send_delete_wiring {
 
         // The control exists, and the strip it belongs to is up. Located
         // and not bound: the press below re-locates on a later frame.
-        matrix_locate_pane_close(state, &open);
-        assert_eq!(
-            crate::theme::icon_probe::stars(&matrix_shapes(&open)).len(),
-            1,
+        matrix_locate_pane_close(state, &ctx, &open);
+        assert!(
+            matrix_find(&open, crate::vault_window::detail::SHARE_LABEL).is_some(),
             "control: the detail pane's header strip is not on screen before anything is \
              pressed, so closing it below would prove nothing. What was painted: {:?}",
             matrix_texts(&open)
@@ -35453,24 +35442,18 @@ mod send_delete_wiring {
         matrix_locate(state, &open, FRAME_ITEM_NAME);
 
         // Press it.
-        let close_at = matrix_locate_pane_close(state, &open);
+        let close_at = matrix_locate_pane_close(state, &ctx, &open);
         let closed = matrix_click(&ctx, &mut frame_fn, close_at);
-        let shapes = matrix_shapes(&closed);
         assert!(
-            crate::theme::icon_probe::stars(&shapes).is_empty(),
+            matrix_find(&closed, crate::vault_window::detail::SHARE_LABEL).is_none(),
             "pressing the header's ✕ left the favourite star on screen, so the detail pane \
              is still showing. What was painted: {:?}",
             matrix_texts(&closed)
         );
         assert!(
-            crate::theme::icon_probe::envelopes(&shapes).is_empty(),
+            matrix_find(&closed, crate::vault_window::detail::EDIT_LABEL).is_none(),
             "pressing the header's ✕ left the Send envelope on screen, so the detail pane \
              is still showing"
-        );
-        assert!(
-            crate::theme::icon_probe::pane_close_marks(&shapes).is_empty(),
-            "pressing the header's ✕ left a second ✕ on screen, so the pane redrew itself \
-             -- the selection is being restored from somewhere"
         );
         // And the LIST is still there. This is the half that says the pane
         // was hidden rather than the window emptied or closed.
@@ -35483,10 +35466,13 @@ mod send_delete_wiring {
         // And clicking the row brings it back -- otherwise this is not
         // "hide the details", it is "lose them".
         let row_at = matrix_locate(state, &closed, FRAME_ITEM_NAME);
-        let reopened = matrix_click(&ctx, &mut frame_fn, row_at);
-        assert_eq!(
-            crate::theme::icon_probe::stars(&matrix_shapes(&reopened)).len(),
-            1,
+        let mut reopened = matrix_click(&ctx, &mut frame_fn, row_at);
+        // The pane slides back in; its worded buttons return once it has room.
+        for _ in 0..60 {
+            reopened = matrix_frame(&ctx, &mut frame_fn);
+        }
+        assert!(
+            matrix_find(&reopened, crate::vault_window::detail::SHARE_LABEL).is_some(),
             "clicking the row after closing the pane did not bring it back, so the ✕ is a \
              one-way door. What was painted: {:?}",
             matrix_texts(&reopened)

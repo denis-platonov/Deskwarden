@@ -143,19 +143,34 @@ pub const ROW: ButtonSize = ButtonSize { height: 42.0, pad_x: 16.0, radius: 12, 
 pub const SMALL: ButtonSize = ButtonSize { height: 40.0, pad_x: 14.0, radius: 11, font_px: 14.0 };
 
 /// A design button with an optional leading glyph (spec part B section 0.6).
-pub fn button(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str, icon: Option<&str>) -> Response {
-    let p = palette(ui.ctx());
-    let (face, ink) = match kind {
+/// A button's face and ink.
+fn button_look(p: &tokens::Palette, kind: ButtonKind) -> (&'static str, Color32) {
+    match kind {
         ButtonKind::Primary => (BOLD, Color32::WHITE),
         ButtonKind::Outline => (SEMIBOLD, p.ink),
         ButtonKind::Tinted => (BOLD, p.blue_deep),
         ButtonKind::Danger => (SEMIBOLD, p.error),
-    };
+    }
+}
+
+/// How wide [`button`] will draw `label`: for rows that must decide, before
+/// drawing, whether their buttons fit.
+pub fn button_width(ctx: &egui::Context, kind: ButtonKind, size: ButtonSize, label: &str, icon: bool) -> f32 {
+    let (face, ink) = button_look(&palette(ctx), kind);
+    let role = Role { size: size.font_px, face, tracking_em: 0.0 };
+    let text = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, label, ink)).size().x);
+    let icon_px = (size.font_px + 2.0).round();
+    size.pad_x * 2.0 + if icon { icon_px + 7.0 } else { 0.0 } + text
+}
+
+pub fn button(ui: &mut Ui, kind: ButtonKind, size: ButtonSize, label: &str, icon: Option<&str>) -> Response {
+    let p = palette(ui.ctx());
+    let (face, ink) = button_look(&p, kind);
     let role = Role { size: size.font_px, face, tracking_em: 0.0 };
     let galley = ui.fonts_mut(|f| f.layout_job(tokens::job(role, label, ink)));
     let icon_px = (size.font_px + 2.0).round();
     let icon_w = if icon.is_some() { icon_px + 7.0 } else { 0.0 };
-    let width = size.pad_x * 2.0 + icon_w + galley.size().x;
+    let width = button_width(ui.ctx(), kind, size, label, icon.is_some());
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, size.height), Sense::click());
     let hovered = response.hovered();
     let radius = CornerRadius::same(size.radius);
@@ -336,6 +351,20 @@ mod tests {
         assert_eq!(t.fill, P.blue_wash);
         assert_eq!(tinted.height(), 40.0);
         assert_eq!(painted.text("Generate").unwrap().1, P.blue_deep);
+    }
+
+    #[test]
+    fn a_buttons_width_is_known_before_it_is_drawn() {
+        let ctx = crate::kit::testing::ctx();
+        for (kind, label, icon) in [
+            (ButtonKind::Primary, "Fill", Some(crate::kit::icon::glyph::FILL)),
+            (ButtonKind::Outline, "Share", Some(crate::kit::icon::glyph::SHARED)),
+            (ButtonKind::Danger, "Delete forever", None),
+        ] {
+            let mut drawn = Rect::NOTHING;
+            frame(&ctx, 0.0, SCREEN, vec![], |ui| drawn = button(ui, kind, LARGE, label, icon).rect);
+            assert_eq!(button_width(&ctx, kind, LARGE, label, icon.is_some()), drawn.width(), "{label}");
+        }
     }
 
     #[test]

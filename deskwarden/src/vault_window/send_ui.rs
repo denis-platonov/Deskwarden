@@ -15513,13 +15513,6 @@ mod frame_promptness {
         }
     }
 
-    /// Everything painted, as one shape, which is what `theme::icon_probe`'s
-    /// finders take: the two controls this harness has to press paint no text
-    /// and cannot be found any other way.
-    fn all_shapes(output: &egui::FullOutput) -> egui::Shape {
-        egui::Shape::Vec(output.shapes.iter().map(|clipped| clipped.shape.clone()).collect())
-    }
-
     /// The centre of the label reading exactly `needle` on `output`, or a
     /// failure naming everything that WAS painted.
     ///
@@ -15682,20 +15675,8 @@ mod frame_promptness {
             // `theme::kebab_button` has exactly one production call site (the
             // one being pressed here), so "the first mark found" is not a
             // guess.
-            let dots = crate::theme::icon_probe::kebab_dots(&all_shapes(&output));
-            let (rect, _) = *dots.first().unwrap_or_else(|| {
-                panic!(
-                    "the read pane painted no overflow menu to open, so this scenario cannot \
-                     reach the editor. What was painted: {:?}",
-                    labels_of(&output).into_iter().map(|(t, _)| t).collect::<Vec<_>>()
-                )
-            });
-            click(&ctx, &mut *frame_fn, rect.center());
-            // The menu is open from the frame after the release; this is the
-            // frame that paints its entries, and so the one "Edit" is found
-            // on.
-            output = ctx.run_ui(input(), |ui| frame_fn(ui));
-            let pos = locate_label(&output, "Edit", "the read pane's overflow menu");
+            // v2: Edit is a button on the header's action row.
+            let pos = locate_label(&output, "Edit", "the read pane's action row");
             click(&ctx, &mut *frame_fn, pos);
             // The click is applied by the frame after the release, and the
             // editor is drawn by the frame after that.

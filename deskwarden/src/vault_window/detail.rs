@@ -23,7 +23,6 @@
 use super::record_ui;
 use super::relative_time;
 use super::send_ui;
-use super::totp_add;
 use super::sidebar::OutOfVault;
 use crate::app_match::AppMatch;
 /// The trigger vocabulary this file still spells is test-only -- see
@@ -106,70 +105,6 @@ pub(crate) const HEADER_AVATAR: f32 = 40.0;
 /// a 44px row, and a row that quietly tracks whichever child is tallest is the
 /// thing that just went wrong.
 pub(crate) const HEADER_ROW: f32 = 44.0;
-/// **How many controls the header strip draws for EVERY item**, because the
-/// strip *reserves* its room before it draws anything and drift between the
-/// two is the failure mode that painted a control at x = -34.5.
-///
-/// Four: ★, ✉, ⋮, ✕ (`draw_controls` fills them right-to-left, so it emits
-/// them in the other order). Every one of them is square at
-/// [`theme::HEADER_BUTTON_HEIGHT`], which is what makes a count sufficient
-/// -- the removed "Fill in app" button was worded and had a per-item width,
-/// and that is exactly why this used to be an expression rather than a
-/// number.
-///
-/// **This is no longer the whole count**, and that is the change the ⏱
-/// brought: read [`header_controls`], never this, when reserving room.
-const HEADER_CONTROLS_ALWAYS: usize = 4;
-
-/// **How many controls the strip draws for THIS item** -- the number the
-/// reservation is computed from, and the number
-/// `the_strip_reserves_room_for_every_control_it_draws` counts the painted
-/// marks against.
-///
-/// [`HEADER_CONTROLS_ALWAYS`] plus the ⏱, which is drawn only where it would
-/// do something. `vault_window::mod`'s one block that opens the form resolves
-/// the selection and filters it on `login.is_some()`; a ⏱ on a card or a note
-/// would be a control that reports an action nothing acts on -- exactly the
-/// "there is nothing to do me to" state that got the record composer's
-/// titlebar pill rejected, and the reason it is now in this strip at all.
-///
-/// **Read off the item and not off [`ItemKind`]**, because that filter is: a
-/// `type: 1` item carrying no `login` object has nowhere to put a seed, and
-/// gating on the kind would draw the control for it anyway.
-///
-/// Not merely a helper two call sites share: the guard counts the controls
-/// actually PAINTED and fails if this disagrees with them, so a sixth control
-/// added to `draw_controls` alone cannot ride on a stale reservation. It is
-/// asserted at both answers -- a login and a card -- because a function of
-/// the item that was checked at one item is a constant that was checked once.
-fn header_controls(item: &VaultItem) -> usize {
-    HEADER_CONTROLS_ALWAYS + usize::from(item_takes_a_one_time_code(item))
-}
-
-/// [`header_controls`] with sharing: the Share control (design 6a) is one
-/// more wherever the window resolved one -- sharing on NodeWarden, or a Send
-/// offered in its place -- and none where it did not.
-///
-/// **Read this, never [`header_controls`], when reserving room**: it is what
-/// `the_strip_reserves_room_for_every_control_it_draws` counts the painted
-/// marks against, in all four cases (a login and a card, with and without
-/// the control).
-///
-/// **A view-only record's strip is the ⋮ and the ✕ alone** (mock 6d, and the
-/// owner's call on the star): the star, the envelope, the clock and Share each
-/// write the record or share it on, and `draw_controls` draws none of them
-/// for it -- so this counts [`HEADER_CONTROLS_VIEW_ONLY`] wherever
-/// [`pane_writable`] says no, the branch and the drawing reading one
-/// predicate. A reservation for fewer controls than are painted is the
-/// x = -34.5 defect; `the_strip_reserves_room_for_every_control_it_draws`
-/// counts both received kinds, and an unnamed `edit: false` item, against the
-/// painted marks.
-fn header_controls_for(item: &VaultItem, people: &PeopleSharing<'_>) -> usize {
-    if !pane_writable(item, people) {
-        return HEADER_CONTROLS_VIEW_ONLY;
-    }
-    header_controls(item) + usize::from(people.share_control.is_some())
-}
 
 /// **Whether the read pane offers anything that writes** -- the ONE predicate
 /// the strip's count, its drawing, the ⋮'s contents and the matched app's
@@ -187,38 +122,6 @@ fn pane_writable(item: &VaultItem, people: &PeopleSharing<'_>) -> bool {
     people.view_only_from.is_none() && crate::vault_bridge::may_edit(item)
 }
 
-/// A view-only record's strip: the kebab, whose menu says why it is short,
-/// and the close. See [`header_controls_for`].
-const HEADER_CONTROLS_VIEW_ONLY: usize = 2;
-
-/// The mock's own `.hctls { gap: 2px }`: the closest two of the strip's
-/// controls are ever drawn. See [`controls_gap`].
-const HEADER_CONTROLS_MIN_GAP: f32 = 2.0;
-
-/// **The gap between the strip's controls in a row `row` points wide.**
-///
-/// [`HEADER_GAP`] wherever the controls fit at it, which is every row the
-/// one-line arrangement is ever given ([`header_layout`] only keeps them on
-/// the title's line where they do) and the stacked row at every width but
-/// the narrowest. Design 6a's Share control made six squares, and six at 14
-/// is 274 points against the 250 the stacked row has at the app's minimum
-/// pane -- the overflow `the_strips_controls_fit_the_apps_minimum_window`
-/// predicted for a sixth control. So there, and only there, the gaps close
-/// until the row fits: at 250 they are 9.2, still well clear of the mock's
-/// own 2, which is the floor.
-///
-/// Closing the gaps rather than dropping a control or shrinking the squares:
-/// every control is a 34-point target the user aims at, and a strip that
-/// hid one at small widths would be a control that exists or not by window
-/// size. The gaps are the only slack the row has.
-fn controls_gap(row: f32, controls: usize) -> f32 {
-    if controls < 2 {
-        return HEADER_GAP;
-    }
-    let spare = (row - theme::HEADER_BUTTON_HEIGHT * controls as f32) / (controls - 1) as f32;
-    spare.clamp(HEADER_CONTROLS_MIN_GAP, HEADER_GAP)
-}
-
 /// **Whether this item is one a one-time code could be added to** -- and the
 /// single expression both the strip and its guards read.
 ///
@@ -230,33 +133,6 @@ fn controls_gap(row: f32, controls: usize) -> f32 {
 fn item_takes_a_one_time_code(item: &VaultItem) -> bool {
     item.login.is_some()
 }
-/// `font-size: 22px` on the item title.
-pub(crate) const TITLE_SIZE: f32 = 22.0;
-/// `gap: 3px` between the title and its subtitle.
-pub(crate) const TITLE_GAP: f32 = 3.0;
-/// `font-size: 12px` on the subtitle under it. A constant rather than a
-/// literal since the folder mark split that line into two labels: two runs of
-/// one sentence set at two sizes is a slip nothing else would catch, and
-/// `theme::FOLDER_MARK_SIZE`'s height is measured against this number.
-pub(crate) const SUBTITLE_SIZE: f32 = 12.0;
-/// **The floor under the item title, and the thing the rest of the strip
-/// gives way to.** Not from the design: 2b draws this pane at one width and
-/// says nothing about what happens below it.
-///
-/// A truncating title has no natural minimum -- egui will happily elide it to
-/// a single "…" and report that as a fitted layout -- so *something* has to
-/// state one, and the number is the point below which the title stops being a
-/// name. 120pt measures out at eight to ten characters of 22pt ExtraBold plus
-/// the ellipsis: enough of a name to recognise, not a mark. See
-/// [`header_layout`] for what is sacrificed to keep it, and
-/// `the_title_is_never_reduced_to_an_ellipsis_at_any_width` for the sweep
-/// that holds it to this.
-const TITLE_MIN: f32 = 120.0;
-/// The gap between the two lines of the header when it stacks -- see
-/// [`header_layout`]. Not [`HEADER_GAP`]: that one is 2b's horizontal `gap`
-/// inside a row the design draws, and this is the vertical space in a
-/// rearrangement the design does not draw at all.
-const HEADER_ROW_GAP: f32 = 10.0;
 /// The body below the strip: `padding: 18px 24px`.
 /// `pub(crate)` so the EDIT pane can take the same inset rather than a
 /// same-valued constant of its own -- see `detail_edit::FORM_PAD_X`, and the
@@ -677,6 +553,11 @@ pub const MAX_HISTORY_ROWS: usize = 8;
 pub enum DetailAction {
     None,
     Edit,
+    /// The header's Fill (logins): the window answers with spec decision 3's
+    /// toast, "Click the sign-in field in <app>".
+    Fill,
+    /// The header's folder chip: show that folder's items (its id).
+    ShowFolder(String),
     /// **Design 5d** -- the SHARING card's Revoke was pressed: ask whether to
     /// delete the live Send this record has out. **Step one of two, and it
     /// destroys nothing**; it arms the same confirmation the Sent screen's
@@ -2069,179 +1950,50 @@ pub fn draw_out_of_vault_read(
     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
 
     egui::Frame::new()
-        .fill(theme::CARD)
-        .inner_margin(Margin::symmetric(HEADER_PAD_X, HEADER_PAD_Y))
+        .inner_margin(Margin { left: 32, right: 32, top: 28, bottom: 0 })
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                // **The avatar, through the read pane's own two doors.** An
-                // item whose row shows a note mark must not open onto a
-                // header showing a letter pair, which is `kind_mark`'s rule
-                // and the reason the `None` arm is not a monogram written out
-                // here.
-                match icon {
-                    Some(tex) => {
-                        let tile = theme::avatar_artwork_tile(ui, HEADER_AVATAR, true);
-                        theme::avatar_image(ui, tile, tex, true);
-                    }
-                    None => crate::kind_mark::avatar(
-                        ui,
-                        ItemKind::of(item),
-                        &item.name,
-                        HEADER_AVATAR,
-                        true,
-                    ),
+            let top = header_top(ui, &HeaderTop { item, icon, folder, shared_by: None, tags: Vec::new() });
+            if top.close {
+                action = DetailAction::ClosePane;
+            }
+            ui.add_space(V2_ROW_GAP);
+            let entries = super::item_list::out_of_vault_entries_for(item, out);
+            let band = egui::vec2(ui.available_width(), V2_ACTION_HEIGHT);
+            ui.allocate_ui_with_layout(band, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                use crate::kit::controls;
+                ui.spacing_mut().item_spacing.x = 10.0;
+                if entries.is_empty() {
+                    let p = crate::kit::tokens::palette(ui.ctx());
+                    ui.label(crate::kit::tokens::job(crate::kit::tokens::BODY, VIEW_ONLY_FOOTER, p.text_faint));
                 }
-                ui.add_space(HEADER_GAP);
-                // The controls are laid out from the right, so the title
-                // column below takes whatever is left -- the read pane's
-                // arrangement, without its stacking rule: this pane has two
-                // controls where that one has four, so the width that forces
-                // that one onto a second line does not force this one.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if theme::close_pane_button(ui)
-                        .on_hover_text("Close this panel and show the full list")
-                        .clicked()
-                    {
-                        action = DetailAction::ClosePane;
+                for entry in entries {
+                    let super::item_list::MenuEntry::Command(entry) = entry else {
+                        continue;
+                    };
+                    let purge = entry.command == super::item_list::RowCommand::PurgeForever;
+                    let kind = if purge { controls::ButtonKind::Danger } else { controls::ButtonKind::Outline };
+                    let response = ui.add_enabled_ui(entry.enabled, |ui| controls::button(ui, kind, controls::LARGE, &entry.label, None)).inner;
+                    if response.clicked() {
+                        action = match entry.command {
+                            super::item_list::RowCommand::Restore => DetailAction::Restore,
+                            super::item_list::RowCommand::Unarchive => DetailAction::Unarchive,
+                            super::item_list::RowCommand::PurgeForever => DetailAction::PurgeForever,
+                            other => {
+                                log::warn!(
+                                    "the out-of-vault pane offered {other:?}, which it has no action \
+                                     for; the click was dropped"
+                                );
+                                DetailAction::None
+                            }
+                        };
                     }
-                    ui.add_space(HEADER_GAP);
-                    let kebab = theme::kebab_button(ui)
-                        .on_hover_text("More actions for this item");
-                    egui::Popup::menu(&kebab)
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| {
-                            // **The row menu's own list, CALLED and not
-                            // copied** -- `item_list::out_of_vault_entries`,
-                            // the same door this pane's "Move to folder"
-                            // submenu goes through for `move_menu`, and for
-                            // the same reason: two hand-written lists of what
-                            // a trashed item can do is one list that goes
-                            // stale, and the stale one is whichever is not
-                            // being read.
-                            //
-                            // `MenuEntry::MoveToFolder` cannot appear here --
-                            // that list holds `Restore`, `PurgeForever` and
-                            // `Unarchive` and nothing else -- but the arm is
-                            // written rather than `unreachable!()`d, because
-                            // a pane that panicked would be a worse answer to
-                            // a future entry than a pane that skipped one.
-                            // `_for` the item: an `edit: false` record's
-                            // Restore and Delete forever are writes too, and
-                            // its menu says why instead (`VIEW_ONLY_FOOTER`).
-                            let entries = super::item_list::out_of_vault_entries_for(item, out);
-                            if entries.is_empty() {
-                                ui.set_width(VIEW_ONLY_MENU_WIDTH);
-                                ui.add(
-                                    egui::Label::new(RichText::new(VIEW_ONLY_FOOTER).size(11.0).color(theme::TEXT_GHOST)).wrap(),
-                                );
-                            }
-                            for entry in entries {
-                                let super::item_list::MenuEntry::Command(entry) = entry else {
-                                    continue;
-                                };
-                                // **The permanent delete keeps its red
-                                // words, and no longer keeps them by
-                                // hand.** This arm used to build its own
-                                // `Button::new(RichText::new(..).color(
-                                // theme::ERROR))` because the shared list
-                                // carried a label and a command and nothing
-                                // that said "this one destroys something";
-                                // `RowCommand::is_destructive` says it now,
-                                // so the red arrives through
-                                // `menu_command_button` exactly as it does
-                                // for the row menu's own Delete forever, and
-                                // the two surfaces cannot drift into
-                                // disagreeing about which entries are red.
-                                //
-                                // What is still special here, and the only
-                                // reason this is not a plain `menu_command`
-                                // call, is the hover sentence: `MenuCommand`
-                                // carries a reason for a DISABLED entry and
-                                // nothing for an enabled one, and this
-                                // pane's entries have always explained
-                                // themselves on hover. So it takes the
-                                // button back and hangs the tooltip on it.
-                                // The click still opens the same
-                                // confirmation modal the row menu's entry
-                                // opens.
-                                let clicked = if entry.command
-                                    == super::item_list::RowCommand::PurgeForever
-                                {
-                                    let button = super::item_list::menu_command_button(ui, &entry);
-                                    if button
-                                        .on_hover_text("Delete this item permanently")
-                                        .clicked()
-                                    {
-                                        ui.close();
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    super::item_list::menu_command(ui, &entry)
-                                };
-                                if clicked {
-                                    action = match entry.command {
-                                        super::item_list::RowCommand::Restore => {
-                                            DetailAction::Restore
-                                        }
-                                        super::item_list::RowCommand::Unarchive => {
-                                            DetailAction::Unarchive
-                                        }
-                                        super::item_list::RowCommand::PurgeForever => {
-                                            DetailAction::PurgeForever
-                                        }
-                                        // Not reachable from that list today.
-                                        // Reported rather than panicked for
-                                        // the reason above, and logged so a
-                                        // new entry that arrives here is not
-                                        // silently inert.
-                                        other => {
-                                            log::warn!(
-                                                "the out-of-vault pane's menu offered {other:?}, \
-                                                 which it has no action for; the click was \
-                                                 dropped"
-                                            );
-                                            DetailAction::None
-                                        }
-                                    };
-                                }
-                            }
-                        });
-                    // The title column, in whatever the controls left it.
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = TITLE_GAP;
-                        title_text(ui, &item.id, &item.name);
-                        // **The read pane's subtitle, unchanged**: the kind,
-                        // and the folder after it when there is one. The
-                        // sentence saying WHERE the item is has moved down to
-                        // the card below, which is where the explanation of
-                        // what that means already lives -- two lines under
-                        // the title, one of them repeating the other, was the
-                        // arrangement this pane had when the title was all it
-                        // showed.
-                        let (lead, name) = header_subtitle_parts(ItemKind::of(item), folder);
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            subtitle_text(
-                                ui,
-                                egui::Id::new(("out-of-vault-subtitle", &item.id)),
-                                &lead,
-                            );
-                            if let Some(name) = name {
-                                theme::folder_mark(ui, theme::TEXT_FAINT);
-                                subtitle_text(
-                                    ui,
-                                    egui::Id::new(("out-of-vault-folder", &item.id)),
-                                    name,
-                                );
-                            }
-                        });
-                    });
-                });
+                }
             });
         });
+    if esc_closes_pane(ui.ctx()) {
+        action = DetailAction::ClosePane;
+    }
     ui.add_space(18.0);
     // **The explanation is a card, like everything else this pane says.**
     //
@@ -3332,135 +3084,6 @@ fn copy_shortcut_action(
     }
 }
 
-/// The header's second line, under the item's name.
-///
-/// Design 2b, line 803: `Login · Engineering` -- **one line carrying the kind
-/// and the folder**, not the kind with a folder line added under it. The pane
-/// already painted the kind here; the folder joins it.
-///
-/// The user asked for the folder "under the title like design has it - if no
-/// folder just don't print anything". "Nothing" is the separator and the name:
-/// the line still reads `Login`, because the kind was never the part that was
-/// missing. A subtitle that vanished with the folder would take the one fact
-/// this line has always carried with it.
-///
-/// `folder` is a NAME the caller has already resolved (`sidebar::folder_name`,
-/// which is where a folder id becomes a name and where every reason there
-/// might be no name is decided). This function never sees an id, so it cannot
-/// paint one.
-///
-/// Pure, and separate from the closure that draws it, for this file's standing
-/// reason: a decision reachable only from inside an eframe closure is a
-/// decision that will not be tested.
-///
-/// **Returned SPLIT, at the point the folder mark goes**: everything up to and
-/// including the separator, then the folder's name when there is one.
-///
-/// The user, of `Card · Work`: *"For foldered items also show folder icon left
-/// to folder name in subtitle, otherwise not clear two words what they mean."*
-/// Two bare words with nothing saying which is the item's TYPE and which is
-/// where it lives -- and a line the design gives one row cannot say it in more
-/// words. `theme::folder_mark` says it in a mark instead, and a mark has to be
-/// painted BETWEEN two runs of text, which a single `String` could not express.
-///
-/// The split is what changed; the reading order is not. The pane paints these
-/// two runs adjacent with nothing between them but the mark, so the line still
-/// reads exactly `<kind> · <folder>` -- `the_header_paints_the_folder_beside_
-/// the_kind_under_the_item_name` reads it back off the rendered frame rather
-/// than trusting this sentence.
-///
-/// **`None` is the whole of the unfoldered case.** An item with no folder
-/// keeps the bare kind label and gains no mark: the mark introduces a folder
-/// name, and there is no name to introduce.
-fn header_subtitle_parts(kind: ItemKind, folder: Option<&str>) -> (String, Option<&str>) {
-    match folder {
-        Some(name) => (format!("{} · ", kind.label()), Some(name)),
-        None => (kind.label(), None),
-    }
-}
-
-/// How the header strip arranges itself at a given width.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct HeaderLayout {
-    /// The controls have moved off the title's line onto their own, right
-    /// aligned underneath it. The strip gets taller; nothing is dropped.
-    stacked: bool,
-}
-
-/// **What the header gives up, in order, as the pane narrows -- and it is
-/// never the title.**
-///
-/// The commit that made the controls claim their width first fixed a real
-/// bug (the header's primary button, since removed, measured painting at
-/// x = -34.5, entirely off a 298pt pane) and introduced its mirror image:
-/// with the controls served first the
-/// title got the remainder, the remainder at 298pt was 21.6pt, and egui
-/// elided a 26-character name down to a lone "…" painted *inside the strip's
-/// left padding, on top of the avatar*. A layout that fits by annihilating
-/// its own subject is not a layout that fits, and the test of the day could
-/// not see it: `Galley::text()` returns the job's SOURCE text, so every
-/// painted-text assertion in this file reads the full name off a galley that
-/// drew one ellipsis.
-///
-/// So the title is given a floor ([`TITLE_MIN`]) and the one thing left to
-/// spend is **the single line**: below the width at which the controls and a
-/// [`TITLE_MIN`]-wide title both fit beside the avatar, the controls move to
-/// their own row under the title. The strip gets taller, which the design
-/// does not draw -- but the design also does not draw a 298pt pane, and a
-/// taller strip costs some body space while the alternative costs the item's
-/// name.
-///
-/// **There used to be a rung above this one**: the header's primary button
-/// carried a `CTRL+SHIFT+F` shortcut hint that was dropped first, being pure
-/// redundancy. The button and its chord are both gone, so the ladder has one
-/// rung and this function one decision. What has NOT changed is that the
-/// stacked branch is still reached at the app's own minimum: the star and the
-/// kebab plus their gap are 82pt, and at 298pt the strip has 250pt inside its
-/// padding of which the avatar and its gap take 58, leaving 192 -- less than
-/// the 82 + 14 + 120 one line needs.
-///
-/// Nothing is ever dropped, and no control is ever shrunk below its 34px hit
-/// target.
-///
-/// Pure, and taking measured widths rather than measuring them, for this
-/// file's standing reason: a decision reachable only from inside an eframe
-/// closure is a decision that will not be tested.
-fn header_layout(content_width: f32, controls: f32) -> HeaderLayout {
-    // What is left of the strip's content box once the avatar and the gap
-    // after it are taken -- the band the controls and the title share.
-    let beside_avatar = content_width - HEADER_AVATAR - HEADER_GAP;
-    // Stacked, when they do not both fit: the controls' own row is the full
-    // content width rather than `beside_avatar`, so it has `HEADER_AVATAR +
-    // HEADER_GAP` (46pt) more to work with than the one-line branch just
-    // rejected. That was 58pt while the avatar was 44.
-    HeaderLayout { stacked: controls + HEADER_GAP + TITLE_MIN > beside_avatar }
-}
-
-/// Lays `contents` out across one [`HEADER_ROW`]-high band, left to right,
-/// every child centred on the band's middle.
-///
-/// **A stated height, which `ui.horizontal` cannot give.** egui lays a
-/// horizontal row out in one pass: the first child is placed before the row
-/// knows how tall its later siblings will make it, so `Align::Center` in an
-/// auto-height row can only centre a child against what is already there --
-/// nothing, for the first one. The avatar is the first one. While it was also
-/// the TALLEST that was invisible; at [`HEADER_AVATAR`] = 32 against a ~40pt
-/// title column it left the tile hanging from the top edge of the row. Giving
-/// the band a height up front is what lets egui centre the tile against a
-/// column it has not laid out yet.
-///
-/// `item_spacing.x = 0` for the reason both call sites already had: the gaps
-/// in this strip are [`HEADER_GAP`], placed explicitly, and egui's default 8pt
-/// between widgets would open a second gap beside each of them.
-fn header_row<R>(ui: &mut egui::Ui, contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    let band = egui::vec2(ui.available_width(), HEADER_ROW);
-    ui.allocate_ui_with_layout(band, egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.spacing_mut().item_spacing.x = 0.0;
-        contents(ui)
-    })
-    .inner
-}
-
 /// `modifiers+key` and **nothing else held**, taken out of the event queue.
 ///
 /// egui's own [`egui::InputState::consume_key`] is the obvious call here and
@@ -3501,6 +3124,260 @@ fn consume_chord(
         !is_match
     });
     found
+}
+
+/// The header's controls that paint no words, each under a known id so the
+/// window's tests can find them (`ctx.read_response`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum HeaderControl {
+    Close,
+    Favourite,
+    More,
+    /// Fill and Edit as squares, on a pane too narrow for their words.
+    Fill,
+    Edit,
+}
+
+/// [`HeaderControl`]'s id.
+/// The action row's words.
+pub const FILL_LABEL: &str = "Fill";
+pub const SHARE_LABEL: &str = "Share";
+pub const EDIT_LABEL: &str = "Edit";
+
+pub(crate) fn header_control_id(which: HeaderControl) -> egui::Id {
+    egui::Id::new(("detail-header", which))
+}
+
+/// The more menu's entry that shares the record with a person.
+pub const SHARE_WITH_PERSON_LABEL: &str = "Share with a person";
+/// The more menu's entry that opens the add-a-code card.
+pub const ADD_2FA_MENU_LABEL: &str = "Add 2FA code";
+
+/// Whether this frame's Esc closes the pane: pressed, and no field (nor a
+/// modal, nor an open menu) is there to take it first.
+pub(crate) fn esc_closes_pane(ctx: &egui::Context) -> bool {
+    ctx.input(|i| i.key_pressed(egui::Key::Escape))
+        && !ctx.egui_wants_keyboard_input()
+        && !egui::Popup::is_any_open(ctx)
+        && !super::item_list::a_modal_is_up(ctx)
+}
+
+/// Fill's toast (spec decision 3): the app the login fills, or its own name.
+pub(crate) fn fill_toast(item: &VaultItem) -> String {
+    let target = crate::vault_bridge::extract_app_match(item)
+        .map(|m| {
+            let process = m.process.trim();
+            let stem = process.strip_suffix(".exe").or_else(|| process.strip_suffix(".EXE")).unwrap_or(process);
+            stem.to_string()
+        })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| item.name.clone());
+    format!("Click the sign-in field in {target}")
+}
+
+/// The header's avatar (spec 3.3): 72pt at radius 20.
+const V2_AVATAR: f32 = 72.0;
+/// Between the avatar, the title column and Close.
+const V2_HEADER_GAP: f32 = 20.0;
+/// Between the header's rows, and between the action row and the body.
+const V2_ROW_GAP: f32 = 18.0;
+/// The action row's buttons, and the star's and more's squares.
+const V2_ACTION_HEIGHT: f32 = 48.0;
+
+/// The kind as the header names it (spec 3.3: a card is a "Payment card").
+pub(crate) fn header_kind_label(kind: ItemKind) -> String {
+    match kind {
+        ItemKind::Card => "Payment card".to_string(),
+        other => other.label(),
+    }
+}
+
+/// What the header's top row shows.
+struct HeaderTop<'a> {
+    item: &'a VaultItem,
+    icon: Option<&'a egui::TextureHandle>,
+    /// The folder's name, when the item is filed.
+    folder: Option<&'a str>,
+    /// Who shares a received record, and whether that is only the org's claim.
+    shared_by: Option<(&'a str, bool)>,
+    tags: Vec<crate::kit::card::TagKind>,
+}
+
+/// What the top row's controls did this frame.
+#[derive(Default)]
+struct HeaderTopOutcome {
+    close: bool,
+    folder: bool,
+}
+
+/// Spec 3.3's top row: the 72pt avatar, the title over its line (kind,
+/// folder chip, tags), and Close at the top right. Painted by hand into one
+/// allocated band, so the band is exactly the avatar's height.
+fn header_top(ui: &mut egui::Ui, top: &HeaderTop<'_>) -> HeaderTopOutcome {
+    use crate::kit::{self, tokens};
+    let p = tokens::palette(ui.ctx());
+    let mut out = HeaderTopOutcome::default();
+    let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), V2_AVATAR), egui::Sense::hover());
+    let avatar = egui::Rect::from_min_size(row.min, egui::Vec2::splat(V2_AVATAR));
+    kit::avatar::paint(ui.painter(), avatar, &super::item_list::row_look(top.item, top.icon), 20);
+
+    let close_rect = egui::Rect::from_min_size(egui::pos2(row.right() - 42.0, row.top()), egui::Vec2::splat(42.0));
+    let close = ui
+        .interact(close_rect, header_control_id(HeaderControl::Close), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if close.hovered() {
+        ui.painter().rect_filled(close_rect, CornerRadius::same(12), p.hover);
+    }
+    kit::icon::stroke(
+        ui.painter(),
+        egui::Rect::from_center_size(close_rect.center(), egui::Vec2::splat(20.0)),
+        kit::icon::glyph::CLOSE,
+        2.2,
+        p.text_icon,
+    );
+    kit::tips::hint(ui, &close, "Close", &["Esc"]);
+    out.close = close.clicked();
+
+    // Beside the avatar when there is room for a name; under the avatar row,
+    // at the column's full width, on a pane too narrow for that.
+    let inline_room = close_rect.left() - V2_HEADER_GAP - (avatar.right() + V2_HEADER_GAP);
+    let stacked = inline_room < TITLE_MIN_ROOM;
+    let ctx = ui.ctx().clone();
+    let title_h = tokens::font_height(&ctx, tokens::PAGE_TITLE);
+    let kind_galley = ctx.fonts_mut(|f| {
+        f.layout_job(tokens::job(tokens::BODY, &header_kind_label(ItemKind::of(top.item)), p.text_faint))
+    });
+    let shared_galley = top.shared_by.map(|(from, unverified)| {
+        ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::BODY, &shared_by_line(from, unverified), p.text_faint)))
+    });
+    let chip_galley = top
+        .folder
+        .map(|name| ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::LABEL, name, p.tag_neutral_ink))));
+    // The chip's `padding: 3 9 3 7`, a 13pt glyph and a gap of 6.
+    let chip_size = chip_galley.as_ref().map(|g| egui::vec2(7.0 + 13.0 + 6.0 + g.size().x + 9.0, g.size().y + 6.0));
+    let tag_sizes: Vec<egui::Vec2> = top
+        .tags
+        .iter()
+        .map(|t| kit::card::tag_size(&ctx, *t, kit::card::TagSize::Detail))
+        .collect();
+    let line_h = [kind_galley.size().y, chip_size.map_or(0.0, |s| s.y)]
+        .into_iter()
+        .chain(tag_sizes.iter().map(|s| s.y))
+        .fold(0.0_f32, f32::max);
+    let column_h = title_h + 8.0 + line_h;
+    let (left, width, y) = if stacked {
+        ui.add_space(V2_ROW_GAP);
+        let (band, _) = ui.allocate_exact_size(egui::vec2(row.width(), column_h), egui::Sense::hover());
+        (band.left(), band.width(), band.top())
+    } else {
+        let left = avatar.right() + V2_HEADER_GAP;
+        (left, inline_room.max(1.0), row.center().y - column_h / 2.0)
+    };
+
+    let mut title = tokens::job(tokens::PAGE_TITLE, &top.item.name, p.ink);
+    title.wrap = egui::text::TextWrapping::truncate_at_width(width);
+    let title = ctx.fonts_mut(|f| f.layout_job(title));
+    ui.painter().galley(egui::pos2(left, y), title, p.ink);
+
+    let line_top = y + title_h + 8.0;
+    let mut x = left;
+    let centred = |h: f32| line_top + (line_h - h) / 2.0;
+    let kind_w = kind_galley.size().x;
+    let kind_h = kind_galley.size().y;
+    ui.painter().galley(egui::pos2(x, centred(kind_h)), kind_galley, p.text_faint);
+    x += kind_w + 8.0;
+    if let Some(galley) = shared_galley {
+        let at = egui::Rect::from_min_size(egui::pos2(x, centred(galley.size().y)), galley.size());
+        x += galley.size().x + 8.0;
+        ui.painter().galley(at.min, galley, p.text_faint);
+        if top.shared_by.is_some_and(|(_, unverified)| unverified) {
+            let _ = ui
+                .interact(at, egui::Id::new(("detail-shared-by", &top.item.id)), egui::Sense::hover())
+                .on_hover_text(UNVERIFIED_SHARER_TOOLTIP);
+        }
+    }
+    if let (Some(galley), Some(size)) = (chip_galley, chip_size) {
+        let chip = egui::Rect::from_min_size(egui::pos2(x, centred(size.y)), size);
+        let response = ui
+            .interact(chip, egui::Id::new(("detail-folder-chip", &top.item.id)), egui::Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let bg = if response.hovered() { FOLDER_CHIP_HOVER } else { p.tag_neutral_bg };
+        ui.painter().rect_filled(chip, CornerRadius::same(7), bg);
+        let glyph = egui::Rect::from_min_size(egui::pos2(chip.left() + 7.0, chip.center().y - 6.5), egui::Vec2::splat(13.0));
+        kit::icon::stroke(ui.painter(), glyph, kit::icon::glyph::FOLDER, 2.0, p.tag_neutral_ink);
+        ui.painter().galley(egui::pos2(glyph.right() + 6.0, chip.top() + 3.0), galley, p.tag_neutral_ink);
+        out.folder = response.clicked();
+        x = chip.right() + 8.0;
+    }
+    for (tag, size) in top.tags.iter().zip(&tag_sizes) {
+        kit::card::paint_tag(ui.painter(), egui::pos2(x, centred(size.y)), *tag, kit::card::TagSize::Detail);
+        x += size.x + 8.0;
+    }
+    out
+}
+
+/// The header's extra side inset inside the body's own padding: spec 3.3's
+/// 32 less the body's [`BODY_PAD_X`].
+const HEADER_INSET_X: i8 = 32 - BODY_PAD_X;
+
+/// Below this much room beside the avatar, the title column moves under it:
+/// a 32pt name in less is a few letters and an ellipsis.
+const TITLE_MIN_ROOM: f32 = 200.0;
+
+/// The folder chip under the pointer: spec 3.3's `#d9d5d0`.
+const FOLDER_CHIP_HOVER: egui::Color32 = egui::Color32::from_rgb(0xd9, 0xd5, 0xd0);
+
+/// A 48pt square in the action row (the star, the more menu), white with
+/// the 1pt border, under [`header_control_id`]; `paint` draws the glyph into
+/// the 20pt box at its centre.
+fn square_button(ui: &mut egui::Ui, which: HeaderControl, paint: impl FnOnce(&egui::Painter, egui::Rect)) -> egui::Response {
+    square_button_as(ui, which, false, paint)
+}
+
+/// [`square_button`], or Fill's own blue (`primary`).
+fn square_button_as(
+    ui: &mut egui::Ui,
+    which: HeaderControl,
+    primary: bool,
+    paint: impl FnOnce(&egui::Painter, egui::Rect),
+) -> egui::Response {
+    let p = crate::kit::tokens::palette(ui.ctx());
+    let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(V2_ACTION_HEIGHT), egui::Sense::hover());
+    let response = ui
+        .interact(rect, header_control_id(which), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let (fill, edge) = match (primary, response.hovered()) {
+        (true, false) => (p.blue, p.blue),
+        (true, true) => (p.blue_deep, p.blue_deep),
+        (false, false) => (p.card, p.border),
+        (false, true) => (p.hover, p.border),
+    };
+    ui.painter().add(egui::epaint::RectShape::new(
+        rect,
+        CornerRadius::same(14),
+        fill,
+        egui::Stroke::new(1.0, edge),
+        egui::StrokeKind::Inside,
+    ));
+    paint(ui.painter(), egui::Rect::from_center_size(rect.center(), egui::Vec2::splat(20.0)));
+    response
+}
+
+/// The header's tags: App, 2FA (spec 3.3, the list's own colours), then the
+/// view-only tag for a received record.
+fn header_tags(item: &VaultItem, view_only: bool) -> Vec<crate::kit::card::TagKind> {
+    use crate::kit::card::TagKind;
+    let mut tags = Vec::new();
+    if crate::vault_bridge::extract_app_match(item).is_some() {
+        tags.push(TagKind::App);
+    }
+    if item.login.as_ref().and_then(|l| l.totp.as_ref()).is_some() {
+        tags.push(TagKind::TwoFa);
+    }
+    if view_only {
+        tags.push(TagKind::ViewOnly);
+    }
+    tags
 }
 
 pub fn draw_detail_read(
@@ -3737,283 +3614,193 @@ pub fn draw_detail_read(
     // Every gap in the strip and the body below is stated, not inherited.
     ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
 
+    let writable = pane_writable(item, &people);
+    // Set by the action row when it had to drop Share's words: the more menu
+    // then offers Share itself.
+    let mut compact_actions = false;
+    if esc_closes_pane(ui.ctx()) {
+        action = DetailAction::ClosePane;
+    }
+
+    // The body's `padding: 18px 24px`, applied by placing the rest of the pane
+    // in a child over the padded remainder rather than by a `Frame`, so
+    // everything below keeps laying itself out exactly where it did.
+    //
+    // The RIGHT padding is 0 here because the scroll bar below is given that
+    // lane instead -- `theme::scrollbar_in_gutter` reserves exactly
+    // `BODY_PAD_X` for itself, so the cards still end at
+    // `pane.right() - BODY_PAD_X` as they always did, and the bar takes the
+    // OUTERMOST `theme::SCROLLBAR_WIDTH` of that padding -- flush to the pane's
+    // edge, where the platform's own bars sit, so every point of the lane's
+    // slack falls between the bar and the cards (18pt of the 24) rather than
+    // half of it behind the bar (9pt and 9pt, which is what this pane shipped).
+    // Same arrangement, and the same reason, as `item_list.rs`'s list; the
+    // helper's doc comment is where that rule is argued.
+    let body = egui::Rect::from_min_max(
+        egui::pos2(
+            pane.left() + f32::from(BODY_PAD_X),
+            ui.cursor().top() + f32::from(BODY_PAD_Y),
+        ),
+        egui::pos2(pane.right(), pane.bottom() - f32::from(BODY_PAD_Y)),
+    );
+    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
+    // **The fix.** This body was one plain `Ui` with no scroll area at any
+    // level, so on a pane shorter than the item -- a full identity with notes
+    // and previous passwords paints to y = 1967 on a pane the app can be
+    // resized down to 600 -- egui laid the lower cards out past the bottom
+    // and culled them: not painted, not scrollable to, not reachable by
+    // anything. The whole `MATCHED APP` card, including the Autofill row and
+    // the Open button, was among them. This is the read-side half of the
+    // defect commit `68f86cb` fixed on the edit form.
+    //
+    // What is pinned and what scrolls: the HEADER STRIP stays outside this
+    // area, and only it. It carries the item's name, the folder subtitle and
+    // the star / kebab / Fill controls -- a title that scrolls away leaves
+    // the reader with no answer to "which item is this?", and the controls
+    // there act on the item as a whole rather than on any row below. The edit
+    // pane additionally pinned an action strip to the BOTTOM; there is no
+    // counterpart here, because the read pane has no Save or Cancel and no
+    // other control that must be reachable without reading what it applies
+    // to. Nothing else is held back: pinning, say, the metadata line as well
+    // would spend a second slice of a 600pt pane on chrome.
+    //
+    // Horizontal scrolling is not offered, deliberately -- the rows already
+    // elide long values (see `value_text`), and a horizontal bar would be the
+    // regression rather than the fix.
+    theme::scrollbar_in_gutter(&mut body_ui, f32::from(BODY_PAD_X));
+    // ... and the bar is hidden outright when there is nothing to scroll.
+    // The lane stays reserved either way -- that is what `AlwaysVisible`
+    // below is for, and why the cards keep ONE width whether or not the bar
+    // is showing, which is the 10pt jump `092da70` measured on the item list.
+    //
+    // Read back from the last frame rather than predicted: unlike the item
+    // list, whose content height is a row count times a pitch, this body's
+    // height is the sum of however many cards this kind of item draws, each
+    // with wrapped text of its own. The one frame of lag can only show a bar
+    // for a frame on an item that does not need one -- never hide one that
+    // is needed for longer than that -- and a first-ever frame, which has no
+    // reading, shows it. That is the safe direction.
+    if !body_overflowed(ui.ctx()) {
+        theme::hide_scrollbar(&mut body_ui);
+    }
+    let scrolled = egui::ScrollArea::vertical()
+        // The area takes the full width and height of the body rect: the
+        // cards inside set their own width from `available_width`, which the
+        // reserved lane has already narrowed back to what it was.
+        .auto_shrink([false; 2])
+        // Required by `scrollbar_in_gutter`: the lane is only reserved for a
+        // bar egui is actually showing, so anything conditional here puts the
+        // width jump back.
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+        .show(&mut body_ui, |ui| {
+    // Spec 3.3: the detail column scrolls as one, the header with it.
     egui::Frame::new()
-        .fill(theme::CARD)
-        .inner_margin(Margin::symmetric(HEADER_PAD_X, HEADER_PAD_Y))
+        .inner_margin(Margin {
+            left: HEADER_INSET_X,
+            right: HEADER_INSET_X,
+            top: 28 - BODY_PAD_Y,
+            bottom: 0,
+        })
         .show(ui, |ui| {
-            let content_width = ui.available_width();
-            ui.set_width(content_width);
-
-            // **Measured before anything is drawn, and drawn the way the
-            // measurement said.** Drift between the room the strip reserves
-            // and the room its controls take is the failure mode that put a
-            // control off the edge of the pane once already.
-            //
-            // The star, the envelope, the clock, the kebab and the close ✕ --
-            // square at the strip's own control height -- plus the gaps
-            // between them. The whole of what this strip draws.
-            //
-            // **There IS a per-item term again, and it is a count and not a
-            // width**: [`header_controls`] answers four or five depending on
-            // whether the ⏱ is drawn for this item. That is why the worded
-            // "Fill in app" button's removal turned this into a number, and
-            // why the number is now behind a function -- every control here
-            // is still square at [`theme::HEADER_BUTTON_HEIGHT`], so how many
-            // there are is the whole question.
-            //
-            // Spelled as a count and not as five additions, because
-            // `the_header_stacks_at_the_minimum_pane_and_does_not_on_a_wide
-            // _one` spells it the same way -- a control added to
-            // `draw_controls` and not here is the drift that painted a
-            // control at x = -34.5 once already, and
-            // `the_strip_reserves_room_for_every_control_it_draws` is what
-            // now measures the two against each other.
-            //
-            // **`header_controls_for`, with the Share control** (design 6a):
-            // one more square wherever the window resolved one.
-            let controls = header_controls_for(item, &people);
-            // What the strip, the ⋮ and the cards below draw writes by --
-            // [`pane_writable`], the predicate the count above just read.
-            let writable = pane_writable(item, &people);
-            let controls_width = theme::HEADER_BUTTON_HEIGHT * controls as f32
-                + HEADER_GAP * (controls - 1) as f32;
-            let layout = header_layout(content_width, controls_width);
-
-            // The three pieces of the strip, as closures, because the two
-            // arrangements below draw exactly the same controls in exactly
-            // the same order -- only on a different number of lines. Written
-            // out twice they would be two headers that have to be kept
-            // agreeing by hand.
-            let draw_avatar = |ui: &mut egui::Ui| match icon {
-                Some(tex) => {
-                    // **The TILE, then the artwork in it** -- the item row's
-                    // own two calls, at this header's size.
-                    //
-                    // This used to be a bare `egui::Image`, rounded to the
-                    // same `size * 0.25` the tile is rounded to and otherwise
-                    // drawn on nothing. That is the half of the tile a rounded
-                    // corner cannot supply: `theme::avatar_tile` also paints
-                    // the FILL, which is what a favicon with transparent
-                    // margins (most of them) shows through, and the BORDER,
-                    // which is the edge every monogram and every list row's
-                    // favicon has. Without them a pale or inset icon floated
-                    // on the header's white with no boundary of its own,
-                    // while the very same icon two hundred points to its left
-                    // in the list sat in a bordered tile. `detail_login_
-                    // favicon` in `ui_preview` is the picture of that.
-                    //
-                    // `theme::avatar_image` carries the rest of the reasoning
-                    // -- full bleed, the corner radius given to the image so
-                    // it is clipped to the tile's curve, and the border
-                    // redrawn over the artwork.
-                    let tile = theme::avatar_artwork_tile(ui, HEADER_AVATAR, true);
-                    theme::avatar_image(ui, tile, tex, true);
+            ui.set_width(ui.available_width());
+            let top = header_top(
+                ui,
+                &HeaderTop {
+                    item,
+                    icon,
+                    folder: if people.view_only_from.is_some() { None } else { folder },
+                    shared_by: people.view_only_from.map(|from| (from, people.view_only_unverified)),
+                    tags: header_tags(item, people.view_only_from.is_some()),
+                },
+            );
+            if top.close {
+                action = DetailAction::ClosePane;
+            }
+            if top.folder {
+                if let Some(id) = item.folder_id.clone() {
+                    action = DetailAction::ShowFolder(id);
                 }
-                // The list row's tile and this one are the same tile at two
-                // sizes, so they take the same branch from the same place:
-                // an item whose row shows a note mark must not open onto a
-                // header showing a letter pair. See `kind_mark`.
-                None => crate::kind_mark::avatar(
-                    ui,
-                    ItemKind::of(item),
-                    &item.name,
-                    HEADER_AVATAR,
-                    true,
-                ),
-            };
-            // The title column, in whatever it has been left. It TRUNCATES
-            // rather than wrapping: the design draws one line, and a name
-            // long enough to wrap would push the 44px avatar off its own
-            // 20px top padding and make the strip's height a function of the
-            // item's name. `header_layout` is what guarantees the width it
-            // truncates at is at least `TITLE_MIN` -- truncation with no
-            // floor under it is how this ended up painting a lone ellipsis.
-            let draw_title = |ui: &mut egui::Ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = TITLE_GAP;
-                        title_text(ui, &item.id, &item.name);
-                        // The subtitle, in the two runs [`header_subtitle_parts`]
-                        // splits it into with the folder mark painted between
-                        // them. An unfoldered item has no second run and no
-                        // mark, so this is one label again -- exactly what it
-                        // was before the mark existed.
-                        //
-                        // `item_spacing.x = 0`: the separator run already ends
-                        // in its own space and the mark's box carries 3px of
-                        // air on each side (`theme::FOLDER_MARK_SIZE`), so
-                        // egui's default 8pt between widgets would open two
-                        // gaps this line did not ask for and push the name
-                        // away from the mark that introduces it.
-                        //
-                        // Both runs are selectable text rather than labels --
-                        // see [`subtitle_text`], which is where the faint
-                        // 12pt styling these used to carry as a `RichText`
-                        // now lives, unchanged.
-                        //
-                        // **A received record says who shared it, and that
-                        // it is view-only** (mock 6d's `.dsub .by`), in place
-                        // of the folder: `Login · ` in the subtitle's faint
-                        // ink, then a person mark and the claim in the
-                        // muted one, a step louder -- the mock's own two
-                        // inks, since this is the line that explains why the
-                        // strip is short. The same two-runs-and-a-mark shape
-                        // as the folder, so it is the folder's line and not a
-                        // third arrangement of it.
-                        //
-                        // The mock's spacing, run for run: `.dsub { gap: 8px }`
-                        // between the kind and the by-line, and inside the
-                        // by-line (`.by { gap: 5px }`) the "·", the mark and
-                        // the words 5 apart -- the dot is the by-line's own,
-                        // so it is in the by-line's muted ink.
-                        //
-                        // Only where a sharer is NAMED. An `edit: false` item
-                        // the view does not name keeps its ordinary subtitle:
-                        // the ⋮ says it is view-only, and a "Shared by" with
-                        // no one after it would be a claim with a hole in it.
-                        if let Some(from) = people.view_only_from {
-                            let line = ui.horizontal(|ui| {
-                                ui.spacing_mut().item_spacing.x = 0.0;
-                                subtitle_text(ui, subtitle_kind_id(&item.id), &kind.label());
-                                ui.add_space(VIEW_ONLY_KIND_GAP);
-                                ui.label(RichText::new("\u{b7}").size(SUBTITLE_SIZE).color(theme::TEXT_MUTED));
-                                ui.add_space(VIEW_ONLY_MARK_GAP);
-                                let (mark, _) = ui.allocate_exact_size(
-                                    egui::vec2(VIEW_ONLY_MARK + VIEW_ONLY_MARK_GAP, SUBTITLE_SIZE),
-                                    egui::Sense::hover(),
-                                );
-                                theme::paint_person_mark(
-                                    ui.painter(),
-                                    egui::Rect::from_center_size(
-                                        egui::pos2(mark.left() + VIEW_ONLY_MARK / 2.0, mark.center().y),
-                                        egui::Vec2::splat(VIEW_ONLY_MARK),
-                                    ),
-                                    theme::TEXT_MUTED,
-                                );
-                                subtitle_text_in(
-                                    ui,
-                                    subtitle_folder_id(&item.id),
-                                    &shared_by_line(from, people.view_only_unverified),
-                                    theme::TEXT_MUTED,
-                                );
-                            });
-                            if people.view_only_unverified {
-                                let _ = line.response.on_hover_text(UNVERIFIED_SHARER_TOOLTIP);
-                            }
-                            return;
+            }
+            ui.add_space(V2_ROW_GAP);
+            let band = egui::vec2(ui.available_width(), V2_ACTION_HEIGHT);
+            ui.allocate_ui_with_layout(band, egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                use crate::kit::{self, controls};
+                ui.spacing_mut().item_spacing.x = 10.0;
+                let p = kit::tokens::palette(ui.ctx());
+                let fills = writable && kind == ItemKind::Login;
+                let edits = writable && kind_offers_edit(kind);
+                // Whether the words fit: Fill, Share and Edit as buttons plus
+                // the two squares. When they do not, Fill and Edit become
+                // squares too and Share waits in the more menu.
+                let ctx = ui.ctx().clone();
+                let worded: Vec<f32> = [
+                    fills.then(|| controls::button_width(&ctx, controls::ButtonKind::Primary, controls::LARGE, FILL_LABEL, true)),
+                    writable.then(|| controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, SHARE_LABEL, true)),
+                    edits.then(|| controls::button_width(&ctx, controls::ButtonKind::Outline, controls::LARGE, EDIT_LABEL, true)),
+                    writable.then_some(V2_ACTION_HEIGHT),
+                    Some(V2_ACTION_HEIGHT),
+                ]
+                .into_iter()
+                .flatten()
+                .collect();
+                let needed = worded.iter().sum::<f32>() + 10.0 * worded.len().saturating_sub(1) as f32;
+                let compact = needed > ui.available_width();
+                compact_actions = compact && writable;
+                if fills {
+                    let fill = if compact {
+                        square_button_as(ui, HeaderControl::Fill, true, |painter, glyph| {
+                            kit::icon::stroke(painter, glyph, kit::icon::glyph::FILL, 2.2, egui::Color32::WHITE);
+                        })
+                    } else {
+                        controls::button(ui, controls::ButtonKind::Primary, controls::LARGE, FILL_LABEL, Some(kit::icon::glyph::FILL))
+                    };
+                    kit::tips::hint(ui, &fill, "Fill into the app", &[]);
+                    if fill.clicked() {
+                        action = DetailAction::Fill;
+                    }
+                }
+                if writable {
+                    if !compact {
+                        let share = controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, SHARE_LABEL, Some(kit::icon::glyph::SHARED));
+                        kit::tips::hint(ui, &share, record_ui::SEND_RECORD_LABEL, &["Mod", "Shift", "S"]);
+                        if share.clicked() {
+                            action = DetailAction::SendRecord;
                         }
-                        let (lead, name) = header_subtitle_parts(kind, folder);
-                        match name {
-                            None => {
-                                subtitle_text(ui, subtitle_kind_id(&item.id), &lead);
-                            }
-                            Some(name) => {
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 0.0;
-                                    subtitle_text(ui, subtitle_kind_id(&item.id), &lead);
-                                    // TEXT_FAINT, the subtitle's own ink: the
-                                    // mark introduces this secondary text and
-                                    // must not be louder than the words it
-                                    // introduces.
-                                    theme::folder_mark(ui, theme::TEXT_FAINT);
-                                    subtitle_text(ui, subtitle_folder_id(&item.id), name);
-                                });
-                            }
+                    }
+                    if edits {
+                        let edit = if compact {
+                            square_button(ui, HeaderControl::Edit, |painter, glyph| {
+                                kit::icon::stroke(painter, glyph, kit::icon::glyph::EDIT, 2.0, p.ink);
+                            })
+                        } else {
+                            controls::button(ui, controls::ButtonKind::Outline, controls::LARGE, EDIT_LABEL, Some(kit::icon::glyph::EDIT))
+                        };
+                        kit::tips::hint(ui, &edit, "Edit", &[]);
+                        if edit.clicked() {
+                            action = DetailAction::Edit;
+                        }
+                    }
+                    let on = item.favorite;
+                    let star = square_button(ui, HeaderControl::Favourite, |painter, glyph| {
+                        if on {
+                            kit::icon::fill(painter, glyph, kit::icon::glyph::FAV, egui::Vec2::splat(24.0), p.star);
+                            kit::icon::stroke(painter, glyph, kit::icon::glyph::FAV, 2.0, p.star);
+                        } else {
+                            kit::icon::stroke(painter, glyph, kit::icon::glyph::FAV, 2.0, p.text_label);
                         }
                     });
-                });
-            };
-            // **Right-to-left, so what reads left-to-right is ★, ✉, Share, ⏱,
-            // ⋮, ✕** -- Share only where the window resolved one (design 6a).
-            // The caller supplies a `Ui` already in that layout and already
-            // carrying `HEADER_GAP` spacing; this only fills it.
-            //
-            // This comment used to list `Fill in app` as the middle control.
-            // That button was removed by commit `7da1bba` -- along with
-            // `DetailAction::Fill`, the CTRL+SHIFT+F chord and
-            // `theme::header_primary_button` -- and the comment was not
-            // updated with it, so for some months the strip's own header
-            // described a control the strip did not draw. It is corrected
-            // rather than merely deleted because the count is load-bearing:
-            // see [`header_controls`], which is what the room reserved above
-            // is computed from.
-            //
-            // **Every one of these states its chord on hover, or has none to
-            // state.** The user's request was "for all of those -- show keys
-            // in tooltip on hover not just a description", which the rows
-            // below this strip have done since `copy_shortcut_chord`
-            // (`"Click to copy · CTRL+B"`). Only ✉ and ⏱ have chords: ★, ⋮
-            // and ✕ are bound to no key anywhere in this crate, and inventing
-            // one in a tooltip would advertise a binding the code does not
-            // have -- which `COPY_SHORTCUTS`' own doc calls worse than no
-            // hint at all. ✉ reads its chord from
-            // `record_ui::SEND_RECORD_SHORTCUT` and ⏱ from
-            // `totp_add::ADD_TOTP_SHORTCUT`, never from a string written
-            // here; see those calls.
-            let mut draw_controls = |ui: &mut egui::Ui| {
-                // **The pane's own close, rightmost -- to the right of the
-                // kebab, where the user asked for it**: "Add X button to the
-                // right of card 3 dots ... details card gets closed and only
-                // results shown".
-                //
-                // It reports and does nothing: `vault_window::mod` clears
-                // `selected_id`, which is the state the window already opens
-                // in, so there is no "no detail" layout for the list to fall
-                // back to -- it simply takes the width.
-                //
-                // **Drawn as the quietest mark in the strip and never red**
-                // -- see `theme::close_pane_button`, where that decision is
-                // argued. It is one control away from a Delete that arms on
-                // its first click, and the two must not look like siblings.
-                //
-                // No chord on the hover, because it has none. ESC is not
-                // bound to it: this window's ESC already belongs to whatever
-                // popup or menu egui has open, and taking it would make the
-                // key that dismisses a menu also throw away the selection
-                // underneath.
-                if theme::close_pane_button(ui)
-                    .on_hover_text("Close this panel and show the full list")
-                    .clicked()
-                {
-                    action = DetailAction::ClosePane;
+                    kit::tips::hint(ui, &star, if on { "Remove from Favorites" } else { "Add to Favorites" }, &[]);
+                    if star.clicked() {
+                        action = DetailAction::ToggleFavorite(!on);
+                    }
                 }
-                // **The overflow menu.** Edit and Delete both
-                // live in here, at the user's explicit direction: four
-                // worded buttons across this strip did not fit the app's
-                // own minimum window size.
-                //
-                // Drawn ALWAYS, not gated: Delete means the same thing for
-                // every kind (see `every_kind_can_still_be_deleted`), so
-                // there is no kind whose menu would be empty. Edit inside
-                // it is still `kind_offers_edit`'s decision.
-                let kebab =
-                    theme::kebab_button(ui).on_hover_text("More actions for this item");
-                // **A click inside this menu closes it only when an entry
-                // says so.** egui's menus default to
-                // `PopupCloseBehavior::CloseOnClick`, which shuts the popup
-                // on ANY click in its body, whatever the entry did -- and
-                // every entry below that wants to close already calls
-                // `ui.close()` itself, so that default was never what made
-                // Edit or Clone dismiss the menu. What it did do was take
-                // the one entry that deliberately did NOT close: the first
-                // click on Delete armed the confirm and the menu vanished
-                // under the pointer, so the user saw a click do nothing and
-                // the second click of a two-click confirm had nothing left
-                // to land on.
-                //
-                // That report is what the delete modal answered, and Delete
-                // does close the menu now -- but the behaviour stays,
-                // because it is what a menu should do either way and
-                // because reverting it would be a change made for no
-                // reason beyond "the case that forced it is gone".
-                //
-                // `CloseOnClickOutside` keeps the dismissal a user expects
-                // -- click anywhere off the menu and it goes -- and hands
-                // the inside back to the entries, which is where this file
-                // already expresses the decision.
-                let menu = egui::Popup::menu(&kebab)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
-                menu.show(|ui| {
+                let more = square_button(ui, HeaderControl::More, |painter, glyph| {
+                    kit::icon::stroke(painter, glyph, kit::icon::glyph::MORE, 3.0, p.text_icon);
+                });
+                kit::tips::hint(ui, &more, "More", &[]);
+                egui::Popup::menu(&more)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .show(|ui| {
                     // **Mock 6d's ⋮ on a received record: nothing that
                     // writes -- only why.** No Edit, Clone or Delete, and no
                     // Move to folder either, although the mock keeps it
@@ -4066,10 +3853,32 @@ pub fn draw_detail_read(
                     // `item_list::icon_menu` is unchanged and still decides
                     // which of the three a given item is offered; see
                     // `detail_edit`'s `edit_header`, its one reader.
-                    if kind_offers_edit(kind) && ui.button("Edit").clicked() {
-                        action = DetailAction::Edit;
+                    if compact_actions && ui.button(SHARE_LABEL).clicked() {
+                        action = DetailAction::SendRecord;
                         ui.close();
                     }
+                    match people.share_control {
+                        Some(ShareControl::Share) => {
+                            if ui
+                                .button(SHARE_WITH_PERSON_LABEL)
+                                .on_hover_text(super::share_ui::SHARE_TOOLTIP)
+                                .clicked()
+                            {
+                                action = DetailAction::ShareRecord;
+                                ui.close();
+                            }
+                        }
+                        Some(ShareControl::Disabled(why)) => {
+                            ui.add_enabled(false, egui::Button::new(SHARE_WITH_PERSON_LABEL))
+                                .on_disabled_hover_text(why);
+                        }
+                        None => {}
+                    }
+                    if item_takes_a_one_time_code(item) && ui.button(ADD_2FA_MENU_LABEL).clicked() {
+                        action = DetailAction::AddTotp;
+                        ui.close();
+                    }
+                    // No Edit here: the action row has it, beside Share.
                     // **4a's door is NOT in this menu.** It was, next to
                     // Edit, as the same act narrowed -- Edit opens a form
                     // over every field, that opened the builder over the
@@ -4233,346 +4042,10 @@ pub fn draw_detail_read(
                         // user finds still open when they cancel.
                         ui.close();
                     }
-                });
-                // **"Add a one-time code", and this is the control
-                // `vault_window::mod` left a stated gap for.** Until now the
-                // whole feature -- the form, the 6c confirmation, the replace
-                // warning -- was reachable by CTRL+SHIFT+2 and by nothing a
-                // user could see.
-                //
-                // **Here, beside the ✉, for the ✉'s own reason.** The record
-                // composer's control moved off the window titlebar because a
-                // pill there acted on the SELECTED ITEM from a strip whose
-                // every other control is global, and had to grey itself out
-                // with nothing selected to say so. Adding a code acts on the
-                // selected item too, so a titlebar pill for it would have
-                // repeated a placement the user has already rejected once.
-                //
-                // **Between the ✉ and the kebab**, which is a position and
-                // not a leftover. The two marks on either side are what it
-                // belongs between: what it opens WRITES a field onto this
-                // item, which is Edit's neighbourhood and Edit is inside that
-                // kebab; and it is the one control in this strip that is not
-                // drawn for every item, so it sits against the boundary
-                // rather than between two marks that are always there. The
-                // pair the user named -- the star and the envelope after it
-                // -- keep their order and their adjacency untouched.
-                //
-                // **Gated, and on the same expression the form's own door
-                // uses**: see `item_takes_a_one_time_code`. The alternative
-                // is a ⏱ on a secure note that reports an action
-                // `vault_window::mod` then filters away -- a control that
-                // does nothing and cannot say so, which is the exact defect
-                // that got the titlebar pill removed.
-                //
-                // **It REPORTS, through `DetailAction::AddTotp`**, into the
-                // same frame-local `add_totp_asked` the chord sets. One door
-                // per surface; see that variant.
-                //
-                // **The hover carries the chord from
-                // `totp_add::ADD_TOTP_SHORTCUT`**, and the words from
-                // `totp_add::ADD_TOTP_LABEL` -- the same rule and the same
-                // separator the ✉ beside it follows, and for the same reason:
-                // a literal typed here would be a second home for a fact the
-                // key handler owns, and a rebinding would leave this tooltip
-                // lying.
-                // **None of the four below on a received record** (mock 6d):
-                // the ⏱ and the ★ write the record, the ✉ and Share hand it
-                // on, and a view-only record takes neither. Not drawn rather
-                // than drawn greyed, for the ⏱'s own reason -- a control that
-                // can only ever say "not you" -- and `header_controls_for`
-                // reserves room for exactly the ⋮ and ✕ that are left.
-                if writable && item_takes_a_one_time_code(item) {
-                    // Bound before it is asked, rather than chained into the
-                    // `if` above: collapsing the two conditions would make
-                    // PAINTING this control a side effect of evaluating a
-                    // boolean, which is how a gate and a mark come to be read
-                    // as one thing.
-                    let clock = theme::add_totp_button(ui).on_hover_text(format!(
-                        "{} · {}",
-                        totp_add::ADD_TOTP_LABEL,
-                        totp_add::ADD_TOTP_SHORTCUT
-                    ));
-                    if clock.clicked() {
-                        action = DetailAction::AddTotp;
-                    }
-                }
-                // **Share, right after the envelope** (mock 6a) -- drawn
-                // before it because this strip lays out right to left, so it
-                // reads ★ ✉ Share ⏱ ⋮ ✕. The mock's strip puts the ⏱ before
-                // the ✉; this one keeps the star and the envelope adjacent,
-                // which is the order the owner asked for ("email icon after
-                // Fav"), and keeps 6a's own point -- Share straight after the
-                // ✉ -- beside it.
-                //
-                // **Where sharing is not offered, no Share-shaped control
-                // opens a Send** (final review, I3). It used to, on every
-                // server but NodeWarden: a second door to the composer beside
-                // the ✉ that already is one. Now `share_ui::share_control`
-                // decides by the view's reason -- a server too old to share
-                // gets the control greyed, with its own reason on the hover;
-                // a record that cannot be shared (attachments) likewise; no
-                // sharing at all, or a view not heard yet, draws nothing.
-                // `header_controls_for` counts exactly what is painted.
-                match people.share_control.filter(|_| writable) {
-                    Some(ShareControl::Share) => {
-                        if theme::share_record_button(ui).on_hover_text(super::share_ui::SHARE_TOOLTIP).clicked() {
-                            action = DetailAction::ShareRecord;
-                        }
-                    }
-                    Some(ShareControl::Disabled(why)) => {
-                        theme::share_record_button_disabled(ui).on_hover_text(why);
-                    }
-                    None => {}
-                }
-                // **"Send a record", MOVED HERE off the window titlebar** at
-                // the user's direction: "remove huge button Send a record on
-                // top -- those are global things to the details like email
-                // icon after Fav".
-                //
-                // The user is right and this reverses a placement that was
-                // approved once. The titlebar pill acted on the SELECTED
-                // ITEM from a strip whose every other control is global --
-                // the account menu, the settings gear, the sync status --
-                // and the tell was that it had to grey itself out with
-                // nothing selected and explain why on its hover. A control
-                // that has to say "there is nothing to do me to" is a
-                // control filed under the wrong noun. In this strip there is
-                // always an item, because this strip is only drawn when
-                // there is one, so `theme::send_record_button` has no
-                // disabled state and `record_ui::NO_ITEM_SELECTED` has no
-                // reader on this path.
-                //
-                // **The chord did not move.** CTRL+SHIFT+S is still read in
-                // `vault_window::mod`, and this reports through
-                // `DetailAction::SendRecord` into the same
-                // `send_record_asked` flag that chord sets -- so there is
-                // still exactly ONE line in the frame that opens the
-                // composer, and it is still `permit_record_send`. See that
-                // variant's doc, and
-                // `exactly_one_line_opens_the_record_composer`.
-                //
-                // **The hover reads the chord from
-                // `record_ui::SEND_RECORD_SHORTCUT`**, which is the one
-                // place that chord is spelled for a human -- and
-                // `the_record_chord_is_spelled_the_way_it_is_bound` already
-                // compares that constant against `SEND_RECORD_MODIFIERS` and
-                // `SEND_RECORD_KEY`, the values the key handler actually
-                // matches on. A literal "CTRL+SHIFT+S" typed here would be a
-                // second home for the same fact, and a rebinding would leave
-                // this tooltip lying. Same rule, and the same separator, as
-                // the rows' `"Click to copy · {chord}"`.
-                if writable
-                    && theme::send_record_button(ui)
-                        .on_hover_text(format!(
-                            "{} · {}",
-                            record_ui::SEND_RECORD_LABEL,
-                            record_ui::SEND_RECORD_SHORTCUT
-                        ))
-                        .clicked()
-                {
-                    action = DetailAction::SendRecord;
-                }
-                // **The strip's worded "Fill in app" button used to sit
-                // here, and was REMOVED at the user's request**: "Fill in
-                // app button I think we can remove -- I'm not sure what it
-                // does". It had become the second of two adjacent controls
-                // acting on the matched app -- the other one, the app's
-                // name as a link, opens it -- and one of the two typing the
-                // user's credentials while the other launched a program was
-                // not a distinction the strip made.
-                //
-                // **Every manual trigger has since gone.** The row context
-                // menu's "Fill in app" entry followed this button out
-                // (`item_list::menu_entries`), and `fill_target`,
-                // `fill_item_into_app` and `app::find_window_for_process`
-                // were deleted with them. What remains is autofill on
-                // focus, the prompt overlay and the global hotkey -- all
-                // three of which take their hwnd straight off a
-                // `window_watch::ForegroundEvent` and never resolved one
-                // through that function in the first place.
-                //
-                // **The host-process refusal lives in `match_engine`, not
-                // on this path.** `MatchEngine::lookup` answers a
-                // host-owned window from the title table and never reads a
-                // stored process name, and `picker_ui::host_process_refusal`
-                // stops such a match being saved at all. No surviving fill
-                // path can reach a credential without passing them.
-                //
-                // **In the header, and gated on no kind at all.** Every
-                // other control in this strip is per-kind because it acts
-                // on the item's *contents* -- Fill needs a username and a
-                // password, Edit needs a form that can honestly save the
-                // type. A favourite is not a content field: it is a
-                // property of the item as a row in a list, like its name
-                // and its folder, and the sidebar's Favorites filter
-                // applies it to every kind (`SidebarFilter::Favorites` is
-                // `item.favorite` and nothing else). So a card can be a
-                // favourite, and gating this the way Fill is gated would
-                // make a filter the sidebar offers unreachable for four
-                // of the five kinds.
-                //
-                // The header rather than a body row for the same reason:
-                // the body is `detail_body_for`'s per-kind dispatch and a
-                // row there would have to be repeated into every arm, and
-                // would read as a field of the login/card/identity rather
-                // than of the item.
-                //
-                // A STAR, and drawn rather than typed. The earlier version
-                // of this control was two words ("Favourite"/"Favourited")
-                // on the argument that a missing glyph renders as tofu --
-                // correct about the risk, and `theme.rs`'s
-                // `the_icon_codepoints_are_not_carried_by_this_apps_own
-                // _typeface` now measures the actual answer: ★ resolves,
-                // but only out of egui's fallback icon face, and ★/☆ are
-                // two unrelated marks rather than one shape in two
-                // weights. `theme::star_toggle` strokes it instead, so
-                // both states are the same silhouette and the on state is
-                // the palette's own BLUE.
-                let favourite_hover = if item.favorite {
-                    "Remove this item from Favorites"
-                } else {
-                    "Add this item to Favorites"
-                };
-                if writable
-                    && theme::star_toggle(ui, item.favorite)
-                        .on_hover_text(favourite_hover)
-                        .clicked()
-                {
-                    // The TARGET state, computed here from the item this
-                    // pane actually drew -- see `DetailAction::ToggleFavorite`.
-                    action = DetailAction::ToggleFavorite(!item.favorite);
-                }
-            };
-
-            if layout.stacked {
-                // Two lines: the item on top, what can be done to it
-                // underneath. The controls' row is the full content width,
-                // right-aligned, which is where the room comes from that the
-                // one-line arrangement did not have.
-                // [`HEADER_ROW`], not `ui.horizontal`: the band's height is
-                // stated so the 32pt avatar is centred against the taller
-                // title column instead of hanging from the row's top edge.
-                header_row(ui, |ui| {
-                    draw_avatar(ui);
-                    ui.add_space(HEADER_GAP);
-                    draw_title(ui);
-                });
-                ui.add_space(HEADER_ROW_GAP);
-                // A band of exactly one control height, allocated rather than
-                // left to `with_layout`: a right-to-left layout takes the
-                // whole *available* rect, and the available rect here runs to
-                // the bottom of the pane -- which centred the controls
-                // halfway down the window and made the white strip the full
-                // height of it.
-                let band = egui::vec2(ui.available_width(), theme::HEADER_BUTTON_HEIGHT);
-                ui.allocate_ui_with_layout(
-                    band,
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        // `HEADER_GAP`, closed only where six controls would
-                        // not otherwise fit this row -- see `controls_gap`.
-                        ui.spacing_mut().item_spacing.x = controls_gap(ui.available_width(), controls);
-                        draw_controls(ui);
-                    },
-                );
-            } else {
-                // One line, and **the controls claim their width first.**
-                // Laid out the other way round -- title, then a
-                // right-aligned group in the remainder -- the title takes as
-                // much room as its text wants and the strip overflows: "Fill
-                // in app" was measured painting at x = -34.5, entirely off
-                // the pane, under a title that ran straight through the
-                // buttons. So the whole rest of the row is one right-to-left
-                // group and the title column is a left-to-right child of it,
-                // which egui hands exactly the rect the controls did not
-                // take. That the rect is big enough to hold a name is
-                // `header_layout`'s job, not this layout's.
-                header_row(ui, |ui| {
-                    draw_avatar(ui);
-                    ui.add_space(HEADER_GAP);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.spacing_mut().item_spacing.x = HEADER_GAP;
-                        draw_controls(ui);
-                        draw_title(ui);
                     });
-                });
-            }
+            });
+            ui.add_space(V2_ROW_GAP);
         });
-    // The strip's `border-bottom: 1px solid #eae7e7`.
-    theme::hairline(ui);
-
-    // The body's `padding: 18px 24px`, applied by placing the rest of the pane
-    // in a child over the padded remainder rather than by a `Frame`, so
-    // everything below keeps laying itself out exactly where it did.
-    //
-    // The RIGHT padding is 0 here because the scroll bar below is given that
-    // lane instead -- `theme::scrollbar_in_gutter` reserves exactly
-    // `BODY_PAD_X` for itself, so the cards still end at
-    // `pane.right() - BODY_PAD_X` as they always did, and the bar takes the
-    // OUTERMOST `theme::SCROLLBAR_WIDTH` of that padding -- flush to the pane's
-    // edge, where the platform's own bars sit, so every point of the lane's
-    // slack falls between the bar and the cards (18pt of the 24) rather than
-    // half of it behind the bar (9pt and 9pt, which is what this pane shipped).
-    // Same arrangement, and the same reason, as `item_list.rs`'s list; the
-    // helper's doc comment is where that rule is argued.
-    let body = egui::Rect::from_min_max(
-        egui::pos2(
-            pane.left() + f32::from(BODY_PAD_X),
-            ui.cursor().top() + f32::from(BODY_PAD_Y),
-        ),
-        egui::pos2(pane.right(), pane.bottom() - f32::from(BODY_PAD_Y)),
-    );
-    let mut body_ui = ui.new_child(egui::UiBuilder::new().max_rect(body));
-    // **The fix.** This body was one plain `Ui` with no scroll area at any
-    // level, so on a pane shorter than the item -- a full identity with notes
-    // and previous passwords paints to y = 1967 on a pane the app can be
-    // resized down to 600 -- egui laid the lower cards out past the bottom
-    // and culled them: not painted, not scrollable to, not reachable by
-    // anything. The whole `MATCHED APP` card, including the Autofill row and
-    // the Open button, was among them. This is the read-side half of the
-    // defect commit `68f86cb` fixed on the edit form.
-    //
-    // What is pinned and what scrolls: the HEADER STRIP stays outside this
-    // area, and only it. It carries the item's name, the folder subtitle and
-    // the star / kebab / Fill controls -- a title that scrolls away leaves
-    // the reader with no answer to "which item is this?", and the controls
-    // there act on the item as a whole rather than on any row below. The edit
-    // pane additionally pinned an action strip to the BOTTOM; there is no
-    // counterpart here, because the read pane has no Save or Cancel and no
-    // other control that must be reachable without reading what it applies
-    // to. Nothing else is held back: pinning, say, the metadata line as well
-    // would spend a second slice of a 600pt pane on chrome.
-    //
-    // Horizontal scrolling is not offered, deliberately -- the rows already
-    // elide long values (see `value_text`), and a horizontal bar would be the
-    // regression rather than the fix.
-    theme::scrollbar_in_gutter(&mut body_ui, f32::from(BODY_PAD_X));
-    // ... and the bar is hidden outright when there is nothing to scroll.
-    // The lane stays reserved either way -- that is what `AlwaysVisible`
-    // below is for, and why the cards keep ONE width whether or not the bar
-    // is showing, which is the 10pt jump `092da70` measured on the item list.
-    //
-    // Read back from the last frame rather than predicted: unlike the item
-    // list, whose content height is a row count times a pitch, this body's
-    // height is the sum of however many cards this kind of item draws, each
-    // with wrapped text of its own. The one frame of lag can only show a bar
-    // for a frame on an item that does not need one -- never hide one that
-    // is needed for longer than that -- and a first-ever frame, which has no
-    // reading, shows it. That is the safe direction.
-    if !body_overflowed(ui.ctx()) {
-        theme::hide_scrollbar(&mut body_ui);
-    }
-    let scrolled = egui::ScrollArea::vertical()
-        // The area takes the full width and height of the body rect: the
-        // cards inside set their own width from `available_width`, which the
-        // reserved lane has already narrowed back to what it was.
-        .auto_shrink([false; 2])
-        // Required by `scrollbar_in_gutter`: the lane is only reserved for a
-        // bar egui is actually showing, so anything conditional here puts the
-        // width jump back.
-        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-        .show(&mut body_ui, |ui| {
     ui.spacing_mut().item_spacing = card_spacing;
 
     // Which body this item gets is decided by `detail_body_for` and nowhere
@@ -7493,236 +6966,9 @@ fn notes_text_id(item_id: &str) -> egui::Id {
     egui::Id::new((NOTES_TEXT_ID_SALT, item_id))
 }
 
-/// The header strip's item title: **the same words, the same weight, and now
-/// selectable with the mouse.** The user: "also make title selectable and
-/// copieble like a regular text in a browser".
-///
-/// **A read-only [`egui::TextEdit`], for [`notes_body`]'s reason and by its
-/// argument** -- egui implements `TextBuffer` for `&str` with
-/// `is_mutable() == false`, so the caret, click-drag range selection,
-/// double-click-a-word, Ctrl+A and the Ctrl+C that copies *that range* are
-/// egui's own, and typing does nothing. A `ui.label` -- what this drew before
-/// -- has none of them.
-///
-/// **What is deliberately NOT taken from the notes card.** That card is a
-/// click-to-copy-the-whole-note tile with the selectable text layered on top
-/// of it, and none of that applies here: the header has never had a click
-/// meaning of its own -- no rename, no expand, no drag -- so there is no
-/// second meaning to split a click against and no tile to sense, no hover
-/// tint to advertise one, and no copy action to raise. Adding one would be
-/// inventing a gesture the user did not ask for on the one strip whose
-/// controls are all to its right. So this is the selection half alone.
-///
-/// **The look is the label's, kept by a `layouter` rather than by `.font()`.**
-/// The title is not a plain font id: [`theme::pane_title`] is a `LayoutJob`
-/// carrying the extra-bold family, `letter-spacing: -0.02em` and the tight
-/// `1.1` line height that keeps this box under the 44px avatar's height (see
-/// that function). `TextEdit::font` takes a `FontId` and can express none of
-/// those three, so the job itself is handed to egui through the layouter --
-/// the same job, built from the same call, with the truncation the label
-/// applied set on the wrap the layouter is given. Frame and margin are
-/// cleared for the same reason the note clears them: a `TextEdit`'s default
-/// box and 4px padding would move the title off the left edge the avatar sets
-/// and paint a field where a heading belongs.
-///
-/// **Single-line, not multiline**, which is what keeps Tab a focus move
-/// rather than an inserted tab -- a multiline field would have made the
-/// header a keyboard trap -- and is also what the strip's one-line design
-/// already required of the label.
-fn title_text(ui: &mut egui::Ui, item_id: &str, name: &str) {
-    let mut layouter = |ui: &egui::Ui, buf: &dyn egui::TextBuffer, wrap_width: f32| {
-        let mut job = theme::pane_title(buf.as_str(), TITLE_SIZE, theme::INK);
-        job.wrap = egui::text::TextWrapping::truncate_at_width(wrap_width);
-        ui.fonts_mut(|f| f.layout_job(job))
-    };
-    // `&str`, so the buffer is immutable: the caret and the selection work,
-    // typing does nothing.
-    let mut source = name;
-    ui.add(
-        egui::TextEdit::singleline(&mut source)
-            .id(title_text_id(item_id))
-            .frame(egui::Frame::NONE)
-            .margin(Margin::ZERO)
-            .desired_width(ui.available_width())
-            .layouter(&mut layouter),
-    );
-}
-
-/// The title `TextEdit`'s id: **this constant AND the item's own id**, for
-/// both of [`notes_text_id`]'s reasons and neither of them weakened by being
-/// the header's.
-///
-/// Named rather than left to egui's auto-id because a selection lives in
-/// `TextEditState`, which is keyed on the widget's id, so
-/// `the_title_can_be_selected_with_a_drag` would otherwise have nothing to
-/// ask. Salted with the item because a global id is one `TextEditState`
-/// shared by every item the pane ever shows -- which is how a selection made
-/// in one item's title came up already made in the next one's.
-const TITLE_TEXT_ID_SALT: &str = "detail-header-title";
-
-fn title_text_id(item_id: &str) -> egui::Id {
-    egui::Id::new((TITLE_TEXT_ID_SALT, item_id))
-}
-
-/// The galley ONE run of the header's subtitle is drawn from -- the kind on
-/// the left of the folder mark, or the folder name on its right.
-///
-/// **Built through `WidgetText::into_galley`, which is the code path
-/// `ui.label(RichText::new(..).size(..).color(..))` itself takes**, rather
-/// than through a `LayoutJob` assembled here to the same description. The
-/// description is the trap: `LayoutJob::simple_singleline` with this font and
-/// this colour produces a galley of the same size, with the same glyphs, the
-/// same advances and the same atlas rects -- and its baseline one pixel
-/// higher, because `Label` also sets `first_row_min_height` from the `Ui`'s
-/// cursor and a job written out by hand does not. Every rect assertion on
-/// this line passed with that pixel wrong in it; the preview render is what
-/// showed it. Calling what `Label` calls is the only version of "the same
-/// text as before" that cannot drift from `Label` again.
-///
-/// `TextWrapMode::Extend` and an infinite width because these two runs share
-/// one line by design and neither may wrap -- see the geometry pinned by
-/// `the_header_paints_the_folder_beside_the_kind_under_the_item_name`.
-/// `TextStyle::Body` is the fallback the size and colour are laid over, and
-/// is what a `RichText` carrying only a size resolves its family from.
-///
-/// **Used to MEASURE as well as to paint.** [`subtitle_text`] has to know the
-/// run's width before it can ask a `TextEdit` to be exactly that wide, and a
-/// width measured from anything but the painted galley is a width that clips
-/// or pads the run.
-///
-/// `color` is the run's ink: [`theme::TEXT_FAINT`] for the kind and the
-/// folder, and the received record's "Shared by" run a step louder in
-/// [`theme::TEXT_MUTED`] (mock 6d's `.by`) -- see [`subtitle_text_in`].
-fn subtitle_galley(ui: &egui::Ui, text: &str, color: egui::Color32) -> std::sync::Arc<egui::Galley> {
-    let styled: egui::WidgetText =
-        RichText::new(text).size(SUBTITLE_SIZE).color(color).into();
-    styled.into_galley(
-        ui,
-        Some(egui::TextWrapMode::Extend),
-        f32::INFINITY,
-        egui::TextStyle::Body,
-    )
-}
-
-/// The font the subtitle's box is SIZED for.
-///
-/// Not redundant with [`subtitle_galley`], which decides what the glyphs look
-/// like. `TextEdit` reads `row_height` off its `FontSelection` and never off
-/// the galley a `layouter` returns, so leaving `TextEdit::font` unset is not
-/// "the layouter decides" -- it is the box being sized for `TextStyle::Body`,
-/// which `theme::apply` sets to 13pt, while the text inside it is drawn at
-/// 12. This states the 12 that `RichText::size(SUBTITLE_SIZE)` states on the
-/// other side, and `FontFamily::Proportional` is the family a `RichText`
-/// carrying only a size resolves to under that same theme.
-fn subtitle_font() -> egui::FontId {
-    egui::FontId::new(SUBTITLE_SIZE, egui::FontFamily::Proportional)
-}
-
-/// Mock 6d's `ic('person', 11, ..)` before a received record's "Shared by",
-/// and the `.by { gap: 5px }` either side of it.
-const VIEW_ONLY_MARK: f32 = 11.0;
-const VIEW_ONLY_MARK_GAP: f32 = 5.0;
-/// Mock 6d's `.dsub { gap: 8px }`: the kind, then the by-line.
-const VIEW_ONLY_KIND_GAP: f32 = 8.0;
 /// Mock 6d's `.menu { width: 250px }`, which the view-only kebab's one line
 /// wraps inside rather than stretching the menu across the pane.
 pub(super) const VIEW_ONLY_MENU_WIDTH: f32 = 250.0;
-
-/// One run of the header's subtitle: **the same faint words in the same
-/// place, and now selectable with the mouse.** The user, of the detail
-/// screen: "also make type and folder on details screen copieble like title".
-///
-/// A read-only [`egui::TextEdit`] for [`title_text`]'s reason and by its
-/// argument -- `&str` is a `TextBuffer` with `is_mutable() == false`, so the
-/// caret, the drag range, double-click-a-word, Ctrl+A and the Ctrl+C that
-/// copies that range are egui's, and typing is inert.
-///
-/// **What is taken from the title and what is not.** Taken: the read-only
-/// `&str`, the id salted with the item (see [`subtitle_kind_id`]), the
-/// cleared frame and zero margin, and singleline. Dropped: the title's
-/// `layouter` exists to carry an extra-bold family, negative letter spacing
-/// and a tight line height that a `FontId` cannot express, and it builds its
-/// own `LayoutJob` to do it; this run is a plain size and colour, so its
-/// layouter hands back the galley `Label` would have made and states
-/// nothing. Also dropped, as on the title: any click-to-copy gesture. These
-/// two runs were plain `ui.label`s with no click meaning to split -- the
-/// folder here is a NAME the caller already resolved, not the sidebar's
-/// folder filter and not the kebab's "Move to folder", neither of which is
-/// on this line.
-///
-/// **`desired_width` is the run's OWN width, which is the one place this
-/// departs from the title.** The title fills the column and truncates; these
-/// two runs sit in a `horizontal` with `item_spacing.x = 0` and the folder
-/// mark between them, so a `TextEdit` left at its default width -- or given
-/// `ui.available_width()` the way the title is -- would eat the rest of the
-/// line and shove the mark and the folder name to the far right of the pane.
-/// The geometry pin `the_header_paints_the_folder_beside_the_kind_under_the_
-/// item_name` would not catch that: it asks about the GALLEY's rect, which
-/// stays at the left edge, not about the box the widget allocated.
-fn subtitle_text(ui: &mut egui::Ui, id: egui::Id, text: &str) {
-    subtitle_text_in(ui, id, text, theme::TEXT_FAINT);
-}
-
-/// [`subtitle_text`] in another ink -- the received record's "Shared by ...
-/// · view-only" run, which mock 6d sets in the muted grey beside the faint
-/// kind. Everything else about the run is [`subtitle_text`]'s, so the two
-/// runs of one line are one widget in two colours.
-fn subtitle_text_in(ui: &mut egui::Ui, id: egui::Id, text: &str, color: egui::Color32) {
-    let width = subtitle_galley(ui, text, color).size().x;
-    let mut layouter =
-        |ui: &egui::Ui, buf: &dyn egui::TextBuffer, _wrap_width: f32| subtitle_galley(ui, buf.as_str(), color);
-    // `&str`, so the buffer is immutable: the selection works, typing does
-    // nothing.
-    let mut source = text;
-    ui.add(
-        egui::TextEdit::singleline(&mut source)
-            .id(id)
-            // Sizes the BOX, not the glyphs -- see [`subtitle_font`], which
-            // is why this is not redundant with the layouter below.
-            .font(subtitle_font())
-            // **Centred, against `TextEdit`'s `LEFT_TOP` default.** The box
-            // this widget allocates is `row_height` tall and the galley
-            // inside it is not; a `ui.label` had no such box and was itself
-            // centred by the surrounding `Align::Center` row, so a
-            // top-aligned galley sits a fraction of a pixel above where
-            // these words have always been.
-            //
-            // Load-bearing, and measured rather than assumed: dropping this
-            // one line moves 337 pixels of `detail_login` and 356 of each
-            // card pane against the pre-change render, while every rect
-            // assertion on this line still passes. With it, all three panes
-            // are byte-identical.
-            .vertical_align(egui::Align::Center)
-            .frame(egui::Frame::NONE)
-            .margin(Margin::ZERO)
-            .desired_width(width)
-            .layouter(&mut layouter),
-    );
-}
-
-/// The ids of the subtitle's two runs: **a constant per run AND the item's
-/// own id**, for both of [`title_text_id`]'s reasons.
-///
-/// Named, because a selection lives in `TextEditState` keyed on the widget's
-/// id and the tests below would otherwise have nothing to ask. Two different
-/// salts, because one shared between the kind and the folder would make them
-/// one widget as far as egui's state is concerned -- a selection dragged
-/// across the kind would come back reported against the folder. Salted with
-/// the item, because a global id is one `TextEditState` for every item the
-/// pane ever shows, which is how a selection made in one item came up
-/// already made in the next.
-const SUBTITLE_KIND_ID_SALT: &str = "detail-header-subtitle-kind";
-
-/// See [`SUBTITLE_KIND_ID_SALT`].
-const SUBTITLE_FOLDER_ID_SALT: &str = "detail-header-subtitle-folder";
-
-fn subtitle_kind_id(item_id: &str) -> egui::Id {
-    egui::Id::new((SUBTITLE_KIND_ID_SALT, item_id))
-}
-
-fn subtitle_folder_id(item_id: &str) -> egui::Id {
-    egui::Id::new((SUBTITLE_FOLDER_ID_SALT, item_id))
-}
 
 /// [`card_text`] with a second run after the first: the same frame, the same
 /// margin, the same width. The metadata strip's breach badge is the only
@@ -10322,7 +9568,11 @@ mod tests {
             output = run(events.clone());
         }
         let mut texts = Vec::new();
+        let control = |which| ctx.read_response(header_control_id(which)).map(|r| r.rect);
         let mut frame = Frame {
+            close: control(HeaderControl::Close),
+            more: control(HeaderControl::More),
+            favourite: control(HeaderControl::Favourite),
             action,
             texts: Vec::new(),
             rendered: Vec::new(),
@@ -10416,16 +9666,15 @@ mod tests {
             // assertions below are what actually distinguish an
             // out-of-vault pane from a live one.
             assert!(
-                frame.stars.is_empty(),
+                frame.favourite.is_none(),
                 "the out-of-vault pane draws a favourite star, which writes through the \
                  live item list"
             );
-            assert_eq!(
-                frame.kebab_dots.len(),
-                3,
-                "the out-of-vault pane draws no kebab (its three dots), so Restore, \
-                 Unarchive and Delete forever are reachable only from the row's \
-                 right-click menu"
+            let offer = if out == OutOfVault::Trash { "Restore" } else { "Unarchive" };
+            assert!(
+                painted.iter().any(|t| t == offer),
+                "the out-of-vault pane offers no {offer}, so it is reachable only from the \
+                 row's right-click menu"
             );
             assert!(
                 frame.eyes.is_empty(),
@@ -10442,14 +9691,13 @@ mod tests {
             // draws no envelope. So it is asserted here rather than left to
             // the shape of the code.
             assert!(
-                frame.envelopes.is_empty(),
-                "the out-of-vault pane draws the Send envelope, so a trashed or archived \
-                 item can be published to a public link"
+                !painted.iter().any(|t| t == SHARE_LABEL),
+                "the out-of-vault pane offers Share, so a trashed or archived item can be \
+                 published to a public link"
             );
-            assert_eq!(
-                frame.pane_closes.len(),
-                1,
-                "the out-of-vault pane draws no close ✕, so the only way out of a trashed \
+            assert!(
+                frame.close.is_some(),
+                "the out-of-vault pane draws no Close, so the only way out of a trashed \
                  item's pane is to select some other row"
             );
         }
@@ -10498,17 +9746,10 @@ mod tests {
     /// The kebab is found by its own three dots -- the middle one is the
     /// button's centre -- rather than by a coordinate written down here, so
     /// this keeps working if the strip is re-laid out.
+    /// What the out-of-vault pane offers: in v2 its entries are the action
+    /// row's buttons, painted with nothing to open first.
     fn open_out_of_vault_kebab(item: &VaultItem, out: OutOfVault) -> Vec<String> {
-        let (_, first) = painted_out_of_vault_in(item, out, None);
-        assert_eq!(
-            first.kebab_dots.len(),
-            3,
-            "the out-of-vault pane painted no kebab to click"
-        );
-        let at = first.kebab_dots[1].0.center();
-        let (painted, _) =
-            out_of_vault_frames(item, out, None, &[out_of_vault_click(at), Vec::new()]);
-        painted
+        painted_out_of_vault_in(item, out, None).0
     }
 
     /// **The header identifies the item the way the read pane's does**: its
@@ -10549,56 +9790,6 @@ mod tests {
         }
     }
 
-    /// **The pane's kebab offers exactly what the row's right-click menu
-    /// offers for the same state**, because it is built from that same list.
-    ///
-    /// Asserted against `item_list::out_of_vault_entries` rather than against
-    /// hand-written strings: a test naming the labels itself would be a third
-    /// list, and a second list is precisely the defect being prevented.
-    #[test]
-    fn the_panes_menu_is_the_row_menus_list() {
-        let item = out_of_vault_item("Ledgerline");
-        for out in [OutOfVault::Trash, OutOfVault::Archive] {
-            let opened = open_out_of_vault_kebab(&item, out);
-            let expected: Vec<String> = crate::vault_window::item_list::out_of_vault_entries(out)
-                .into_iter()
-                .filter_map(|entry| match entry {
-                    crate::vault_window::item_list::MenuEntry::Command(entry) => Some(entry.label),
-                    _ => None,
-                })
-                .collect();
-            assert!(!expected.is_empty(), "{out:?}: the row menu offers nothing to compare");
-            for label in &expected {
-                assert!(
-                    opened.iter().any(|t| t == label),
-                    "{out:?}: the pane's menu is missing {label:?}; it painted {opened:?}"
-                );
-            }
-        }
-    }
-
-    /// **The Trash and the Archive get different menus**, which the equality
-    /// above cannot establish on its own: a pane that ignored `out` and
-    /// always drew the Trash's two entries would satisfy every `contains`
-    /// check for the Trash and be wrong for the Archive.
-    #[test]
-    fn the_archives_menu_is_not_the_trashs() {
-        let item = out_of_vault_item("Ledgerline");
-        let trash = open_out_of_vault_kebab(&item, OutOfVault::Trash);
-        let archive = open_out_of_vault_kebab(&item, OutOfVault::Archive);
-        assert!(trash.iter().any(|t| t == "Delete forever"), "painted {trash:?}");
-        assert!(
-            !archive.iter().any(|t| t == "Delete forever"),
-            "an archived item's pane offers the permanent delete, which acts on the trash: \
-             {archive:?}"
-        );
-        assert!(archive.iter().any(|t| t == "Unarchive"), "painted {archive:?}");
-        assert!(
-            !trash.iter().any(|t| t == "Unarchive"),
-            "a trashed item's pane offers Unarchive, which acts on the other list: {trash:?}"
-        );
-    }
-
     /// **The close mark reports `ClosePane`**, which is what makes it a way
     /// out of this pane rather than a decoration. Clicked where the pane
     /// really painted it.
@@ -10606,8 +9797,7 @@ mod tests {
     fn the_out_of_vault_close_mark_reports_a_close() {
         let item = out_of_vault_item("Ledgerline");
         let (_, first) = painted_out_of_vault_in(&item, OutOfVault::Trash, None);
-        assert_eq!(first.pane_closes.len(), 1, "the pane painted no close mark");
-        let at = first.pane_closes[0].0.center();
+        let at = first.close.expect("the pane painted no Close").center();
         let (_, clicked) =
             out_of_vault_frames(&item, OutOfVault::Trash, None, &[out_of_vault_click(at)]);
         assert_eq!(
@@ -10633,12 +9823,8 @@ mod tests {
             (OutOfVault::Trash, "Delete forever", DetailAction::PurgeForever),
             (OutOfVault::Archive, "Unarchive", DetailAction::Unarchive),
         ] {
-            let (_, first) = painted_out_of_vault_in(&item, out, None);
-            let kebab = first.kebab_dots[1].0.center();
-            // Frame 1 opens the menu, frame 2 paints it -- that is where the
-            // entry's rectangle can first be read.
-            let (_, opened) =
-                out_of_vault_frames(&item, out, None, &[out_of_vault_click(kebab), Vec::new()]);
+            // The entries are the action row's buttons, on the first frame.
+            let (_, opened) = painted_out_of_vault_in(&item, out, None);
             let entry = opened
                 .texts
                 .iter()
@@ -10651,12 +9837,7 @@ mod tests {
                 })
                 .1
                 .center();
-            let (_, chosen) = out_of_vault_frames(
-                &item,
-                out,
-                None,
-                &[out_of_vault_click(kebab), Vec::new(), out_of_vault_click(entry)],
-            );
+            let (_, chosen) = out_of_vault_frames(&item, out, None, &[out_of_vault_click(entry)]);
             assert_eq!(
                 chosen.action, expected,
                 "{out:?}: clicking {label:?} reported {:?}",
@@ -10989,6 +10170,8 @@ mod tests {
     struct Pane {
         ctx: egui::Context,
         width: f32,
+        /// The pane's height: [`PANE`], unless [`Pane::tall`].
+        height: f32,
         reveal: RevealState,
         /// The folder name the window would have resolved for this item --
         /// `None` unless a test sets it, which is the vault's usual case.
@@ -11041,6 +10224,11 @@ mod tests {
     /// `theme::icon_probe`, which owns that lookup).
     struct Frame {
         action: DetailAction,
+        /// The v2 header's icon-only controls, read back by their ids
+        /// (`header_control_id`): they paint no words to be found by.
+        close: Option<egui::Rect>,
+        more: Option<egui::Rect>,
+        favourite: Option<egui::Rect>,
         texts: Vec<(String, egui::Rect)>,
         /// Every string the frame painted with **the characters that were
         /// actually laid out**, which is not the same list as [`texts`].
@@ -11186,6 +10374,26 @@ mod tests {
             found[0]
         }
 
+        /// [`rect_of`](Self::rect_of) below the header: the header's tags
+        /// say "App" too, and these tests mean the body's row of that name.
+        fn body_rect_of(&self, label: &str) -> egui::Rect {
+            let header_bottom = self.more.or(self.close).map_or(0.0, |r| r.bottom());
+            let found: Vec<egui::Rect> = self
+                .texts
+                .iter()
+                .filter(|(t, r)| t == label && r.top() > header_bottom)
+                .map(|(_, r)| *r)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "expected exactly one {label:?} under the header, found {}; painted: {:?}",
+                found.len(),
+                self.strings()
+            );
+            found[0]
+        }
+
         /// The **box a menu entry occupies**, with the colour it was filled
         /// in -- which is the rectangle a click has to land in, and is not
         /// [`rect_of`](Self::rect_of)'s box.
@@ -11268,91 +10476,11 @@ mod tests {
             found[0]
         }
 
-        /// The header's favourite star. Exactly one, in either state.
-        fn star(&self) -> theme::icon_probe::Star {
-            assert_eq!(
-                self.stars.len(),
-                1,
-                "expected exactly one star in the header, found {}; the pane painted: {:?}",
-                self.stars.len(),
-                self.strings()
-            );
-            self.stars[0]
-        }
-
         /// The header's kebab, as the union of its three dots. Three is the
         /// assertion: two would be an ellipsis and four a different control.
+        /// The header's more (`⋯`) button.
         fn kebab(&self) -> egui::Rect {
-            assert_eq!(
-                self.kebab_dots.len(),
-                3,
-                "expected exactly three kebab dots in the header, found {}; the pane \
-                 painted: {:?}",
-                self.kebab_dots.len(),
-                self.strings()
-            );
-            self.kebab_dots
-                .iter()
-                .skip(1)
-                .fold(self.kebab_dots[0].0, |a, (b, _)| a.union(*b))
-        }
-
-        /// The header's "Send a record" envelope, with its stroke colour.
-        /// Exactly one, for [`Frame::star`]'s reason.
-        fn envelope(&self) -> (egui::Rect, egui::Color32) {
-            assert_eq!(
-                self.envelopes.len(),
-                1,
-                "expected exactly one Send envelope in the header, found {}; the pane \
-                 painted: {:?}",
-                self.envelopes.len(),
-                self.strings()
-            );
-            self.envelopes[0]
-        }
-
-        /// The header's close ✕, with its stroke colour. Exactly one, for
-        /// [`Frame::star`]'s reason -- and here that also proves the strip's
-        /// ✕ is not being confused with any other ✕ this app strokes.
-        fn pane_close(&self) -> (egui::Rect, egui::Color32) {
-            assert_eq!(
-                self.pane_closes.len(),
-                1,
-                "expected exactly one close ✕ in the header, found {}; the pane painted: {:?}",
-                self.pane_closes.len(),
-                self.strings()
-            );
-            self.pane_closes[0]
-        }
-
-        /// The header's "Add a one-time code" clock, with its stroke colour.
-        /// Exactly one, for [`Frame::star`]'s reason -- and here that also
-        /// proves the clock's face is not being confused with any other ring
-        /// this pane strokes, of which every masked row paints a pupil.
-        fn clock(&self) -> (egui::Rect, egui::Color32) {
-            assert_eq!(
-                self.clocks.len(),
-                1,
-                "expected exactly one one-time-code clock in the header, found {}; the \
-                 pane painted: {:?}",
-                self.clocks.len(),
-                self.strings()
-            );
-            self.clocks[0]
-        }
-
-        /// The colour the kebab's three dots were filled in -- one colour,
-        /// or a failure, so "the kebab is red" cannot be satisfied by one
-        /// red dot out of three.
-        fn kebab_colour(&self) -> egui::Color32 {
-            let _ = self.kebab();
-            let first = self.kebab_dots[0].1;
-            assert!(
-                self.kebab_dots.iter().all(|(_, c)| *c == first),
-                "the kebab's dots are not all one colour: {:?}",
-                self.kebab_dots
-            );
-            first
+            self.more.unwrap_or_else(|| panic!("the header drew no more button; it painted: {:?}", self.strings()))
         }
 
         /// What was actually DRAWN for the run whose source text is `label`
@@ -11382,14 +10510,12 @@ mod tests {
         /// background and the tests care about its OUTER bounds. A body card
         /// is also CARD-filled, which is why this is anchored to the pane's
         /// top edge; the first card starts well below it.
+        /// The header: from the pane's top to the bottom of its action row
+        /// (or of Close, when there is no row), across to Close's right.
         fn header_strip(&self) -> egui::Rect {
-            let strip = self
-                .rects
-                .iter()
-                .filter(|(rect, fill)| *fill == theme::CARD && rect.top() <= 0.5)
-                .map(|(rect, _)| *rect)
-                .reduce(egui::Rect::union);
-            strip.expect("the pane painted no white header strip at its top edge")
+            let close = self.close.expect("the pane drew no header");
+            let bottom = self.more.unwrap_or(close).bottom();
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(close.right(), bottom))
         }
 
         /// The header's avatar tile: the [`HEADER_AVATAR`]-square box, found
@@ -11402,12 +10528,12 @@ mod tests {
                 .rects
                 .iter()
                 .filter(|(rect, _)| {
-                    (rect.width() - HEADER_AVATAR).abs() < 0.5
-                        && (rect.height() - HEADER_AVATAR).abs() < 0.5
+                    (rect.width() - V2_AVATAR).abs() < 0.5
+                        && (rect.height() - V2_AVATAR).abs() < 0.5
                 })
                 .map(|(rect, _)| *rect)
                 .reduce(egui::Rect::union);
-            tile.expect("the header painted no 44px avatar tile")
+            tile.expect("the header painted no 72pt avatar tile")
         }
 
         /// The one filled `colour` rectangle that encloses `inner` -- the
@@ -11465,6 +10591,7 @@ mod tests {
             Self {
                 ctx,
                 width,
+                height: PANE,
                 reveal: RevealState::default(),
                 folder: None,
                 folders: Vec::new(),
@@ -11553,6 +10680,13 @@ mod tests {
             self
         }
 
+        /// The same pane, tall enough that every card of the longest item is
+        /// on screen at once: the v2 header is ~180pt, not v1's strip.
+        fn tall(mut self) -> Self {
+            self.height = 1600.0;
+            self
+        }
+
         /// The same pane, on a machine whose `settings.json` has the
         /// TOTP-secret preference turned ON.
         fn revealing_secrets(mut self) -> Self {
@@ -11573,7 +10707,7 @@ mod tests {
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
                         egui::Pos2::ZERO,
-                        egui::vec2(self.width, PANE),
+                        egui::vec2(self.width, self.height),
                     )),
                     events,
                     ..Default::default()
@@ -11611,7 +10745,11 @@ mod tests {
                         &self.vault);
                 },
             );
+            let control = |which| self.ctx.read_response(header_control_id(which)).map(|r| r.rect);
             let mut frame = Frame {
+                close: control(HeaderControl::Close),
+                more: control(HeaderControl::More),
+                favourite: control(HeaderControl::Favourite),
                 action,
                 texts: Vec::new(),
                 rendered: Vec::new(),
@@ -11702,7 +10840,7 @@ mod tests {
             // The ✕ and not the star: a received record's strip draws no
             // star (mock 6d), and its kebab is the one this opens most.
             assert!(
-                closed.pane_closes.len() == 1,
+                closed.close.is_some(),
                 "the pane did not lay out at all, so opening its menu proves nothing"
             );
             let kebab = closed.kebab().center();
@@ -11752,356 +10890,8 @@ mod tests {
         painted_text(item, totp, reveal)
     }
 
-    /// Every text the pane painted, and **the box of every bitmap it
-    /// painted** -- which on a card pane is the network mark and nothing else.
-    ///
-    /// `egui::Image` paints a textured `Shape::Mesh`, and no drawn icon in
-    /// this app does: `detail_edit`'s
-    /// `an_app_icon_bitmap_is_not_mistaken_for_any_drawn_icon` measures
-    /// exactly that separation. Textured `Shape::Rect`s are collected too, so
-    /// the probe does not go blind if egui changes which of the two it emits;
-    /// every caller pairs an emptiness claim with a positive control that
-    /// would catch a probe that found nothing either way.
-    /// The pane's texts, every NETWORK MARK it painted, and -- separately --
-    /// every blue shape it painted INSIDE THE HEADER'S AVATAR TILE.
-    ///
-    /// A network mark is a `theme::BLUE` ground with a word on it, so that is
-    /// what this looks for -- not "a textured rect", which is what it looked
-    /// for while the marks were PNGs.
-    ///
-    /// **The third return is the split this helper grew.** Its doc used to
-    /// finish "the pane paints no other blue ground on the rows this is used
-    /// against", and that stopped being true when the header's avatar tile
-    /// started carrying `kind_mark`'s glyph: a card's mark includes a FILLED
-    /// stripe, drawn in the header's emphasized ink, which is `theme::BLUE`.
-    /// Left in the first return it read as a second network badge on a pane
-    /// that had drawn none.
-    ///
-    /// It is SPLIT OUT rather than filtered away, and the callers assert on
-    /// it, so the tile cannot become a place a stray blue ground hides.
-    /// The tile locates itself: it is the one `theme::BLUE_WASH` square the
-    /// pane paints at [`HEADER_AVATAR`].
-    fn painted_with_marks(
-        item: &VaultItem,
-    ) -> (Vec<String>, Vec<egui::Rect>, Vec<egui::Rect>) {
-        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>, tiles: &mut Vec<egui::Rect>) {
-            match shape {
-                // Matched by GEOMETRY, not by fill. The tile behind a drawn
-                // mark carries no fill at all any more ("secnote and other
-                // icons have gray background - they should not"), so a
-                // `BLUE_WASH` test finds nothing and every claim below is then
-                // made about a pane nobody found.
-                egui::Shape::Rect(rect)
-                    if (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
-                        && (rect.rect.height() - HEADER_AVATAR).abs() < 0.5 =>
-                {
-                    tiles.push(rect.rect);
-                }
-                egui::Shape::Rect(rect) if rect.fill == theme::BLUE => out.push(rect.rect),
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, out, tiles);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let shapes = frame_shapes(item, &TotpState::NoSecret, RevealState::default());
-        let (mut marks, mut tiles) = (Vec::new(), Vec::new());
-        for clipped in &shapes {
-            walk(&clipped.shape, &mut marks, &mut tiles);
-        }
-        let in_tile: Vec<egui::Rect> = marks
-            .iter()
-            .copied()
-            .filter(|m| tiles.iter().any(|t| t.contains_rect(*m)))
-            .collect();
-        marks.retain(|m| !tiles.iter().any(|t| t.contains_rect(*m)));
-        (painted(item, &TotpState::NoSecret), marks, in_tile)
-    }
-
     fn contains(texts: &[String], needle: &str) -> bool {
         texts.iter().any(|t| t.contains(needle))
-    }
-
-    /// The exact hardcoding this task exists to remove: every item, of every
-    /// type, was labelled "Login" under its name.
-    #[test]
-    fn the_header_subtitle_is_the_items_own_kind() {
-        for kind in EVERY_KIND {
-            let item = an_item(item_type_for(kind));
-            let texts = painted(&item, &TotpState::NoSecret);
-            assert!(
-                texts.contains(&kind.label()),
-                "{kind:?} rendered no {:?} subtitle; painted: {texts:?}",
-                kind.label()
-            );
-            if kind != ItemKind::Login {
-                assert!(
-                    !texts.iter().any(|t| t == "Login"),
-                    "{kind:?} still renders the hardcoded \"Login\" subtitle"
-                );
-            }
-        }
-    }
-
-    /// **The folder joins that line; it does not get one of its own.**
-    ///
-    /// Design 2b line 803 is `Login · Engineering` in a single 12px run. The
-    /// user asked for the folder "under the title like design has it - if no
-    /// folder just don't print anything", and "nothing" is the separator and
-    /// the name: the line still reads `Login`. It is asserted for every kind,
-    /// so a subtitle wired to a fixed "Login" cannot pass.
-    ///
-    /// The no-folder half is here as well as in
-    /// `the_header_subtitle_is_the_items_own_kind` because that test reads the
-    /// rendered pane and this one reads the decision; between them the two
-    /// mutations that produce a bare kind line -- dropping the folder, and
-    /// dropping the subtitle -- are both caught.
-    #[test]
-    fn the_header_subtitle_carries_the_folder_after_the_kind_and_nothing_when_there_is_none() {
-        for kind in EVERY_KIND {
-            // The two runs REJOINED, which is the reading order the design
-            // asks for and the thing splitting the line for the folder mark
-            // could quietly have broken: a lead that lost its separator, or a
-            // name put before the kind, reads wrong here and nowhere else in
-            // this pure test.
-            let (lead, name) = header_subtitle_parts(kind, Some("Engineering"));
-            assert_eq!(
-                format!("{lead}{}", name.unwrap_or_default()),
-                format!("{} · Engineering", kind.label()),
-                "{kind:?} does not read as the design's `<kind> · <folder>`"
-            );
-            // And the split is where the MARK goes -- after the separator,
-            // immediately before the name. A lead that swallowed the folder
-            // name would rejoin correctly above and leave the mark with
-            // nothing to introduce.
-            assert_eq!(
-                name,
-                Some("Engineering"),
-                "{kind:?} does not hand the folder name back as its own run, so the \
-                 folder mark has nothing to sit in front of"
-            );
-
-            let (lead, name) = header_subtitle_parts(kind, None);
-            assert_eq!(lead, kind.label(), "{kind:?} with no folder does not still name its kind");
-            assert_eq!(
-                name, None,
-                "{kind:?} with no folder still offers a second run, so the unfoldered \
-                 header would draw a folder mark"
-            );
-        }
-    }
-
-    /// **And the header really paints it, on the title's own line-under.**
-    ///
-    /// The decision above is pure; this is the other half. It also holds the
-    /// shape: ONE LINE, so a folder painted as a second line under the kind --
-    /// which is what "show Folder under the title" could equally have meant --
-    /// fails here rather than shipping.
-    ///
-    /// **The line is two runs now, and that is exactly what has to be pinned
-    /// rather than assumed.** `theme::folder_mark` is painted between them, so
-    /// the subtitle can no longer be one galley; what makes it still one line
-    /// is that the two runs share a baseline and sit adjacent in reading
-    /// order, which is what the geometry below asks. A "· " lead that had
-    /// wrapped its name onto a row of its own would satisfy every string
-    /// assertion here and fail the baseline one.
-    ///
-    /// An item whose `folder_id` names a folder that is not in the list never
-    /// reaches this function with a name at all: `sidebar::folder_name`
-    /// answers `None` for it (see
-    /// `a_folder_is_named_only_when_the_list_really_has_it`) and the pane then
-    /// draws the no-folder case, which is the line the kind test above pins.
-    #[test]
-    fn the_header_paints_the_folder_beside_the_kind_under_the_item_name() {
-        let mut pane = Pane::new().in_folder("Engineering");
-        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
-
-        for run in ["Login · ", "Engineering"] {
-            assert!(
-                frame.painted(run),
-                "the header painted no {run:?} run of its subtitle; it painted: {:?}",
-                frame.strings()
-            );
-        }
-        // Not a bare "Login": that would be the kind's own run having lost the
-        // separator, which is the folder line broken back into two unrelated
-        // words -- the very complaint this pane's mark exists to answer.
-        assert!(
-            !frame.strings().iter().any(|t| *t == "Login"),
-            "the header painted a bare \"Login\" run, so the subtitle's separator is \
-             gone; it painted: {:?}",
-            frame.strings()
-        );
-
-        let title = frame.rect_of("Sample");
-        let kind = frame.rect_of("Login · ");
-        let folder = frame.rect_of("Engineering");
-        assert!(
-            (kind.left() - title.left()).abs() < 0.5,
-            "the subtitle at {kind:?} does not share the title's column ({title:?})"
-        );
-        assert!(
-            kind.top() > title.top(),
-            "the subtitle at {kind:?} is not UNDER the title at {title:?}"
-        );
-        // ONE LINE: the folder's run sits to the RIGHT of the kind's, on the
-        // same baseline, not under it.
-        assert!(
-            folder.left() > kind.right(),
-            "the folder run at {folder:?} is not to the right of the kind run at \
-             {kind:?}, so the subtitle is not one line"
-        );
-        assert!(
-            (folder.bottom() - kind.bottom()).abs() < 1.0,
-            "the folder run at {folder:?} does not share the kind run's baseline \
-             ({kind:?}), so the subtitle wrapped onto two lines"
-        );
-    }
-
-    /// Every folder mark in a frame, as its outline's box and the colour it
-    /// was stroked in. See `theme::icon_probe::folder_marks`.
-    fn folder_marks(frame: &Frame) -> Vec<(egui::Rect, egui::Color32)> {
-        theme::icon_probe::folder_marks(&frame.shapes)
-    }
-
-    /// **The folder mark, between the separator and the name it introduces.**
-    ///
-    /// The user: *"For foldered items also show folder icon left to folder
-    /// name in subtitle, otherwise not clear two words what they mean."* So
-    /// the mark's position is the requirement, not merely its presence -- a
-    /// mark at the far end of the line, or before the kind, would be painted
-    /// and would answer nothing.
-    ///
-    /// **Drawn, not typed**, which is why this is asked of the shape stream at
-    /// all: the mark paints no string, so no text assertion in this file can
-    /// see it. `theme::the_folder_codepoints_are_not_carried_by_this_apps_own_
-    /// typeface` is the measurement behind that choice -- 📁, 📂 and 🗀 all
-    /// come back absent from the real font stack, so as text this would be a
-    /// tofu box in every foldered item's header.
-    #[test]
-    fn the_folder_mark_sits_between_the_separator_and_the_folder_name() {
-        let mut pane = Pane::new().in_folder("Engineering");
-        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
-
-        let marks = folder_marks(&frame);
-        assert_eq!(
-            marks.len(),
-            1,
-            "expected exactly one folder mark in a foldered item's header, found {}",
-            marks.len()
-        );
-        let (mark, color) = marks[0];
-        // `rect_of`, not `ink_of`: both runs are laid out LEFT to right, which
-        // is the case `rect_of` reports exactly -- its documented inaccuracy
-        // is the `halign: Max` of a right-to-left control line, and neither of
-        // these is on one. It is also the only one of the two that can be
-        // compared with a painted shape's box vertically.
-        let kind = frame.rect_of("Login · ");
-        let folder = frame.rect_of("Engineering");
-        assert!(
-            mark.left() >= kind.right() - 1.0 && mark.right() <= folder.left() + 1.0,
-            "the folder mark at {mark:?} is not between the separator ({kind:?}) and the \
-             folder name ({folder:?})"
-        );
-        // Vertically ON the line, not floating above or below it: the mark's
-        // box is the subtitle's line height, so its centre is the run's.
-        assert!(
-            (mark.center().y - folder.center().y).abs() < 3.0,
-            "the folder mark at {mark:?} is not on the folder name's line ({folder:?})"
-        );
-        // **The subtitle's own ink, not louder.** This is the assertion that
-        // is easiest to write blind -- the mark paints no fill and no string,
-        // so `TEXT_FAINT` is visible to a test only through the stroke colour
-        // `icon_probe::folder_marks` reports. The negative half is the proof
-        // the positive one can see anything: INK is what the mark would be
-        // stroked in if it had been given the title's colour by mistake, and
-        // the two are different values.
-        assert_eq!(
-            color,
-            theme::TEXT_FAINT,
-            "the folder mark is stroked in {color:?}, not the subtitle's own TEXT_FAINT"
-        );
-        assert_ne!(
-            theme::TEXT_FAINT,
-            theme::INK,
-            "TEXT_FAINT and INK are the same colour, so the assertion above could not \
-             have failed for a mark painted in the title's ink"
-        );
-    }
-
-    /// **And an item with no folder gets no mark at all.**
-    ///
-    /// The other half of the one above, and the half that would rot silently:
-    /// a mark painted unconditionally sits after a bare `Login` introducing
-    /// nothing, and every assertion in the test above still passes.
-    ///
-    /// The positive control is the foldered frame right beside it, so a probe
-    /// that had stopped finding this mark entirely cannot pass this test by
-    /// finding nothing.
-    #[test]
-    fn an_unfoldered_item_paints_no_folder_mark() {
-        let unfoldered = folder_marks(&Pane::new().idle(&a_login(), &TotpState::NoSecret));
-        assert!(
-            unfoldered.is_empty(),
-            "an item with no folder painted {} folder mark(s) at {unfoldered:?}",
-            unfoldered.len()
-        );
-        let foldered =
-            folder_marks(&Pane::new().in_folder("Engineering").idle(&a_login(), &TotpState::NoSecret));
-        assert_eq!(
-            foldered.len(),
-            1,
-            "the foldered control painted {} marks, so the emptiness above is about the \
-             probe rather than about the folder",
-            foldered.len()
-        );
-    }
-
-    /// **`FOLDER_VERTICES` really is unique in a rendered header.**
-    ///
-    /// `icon_probe::folder_marks` matches a six-point unfilled closed path and
-    /// nothing else. That is a claim about the whole crate's painting, made in
-    /// `theme.rs`'s doc, and this is what holds it: a frame of the real detail
-    /// pane paints the star, the envelope and its flap, the kebab, the pane
-    /// close, the eyes -- every drawn mark this app has -- and exactly one of
-    /// the paths in it has six points.
-    ///
-    /// Asked over the UNFOLDERED frame as well, which is where a collision
-    /// would actually show: `an_unfoldered_item_paints_no_folder_mark` asserts
-    /// emptiness there, and a second six-point path from some other control
-    /// would make that test fail for a reason nobody would guess from its
-    /// name.
-    #[test]
-    fn the_folder_mark_is_the_only_six_point_path_in_the_header() {
-        fn six_point_paths(shape: &egui::Shape, out: &mut usize) {
-            match shape {
-                egui::Shape::Path(p) if p.points.len() == theme::FOLDER_VERTICES => *out += 1,
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        six_point_paths(shape, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for (folder, want) in [(None, 0), (Some("Engineering"), 1)] {
-            let mut pane = Pane::new();
-            if let Some(name) = folder {
-                pane = pane.in_folder(name);
-            }
-            let frame = pane.idle(&a_login(), &TotpState::NoSecret);
-            let mut found = 0;
-            six_point_paths(&frame.shapes, &mut found);
-            assert_eq!(
-                found, want,
-                "a frame with folder {folder:?} paints {found} six-point path(s), not \
-                 {want} -- `theme::FOLDER_VERTICES` is no longer a point count only the \
-                 folder mark uses, so `icon_probe::folder_marks` reports marks that are \
-                 not folders"
-            );
-        }
     }
 
     /// An AUTOFILL TARGETS card on a non-login would advertise a capability
@@ -12320,24 +11110,16 @@ mod tests {
     #[test]
     fn the_trashed_panes_delete_forever_is_painted_as_an_alarm_and_restore_is_not() {
         let item = out_of_vault_item("Ledgerline");
-        let (_, first) = painted_out_of_vault_in(&item, OutOfVault::Trash, None);
-        assert_eq!(first.kebab_dots.len(), 3, "the pane painted no kebab to click");
-        let at = first.kebab_dots[1].0.center();
-        let (_, open) = out_of_vault_frames(
-            &item,
-            OutOfVault::Trash,
-            None,
-            &[out_of_vault_click(at), Vec::new()],
-        );
+        let (_, open) = painted_out_of_vault_in(&item, OutOfVault::Trash, None);
         assert_eq!(
             open.text_colour_of("Delete forever"),
-            theme::ERROR,
+            crate::kit::tokens::Palette::LIGHT.error,
             "the app's one irreversible entry is painted {:?}",
             open.text_colour_of("Delete forever")
         );
         assert_ne!(
             open.text_colour_of("Restore"),
-            theme::ERROR,
+            crate::kit::tokens::Palette::LIGHT.error,
             "Restore is painted in the alarm colour, so this menu is uniformly red and \
              says nothing about Delete forever"
         );
@@ -12460,13 +11242,12 @@ mod tests {
         let item = a_login();
         let mut pane = Pane::new();
         let closed = pane.idle(&item, &TotpState::NoSecret);
-        assert_eq!(
-            closed.kebab_dots.len(),
-            3,
-            "no kebab painted at all, so this proves nothing: {:?}",
+        assert!(
+            closed.more.is_some(),
+            "no more button painted at all, so this proves nothing: {:?}",
             closed.strings()
         );
-        for entry in ["Edit", "Delete"] {
+        for entry in ["Clone", "Delete"] {
             assert!(
                 !closed.painted(entry),
                 "{entry:?} is on the header strip with the menu shut: {:?}",
@@ -12474,7 +11255,7 @@ mod tests {
             );
         }
         let open = pane.open_kebab(&item, &TotpState::NoSecret);
-        for entry in ["Edit", "Delete"] {
+        for entry in ["Clone", "Delete"] {
             assert!(
                 open.painted(entry),
                 "the opened kebab menu does not carry {entry:?}: {:?}",
@@ -12851,33 +11632,6 @@ mod tests {
         }
     }
 
-    /// A trashed or archived item's kebab offers no Icon entry at all.    /// A trashed or archived item's kebab offers no Icon entry at all.
-    ///
-    /// That pane is built from `item_list::out_of_vault_entries`, which
-    /// shares nothing with the live menu, so this is a property that already
-    /// holds by construction -- pinned anyway, because "Icon" is exactly the
-    /// kind of entry someone adds to the header's one kebab-drawing block
-    /// without noticing there are two panes behind it.
-    #[test]
-    fn an_out_of_vault_items_kebab_offers_no_icon_entry() {
-        for out in [OutOfVault::Trash, OutOfVault::Archive] {
-            let painted = open_out_of_vault_kebab(&an_item(Some(1)), out);
-            assert!(
-                !painted.is_empty(),
-                "{out:?}: the kebab painted nothing, so the absence below proves nothing"
-            );
-            for label in
-                std::iter::once(crate::vault_window::item_list::ICON_LABEL).chain(ICON_ROWS)
-            {
-                assert!(
-                    !painted.contains(&label.to_string()),
-                    "{out:?}: an out-of-vault kebab offered {label:?}, which acts on an item \
-                     the live list does not hold: {painted:?}"
-                );
-            }
-        }
-    }
-
     /// **The menu asks nothing, and never reads as if it had.**
     ///
     /// This pane used to owe the confirmation an armed state the user could
@@ -12911,24 +11665,6 @@ mod tests {
             clicked.action,
             DetailAction::Delete,
             "the Delete entry is inert, so the modal can never be opened"
-        );
-    }
-
-    /// **The kebab has one colour scheme, and red is not in it.**
-    ///
-    /// Its dots turned `ERROR` red while a delete was armed, because the arm
-    /// could outlive the menu being closed and had to be legible somewhere.
-    /// A modal is legible on its own, so the only red left on this strip
-    /// would be an alarm reporting nothing -- and the ✕ beside it has its
-    /// own test (below) resting on there being none.
-    #[test]
-    fn the_kebab_is_never_painted_as_an_alarm() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        assert_ne!(
-            pane.idle(&item, &TotpState::NoSecret).kebab_colour(),
-            theme::ERROR,
-            "the kebab is red with nothing to report"
         );
     }
 
@@ -14085,7 +12821,7 @@ mod tests {
                 } else {
                     base
                 };
-                let mut pane = Pane::new();
+                let mut pane = Pane::new().tall();
                 let frame = pane.idle(&item, &TotpState::NoSecret);
                 let headings = frame.card_headings();
 
@@ -14336,333 +13072,6 @@ mod tests {
             "a selection drag raised a copy confirmation; painted: {:?}",
             after.strings()
         );
-    }
-
-    /// Drag the pointer across `over`, from just inside its left edge to
-    /// `fraction` of the way along it, and leave the button up again.
-    ///
-    /// Four frames, because that is what egui needs to call this a drag and
-    /// not a click: the press, a move, and the release -- a press and release
-    /// in one frame never passes the drag threshold and selects nothing. The
-    /// notes tests wrote this out inline twice before there were three of
-    /// them; the length assertion travels with it because a drag shorter than
-    /// the threshold is exactly the way this gesture silently degrades into a
-    /// click and stops testing selection at all.
-    fn drag_across(
-        pane: &mut Pane,
-        item: &VaultItem,
-        over: egui::Rect,
-        fraction: f32,
-    ) -> Frame {
-        let from = egui::pos2(over.left() + 2.0, over.center().y);
-        let to = egui::pos2(over.left() + over.width() * fraction, over.center().y);
-        assert!(
-            (to.x - from.x) > 30.0,
-            "the drag is only {}pt long, which egui may still call a click",
-            to.x - from.x
-        );
-        let _ = pane.frame(
-            item,
-            &TotpState::NoSecret,
-            vec![
-                egui::Event::PointerMoved(from),
-                egui::Event::PointerButton {
-                    pos: from,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        let _ = pane.frame(item, &TotpState::NoSecret, vec![egui::Event::PointerMoved(to)]);
-        pane.frame(
-            item,
-            &TotpState::NoSecret,
-            vec![
-                egui::Event::PointerMoved(to),
-                egui::Event::PointerButton {
-                    pos: to,
-                    button: egui::PointerButton::Primary,
-                    pressed: false,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        pane.idle(item, &TotpState::NoSecret)
-    }
-
-    /// The title's text cursor for ONE item, out of egui's `TextEditState` --
-    /// [`notes_selection`]'s counterpart, and the only place a selection
-    /// exists at all.
-    fn title_selection(
-        ctx: &egui::Context,
-        item_id: &str,
-    ) -> Option<egui::text_selection::CCursorRange> {
-        egui::text_edit::TextEditState::load(ctx, title_text_id(item_id))?.cursor.char_range()
-    }
-
-    /// A name long enough that a drag across part of it is unambiguously a
-    /// drag, and distinctive enough that `rect_of` cannot find it twice on
-    /// the pane.
-    const A_LONG_NAME: &str = "Ledgerline Treasury Portal";
-
-    /// **A drag across the header's title selects part of it.** The user:
-    /// "also make title selectable and copieble like a regular text in a
-    /// browser".
-    ///
-    /// **The control is what makes this a test.** A pane on which nothing is
-    /// ever selectable satisfies every "nothing went wrong" clause here, so
-    /// the finding is stated as a character count that must be greater than
-    /// zero and smaller than the whole name -- a selection that is neither is
-    /// not a partial selection and would not tell a `TextEdit` apart from a
-    /// `Label` that egui happened to give a cursor to.
-    ///
-    /// The title being on screen at all is asserted first, for
-    /// `a_notes_selection_does_not_follow_the_user_to_the_next_item`'s
-    /// reason: egui culls a shape outside the screen rect entirely, so a
-    /// header that stopped painting the name would carry no selection either
-    /// and would pass a test that only looked for one.
-    #[test]
-    fn the_title_can_be_selected_with_a_drag() {
-        let mut item = a_login();
-        item.name = A_LONG_NAME.to_string();
-
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            laid_out.painted(A_LONG_NAME),
-            "the header painted no title, so there is nothing to select; painted: {:?}",
-            laid_out.strings()
-        );
-        let title = laid_out.rect_of(A_LONG_NAME);
-
-        let _ = drag_across(&mut pane, &item, title, 0.5);
-
-        // THE CONTROL AND THE FINDING IN ONE: a real, partial range.
-        let range = title_selection(&pane.ctx, &item.id)
-            .expect("the title carries no text cursor at all, so it is not selectable");
-        let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
-        assert!(
-            selected > 0,
-            "the drag selected nothing in the title: the cursor sits at {range:?}"
-        );
-        assert!(
-            selected < A_LONG_NAME.chars().count(),
-            "the drag selected the whole title ({selected} chars), so a half-drag is not \
-             distinguishable from selecting everything"
-        );
-    }
-
-    /// **Read-only means read-only: the focused title does not take typing.**
-    ///
-    /// The widget under the header is a `TextEdit`, and the whole reason it
-    /// is safe there is that its buffer is a `&str`, whose `TextBuffer` is
-    /// not mutable. That is a property of a type, which is exactly the kind
-    /// of thing a later edit -- a `String` for one frame, a clone to please
-    /// the borrow checker -- undoes without looking like it changed anything.
-    /// So it is asserted through the widget: focus the title, type into it,
-    /// and the header still paints the name it was handed.
-    #[test]
-    fn typing_into_the_focused_title_does_not_change_it() {
-        let mut item = a_login();
-        item.name = A_LONG_NAME.to_string();
-
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        assert!(laid_out.painted(A_LONG_NAME), "the header painted no title");
-
-        pane.ctx.memory_mut(|m| m.request_focus(title_text_id(&item.id)));
-        let _ = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            pane.ctx.memory(|m| m.has_focus(title_text_id(&item.id))),
-            "the title never took keyboard focus, so this frame is not the case this \
-             test is named for"
-        );
-
-        let typed = pane.frame(
-            &item,
-            &TotpState::NoSecret,
-            vec![egui::Event::Text("zzz".to_string())],
-        );
-        assert!(
-            typed.painted(A_LONG_NAME),
-            "the title changed under three typed characters; painted: {:?}",
-            typed.strings()
-        );
-        assert_eq!(item.name, A_LONG_NAME, "the item itself was edited");
-    }
-
-    /// The text cursor behind ONE subtitle run -- [`title_selection`]'s
-    /// counterpart, taking the widget's id rather than the item's because
-    /// there are two of these runs on the line and the whole point of
-    /// [`subtitle_kind_id`] and [`subtitle_folder_id`] being different salts
-    /// is that they answer separately.
-    fn subtitle_selection(
-        ctx: &egui::Context,
-        id: egui::Id,
-    ) -> Option<egui::text_selection::CCursorRange> {
-        egui::text_edit::TextEditState::load(ctx, id)?.cursor.char_range()
-    }
-
-    /// A folder name long enough that a drag across half of it is
-    /// unambiguously a drag and not a click, and distinctive enough that
-    /// `rect_of` cannot find it twice on the pane.
-    const A_LONG_FOLDER: &str = "Ledgerline Engineering";
-
-    /// The kind whose subtitle run is longest, so that a drag across most of
-    /// it clears `drag_across`'s threshold with room to spare. "Login · " is
-    /// barely wider than the threshold itself, which would make the ordinary
-    /// fixture's version of this test pass or fail on a font metric.
-    fn a_secure_note() -> VaultItem {
-        an_item(item_type_for(ItemKind::SecureNote))
-    }
-
-    /// **A drag across the subtitle's KIND selects part of it.** The user:
-    /// "also make type and folder on details screen copieble like title".
-    ///
-    /// **The control is what makes this a test**, exactly as in
-    /// `the_title_can_be_selected_with_a_drag`: a pane on which nothing is
-    /// ever selectable satisfies every "nothing went wrong" clause, so the
-    /// finding is a character count that must be both greater than zero and
-    /// smaller than the whole run. A selection that is neither is not a
-    /// partial selection, and a select-all would otherwise masquerade as one.
-    ///
-    /// The run being painted at all is asserted first, for
-    /// `a_notes_selection_does_not_follow_the_user_to_the_next_item`'s
-    /// reason: egui culls a shape outside the screen rect entirely, so a
-    /// subtitle that stopped painting would carry no selection either and
-    /// would pass a test that only went looking for one.
-    ///
-    /// **And the FOLDER's cursor is asserted absent.** The two runs are two
-    /// widgets, and the mistake this guards is the one salt shared between
-    /// them: with a single id egui has a single `TextEditState`, this drag
-    /// would report against both, and the assertions above would all still
-    /// hold.
-    #[test]
-    fn the_subtitles_kind_can_be_selected_with_a_drag() {
-        let item = a_secure_note();
-        let run = format!("{} · ", ItemKind::SecureNote.label());
-
-        let mut pane = Pane::new().in_folder(A_LONG_FOLDER);
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            laid_out.painted(&run),
-            "the header painted no {run:?} run, so there is nothing to select; \
-             painted: {:?}",
-            laid_out.strings()
-        );
-
-        let _ = drag_across(&mut pane, &item, laid_out.rect_of(&run), 0.8);
-
-        // THE CONTROL AND THE FINDING IN ONE: a real, partial range.
-        let range = subtitle_selection(&pane.ctx, subtitle_kind_id(&item.id))
-            .expect("the kind run carries no text cursor at all, so it is not selectable");
-        let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
-        assert!(
-            selected > 0,
-            "the drag selected nothing in the kind run: the cursor sits at {range:?}"
-        );
-        assert!(
-            selected < run.chars().count(),
-            "the drag selected the whole kind run ({selected} chars), so a partial \
-             drag is not distinguishable from selecting everything"
-        );
-        assert!(
-            subtitle_selection(&pane.ctx, subtitle_folder_id(&item.id)).is_none(),
-            "dragging across the KIND also gave the FOLDER a cursor, so the two runs \
-             share one widget id and neither selection is really its own"
-        );
-    }
-
-    /// **A drag across the subtitle's FOLDER selects part of it** -- the
-    /// other half of the user's "type and folder", with
-    /// [`the_subtitles_kind_can_be_selected_with_a_drag`]'s control and its
-    /// cross-check, pointed the other way.
-    #[test]
-    fn the_subtitles_folder_can_be_selected_with_a_drag() {
-        let item = a_login();
-
-        let mut pane = Pane::new().in_folder(A_LONG_FOLDER);
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            laid_out.painted(A_LONG_FOLDER),
-            "the header painted no folder run, so there is nothing to select; \
-             painted: {:?}",
-            laid_out.strings()
-        );
-
-        let _ = drag_across(&mut pane, &item, laid_out.rect_of(A_LONG_FOLDER), 0.5);
-
-        let range = subtitle_selection(&pane.ctx, subtitle_folder_id(&item.id))
-            .expect("the folder run carries no text cursor at all, so it is not selectable");
-        let selected = range.primary.index.0.abs_diff(range.secondary.index.0);
-        assert!(
-            selected > 0,
-            "the drag selected nothing in the folder run: the cursor sits at {range:?}"
-        );
-        assert!(
-            selected < A_LONG_FOLDER.chars().count(),
-            "the drag selected the whole folder run ({selected} chars), so a partial \
-             drag is not distinguishable from selecting everything"
-        );
-        assert!(
-            subtitle_selection(&pane.ctx, subtitle_kind_id(&item.id)).is_none(),
-            "dragging across the FOLDER also gave the KIND a cursor, so the two runs \
-             share one widget id and neither selection is really its own"
-        );
-    }
-
-    /// **Read-only means read-only: neither focused subtitle run takes
-    /// typing.**
-    ///
-    /// [`typing_into_the_focused_title_does_not_change_it`]'s argument, for
-    /// two more widgets. What makes these `TextEdit`s safe on a read pane is
-    /// that their buffer is a `&str`, whose `TextBuffer` is not mutable --
-    /// a property of a TYPE, and so exactly the kind of thing a later edit
-    /// (a `String` for one frame, a clone to please the borrow checker)
-    /// undoes without looking like it changed anything. So it is asserted
-    /// through the widget rather than read off the source.
-    ///
-    /// Focus is asserted taken before anything is typed, because a frame in
-    /// which the run never took focus is a frame in which typing was never
-    /// offered to it -- the "passes because it never reached the thing it
-    /// names" case.
-    #[test]
-    fn typing_into_a_focused_subtitle_run_does_not_change_it() {
-        let item = a_login();
-        let kind_run = format!("{} · ", ItemKind::Login.label());
-
-        for (which, id, run) in [
-            ("kind", subtitle_kind_id(&item.id), kind_run.as_str()),
-            ("folder", subtitle_folder_id(&item.id), A_LONG_FOLDER),
-        ] {
-            let mut pane = Pane::new().in_folder(A_LONG_FOLDER);
-            let laid_out = pane.idle(&item, &TotpState::NoSecret);
-            assert!(
-                laid_out.painted(run),
-                "the header painted no {which} run {run:?}; painted: {:?}",
-                laid_out.strings()
-            );
-
-            pane.ctx.memory_mut(|m| m.request_focus(id));
-            let _ = pane.idle(&item, &TotpState::NoSecret);
-            assert!(
-                pane.ctx.memory(|m| m.has_focus(id)),
-                "the {which} run never took keyboard focus, so this frame is not the \
-                 case this test is named for"
-            );
-
-            let typed = pane.frame(
-                &item,
-                &TotpState::NoSecret,
-                vec![egui::Event::Text("zzz".to_string())],
-            );
-            assert!(
-                typed.painted(run),
-                "the {which} run changed under three typed characters; painted: {:?}",
-                typed.strings()
-            );
-        }
     }
 
     /// The note's text cursor for ONE item, straight out of egui's own
@@ -15461,7 +13870,7 @@ mod tests {
         );
         // The App row IS clickable -- it copies the process name -- so what is
         // asserted about it is that copying is the WHOLE of what it does.
-        let row = pane.click(&item, &TotpState::NoSecret, laid_out.rect_of("App").center());
+        let row = pane.click(&item, &TotpState::NoSecret, laid_out.body_rect_of("App").center());
         assert_eq!(
             row.action,
             DetailAction::CopyValue(a_desktop_match().process),
@@ -16874,219 +15283,6 @@ mod tests {
         );
     }
 
-    /// **A brand this app cannot name draws no badge and still masks true.**
-    ///
-    /// The two halves of the unrecognised case, together, because each alone
-    /// passes over a pane that failed to draw the card at all: no mark is
-    /// painted, and the number still masks to the length actually stored with
-    /// its last four shown.
-    #[test]
-    fn an_unrecognised_brand_renders_no_badge_and_masks_to_its_stored_length() {
-        let mut item = a_full_card();
-        let card = item.card.as_mut().expect("a_full_card has card data");
-        card.brand = Some("Not A Network".to_string());
-        card.number = Some("1234567890123".to_string().into());
-        let (texts, marks, in_tile) = painted_with_marks(&item);
-        assert!(
-            marks.is_empty(),
-            "an unrecognised brand painted a badge: {marks:?}"
-        );
-        // ...and the blue the tile DOES hold is the card KIND mark, which
-        // every card gets and which says nothing about the network. Asserted
-        // rather than merely excluded, so the split above cannot become a
-        // place a stray badge hides.
-        assert_eq!(
-            in_tile.len(),
-            1,
-            "the header tile did not draw the card mark's one filled stripe: {in_tile:?}"
-        );
-        assert!(
-            contains(&texts, "• •••• •••• 0123"),
-            "the number did not mask to the length actually stored: {texts:?}"
-        );
-        // The control, and it is what makes the emptiness above mean
-        // something: the SAME pane with a brand it does know paints exactly
-        // one mark, at the size the pane draws it.
-        let (_, visa, _) = painted_with_marks(&a_full_card());
-        assert_eq!(
-            visa.len(),
-            1,
-            "a recognised brand painted {} marks, so 'none' proves nothing: {visa:?}",
-            visa.len()
-        );
-        assert_eq!(
-            visa[0].height(),
-            BRAND_MARK_SIZE,
-            "the network mark is not drawn at the pane's own mark height"
-        );
-        // The WORD, which is the whole point of the mark: the pane no longer
-        // draws the brand as a text row, so this mark is the only thing on the
-        // pane that says which network the card is on.
-        assert!(
-            contains(&painted(&a_full_card(), &TotpState::NoSecret), CardBrand::Visa.wordmark()),
-            "the mark did not paint the network's own word"
-        );
-    }
-
-    /// Everything a card's read pane painted that this module's brand-mark
-    /// tests care about: its runs with their boxes, the blue wordmark grounds,
-    /// and the TEXTURED rects -- which is what a logo is.
-    fn painted_with_logos(
-        item: &VaultItem,
-        marks: Option<std::path::PathBuf>,
-    ) -> (Vec<(String, egui::Rect)>, Vec<egui::Rect>, Vec<egui::Rect>) {
-        fn walk(
-            shape: &egui::Shape,
-            texts: &mut Vec<(String, egui::Rect)>,
-            grounds: &mut Vec<egui::Rect>,
-            images: &mut Vec<egui::Rect>,
-            tiles: &mut Vec<egui::Rect>,
-        ) {
-            match shape {
-                egui::Shape::Rect(rect) if rect.brush.is_some() => images.push(rect.rect),
-                // The header avatar tile's own blue-wash square, and anything
-                // blue inside it, belong to `kind_mark`'s glyph and not to a
-                // wordmark pill -- see `painted_with_marks`, which makes the
-                // same split for the same reason.
-                // Matched by GEOMETRY, not by fill. The tile behind a drawn
-                // mark carries no fill at all any more ("secnote and other
-                // icons have gray background - they should not"), so a
-                // `BLUE_WASH` test finds nothing and every claim below is then
-                // made about a pane nobody found.
-                egui::Shape::Rect(rect)
-                    if (rect.rect.width() - HEADER_AVATAR).abs() < 0.5
-                        && (rect.rect.height() - HEADER_AVATAR).abs() < 0.5 =>
-                {
-                    tiles.push(rect.rect);
-                }
-                egui::Shape::Rect(rect) if rect.fill == theme::BLUE => grounds.push(rect.rect),
-                egui::Shape::Text(text) => {
-                    texts.push((
-                        text.galley.text().to_string(),
-                        // Where it was PAINTED: a galley's own rect is local to
-                        // itself and starts at the origin.
-                        egui::Rect::from_min_size(text.pos, text.galley.size()),
-                    ))
-                }
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, texts, grounds, images, tiles);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let shapes =
-            frame_shapes_with_marks(item, &TotpState::NoSecret, RevealState::default(), marks);
-        let (mut texts, mut grounds, mut images) = (Vec::new(), Vec::new(), Vec::new());
-        let mut tiles = Vec::new();
-        for clipped in &shapes {
-            walk(&clipped.shape, &mut texts, &mut grounds, &mut images, &mut tiles);
-        }
-        grounds.retain(|g| !tiles.iter().any(|t| t.contains_rect(*g)));
-        // The tile is not optional on this pane: the header always draws one,
-        // so an empty list here means the walk missed it and every `grounds`
-        // claim below is being made about a pane nobody found.
-        assert!(!tiles.is_empty(), "no header avatar tile was painted at all");
-        (texts, grounds, images)
-    }
-
-    /// **The read pane's own brand mark, drawn from a logo file.** The list row
-    /// has its own tests; this is the second surface, and the two have to
-    /// agree -- one mark, of one kind at a time, in a box the digits beside it
-    /// were laid out around.
-    #[test]
-    fn a_supplied_logo_replaces_the_word_on_the_read_pane_too() {
-        let dir = crate::brand_mark::tests::tempdir("detail-marks");
-        std::fs::write(
-            dir.join(crate::brand_mark::file_name(CardBrand::Visa).expect("a name")),
-            crate::brand_mark::tests::on_ground_png(300, 100, 46),
-        )
-        .expect("the fixture was written");
-
-        // The control first: the same card with nowhere to look draws the
-        // word, so everything below is about the FILE and not about the card.
-        let (texts, grounds, images) = painted_with_logos(&a_full_card(), None);
-        assert!(images.is_empty(), "an image was drawn with no marks directory");
-        assert!(!grounds.is_empty(), "the control did not draw its wordmark pill");
-        assert!(
-            texts.iter().any(|(t, _)| t == CardBrand::Visa.wordmark()),
-            "the control did not draw the word"
-        );
-
-        let control_digits = texts
-            .iter()
-            .find(|(t, _)| t.contains("4242"))
-            .map(|(t, _)| t.clone())
-            .expect("the control painted the card number");
-
-        let (texts, grounds, images) = painted_with_logos(&a_full_card(), Some(dir.to_path_buf()));
-        assert_eq!(images.len(), 1, "the logo was not drawn on the read pane");
-        assert!(
-            grounds.is_empty(),
-            "the pane drew the logo AND the blue wordmark pill under it: {grounds:?}"
-        );
-        assert!(
-            !texts.iter().any(|(t, _)| t == CardBrand::Visa.wordmark()),
-            "the word was painted as well as the logo"
-        );
-        // The box the mark was given is the pane's own mark height, exactly as
-        // the wordmark's is -- so the Number row's arithmetic, which reserves
-        // `card_mark::mark_width` before deciding how the digits fit, reserved
-        // the right box.
-        assert!(
-            images[0].height() <= BRAND_MARK_SIZE + 0.01,
-            "the logo is {}pt tall in a {BRAND_MARK_SIZE}pt box",
-            images[0].height()
-        );
-        // ...and the digits start after it rather than under it, which is the
-        // failure a mark measured one way and drawn another produces.
-        let digits = texts
-            .iter()
-            .find(|(t, _)| t.contains("4242"))
-            .map(|(_, r)| *r)
-            .expect("the card number was painted");
-        assert!(
-            digits.left() >= images[0].right(),
-            "the digits at {digits:?} start inside the logo at {:?}",
-            images[0]
-        );
-
-        // **The owner's own shape of file: a wide wordmark on transparency**
-        // (`visa.png` is 210x69). Fitted to the box rather than to the word's
-        // cap height it is the widest thing this row has drawn -- about 58pt
-        // of box, where it took 33 at the cap height -- so this is the case
-        // where a logo could crowd the digits.
-        std::fs::write(
-            dir.join(crate::brand_mark::file_name(CardBrand::Visa).expect("a name")),
-            crate::brand_mark::tests::isolated_png(210, 69, 65),
-        )
-        .expect("the fixture was replaced");
-        let (texts, _, images) = painted_with_logos(&a_full_card(), Some(dir.to_path_buf()));
-        assert_eq!(images.len(), 1, "the wide logo was not drawn on the read pane");
-        let inner = BRAND_MARK_SIZE - 2.0 * card_mark::LOGO_INSET;
-        assert!(
-            (images[0].height() - inner).abs() < 0.01,
-            "the logo is {}pt tall on an {BRAND_MARK_SIZE}pt row -- not the {inner}pt the box \
-             less its inset gives it",
-            images[0].height()
-        );
-        let (shown, digits) = texts
-            .iter()
-            .find(|(t, _)| t.contains("4242"))
-            .cloned()
-            .expect("the card number was painted beside the wide logo");
-        assert!(
-            digits.left() >= images[0].right(),
-            "the digits at {digits:?} start inside the wide logo at {:?}",
-            images[0]
-        );
-        assert_eq!(
-            shown, control_digits,
-            "the wider logo cost the masked number characters on a pane with room for both"
-        );
-    }
-
     #[test]
     fn the_ssh_private_key_is_not_painted_by_default() {
         let texts = painted(&an_ssh_key_item(), &TotpState::NoSecret);
@@ -18202,126 +16398,6 @@ mod tests {
     // Design 2b, the header strip.
     // -----------------------------------------------------------------
 
-    /// The report this work came from, as an assertion. Design 2b's detail
-    /// column is `background: #f7f6f5` and the *only* white element on it is
-    /// the header strip, which spans the pane's full width from its very top.
-    #[test]
-    fn the_pane_is_the_warm_grey_and_the_strip_across_its_top_is_the_white() {
-        assert_ne!(
-            theme::CARD,
-            theme::WINDOW_BG,
-            "this whole test is vacuous if the two surfaces are the same colour"
-        );
-        let rects = painted_rects(&an_item(Some(1)), &TotpState::NoSecret);
-        let pane = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(PANE, PANE));
-        assert!(
-            rects
-                .iter()
-                .any(|(r, fill)| *fill == theme::WINDOW_BG && r.contains_rect(pane)),
-            "the pane is not filled with the design's #f7f6f5: {rects:?}"
-        );
-        let strip = rects
-            .iter()
-            .find(|(r, fill)| {
-                *fill == theme::CARD && r.top() == 0.0 && r.left() == 0.0 && r.right() == PANE
-            })
-            .unwrap_or_else(|| panic!("no full-width white header strip at the top: {rects:?}"));
-        assert!(
-            strip.0.height() >= 84.0,
-            "the strip is shorter than the design's 20px padding + 44px avatar + 20px \
-             padding: {:?}",
-            strip.0
-        );
-    }
-
-    /// The strip's own grid: `padding: 20px 24px`, a [`HEADER_ROW`]-high
-    /// content band holding a [`HEADER_AVATAR`] tile, `gap: 14px`, then a
-    /// 22px/800 title over a 12px subtitle.
-    ///
-    /// **The avatar is 32 and the row is still 44**, which is the pair this
-    /// test exists to keep apart. The tile was taken to 32 to match the list
-    /// row's; the ROW it sits in is design 2b's 44px and did not move with it.
-    /// Asserting only the tile would let the strip's height follow the tile
-    /// down (it did: 84 -> 80.1, the title column silently becoming the
-    /// tallest child), and asserting only the row would let the tile drift
-    /// back up. So both, plus the centring that relates them -- a 32pt tile
-    /// hanging from the top of a 44pt band is the third failure available
-    /// here, and it is the one `ui.horizontal` actually produced.
-    #[test]
-    fn the_header_strip_lays_its_avatar_and_title_out_on_the_designs_grid() {
-        let item = an_item(Some(1));
-        let rects = painted_rects(&item, &TotpState::NoSecret);
-        let avatar = rects
-            .iter()
-            // Found by GEOMETRY. The tile carries no fill any more -- the
-            // owner's ruling on the grey square inside it -- so a
-            // `BLUE_WASH` test finds nothing and this panics on a header
-            // that is laid out perfectly well.
-            .find(|(r, _)| r.width() == HEADER_AVATAR && r.height() == HEADER_AVATAR)
-            .unwrap_or_else(|| {
-                panic!("no {HEADER_AVATAR}px avatar tile in the header: {rects:?}")
-            });
-        assert_eq!(
-            avatar.0.left(),
-            24.0,
-            "the avatar is not at the strip's 24px left padding"
-        );
-        // Centred in the band, not hung from its top: 20px of padding plus
-        // half the slack between the row and the tile.
-        let slack = (HEADER_ROW - HEADER_AVATAR) / 2.0;
-        assert_eq!(
-            avatar.0.top(),
-            20.0 + slack,
-            "the avatar is not centred in the strip's {HEADER_ROW}px content row -- at the \
-             strip's 20px top padding it is hanging from the row's top edge instead"
-        );
-        // The same claim from the other side, and the one that actually says
-        // "centred": the tile's middle is the row's middle. This is also the
-        // number that did NOT move when the tile went 44 -> 32.
-        assert_eq!(
-            avatar.0.center().y,
-            20.0 + HEADER_ROW / 2.0,
-            "the avatar's centre is off the content row's centre"
-        );
-        // And the row is still the design's, so the strip did not follow the
-        // tile down when the tile shrank.
-        let strip = rects
-            .iter()
-            .find(|(r, fill)| *fill == theme::CARD && r.top() == 0.0 && r.left() == 0.0)
-            .unwrap_or_else(|| panic!("no white header strip: {rects:?}"));
-        assert_eq!(
-            strip.0.height(),
-            20.0 + HEADER_ROW + 20.0,
-            "the strip is not 20px padding + a {HEADER_ROW}px row + 20px padding -- its \
-             height has gone back to being whatever its tallest child happened to be"
-        );
-
-        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
-        let (title, title_font) = only(&painted, "Sample");
-        assert_eq!(
-            title.left(),
-            24.0 + HEADER_AVATAR + HEADER_GAP,
-            "the title is not 24 + {HEADER_AVATAR} + {HEADER_GAP} from the pane's left edge"
-        );
-        assert_eq!(title_font.size, 22.0, "the title is not the design's 22px");
-        assert_eq!(
-            title_font.family,
-            egui::FontFamily::Name(theme::EXTRABOLD.into()),
-            "the title is not the design's 800 weight"
-        );
-
-        let (subtitle, subtitle_font) = only(&painted, "Login");
-        assert_eq!(
-            subtitle.left(),
-            24.0 + HEADER_AVATAR + HEADER_GAP,
-            "the subtitle does not share the title's column"
-        );
-        assert_eq!(
-            subtitle_font.size, 12.0,
-            "the subtitle is not the design's 12px"
-        );
-    }
-
     // `the_header_primary_button_is_the_designs_34px_filled_control` stood
     // here and is DELETED. Every one of its assertions was about the header's
     // "Fill in app" button -- that a 34px `theme::BLUE`-filled rect existed,
@@ -18337,202 +16413,6 @@ mod tests {
     // their private galley/width helpers and the `HEADER_PRIMARY_*` numbers.
     // `theme.rs` carries the tombstone. `theme::HEADER_BUTTON_HEIGHT` stays,
     // and is what the band below is now derived from.
-
-    /// The two drawn controls are square at the strip's own 34px control
-    /// height, so their HIT TARGETS are the strip's full 34px band rather
-    /// than being only as big as the marks they paint.
-    ///
-    /// A star drawn at its own 18px would look identical in a screenshot and
-    /// be half as easy to hit, which is exactly the kind of regression a
-    /// shape-drawn control invites: nothing about the painted geometry says
-    /// how big the clickable area is.
-    ///
-    /// **The band used to be read off the header's "Fill in app" button**,
-    /// which stood between these two and was the one 34px `theme::BLUE` rect
-    /// in the strip. That button was removed at the user's request, so the
-    /// band is now derived from [`theme::HEADER_BUTTON_HEIGHT`] -- the very
-    /// constant the strip lays itself out with -- centred on each mark. The
-    /// defect this was written for is untouched by that change: an 18px star
-    /// still fails the edge click 15pt above its own centre, and the two
-    /// controls are still required to share one centre line.
-    #[test]
-    fn the_star_and_the_kebab_share_the_strips_34px_hit_target() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let frame = pane.idle(&item, &TotpState::NoSecret);
-        let star = frame.star().rect;
-        let kebab = frame.kebab();
-        let band = theme::HEADER_BUTTON_HEIGHT;
-        assert_eq!(band, 34.0, "the strip's control height is no longer the design's 34px");
-
-        // The marks are smaller than the band they sit in, so the painted
-        // geometry alone cannot say how big the hit target is. Two things
-        // can: that both sit on ONE centre line, and that a click near the
-        // TOP EDGE of the 34px band -- well outside the marks themselves --
-        // still activates each of them.
-        assert!(
-            (star.center().y - kebab.center().y).abs() <= 0.5,
-            "the star and the kebab are not on one centre line: {star:?} {kebab:?}"
-        );
-        for (name, mark) in [("star", star), ("kebab", kebab)] {
-            assert!(
-                mark.height() < band,
-                "the {name}'s painted mark already fills the whole 34px band, so the \
-                 edge click below proves nothing about its hit target"
-            );
-        }
-
-        let corner =
-            |mark: egui::Rect| egui::pos2(mark.center().x, mark.center().y - band / 2.0 + 2.0);
-
-        let mut star_pane = Pane::new();
-        let _ = star_pane.idle(&item, &TotpState::NoSecret);
-        let poked = star_pane.click(&item, &TotpState::NoSecret, corner(star));
-        assert_eq!(
-            poked.action,
-            DetailAction::ToggleFavorite(true),
-            "a click 2pt below the strip's top edge, over the star's column, missed the \
-             star -- its target is smaller than the 34px control beside it"
-        );
-
-        let mut kebab_pane = Pane::new();
-        let _ = kebab_pane.idle(&item, &TotpState::NoSecret);
-        let _ = kebab_pane.click(&item, &TotpState::NoSecret, corner(kebab));
-        assert!(
-            kebab_pane.idle(&item, &TotpState::NoSecret).painted("Delete"),
-            "a click 2pt below the strip's top edge, over the kebab's column, did not \
-             open the menu -- its target is smaller than the 34px control beside it"
-        );
-    }
-
-    /// **The strip fits at the width the app can actually be shrunk to, and
-    /// this is the defect that motivated the whole change.**
-    ///
-    /// Every other geometry test in this file lays the pane out at
-    /// [`PANE`] -- 900pt, which is a ~1500px window. The app's own minimum
-    /// is 900px WIDE IN TOTAL, and at that size the detail column is
-    /// [`MIN_PANE`]: 298pt. With four worded buttons in this strip, the
-    /// primary ("Fill in app", since removed) was measured painting at
-    /// x = -34.5..21.9 -- entirely off the pane -- and "Favourite"
-    /// overlapping the item's own title. Nothing caught it, because nothing
-    /// tried that width.
-    ///
-    /// The first attempt at this test asserted two things -- controls inside
-    /// the pane, and `control.left() >= title.right()` -- and both held while
-    /// the strip was, in fact, broken in three separate ways. The star was
-    /// painted at x = 27.3..45.9, on top of an avatar tile occupying
-    /// 24.0..68.0; the title was elided to a single "…" at x = 5.6..27.2, in
-    /// the strip's own left padding; and the white strip itself started at
-    /// x = -18.4, off the left edge of the pane. The non-overlap assertion
-    /// passed by 0.1pt, and only because the title had collapsed to nothing.
-    ///
-    /// So this checks the four things that state actually violated:
-    ///
-    /// * every control inside the pane -- what the original test meant;
-    /// * every control clear of the AVATAR, which nothing looked at;
-    /// * the strip's own rect inside the pane, which is a layout overflow
-    ///   independent of anything in it;
-    /// * the title's RENDERED glyphs -- not `Galley::text()`, which returns
-    ///   the source string and reported the full 26-character name off a
-    ///   galley that drew one ellipsis.
-    ///
-    /// Rect intersection rather than a left/right comparison, because the
-    /// controls are not necessarily beside the title any more: below about
-    /// 420pt they move to their own line under it (see `header_layout`), and
-    /// a one-axis test would then be trivially satisfied.
-    #[test]
-    fn every_header_control_fits_inside_the_minimum_width_pane() {
-        let mut item = a_login();
-        // A name long enough to want the room, since a short one leaves
-        // slack that would hide exactly the overlap this pins.
-        item.name = "Ledgerline Treasury Portal".to_string();
-
-        let mut pane = Pane::wide(MIN_PANE);
-        let frame = pane.idle(&item, &TotpState::NoSecret);
-        let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
-
-        let title = frame.rect_of("Ledgerline Treasury Portal");
-        let avatar = frame.avatar_tile();
-        // The header's "Fill in app" button was a third entry here until it
-        // was removed at the user's request. The two that remain are the two
-        // the original defect actually mispainted -- the star sat on the
-        // avatar at 27.3..45.9 -- so every clause below still fails against
-        // the state this test was written for.
-        let controls = [
-            ("the favourite star", frame.star().rect),
-            ("the kebab", frame.kebab()),
-        ];
-
-        for (name, rect) in controls {
-            assert!(
-                bounds.contains_rect(rect),
-                "{name} is painted at x = {}..{} on a {MIN_PANE}pt pane -- outside it",
-                rect.left(),
-                rect.right()
-            );
-            assert!(
-                !rect.intersects(avatar),
-                "{name} is painted ON TOP of the item's avatar at the app's minimum window \
-                 width: {name} {rect:?}, avatar {avatar:?}"
-            );
-            assert!(
-                !rect.intersects(title),
-                "{name} is painted ON TOP of the item's title at the app's minimum window \
-                 width: {name} {rect:?}, title {title:?}"
-            );
-        }
-
-        assert!(
-            bounds.contains_rect(frame.header_strip()),
-            "the white header strip itself runs to {:?} on a {MIN_PANE}pt pane -- it is \
-             painting outside the column it belongs to",
-            frame.header_strip()
-        );
-
-        // THE FOURTH THING THE DOC ABOVE CLAIMS, which for four commits this
-        // body did not do. `rect_of` reads `texts`, which is the galley's
-        // SOURCE string -- the exact channel the doc says this avoids -- so
-        // the state this test was written for (the title elided to a lone
-        // "…" at x = 5.6..27.2) reported the full 26-character name and
-        // satisfied every rect assertion above. `header_layout`'s final
-        // branch with `stacked: false` restores that state at 298pt;
-        // `the_title_is_never_reduced_to_an_ellipsis_at_any_width` fails on
-        // it and, until this, nothing here did.
-        //
-        // Same threshold as that sweep, so the two agree on what "still a
-        // name" means: the ellipsis and the spaces do not count, and "…",
-        // " …" and "L…" are all the same failure.
-        let rendered = frame.rendered_glyphs("Ledgerline Treasury Portal");
-        let readable = rendered
-            .chars()
-            .filter(|c| *c != '\u{2026}' && !c.is_whitespace())
-            .count();
-        assert!(
-            readable >= 6,
-            "at the {MIN_PANE}pt minimum pane the header DREW {rendered:?} for a title of \
-             {:?} -- the name has been truncated past the point of being a name, and the \
-             rect assertions above pass precisely because it collapsed",
-            item.name
-        );
-
-        // The positive control. Without it, a pane that painted no header at
-        // all would satisfy every assertion above by vacuity -- and
-        // `rect_of` would have caught that, but only for the two strings;
-        // the star and the kebab are found by shape, and "no star" is not
-        // distinguishable from "a star that fits" without this.
-        assert_eq!(frame.stars.len(), 1, "no star painted at the minimum width");
-        assert_eq!(frame.kebab_dots.len(), 3, "no kebab painted at the minimum width");
-        assert_eq!(
-            frame.envelopes.len(),
-            1,
-            "no Send envelope painted at the minimum width"
-        );
-        assert_eq!(
-            frame.pane_closes.len(),
-            1,
-            "no close ✕ painted at the minimum width"
-        );
-    }
 
     /// **A band, not a width.** The defect the test above pins was not a
     /// property of 298pt: the title was a bare "…" everywhere from 298 up to
@@ -18587,17 +16467,26 @@ mod tests {
                  outside the column"
             );
             let avatar = frame.avatar_tile();
-            for (name, rect) in [
-                ("the favourite star", frame.star().rect),
-                ("the Send envelope", frame.envelope().0),
-                ("the kebab", frame.kebab()),
-                ("the close ✕", frame.pane_close().0),
-                // The fifth control. The sweep's item is a login, so it is
-                // drawn at every width here -- and it is the control the
-                // reservation grew for, which makes it the one most likely
-                // to be the mark pushed off the pane.
-                ("the one-time code clock", frame.clock().0),
-            ] {
+            // Every control the v2 header drew at this width: the squares by
+            // their ids, the worded buttons by their words.
+            let controls: Vec<(&str, egui::Rect)> = [
+                ("Close", HeaderControl::Close),
+                ("the star", HeaderControl::Favourite),
+                ("more", HeaderControl::More),
+                ("the Fill square", HeaderControl::Fill),
+                ("the Edit square", HeaderControl::Edit),
+            ]
+            .into_iter()
+            .filter_map(|(name, which)| pane.ctx.read_response(header_control_id(which)).map(|r| (name, r.rect)))
+            .chain(
+                [FILL_LABEL, SHARE_LABEL, EDIT_LABEL]
+                    .into_iter()
+                    .filter(|label| frame.painted(label))
+                    .map(|label| (label, frame.rect_of(label))),
+            )
+            .collect();
+            assert!(controls.len() >= 5, "at {width}pt the header drew only {controls:?}");
+            for (name, rect) in controls {
                 assert!(
                     bounds.contains_rect(rect),
                     "at a {width}pt pane {name} is painted at {rect:?} -- outside the column"
@@ -18623,262 +16512,6 @@ mod tests {
             MIN_PANE < PANE,
             "the minimum-width test is laying out a WIDER pane than the ordinary one"
         );
-    }
-
-    /// **`header_layout` still has two answers, and the stacked one is still
-    /// the answer at the app's own minimum.**
-    ///
-    /// Removing the header's "Fill in app" button took a rung off this
-    /// ladder: the strip's controls used to be a per-item width with a
-    /// shortcut hint that could be shed, and are now [`header_controls`]
-    /// fixed squares. A collapse that far can quietly leave a function with
-    /// one reachable branch, and this is the pane whose controls were once
-    /// painted at x = -34.5 -- so the branch that keeps them off the title at
-    /// 298pt is asserted directly rather than inferred from the sweep above.
-    ///
-    /// The controls' width is spelled the way `draw_detail_read` spells it,
-    /// and the content width the way the strip's `Frame` produces it, so this
-    /// cannot pass on numbers the real header does not use. It went from two
-    /// controls to four when the ✉ and the ✕ were added -- moving the
-    /// threshold from ~322pt to ~418pt -- and to FIVE when the ⏱ was, which
-    /// moves it again, to ~466pt. The sweep above runs to 560 and still
-    /// crosses it.
-    ///
-    /// **Asserted at both counts**, because the ⏱ is drawn for some items
-    /// and not others: a stacking rule checked only at the wider of the two
-    /// is a rule checked for logins and assumed for everything else.
-    #[test]
-    fn the_header_stacks_at_the_minimum_pane_and_does_not_on_a_wide_one() {
-        let content = |pane: f32| pane - f32::from(HEADER_PAD_X) * 2.0;
-        let width_of = |item: &VaultItem| {
-            let n = header_controls(item);
-            theme::HEADER_BUTTON_HEIGHT * n as f32 + HEADER_GAP * (n - 1) as f32
-        };
-        // A login draws five controls and a card four -- the premise for the
-        // loop below being two cases and not one twice.
-        let login = a_login();
-        let card = a_full_card();
-        assert_eq!(
-            (header_controls(&login), header_controls(&card)),
-            (HEADER_CONTROLS_ALWAYS + 1, HEADER_CONTROLS_ALWAYS),
-            "these two items no longer draw different numbers of controls, so this test is \
-             checking one arrangement twice"
-        );
-
-        for (what, item) in [("a login", &login), ("a card", &card)] {
-            let controls = width_of(item);
-            assert!(
-                header_layout(content(MIN_PANE), controls).stacked,
-                "at the app's minimum, with {what} selected, the controls and a \
-                 {TITLE_MIN}pt title are being kept on one line -- which is how the strip \
-                 painted a control off the pane before"
-            );
-            assert!(
-                !header_layout(content(PANE), controls).stacked,
-                "the ordinary {PANE}pt pane is stacking with {what} selected, so the \
-                 unstacked branch is dead"
-            );
-        }
-    }
-
-    /// **Every control still fits inside the app's own minimum window.**
-    ///
-    /// [`header_layout`] answers "stacked" or "not", and neither answer is
-    /// "they do not fit at all": the stacked branch gives the controls a row
-    /// of the full content width and then trusts them to live in it. That
-    /// trust was worth little while the strip drew four fixed squares with
-    /// 24pt to spare; the ⏱ spends 48 of that, leaving 24, and a SIXTH
-    /// control would overflow the narrowest pane this app can be with no
-    /// branch left to take.
-    ///
-    /// So the arithmetic is asserted rather than left implied -- at the
-    /// widest count the strip can draw, which is the login's.
-    ///
-    /// **Six now, with design 6a's Share control**, and six at the full
-    /// [`HEADER_GAP`] do NOT fit: 6 x 34 + 5 x 14 is 274 against the stacked
-    /// row's 250. That is the overflow this test's doc predicted for a sixth
-    /// control, and the answer is [`controls_gap`]: the stacked row closes the
-    /// gaps between its controls -- never below the mock's own 2 -- until the
-    /// row fits, and stays at `HEADER_GAP` wherever it already did. So the
-    /// arithmetic is asserted at the gap the row is really drawn with.
-    #[test]
-    fn the_strips_controls_fit_the_apps_minimum_window() {
-        let item = a_login();
-        let people = PeopleSharing { share_control: Some(ShareControl::Share), ..PeopleSharing::default() };
-        let n = header_controls_for(&item, &people);
-        assert_eq!(n, 6, "a login with the Share control is the widest strip there is");
-        let content = MIN_PANE - f32::from(HEADER_PAD_X) * 2.0;
-        let at_full_gap = theme::HEADER_BUTTON_HEIGHT * n as f32 + HEADER_GAP * (n - 1) as f32;
-        assert!(
-            header_layout(content, at_full_gap).stacked,
-            "the minimum pane is not stacking, so the controls are not getting the full \
-             content width this assertion assumes"
-        );
-        let gap = controls_gap(content, n);
-        let controls = theme::HEADER_BUTTON_HEIGHT * n as f32 + gap * (n - 1) as f32;
-        assert!(
-            controls <= content + 0.01,
-            "at the app's minimum the strip's {n} controls want {controls}pt and the \
-             stacked row has {content}pt -- a control is being painted off the pane, which \
-             is the exact failure this file has already shipped once"
-        );
-        assert!(gap >= HEADER_CONTROLS_MIN_GAP, "the controls are touching: a {gap}pt gap");
-        assert_eq!(
-            controls_gap(PANE - f32::from(HEADER_PAD_X) * 2.0, n),
-            HEADER_GAP,
-            "a row with room to spare keeps the strip's own gap"
-        );
-    }
-
-    /// **All six controls, painted at the app's minimum pane**: each inside
-    /// the column, none on another, none on the avatar -- the property
-    /// [`controls_gap`] exists for, read off the frame rather than the sum.
-    #[test]
-    fn six_controls_are_painted_inside_the_minimum_pane_and_apart() {
-        let item = a_login();
-        let mut pane = Pane::wide(MIN_PANE).with_share_control(ShareControl::Share);
-        let frame = pane.idle(&item, &TotpState::NoSecret);
-        let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
-        let (share, _) = frame.shares.first().copied().expect("the Share control");
-        let marks = [
-            ("the favourite star", frame.star().rect),
-            ("the Send envelope", frame.envelope().0),
-            ("the Share control", share),
-            ("the one-time code clock", frame.clock().0),
-            ("the kebab", frame.kebab()),
-            ("the close ✕", frame.pane_close().0),
-        ];
-        let avatar = frame.avatar_tile();
-        for (i, (name, rect)) in marks.iter().enumerate() {
-            assert!(bounds.contains_rect(*rect), "{name} is painted at {rect:?}, outside the column");
-            assert!(!rect.intersects(avatar), "{name} is painted on the avatar");
-            for (other, theirs) in &marks[i + 1..] {
-                assert!(!rect.intersects(*theirs), "{name} {rect:?} overlaps {other} {theirs:?}");
-            }
-        }
-        // Left to right: the envelope, then Share straight after it (6a).
-        assert!(frame.envelope().0.center().x < share.center().x);
-        assert!(share.center().x < frame.clock().0.center().x);
-    }
-
-    /// **The strip reserves room for exactly the controls it draws.**
-    ///
-    /// [`header_controls`] is read before anything is painted, to decide
-    /// whether the strip fits on one line, and `draw_controls` is what
-    /// actually paints. Drift between those two is not hypothetical: it is
-    /// the failure mode that put a control at x = -34.5, entirely off the
-    /// pane, under a title running straight through the buttons.
-    ///
-    /// So the count is not merely shared -- the controls PAINTED are counted
-    /// off the shape tree and compared to it. A sixth control added to
-    /// `draw_controls` and not to the function reds here, at the pane width
-    /// where the reservation matters most.
-    ///
-    /// Each control is found by its own probe, which is also what makes this
-    /// a count of *different* marks rather than of that many of anything: a
-    /// star found five times would not satisfy it.
-    ///
-    /// **Run for BOTH answers the strip can give**, since [`header_controls`]
-    /// is a function of the item now: a login, which gets the ⏱, and a card,
-    /// which does not. A reservation checked at one answer of a two-answer
-    /// function is a reservation that has been checked once.
-    ///
-    /// **And for both answers of the Share control** (design 6a): drawn, it
-    /// is one more control and [`header_controls_for`] must count it; not
-    /// drawn, it must not be painted. Four cases, not two.
-    ///
-    /// **And for a received record** (mock 6d), whose strip is the ⋮ and the
-    /// ✕ alone: the four marks that write -- or share it on -- are asserted
-    /// ABSENT, and the reservation must shrink with them. A reservation for
-    /// more than is painted only wastes room; for fewer, it is the x = -34.5
-    /// defect, which is why the count and the drawing changed together.
-    #[test]
-    fn the_strip_reserves_room_for_every_control_it_draws() {
-        // An `edit: false` item the view names no sharer for: a read-only
-        // organisation collection's, or a received record before the view
-        // has arrived. View-only all the same (`pane_writable`).
-        let mut unnamed = a_login();
-        unnamed.other.insert("edit".into(), serde_json::Value::Bool(false));
-        for (what, item, share, from) in [
-            ("a login", a_login(), None, None),
-            ("a card", a_full_card(), None, None),
-            ("a login with Share", a_login(), Some(ShareControl::Share), None),
-            ("a card with Share greyed", a_full_card(), Some(ShareControl::Disabled("too old")), None),
-            ("a received login", a_login(), None, Some("denis@x.io")),
-            ("a received card", a_full_card(), None, Some("denis@x.io")),
-            ("an unnamed edit:false login offered Share", unnamed, Some(ShareControl::Share), None),
-        ] {
-            let mut pane = Pane::wide(MIN_PANE);
-            if let Some(offered) = share {
-                pane = pane.with_share_control(offered);
-            }
-            if let Some(from) = from {
-                pane = pane.view_only(from);
-            }
-            let people = PeopleSharing { share_control: share, view_only_from: from, ..PeopleSharing::default() };
-            let frame = pane.idle(&item, &TotpState::NoSecret);
-            let view_only = from.is_some() || !crate::vault_bridge::may_edit(&item);
-
-            let mut painted = vec![
-                // Three dots, one control -- `Frame::kebab` is what asserts
-                // the count of dots, and it is called here for that assertion.
-                ("the kebab", usize::from(!frame.kebab_dots.is_empty())),
-                ("the close ✕", frame.pane_closes.len()),
-            ];
-            if view_only {
-                for (name, count) in [
-                    ("star", frame.stars.len()),
-                    ("envelope", frame.envelopes.len()),
-                    ("clock", frame.clocks.len()),
-                    ("Share control", frame.shares.len()),
-                ] {
-                    assert_eq!(count, 0, "{what} was drawn a {name}, and a view-only record takes no write");
-                }
-            } else {
-                painted.push(("the favourite star", frame.stars.len()));
-                painted.push(("the Send envelope", frame.envelopes.len()));
-            }
-            // The conditional one, listed only where it is meant to be drawn
-            // -- and its ABSENCE asserted on the other item, so a ⏱ that
-            // started appearing on cards fails here rather than merely making
-            // two counts agree with each other.
-            if view_only {
-                // Asserted absent above.
-            } else if item_takes_a_one_time_code(&item) {
-                painted.push(("the one-time code clock", frame.clocks.len()));
-            } else {
-                assert!(
-                    frame.clocks.is_empty(),
-                    "{what} was drawn a one-time-code clock, and there is nothing on it \
-                     for a code to go into"
-                );
-            }
-            if view_only {
-                // Asserted absent above -- even where the window resolved
-                // one, which is the unnamed `edit: false` case's point.
-            } else if share.is_some() {
-                painted.push(("the Share control", frame.shares.len()));
-            } else {
-                assert!(frame.shares.is_empty(), "{what} was drawn a Share control nobody resolved");
-            }
-            let _ = frame.kebab();
-            for (name, count) in &painted {
-                assert_eq!(
-                    *count, 1,
-                    "with {what} selected the header painted {count} of {name}, so the \
-                     count below is not counting distinct controls"
-                );
-            }
-            assert_eq!(
-                painted.len(),
-                header_controls_for(&item, &people),
-                "with {what} selected the strip draws {} controls and reserves room for \
-                 {} -- a control the reservation does not know about is a control that \
-                 gets painted off the pane",
-                painted.len(),
-                header_controls_for(&item, &people)
-            );
-        }
     }
 
     /// **A received record is view-only** (mock 6d): the subtitle says who
@@ -19031,21 +16664,6 @@ mod tests {
         }
     }
 
-    /// **Two controls fit anywhere, at the strip's own gap**: the six-control
-    /// strip closes its gaps at the minimum pane (`controls_gap`); the
-    /// received record's ⋮ and ✕ never need to.
-    #[test]
-    fn a_received_records_strip_keeps_its_gap_at_the_minimum_pane() {
-        let people = PeopleSharing { view_only_from: Some("denis@x.io"), ..PeopleSharing::default() };
-        let n = header_controls_for(&a_login(), &people);
-        assert_eq!(n, 2, "the kebab and the close");
-        assert_eq!(controls_gap(MIN_PANE - f32::from(HEADER_PAD_X) * 2.0, n), HEADER_GAP);
-        let mut pane = Pane::wide(MIN_PANE).view_only("denis@x.io");
-        let frame = pane.idle(&a_login(), &TotpState::NoSecret);
-        let bounds = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(MIN_PANE, PANE));
-        assert!(bounds.contains_rect(frame.kebab()) && bounds.contains_rect(frame.pane_close().0));
-    }
-
     /// **An `edit: false` item the view names no sharer for is view-only
     /// too** -- a read-only organisation collection's, or a received record
     /// before the view arrives. Its strip is the ⋮ and the ✕, its ⋮ says so
@@ -19095,333 +16713,6 @@ mod tests {
             }
             assert!(opened.iter().any(|t| t == VIEW_ONLY_FOOTER), "{out:?}: says nothing: {opened:?}");
         }
-    }
-
-    /// **The ✕ reports `ClosePane`, and the ✉ reports `SendRecord`.**
-    ///
-    /// Pressed for real, at the position the header actually painted each
-    /// mark, and each asserted to produce its OWN action -- the pair, not one
-    /// at a time, because a `draw_controls` that wired both clicks to the
-    /// same variant would pass either test alone.
-    #[test]
-    fn the_two_new_header_controls_each_report_their_own_action() {
-        let item = a_login();
-
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let close_at = laid_out.pane_close().0.center();
-        let envelope_at = laid_out.envelope().0.center();
-        assert!(
-            !close_at.any_nan() && !envelope_at.any_nan(),
-            "the header painted no ✕ or no envelope to press"
-        );
-
-        let mut pane = Pane::new();
-        let _ = pane.idle(&item, &TotpState::NoSecret);
-        assert_eq!(
-            pane.click(&item, &TotpState::NoSecret, close_at).action,
-            DetailAction::ClosePane,
-            "clicking the header's ✕ did not report `ClosePane`, so the control is inert"
-        );
-
-        let mut pane = Pane::new();
-        let _ = pane.idle(&item, &TotpState::NoSecret);
-        assert_eq!(
-            pane.click(&item, &TotpState::NoSecret, envelope_at).action,
-            DetailAction::SendRecord,
-            "clicking the header's ✉ did not report `SendRecord`, so the record composer \
-             is unreachable from the only control that opens it"
-        );
-    }
-
-    /// **The Share control sits right after the envelope** (mock 6a) and
-    /// reports `ShareRecord` -- or, greyed, reports nothing at all. It never
-    /// opens a Send: the ✉ beside it is that door (final review, I3).
-    #[test]
-    fn the_share_control_shares_or_is_greyed_and_never_sends() {
-        let item = a_login();
-        for (offered, expected) in [
-            (ShareControl::Share, DetailAction::ShareRecord),
-            (ShareControl::Disabled(super::super::share_ui::SHARE_TOO_OLD_TOOLTIP), DetailAction::None),
-        ] {
-            let mut pane = Pane::new().with_share_control(offered);
-            let frame = pane.idle(&item, &TotpState::NoSecret);
-            let (envelope, _) = frame.envelopes.first().copied().expect("the envelope");
-            // Right of the envelope by one control's pitch.
-            let at = egui::pos2(envelope.center().x + theme::HEADER_BUTTON_HEIGHT, envelope.center().y);
-            assert_eq!(pane.click(&item, &TotpState::NoSecret, at).action, expected);
-        }
-    }
-
-    /// **The Share control's hover says what it does**: a share is
-    /// view-only, and a greyed control says why it is greyed, in its own
-    /// words (final review, I3).
-    #[test]
-    fn the_share_controls_hover_says_share_or_why_not() {
-        let item = a_login();
-        for (offered, words) in [
-            (ShareControl::Share, super::super::share_ui::SHARE_TOOLTIP),
-            (ShareControl::Disabled(super::super::share_ui::SHARE_TOO_OLD_TOOLTIP), super::super::share_ui::SHARE_TOO_OLD_TOOLTIP),
-            (ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS), crate::rest::sharing::HAS_ATTACHMENTS),
-        ] {
-            let mut pane = Pane::new().with_share_control(offered);
-            let frame = pane.idle(&item, &TotpState::NoSecret);
-            let (share, _) = frame.shares.first().copied().expect("the Share control");
-            let hovered = pane.hover_settled(&item, &TotpState::NoSecret, share.center());
-            assert!(hovered.painted(words), "hovering Share painted {:?}", hovered.strings());
-        }
-    }
-
-    /// **The ⏱ reports `AddTotp`, pressed where the header really painted
-    /// it -- and it is the ONLY control in the strip that does.**
-    ///
-    /// Both halves are needed. The first says the control is not inert; the
-    /// second says it was not wired by pressing something else, which is the
-    /// slip a single positive assertion cannot see -- four other marks sit in
-    /// this strip and one of them is 48pt away.
-    #[test]
-    fn the_header_clock_reports_add_totp_and_no_other_control_does() {
-        let item = a_login();
-
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let clock_at = laid_out.clock().0.center();
-        let others = [
-            ("the favourite star", laid_out.star().rect.center()),
-            ("the Send envelope", laid_out.envelope().0.center()),
-            ("the kebab", laid_out.kebab().center()),
-            ("the close ✕", laid_out.pane_close().0.center()),
-        ];
-        assert!(!clock_at.any_nan(), "the header painted no clock to press");
-
-        let mut pane = Pane::new();
-        let _ = pane.idle(&item, &TotpState::NoSecret);
-        assert_eq!(
-            pane.click(&item, &TotpState::NoSecret, clock_at).action,
-            DetailAction::AddTotp,
-            "clicking the header's ⏱ did not report `AddTotp`, so the one-time code form \
-             is still reachable only by a chord nothing on screen mentions"
-        );
-
-        for (name, at) in others {
-            let mut pane = Pane::new();
-            let _ = pane.idle(&item, &TotpState::NoSecret);
-            assert_ne!(
-                pane.click(&item, &TotpState::NoSecret, at).action,
-                DetailAction::AddTotp,
-                "clicking {name} also reported `AddTotp`, so the ⏱'s own assertion above \
-                 says nothing about which mark was pressed"
-            );
-        }
-    }
-
-    /// **The ⏱ is drawn for exactly the items the form will open for.**
-    ///
-    /// `vault_window::mod`'s block filters the selection on `login.is_some()`
-    /// before it builds a `TotpAdd`. A control drawn wider than that filter
-    /// is a control that reports an action and produces nothing -- the exact
-    /// "there is nothing to do me to" state that got the record composer's
-    /// titlebar pill removed, and the reason this control is in this strip.
-    ///
-    /// Asserted over every kind this pane draws, and in both directions, so
-    /// neither a ⏱ that appeared on a note nor one that vanished from a
-    /// login can pass. The premise -- that these fixtures really do differ --
-    /// is checked first, because a list of five items that all happened to
-    /// carry a login would satisfy the loop by never taking one branch.
-    #[test]
-    fn the_clock_is_drawn_for_exactly_the_items_the_form_opens_for() {
-        let cases = [
-            ("a login", a_login()),
-            ("a card", a_full_card()),
-            ("a secure note", an_item(Some(2))),
-            ("an identity", an_item(Some(4))),
-            ("an SSH key", an_item(Some(5))),
-        ];
-        assert!(
-            cases.iter().any(|(_, i)| item_takes_a_one_time_code(i))
-                && cases.iter().any(|(_, i)| !item_takes_a_one_time_code(i)),
-            "every fixture answers the same way, so this loop only ever tests one branch"
-        );
-
-        for (what, item) in &cases {
-            let mut pane = Pane::new();
-            let frame = pane.idle(item, &TotpState::NoSecret);
-            // The premise for each case separately: the header really was
-            // drawn for this item, so "no clock" is a statement about the
-            // gate and not about an empty pane.
-            let _ = frame.kebab();
-            if item_takes_a_one_time_code(item) {
-                assert_eq!(
-                    frame.clocks.len(),
-                    1,
-                    "{what} can take a one-time code and the header offers no way to add one"
-                );
-            } else {
-                assert!(
-                    frame.clocks.is_empty(),
-                    "{what} was drawn a ⏱, and the block that would open the form filters \
-                     it out -- so the control reports an action and nothing happens"
-                );
-            }
-        }
-    }
-
-    /// **The ⏱'s hover states its chord, and states it from the constant
-    /// the key handler is held to.**
-    ///
-    /// The user's request for this strip was "show keys in tooltip on hover
-    /// not just a description". The ✉ beside it does that from
-    /// `record_ui::SEND_RECORD_SHORTCUT`; this does it from
-    /// `totp_add::ADD_TOTP_SHORTCUT`, which
-    /// `vault_window::mod`'s `the_add_code_chord_is_spelled_the_way_it_is_bound`
-    /// already compares against `ADD_TOTP_MODIFIERS` and `ADD_TOTP_KEY` --
-    /// the values the key handler actually matches on. So a rebinding cannot
-    /// leave this tooltip lying.
-    ///
-    /// Read off the SOURCE and not off a rendered tooltip, deliberately and
-    /// with its limit stated: egui paints a tooltip in a layer this pane's
-    /// harness does not drive, so there is no frame in which the words are
-    /// findable text. What can be checked -- and what a literal typed at the
-    /// call site would fail -- is that neither string is spelled here.
-    #[test]
-    fn the_clocks_hover_carries_the_chord_from_the_one_place_it_is_spelled() {
-        let source = include_str!("detail.rs");
-        let code = source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<String>();
-        assert!(
-            code.contains("totp_add::ADD_TOTP_LABEL") && code.contains("totp_add::ADD_TOTP_SHORTCUT"),
-            "the ⏱'s hover no longer reads its words and its chord from `totp_add`"
-        );
-        for spelled in [totp_add::ADD_TOTP_LABEL, totp_add::ADD_TOTP_SHORTCUT] {
-            assert!(
-                !code.contains(&format!("\"{spelled}")),
-                "{spelled:?} is written out as a literal in this file, so there are now two \
-                 homes for it and a rebinding will leave one of them lying"
-            );
-        }
-    }
-
-    /// **The ✕ does not look like the Delete it sits beside -- and is not
-    /// quieter than the controls it sits among.**
-    ///
-    /// These two controls are 48pt apart -- the kebab is between them, and
-    /// inside that kebab is a Delete that arms on its first click and is
-    /// permanent on its second. A ✕ drawn in [`theme::ERROR`], or at the
-    /// weight of a primary, would be inviting exactly that misclick.
-    ///
-    /// **Two assertions, and only the first is the safety property.** This
-    /// test used to pin `close_colour == TEXT_GHOST` alongside
-    /// `close_colour != ERROR`, and the pair reads as if both were about the
-    /// Delete. They are not: resting at the palette's faintest clickable ink
-    /// is far stronger than "not mistakable for an armed delete", and the
-    /// difference is what got reported as "close button feels too gray/thin
-    /// compared to the rest on details screen". `TEXT_SECONDARY` is a neutral
-    /// dark grey with no hue in it; nothing about it makes a ✕ readable as a
-    /// delete. So the second assertion now states the thing that was actually
-    /// wanted -- the ✕ is as legible as the other actions on the strip -- and
-    /// states it by naming one of them rather than by writing a palette
-    /// constant down.
-    ///
-    /// Read off the PAINTED stroke colour and not off the source: the point
-    /// is what a user sees, and a constant comparison would only restate
-    /// that `theme.rs` says so. Both sides of the second assertion are read
-    /// off the same frame for the same reason -- it compares two things the
-    /// user is looking at, not two entries in a palette.
-    ///
-    /// **There is no longer an armed frame, and that is the change.** This
-    /// used to drive the pane twice -- unarmed and armed -- because the
-    /// kebab turned `ERROR` red while a delete was armed, and an unarmed
-    /// strip has no red on it at all, so "the ✕ is not red" was trivially
-    /// true there. The arm is gone with the delete modal, so the positive
-    /// control it rested on is gone too. What is left is the relationship
-    /// between the ✕ and the ✉, which is the half that was always about this
-    /// strip rather than about the confirmation.
-    #[test]
-    fn the_close_mark_is_never_dressed_as_the_delete_beside_it() {
-        let item = a_login();
-
-        {
-            let mut pane = Pane::new();
-            let frame = pane.idle(&item, &TotpState::NoSecret);
-            let (_, close_colour) = frame.pane_close();
-            assert_ne!(
-                close_colour,
-                theme::ERROR,
-                "the header's close ✕ is painted in the palette's error red, one control \
-                 away from the Delete entry that wears the same colour inside the kebab's \
-                 menu"
-            );
-            // **The relationship, not the constant.** This used to read
-            // `assert_eq!(close_colour, theme::TEXT_GHOST)` -- a photograph of
-            // one palette entry, which pinned the ✕ at the faintest ink this
-            // palette has and made "it looks disabled" a test failure rather
-            // than a bug report. What the strip actually needs is that the ✕
-            // is as legible as the other ACTIONS on it, and that is stated by
-            // naming one of them.
-            //
-            // The ✉ is the reference rather than the ★: a star that is not a
-            // favourite is a toggle in its OFF state and is quieter on
-            // purpose, so matching it would be matching a different kind of
-            // thing.
-            let (_, envelope_colour) = frame.envelope();
-            assert_eq!(
-                close_colour, envelope_colour,
-                "the close ✕ rests at {close_colour:?} while the ✉ beside it rests at \
-                 {envelope_colour:?} -- the two are the same kind of control on the same \
-                 strip and one of them is fainter than the other"
-            );
-        }
-    }
-
-    /// **The ✉'s tooltip carries its chord, and carries it from the ONE place
-    /// that chord is spelled.**
-    ///
-    /// The user asked for this on every header control: "for all of those --
-    /// show keys in tooltip on hover not just a description". Only the ✉ has
-    /// a chord to show -- ★, ⋮ and ✕ are bound to no key -- and it must not
-    /// be typed out here or in the pane. `record_ui::SEND_RECORD_SHORTCUT` is
-    /// the single home for the spelling, and `vault_window::mod`'s
-    /// `the_record_chord_is_spelled_the_way_it_is_bound` is what holds THAT
-    /// constant to the modifiers and key the handler matches on -- so the
-    /// chain from this tooltip to the real binding is closed.
-    ///
-    /// Built from the constants rather than compared against a literal, for
-    /// the reason the row tooltips' own test is: a hard-coded
-    /// `"Send a record · CTRL+SHIFT+S"` here would be a second place the same
-    /// fact is written, and a rebinding would leave this test agreeing with a
-    /// tooltip that had started lying.
-    #[test]
-    fn the_send_envelopes_tooltip_states_its_chord() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let at = laid_out.envelope().0.center();
-
-        let hovered = pane.hover_settled(&item, &TotpState::NoSecret, at);
-        let want = format!(
-            "{} · {}",
-            record_ui::SEND_RECORD_LABEL,
-            record_ui::SEND_RECORD_SHORTCUT
-        );
-        assert!(
-            hovered.painted(&want),
-            "hovering the header's ✉ painted no {want:?} tooltip; the frame painted: {:?}",
-            hovered.strings()
-        );
-        // The chord half specifically, and not merely the sentence: a tooltip
-        // that had lost its chord and kept its words would still contain the
-        // label, and the whole request was the keys.
-        assert!(
-            hovered
-                .strings()
-                .iter()
-                .any(|t| t.contains(record_ui::SEND_RECORD_SHORTCUT)),
-            "the ✉'s tooltip does not state {:?} at all: {:?}",
-            record_ui::SEND_RECORD_SHORTCUT,
-            hovered.strings()
-        );
     }
 
     // -----------------------------------------------------------------
@@ -23525,44 +20816,6 @@ mod tests {
     // Favourites
     // -----------------------------------------------------------------
 
-    /// **The star states the current state, and both states are drawn.**
-    ///
-    /// This used to read the words "Favourite"/"Favourited" off the header.
-    /// The control paints no words now, so what is asserted is the only
-    /// thing left that distinguishes the two: a favourited item's star is
-    /// FILLED, in the palette's own "on" blue, and an un-favourited one's is
-    /// an outline that is not blue.
-    ///
-    /// Both directions, exactly as before -- one alone would pass against a
-    /// star hardcoded to whichever state the test happened to expect, which
-    /// is the same defect the two labels were guarding against.
-    #[test]
-    fn the_header_star_is_filled_exactly_when_the_item_is_a_favourite() {
-        let mut item = a_login();
-
-        item.favorite = false;
-        let off = Pane::new().idle(&item, &TotpState::NoSecret).star();
-        assert!(
-            !off.filled,
-            "an un-favourited item's star is filled, so it claims the item already is one"
-        );
-        assert_ne!(
-            off.stroke,
-            theme::BLUE,
-            "an un-favourited item's star is drawn in the palette's ON colour"
-        );
-
-        item.favorite = true;
-        let on = Pane::new().idle(&item, &TotpState::NoSecret).star();
-        assert!(on.filled, "a favourited item's star is not filled, so it does not say so");
-        assert_eq!(
-            on.stroke,
-            theme::BLUE,
-            "a favourited item's star is not the design's primary blue -- ERROR red is \
-             reserved for failures and cannot be borrowed for an ON state"
-        );
-    }
-
     #[test]
     fn every_kind_gets_the_favourite_control_even_the_ones_it_cannot_fill_or_edit() {
         // The gating decision, asserted as behaviour rather than read off
@@ -23573,9 +20826,8 @@ mod tests {
         for kind in EVERY_KIND {
             let item = an_item(item_type_for(kind));
             let frame = Pane::new().idle(&item, &TotpState::NoSecret);
-            assert_eq!(
-                frame.stars.len(),
-                1,
+            assert!(
+                frame.favourite.is_some(),
                 "{kind:?} has no favourite control; the pane painted: {:?}",
                 frame.strings()
             );
@@ -23601,7 +20853,7 @@ mod tests {
 
             let mut pane = Pane::new();
             let laid_out = pane.idle(&item, &TotpState::NoSecret);
-            let control = laid_out.star().rect.center();
+            let control = laid_out.favourite.expect("the header's star").center();
 
             let clicked = pane.click(&item, &TotpState::NoSecret, control);
             assert_eq!(
@@ -25169,7 +22421,7 @@ mod tests {
         // The control: a click somewhere else in the same card reports
         // something else, so the assertion above is not satisfied by a pane
         // that returns OpenApp for every click.
-        let elsewhere = pane.click(&item, &TotpState::NoSecret, laid_out.rect_of("App").center());
+        let elsewhere = pane.click(&item, &TotpState::NoSecret, laid_out.body_rect_of("App").center());
         assert_ne!(elsewhere.action, clicked.action, "every click on this card opens the app");
     }
 
@@ -25524,51 +22776,6 @@ mod tests {
         );
     }
 
-    /// **The `icon_probe` tripwire, answered here rather than assumed.**
-    ///
-    /// Every drawn icon in this app is identified by vertex count alone, and
-    /// `theme::no_two_drawn_icons_share_a_vertex_count` is a live guard
-    /// against two colliding. This card now paints a bitmap. Measured, on the
-    /// real pane: adding the icon changes no probe's answer.
-    #[test]
-    fn the_app_icon_is_not_mistaken_for_any_drawn_icon() {
-        let item = bound_to(&a_login_on_the_web(), &a_browser_match());
-        let mut without = a_pane_that_knows_chrome();
-        let bare = without.idle(&item, &TotpState::NoSecret);
-        let mut with = Pane::new().knows_app_with_icon(CHROME_PATH, CHROME_NAME);
-        let frame = with.idle(&item, &TotpState::NoSecret);
-
-        assert_eq!(frame.images.len(), 1, "the premise: an icon really was painted");
-        assert_eq!(
-            frame.stars.len(),
-            bare.stars.len(),
-            "the app icon was counted as a favourite star"
-        );
-        assert_eq!(frame.eyes.len(), bare.eyes.len(), "the app icon was counted as an eye");
-        assert_eq!(
-            frame.kebab_dots.len(),
-            bare.kebab_dots.len(),
-            "the app icon was counted as a kebab dot"
-        );
-        assert_eq!(
-            frame.segments.len(),
-            bare.segments.len(),
-            "the app icon was counted as a line segment"
-        );
-        assert_eq!(
-            theme::icon_probe::tune_icons(&frame.shapes).len(),
-            theme::icon_probe::tune_icons(&bare.shapes).len(),
-            "the app icon was counted as a Preferences tune icon"
-        );
-        // The control: the probes are not blind on this pane -- it really
-        // does draw eyes and a star for this item, so the equalities above
-        // are not 0 == 0.
-        assert!(
-            !bare.eyes.is_empty() && !bare.stars.is_empty(),
-            "no drawn icon is on this pane at all"
-        );
-    }
-
     // -- the link and the chord -----------------------------------------
 
     /// **Clicking the NAME opens the app, and copies nothing** -- the split
@@ -25605,7 +22812,7 @@ mod tests {
         let item = bound_to(&a_login_on_the_web(), &a_browser_match());
         let mut pane = a_pane_that_knows_chrome();
         let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let label = laid_out.rect_of("App");
+        let label = laid_out.body_rect_of("App");
 
         let clicked = pane.click(&item, &TotpState::NoSecret, label.center());
         assert_eq!(
@@ -25851,7 +23058,7 @@ mod tests {
     fn the_footers_controls_never_overlap_the_cards_notes() {
         let item = bound_to(&a_login_on_the_web(), &a_browser_match());
         for width in [MIN_PANE, PANE] {
-            let mut pane = Pane::wide(width).knows_app(CHROME_PATH, CHROME_NAME);
+            let mut pane = Pane::wide(width).tall().knows_app(CHROME_PATH, CHROME_NAME);
             let frame = pane.idle(&item, &TotpState::NoSecret);
             let note = frame.rect_of(APP_MATCH_BEHAVIOUR_NOTE);
             for control in [APP_REMOVE_LABEL, OPEN_MENU_LABEL] {
@@ -25876,7 +23083,7 @@ mod tests {
             // the value column where the notes and every other row's value
             // sit. Open is the leftmost of the two.
             let open = frame.rect_of(OPEN_MENU_LABEL);
-            let label = frame.rect_of("App");
+            let label = frame.body_rect_of("App");
             assert!(
                 open.left() < note.left(),
                 "on a {width}pt pane the controls line starts at {} -- out in the value \
@@ -25922,6 +23129,203 @@ mod tests {
             );
         }
     }
+
+    /// Spec 3.3's header: the 72pt avatar, the title and its line, Close,
+    /// and the action row -- Fill, Share, Edit, the star and the more menu.
+    mod v2_header {
+        use super::*;
+        use crate::kit::tokens::Palette;
+        use egui::vec2;
+
+        const P: Palette = Palette::LIGHT;
+
+        /// Where an icon-only header control is: they paint no words to be
+        /// found by, so each carries a known id (`header_control_id`).
+        fn control(pane: &Pane, which: HeaderControl) -> egui::Rect {
+            pane.ctx
+                .read_response(header_control_id(which))
+                .unwrap_or_else(|| panic!("the header drew no {which:?}"))
+                .rect
+        }
+
+        fn has_control(pane: &Pane, which: HeaderControl) -> bool {
+            pane.ctx.read_response(header_control_id(which)).is_some()
+        }
+
+        fn filed_login() -> VaultItem {
+            let mut item = a_login();
+            item.folder_id = Some("f1".into());
+            item.login.as_mut().unwrap().totp = Some("seed".to_string().into());
+            item
+        }
+
+        #[test]
+        fn the_header_is_72_avatar_32_title_kind_folder_chip_tags() {
+            let mut pane = Pane::new().in_folder("Engineering");
+            let f = pane.idle(&filed_login(), &TotpState::NoSecret);
+            let avatar = f
+                .rects
+                .iter()
+                .map(|(r, _)| *r)
+                .find(|r| (r.width() - 72.0).abs() < 0.5 && (r.height() - 72.0).abs() < 0.5)
+                .expect("a 72pt avatar");
+            let title = f.rect_of("Sample");
+            assert!(title.height() >= 28.0, "the title is set at 32: {title:?}");
+            assert!(title.left() >= avatar.right() + 19.5, "20 between the avatar and the title");
+            let kind = f.rect_of("Login");
+            assert!(kind.top() >= title.bottom() - 2.0, "the kind line sits under the title");
+            let chip = f.rect_of("Engineering");
+            assert!(
+                f.rects.iter().any(|(r, c)| *c == P.tag_neutral_bg && r.contains(chip.center())),
+                "the folder sits on its chip"
+            );
+            assert!(chip.left() > kind.right(), "the chip follows the kind");
+            assert!(f.painted("2FA"), "the item's tags follow");
+            let close = control(&pane, HeaderControl::Close);
+            assert_eq!(close.size(), vec2(42.0, 42.0));
+            assert!((close.top() - avatar.top()).abs() < 0.5, "Close is top-aligned with the avatar");
+        }
+
+        #[test]
+        fn the_folder_chip_shows_its_folder() {
+            let mut pane = Pane::new().in_folder("Engineering");
+            let item = filed_login();
+            let chip = pane.idle(&item, &TotpState::NoSecret).rect_of("Engineering");
+            let clicked = pane.click(&item, &TotpState::NoSecret, chip.center());
+            assert_eq!(clicked.action, DetailAction::ShowFolder("f1".into()));
+        }
+
+        #[test]
+        fn fill_appears_for_logins_only_and_asks_for_the_toast() {
+            let mut pane = Pane::new();
+            let login = a_login();
+            let fill = pane.idle(&login, &TotpState::NoSecret).rect_of("Fill");
+            assert_eq!(fill.height().round(), fill.height().round(), "control");
+            let clicked = pane.click(&login, &TotpState::NoSecret, fill.center());
+            assert_eq!(clicked.action, DetailAction::Fill);
+
+            let card = an_item(Some(3));
+            let f = Pane::new().idle(&card, &TotpState::NoSecret);
+            assert!(!f.painted("Fill"), "a card has nothing to fill into a sign-in");
+        }
+
+        #[test]
+        fn share_edit_favourite_report_their_actions() {
+            let mut pane = Pane::new();
+            let item = a_login();
+            let f = pane.idle(&item, &TotpState::NoSecret);
+            let (share, edit) = (f.rect_of("Share"), f.rect_of("Edit"));
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, share.center()).action, DetailAction::SendRecord);
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, edit.center()).action, DetailAction::Edit);
+            let star = control(&pane, HeaderControl::Favourite);
+            assert_eq!(star.size(), vec2(48.0, 48.0));
+            assert_eq!(
+                pane.click(&item, &TotpState::NoSecret, star.center()).action,
+                DetailAction::ToggleFavorite(true)
+            );
+        }
+
+        #[test]
+        fn the_more_menu_holds_share_with_a_person_add_2fa_clone_move_delete() {
+            let mut pane = Pane::new().with_share_control(ShareControl::Share);
+            let item = a_login();
+            let _ = pane.idle(&item, &TotpState::NoSecret);
+            let more = control(&pane, HeaderControl::More);
+            assert_eq!(more.size(), vec2(48.0, 48.0));
+            let _ = pane.click(&item, &TotpState::NoSecret, more.center());
+            let open = pane.idle(&item, &TotpState::NoSecret);
+            for entry in [SHARE_WITH_PERSON_LABEL, ADD_2FA_MENU_LABEL, "Clone", crate::vault_window::item_list::MOVE_TO_FOLDER_LABEL, "Delete"] {
+                assert!(open.painted(entry), "the more menu has no {entry:?}: {:?}", open.strings());
+            }
+            let share = open.rect_of(SHARE_WITH_PERSON_LABEL);
+            let chosen = pane.click(&item, &TotpState::NoSecret, share.center());
+            assert_eq!(chosen.action, DetailAction::ShareRecord);
+        }
+
+        #[test]
+        fn a_view_only_record_offers_no_edit_or_fill() {
+            let mut pane = Pane::new().view_only("anna@x.io");
+            let f = pane.idle(&a_login(), &TotpState::NoSecret);
+            for word in ["Fill", "Share", "Edit"] {
+                assert!(!f.painted(word), "a view-only record offers {word}");
+            }
+            assert!(!has_control(&pane, HeaderControl::Favourite), "nor the star, which writes");
+            assert!(has_control(&pane, HeaderControl::More), "the more menu holds what it can do");
+        }
+
+        #[test]
+        fn the_trash_view_offers_restore_and_delete_forever() {
+            let (painted, _) = painted_out_of_vault(&a_login(), OutOfVault::Trash);
+            for word in ["Restore", "Delete forever"] {
+                assert!(painted.iter().any(|t| t == word), "the trash header offers no {word}: {painted:?}");
+            }
+            let (archived, _) = painted_out_of_vault(&a_login(), OutOfVault::Archive);
+            assert!(archived.iter().any(|t| t == "Unarchive"), "{archived:?}");
+        }
+
+        /// At the window's minimum the pane is 298 wide: the title moves
+        /// under the avatar so it stays a name, and the action row turns to
+        /// squares (Share moving into the more menu) so nothing leaves it.
+        #[test]
+        fn a_narrow_pane_stacks_the_title_and_squares_the_actions() {
+            let mut item = a_login();
+            item.name = "Ledgerline Treasury Portal".to_string();
+            let mut pane = Pane::wide(MIN_PANE);
+            let f = pane.idle(&item, &TotpState::NoSecret);
+            let readable = f.rendered_glyphs("Ledgerline Treasury Portal").chars().filter(|c| *c != '\u{2026}' && !c.is_whitespace()).count();
+            assert!(readable >= 8, "the title is still a name at {MIN_PANE}pt");
+            let column = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(MIN_PANE, PANE));
+            for which in [HeaderControl::Close, HeaderControl::Fill, HeaderControl::Edit, HeaderControl::Favourite, HeaderControl::More] {
+                let rect = control(&pane, which);
+                assert!(column.contains_rect(rect), "{which:?} at {rect:?} leaves the {MIN_PANE}pt pane");
+            }
+            assert!(!f.painted("Share"), "Share waits in the more menu");
+            let _ = pane.click(&item, &TotpState::NoSecret, control(&pane, HeaderControl::More).center());
+            let open = pane.idle(&item, &TotpState::NoSecret);
+            let share = open.rect_of(SHARE_LABEL);
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, share.center()).action, DetailAction::SendRecord);
+            // And at the design's own width, words.
+            let mut wide = Pane::wide(648.0);
+            let w = wide.idle(&item, &TotpState::NoSecret);
+            assert!(w.painted("Fill") && w.painted("Share") && w.painted("Edit"));
+        }
+
+        #[test]
+        fn fill_toast_names_the_app_or_the_item() {
+            assert_eq!(fill_toast(&a_login()), "Click the sign-in field in Sample");
+            let bound = crate::vault_bridge::with_app_match(&a_login(), &a_desktop_match());
+            assert_eq!(fill_toast(&bound), "Click the sign-in field in Ledgerline");
+        }
+
+        #[test]
+        fn esc_closes_the_pane_unless_a_field_is_focused() {
+            let escape = vec![egui::Event::Key {
+                key: egui::Key::Escape,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }];
+            let mut pane = Pane::new();
+            let f = pane.frame(&a_login(), &TotpState::NoSecret, escape.clone());
+            assert_eq!(f.action, DetailAction::ClosePane);
+
+            // A field with the keyboard keeps its Esc.
+            let ctx = crate::kit::testing::ctx();
+            let field = egui::Id::new("a-field");
+            let mut closes = None;
+            let mut text = String::new();
+            for events in [Vec::new(), escape] {
+                crate::kit::testing::frame(&ctx, 0.0, vec2(400.0, 300.0), events, |ui| {
+                    let edit = ui.add(egui::TextEdit::singleline(&mut text).id(field));
+                    edit.request_focus();
+                    closes = Some(esc_closes_pane(ui.ctx()));
+                });
+            }
+            assert_eq!(closes, Some(false));
+        }
+    }
+
 }
 
 
@@ -26613,7 +24017,8 @@ mod read_pane_scroll_tests {
             // about 600pt of pane, and the vertical-only `assert_visible`
             // could not have said so if it had been named.
             "Remove",
-            "App",
+            // Not "App": the header's App tag says it too, so the row is
+            // named by its neighbours here.
             "Program file",
             // **The VALUES, not only the labels.** Every label on this card
             // sits at x = 41 whatever the pane is, so a list of labels alone
@@ -26673,37 +24078,6 @@ mod read_pane_scroll_tests {
     /// unlike its path's file name, and unlike every directory in its path --
     /// see `tests::CHROME_NAME` for why that matters.
     const TALL_ITEM_APP_NAME: &str = "Ledgerline Accounting Suite";
-
-    /// The header stays where it is. It is the only thing held out of the
-    /// scroll area, and the reason is that a scrolled-away title leaves no
-    /// answer to "which item am I looking at?" -- so it has to be pinned in
-    /// fact and not just in intent.
-    #[test]
-    fn the_header_does_not_move_when_the_body_scrolls() {
-        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
-        let item = the_tallest_item();
-        let bounds = pane.bounds();
-
-        let before = pane.idle(&item);
-        let title_before = before
-            .rect_of(&item.name)
-            .expect("the header painted no title");
-        assert_visible(&before, &item.name, bounds);
-
-        let after = pane.scroll_to_bottom(&item);
-        let title_after = after.rect_of(&item.name).expect("the title scrolled away");
-        assert_eq!(
-            title_before, title_after,
-            "the header title moved from {title_before:?} to {title_after:?} when the body \
-             scrolled -- it is inside the scroll area"
-        );
-        // The control on that: the BODY did move, so an equality that held
-        // because nothing scrolled at all would not pass here.
-        assert!(
-            after.rect_of("NOTES").is_some(),
-            "nothing scrolled, so the title standing still proves nothing"
-        );
-    }
 
     /// The copy confirmation is drawn on a foreground layer against the PANE,
     /// not against the scrolled content, so it keeps the corner
