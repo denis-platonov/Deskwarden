@@ -2180,7 +2180,7 @@ mod tests {
 
     #[test]
     fn the_gate_matches_the_login_windows() {
-        assert_eq!(gate(""), Submit::Refuse(crate::login_ui::ENTER_PASSWORD));
+        assert_eq!(gate(""), Submit::Refuse(crate::login_ui::enter_password()));
         assert_eq!(gate("a"), Submit::Attempt);
         // Whitespace is a real password as far as this app is concerned, and
         // as far as `bw` is: only *empty* is the plumbing hazard.

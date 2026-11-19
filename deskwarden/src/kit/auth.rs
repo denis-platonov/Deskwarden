@@ -9,6 +9,7 @@
 
 use eframe::egui::{self, pos2, vec2, Color32, CornerRadius, Rect, Sense, Shadow, Stroke, Ui, UiBuilder, Vec2};
 
+use crate::i18n;
 use crate::kit::icon::{self, glyph};
 use crate::kit::motion;
 use crate::kit::tokens::{self, palette, Role, PAGE_TITLE};
@@ -16,11 +17,17 @@ use crate::login_ui::{ChromeAction, CloseControl};
 use crate::theme::{self, BOLD, EXTRABOLD, SEMIBOLD};
 
 /// The brand half's headline (spec C 5.2, verbatim).
-pub const HEADLINE: &str = "Your Bitwarden vault, in every app.";
+pub fn headline() -> &'static str {
+    i18n::t("auth.headline")
+}
 /// Under the headline.
-pub const BRAND_SUB: &str = "Sign in once. Deskwarden fills SAP, VPNs and every desktop login for you.";
+pub fn brand_sub() -> &'static str {
+    i18n::t("auth.brand_sub")
+}
 /// Pinned to the brand half's foot.
-pub const BRAND_FOOT: &str = "Uses your existing Bitwarden account";
+pub fn brand_foot() -> &'static str {
+    i18n::t("auth.brand_foot")
+}
 /// The wordmark beside the mark.
 pub const WORDMARK: &str = "Deskwarden";
 
@@ -42,12 +49,22 @@ pub const LABEL_GAP: f32 = 8.0;
 pub const LOCK_GAP: f32 = 26.0;
 
 /// What the lock screen's Hello button says before and during a check.
-pub const HELLO_LABEL: &str = "Unlock with Windows Hello";
-pub const HELLO_CHECKING: &str = "Checking\u{2026}";
+pub fn hello_label() -> &'static str {
+    i18n::t("auth.hello_label")
+}
+pub fn hello_checking() -> &'static str {
+    i18n::t("auth.hello_checking")
+}
 /// The link from the Hello stage to the password stage, and back.
-pub const USE_PASSWORD_LABEL: &str = "Use master password instead";
-pub const LOCK_HEADING: &str = "Welcome back";
-pub const LOCK_SUB: &str = "Your vault is locked";
+pub fn use_password_label() -> &'static str {
+    i18n::t("auth.use_password")
+}
+pub fn lock_heading() -> &'static str {
+    i18n::t("auth.lock_heading")
+}
+pub fn lock_sub() -> &'static str {
+    i18n::t("auth.lock_sub")
+}
 
 // ---------------------------------------------------------------- caption
 
@@ -292,15 +309,15 @@ fn brand_panel(ui: &mut Ui, rect: Rect) {
 
     // Foot.
     let foot_role = Role { size: 14.0, face: theme::REGULAR, tracking_em: 0.0 };
-    let foot = galley(&ctx, foot_role, BRAND_FOOT, p.blue_soft, None, None);
+    let foot = galley(&ctx, foot_role, brand_foot(), p.blue_soft, None, None);
     let foot_at = pos2(inner.left(), inner.bottom() - foot.size().y);
     ui.painter().galley(foot_at, foot, p.blue_soft);
 
     // Middle: centred between the two, headline 48 over a 30ch line of 18.
     let head_role = Role { size: 48.0, face: EXTRABOLD, tracking_em: -0.035 };
     let sub_role = Role { size: 18.0, face: theme::REGULAR, tracking_em: 0.0 };
-    let head = galley(&ctx, head_role, HEADLINE, Color32::WHITE, Some(inner.width()), Some(48.0 * 1.04));
-    let sub = galley(&ctx, sub_role, BRAND_SUB, p.blue_edge, Some(30.0 * 18.0 * 0.5), Some(18.0 * 1.5));
+    let head = galley(&ctx, head_role, headline(), Color32::WHITE, Some(inner.width()), Some(48.0 * 1.04));
+    let sub = galley(&ctx, sub_role, brand_sub(), p.blue_edge, Some(30.0 * 18.0 * 0.5), Some(18.0 * 1.5));
     let block = head.size().y + 18.0 + sub.size().y;
     let top = (mark.bottom() + foot_at.y) / 2.0 - block / 2.0;
     let pose = rise(&ctx, "split-brand", 0.0, 0.5);
@@ -593,7 +610,7 @@ pub fn field_secret(
     }
     let d = if *revealed { glyph::EYE_OFF } else { glyph::EYE };
     icon::stroke(ui.painter(), Rect::from_center_size(eye.center(), Vec2::splat(19.0)), d, 2.0, p.text_muted);
-    crate::kit::tips::hint(ui, &eye_response, if *revealed { "Hide password" } else { "Show password" }, &[]);
+    crate::kit::tips::hint(ui, &eye_response, if *revealed { i18n::t("auth.hide_password") } else { i18n::t("auth.show_password") }, &[]);
     if eye_response.clicked() {
         *revealed = !*revealed;
     }
@@ -807,13 +824,13 @@ pub fn done_stage(ui: &mut Ui) {
     let (ring, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
     ui.painter().circle_filled(ring.center(), 32.0, p.done_wash);
     icon::stroke(ui.painter(), Rect::from_center_size(ring.center(), Vec2::splat(30.0)), DONE_TICK, 2.6, p.done_ink);
-    stage_title(ui, "You're in");
+    stage_title(ui, i18n::t("auth.done_title"));
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 14.0;
         let (track, _) = ui.allocate_exact_size(BUTTON_BAR, Sense::hover());
         slide_bar(ui, track, Color32::from_rgb(0xe3, 0xe8, 0xf6), p.blue, 0.3);
         let role = Role { size: 15.0, face: SEMIBOLD, tracking_em: 0.0 };
-        let g = galley(ui.ctx(), role, "Opening your vault", p.text_muted, None, None);
+        let g = galley(ui.ctx(), role, i18n::t("auth.done_opening"), p.text_muted, None, None);
         let (rect, _) = ui.allocate_exact_size(g.size(), Sense::hover());
         ui.painter().galley(rect.min, g, p.text_muted);
     });
@@ -861,7 +878,7 @@ mod tests {
         let navy = painted.rects.iter().find(|r| r.fill == palette(&ctx).blue_deep).expect("the brand half");
         assert_eq!(navy.rect.width(), 640.0);
         assert_eq!(navy.rect.height(), 820.0);
-        for copy in [HEADLINE.split_whitespace().next().unwrap(), "Sign in once", BRAND_FOOT, WORDMARK, "Log in"] {
+        for copy in [headline().split_whitespace().next().unwrap(), "Sign in once", brand_foot(), WORDMARK, "Log in"] {
             assert!(painted.text(copy).is_some(), "{copy} is not on the screen");
         }
     }
@@ -891,7 +908,7 @@ mod tests {
                 seen = rect;
             });
         }
-        assert!(painted.text(BRAND_FOOT).is_none());
+        assert!(painted.text(brand_foot()).is_none());
         assert_eq!(seen.width(), 420.0, "the form keeps its width when it fits");
         let ctx = testing::ctx();
         for _ in 0..8 {
@@ -932,13 +949,13 @@ mod tests {
         for i in 0..8 {
             painted = testing::frame(&ctx, 1.0 + i as f64 * 0.2, WIDE, vec![], |ui| {
                 let full = ui.max_rect();
-                let _ = lock_surface(ui, full, CloseControl::Active, |ui| lock_header(ui, LOCK_HEADING, LOCK_SUB));
+                let _ = lock_surface(ui, full, CloseControl::Active, |ui| lock_header(ui, lock_heading(), lock_sub()));
             });
         }
         assert!(painted.rects.iter().any(|r| r.fill == palette(&ctx).blue_deep && r.rect.size() == WIDE));
-        let heading = painted.text(LOCK_HEADING).expect("the heading");
+        let heading = painted.text(lock_heading()).expect("the heading");
         assert_eq!(heading.1, Color32::WHITE);
-        assert_eq!(painted.text(LOCK_SUB).expect("the line").1, palette(&ctx).blue_edge);
+        assert_eq!(painted.text(lock_sub()).expect("the line").1, palette(&ctx).blue_edge);
         assert!((heading.2.center().x - 640.0).abs() < 1.0, "centred");
     }
 
@@ -947,12 +964,12 @@ mod tests {
         let ctx = testing::ctx();
         let mut size = Vec2::ZERO;
         let p = testing::frame(&ctx, 1.0, WIDE, vec![], |ui| {
-            size = hello_button(ui, HELLO_LABEL, false).rect.size();
+            size = hello_button(ui, hello_label(), false).rect.size();
         });
         assert_eq!(size.y, 62.0);
-        assert!(p.text(HELLO_LABEL).is_some());
+        assert!(p.text(hello_label()).is_some());
         let p = testing::frame(&ctx, 1.1, WIDE, vec![], |ui| {
-            hello_button(ui, HELLO_CHECKING, true);
+            hello_button(ui, hello_checking(), true);
         });
         assert!(p.text("Checking").is_some());
     }
@@ -965,22 +982,22 @@ mod tests {
         for t in 0..3 {
             testing::frame(&ctx, t as f64, WIDE, vec![], |ui| {
                 button = lock_button(ui, "Unlock").rect;
-                link = lock_link(ui, USE_PASSWORD_LABEL).rect;
+                link = lock_link(ui, use_password_label()).rect;
             });
         }
         assert_eq!(button.height(), 58.0);
         let mut clicked = (false, false);
         testing::frame(&ctx, 3.0, WIDE, click_at(button.center()), |ui| {
             clicked.0 = lock_button(ui, "Unlock").clicked();
-            lock_link(ui, USE_PASSWORD_LABEL);
+            lock_link(ui, use_password_label());
         });
         testing::frame(&ctx, 4.0, WIDE, vec![egui::Event::PointerGone], |ui| {
             lock_button(ui, "Unlock");
-            lock_link(ui, USE_PASSWORD_LABEL);
+            lock_link(ui, use_password_label());
         });
         testing::frame(&ctx, 5.0, WIDE, click_at(link.center()), |ui| {
             lock_button(ui, "Unlock");
-            clicked.1 = lock_link(ui, USE_PASSWORD_LABEL).clicked();
+            clicked.1 = lock_link(ui, use_password_label()).clicked();
         });
         assert_eq!(clicked, (true, true));
     }

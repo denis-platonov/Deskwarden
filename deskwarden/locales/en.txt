@@ -1,0 +1,153 @@
+# Deskwarden's English text: the source every other catalog translates.
+# The format is documented at the top of src/i18n.rs.
+# Keys are `area.thing`; sections below are grouped by the file that owns them.
+
+# ---- kit/auth.rs (sign-in and lock screens) ----
+auth.headline = Your Bitwarden vault, in every app.
+auth.brand_sub = Sign in once. Deskwarden fills SAP, VPNs and every desktop login for you.
+auth.brand_foot = Uses your existing Bitwarden account
+auth.hello_label = Unlock with Windows Hello
+auth.hello_checking = Checking…
+auth.use_password = Use master password instead
+auth.lock_heading = Welcome back
+auth.lock_sub = Your vault is locked
+auth.hide_password = Hide password
+auth.show_password = Show password
+auth.done_title = You're in
+auth.done_opening = Opening your vault
+
+# ---- login_ui.rs (sign-in, lock and two-step screens) ----
+login.first_run_notice = Deskwarden now keeps each account in its own profile — sign in once to set this one up. Windows Hello quick unlock has to be set up again too.
+login.hello_setup_needs_password = Type your master password first — Windows Hello is set up right after it unlocks the vault.
+login.hello_setup_label = Log in and set up Windows Hello
+login.hello_setup_link = Unlock and set up Windows Hello
+login.hello_setup_hint = First use: enter your master password, then click here
+login.sign_in_title = Log in
+login.server_label = Server
+login.server_tip = Most people use bitwarden.com. Pick EU if your account was made there, or Self-hosted if your company runs its own.
+login.password_placeholder = Your Bitwarden master password
+login.lock_placeholder = Master password
+login.enter_email = Enter your email.
+login.bad_email = That doesn't look like an email address.
+login.enter_password = Enter your master password.
+login.enter_server = Enter your server's address.
+login.sign_in_subtitle = Use your Bitwarden account
+login.forgot_label = Forgot?
+login.forgot_hint = Bitwarden can't see or reset it
+login.forgot_long_label = Forgot master password?
+login.too_many_title = Too many tries
+login.too_many_line = To keep your vault safe, logging in is paused on this PC.
+login.too_many_wait = a few minutes
+login.try_again = Try again
+login.checking = Checking
+login.log_in = Log in
+login.unlock = Unlock
+login.log_out = Log out
+
+# ---- login_ui.rs (sign-in, lock and two-step screens) ----
+login.err_bad_master_password = That master password didn't work. Check it and try again.
+login.err_bad_credentials = That email or master password didn't work. Check them and try again.
+login.err_two_step = That two-step login didn't complete. Try again — and if this account uses Duo or a security key, sign in with a personal API key instead.
+login.err_too_many = Too many failed attempts. Wait a few minutes, then try again.
+login.err_unreachable = Couldn't reach the server. Check your connection — and the server URL, if this is a self-hosted account.
+login.err_unlock_generic = Could not unlock the vault. The log has the details.
+login.banner_server_title = Can't reach your server
+login.banner_server_body = Check the address, or connect to your company VPN.
+login.retry = Retry
+login.banner_offline_title = You're offline
+login.banner_offline_body = Connect to the internet to log in. Once you have, your vault also opens offline.
+login.email_label = Email
+login.master_password_label = Master password
+login.try_again_in = Try again in
+login.hello_no_account = There is no account to unlock with Windows Hello.
+
+# ---- second_factor_ui.rs (the two-step code stage) ----
+second_factor.title_authenticator = Authenticator app
+second_factor.title_email = Email code
+second_factor.title_generic = Two-step login
+second_factor.hint_authenticator = Open your authenticator app and type the code for Bitwarden.
+second_factor.hint_email_unmasked = Send a code to the email address on this account, then enter it here. Codes expire after a few minutes.
+second_factor.hint_yubikey = Plug in your YubiKey, put the cursor in the box below and touch the key. It types the code for you.
+second_factor.hint_unsupported = Deskwarden cannot complete this kind of two-step login.
+second_factor.send_code = Send code
+second_factor.code_sent = Code sent. Check your email — it may take a moment to arrive.
+second_factor.err_code_rejected = That code didn't work. Check it and try again — codes change every 30 seconds.
+second_factor.err_send_failed = Deskwarden couldn't send the code. Check your connection, then try Send code again.
+second_factor.err_expired = This sign-in took too long and has expired. Enter your master password again to start over.
+second_factor.heading_code = Enter your 6-digit code
+second_factor.heading_yubikey = Touch your YubiKey
+second_factor.short_code = Enter all 6 digits.
+second_factor.other_method = Use another method
+second_factor.continue = Continue
+second_factor.back = Back
+
+# ---- second_factor_ui.rs (the two-step code stage) ----
+second_factor.hint_email_masked = Send a code to {address}, then enter it here. Codes expire after a few minutes.
+second_factor.provider_duo = Duo
+second_factor.provider_duo_org = Duo (organization)
+second_factor.provider_webauthn = a security key (WebAuthn)
+second_factor.provider_u2f = a U2F security key
+second_factor.provider_remembered = a remembered device
+second_factor.provider_recovery = a recovery code
+second_factor.provider_unknown = an unrecognised two-step method ({number})
+second_factor.list_and = {first} and {rest}
+second_factor.unsupported_only = This account's two-step login uses {list}, which Deskwarden cannot complete. Use a personal API key instead: create one under Account settings → Security → Keys in the Bitwarden web vault, then sign in here with it. You will still be asked for your master password — the API key signs you in, the password unlocks the vault.
+
+# ---- api_key_ui.rs (sign in with an API key) ----
+api_key.key_pair_title = Sign in with an API key
+api_key.key_pair_hint = Create a personal API key under Account settings → Security → Keys in the Bitwarden web vault, then paste both halves here.
+api_key.client_id = Client ID
+api_key.client_secret = Client secret
+api_key.password_title = Master password
+api_key.password_hint = The API key signed you in. Your master password is what unlocks the vault — the key cannot decrypt it.
+api_key.password_label = Master password
+api_key.use_api_key = Sign in with an API key
+
+# ---- tray.rs (the notification-area icon and its menu) ----
+tray.accounts = Accounts
+tray.add_account = Add account...
+tray.no_other_accounts = No other accounts yet
+tray.accounts_not_set_up = Accounts are not set up on this machine yet - restart Deskwarden
+tray.fill_armed = Fill:  {chord}
+tray.fill_unavailable = Fill shortcut ({chord}) unavailable
+tray.fill_off = Fill shortcut turned off
+tray.open_vault = Open Vault
+tray.lock = Lock
+tray.more = More
+tray.add_app = Add app...
+tray.sync = Sync
+tray.quit = Quit
+tray.signed_in = Signed in: {account}
+tray.tooltip_syncing = Deskwarden - syncing...
+tray.tooltip_sync_failed = Deskwarden - sync failed; see the log file
+tray.syncing = Syncing...
+tray.sync_failed = Sync failed - click to retry
+
+# ---- tray_popup.rs (the left-click quick-access panel) ----
+tray_popup.footer_locked = Locked · filling is paused
+tray_popup.footer_offline = Offline · filling still works
+tray_popup.footer_syncing = Syncing...
+tray_popup.footer_synced_one_minute = Synced · locks after 1 min idle
+tray_popup.footer_synced_minutes = Synced · locks after {minutes} min idle
+tray_popup.footer_synced = Synced
+tray_popup.toast_username_copied = Username copied
+tray_popup.toast_password_copied = Password copied
+tray_popup.toast_no_username = No username saved
+tray_popup.toast_no_password = No password saved
+tray_popup.toast_cancelled = Cancelled. Nothing was copied
+tray_popup.toast_needs_hello = Asks for the master password. Turn on Windows Hello
+tray_popup.toast_gone = That login is gone. Nothing was copied
+tray_popup.empty_title = Nothing to show yet
+tray_popup.empty_body = Logins you save will appear here.
+tray_popup.no_matches_title = No matches
+tray_popup.no_matches_body = Nothing in your vault is called that.
+tray_popup.label_recent = RECENT
+tray_popup.label_results = RESULTS
+tray_popup.label_top = TOP {shown} OF {total} MATCHES
+tray_popup.tile_generate = Generate
+tray_popup.tile_new_item = New item
+tray_popup.tile_share = Share
+tray_popup.locked_title = Deskwarden is locked
+tray_popup.locked_body = Unlock to search and copy your logins.
+tray_popup.unlock = Unlock
+tray_popup.search = Search

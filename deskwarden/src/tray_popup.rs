@@ -30,6 +30,7 @@
 //! reopen rule, [`run_with`]) is pure and tested without a desktop. The Win32
 //! half is the `win32` module at the bottom, behind the [`PopupCalls`] seam.
 
+use crate::i18n;
 use crate::prompt_card::Box2;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -174,19 +175,19 @@ pub struct Footer {
 /// rather than a countdown, which would not be.
 pub fn footer(locked: bool, status: &Status) -> Footer {
     if locked {
-        return Footer { text: "Locked \u{b7} filling is paused".to_string(), tone: Tone::Quiet };
+        return Footer { text: i18n::t("tray_popup.footer_locked").to_string(), tone: Tone::Quiet };
     }
     match status.sync {
         Sync::Failed => Footer {
-            text: "Offline \u{b7} filling still works".to_string(),
+            text: i18n::t("tray_popup.footer_offline").to_string(),
             tone: Tone::Warn,
         },
-        Sync::Syncing => Footer { text: "Syncing...".to_string(), tone: Tone::Quiet },
+        Sync::Syncing => Footer { text: i18n::t("tray_popup.footer_syncing").to_string(), tone: Tone::Quiet },
         Sync::Synced => Footer {
             text: match status.auto_lock_minutes {
-                Some(1) => "Synced \u{b7} locks after 1 min idle".to_string(),
-                Some(minutes) => format!("Synced \u{b7} locks after {minutes} min idle"),
-                None => "Synced".to_string(),
+                Some(1) => i18n::t("tray_popup.footer_synced_one_minute").to_string(),
+                Some(minutes) => i18n::tf("tray_popup.footer_synced_minutes", &[("minutes", &minutes.to_string())]),
+                None => i18n::t("tray_popup.footer_synced").to_string(),
             },
             tone: Tone::Good,
         },
@@ -228,13 +229,13 @@ pub enum CopyResult {
 /// line, and a refusal that wraps is a refusal nobody reads.
 pub fn toast_for(field: Field, result: CopyResult) -> &'static str {
     match (field, result) {
-        (Field::Username, CopyResult::Copied) => "Username copied",
-        (Field::Password, CopyResult::Copied) => "Password copied",
-        (Field::Username, CopyResult::Empty) => "No username saved",
-        (Field::Password, CopyResult::Empty) => "No password saved",
-        (_, CopyResult::Cancelled) => "Cancelled. Nothing was copied",
-        (_, CopyResult::NeedsHello) => "Asks for the master password. Turn on Windows Hello",
-        (_, CopyResult::Gone) => "That login is gone. Nothing was copied",
+        (Field::Username, CopyResult::Copied) => i18n::t("tray_popup.toast_username_copied"),
+        (Field::Password, CopyResult::Copied) => i18n::t("tray_popup.toast_password_copied"),
+        (Field::Username, CopyResult::Empty) => i18n::t("tray_popup.toast_no_username"),
+        (Field::Password, CopyResult::Empty) => i18n::t("tray_popup.toast_no_password"),
+        (_, CopyResult::Cancelled) => i18n::t("tray_popup.toast_cancelled"),
+        (_, CopyResult::NeedsHello) => i18n::t("tray_popup.toast_needs_hello"),
+        (_, CopyResult::Gone) => i18n::t("tray_popup.toast_gone"),
     }
 }
 
@@ -446,9 +447,9 @@ impl Popup {
         }
         let empty = (!locked && rows.is_empty()).then(|| {
             if self.query.trim().is_empty() {
-                ("Nothing to show yet", "Logins you save will appear here.")
+                (i18n::t("tray_popup.empty_title"), i18n::t("tray_popup.empty_body"))
             } else {
-                ("No matches", "Nothing in your vault is called that.")
+                (i18n::t("tray_popup.no_matches_title"), i18n::t("tray_popup.no_matches_body"))
             }
         });
         View {
@@ -468,11 +469,11 @@ impl Popup {
 /// defect this project keeps finding**, so the count is the news.
 pub fn label_for(no_query: bool, shown: usize, total: usize) -> String {
     if no_query {
-        "RECENT".to_string()
+        i18n::t("tray_popup.label_recent").to_string()
     } else if total > shown {
-        format!("TOP {shown} OF {total} MATCHES")
+        i18n::tf("tray_popup.label_top", &[("shown", &shown.to_string()), ("total", &total.to_string())])
     } else {
-        "RESULTS".to_string()
+        i18n::t("tray_popup.label_results").to_string()
     }
 }
 
@@ -501,14 +502,25 @@ pub enum Hit {
 }
 
 /// The three tiles, left to right, and their words.
-pub const TILES: [(Hit, &str); 3] =
-    [(Hit::Generate, "Generate"), (Hit::NewItem, "New item"), (Hit::Share, "Share")];
+pub const TILES: [(Hit, &str); 3] = [
+    (Hit::Generate, crate::tk!("tray_popup.tile_generate")),
+    (Hit::NewItem, crate::tk!("tray_popup.tile_new_item")),
+    (Hit::Share, crate::tk!("tray_popup.tile_share")),
+];
 
 /// What the locked panel says.
-pub const LOCKED_TITLE: &str = "Deskwarden is locked";
-pub const LOCKED_BODY: &str = "Unlock to search and copy your logins.";
-pub const UNLOCK_LABEL: &str = "Unlock";
-pub const SEARCH_PLACEHOLDER: &str = "Search";
+pub fn locked_title() -> &'static str {
+    i18n::t("tray_popup.locked_title")
+}
+pub fn locked_body() -> &'static str {
+    i18n::t("tray_popup.locked_body")
+}
+pub fn unlock_label() -> &'static str {
+    i18n::t("tray_popup.unlock")
+}
+pub fn search_placeholder() -> &'static str {
+    i18n::t("tray_popup.search")
+}
 
 /// One row's boxes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -887,7 +899,7 @@ pub fn show(
 mod win32 {
     use super::{
         hit, layout, place, Event, Field, Hit, Layout, PopupCalls, PopupWindow, Shape, Tone, View,
-        ROW_RADIUS, SEARCH_PLACEHOLDER, TILES, TILE_RADIUS, TOAST_MS, TRAY_POPUP_TITLE,
+        ROW_RADIUS, search_placeholder, TILES, TILE_RADIUS, TOAST_MS, TRAY_POPUP_TITLE,
     };
     use crate::prompt_card::Box2;
     use std::ffi::c_void;
@@ -1497,7 +1509,7 @@ mod win32 {
                     SetTextColor(hdc, rgb(crate::theme::TEXT_GHOST));
                     draw_text(
                         hdc,
-                        SEARCH_PLACEHOLDER,
+                        search_placeholder(),
                         &mut rc,
                         DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
                     );
@@ -1670,8 +1682,8 @@ mod win32 {
 
         match view.shape {
             Shape::Locked => {
-                text(hdc, fonts.title, l.title, super::LOCKED_TITLE, INK, DT_LEFT.0);
-                text(hdc, fonts.body, l.body, super::LOCKED_BODY, TEXT_FAINT, DT_LEFT.0);
+                text(hdc, fonts.title, l.title, super::locked_title(), INK, DT_LEFT.0);
+                text(hdc, fonts.body, l.body, super::locked_body(), TEXT_FAINT, DT_LEFT.0);
                 let skin = crate::panel_draw::skin(
                     crate::panel_draw::PanelButton::Deep,
                     hover == Some(Hit::Unlock),
@@ -1679,7 +1691,7 @@ mod win32 {
                 draw_button(
                     hdc,
                     dev(l.unlock),
-                    super::UNLOCK_LABEL,
+                    super::unlock_label(),
                     fonts.button,
                     skin,
                     scale(crate::panel_draw::TALL_BUTTON_RADIUS),
@@ -1790,7 +1802,7 @@ mod win32 {
                         hdc,
                         fonts.tile,
                         Box2 { x: tile.x, y: tile.y + 40, w: tile.w, h: 22 },
-                        label,
+                        crate::i18n::t(label),
                         ink,
                         DT_CENTER.0,
                     );

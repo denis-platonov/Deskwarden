@@ -1,0 +1,4 @@
+# Deskwarden's sl catalog. Empty means "read as English".
+# Translate a key by copying its line from en.txt and changing the value only;
+# keep every {placeholder}, and for plurals write the forms this language uses.
+# The format is documented at the top of src/i18n.rs.

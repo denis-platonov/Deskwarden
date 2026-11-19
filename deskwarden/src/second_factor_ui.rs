@@ -5,6 +5,7 @@
 //! `login_ui::SecondFactorRequest` for what does, and why it stays on the
 //! worker thread.
 
+use crate::i18n;
 use crate::rest::api::SecondFactor;
 use crate::theme;
 use eframe::egui;
@@ -129,10 +130,10 @@ impl Prompt {
 /// Bitwarden security settings name it.
 pub fn factor_title(factor: &SecondFactor) -> &'static str {
     match factor {
-        SecondFactor::Authenticator => "Authenticator app",
-        SecondFactor::Email { .. } => "Email code",
+        SecondFactor::Authenticator => i18n::t("second_factor.title_authenticator"),
+        SecondFactor::Email { .. } => i18n::t("second_factor.title_email"),
         SecondFactor::YubiKey => "YubiKey",
-        SecondFactor::Unsupported(_) => "Two-step login",
+        SecondFactor::Unsupported(_) => i18n::t("second_factor.title_generic"),
     }
 }
 
@@ -145,31 +146,31 @@ pub fn factor_title(factor: &SecondFactor) -> &'static str {
 pub fn factor_hint(factor: &SecondFactor) -> String {
     match factor {
         SecondFactor::Authenticator => {
-            "Open your authenticator app and type the code for Bitwarden.".to_string()
+            i18n::t("second_factor.hint_authenticator").to_string()
         }
-        SecondFactor::Email { masked: Some(address) } => format!(
-            "Send a code to {address}, then enter it here. Codes expire after a few \
-             minutes."
-        ),
+        SecondFactor::Email { masked: Some(address) } => {
+            i18n::tf("second_factor.hint_email_masked", &[("address", address.as_str())])
+        }
         SecondFactor::Email { masked: None } => {
-            "Send a code to the email address on this account, then enter it here. Codes \
-             expire after a few minutes."
+            i18n::t("second_factor.hint_email_unmasked")
                 .to_string()
         }
         SecondFactor::YubiKey => {
-            "Plug in your YubiKey, put the cursor in the box below and touch the key. It \
-             types the code for you."
+            i18n::t("second_factor.hint_yubikey")
                 .to_string()
         }
         SecondFactor::Unsupported(_) => {
-            "Deskwarden cannot complete this kind of two-step login.".to_string()
+            i18n::t("second_factor.hint_unsupported").to_string()
         }
     }
 }
 
-pub const SEND_CODE_LABEL: &str = "Send code";
-pub const CODE_SENT_NOTICE: &str =
-    "Code sent. Check your email \u{2014} it may take a moment to arrive.";
+pub fn send_code_label() -> &'static str {
+    i18n::t("second_factor.send_code")
+}
+pub fn code_sent_notice() -> &'static str {
+    i18n::t("second_factor.code_sent")
+}
 
 impl Prompt {
     /// Email is the one factor that needs a call before the user has anything
@@ -188,13 +189,13 @@ impl Prompt {
 /// look up.
 pub fn provider_name(number: u8) -> String {
     match number {
-        2 => "Duo".to_string(),
-        6 => "Duo (organization)".to_string(),
-        7 => "a security key (WebAuthn)".to_string(),
-        4 => "a U2F security key".to_string(),
-        5 => "a remembered device".to_string(),
-        8 => "a recovery code".to_string(),
-        other => format!("an unrecognised two-step method ({other})"),
+        2 => i18n::t("second_factor.provider_duo").to_string(),
+        6 => i18n::t("second_factor.provider_duo_org").to_string(),
+        7 => i18n::t("second_factor.provider_webauthn").to_string(),
+        4 => i18n::t("second_factor.provider_u2f").to_string(),
+        5 => i18n::t("second_factor.provider_remembered").to_string(),
+        8 => i18n::t("second_factor.provider_recovery").to_string(),
+        other => i18n::tf("second_factor.provider_unknown", &[("number", &other.to_string())]),
     }
 }
 
@@ -228,18 +229,12 @@ pub fn unsupported_only_message(offered: &[SecondFactor]) -> Option<String> {
             supported => factor_title(supported).to_lowercase(),
         })
         .collect();
-    let list = match names.as_slice() {
-        [one] => one.clone(),
-        [first, rest @ ..] => format!("{first} and {}", rest.join(" and ")),
-        [] => return None,
-    };
-    Some(format!(
-        "This account's two-step login uses {list}, which Deskwarden cannot complete. Use a \
-         personal API key instead: create one under Account settings \u{2192} Security \u{2192} \
-         Keys in the Bitwarden web vault, then sign in here with it. You will still be asked \
-         for your master password \u{2014} the API key signs you in, the password unlocks the \
-         vault."
-    ))
+    let list = names
+        .into_iter()
+        .reduce(|so_far, next| {
+            i18n::tf("second_factor.list_and", &[("first", &so_far), ("rest", &next)])
+        })?;
+    Some(i18n::tf("second_factor.unsupported_only", &[("list", &list)]))
 }
 
 /// Why the prompt is showing a message.
@@ -277,20 +272,16 @@ impl Trouble {
 pub fn message_for(trouble: Trouble) -> &'static str {
     match trouble {
         Trouble::CodeRejected => {
-            "That code didn't work. Check it and try again \u{2014} codes change every 30 \
-             seconds."
+            i18n::t("second_factor.err_code_rejected")
         }
         Trouble::EmailSendFailed => {
-            "Deskwarden couldn't send the code. Check your connection, then try Send code \
-             again."
+            i18n::t("second_factor.err_send_failed")
         }
         Trouble::ChallengeExpired => {
-            "This sign-in took too long and has expired. Enter your master password again to \
-             start over."
+            i18n::t("second_factor.err_expired")
         }
         Trouble::Unreachable => {
-            "Couldn't reach the server. Check your connection \u{2014} and the server URL, if \
-             this is a self-hosted account."
+            i18n::t("login.err_unreachable")
         }
     }
 }
@@ -319,8 +310,12 @@ impl Prompt {
     }
 }
 
-pub const CONTINUE_LABEL: &str = "Continue";
-pub const BACK_LABEL: &str = "Back";
+pub fn continue_label() -> &'static str {
+    i18n::t("second_factor.continue")
+}
+pub fn back_label() -> &'static str {
+    i18n::t("second_factor.back")
+}
 
 /// What the user asked the code stage to do this frame. `None` from [`draw`]
 /// is the ordinary case: the user is still typing.
@@ -362,16 +357,20 @@ pub fn draw(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
 /// 6-digit code" for the two numeric methods).
 pub fn stage_heading(factor: &SecondFactor) -> &'static str {
     match factor {
-        SecondFactor::Authenticator | SecondFactor::Email { .. } => "Enter your 6-digit code",
-        SecondFactor::YubiKey => "Touch your YubiKey",
-        SecondFactor::Unsupported(_) => "Two-step login",
+        SecondFactor::Authenticator | SecondFactor::Email { .. } => i18n::t("second_factor.heading_code"),
+        SecondFactor::YubiKey => i18n::t("second_factor.heading_yubikey"),
+        SecondFactor::Unsupported(_) => i18n::t("second_factor.title_generic"),
     }
 }
 
 /// What the stage says when Continue is pressed with fewer than six digits.
-pub const SHORT_CODE: &str = "Enter all 6 digits.";
+pub fn short_code() -> &'static str {
+    i18n::t("second_factor.short_code")
+}
 /// The link that moves to the next method the account offers.
-pub const OTHER_METHOD_LABEL: &str = "Use another method";
+pub fn other_method_label() -> &'static str {
+    i18n::t("second_factor.other_method")
+}
 
 /// The glyph in the stage's tile.
 fn tile_glyph(factor: &SecondFactor) -> &'static str {
@@ -413,11 +412,11 @@ fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
         ui.add_space(20.0);
         // The message above names the API key and where to create it. This is
         // the button that makes it true.
-        if auth::submit_button(ui, crate::api_key_ui::USE_API_KEY_LABEL, false, width).clicked() {
+        if auth::submit_button(ui, crate::api_key_ui::use_api_key_label(), false, width).clicked() {
             return Some(PromptAction::UseApiKey);
         }
         ui.add_space(20.0);
-        return auth::link_big(ui, BACK_LABEL).clicked().then_some(PromptAction::Back);
+        return auth::link_big(ui, back_label()).clicked().then_some(PromptAction::Back);
     }
 
     let Some(chosen) = prompt.chosen() else {
@@ -426,7 +425,7 @@ fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
         // for the empty offer, so this arm exists and must say something.
         auth::field_error(ui, message_for(Trouble::Unreachable));
         ui.add_space(FORM_GAP);
-        return auth::link_big(ui, BACK_LABEL).clicked().then_some(PromptAction::Back);
+        return auth::link_big(ui, back_label()).clicked().then_some(PromptAction::Back);
     };
 
     // The gallery's column: 20 between the parts.
@@ -447,7 +446,7 @@ fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
                     ui,
                     crate::kit::controls::ButtonKind::Outline,
                     crate::kit::controls::ROW,
-                    SEND_CODE_LABEL,
+                    send_code_label(),
                     None,
                 )
             })
@@ -458,7 +457,7 @@ fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
         if prompt.email_sent {
             ui.add_space(10.0);
             let p = crate::kit::tokens::palette(ui.ctx());
-            ui.add(egui::Label::new(theme::regular(CODE_SENT_NOTICE, 14.0).color(p.text_muted)).wrap());
+            ui.add(egui::Label::new(theme::regular(code_sent_notice(), 14.0).color(p.text_muted)).wrap());
         }
         ui.add_space(20.0);
     }
@@ -486,12 +485,12 @@ fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
     }
 
     ui.add_space(20.0);
-    let label = if prompt.busy { crate::login_ui::CHECKING_LABEL } else { CONTINUE_LABEL };
+    let label = if prompt.busy { crate::login_ui::checking_label() } else { continue_label() };
     let go = auth::submit_button(ui, label, prompt.busy, width).clicked();
     if (go || entered) && !prompt.busy && asked.is_none() {
         let code = prompt.code.trim().to_string();
         if code.is_empty() || (six_digits(&chosen) && code.len() < 6) {
-            prompt.error = Some(SHORT_CODE.to_string());
+            prompt.error = Some(short_code().to_string());
         } else {
             asked = Some(PromptAction::Submit(crate::rest::api::SecondFactorAnswer::new(
                 chosen.clone(),
@@ -504,7 +503,7 @@ fn draw_form(ui: &mut egui::Ui, prompt: &mut Prompt) -> Option<PromptAction> {
     ui.add_space(20.0);
     let other = next_method(prompt, &chosen);
     let labels: Vec<&str> =
-        if other.is_some() { vec![BACK_LABEL, OTHER_METHOD_LABEL] } else { vec![BACK_LABEL] };
+        if other.is_some() { vec![back_label(), other_method_label()] } else { vec![back_label()] };
     match auth::link_row(ui, &labels) {
         Some(0) => asked = Some(PromptAction::Back),
         Some(_) => {
@@ -931,7 +930,7 @@ mod tests {
             says(&email_texts, "a***@b.c"),
             "control: the card painted its own hint; got {email_texts:?}"
         );
-        assert!(says(&email_texts, SEND_CODE_LABEL), "got {email_texts:?}");
+        assert!(says(&email_texts, send_code_label()), "got {email_texts:?}");
 
         let mut totp = Prompt::new(vec![SecondFactor::Authenticator]);
         let totp_texts = painted(&mut totp);
@@ -939,7 +938,7 @@ mod tests {
             says(&totp_texts, "authenticator app"),
             "control: the authenticator card painted its own hint; got {totp_texts:?}"
         );
-        assert!(!says(&totp_texts, SEND_CODE_LABEL), "got {totp_texts:?}");
+        assert!(!says(&totp_texts, send_code_label()), "got {totp_texts:?}");
     }
 
     /// The provider switch appears only when there is something to switch to.
@@ -947,7 +946,7 @@ mod tests {
     fn the_provider_switch_appears_only_with_more_than_one_factor() {
         let mut two = Prompt::new(vec![SecondFactor::Authenticator, SecondFactor::YubiKey]);
         let two_texts = painted(&mut two);
-        assert!(says(&two_texts, OTHER_METHOD_LABEL), "got {two_texts:?}");
+        assert!(says(&two_texts, other_method_label()), "got {two_texts:?}");
 
         let mut one = Prompt::new(vec![SecondFactor::Authenticator]);
         let one_texts = painted(&mut one);
@@ -955,7 +954,7 @@ mod tests {
             says(&one_texts, stage_heading(&SecondFactor::Authenticator)),
             "control: the single-factor card painted its heading; got {one_texts:?}"
         );
-        assert!(!says(&one_texts, OTHER_METHOD_LABEL), "got {one_texts:?}");
+        assert!(!says(&one_texts, other_method_label()), "got {one_texts:?}");
     }
 
     /// An unsupported-only account gets the message and NO code box: a box
@@ -966,12 +965,12 @@ mod tests {
         let texts = painted(&mut duo);
         assert!(says(&texts, "Duo"), "got {texts:?}");
         assert!(says(&texts, "API key"), "got {texts:?}");
-        assert!(!says(&texts, CONTINUE_LABEL), "there is nothing to submit; got {texts:?}");
+        assert!(!says(&texts, continue_label()), "there is nothing to submit; got {texts:?}");
         // Control: a card that CAN be answered does paint the box, so the
         // absence above is about this account and not about a `draw` that
         // stopped drawing.
         let mut totp = Prompt::new(vec![SecondFactor::Authenticator]);
-        assert!(says(&painted(&mut totp), CONTINUE_LABEL), "control: the box is painted at all");
+        assert!(says(&painted(&mut totp), continue_label()), "control: the box is painted at all");
     }
 
     /// The error line is painted under the box, and it is the one the trouble
@@ -1024,7 +1023,7 @@ mod tests {
             "control: the message this button belongs to is still painted; got {texts:?}"
         );
         assert!(
-            says(&texts, crate::api_key_ui::USE_API_KEY_LABEL),
+            says(&texts, crate::api_key_ui::use_api_key_label()),
             "the message tells the user to sign in with an API key and there must be a \
              way to; got {texts:?}"
         );
@@ -1035,7 +1034,7 @@ mod tests {
         let mut totp = Prompt::new(vec![SecondFactor::Authenticator]);
         let texts = painted(&mut totp);
         assert!(
-            !says(&texts, crate::api_key_ui::USE_API_KEY_LABEL),
+            !says(&texts, crate::api_key_ui::use_api_key_label()),
             "an account with an authenticator app should use it; got {texts:?}"
         );
     }
@@ -1057,7 +1056,7 @@ mod tests {
 
     fn press_continue(prompt: &mut Prompt) -> Option<PromptAction> {
         let (ctx, painted) = stage_frames(prompt);
-        let at = painted.text(CONTINUE_LABEL).unwrap().2.center();
+        let at = painted.text(continue_label()).unwrap().2.center();
         let mut asked = None;
         crate::kit::testing::frame(&ctx, 1.6, STAGE, crate::kit::testing::click_at(at), |ui| {
             asked = draw(ui, prompt);
@@ -1081,7 +1080,7 @@ mod tests {
         prompt.code = "482".to_string();
         let (_, painted) = stage_frames(&mut prompt);
         assert_eq!(painted.rects.iter().filter(|r| r.rect.height() == 64.0).count(), 6);
-        for word in ["Enter your 6-digit code", CONTINUE_LABEL, BACK_LABEL, OTHER_METHOD_LABEL] {
+        for word in ["Enter your 6-digit code", continue_label(), back_label(), other_method_label()] {
             assert!(painted.text(word).is_some(), "{word}");
         }
     }
@@ -1090,8 +1089,8 @@ mod tests {
     fn a_one_method_account_has_no_other_method_link() {
         let mut prompt = Prompt::new(vec![SecondFactor::Authenticator]);
         let (_, painted) = stage_frames(&mut prompt);
-        assert!(painted.text(OTHER_METHOD_LABEL).is_none());
-        assert!(painted.text(BACK_LABEL).is_some());
+        assert!(painted.text(other_method_label()).is_none());
+        assert!(painted.text(back_label()).is_some());
     }
 
     #[test]
@@ -1112,7 +1111,7 @@ mod tests {
         let mut prompt = Prompt::new(vec![SecondFactor::Authenticator]);
         prompt.code = "482".to_string();
         assert!(press_continue(&mut prompt).is_none(), "nothing is sent");
-        assert_eq!(prompt.error.as_deref(), Some(SHORT_CODE));
+        assert_eq!(prompt.error.as_deref(), Some(short_code()));
     }
 
     #[test]
@@ -1128,6 +1127,6 @@ mod tests {
         prompt.code = "482913".to_string();
         prompt.busy = true;
         let (_, painted) = stage_frames(&mut prompt);
-        assert!(painted.text(crate::login_ui::CHECKING_LABEL).is_some());
+        assert!(painted.text(crate::login_ui::checking_label()).is_some());
     }
 }

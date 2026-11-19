@@ -3178,7 +3178,19 @@ mod tests {
             // implementation was first run against the PREVIOUS pinned pair and
             // reproduced (29701, 0xcb35_0ed7_b18a_6775) exactly, so it is measuring
             // what this test measures.
-            (29705, 0x6fcc_62cc_c06d_5cda_u64),
+            //
+            // **29972 bytes, new hash: ONE FEATURE, on a dependency that was already
+            // here.** `Win32_Globalization` was added to the `windows` list, for
+            // `src/i18n/system.rs`, which calls `GetUserPreferredUILanguages` so a first
+            // start with no saved language shows the user's Windows display language.
+            // 29705 -> 29972 bytes, all of it the feature name and its comment.
+            //
+            // No dependency was added, removed or re-pointed, no `[patch]`/`[replace]`
+            // table appeared, no path or fork appeared, `[build-dependencies]` still
+            // reads exactly `winresource = "0.1"`, and `Cargo.lock` did not change.
+            // Recomputed in a separate implementation (FNV-1a/64 over the file with CRLF
+            // normalised to LF), first run against the pair above, which it reproduced.
+            (29972, 0x5e10_7fc4_939e_a369_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \
@@ -3534,6 +3546,47 @@ mod tests {
                 // parser are gone. `main::the_bootstrap_script_is_not_in_the_tree`
                 // asserts its absence from the other side.
                 "installer/deskwarden.iss",
+                // The translation catalogs `i18n` embeds with `include_str!`:
+                // one `key = value` text file per language, thirty-six of them,
+                // created together so the list of languages is fixed by the
+                // build. Data, not modules -- nothing here is compiled as
+                // Rust, and `i18n`'s own tests parse every one of them.
+                "locales/bg.txt",
+                "locales/ca.txt",
+                "locales/cs.txt",
+                "locales/da.txt",
+                "locales/de.txt",
+                "locales/el.txt",
+                "locales/en.txt",
+                "locales/es.txt",
+                "locales/et.txt",
+                "locales/fi.txt",
+                "locales/fr.txt",
+                "locales/hr.txt",
+                "locales/hu.txt",
+                "locales/id.txt",
+                "locales/it.txt",
+                "locales/ja.txt",
+                "locales/ko.txt",
+                "locales/lt.txt",
+                "locales/lv.txt",
+                "locales/ms.txt",
+                "locales/nb.txt",
+                "locales/nl.txt",
+                "locales/pl.txt",
+                "locales/pt-BR.txt",
+                "locales/pt-PT.txt",
+                "locales/ro.txt",
+                "locales/ru.txt",
+                "locales/sk.txt",
+                "locales/sl.txt",
+                "locales/sr.txt",
+                "locales/sv.txt",
+                "locales/tr.txt",
+                "locales/uk.txt",
+                "locales/vi.txt",
+                "locales/zh-Hans.txt",
+                "locales/zh-Hant.txt",
             ],
             "the set of NON-Rust files in this crate changed. rustc does not care what a module \
              file is called -- `#[path = \"aid.txt\"] mod aid;` compiles, and that exact mutant \

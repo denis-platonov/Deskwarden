@@ -27,6 +27,7 @@
 //! `Account`, `Step`, `Command` and `Report` are every one of them already
 //! taken elsewhere in this crate.
 
+use crate::i18n;
 use crate::rest::api::{Authenticated, Device, RestClient, RestError, Session};
 use eframe::egui;
 use zeroize::{Zeroize, Zeroizing};
@@ -465,22 +466,39 @@ pub fn run_api_key_sign_in(
     None
 }
 
-pub const KEY_PAIR_TITLE: &str = "Sign in with an API key";
-pub const KEY_PAIR_HINT: &str = "Create a personal API key under Account settings \u{2192} \
-                                 Security \u{2192} Keys in the Bitwarden web vault, then paste \
-                                 both halves here.";
-pub const CLIENT_ID_LABEL: &str = "Client ID";
-pub const CLIENT_SECRET_LABEL: &str = "Client secret";
-pub const PASSWORD_TITLE: &str = "Master password";
-pub const PASSWORD_HINT: &str = "The API key signed you in. Your master password is what \
-                                 unlocks the vault \u{2014} the key cannot decrypt it.";
-pub const PASSWORD_LABEL: &str = "Master password";
-pub const CONTINUE_LABEL: &str = "Continue";
-pub const BACK_LABEL: &str = "Back";
+pub fn key_pair_title() -> &'static str {
+    i18n::t("api_key.key_pair_title")
+}
+pub fn key_pair_hint() -> &'static str {
+    i18n::t("api_key.key_pair_hint")
+}
+pub fn client_id_label() -> &'static str {
+    i18n::t("api_key.client_id")
+}
+pub fn client_secret_label() -> &'static str {
+    i18n::t("api_key.client_secret")
+}
+pub fn password_title() -> &'static str {
+    i18n::t("api_key.password_title")
+}
+pub fn password_hint() -> &'static str {
+    i18n::t("api_key.password_hint")
+}
+pub fn password_label() -> &'static str {
+    i18n::t("api_key.password_label")
+}
+pub fn continue_label() -> &'static str {
+    i18n::t("second_factor.continue")
+}
+pub fn back_label() -> &'static str {
+    i18n::t("second_factor.back")
+}
 /// The label on both routes in: the sign-in card's link, and the button on
 /// `second_factor_ui`'s unsupported-only card. One constant, so the two places
 /// cannot drift into naming the same destination differently.
-pub const USE_API_KEY_LABEL: &str = "Sign in with an API key";
+pub fn use_api_key_label() -> &'static str {
+    i18n::t("api_key.use_api_key")
+}
 
 /// What the user asked the API-key stage to do this frame. `None` from
 /// [`draw`] is the ordinary case: they are still typing.
@@ -539,8 +557,8 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
     // The stage's head, in the sign-in gallery's measure: the title 30, its line
     // 16 under it, 18 before the fields.
     let (title, hint) = match form.step {
-        ApiKeyStep::KeyPair => (KEY_PAIR_TITLE, KEY_PAIR_HINT),
-        ApiKeyStep::MasterPassword => (PASSWORD_TITLE, PASSWORD_HINT),
+        ApiKeyStep::KeyPair => (key_pair_title(), key_pair_hint()),
+        ApiKeyStep::MasterPassword => (password_title(), password_hint()),
     };
     auth::stage_title(ui, title);
     ui.add_space(6.0);
@@ -549,14 +567,14 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
 
     match form.step {
         ApiKeyStep::KeyPair => {
-            auth::label(ui, CLIENT_ID_LABEL);
+            auth::label(ui, client_id_label());
             ui.add_space(FIELD_LABEL_GAP);
             ui.add_enabled_ui(!form.busy, |ui| {
                 auth::field_text(ui, egui::Id::new("auth-api-client-id"), &mut form.client_id, "", width, bad, None);
             });
             ui.add_space(FORM_GAP);
 
-            auth::label(ui, CLIENT_SECRET_LABEL);
+            auth::label(ui, client_secret_label());
             ui.add_space(FIELD_LABEL_GAP);
             ui.add_enabled_ui(!form.busy, |ui| {
                 auth::field_secret(
@@ -571,7 +589,7 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
             });
         }
         ApiKeyStep::MasterPassword => {
-            auth::label(ui, PASSWORD_LABEL);
+            auth::label(ui, password_label());
             ui.add_space(FIELD_LABEL_GAP);
             ui.add_enabled_ui(!form.busy, |ui| {
                 auth::field_secret(
@@ -594,13 +612,13 @@ fn draw_form(ui: &mut egui::Ui, form: &mut ApiKeyForm) -> Option<ApiKeyAction> {
     }
 
     ui.add_space(FORM_GAP);
-    let label = if form.busy { crate::login_ui::CHECKING_LABEL } else { CONTINUE_LABEL };
+    let label = if form.busy { crate::login_ui::checking_label() } else { continue_label() };
     let go = auth::submit_button(ui, label, form.busy, width);
     if go.clicked() && !form.busy && ready {
         asked = Some(ApiKeyAction::Submit);
     }
     ui.add_space(FORM_GAP);
-    if auth::link_big(ui, BACK_LABEL).clicked() {
+    if auth::link_big(ui, back_label()).clicked() {
         asked = Some(ApiKeyAction::Back);
     }
 
@@ -1276,12 +1294,12 @@ mod tests {
         let mut form = ApiKeyForm::new();
         let stage_one = painted(&mut form);
         assert!(
-            says(&stage_one, CLIENT_ID_LABEL),
+            says(&stage_one, client_id_label()),
             "control: the key-pair card painted its own labels; got {stage_one:?}"
         );
-        assert!(says(&stage_one, CLIENT_SECRET_LABEL), "got {stage_one:?}");
+        assert!(says(&stage_one, client_secret_label()), "got {stage_one:?}");
         assert!(
-            !says(&stage_one, PASSWORD_LABEL),
+            !says(&stage_one, password_label()),
             "the master password is not on the same screen as the client secret; \
              got {stage_one:?}"
         );
@@ -1290,11 +1308,11 @@ mod tests {
         form.step = ApiKeyStep::MasterPassword;
         let stage_two = painted(&mut form);
         assert!(
-            says(&stage_two, PASSWORD_LABEL),
+            says(&stage_two, password_label()),
             "control: the password card painted its own label; got {stage_two:?}"
         );
         assert!(
-            !says(&stage_two, CLIENT_SECRET_LABEL),
+            !says(&stage_two, client_secret_label()),
             "the secret is done with; leaving it on screen is a long-lived credential \
              sitting in a text box for no reason. got {stage_two:?}"
         );
@@ -1332,7 +1350,7 @@ mod tests {
             "got {texts:?}"
         );
         assert!(
-            says(&texts, PASSWORD_LABEL),
+            says(&texts, password_label()),
             "control: it is painted on the PASSWORD stage, which is where that refusal \
              returns to; got {texts:?}"
         );
@@ -1345,7 +1363,7 @@ mod tests {
             "got {texts:?}"
         );
         assert!(
-            says(&texts, CLIENT_SECRET_LABEL),
+            says(&texts, client_secret_label()),
             "a rejected key pair returns to the key-pair stage with both fields on screen; \
              got {texts:?}"
         );
