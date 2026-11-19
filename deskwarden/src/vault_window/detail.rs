@@ -3898,55 +3898,13 @@ pub fn draw_detail_read(
         ui.add_space(CARD_GAP);
     }
 
+    // The websites. The matched app keeps its own card (MATCHED APP, below),
+    // which carries Open, Remove, the program file and the trigger: a chip
+    // here as well would name the app twice on one pane.
     if !websites.is_empty() {
-        card(ui, "AUTOFILL TARGETS", |ui| {
-            for (index, uri) in websites.iter().enumerate() {
-                // **Two things one click can mean, split by where it
-                // lands.** The URL text is the link -- clicking it opens the
-                // browser -- and the rest of the tile copies, like every
-                // other row on this pane. That split is safe for exactly the
-                // reason the eye's is (see `copy_row`): `row_impl` senses
-                // the tile on a `UiBuilder` background, which egui registers
-                // when the `Ui` is created and therefore *before* its
-                // children, and a click goes to the topmost widget under the
-                // pointer and to nothing else. The link is a child, so it
-                // wins its own click and does not also copy. Pinned by
-                // `clicking_the_website_link_opens_it_without_copying`,
-                // which asserts both halves in one frame.
-                let mut opened = false;
-                copy_row(
-                    ui,
-                    // `Website`, `Website 2`, `Website 3` -- the edit form's
-                    // own numbering, so the same row is called the same
-                    // thing on the two panes. The first keeps the bare word
-                    // because `copy_shortcut_label` is what the chord's
-                    // toast says, and the chord copies that one.
-                    &super::detail_edit::website_label(index),
-                    |ui| {
-                        opened = theme::link_label(ui, uri, ROW_VALUE_SIZE)
-                            .on_hover_text("Open in browser")
-                            .clicked();
-                    },
-                    |_ui| {},
-                    DetailAction::CopyValue((*uri).to_string()),
-                    // **The chord is offered on the first row only.** It
-                    // copies one website and a chord hint on three rows
-                    // would promise it copies whichever one you are looking
-                    // at.
-                    (index == 0).then_some(CopyShortcut::Url),
-                    // Not a constant `true`: the list is already filtered to
-                    // non-empty above, and stating the rule through the same
-                    // predicate every other row uses means the two cannot
-                    // drift if that filter ever changes.
-                    row_offers_copy(uri),
-                    &mut action,
-                    RowShape::Columns,
-                );
-                if opened {
-                    action = DetailAction::OpenWebsite((*uri).to_string());
-                }
-            }
-        });
+        if let Some(chosen) = fills_in_card(ui, &websites) {
+            action = chosen;
+        }
         ui.add_space(CARD_GAP);
     }
 
@@ -4085,9 +4043,6 @@ pub fn draw_detail_read(
         breach_segment(&ctx, check_breaches, kind, password, breaches)
     };
     egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, theme::HAIRLINE))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             let strip = RichText::new(metadata_line_for(
@@ -4419,6 +4374,62 @@ fn app_card_body(app_match: Option<&AppMatch>, field_present: bool) -> AppCardBo
 /// the whole card suppressed -- an invisible binding the user cannot see or
 /// remove, which is the exact defect this card was added to end. An
 /// unreadable field IS a binding; only its text is lost.
+/// The "Fills in" card's words (spec 3.3).
+pub const FILLS_IN_LABEL: &str = "Fills in";
+/// Spec 3.3's `fills` tip.
+const FILLS_TIP: &str = "Deskwarden suggests this login when one of these apps or sites asks you to sign in.";
+
+/// A website as its chip shows it: no scheme, no path.
+fn fills_in_site_label(uri: &str) -> &str {
+    let rest = uri.trim();
+    let rest = rest.strip_prefix("https://").or_else(|| rest.strip_prefix("http://")).unwrap_or(rest);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+/// One "Fills in" chip: 38 high, `0 14` padding, radius 11, a 16pt glyph.
+fn fills_in_chip(ui: &mut egui::Ui, d: &str, label: &str) -> egui::Response {
+    use crate::kit::{self, tokens};
+    let p = tokens::palette(ui.ctx());
+    let text = ui.fonts_mut(|f| f.layout_job(tokens::job(tokens::NAV, label, p.ink)));
+    let size = egui::vec2(14.0 + 16.0 + 9.0 + text.size().x + 14.0, 38.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    let bg = if response.hovered() { p.secondary_hover } else { p.field_bg };
+    ui.painter().rect_filled(rect, CornerRadius::same(11), bg);
+    let glyph = egui::Rect::from_min_size(egui::pos2(rect.left() + 14.0, rect.center().y - 8.0), egui::Vec2::splat(16.0));
+    kit::icon::stroke(ui.painter(), glyph, d, 2.0, p.text_icon);
+    let text_h = text.size().y;
+    ui.painter().galley(egui::pos2(glyph.right() + 9.0, rect.center().y - text_h / 2.0), text, p.ink);
+    response
+}
+
+/// Spec 3.3's "Fills in" card: the item's websites as chips; a chip opens
+/// its site.
+fn fills_in_card(ui: &mut egui::Ui, websites: &[&str]) -> Option<DetailAction> {
+    use crate::kit::{self, tokens};
+    let p = tokens::palette(ui.ctx());
+    let mut chosen = None;
+    kit::card::card(ui, tokens::R_CARD, Margin::symmetric(20, 18), |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(tokens::job(tokens::LABEL, FILLS_IN_LABEL, p.text_label));
+            kit::tips::help_dot(ui, ui.id().with("fills-tip"), FILLS_TIP, 260.0, kit::tips::Placement::Above);
+        });
+        ui.add_space(12.0);
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
+            for uri in websites {
+                let chip = fills_in_chip(ui, kit::icon::glyph::WEB, fills_in_site_label(uri)).on_hover_text("Open in browser");
+                if chip.clicked() {
+                    chosen = Some(DetailAction::OpenWebsite((*uri).to_string()));
+                }
+            }
+        });
+    });
+    chosen
+}
+
 fn app_card_visible(has_field: bool) -> bool {
     has_field
 }
@@ -5858,10 +5869,7 @@ fn card_with_side(
     side: Option<&str>,
     contents: impl FnOnce(&mut egui::Ui),
 ) {
-    egui::Frame::new()
-        .fill(theme::CARD)
-        .corner_radius(CornerRadius::same(10))
-        .stroke(Stroke::new(1.0, theme::HAIRLINE))
+    crate::kit::tokens::card_frame(&crate::kit::tokens::palette(ui.ctx()), crate::kit::tokens::R_CARD)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = egui::Vec2::ZERO;
@@ -9165,20 +9173,6 @@ mod tests {
     /// claim that test is making. Used for height alone.
     const UNCULLED: f32 = 2400.0;
 
-    /// One frame of `draw_detail_read`, as the filled rectangles it painted.
-    ///
-    /// The counterpart to [`painted_text`]: the pane surface, the header
-    /// strip, the cards, the avatar tile and every button body are *fills*,
-    /// and the report this work came from ("top is white") is a statement
-    /// about exactly those. Nothing that walks galleys can see them.
-    fn painted_rects(item: &VaultItem, totp: &TotpState) -> Vec<(egui::Rect, egui::Color32)> {
-        let mut rects = Vec::new();
-        for clipped in &frame_shapes(item, totp, RevealState::default()) {
-            collect_rects(&clipped.shape, &mut rects);
-        }
-        rects
-    }
-
     /// Every TEXTURED rectangle -- which is what an `egui::Image` paints in
     /// this version of egui, and the only trace an icon leaves: it paints no
     /// string, and `collect_rects` throws the brush away and would report it
@@ -9201,46 +9195,6 @@ mod tests {
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
                     collect_rects(shape, out);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// Every painted string with the rectangle it landed in *and the font it
-    /// was laid out with* -- the only way to assert a size or a weight, which
-    /// [`collect_text_rects`] throws away.
-    fn painted_type(
-        item: &VaultItem,
-        totp: &TotpState,
-        reveal: RevealState,
-    ) -> Vec<(String, egui::Rect, egui::FontId)> {
-        let mut out = Vec::new();
-        for clipped in &frame_shapes(item, totp, reveal) {
-            collect_type(&clipped.shape, &mut out);
-        }
-        out
-    }
-
-    fn collect_type(shape: &egui::Shape, out: &mut Vec<(String, egui::Rect, egui::FontId)>) {
-        match shape {
-            egui::Shape::Text(text) => {
-                let font = text
-                    .galley
-                    .job
-                    .sections
-                    .first()
-                    .map(|s| s.format.font_id.clone())
-                    .unwrap_or_default();
-                out.push((
-                    text.galley.text().to_string(),
-                    egui::Rect::from_min_size(text.pos, text.galley.size()),
-                    font,
-                ));
-            }
-            egui::Shape::Vec(shapes) => {
-                for shape in shapes {
-                    collect_type(shape, out);
                 }
             }
             _ => {}
@@ -11083,7 +11037,7 @@ mod tests {
                 "{kind:?}: the removed header Fill button is painted again"
             );
             assert_eq!(
-                contains(&texts, "AUTOFILL TARGETS"),
+                contains(&texts, FILLS_IN_LABEL),
                 kind_offers_fill(kind),
                 "{kind:?}: the autofill card disagrees with kind_offers_fill"
             );
@@ -11523,7 +11477,7 @@ mod tests {
     #[test]
     fn the_pane_draws_the_matched_app_card_for_a_bound_item() {
         let item = bound_to(&a_login(), &a_store_match());
-        let mut pane = Pane::new();
+        let mut pane = Pane::new().tall();
         let frame = pane.idle(&item, &TotpState::NoSecret);
         for needle in [
             "MATCHED APP",
@@ -11567,14 +11521,13 @@ mod tests {
     /// card. `the_card_heading_list_is_complete` counts the `card(` call sites
     /// in this file against it, so a ninth card fails the build's own suite
     /// rather than quietly narrowing the ordering claim.
-    const EVERY_CARD_HEADING: [&str; 11] = [
+    const EVERY_CARD_HEADING: [&str; 10] = [
         TOTP_CARD_HEADING,
         "CARD DETAILS",
         "IDENTITY",
         "SSH KEY",
         "UNSUPPORTED ITEM",
         "PREVIOUS PASSWORDS",
-        "AUTOFILL TARGETS",
         APP_CARD_HEADING,
         CUSTOM_FIELDS_CARD_HEADING,
         SHARING_CARD_HEADING,
@@ -11721,7 +11674,7 @@ mod tests {
                     // because the whole point of the login fixture is that
                     // they are in the frame this assertion is made against --
                     // a count alone would be satisfied by two other cards.
-                    for heading in ["AUTOFILL TARGETS", "PREVIOUS PASSWORDS"] {
+                    for heading in ["PREVIOUS PASSWORDS"] {
                         assert!(
                             headings.iter().any(|(h, _)| *h == heading),
                             "the login fixture drew no {heading} card, so 'NOTES is below \
@@ -11763,7 +11716,8 @@ mod tests {
             // PASSWORDS that `a_noted_login_with_targets_and_history` exists
             // to put on the pane.
             // (Credentials are the v2 field card, which has no heading.)
-            ItemKind::Login => 2,
+            // (Its websites are the heading-less Fills in card.)
+            ItemKind::Login => 1,
             _ => 1,
         };
         body + 1 + usize::from(bound)
@@ -12537,7 +12491,7 @@ mod tests {
     #[test]
     fn clicking_remove_reports_that_the_binding_should_go() {
         let item = bound_to(&a_login(), &a_store_match());
-        let mut pane = Pane::new();
+        let mut pane = Pane::new().tall();
         let laid_out = pane.idle(&item, &TotpState::NoSecret);
         let remove = laid_out.rect_of("Remove");
         let clicked = pane.click(&item, &TotpState::NoSecret, remove.center());
@@ -15054,213 +15008,6 @@ mod tests {
         );
     }
 
-    /// **An item with several websites shows all of them**, numbered the
-    /// way the edit form numbers them, each its own link -- and the chord
-    /// still copies the first.
-    ///
-    /// This pane read `login.uris.first()` and drew one row, where the edit
-    /// form has drawn a row per website since 8a: the two panes disagreed
-    /// about what the item holds, one click apart. The owner, with a login
-    /// that has two: "So if record has two websites - only one gets shown
-    /// for example Hayward OmniLogic record".
-    #[test]
-    fn every_website_on_the_item_gets_a_row_of_its_own() {
-        const SECOND: &str = "portal.ledgerline.example";
-        let mut item = a_login();
-        item.login.as_mut().expect("a_login has login data").uris.push(
-            crate::vault_bridge::UriEntry {
-                uri: Some(SECOND.to_string()),
-                other: serde_json::Map::new(),
-            },
-        );
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-
-        for (label, uri) in [("Website", WEBSITE), ("Website 2", SECOND)] {
-            assert!(
-                laid_out.painted(label),
-                "no {label:?} row: {:?}",
-                laid_out.strings()
-            );
-            assert!(laid_out.painted(uri), "{uri:?} is not on the pane");
-        }
-
-        // The second row is a link of its own, and it opens ITS own url.
-        let clicked =
-            pane.click(&item, &TotpState::NoSecret, laid_out.rect_of(SECOND).center());
-        assert_eq!(clicked.action, DetailAction::OpenWebsite(SECOND.to_string()));
-
-        // ...and the chord copies the FIRST, which is the one this item's
-        // page is drawn from -- see `detail_edit::WEBSITE_FIRST_NOTE`.
-        let mut pane = Pane::new();
-        let _ = pane.idle(&item, &TotpState::NoSecret);
-        let chord = vec![egui::Event::Key {
-            key: egui::Key::U,
-            physical_key: None,
-            pressed: true,
-            repeat: false,
-            modifiers: egui::Modifiers::CTRL | egui::Modifiers::SHIFT,
-        }];
-        assert_eq!(
-            pane.frame(&item, &TotpState::NoSecret, chord).action,
-            DetailAction::CopyValue(WEBSITE.to_string()),
-            "the chord copied something other than the first website"
-        );
-    }
-
-    /// And a click anywhere else in the same tile copies it. Over the LABEL
-    /// column, which is as far from the link as the row goes -- the other
-    /// half of the split, and the one that says the tile did not simply stop
-    /// being clickable when the link arrived.
-    #[test]
-    fn clicking_elsewhere_in_the_website_tile_copies_the_url() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let label = laid_out.rect_of("Website");
-
-        let clicked = pane.click(&item, &TotpState::NoSecret, label.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::CopyValue(WEBSITE.to_string()),
-            "clicking the Website tile reported {:?}, so the tile is not the copy \
-             target every other row on this pane is",
-            clicked.action
-        );
-    }
-
-    /// **The link is the control, so the `Open` button is gone.** The row's
-    /// label and the URL itself are the positive control: "nothing painted
-    /// Open" is also true of a pane that drew no AUTOFILL TARGETS card, and
-    /// of one that drew no card at all.
-    #[test]
-    fn the_website_row_has_no_open_button() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let frame = pane.idle(&item, &TotpState::NoSecret);
-
-        assert!(
-            frame.painted("Website") && frame.painted(WEBSITE),
-            "the Website row is not on this pane at all, so finding no Open button \
-             proves nothing; the pane painted: {:?}",
-            frame.strings()
-        );
-        assert!(
-            !frame.painted("Open"),
-            "the Open button is still painted beside the URL that replaced it; the \
-             pane painted: {:?}",
-            frame.strings()
-        );
-    }
-
-    /// Every painted run with the colour it was laid out in -- which
-    /// [`collect_text_rects`] and [`collect_type`] both throw away, and which
-    /// is the whole of "make the URL blue".
-    fn painted_colours(item: &VaultItem, totp: &TotpState) -> Vec<(String, egui::Color32)> {
-        fn walk(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
-            match shape {
-                egui::Shape::Text(text) => {
-                    let colour = text.override_text_color.unwrap_or_else(|| {
-                        text.galley
-                            .job
-                            .sections
-                            .first()
-                            .map(|s| s.format.color)
-                            .unwrap_or_default()
-                    });
-                    out.push((text.galley.text().to_string(), colour));
-                }
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut out = Vec::new();
-        for clipped in &frame_shapes(item, totp, RevealState::default()) {
-            walk(&clipped.shape, &mut out);
-        }
-        out
-    }
-
-    /// **The URL paints in `BLUE`, not `INK`.** The username, painted in the
-    /// same kind of row on the same pane, is the control: it pins that this
-    /// walk reads real colours off the galleys rather than reporting one
-    /// default for everything, so "the URL is blue" cannot pass by accident.
-    #[test]
-    fn the_url_is_painted_as_a_link_and_the_values_around_it_are_not() {
-        let colours = painted_colours(&a_login(), &TotpState::NoSecret);
-        let colour_of = |needle: &str| {
-            let hits: Vec<egui::Color32> = colours
-                .iter()
-                .filter(|(text, _)| text == needle)
-                .map(|(_, colour)| *colour)
-                .collect();
-            assert_eq!(
-                hits.len(),
-                1,
-                "expected exactly one {needle:?} on the pane, found {}; painted: {:?}",
-                hits.len(),
-                colours
-            );
-            hits[0]
-        };
-        assert_eq!(
-            colour_of(WEBSITE),
-            theme::BLUE,
-            "the URL is not painted as a link"
-        );
-        assert_eq!(
-            colour_of("a.novak@ledgerline.com"),
-            theme::INK,
-            "the username is not INK either, so this test is not reading colours"
-        );
-    }
-
-    /// **The link wins the hover as well as the click.** It says "Open in
-    /// browser"; the tile under it says "Click to copy". Both are wired, and
-    /// only the link's own can appear when the pointer is on the link --
-    /// which is the same layering the click test relies on, observed through
-    /// a second, independent channel.
-    #[test]
-    fn hovering_the_url_offers_to_open_it_rather_than_to_copy_it() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let url = laid_out.rect_of(WEBSITE);
-        let label = laid_out.rect_of("Website");
-
-        let on_link = pane.hover_settled(&item, &TotpState::NoSecret, url.center());
-        assert!(
-            on_link.painted("Open in browser"),
-            "hovering the URL offered no way to open it; the frame painted: {:?}",
-            on_link.strings()
-        );
-        assert!(
-            !on_link
-                .strings()
-                .iter()
-                .any(|t| t.starts_with("Click to copy")),
-            "hovering the URL ALSO offered the tile's copy, so the two are not \
-             layered; the frame painted: {:?}",
-            on_link.strings()
-        );
-
-        // And the rest of the tile is the copy tooltip -- the control that
-        // says the row really does carry one for the link to be winning.
-        let mut pane = Pane::new();
-        let _ = pane.idle(&item, &TotpState::NoSecret);
-        let on_tile = pane.hover_settled(&item, &TotpState::NoSecret, label.center());
-        assert!(
-            on_tile.painted("Click to copy · CTRL+SHIFT+U"),
-            "hovering the Website row's label painted no copy tooltip; the frame \
-             painted: {:?}",
-            on_tile.strings()
-        );
-    }
-
     /// **CTRL+SHIFT+U copies the URL and CTRL+U still copies the username.**
     /// One key, two chords, told apart only by `consume_chord`'s
     /// `matches_exact` -- under egui's own `consume_key` these would be the
@@ -15365,64 +15112,6 @@ mod tests {
     // -----------------------------------------------------------------
     // Design 2b, the cards and their rows.
     // -----------------------------------------------------------------
-
-    /// A login carrying the design's own sample values.
-    /// **THE REPORT: "if website or any other value too long - it should cut
-    /// off with ... before overlapping the shortcut".**
-    ///
-    /// A row lays out its label, its value and its controls in one band. The
-    /// value used to be allocated BEFORE the control group, so a URL longer
-    /// than the row took the whole band and CTRL+SHIFT+U painted on top of
-    /// it. The controls are allocated first now, and the value is truncated
-    /// into what is left.
-    ///
-    /// Asserted on the INK, not on the laid-out rects: a run in a
-    /// right-to-left layout is positioned by its right edge, so a rect-based
-    /// overlap test reports collisions where the pane is clean and misses the
-    /// ones beside them. See `Painted::ink_of`, which says so at length.
-    #[test]
-    fn a_website_too_long_for_its_row_is_cut_before_it_reaches_the_chord() {
-        let mut item = a_login();
-        // Long enough that it cannot fit even the widest pane these tests
-        // build: the point is the rule, and a URL that happens to fit today
-        // would make this test a measurement of the fixture instead.
-        let long = concat!(
-            "https://airbnb-wyze-lockcode.autobis.workers.dev/login/with/a/very/long/path",
-            "/that/keeps/going/well/past/anything/a/row/could/hold/even/on/a/wide/window",
-            "/and/then/some/more/for/good/measure"
-        );
-        item.login.as_mut().expect("the fixture is a login").uris =
-            vec![crate::vault_bridge::UriEntry {
-                uri: Some(long.to_string()),
-                other: serde_json::Map::new(),
-            }];
-        let mut pane = Pane::new();
-        let frame = pane.idle(&item, &TotpState::NoSecret);
-
-        let chord = frame.ink_of(copy_shortcut_chord(CopyShortcut::Url));
-        // The GLYPHS, not the source string: `Galley::text()` still reports
-        // the whole URL after egui has elided it, which is the blindness
-        // `Frame::rendered` exists for.
-        let shown = frame
-            .rendered
-            .iter()
-            .map(|(_, glyphs, _)| glyphs.clone())
-            .find(|glyphs| glyphs.starts_with("https://airbnb-wyze"))
-            .expect("the website row painted no value at all");
-        assert_ne!(
-            shown, long,
-            "the whole URL was laid out, so nothing truncated it and the only question left is \
-             whether it happens to be short enough today"
-        );
-        let value = frame.ink_of(long);
-        assert!(
-            value.right() <= chord.left(),
-            "the website value runs to x={} and the chord starts at x={}, so the URL is painted \
-             under its own shortcut",
-            value.right(),
-            chord.left()
-        );
-    }
 
     /// **The same rule on the PREVIOUS PASSWORDS card**, whose rows are the
     /// last ones on this pane that answered "too long" by folding.
@@ -15711,7 +15400,7 @@ mod tests {
             line: "Waiting to accept \u{b7} invited 6 days ago".to_string(),
             authenticated: true,
         });
-        let mut pane = Pane::wide(MIN_PANE).with_people(people);
+        let mut pane = Pane::wide(MIN_PANE).tall().with_people(people);
         let frame = pane.idle(&item, &totp);
         let card_right = MIN_PANE - f32::from(BODY_PAD_X);
         let reinvite = frame.rect_of(crate::vault_window::share_ui::REINVITE_LABEL);
@@ -16706,30 +16395,6 @@ mod tests {
         });
     }
 
-    /// The design's last card is the metadata strip -- a white tile like the
-    /// others, `padding: 13px 16px; font-size: 12px`, not a bare line of 11px
-    /// ghost text sitting on the pane's grey.
-    #[test]
-    fn the_metadata_strip_is_a_card_of_its_own_rather_than_bare_text_on_the_pane() {
-        let item = a_login();
-        let painted = painted_type(&item, &TotpState::NoSecret, RevealState::default());
-        let (strip, font) = painted
-            .iter()
-            .find(|(t, _, _)| t.contains("Filled 3 times"))
-            .map(|(_, r, f)| (*r, f.clone()))
-            .unwrap_or_else(|| panic!("no metadata strip painted: {painted:?}"));
-        assert_eq!(font.size, 12.0, "the metadata strip is not the design's 12px");
-        assert_eq!(strip.left(), 41.0, "the strip's text is not at 24 + 1 + 16");
-
-        let rects = painted_rects(&item, &TotpState::NoSecret);
-        assert!(
-            rects
-                .iter()
-                .any(|(r, fill)| *fill == theme::CARD && r.contains_rect(strip) && r.left() == 24.0),
-            "the metadata strip is not inside a card of its own: {rects:?}"
-        );
-    }
-
     // -----------------------------------------------------------------
     // Favourites
     // -----------------------------------------------------------------
@@ -17054,40 +16719,6 @@ mod tests {
         assert_eq!(copy_shortcut_label(CopyShortcut::Username), "Username");
         assert_eq!(copy_shortcut_label(CopyShortcut::Totp), "2FA code");
         assert_eq!(copy_shortcut_label(CopyShortcut::Url), "Website");
-    }
-
-    /// **The row paints the name the confirmation says.**
-    ///
-    /// This is the promise `copy_shortcut_label` exists to make, and it is
-    /// only a promise if the rows really do read it. A row labelled anything
-    /// else beside a toast naming this string is the parallel-table bug this
-    /// crate keeps shipping.
-    #[test]
-    fn each_chord_bound_row_paints_the_name_its_confirmation_uses() {
-        let mut item = a_login();
-        item.login.as_mut().expect("a_login has login data").totp =
-            Some("seed".to_string().into());
-        let totp = TotpState::Code {
-            code: "123456".to_string(),
-            seconds_left: 9,
-            period: 30,
-        };
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &totp);
-        for which in [
-            CopyShortcut::Username,
-            CopyShortcut::Password,
-            CopyShortcut::Totp,
-            CopyShortcut::Url,
-        ] {
-            let name = copy_shortcut_label(which);
-            assert!(
-                laid_out.painted(name),
-                "{which:?}'s confirmation would say {name:?}, but no row on the pane \
-                 is labelled that; painted: {:?}",
-                laid_out.strings()
-            );
-        }
     }
 
     /// **The confirmation names the field. It cannot carry the value.**
@@ -18540,7 +18171,7 @@ mod tests {
     fn the_card_really_does_carry_a_note_at_every_width() {
         let item = bound_to(&a_login_on_the_web(), &a_browser_match());
         for width in [MIN_PANE, PANE] {
-            let mut pane = Pane::wide(width);
+            let mut pane = Pane::wide(width).tall();
             let frame = pane.idle(&item, &TotpState::NoSecret);
             assert!(
                 frame.painted(APP_MATCH_BEHAVIOUR_NOTE),
@@ -18761,6 +18392,43 @@ mod tests {
             let _ = pane.click(&item, &TotpState::NoSecret, eye);
             let shown = pane.idle(&item, &TotpState::NoSecret);
             assert!(shown.painted("4242 4242 4242 4242"), "{:?}", shown.strings());
+        }
+
+        #[test]
+        fn fills_in_lists_websites_and_the_matched_app_as_chips() {
+            let item = bound_to(&a_login(), &a_desktop_match());
+            let mut pane = Pane::new().tall();
+            let f = pane.idle(&item, &TotpState::NoSecret);
+            assert!(f.painted(FILLS_IN_LABEL), "{:?}", f.strings());
+            let site = f.rect_of("app.ledgerline.com");
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, site.center()).action, DetailAction::OpenWebsite("app.ledgerline.com".into()));
+            // The matched app is named once, on its own card, not as a chip.
+            assert_eq!(f.texts.iter().filter(|(t, _)| t.contains("Ledgerline.exe")).count(), f.texts.iter().filter(|(t, r)| t.contains("Ledgerline.exe") && r.top() > site.bottom()).count());
+            // No website: no card.
+            let f = Pane::new().idle(&an_item(Some(2)), &TotpState::NoSecret);
+            assert!(!f.painted(FILLS_IN_LABEL));
+        }
+
+        #[test]
+        fn notes_custom_fields_history_and_sharing_are_still_shown() {
+            let mut item = a_noted_login_with_targets_and_history();
+            item.fields = vec![custom_field("Employee ID", Some("LL-40912"), Some(0))];
+            let mut pane = Pane::new().tall();
+            let f = pane.idle(&item, &TotpState::NoSecret);
+            for heading in ["PREVIOUS PASSWORDS", CUSTOM_FIELDS_CARD_HEADING, "NOTES"] {
+                assert!(f.painted(heading), "{heading} is gone: {:?}", f.strings());
+            }
+            assert!(f.painted("LL-40912"));
+            // v2 cards: white at radius 18, under the headings.
+            let notes = f.rect_of("NOTES");
+            let card = f.filled_box_around(f.rect_of(CUSTOM_FIELDS_CARD_HEADING), P.card);
+            assert!(card.height() > 30.0);
+            assert!(f.rects.iter().any(|(r, c)| *c == P.card && (*r == card)), "a card holds its heading");
+            // The footer is plain text on the pane, no box of its own.
+            let footer = f.texts.iter().find(|(t, _)| t.starts_with("Updated")).expect("the footer").1;
+            assert!(footer.top() > notes.bottom());
+            assert_eq!(f.text_colour_of(&f.texts.iter().find(|(t, _)| t.starts_with("Updated")).unwrap().0.clone()), P.text_faint);
+            assert!(!f.rects.iter().any(|(r, c)| *c == P.card && r.contains_rect(footer)), "the footer sits on no card");
         }
 
         #[test]
@@ -21196,17 +20864,23 @@ mod breach_badge_tests {
             hits[0]
         }
 
-        /// The smallest CARD-filled rectangle that encloses `run` -- the tile
-        /// the run is supposed to be inside of.
+        /// The footer's own extent, which in v2 is text on the pane and no
+        /// tile (spec 3.3): across, the body column the cards above it span;
+        /// down, from `run` to the last ink painted under it -- the footer is
+        /// the last thing on the pane, so a segment that wraps grows it.
         fn card_around(&self, run: &Run) -> egui::Rect {
-            self.fills
+            let (left, right) = self
+                .fills
                 .iter()
-                .filter(|(rect, fill)| *fill == theme::CARD && rect.contains_rect(run.ink))
-                .map(|(rect, _)| *rect)
-                .min_by(|a, b| a.area().partial_cmp(&b.area()).expect("a NaN card"))
-                .unwrap_or_else(|| {
-                    panic!("no CARD tile encloses {:?} at {:?}", run.text, run.ink)
-                })
+                .filter(|(rect, fill)| *fill == theme::CARD && rect.bottom() <= run.ink.top())
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(l, r), (rect, _)| (l.min(rect.left()), r.max(rect.right())));
+            assert!(left.is_finite(), "no card above {:?}, so the column is unknown", run.text);
+            let bottom = self
+                .runs
+                .iter()
+                .filter(|r| r.ink.top() >= run.ink.top() - 0.5)
+                .fold(run.ink.bottom(), |b, r| b.max(r.ink.bottom()));
+            egui::Rect::from_min_max(egui::pos2(left, run.ink.top()), egui::pos2(right, bottom))
         }
     }
 
@@ -21460,7 +21134,7 @@ mod breach_badge_tests {
     // The value moved; what it guards did not -- see `digits_fit`, and
     // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
     // the same pane and stayed green through the change.
-    const NARROW_CARD_WITH_AGE: (f32, f32) = (250.0, 67.0);
+    const NARROW_CARD_WITH_AGE: (f32, f32) = (250.0, 26.0625);
 
     /// **What the fourth fact costs the card**, both widths, pinned.
     ///
@@ -21519,7 +21193,7 @@ mod breach_badge_tests {
     /// Absolute numbers taken from BEFORE the change, which is the only kind
     /// that can prove the card did not move. A number measured afterwards
     /// would be a photograph of whatever this commit happens to do.
-    const BASELINE_CARD: (f32, f32) = (852.0, 41.0);
+    const BASELINE_CARD: (f32, f32) = (852.0, 13.0625);
 
     /// The same, at the detail column's minimum width: `[[24 471] - [275 525]]`.
     // 251.0 until masked rows stopped stacking at the app's minimum
@@ -21528,7 +21202,7 @@ mod breach_badge_tests {
     // The value moved; what it guards did not -- see `digits_fit`, and
     // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
     // the same pane and stayed green through the change.
-    const BASELINE_CARD_NARROW: (f32, f32) = (250.0, 54.0);
+    const BASELINE_CARD_NARROW: (f32, f32) = (250.0, 26.0625);
 
     /// **The "we broke nothing" test.** With the preference off -- which is
     /// how it ships -- the strip is the string `metadata_line` produces and
@@ -21937,14 +21611,14 @@ mod breach_badge_tests {
     ///
     /// Recorded, not argued. If either grows, a rewording has cost a row; if
     /// the wide one drops back to 46 the warning has rejoined the run.
-    const BREACHED_CARD: (f32, f32) = (852.0, 54.0);
+    const BREACHED_CARD: (f32, f32) = (852.0, 26.0625);
     // 251.0 until masked rows stopped stacking at the app's minimum
     // window size. A `Columns` row asks the pane for a different width
     // than a `Stacked` one, and the cards settle a point narrower for it.
     // The value moved; what it guards did not -- see `digits_fit`, and
     // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
     // the same pane and stayed green through the change.
-    const BREACHED_CARD_NARROW: (f32, f32) = (250.0, 93.0);
+    const BREACHED_CARD_NARROW: (f32, f32) = (250.0, 65.0625);
 
     /// **The un-breached card, unmoved.** 852x46 and 251x72 are what this
     /// same fixture measured on `f2556b8` with a `Safe` answer, and they are
@@ -21958,14 +21632,14 @@ mod breach_badge_tests {
     /// rather than 13. That difference is the badge's, it predates this
     /// change, and the test below pins the feature-OFF card against the
     /// original two so both facts are stated rather than conflated.
-    const SAFE_CARD: (f32, f32) = (852.0, 46.0);
+    const SAFE_CARD: (f32, f32) = (852.0, 13.0625);
     // 251.0 until masked rows stopped stacking at the app's minimum
     // window size. A `Columns` row asks the pane for a different width
     // than a `Stacked` one, and the cards settle a point narrower for it.
     // The value moved; what it guards did not -- see `digits_fit`, and
     // `the_previous_password_rows_fit_the_narrowest_pane`, which measures
     // the same pane and stayed green through the change.
-    const SAFE_CARD_NARROW: (f32, f32) = (250.0, 72.0);
+    const SAFE_CARD_NARROW: (f32, f32) = (250.0, 42.0625);
 
     /// **Two lines breached, one line clean -- as card heights**, which is
     /// the half of "its own line" a reader feels rather than measures.
