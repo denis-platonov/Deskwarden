@@ -979,6 +979,53 @@ fn verify(text: &str) -> Result<Vec<String>, PasswordGenError> {
 /// `WordlistMissing` while passing on an older local toolchain. So the test
 /// lays the file down itself, from `assets/` -- the very file the installer
 /// ships -- once per test process, and the function under test is unchanged.
+/// The Generator screen's three modes (spec C §1).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GeneratorMode {
+    #[default]
+    Password,
+    Passphrase,
+    Pin,
+}
+
+/// A PIN's shortest and longest (spec C §1: 4-12, default 6).
+pub const PIN_MIN: usize = 4;
+pub const PIN_MAX: usize = 12;
+
+/// A PIN of `len` digits (clamped to [`PIN_MIN`]..=[`PIN_MAX`]), each drawn
+/// from the OS RNG like every other generated value here.
+pub fn generate_pin(len: usize) -> Result<Zeroizing<String>, PasswordGenError> {
+    let len = len.clamp(PIN_MIN, PIN_MAX);
+    let mut out = Zeroizing::new(String::with_capacity(len));
+    for _ in 0..len {
+        let digit = uniform_below(10)?;
+        out.push(char::from(b'0' + digit as u8));
+    }
+    Ok(out)
+}
+
+/// Spec C §1.3's strength: bits, and the word for them. `size` is the
+/// length (password, PIN) or the word count (passphrase); `pool` is the
+/// password's alphabet size.
+pub fn generator_strength(mode: GeneratorMode, size: usize, pool: usize) -> (f64, &'static str) {
+    let bits = match mode {
+        GeneratorMode::Pin => size as f64 * 3.32,
+        GeneratorMode::Passphrase => size as f64 * 12.9,
+        GeneratorMode::Password => size as f64 * (pool.max(1) as f64).log2(),
+    };
+    let label = if bits < 40.0 {
+        "Weak"
+    } else if bits < 70.0 {
+        "Fair"
+    } else if bits < 100.0 {
+        "Strong"
+    } else {
+        "Very strong"
+    };
+    (bits, label)
+}
+
 #[cfg(test)]
 pub(crate) mod installed_list {
     /// Puts `assets/wordlist.txt` beside this test binary, once per process.
@@ -2104,5 +2151,39 @@ mod tests {
                 "an error message carries a digit, which a generated secret can be made of: {error}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pin_and_strength_tests {
+    //! Slice 6: the Generator screen's PIN mode and strength model.
+    use super::*;
+
+    #[test]
+    fn a_pin_is_digits_of_the_asked_length() {
+        for len in [4, 6, 12] {
+            let pin = generate_pin(len).expect("the OS RNG answers");
+            assert_eq!(pin.len(), len);
+            assert!(pin.chars().all(|c| c.is_ascii_digit()), "{}", pin.as_str());
+        }
+    }
+
+    #[test]
+    fn pin_length_is_clamped() {
+        assert_eq!(generate_pin(1).unwrap().len(), PIN_MIN);
+        assert_eq!(generate_pin(99).unwrap().len(), PIN_MAX);
+    }
+
+    #[test]
+    fn strength_follows_the_spec_bits() {
+        // PIN: len * 3.32; 6 digits ~ 20 bits.
+        assert_eq!(generator_strength(GeneratorMode::Pin, 6, 10).1, "Weak");
+        // Passphrase: words * 12.9; 5 words ~ 64.5 bits; 6 ~ 77.4.
+        assert_eq!(generator_strength(GeneratorMode::Passphrase, 5, 0).1, "Fair");
+        assert_eq!(generator_strength(GeneratorMode::Passphrase, 6, 0).1, "Strong");
+        // Password: len * log2(pool); 20 of 94 ~ 131 bits.
+        assert_eq!(generator_strength(GeneratorMode::Password, 20, 94).1, "Very strong");
+        let (bits, _) = generator_strength(GeneratorMode::Password, 8, 26);
+        assert!((bits - 8.0 * 26f64.log2()).abs() < 1e-9);
     }
 }
