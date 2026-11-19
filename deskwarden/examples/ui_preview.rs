@@ -1554,6 +1554,8 @@ fn main() -> eframe::Result {
                     screenshot,
                 done: false,
                 frames: 0,
+                warm_since: 0.0,
+                shot_asked: false,
                 icons: None,
                 kind_icons: None,
                 detail_icon: None,
@@ -1653,6 +1655,11 @@ fn main() -> eframe::Result {
 /// geometry last moved" rather than "frames since the surface appeared".
 const WARMUP_FRAMES: u32 = 12;
 
+/// How long a surface is drawn before it is captured, at least. The sign-in
+/// and lock screens rise into place over about half a second (`kit::auth`'s
+/// `rise`); twelve frames at 60 Hz caught them faded and mid-rise.
+const MOTION_SETTLE_SECONDS: f64 = 0.9;
+
 struct Preview {
     /// The surfaces to draw, and where in them we are.
     queue: Vec<Surface>,
@@ -1671,6 +1678,10 @@ struct Preview {
     done: bool,
     /// Frames drawn since this surface's geometry last moved.
     frames: u32,
+    /// When `frames` last started counting from one.
+    warm_since: f64,
+    /// The screenshot for this warm-up has been asked for.
+    shot_asked: bool,
     /// The item-list shot's own state. Built on the first frame that needs it
     /// and then held: `load_texture` allocates a new texture on every call, so
     /// rebuilding the cache per frame would upload nine images a frame for the
@@ -1790,6 +1801,10 @@ impl eframe::App for Preview {
             return;
         }
         self.frames += 1;
+        if self.frames == 1 {
+            self.warm_since = ctx.input(|i| i.time);
+            self.shot_asked = false;
+        }
 
         match self.current() {
             Surface::LoginUnlock => self.draw_login(root, &ctx, false, false, None),
@@ -2019,8 +2034,12 @@ impl eframe::App for Preview {
         }
 
         if self.screenshot && !self.done {
-            if self.frames == WARMUP_FRAMES {
+            let warm_for = ctx.input(|i| i.time) - self.warm_since;
+            if self.frames >= WARMUP_FRAMES && !self.shot_asked && warm_for >= MOTION_SETTLE_SECONDS {
+                self.shot_asked = true;
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(Default::default()));
+            } else if !self.shot_asked {
+                ctx.request_repaint();
             }
             let captured = ctx.input(|i| {
                 i.events.iter().find_map(|e| match e {
