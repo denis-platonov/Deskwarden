@@ -252,13 +252,6 @@ const MASKED_TRACKING: f32 = 1.2;
 /// It is supplied through [`MaskedFace::mask`], the same door the card's own
 /// mask comes through, so this needs no machinery of its own.
 const MASKED_BULLETS: usize = 10;
-/// A live one-time code: `font-size: 17px; letter-spacing: 0.12em`, then a
-/// `96x4` progress bar and the seconds remaining, `gap: 12px` apart.
-const TOTP_CODE_SIZE: f32 = 17.0;
-const TOTP_CODE_TRACKING: f32 = 2.04;
-const TOTP_GAP: f32 = 12.0;
-const TOTP_BAR_WIDTH: f32 = 96.0;
-const TOTP_BAR_HEIGHT: f32 = 4.0;
 /// The masked SECRET row's label -- the seed, distinct from the "TOTP" row
 /// above it, which is the six digits derived from it.
 ///
@@ -2224,7 +2217,7 @@ pub(crate) fn copy_shortcut_label(which: CopyShortcut) -> &'static str {
     match which {
         CopyShortcut::Username => "Username",
         CopyShortcut::Password => "Password",
-        CopyShortcut::Totp => "TOTP",
+        CopyShortcut::Totp => "2FA code",
         CopyShortcut::Url => "Website",
         // The card's four, read off the very constants `card_rows` paints, so
         // the row's label, the chord's name and the toast are one string in
@@ -2293,143 +2286,6 @@ fn pane_chords() -> Vec<(&'static str, egui::Modifiers, egui::Key, &'static str)
     all
 }
 
-/// How long a copy confirmation stays up, in seconds. The user asked for
-/// "5 seconds tooltip".
-const COPY_TOAST_SECONDS: f64 = 5.0;
-
-/// How far the confirmation sits in from the window's bottom-right corner.
-///
-/// Clear of `login_ui`'s resize handles, which live in their own foreground
-/// layer along the very edge, and clear of the detail pane's own controls --
-/// every one of which (Edit, Fill, the kebab, the star) is in the header
-/// strip at the TOP of the pane. It also cannot cover the row that was just
-/// clicked: the rows are laid out from the top of the body downwards and this
-/// is anchored to the opposite corner.
-const COPY_TOAST_INSET: f32 = 20.0;
-
-/// The confirmation's type size -- the pane's own body size (`ROW_VALUE_SIZE`
-/// is 15, a row label 12); 13 is the design's plain-text size, used here so
-/// the toast reads as this app rather than as a system notification.
-const COPY_TOAST_TEXT_SIZE: f32 = 13.0;
-
-/// What was copied, and when -- on egui's own frame clock (`InputState::time`,
-/// seconds), not `Instant`, so a test can drive the whole lifetime by running
-/// frames or by handing `RawInput::time` a number.
-///
-/// Kept in the context's temporary data rather than threaded through
-/// [`draw_detail_read`]'s signature because the two writers are a widget deep
-/// inside the pane ([`copy_row`]) and the chord resolution at the end of the
-/// pane, and neither can reach a local of the other without a new out-param
-/// on five row helpers. The DECISION does not live in there: see
-/// [`copy_toast_now`], which is a pure function of this value and the time,
-/// and is what the tests call.
-#[derive(Clone, Debug, PartialEq)]
-struct CopyToast {
-    /// The row's label. **Never the value.** See [`copy_toast_text`].
-    ///
-    /// When `verbatim` is set this is the whole sentence instead, and the
-    /// same rule still holds: nothing that reaches here is a secret.
-    label: String,
-    /// Whether `label` is already the sentence to show.
-    ///
-    /// A flag rather than a second egui data entry, so that a refusal and a
-    /// confirmation cannot both be live at once. That matters more than it
-    /// sounds: the refusal this exists for is "nothing was copied", and a
-    /// stale "Password copied" sitting beside it would be the exact untruth
-    /// the refusal is there to prevent.
-    verbatim: bool,
-    shown_at: f64,
-}
-
-/// Where [`CopyToast`] lives in `egui`'s temporary data.
-fn copy_toast_id() -> egui::Id {
-    egui::Id::new("detail-copy-toast")
-}
-
-/// Where the id of the item the pane drew LAST lives.
-///
-/// Companion to [`copy_toast_id`], and deliberately a second entry rather than
-/// a field on [`CopyToast`]: the toast is written by [`copy_row`], a widget
-/// several helpers deep inside the body, and the item id is not reachable from
-/// there without the new out-param on every row helper that `CopyToast` exists
-/// to avoid (see its doc). The pane's one entry point knows the item; this is
-/// where it says so.
-fn copy_toast_item_id() -> egui::Id {
-    egui::Id::new("detail-copy-toast-item")
-}
-
-/// Drops any live confirmation when the pane starts drawing a **different**
-/// item, and records the item now being drawn.
-///
-/// The confirmation is context-global, so without this it followed the pane:
-/// copy the password on a login, click any other item inside the five seconds,
-/// and the new item painted "Password copied" -- on an item that may have no
-/// Password row at all. That is this feature's own central claim (the toast
-/// names the row it belongs to) failing across a selection change.
-///
-/// **Cleared, not merely filtered.** Hiding a mismatched toast would leave it
-/// in the map, so copying on A, glancing at B and coming back to A inside the
-/// five seconds would RESURRECT a confirmation for a copy the user has since
-/// looked away from -- almost as wrong as the followed one. Removing it makes
-/// "you left the item" and "it expired" the same end state.
-///
-/// **Keyed on the item, not on the redraw.** A vault refresh, a write landing
-/// or any other reason the pane redraws the SAME item leaves the id equal and
-/// the toast alone: the confirmation belongs to the item, not to the frame.
-fn forget_copy_toast_on_item_change(ctx: &egui::Context, item: &str) {
-    ctx.data_mut(|data| {
-        if data.get_temp::<String>(copy_toast_item_id()).as_deref() != Some(item) {
-            forget_copy_toast_in(data);
-            data.insert_temp(copy_toast_item_id(), item.to_string());
-        }
-    });
-}
-
-/// Drops any live confirmation **and** the record of which item it belonged
-/// to, unconditionally.
-///
-/// The other route out of a confirmation. [`forget_copy_toast_on_item_change`]
-/// covers the pane being handed a different item, which is the only look-away
-/// the read pane itself can see -- and for a long time it was the only one
-/// wired up at all, which left two routes that the same reasoning covers wide
-/// open:
-///
-///  * copy a password, click **Edit**, cancel back inside the five seconds --
-///    `draw_detail_edit` never called this, so the read pane resumed with the
-///    recorded id still equal to the item's and the toast still in the map,
-///    and the confirmation came back;
-///  * deselect the item and reselect it, same window, same result.
-///
-/// Neither crosses items, so neither breaks the "the toast belongs to the
-/// item" rule that [`forget_copy_toast_on_item_change`]'s doc states -- but
-/// both are exactly the RESURRECTION that doc sets out to make impossible,
-/// reached by a door it does not watch.
-///
-/// **Clear, rather than merely decline to resurrect.** "Don't resurrect" means
-/// leaving the toast in the map and suppressing it, which is the "hidden
-/// rather than cleared" state the cross-item test already refuses -- it makes
-/// a live toast's visibility depend on where the user has been rather than on
-/// what is on screen, and every new door then needs its own suppression. One
-/// primitive that destroys the toast makes "you left the item", "you opened
-/// the editor", "you deselected it" and "it expired" the same end state, and
-/// that is the whole rule.
-///
-/// The item-id record goes too, and not just the toast: leaving a stale id
-/// behind would make the next `forget_copy_toast_on_item_change` for that same
-/// item a no-op, which is harmless today only because there is nothing left to
-/// drop. Removing both leaves no state at all, which is the state a fresh
-/// context is in.
-pub(crate) fn forget_copy_toast(ctx: &egui::Context) {
-    ctx.data_mut(forget_copy_toast_in);
-}
-
-/// The one place a confirmation is destroyed, so the two callers above cannot
-/// drift into forgetting different halves of it.
-fn forget_copy_toast_in(data: &mut egui::util::IdTypeMap) {
-    data.remove::<CopyToast>(copy_toast_id());
-    data.remove::<String>(copy_toast_item_id());
-}
-
 
 /// The sentence a confirmation shows for a row labelled `label`.
 ///
@@ -2448,29 +2304,6 @@ fn copy_toast_text(label: &str, verbatim: bool) -> String {
     }
 }
 
-/// What the confirmation should say **now**, and how many seconds are left --
-/// or `None` once it has expired.
-///
-/// The remainder is returned rather than kept private because the caller owes
-/// egui a `request_repaint_after` for exactly that long. egui only redraws on
-/// input, so a toast whose deadline nobody schedules stays on screen until
-/// the next mouse move; that is this feature's most likely bug and the reason
-/// the deadline is part of this function's answer instead of a separate
-/// calculation somewhere else.
-///
-/// A second copy overwrites the whole [`CopyToast`], label and timestamp
-/// together, so it replaces the message and restarts the clock -- nothing
-/// queues and nothing stacks.
-///
-/// Pure, and separate from the closure that draws it, for this file's
-/// standing reason: a decision reachable only from inside an eframe closure
-/// is a decision that will not be tested.
-fn copy_toast_now(toast: Option<&CopyToast>, now: f64) -> Option<(String, f64)> {
-    let toast = toast?;
-    let left = COPY_TOAST_SECONDS - (now - toast.shown_at);
-    (left > 0.0).then(|| (copy_toast_text(&toast.label, toast.verbatim), left))
-}
-
 /// Records that `label`'s row was just copied, starting the confirmation.
 ///
 /// Called from BOTH copy paths -- [`copy_row`]'s click and
@@ -2479,17 +2312,8 @@ fn copy_toast_now(toast: Option<&CopyToast>, now: f64) -> Option<(String, f64)> 
 /// has least evidence anything happened at all, since there is no row under
 /// the pointer to have reacted.
 pub(crate) fn note_copied(ctx: &egui::Context, label: &str) {
-    let shown_at = ctx.input(|i| i.time);
-    ctx.data_mut(|data| {
-        data.insert_temp(
-            copy_toast_id(),
-            CopyToast {
-                label: label.to_string(),
-                verbatim: false,
-                shown_at,
-            },
-        )
-    });
+    // Spec 2.6: "<Label> copied", in the window's one toast.
+    crate::kit::toast::show(ctx, copy_toast_text(label, false));
 }
 
 /// Replaces any confirmation with `text`, shown as written.
@@ -2503,17 +2327,7 @@ pub(crate) fn note_copied(ctx: &egui::Context, label: &str) {
 /// is on the clipboard when it is not. Writing to the same egui entry
 /// overwrites it, label and clock together.
 pub(crate) fn note_refused(ctx: &egui::Context, text: &str) {
-    let shown_at = ctx.input(|i| i.time);
-    ctx.data_mut(|data| {
-        data.insert_temp(
-            copy_toast_id(),
-            CopyToast {
-                label: text.to_string(),
-                verbatim: true,
-                shown_at,
-            },
-        )
-    });
+    crate::kit::toast::show(ctx, copy_toast_text(text, true));
 }
 
 /// Paints the copy confirmation, if one is live, and schedules the repaint
@@ -2555,110 +2369,6 @@ fn body_overflowed(ctx: &egui::Context) -> bool {
 /// Records this frame's reading for [`body_overflowed`] to use on the next.
 fn note_body_overflow(ctx: &egui::Context, overflowed: bool) {
     ctx.data_mut(|data| data.insert_temp(body_overflow_id(), overflowed));
-}
-
-/// **`pub(crate)` for one more caller, and the caller is a modal.**
-///
-/// The add-a-code card copies five things now, and its first two attempts at
-/// saying so were both wrong. A hover text could not work at all -- egui hides
-/// a tooltip on the press that would open it. A word in the row itself did
-/// work and looked it: `CopiedReveal`, jammed against the control beside it,
-/// which is what the owner sent back with "show copied at the bottom like
-/// usually".
-///
-/// "Like usually" is this. One confirmation, in one place, in the app's own
-/// words -- `{label} copied` -- with the same five seconds and the same
-/// bottom-right inset wherever a copy happens. The `pane` argument is what
-/// makes that possible from a modal: it is the rect the toast is placed in,
-/// so the read pane passes its pane and the card passes its card.
-pub(crate) fn draw_copy_toast(ui: &mut egui::Ui, pane: egui::Rect) {
-    let now = ui.input(|i| i.time);
-    let toast = ui.ctx().data(|data| data.get_temp::<CopyToast>(copy_toast_id()));
-    let Some((text, left)) = copy_toast_now(toast.as_ref(), now) else {
-        // **Expired means gone, not merely unpainted.** Left in place, a dead
-        // `CopyToast` sat in the context's temp map for the rest of the
-        // session. Nothing sensitive is in it (the label is one of a fixed
-        // set of literals -- see `copy_toast_text`) and the next copy
-        // overwrites it, so this is tidiness rather than a leak; it is here
-        // because it leaves the map in the same state
-        // `forget_copy_toast_on_item_change` does, so "a toast is recorded"
-        // and "a toast is live" cannot become two different answers.
-        if toast.is_some() {
-            ui.ctx()
-                .data_mut(|data| data.remove::<CopyToast>(copy_toast_id()));
-        }
-        return;
-    };
-    // The deadline, handed to egui. Without this the toast expires only when
-    // something else happens to cause a frame.
-    ui.ctx()
-        .request_repaint_after(std::time::Duration::from_secs_f64(left));
-    let (rect, galley) = copy_toast_geometry(ui, pane, text);
-    // **A painter on a foreground layer, not an `egui::Area`.** An `Area`
-    // that has never been laid out before runs its first pass invisibly to
-    // learn its own size, so an `Area`-based toast painted NOTHING on the
-    // frame the copy happened and only appeared on the next one -- measured,
-    // not assumed: `clicking_a_row_confirms_the_copy_by_name` failed against
-    // exactly that version while the placement test, which reads the frame
-    // after, passed. A painter has no layout and no state to warm up, and a
-    // confirmation is only ever painted: it takes no input, so it wants none
-    // of what an `Area` is for, and cannot swallow a click meant for the row
-    // beneath it.
-    let painter = ui
-        .ctx()
-        .layer_painter(egui::LayerId::new(egui::Order::Foreground, copy_toast_id()));
-    painter.rect_filled(rect, CornerRadius::same(8), theme::INK);
-    painter.galley(rect.min + COPY_TOAST_PAD, galley, theme::CARD);
-}
-
-/// The copy confirmation's padding round its text.
-const COPY_TOAST_PAD: egui::Vec2 = egui::vec2(14.0, 10.0);
-
-/// **Where the copy confirmation is on screen right now, if it is up** --
-/// the box [`draw_copy_toast`] paints this frame, from the same arithmetic.
-/// For the share toast, which shares the corner and stands above this one
-/// rather than over it (`share_ui::draw_share_toast`). Reads the record and
-/// changes nothing: an expired one is [`draw_copy_toast`]'s to clear.
-pub(crate) fn live_copy_toast_rect(ui: &egui::Ui, pane: egui::Rect) -> Option<egui::Rect> {
-    let now = ui.input(|i| i.time);
-    let toast = ui.ctx().data(|data| data.get_temp::<CopyToast>(copy_toast_id()));
-    let (text, _) = copy_toast_now(toast.as_ref(), now)?;
-    Some(copy_toast_geometry(ui, pane, text).0)
-}
-
-/// The copy confirmation's box inside `pane`, and its laid-out text.
-fn copy_toast_geometry(ui: &egui::Ui, pane: egui::Rect, text: String) -> (egui::Rect, std::sync::Arc<egui::Galley>) {
-    // **Measured here and placed with `fixed_pos`, not handed to `anchor`.**
-    // An `Area` whose size egui does not yet know runs an INVISIBLE sizing
-    // pass on its first frame when it has to align itself -- so an anchored
-    // toast paints nothing on the very frame the copy happened and only
-    // appears on the next one. The copy and its confirmation are one gesture;
-    // a frame of silence in between is the bug this whole feature exists to
-    // remove. Laying the text out first makes the size known, which makes the
-    // placement arithmetic this function's own and the paint immediate.
-    let galley = ui.painter().layout_no_wrap(
-        text,
-        egui::FontId::proportional(COPY_TOAST_TEXT_SIZE),
-        theme::CARD,
-    );
-    let size = galley.size() + COPY_TOAST_PAD * 2.0;
-    // `max` on the near edges so a pane narrower than the message keeps the
-    // START of the sentence on screen rather than the end of it.
-    //
-    // **Unreachable today, and kept anyway.** The widest message boxes at
-    // about 127pt, and `MIN_VAULT_WINDOW_SIZE` puts the narrowest pane this
-    // window can be resized to at `MIN_PANE` (298), so the clamp needs a pane
-    // under roughly 167pt that the app cannot produce -- deleting it changes
-    // nothing visible, which is exactly why it would be deleted by mistake.
-    // It is not dead code but a bound on arithmetic that would otherwise
-    // place the box off the left of the pane the moment any of those three
-    // numbers moves, so its unreachability is written down here rather than
-    // rediscovered.
-    let pos = egui::pos2(
-        (pane.right() - COPY_TOAST_INSET - size.x).max(pane.left() + COPY_TOAST_INSET),
-        (pane.bottom() - COPY_TOAST_INSET - size.y).max(pane.top() + COPY_TOAST_INSET),
-    );
-    (egui::Rect::from_min_size(pos, size), galley)
 }
 
 /// What a copy-on-click tile says when the pointer rests on it.
@@ -3480,7 +3190,6 @@ pub fn draw_detail_read(
     // made later in THIS frame belongs to the item being drawn now, so it
     // must outlive this clear; a copy made on the item that was on screen
     // before it must not. See `forget_copy_toast_on_item_change`.
-    forget_copy_toast_on_item_change(ui.ctx(), &item.id);
     // Derived once, here, and passed to the pure decisions below -- not
     // re-derived per widget, so the header, the chrome, the body and the
     // metadata strip cannot disagree about what this item is.
@@ -4174,6 +3883,12 @@ pub fn draw_detail_read(
                     }
                 });
                 ui.add_space(CARD_GAP);
+            } else if writable && item_takes_a_one_time_code(item) {
+                crate::kit::card::card(ui, crate::kit::tokens::R_CARD, Margin::ZERO, |ui| {
+                    ui.set_width(ui.available_width());
+                    add_2fa_row(ui, &mut action);
+                });
+                ui.add_space(CARD_GAP);
             }
         }
         // The body is the NOTES card below, and that card is shared with
@@ -4507,7 +4222,6 @@ pub fn draw_detail_read(
     // topmost whenever there is one; see `item_list::a_modal_is_up`, which the
     // list already asks the same question of for the same kind of reason.
     if !super::item_list::a_modal_is_up(ui.ctx()) {
-        draw_copy_toast(ui, pane);
     }
     action
 }
@@ -7417,25 +7131,6 @@ fn fit_mask(ui: &egui::Ui, mask: &str, room: f32) -> String {
     chars[..keep].iter().collect()
 }
 
-/// A plain run in one size and colour, as a [`LayoutJob`] rather than a
-/// `RichText` -- so it can go through [`paint_on_the_value_baseline`], which
-/// needs a job it can lay out itself.
-///
-/// [`egui::text::LayoutJob`]: egui::text::LayoutJob
-fn plain_job(text: &str, size: f32, color: egui::Color32) -> egui::text::LayoutJob {
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        text,
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::new(size, egui::FontFamily::Proportional),
-            color,
-            ..Default::default()
-        },
-    );
-    job
-}
-
 /// A row whose value is DIGITS and is **not a secret**: the card's expiry.
 ///
 /// [`credential_row`], except that the value is painted in the pane's shared
@@ -9025,23 +8720,6 @@ fn plain_value_row(ui: &mut egui::Ui, label: &str, value: &str) {
     );
 }
 
-/// The TOTP countdown, as the user asked for it: **"9s left - show just 9s"**.
-///
-/// A pure function rather than a `format!` inside the paint closure, for this
-/// file's standing reason -- a string reachable only through an `egui` closure
-/// is a string no test can call -- and because the wording is the whole of the
-/// change: `totp_countdown_reads_just_the_number_and_the_unit` calls this
-/// directly and `a_totp_countdown_paints_just_the_seconds` reads it off the
-/// painted frame, so reverting to `"{n}s left"` fails both.
-///
-/// The two ends read correctly with the short form and were checked rather
-/// than assumed: a full window is `30s` and an expiring one is `0s`, both of
-/// which are what a countdown says. `1s` is not pluralised because it is not a
-/// sentence -- there is no word left to agree with the number.
-fn totp_countdown_text(seconds_left: u8) -> String {
-    format!("{seconds_left}s")
-}
-
 /// How full the TOTP track should be: the share of this card's own window
 /// that is still to run, in `0.0..=1.0`.
 ///
@@ -9085,90 +8763,138 @@ fn totp_code_row(
     period: u16,
     action: &mut DetailAction,
 ) {
-    copy_row(
-        ui,
-        // See `copy_shortcut_label`: one string for the row and its toast.
-        // The three NON-code One-time code rows keep their own literal --
-        // they copy nothing, so they have no toast to disagree with.
-        copy_shortcut_label(CopyShortcut::Totp),
-        |ui| {
-            // The design lays these three out along one centred line, `gap:
-            // 12px` apart: the code, a 96x4 track, then the seconds left.
-            //
-            // **`paint_on_the_value_baseline`, not `ui.label`, and that is
-            // the whole of the "the code is not centred" repair.** Reported
-            // as "TOTP code itself not in the center vertically": three runs
-            // at three sizes share one `Align::Center` band, egui centres
-            // each one's BOX, and the monospace face puts its baseline
-            // further up inside its box than the proportional faces beside it
-            // do. Measured on this row before the fix, as the drop from a
-            // label's centre to the value's ink: the code sat 1.5pt high and
-            // the countdown 0.5pt.
-            //
-            // The offset is `digits_baseline_drop`'s, derived from these two
-            // galleys -- see that function, which insists on exactly this
-            // rather than a written-down constant "nobody could later
-            // justify, and one that would go stale the moment either type
-            // size moved". It is the card rows' mechanism unchanged: nothing
-            // in it is about digits or about 15px, so a 17px monospace code
-            // needs no second rule.
-            paint_on_the_value_baseline(
-                ui,
-                theme::letterspaced_mono(code, TOTP_CODE_SIZE, TOTP_CODE_TRACKING, theme::INK),
-                theme::INK,
-            );
-            ui.add_space(TOTP_GAP);
-            let (rect, _) = ui.allocate_exact_size(
-                egui::vec2(TOTP_BAR_WIDTH, TOTP_BAR_HEIGHT),
-                egui::Sense::hover(),
-            );
-            ui.painter()
-                .rect_filled(rect, CornerRadius::same(2), theme::HAIRLINE);
-            let fraction = totp_bar_fraction(seconds_left, period);
-            let filled = egui::Rect::from_min_size(
-                rect.min,
-                egui::vec2(rect.width() * fraction, rect.height()),
-            );
-            ui.painter()
-                .rect_filled(filled, CornerRadius::same(2), theme::BLUE);
-            ui.add_space(TOTP_GAP);
-            // The same placement as the code, for the same reason and by the
-            // same function. An 11px run's box is SHORTER than an ordinary
-            // value's rather than taller, so it was off in the other
-            // direction and by less -- 0.5pt -- but "less" is not "not", and
-            // a row centred by one rule everywhere is worth more than a row
-            // with one run exempted because its error was small.
-            paint_on_the_value_baseline(
-                ui,
-                plain_job(&totp_countdown_text(seconds_left), ROW_HINT_SIZE, theme::TEXT_FAINT),
-                theme::TEXT_FAINT,
-            );
-        },
-        |_ui| {},
-        DetailAction::CopyTotp,
-        Some(CopyShortcut::Totp),
-        // Stated rather than assumed true. `TotpRow::Code` is only reached
-        // from `TotpState::Code`, whose code has always been non-empty in
-        // practice -- but "in practice" is what the Password row had too.
-        row_offers_copy(code),
-        action,
-        RowShape::Columns,
+    use crate::kit::{self, tokens};
+    let p = tokens::palette(ui.ctx());
+    let ctx = ui.ctx().clone();
+    let label_h = tokens::font_height(&ctx, tokens::LABEL);
+    let code_h = tokens::font_height(&ctx, tokens::TOTP);
+    let column_h = label_h + 4.0 + code_h;
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 32.0 + column_h.max(42.0)),
+        egui::Sense::hover(),
     );
+    let inner = rect.shrink2(egui::vec2(20.0, 16.0));
+    // Spec 3.3: the code and its ring turn red in the last five seconds.
+    let ink = if seconds_left <= 5 { p.error } else { p.blue };
+    let top = inner.center().y - column_h / 2.0;
+
+    let label = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::LABEL, copy_shortcut_label(CopyShortcut::Totp), p.text_label)));
+    let label_w = label.size().x;
+    ui.painter().galley(egui::pos2(inner.left(), top), label, p.text_label);
+    let tip = egui::Rect::from_min_size(egui::pos2(inner.left() + label_w + 8.0, top + label_h / 2.0 - 9.0), egui::Vec2::splat(18.0));
+    ui.scope_builder(egui::UiBuilder::new().max_rect(tip), |ui| {
+        kit::tips::help_dot(ui, ui.id().with("totp-tip"), TOTP_TIP, 250.0, kit::tips::Placement::Above);
+    });
+    let digits = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::TOTP, &grouped_code(code), ink)));
+    ui.painter().galley(egui::pos2(inner.left(), top + label_h + 4.0), digits, ink);
+
+    let copy_rect = egui::Rect::from_min_size(egui::pos2(inner.right() - 42.0, inner.center().y - 21.0), egui::Vec2::splat(42.0));
+    let copy = ui
+        .interact(copy_rect, ui.id().with("totp-copy"), egui::Sense::click())
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    let glyph_ink = if copy.hovered() {
+        ui.painter().rect_filled(copy_rect, CornerRadius::same(12), p.blue_wash);
+        p.blue
+    } else {
+        p.text_icon
+    };
+    kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(copy_rect.center(), egui::Vec2::splat(19.0)), kit::icon::glyph::COPY, 2.0, glyph_ink);
+    kit::tips::hint(ui, &copy, "Copy 2FA code", &["Mod", "T"]);
+    if copy.clicked() && row_offers_copy(code) {
+        *action = DetailAction::CopyTotp;
+        note_copied(ui.ctx(), copy_shortcut_label(CopyShortcut::Totp));
+    }
+
+    // The 40pt ring: a track, and the time left drawn clockwise from twelve.
+    let centre = egui::pos2(copy_rect.left() - 14.0 - 20.0, inner.center().y);
+    ui.painter().circle_stroke(centre, 15.0, egui::Stroke::new(4.0, p.badge_bg));
+    let fraction = totp_bar_fraction(seconds_left, period);
+    let points = ring_points(centre, 15.0, fraction);
+    if points.len() >= 2 {
+        ui.painter().add(egui::Shape::line(points, egui::Stroke::new(4.0, ink)));
+    }
+    let seconds = ctx.fonts_mut(|f| {
+        f.layout_job(tokens::job(tokens::Role { size: 12.0, face: theme::BOLD, tracking_em: 0.0 }, &seconds_left.to_string(), p.text_icon))
+    });
+    ui.painter().galley(centre - seconds.size() / 2.0, seconds, p.text_icon);
 }
 
-/// The shape the three *non-code* One-time code rows share: the row's label
-/// stays in its column, and the value column carries a plain status line with
-/// an optional second line of explanation under it.
-///
-/// Shared *rendering* only. Which [`TotpState`] reaches which of the three is
-/// unchanged and still lives in `totp_row_for` plus the one exhaustive match
-/// in `draw_detail_read`; each row keeps its own function, its own wording and
-/// its own doc comment, because the reasons they are three rows and not one
-/// are the whole point of them.
+/// Spec 3.3's `totp` tip, beside "2FA code".
+const TOTP_TIP: &str = "The second step some sites ask for. Deskwarden types it for you after the password.";
+
+/// A code split in two for reading: `123 456`, `1234 5678`; an odd length
+/// puts the longer half second.
+pub(crate) fn grouped_code(code: &str) -> String {
+    let chars: Vec<char> = code.chars().collect();
+    if chars.len() < 4 {
+        return code.to_string();
+    }
+    let (a, b) = chars.split_at(chars.len() / 2);
+    format!("{} {}", a.iter().collect::<String>(), b.iter().collect::<String>())
+}
+
+/// The ring's arc: from twelve o'clock, clockwise, `fraction` of the way
+/// round a circle of `radius` about `centre`. Nothing for an empty ring.
+pub(crate) fn ring_points(centre: egui::Pos2, radius: f32, fraction: f32) -> Vec<egui::Pos2> {
+    let fraction = fraction.clamp(0.0, 1.0);
+    if fraction <= 0.0 {
+        return Vec::new();
+    }
+    let steps = ((fraction * 64.0).ceil() as usize).max(2);
+    (0..=steps)
+        .map(|k| {
+            let a = -std::f32::consts::FRAC_PI_2 + std::f32::consts::TAU * fraction * k as f32 / steps as f32;
+            centre + radius * egui::vec2(a.cos(), a.sin())
+        })
+        .collect()
+}
+
+/// The Add 2FA row's words (spec 3.3).
+pub const ADD_2FA_ROW_TITLE: &str = "Add 2FA code";
+pub const ADD_2FA_ROW_DETAIL: &str = "Scan the QR code from your screen";
+
+/// Spec 3.3's Add 2FA row, for a login with no code: the scan tile, the two
+/// lines and a chevron; the whole row opens the add-a-code card.
+fn add_2fa_row(ui: &mut egui::Ui, action: &mut DetailAction) {
+    use crate::kit::{self, tokens};
+    let p = tokens::palette(ui.ctx());
+    let ctx = ui.ctx().clone();
+    let title = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::ROW_TITLE, ADD_2FA_ROW_TITLE, p.blue_deep)));
+    let detail = ctx.fonts_mut(|f| f.layout_job(tokens::job(tokens::SUBTITLE, ADD_2FA_ROW_DETAIL, p.text_faint)));
+    let column_h = title.size().y + 2.0 + detail.size().y;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 32.0 + column_h.max(42.0)),
+        egui::Sense::click(),
+    );
+    let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
+    if response.hovered() {
+        ui.painter().rect_filled(rect, CornerRadius::same(18), p.row_hover_blue);
+    }
+    let inner = rect.shrink2(egui::vec2(20.0, 16.0));
+    let tile = egui::Rect::from_min_size(egui::pos2(inner.left(), inner.center().y - 21.0), egui::Vec2::splat(42.0));
+    ui.painter().rect_filled(tile, CornerRadius::same(12), p.blue_wash);
+    kit::icon::stroke(ui.painter(), egui::Rect::from_center_size(tile.center(), egui::Vec2::splat(20.0)), kit::icon::glyph::SCAN, 2.0, p.blue);
+    let x = tile.right() + 14.0;
+    let top = inner.center().y - column_h / 2.0;
+    let title_h = title.size().y;
+    ui.painter().galley(egui::pos2(x, top), title, p.blue_deep);
+    ui.painter().galley(egui::pos2(x, top + title_h + 2.0), detail, p.text_faint);
+    kit::icon::stroke(
+        ui.painter(),
+        egui::Rect::from_center_size(egui::pos2(inner.right() - 9.0, inner.center().y), egui::Vec2::splat(18.0)),
+        kit::icon::glyph::CHEVRON_RIGHT,
+        2.0,
+        p.text_ghost,
+    );
+    if response.clicked() {
+        *action = DetailAction::AddTotp;
+    }
+}
+
 fn totp_status_row(ui: &mut egui::Ui, status: &str, hint: Option<&str>) {
     row(
         ui,
-        "TOTP",
+        copy_shortcut_label(CopyShortcut::Totp),
         |ui| {
             let status = RichText::new(status)
                 .size(ROW_VALUE_SIZE)
@@ -9570,6 +9296,7 @@ mod tests {
         let mut texts = Vec::new();
         let control = |which| ctx.read_response(header_control_id(which)).map(|r| r.rect);
         let mut frame = Frame {
+            toast: crate::kit::toast::current(&ctx),
             close: control(HeaderControl::Close),
             more: control(HeaderControl::More),
             favourite: control(HeaderControl::Favourite),
@@ -9588,9 +9315,6 @@ mod tests {
             segments: Vec::new(),
             images: Vec::new(),
             shapes: egui::Shape::Noop,
-            // The out-of-vault pane copies nothing, so it has no deadline of
-            // its own; no test here reads this.
-            repaint_delay: std::time::Duration::MAX,
         };
         // One tree -- see `Pane::frame`, which explains why per-clipped-shape
         // probing cannot see a filled star.
@@ -10224,6 +9948,8 @@ mod tests {
     /// `theme::icon_probe`, which owns that lookup).
     struct Frame {
         action: DetailAction,
+        /// The window's toast after this frame, if any.
+        toast: Option<String>,
         /// The v2 header's icon-only controls, read back by their ids
         /// (`header_control_id`): they paint no words to be found by.
         close: Option<egui::Rect>,
@@ -10278,14 +10004,6 @@ mod tests {
         /// probe's answer; a test asking "did the icon confuse ALL of them"
         /// needs the tree.
         shapes: egui::Shape,
-        /// The soonest this frame asked egui to come back on its own.
-        ///
-        /// egui redraws on input; anything with a DEADLINE has to say so, or
-        /// it stays on screen until something else happens to cause a frame.
-        /// The copy confirmation is the one thing on this pane with a
-        /// deadline, so this is how a test can see that it scheduled its own
-        /// disappearance rather than hoping for a mouse move.
-        repaint_delay: std::time::Duration,
     }
 
     impl Frame {
@@ -10306,8 +10024,10 @@ mod tests {
             self.texts.iter().map(|(t, _)| t.as_str()).collect()
         }
 
+        /// On screen: painted by the pane, or the window's toast (`kit::toast`),
+        /// which is where every copy now says so.
         fn painted(&self, label: &str) -> bool {
-            self.texts.iter().any(|(t, _)| t == label)
+            self.texts.iter().any(|(t, _)| t == label) || self.toast.as_deref() == Some(label)
         }
 
         /// The box `label`'s GLYPHS really cover -- which is not
@@ -10747,6 +10467,7 @@ mod tests {
             );
             let control = |which| self.ctx.read_response(header_control_id(which)).map(|r| r.rect);
             let mut frame = Frame {
+                toast: crate::kit::toast::current(&self.ctx),
                 close: control(HeaderControl::Close),
                 more: control(HeaderControl::More),
                 favourite: control(HeaderControl::Favourite),
@@ -10765,12 +10486,6 @@ mod tests {
                 segments: Vec::new(),
                 images: Vec::new(),
                 shapes: egui::Shape::Noop,
-                repaint_delay: output
-                    .viewport_output
-                    .values()
-                    .map(|viewport| viewport.repaint_delay)
-                    .min()
-                    .unwrap_or(std::time::Duration::MAX),
             };
             // ONE tree, not one call per clipped shape: `paint_star` adds
             // the star's outline and its ten fill triangles as separate
@@ -10888,6 +10603,12 @@ mod tests {
 
     fn painted_with_reveal(item: &VaultItem, totp: &TotpState, reveal: RevealState) -> Vec<String> {
         painted_text(item, totp, reveal)
+    }
+
+    /// Every string a pane tall enough for the whole item painted: the v2
+    /// header and the Add 2FA row push the lower cards past a 900pt pane.
+    fn tall_painted(item: &VaultItem) -> Vec<String> {
+        Pane::new().tall().idle(item, &TotpState::NoSecret).strings().iter().map(|s| s.to_string()).collect()
     }
 
     fn contains(texts: &[String], needle: &str) -> bool {
@@ -12032,7 +11753,7 @@ mod tests {
             ] {
                 let texts = painted(&an_item(item_type_for(kind)), &totp);
                 assert!(
-                    !contains(&texts, "TOTP"),
+                    !contains(&texts, "2FA code"),
                     "{kind:?} rendered a One-time code row for {totp:?}: {texts:?}"
                 );
                 assert!(
@@ -12060,22 +11781,22 @@ mod tests {
             (TotpState::Fetching, "Fetching"),
             (
                 TotpState::Code { code: "123456".to_string(), seconds_left: 12, period: 30 },
-                "123456",
+                "123 456",
             ),
             (TotpState::Unavailable, "Unavailable right now"),
             (TotpState::NoCodeReported, "No code available for this item"),
         ] {
             let texts = painted(&item, &totp);
             assert!(
-                contains(&texts, "TOTP"),
+                contains(&texts, "2FA code"),
                 "{totp:?} lost its One-time code row: {texts:?}"
             );
             assert!(contains(&texts, needle), "{totp:?} rendered the wrong row: {texts:?}");
         }
         let texts = painted(&item, &TotpState::NoSecret);
         assert!(
-            !contains(&texts, "TOTP"),
-            "NoSecret must still draw no row: {texts:?}"
+            !texts.iter().any(|t| t == "2FA code"),
+            "NoSecret must still draw no code row (the Add 2FA row may offer one): {texts:?}"
         );
     }
 
@@ -13740,58 +13461,6 @@ mod tests {
         assert!(edit_source.contains("APP_BLOCK_HEADING"));
     }
 
-    /// **"9s left - show just 9s".** The decision, called directly.
-    #[test]
-    fn totp_countdown_reads_just_the_number_and_the_unit() {
-        assert_eq!(totp_countdown_text(9), "9s");
-        // The two ends, checked rather than assumed to read sensibly.
-        assert_eq!(totp_countdown_text(30), "30s");
-        assert_eq!(totp_countdown_text(0), "0s");
-        // ... and the wording it replaced is gone, from every value.
-        for n in 0..=30u8 {
-            let text = totp_countdown_text(n);
-            assert!(
-                !text.contains("left"),
-                "the countdown reads {text:?} at {n} seconds"
-            );
-            assert_eq!(text, format!("{n}s"));
-        }
-    }
-
-    /// The same, off the painted frame -- so the short string is what the row
-    /// really draws and not merely what a helper returns. The row's other two
-    /// parts are asserted alongside it: a countdown column that changed width
-    /// must not have pushed the code or the track out of the card.
-    #[test]
-    fn a_totp_countdown_paints_just_the_seconds() {
-        let (item, totp) = a_login_with_a_code();
-        let mut pane = Pane::new();
-        let frame = pane.idle(&item, &totp);
-        let seconds = match &totp {
-            TotpState::Code { seconds_left, .. } => *seconds_left,
-            other => panic!("the fixture is {other:?}, which draws no countdown"),
-        };
-        assert!(
-            frame.painted(&format!("{seconds}s")),
-            "the countdown does not read {seconds}s; painted: {:?}",
-            frame.strings()
-        );
-        assert!(
-            !frame.strings().iter().any(|t| t.contains("s left")),
-            "the countdown still says \"s left\": {:?}",
-            frame.strings()
-        );
-        // The layout, MEASURED: the whole row is still inside its card, and
-        // the code is still to the left of the countdown with the track
-        // between them.
-        let card = totp_card(&frame);
-        let countdown = frame.rect_of(&format!("{seconds}s"));
-        assert!(
-            card.contains_rect(countdown),
-            "the countdown at {countdown:?} is outside its card {card:?}"
-        );
-    }
-
     /// A secure note is not filled into anything, so an unbound one gets no
     /// card -- but a bound one still shows what it is bound to.
     #[test]
@@ -14682,31 +14351,6 @@ mod tests {
                 .iter()
                 .any(|(rect, fill)| *fill == theme::CARD_TINT && rect.contains(live.center())),
             "no row on this pane paints the hover tint, so its absence above proves nothing"
-        );
-    }
-
-    /// The live code's row DOES copy -- the `Unavailable` row above is inert
-    /// because it has no code, not because TOTP rows are inert.
-    #[test]
-    fn clicking_the_one_time_code_tile_copies_the_code() {
-        let mut item = a_login();
-        item.login.as_mut().expect("a_login has login data").totp =
-            Some("seed".to_string().into());
-        let totp = TotpState::Code {
-            code: "123456".to_string(),
-            seconds_left: 21,
-            period: 30,
-        };
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &totp);
-        let row = laid_out.rect_of("TOTP");
-
-        let clicked = pane.click(&item, &totp, row.center());
-        assert_eq!(
-            clicked.action,
-            DetailAction::CopyTotp,
-            "clicking the one-time code tile reported {:?}",
-            clicked.action
         );
     }
 
@@ -16832,135 +16476,6 @@ mod tests {
         }
     }
 
-    /// A login with a live one-time code -- the one fixture that has all
-    /// three chorded rows on screen at once.
-    fn a_login_with_a_code() -> (VaultItem, TotpState) {
-        let mut item = a_login();
-        item.login.as_mut().expect("a_login has login data").totp =
-            Some("seed".to_string().into());
-        (
-            item,
-            TotpState::Code {
-                code: "123456".to_string(),
-                seconds_left: 9,
-                period: 30,
-            },
-        )
-    }
-
-    /// **The chords are not painted beside the rows any more.** The user
-    /// asked for the `CTRL+B` text on the Password row to go, leaving the
-    /// eye as the row's only control, and the same was applied to the
-    /// Username and One-time code rows so the card does not carry one row
-    /// with a chord beside two without.
-    ///
-    /// The row labels are the positive control: "no CTRL+B anywhere" is also
-    /// true of a pane that failed to draw the LOGIN CREDENTIALS card at all,
-    /// and this fixture is the one that puts all three chorded rows on
-    /// screen together.
-    #[test]
-    fn every_chord_is_painted_beside_its_row_and_last_on_the_line() {
-        let (item, totp) = a_login_with_a_code();
-        let mut pane = Pane::new();
-        let frame = pane.idle(&item, &totp);
-
-        for label in ["Username", "Password", "TOTP", "Website"] {
-            assert!(
-                frame.painted(label),
-                "the {label:?} row is not on this pane at all, so finding no chord on \
-                 it proves nothing; the pane painted: {:?}",
-                frame.strings()
-            );
-        }
-        // EVERY row with a chord paints it, the Password row included.
-        for chord in ["CTRL+U", "CTRL+B", "CTRL+T", "CTRL+SHIFT+U"] {
-            assert!(
-                frame.painted(chord),
-                "the {chord} hint is not painted beside its row; the pane painted: {:?}",
-                frame.strings()
-            );
-        }
-
-        // **And the chord is the last thing on the line.** The user asked
-        // for the keys to be "always in the end", and for the Password row
-        // to read eye-then-chord. The Password row is the one that can get
-        // this wrong, because it is the only chord-bearing row that also has
-        // a control -- so the eye is what the chord has to clear.
-        // The eye is a stroked shape, not text, so it is found through
-        // `icon_probe` rather than by string. Positive control first: an
-        // empty eye list would make the comparison below vacuous.
-        let eyes = &frame.eyes;
-        assert!(
-            !eyes.is_empty(),
-            "no eye was painted at all, so 'the chord clears the eye' proves nothing"
-        );
-        let chord = frame.rect_of("CTRL+B");
-        let eye = eyes
-            .iter()
-            .min_by(|a, b| a.center().y.total_cmp(&b.center().y))
-            .expect("checked non-empty above");
-        assert!(
-            chord.left() >= eye.right(),
-            "the Password row paints CTRL+B at {chord:?}, to the LEFT of the eye at \
-             {eye:?} -- the chord is meant to be the last thing on the line"
-        );
-    }
-
-    /// **And the tooltip carries it instead.** Each of the three rows names
-    /// its own chord on hover, and it names the chord that row is bound to --
-    /// asserted per row, so a tooltip wired to one fixed string cannot pass.
-    #[test]
-    fn hovering_a_row_names_the_chord_that_copies_it() {
-        let (item, totp) = a_login_with_a_code();
-        for (label, chord) in [
-            ("Username", "CTRL+U"),
-            ("Password", "CTRL+B"),
-            ("TOTP", "CTRL+T"),
-            ("Website", "CTRL+SHIFT+U"),
-        ] {
-            let mut pane = Pane::new();
-            let laid_out = pane.idle(&item, &totp);
-            let row = laid_out.rect_of(label);
-            // The tooltip belongs to the row's own background widget, so the
-            // pointer goes over the label column -- as far from the eye and
-            // its own "Reveal" tooltip as the row goes.
-            let hovered = pane.hover_settled(&item, &totp, row.center());
-            let want = format!("Click to copy · {chord}");
-            assert!(
-                hovered.painted(&want),
-                "hovering the {label:?} row painted no {want:?} tooltip; the frame \
-                 painted: {:?}",
-                hovered.strings()
-            );
-            // No OTHER row's tooltip may be in this frame: one tooltip
-            // naming all four chords would satisfy the assertion above.
-            //
-            // Matched on the whole tooltip sentence, not the bare chord.
-            // The chords are painted on their own rows again, so `CTRL+T` is
-            // legitimately in this frame whichever row is hovered -- as a
-            // row hint, not as this row's tooltip. Searching for the bare
-            // chord confused the two and made this test fail on a pane that
-            // was behaving correctly.
-            for (_, other) in [
-                ("Username", "CTRL+U"),
-                ("Password", "CTRL+B"),
-                ("TOTP", "CTRL+T"),
-                ("Website", "CTRL+SHIFT+U"),
-            ] {
-                if other == chord {
-                    continue;
-                }
-                let other_tooltip = format!("Click to copy · {other}");
-                assert!(
-                    !hovered.strings().iter().any(|t| t.contains(&other_tooltip)),
-                    "hovering the {label:?} row also surfaced {other_tooltip:?}; the frame \
-                     painted: {:?}",
-                    hovered.strings()
-                );
-            }
-        }
-    }
-
     /// **A tooltip that is already up has to let go when the pointer reaches
     /// a child of the tile.**
     ///
@@ -18505,21 +18020,6 @@ mod tests {
         frame.filled_box_around(frame.rect_of(TOTP_CARD_HEADING), theme::CARD)
     }
 
-    /// One row rule inside `card` -- a 1pt `theme::CANVAS` fill, the shape
-    /// `theme::row_rule` paints. A removed row leaves its hairline standing
-    /// about a point tall, which a height comparison is too coarse to see.
-    fn rules_in(frame: &Frame, card: egui::Rect) -> usize {
-        frame
-            .rects
-            .iter()
-            .filter(|(rect, fill)| {
-                *fill == theme::CANVAS
-                    && (rect.height() - 1.0).abs() < 0.5
-                    && card.contains_rect(*rect)
-            })
-            .count()
-    }
-
     /// The reveal eye nearest `row_y` -- the one belonging to the row whose
     /// label sits there. Asserts it really is on that row rather than
     /// returning whichever eye happened to be closest.
@@ -18559,178 +18059,6 @@ mod tests {
         let eye = eye_on_row(frame, row_y);
         let _delivering = pane.click(item, totp, eye.center());
         pane.idle(item, totp)
-    }
-
-    /// **Off means the row is not drawn -- not drawn empty, not drawn
-    /// disabled, not drawn at alpha 0 and not drawn at zero size.**
-    ///
-    /// Four instruments, because each one alone has a way of passing on a row
-    /// that is still there: the LABEL is absent from the painted frame (an
-    /// alpha-0 label is still a painted galley, so this catches that), the
-    /// card is exactly as TALL as it is with no row (a zero-size or
-    /// off-screen row would pass the label check but not this one), the card
-    /// carries no extra reveal EYE or row rule, and no second bullet run.
-    ///
-    /// Every negative half is paired with the setting-ON pass in this same
-    /// test, so none of them can pass against a pane that drew nothing.
-    #[test]
-    fn the_secret_row_is_not_drawn_when_the_setting_is_off() {
-        let item = a_login_with_a_seed("seed-off", SEED);
-
-        let mut pane_off = Pane::new();
-        let off = pane_off.idle(&item, &a_live_code());
-        let mut pane_on = Pane::new().revealing_secrets();
-        let on = pane_on.idle(&item, &a_live_code());
-
-        // The premise: BOTH passes really drew the card and the code row, so
-        // an absent label cannot be "the pane drew nothing this time".
-        for (name, frame) in [("off", &off), ("on", &on)] {
-            assert!(
-                frame.painted("LOGIN CREDENTIALS"),
-                "{name}: the login card was not drawn at all: {:?}",
-                frame.strings()
-            );
-            assert!(
-                frame.painted(copy_shortcut_label(CopyShortcut::Totp)),
-                "{name}: the One-time code row the secret row goes under was not drawn: {:?}",
-                frame.strings()
-            );
-        }
-
-        // 1. THE LABEL IS GONE. Not faint, not clipped -- absent from the
-        //    frame's own shape list.
-        assert!(
-            !off.painted(TOTP_SECRET_LABEL),
-            "the setting is off and the pane still painted {TOTP_SECRET_LABEL:?}: {:?}",
-            off.strings()
-        );
-        assert!(
-            on.painted(TOTP_SECRET_LABEL),
-            "with the setting ON the row is missing too, so the check above is vacuous: {:?}",
-            on.strings()
-        );
-
-        // 2. THE CARD IS EXACTLY AS TALL as one with no such row. A row
-        //    hidden rather than skipped still takes its band, and this is the
-        //    only instrument that can tell the two apart.
-        // The ONE-TIME CODE card, since that is where both rows live now.
-        // Both passes draw the code row -- asserted above -- so the card
-        // exists in both and the comparison is a row's worth of height and
-        // not a card appearing.
-        let (card_off, card_on) = (totp_card(&off), totp_card(&on));
-        assert!(card_off.height() > 0.0, "the card has no box at all: {card_off:?}");
-        let grew = card_on.height() - card_off.height();
-        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
-        assert!(
-            grew >= a_row,
-            "turning the setting ON grew the card by only {grew}pt where a row is {a_row}pt, so \
-             this instrument cannot see a row's worth of height at all"
-        );
-
-        // 3. NO EXTRA EYE, and no extra hairline. A row drawn at alpha 0
-        //    still paints its eye's strokes and still sits under a rule.
-        assert_eq!(
-            on.eyes.len(),
-            off.eyes.len() + 1,
-            "the ON pass did not add exactly one reveal eye ({} -> {}), so counting eyes cannot \
-             show the OFF pass is missing one",
-            off.eyes.len(),
-            on.eyes.len()
-        );
-        assert_eq!(
-            rules_in(&on, card_on),
-            rules_in(&off, card_off) + 1,
-            "the ON pass did not add exactly one row rule, so a leftover hairline in the OFF \
-             pass could not have been seen either"
-        );
-
-        // 4. AND NO MASK -- meaning no run of the SEED's own length, which
-        //    would be a secret row drawn with its label suppressed.
-        //
-        //    **Sharper than it was.** While every masked row drew the same
-        //    fixed bullet run, this could only count runs and infer: one was
-        //    the password, two meant a second row had appeared. Now that a
-        //    mask is one bullet per character, the seed's mask and the
-        //    password's are different strings, so this counts the seed's
-        //    directly and 0-against-1 says exactly what it means.
-        let masks = |frame: &Frame| frame.strings().iter().filter(|t| **t == mask(SEED)).count();
-        assert_eq!(masks(&off), 0, "off: {:?}", off.strings());
-        assert_eq!(masks(&on), 1, "on: {:?}", on.strings());
-    }
-
-    /// **No seed on the item means no row, even with the setting on** -- for
-    /// the same reason an empty password draws no row: a mask is a claim that
-    /// there is a secret behind it.
-    ///
-    /// `masked_row`'s own empty-value guard is not what is being tested here.
-    /// That guard is documented as defence in depth and production-
-    /// unreachable; the CALL is gated, and this test is about the call.
-    #[test]
-    fn the_secret_row_is_not_drawn_for_an_item_with_no_seed() {
-        // Same preference, same TOTP state, two items -- so the only
-        // difference between the passes is whether the seed is there.
-        let seedless = a_login();
-        let seeded = a_login_with_a_seed("seed-present", SEED);
-        assert!(
-            seedless.login.as_ref().unwrap().totp.is_none(),
-            "the premise: the fixture really carries no seed"
-        );
-
-        let mut pane = Pane::new().revealing_secrets();
-        let without = pane.idle(&seedless, &a_live_code());
-        let mut pane = Pane::new().revealing_secrets();
-        let with = pane.idle(&seeded, &a_live_code());
-
-        for (name, frame) in [("without", &without), ("with", &with)] {
-            assert!(
-                frame.painted("LOGIN CREDENTIALS"),
-                "{name}: the card was not drawn at all: {:?}",
-                frame.strings()
-            );
-            assert!(
-                frame.painted(copy_shortcut_label(CopyShortcut::Totp)),
-                "{name}: the One-time code row was not drawn: {:?}",
-                frame.strings()
-            );
-        }
-
-        assert!(
-            !without.painted(TOTP_SECRET_LABEL),
-            "an item with no seed still painted a secret row: {:?}",
-            without.strings()
-        );
-        assert!(
-            with.painted(TOTP_SECRET_LABEL),
-            "the control: an item WITH a seed draws the row on the same setting: {:?}",
-            with.strings()
-        );
-
-        // **The `ONE-TIME CODE` card**, since that is where the seed row
-        // lives now. Both passes still draw the CODE row -- the poll in this
-        // harness yields one either way -- so the card exists in both and the
-        // comparison is a row's worth of height rather than a card appearing.
-        let (card_without, card_with) = (totp_card(&without), totp_card(&with));
-        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
-        assert!(
-            card_with.height() - card_without.height() >= a_row,
-            "the seedless card is not a whole row shorter ({} vs {}), so the row is taking its \
-             space and was hidden rather than skipped",
-            card_without.height(),
-            card_with.height()
-        );
-        assert_eq!(
-            with.eyes.len(),
-            without.eyes.len() + 1,
-            "the seedless pass did not lose exactly one reveal eye"
-        );
-        // Inside the `ONE-TIME CODE` card, which both passes draw: the
-        // rule being counted is the one between the code row and the seed
-        // row, and it is the only hairline either pass gains or loses.
-        assert_eq!(
-            rules_in(&with, card_with),
-            rules_in(&without, card_without) + 1,
-            "a hairline was left standing where the seedless item's row would have been"
-        );
     }
 
     /// **The positive control for both hiding rules**, so neither can pass by
@@ -19204,90 +18532,6 @@ mod tests {
             ran += 1;
         }
         assert_eq!(ran, table.len(), "not every row of the table ran");
-    }
-
-    /// **A URI with no `secret=` draws no row at all** -- the same rule as an
-    /// absent seed and an empty password, because a URI is not a key and a
-    /// mask over one would be an eye offering to reveal nothing.
-    ///
-    /// Four instruments, for the reason
-    /// `the_secret_row_is_not_drawn_for_an_item_with_no_seed` gives: the
-    /// label is absent (an alpha-0 label is still a painted galley), the card
-    /// is a whole row SHORTER (a zero-height or off-screen row would pass the
-    /// label check -- egui culls a shape pushed off the screen rect entirely,
-    /// so it comes back as nothing), one fewer eye and one fewer hairline.
-    ///
-    /// The expected row count is asserted BEFORE any geometry is read.
-    #[test]
-    fn a_uri_with_no_secret_draws_no_row() {
-        let keyless = a_login_with_a_seed("uri-no-secret", KEYLESS_URI);
-        let keyed = a_login_with_a_seed("uri-with-secret", SEED_URI);
-
-        let mut pane = Pane::new().revealing_secrets();
-        let without = pane.idle(&keyless, &a_live_code());
-        let mut pane = Pane::new().revealing_secrets();
-        let with = pane.idle(&keyed, &a_live_code());
-
-        // The premise: both passes really drew the card and the code row, so
-        // an absent label cannot be "the pane drew nothing this time".
-        for (name, frame) in [("keyless", &without), ("keyed", &with)] {
-            assert!(
-                frame.painted("LOGIN CREDENTIALS"),
-                "{name}: the card was not drawn at all: {:?}",
-                frame.strings()
-            );
-            assert!(
-                frame.painted(copy_shortcut_label(CopyShortcut::Totp)),
-                "{name}: the One-time code row was not drawn: {:?}",
-                frame.strings()
-            );
-        }
-        // The expected number of secret rows, before a single rect is read.
-        assert_eq!(
-            with.strings().iter().filter(|t| **t == TOTP_SECRET_LABEL).count(),
-            1,
-            "the control pass did not draw exactly one secret row: {:?}",
-            with.strings()
-        );
-        assert_eq!(
-            without.strings().iter().filter(|t| **t == TOTP_SECRET_LABEL).count(),
-            0,
-            "a URI with no secret= still painted a secret row: {:?}",
-            without.strings()
-        );
-        // ...and neither pass leaked the URI itself onto the pane.
-        for (name, frame) in [("keyless", &without), ("keyed", &with)] {
-            assert!(
-                !frame.strings().iter().any(|t| t.contains("otpauth")),
-                "{name}: the stored URI reached the pane: {:?}",
-                frame.strings()
-            );
-        }
-
-        // The `ONE-TIME CODE` card -- see the same comparison in
-        // `the_secret_row_is_not_drawn_for_an_item_with_no_seed`.
-        let (card_without, card_with) = (totp_card(&without), totp_card(&with));
-        let a_row = ROW_CONTENT_HEIGHT + 2.0 * f32::from(ROW_PAD_Y);
-        assert!(
-            card_with.height() - card_without.height() >= a_row,
-            "the keyless card is not a whole row shorter ({} vs {}), so the row is taking its \
-             space and was hidden rather than skipped",
-            card_without.height(),
-            card_with.height()
-        );
-        assert_eq!(
-            with.eyes.len(),
-            without.eyes.len() + 1,
-            "the keyless pass did not lose exactly one reveal eye"
-        );
-        // Inside the `ONE-TIME CODE` card, which both passes draw: the
-        // rule being counted is the one between the code row and the seed
-        // row, and it is the only hairline either pass gains or loses.
-        assert_eq!(
-            rules_in(&with, card_with),
-            rules_in(&without, card_without) + 1,
-            "a hairline was left standing where the keyless item's row would have been"
-        );
     }
 
     /// **The row shows the KEY, not the stored URI** -- the user's request,
@@ -20165,297 +19409,8 @@ mod tests {
         item
     }
 
-    /// The live code and the seconds this fixture is drawn at. Digits only,
-    /// so the code's ink bottom is its baseline too.
-    const SHOWN_CODE: &str = "418902";
-    const SHOWN_SECONDS: u8 = 19;
 
-    /// The window this fixture's code belongs to, in seconds.
-    ///
-    /// Named rather than written as a bare `30` at each of these fixtures for
-    /// the reason the bar bug existed at all: a `30` that appears in more than
-    /// one place is a `30` that can be right in one of them and stale in the
-    /// rest. The typography tests do not care what it is -- they measure
-    /// baselines -- but `the_track_is_a_fraction_of_the_cards_own_window`
-    /// does, and it must be able to say "the same window the other TOTP tests
-    /// draw" and be believed.
-    const SHOWN_PERIOD: u16 = 30;
 
-    /// **The live code sits on the pane's line, exactly as a card number
-    /// does.**
-    ///
-    /// Reported as "TOTP code itself not in the center vertically". The row
-    /// paints three runs at three different sizes along one
-    /// `Align::Center` band -- a 17px monospace code, a 96x4 track, and an
-    /// 11px countdown -- and egui centres each one's BOX. The code's box is
-    /// the tallest and the monospace face puts its baseline further up inside
-    /// that box than the proportional faces around it do, so the digits
-    /// landed high while the two things beside them did not.
-    ///
-    /// **This is the identical defect the card rows had**, and it is fixed by
-    /// the identical mechanism: [`digits_baseline_drop`], derived from the two
-    /// galleys rather than written down as a number. Nothing about that
-    /// function is specific to 15px or to the masked face -- it takes the
-    /// heights and first baselines of whatever two galleys it is handed -- so
-    /// the 17px code needs no second constant and no second rule.
-    ///
-    /// Measured the same way `every_card_value_paints_its_ink_on_one_baseline_
-    /// with_its_label` measures, against the same reference: the drop from a
-    /// label's box centre to the value's ink bottom, on a row whose value has
-    /// no descender. The `Username` row is the reference because it is an
-    /// ordinary proportional value beside an ordinary label -- the line the
-    /// whole pane reads on -- and it is NAMED rather than written down, so a
-    /// retuned row height moves this with it.
-    #[test]
-    fn the_live_code_sits_on_the_same_line_an_ordinary_value_does() {
-        let painted = painted_ink_showing(
-            &a_login_showing_a_code(),
-            &TotpState::Code {
-                code: SHOWN_CODE.to_string(),
-                seconds_left: SHOWN_SECONDS,
-                period: SHOWN_PERIOD,
-            },
-            RevealState::default(),
-        );
-        let drop = |label: &str, value: &str| {
-            let (.., label_box, _) = one_run(&painted, label);
-            let (.., ink) = one_run(&painted, value);
-            ink.bottom() - label_box.center().y
-        };
-        let ordinary = drop("Username", NO_DESCENDER_USERNAME);
-        let code = drop(copy_shortcut_label(CopyShortcut::Totp), SHOWN_CODE);
-        assert!(
-            (code - ordinary).abs() <= 0.25,
-            "the live code paints its ink {code}pt below its label's centre where an \
-             ordinary value paints {ordinary}pt below -- the code is {}pt off the pane's \
-             line",
-            ordinary - code
-        );
-    }
-
-    /// **And the two things beside the code are on that line too.**
-    ///
-    /// Split from the test above deliberately. The report was about the code,
-    /// and the code is what that test is named for; but a row is only centred
-    /// if all of it is, and a fix that moved the digits onto the line while
-    /// leaving the countdown where it was would pass that test and still look
-    /// wrong. The countdown is measured against the same reference and the
-    /// same way -- `19s` has no descender either.
-    ///
-    /// The track is not text and so has no baseline. It is a 4pt bar, and
-    /// what "centred" means for it is that its own middle is on the row's
-    /// middle; it is measured against the code's ink rather than against a
-    /// label so that the assertion is about the three things sharing a line.
-    #[test]
-    fn the_countdown_and_the_track_share_the_codes_line() {
-        let item = a_login_showing_a_code();
-        let totp = TotpState::Code {
-            code: SHOWN_CODE.to_string(),
-            seconds_left: SHOWN_SECONDS,
-            period: SHOWN_PERIOD,
-        };
-        let painted = painted_ink_showing(&item, &totp, RevealState::default());
-        let drop = |label: &str, value: &str| {
-            let (.., label_box, _) = one_run(&painted, label);
-            let (.., ink) = one_run(&painted, value);
-            ink.bottom() - label_box.center().y
-        };
-        let ordinary = drop("Username", NO_DESCENDER_USERNAME);
-        let countdown = drop(
-            copy_shortcut_label(CopyShortcut::Totp),
-            &totp_countdown_text(SHOWN_SECONDS),
-        );
-        assert!(
-            (countdown - ordinary).abs() <= 0.25,
-            "the countdown paints its ink {countdown}pt below the row's label centre where \
-             an ordinary value paints {ordinary}pt below"
-        );
-
-        // The track: the one filled rect on this row that is
-        // `TOTP_BAR_HEIGHT` tall, found by its own measurements rather than
-        // by position, and checked against the middle of the code's ink.
-        // Both of them: the groove and the fill over it are equally the
-        // track.
-        let (groove, filled) = totp_track(&item, &totp);
-        let (.., code_ink) = one_run(&painted, SHOWN_CODE);
-        for bar in &[groove, filled] {
-            assert!(
-                (bar.center().y - code_ink.center().y).abs() <= 1.5,
-                "the track's middle is {}pt off the middle of the code's ink: {bar:?} \
-                 against {code_ink:?}",
-                bar.center().y - code_ink.center().y
-            );
-        }
-    }
-
-    /// **The TOTP row's progress track as two painted rects: the full-width
-    /// groove, then the filled portion drawn over it.**
-    ///
-    /// Found by measurement rather than by position -- the one pair of rects
-    /// on the whole pane that are [`TOTP_BAR_HEIGHT`] tall -- so no assertion
-    /// here depends on where in the shape list the row happens to land, and a
-    /// row that moved up or down the pane still names itself.
-    ///
-    /// Returned in PAINT ORDER, and the caller gets the groove first because
-    /// `totp_code_row` paints it first. The order is not merely assumed: the
-    /// groove is the one that is always the full [`TOTP_BAR_WIDTH`], and that
-    /// is asserted here, so a row that started painting the fill first would
-    /// fail in this function with a sentence about it rather than silently
-    /// swap two numbers in somebody else's assertion. (They cannot be told
-    /// apart by width alone: on a full window the fill IS the whole track.)
-    ///
-    /// `width() > 1.0` keeps hairlines and zero-width artefacts out. It is
-    /// inherited from the test this was extracted from and it constrains
-    /// callers: a fixture whose fill rounds to nothing would come back as one
-    /// bar and panic here, which is the honest outcome -- every caller below
-    /// draws a fill of tens of points.
-    fn totp_track(item: &VaultItem, totp: &TotpState) -> (egui::Rect, egui::Rect) {
-        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
-            match shape {
-                egui::Shape::Rect(r)
-                    if (r.rect.height() - TOTP_BAR_HEIGHT).abs() < 0.01
-                        && r.rect.width() > 1.0 =>
-                {
-                    out.push(r.rect)
-                }
-                egui::Shape::Vec(shapes) => {
-                    for shape in shapes {
-                        walk(shape, out);
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut bars: Vec<egui::Rect> = Vec::new();
-        for clipped in &frame_shapes(item, totp, RevealState::default()) {
-            walk(&clipped.shape, &mut bars);
-        }
-        assert_eq!(bars.len(), 2, "the TOTP track is not two bars: {bars:?}");
-        let (groove, filled) = (bars[0], bars[1]);
-        assert!(
-            (groove.width() - TOTP_BAR_WIDTH).abs() < 0.01,
-            "the first of the two track rects is {}pt wide, not the groove's whole \
-             {TOTP_BAR_WIDTH}pt -- the row is painting them in the other order and every \
-             measurement taken from this pair is the wrong way round",
-            groove.width()
-        );
-        (groove, filled)
-    }
-
-    /// A login carrying `seed` verbatim in its `login.totp`, so the period
-    /// under test is the one the production reader gets out of a real stored
-    /// value rather than a number a test handed it.
-    fn a_login_with_seed(seed: &str) -> VaultItem {
-        let mut item = a_login_showing_a_code();
-        item.login.as_mut().expect("a_login has login data").totp =
-            Some(seed.to_string().into());
-        item
-    }
-
-    /// RFC 6238's published seed, in the base32 form a user pastes. Its own
-    /// period is the default 30.
-    const THIRTY_SECOND_SEED: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
-
-    /// **The track is a fraction of the CARD's window, not of a 30 written
-    /// into the row.**
-    ///
-    /// The bug: `totp_code_row` divided `seconds_left` by a literal `30.0`.
-    /// On a card whose period is 60 -- `totp_add::PERIOD_CHOICES` offers it,
-    /// and a scanned `otpauth://` URI can carry any `period=` -- the bar was
-    /// therefore full for the first half of the code's life and pinned at
-    /// zero for the second, under six digits that stayed valid the whole
-    /// time. `9276c7a` had already moved the COUNTDOWN onto the item's own
-    /// period; the bar was the half of that fix deliberately left standing,
-    /// because carrying the period to it meant touching every
-    /// `TotpState::Code` in the crate.
-    ///
-    /// **All three cases are read at ONE instant, unix second 30, and that is
-    /// the whole design of this test.** At that moment
-    /// `totp_add::seconds_left_in_period` answers 30 for a 30-second card
-    /// (a window has just begun) and 30 for a 60-second card (a window is
-    /// exactly half run). So `seconds_left` is the SAME NUMBER in every row
-    /// here, and the only thing that can make the bars differ is the period
-    /// the row divides by. A version that reads `seconds_left` and guesses
-    /// the rest cannot pass this; the old one drew all three full.
-    ///
-    /// The period and the seconds are both produced by the production
-    /// functions -- `vault_window::mod`'s `totp_period_for` and
-    /// `totp_seconds_left_at`, reachable here because this module is a
-    /// descendant of the one they live in -- rather than written into the
-    /// fixture. That is what makes the third case worth anything: it asserts
-    /// what the app really does with a seed it cannot read, not what this
-    /// test would like it to do.
-    #[test]
-    fn the_track_is_a_fraction_of_the_cards_own_window() {
-        // The clock. `30 % 30 == 0` and `30 % 60 == 30`, so both periods
-        // report 30 seconds left and the two rows differ only in their whole.
-        const AT: u64 = 30;
-        for (label, seed, want_period, want_fill) in [
-            (
-                "a 30-second card, a whole window still to run",
-                THIRTY_SECOND_SEED.to_string(),
-                30u16,
-                1.0f32,
-            ),
-            (
-                "a 60-second card, exactly half its window run",
-                format!("otpauth://totp/RFC:u?secret={THIRTY_SECOND_SEED}&period=60"),
-                60,
-                0.5,
-            ),
-            // **The fallback, and it is a real case rather than an edge
-            // one.** `crate::otpauth` refuses `otpauth://hotp/` by name, so
-            // this seed's `period=60` is a value this crate has DECLINED to
-            // interpret -- and the row must not go fishing it back out of the
-            // string. `totp_period_for` answers `totp_add::DEFAULT_PERIOD`
-            // for exactly this, erring short, and it is the only place that
-            // decision is made; the bar inherits it through
-            // `TotpState::Code` and expresses no opinion of its own. So this
-            // row draws at 30's cadence -- a full bar at second 30 -- even
-            // though the string says 60. A bar that came out half-filled here
-            // would mean somebody had taught it to read a seed the parser
-            // rejected.
-            (
-                "a seed the parser refuses, whose own period= is not read back out",
-                format!("otpauth://hotp/RFC:u?secret={THIRTY_SECOND_SEED}&period=60"),
-                30,
-                1.0,
-            ),
-        ] {
-            let item = a_login_with_seed(&seed);
-            let period = crate::vault_window::totp_period_for(&item);
-            assert_eq!(period, want_period, "{label}: the period read off the seed");
-            let seconds_left = crate::vault_window::totp_seconds_left_at(period, Some(AT));
-            assert_eq!(
-                seconds_left, 30,
-                "{label}: this test's whole argument is that all three rows show the same \
-                 seconds left and differ only in their period"
-            );
-
-            let totp = TotpState::Code {
-                code: SHOWN_CODE.to_string(),
-                seconds_left,
-                period,
-            };
-            let (groove, filled) = totp_track(&item, &totp);
-            let want = want_fill * TOTP_BAR_WIDTH;
-            assert!(
-                (filled.width() - want).abs() <= 0.01,
-                "{label}: the filled part of the track is {}pt of a {}pt groove, where \
-                 {seconds_left}s of a {period}s window is {want}pt",
-                filled.width(),
-                groove.width()
-            );
-            // The fill starts where the groove does, so its width is the
-            // whole of what a reader sees. A fill that were centred, or
-            // right-aligned, would satisfy the width assertion above and
-            // still draw a bar that empties from the wrong end.
-            assert_eq!(
-                filled.min, groove.min,
-                "{label}: the fill does not start at the groove's own left edge"
-            );
-        }
-    }
 
     /// The bar's arithmetic on its own, at the ends and at the one value that
     /// cannot be trusted to arrive well-formed.
@@ -20504,198 +19459,6 @@ mod tests {
              on another device, Sync to pick that up.",
         ),
     ];
-
-    /// **How far a 14px value's ink reaches ABOVE its own baseline**, read off
-    /// a run in that face that has an ascender and no descender.
-    ///
-    /// The conversion this file's TOTP tests need and could not get any other
-    /// way. A run's baseline is its ink BOTTOM only when nothing in it
-    /// descends -- true of `418902` and of [`NO_DESCENDER_USERNAME`], and
-    /// false of `Fetching…`, whose `g` hangs below the line. So the status
-    /// run's baseline is found from its ink TOP instead, which is the
-    /// ASCENDER line: both strings carry a full ascender (`k` in
-    /// `anna.novak`, `h` in `Fetching…`) and both are laid out in the same
-    /// `FontId`, so the distance from that line down to the baseline is one
-    /// number for both and this reads it off the one that can state it.
-    ///
-    /// Wholly on ink -- `drawn_glyph_ink`'s glyph outlines -- which is the
-    /// point. The whole reason `paint_on_the_value_baseline` exists is that
-    /// the allocated boxes agreed while the glyphs did not; a measurement
-    /// taken off a box would be blind in exactly that way again.
-    fn ascender_to_baseline(
-        painted: &[(String, egui::FontId, f32, egui::Rect, egui::Rect)],
-    ) -> (egui::FontId, f32) {
-        let (font, _, _, ink) = one_run(painted, NO_DESCENDER_USERNAME);
-        (font, ink.height())
-    }
-
-    /// **The `Fetching…` status sits on the line the live code replaces it
-    /// on.**
-    ///
-    /// THE REPORT, with a screenshot: while a poll is in flight the row reads
-    /// `Fetching…`, and that text sits visibly HIGHER than the six digits
-    /// that take its place a moment later -- so the value jumps up the row
-    /// and back down again every time a code arrives.
-    ///
-    /// Measured on a 900pt pane as each run's absolute baseline: the code's
-    /// is 281.5, and `Fetching…`'s was 275.0. A 6.5pt jump on a 28pt row.
-    ///
-    /// **The cause was not the code's baseline correction**, which is
-    /// measured and correct and is left alone. It was `totp_status_row`
-    /// wrapping its single label in a `ui.vertical` built for the two-line
-    /// states: a top-down `Ui` pins its first widget to the TOP of the
-    /// `ROW_CONTENT_HEIGHT` band, and one 15pt line in a 28pt band leaves all
-    /// 13pt of the slack underneath it. See that function.
-    ///
-    /// **This is asserted on INK and it has to be**, for the reason
-    /// `every_card_value_paints_its_ink_on_one_baseline_with_its_label`
-    /// gives at length: the boxes on this row have agreed with each other
-    /// through every version of this defect, and a rect-based assertion
-    /// passes on all of them.
-    ///
-    /// The tolerance is the 0.25pt its two sibling tests use, and it is not a
-    /// round number picked to fit: this pane lays out at one point per pixel
-    /// and egui rounds glyph positions to the half pixel, so 0.5pt is the
-    /// smallest disagreement that can reach a screen and 0.25 is half of
-    /// that. The measured disagreement after the repair is 0.0.
-    #[test]
-    fn the_fetching_status_sits_on_the_line_the_live_code_replaces_it_on() {
-        let item = a_login_showing_a_code();
-        let live = TotpState::Code {
-            code: SHOWN_CODE.to_string(),
-            seconds_left: SHOWN_SECONDS,
-            period: SHOWN_PERIOD,
-        };
-        let showing_code = painted_ink_showing(&item, &live, RevealState::default());
-        let fetching = painted_ink_showing(&item, &TotpState::Fetching, RevealState::default());
-
-        // **The control, and without it every number below could be measuring
-        // one frame twice.** The two frames must be in genuinely different
-        // states: each has to carry its own run and NOT the other's, because
-        // `one_run` is happy to find a run in a frame that never changed.
-        let painted = |painted: &[(String, egui::FontId, f32, egui::Rect, egui::Rect)],
-                       text: &str| painted.iter().any(|(t, ..)| t == text);
-        assert!(
-            painted(&showing_code, SHOWN_CODE) && !painted(&showing_code, FETCHING_STATUS),
-            "the Code frame is not showing a code without the fetching status"
-        );
-        assert!(
-            painted(&fetching, FETCHING_STATUS) && !painted(&fetching, SHOWN_CODE),
-            "the Fetching frame is not showing the fetching status without a code"
-        );
-
-        // **The row's own label has not moved**, which is both a constraint
-        // on the repair and what makes the two frames' absolute y values
-        // comparable at all: everything above this row is identical in them,
-        // so if the label lands in the same box the rows are registered.
-        let label = copy_shortcut_label(CopyShortcut::Totp);
-        let (.., code_label, _) = one_run(&showing_code, label);
-        let (.., fetch_label, _) = one_run(&fetching, label);
-        assert_eq!(
-            code_label, fetch_label,
-            "the {label:?} label is in a different place in the two states, so the two \
-             baselines below are measured from different origins"
-        );
-
-        // The code is digits and nothing else, so its ink bottom IS its
-        // baseline. The status carries a `g`, so its is reached through the
-        // ascender line -- see `ascender_to_baseline`.
-        let (code_font, _, _, code_ink) = one_run(&showing_code, SHOWN_CODE);
-        let code_baseline = code_ink.bottom();
-        let (reference_font, rise) = ascender_to_baseline(&fetching);
-        let (status_font, _, _, status_ink) = one_run(&fetching, FETCHING_STATUS);
-        assert_eq!(
-            status_font, reference_font,
-            "the status run and the run its ascender line is read off are in different \
-             faces, so the conversion to a baseline is not valid"
-        );
-        // And the two runs really are in different faces, so this is the
-        // cross-face question the report is about and not an identity.
-        assert_ne!(
-            status_font, code_font,
-            "the status and the code are laid out in the same face, so this test can no \
-             longer tell a shared baseline from a shared box"
-        );
-        let status_baseline = status_ink.top() + rise;
-
-        assert!(
-            (status_baseline - code_baseline).abs() <= 0.25,
-            "the {FETCHING_STATUS:?} status paints its baseline at y={status_baseline} \
-             and the code that replaces it paints its own at y={code_baseline} -- the \
-             row's value jumps {}pt when the code arrives",
-            code_baseline - status_baseline
-        );
-    }
-
-    /// **And the two-line statuses still stack**, which is the half of
-    /// `totp_status_row` the repair above had to leave alone.
-    ///
-    /// `Unavailable` and `NoCodeReported` are genuinely two lines -- a status
-    /// with an explanation under it -- and their `ui.vertical` is right for
-    /// them. A repair that centred every status in the band would have taken
-    /// the stack with it, so this pins the stack directly: one run above the
-    /// other, both starting at the same left edge (a flowed pair would sit
-    /// side by side), and the status still at the band's TOP rather than at
-    /// the centred position the one-line state now takes.
-    ///
-    /// That last comparison is the one that would catch the repair leaking:
-    /// it is measured against the `Fetching…` run in a frame of its own, so
-    /// it names the difference between the two shapes rather than writing
-    /// down where either of them is.
-    #[test]
-    fn the_two_line_totp_statuses_still_stack_their_hint_under_their_status() {
-        let item = a_login_showing_a_code();
-        let fetching = painted_ink_showing(&item, &TotpState::Fetching, RevealState::default());
-        let (.., one_line_ink) = one_run(&fetching, FETCHING_STATUS);
-
-        for (state, status, hint) in STACKED_STATUSES {
-            let painted = painted_ink_showing(&item, &state, RevealState::default());
-            let (.., status_ink) = one_run(&painted, status);
-            let (.., hint_ink) = one_run(&painted, hint);
-            assert!(
-                hint_ink.top() >= status_ink.bottom(),
-                "{state:?} paints its hint's ink at {:?} and its status's at {:?} -- the \
-                 second line is not under the first",
-                hint_ink,
-                status_ink
-            );
-            // **2pt, and the slack is the LEFT SIDE BEARING**, not a loose
-            // assertion. The two lines start with different letters at
-            // different sizes -- `U` at 14px over `C` at 11px on the
-            // `Unavailable` row -- so their first glyph's outline begins a
-            // different distance inside the layout origin the two runs really
-            // do share; measured here at 1.0pt. What this rules out is the
-            // flowed alternative, where the second run would begin past the
-            // first run's RIGHT edge, over a hundred points away; that is
-            // asserted separately below so the tolerance is not the only
-            // thing standing between the two readings.
-            assert!(
-                (hint_ink.left() - status_ink.left()).abs() <= 2.0,
-                "{state:?} starts its two lines at x={} and x={} -- they are not one \
-                 column",
-                status_ink.left(),
-                hint_ink.left()
-            );
-            assert!(
-                hint_ink.left() < status_ink.right(),
-                "{state:?} begins its hint at x={} past its status's right edge at x={} \
-                 -- the two lines have been flowed onto one",
-                hint_ink.left(),
-                status_ink.right()
-            );
-            // The stack is top-aligned in the band and the one-line state is
-            // centred in it, so the two-line status must still sit ABOVE
-            // where `Fetching…` now sits. Equal tops would mean the stack had
-            // been centred along with it.
-            assert!(
-                status_ink.top() < one_line_ink.top() - 0.25,
-                "{state:?} paints its status at y={} where the one-line state paints its \
-                 own at y={} -- the two-line row has been pulled off the top of its band",
-                status_ink.top(),
-                one_line_ink.top()
-            );
-        }
-    }
 
     /// The pure function the painted-ink test above rests on, exercised on
     /// the two galleys it is really asked about -- so the arithmetic is
@@ -21048,7 +19811,7 @@ mod tests {
         // to five entries -- which is exactly why it needs a test: an omitted
         // previous password is indistinguishable from one the user never had,
         // and this pane is the only place in the app they are visible.
-        let texts = painted(&a_login_with_history(MAX_HISTORY_ROWS + 3), &TotpState::NoSecret);
+        let texts = tall_painted(&a_login_with_history(MAX_HISTORY_ROWS + 3));
         assert!(
             contains(&texts, "3 older passwords are not shown"),
             "a truncated history did not say how many rows it dropped: {texts:?}"
@@ -21134,7 +19897,7 @@ mod tests {
         // Absolute, not re-derived: these are the four words the user reads.
         assert_eq!(copy_shortcut_label(CopyShortcut::Password), "Password");
         assert_eq!(copy_shortcut_label(CopyShortcut::Username), "Username");
-        assert_eq!(copy_shortcut_label(CopyShortcut::Totp), "TOTP");
+        assert_eq!(copy_shortcut_label(CopyShortcut::Totp), "2FA code");
         assert_eq!(copy_shortcut_label(CopyShortcut::Url), "Website");
     }
 
@@ -21185,7 +19948,7 @@ mod tests {
         // The fixtures' actual secrets, spelled out here rather than read off
         // the items, so this test still fails if a fixture changes.
         let secrets = ["hunter2", "4242424242424242", "a.novak@ledgerline.com"];
-        for label in ["Password", "Username", "TOTP", "Website", "Number"] {
+        for label in ["Password", "Username", "2FA code", "Website", "Number"] {
             let text = copy_toast_text(label, false);
             assert_eq!(text, format!("{label} copied"));
             for secret in secrets {
@@ -21252,79 +20015,6 @@ mod tests {
             "the harness cannot see the password even when the row reveals it, so \
              the negative above proves nothing: {:?}",
             revealed.strings()
-        );
-    }
-
-    /// **Five seconds, and then nothing** -- the number the user asked for.
-    ///
-    /// Every time here is an absolute second count, never one computed from
-    /// `COPY_TOAST_SECONDS`: a test that derives its expectation from the
-    /// constant under test passes at any value of it.
-    #[test]
-    fn the_confirmation_lasts_five_seconds_and_reports_the_time_left() {
-        let toast = CopyToast {
-            label: "Password".to_string(),
-            verbatim: false,
-            shown_at: 100.0,
-        };
-        assert_eq!(
-            copy_toast_now(Some(&toast), 100.0),
-            Some(("Password copied".to_string(), 5.0)),
-            "the confirmation is not up on the very frame the copy happened"
-        );
-        let (text, left) = copy_toast_now(Some(&toast), 104.9)
-            .expect("the confirmation is gone before five seconds are up");
-        assert_eq!(text, "Password copied");
-        assert!(
-            (left - 0.1).abs() < 1e-6,
-            "0.1s before the deadline the confirmation reported {left}s left, so a \
-             repaint scheduled from it would come at the wrong time"
-        );
-        assert_eq!(
-            copy_toast_now(Some(&toast), 105.0),
-            None,
-            "the confirmation outlived its five seconds"
-        );
-        assert_eq!(copy_toast_now(Some(&toast), 900.0), None);
-        assert_eq!(
-            copy_toast_now(None, 100.0),
-            None,
-            "a pane that has copied nothing is showing a confirmation"
-        );
-    }
-
-    /// **A second copy replaces the first and restarts the clock** -- it does
-    /// not queue behind it, and two do not stack.
-    #[test]
-    fn a_second_copy_replaces_the_message_and_restarts_the_five_seconds() {
-        let first = CopyToast {
-            label: "Password".to_string(),
-            verbatim: false,
-            shown_at: 100.0,
-        };
-        // Four seconds in, one second left.
-        let (text, left) = copy_toast_now(Some(&first), 104.0).expect("still up at 4s");
-        assert_eq!(text, "Password copied");
-        assert!((left - 1.0).abs() < 1e-6, "reported {left}s left at 4s in");
-
-        // The username is copied at that moment. One value, overwritten
-        // whole, so the label and the deadline move together.
-        let second = CopyToast {
-            label: "Username".to_string(),
-            verbatim: false,
-            shown_at: 104.0,
-        };
-        assert_eq!(
-            copy_toast_now(Some(&second), 104.0),
-            Some(("Username copied".to_string(), 5.0)),
-            "the second copy did not take over the confirmation"
-        );
-        // And the first one's original deadline no longer retires anything:
-        // at 105.5 -- past the FIRST five seconds -- the second is still up.
-        assert_eq!(
-            copy_toast_now(Some(&second), 105.5),
-            Some(("Username copied".to_string(), 3.5)),
-            "the second copy inherited the first one's deadline instead of its own"
         );
     }
 
@@ -21406,7 +20096,7 @@ mod tests {
         for (modifiers, key, want) in [
             (egui::Modifiers::CTRL, egui::Key::B, "Password copied"),
             (egui::Modifiers::CTRL, egui::Key::U, "Username copied"),
-            (egui::Modifiers::CTRL, egui::Key::T, "TOTP copied"),
+            (egui::Modifiers::CTRL, egui::Key::T, "2FA code copied"),
             (shift_ctrl, egui::Key::U, "Website copied"),
         ] {
             let mut pane = Pane::new();
@@ -21439,173 +20129,8 @@ mod tests {
         }
     }
 
-    /// **The confirmation retires itself.** egui only redraws on input, so a
-    /// toast with a deadline that nobody schedules stays on screen until the
-    /// user happens to move the mouse. This is the single most likely bug in
-    /// the feature, so it is pinned twice: the frame asks for a repaint, and
-    /// the message really is gone five seconds later.
-    ///
-    /// The repaint half asserts the request SHRINKS as the deadline nears --
-    /// a constant delay (or egui's own idle default) cannot do that, and a
-    /// bare "is it under five seconds" could be satisfied by an unrelated
-    /// animation.
-    #[test]
-    fn the_confirmation_schedules_the_repaint_that_retires_it_and_then_goes_away() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let row = laid_out.rect_of("Password");
-        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
-        assert!(copied.painted("Password copied"), "nothing was copied");
-        // The frame the click landed on asks for an immediate repaint for
-        // reasons of its own -- egui always does after a pointer event -- so
-        // the countdown is read off the quiet frames that follow. egui
-        // advances its own clock by one predicted frame (1/60s) per
-        // input-less pass, the same trick `hover_settled` uses.
-        //
-        // 121 frames is 2.02s, so a five-second deadline started at the copy
-        // has about 2.98s left. Every number below is ABSOLUTE: none is
-        // computed from `COPY_TOAST_SECONDS`, and no constant delay and no
-        // unrelated animation can land in this window AND in the next one a
-        // second later.
-        for _ in 0..120 {
-            let _ = pane.idle(&item, &TotpState::NoSecret);
-        }
-        let two_seconds_in = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            two_seconds_in.painted("Password copied"),
-            "the confirmation was gone two seconds after the copy; the frame painted: {:?}",
-            two_seconds_in.strings()
-        );
-        let left = two_seconds_in.repaint_delay.as_secs_f64();
-        assert!(
-            (2.7..3.2).contains(&left),
-            "two seconds after the copy the frame asked egui back in {left}s; a \
-             five-second deadline started at the copy has about 2.98s left"
-        );
-
-        // One more second of frames, and the request must have shrunk by
-        // about exactly that second.
-        for _ in 0..60 {
-            let _ = pane.idle(&item, &TotpState::NoSecret);
-        }
-        let three_seconds_in = pane.idle(&item, &TotpState::NoSecret);
-        let left = three_seconds_in.repaint_delay.as_secs_f64();
-        assert!(
-            (1.7..2.2).contains(&left),
-            "a second later the frame asked egui back in {left}s, so the request is \
-             not counting the confirmation down"
-        );
-
-        // Past five seconds. 200 more frames is 3.33s, taking the total to
-        // 6.35s -- past the deadline without being computed from it.
-        for _ in 0..200 {
-            let _ = pane.idle(&item, &TotpState::NoSecret);
-        }
-        let expired = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            !expired.painted("Password copied"),
-            "the confirmation was still up more than five seconds after the copy: {:?}",
-            expired.strings()
-        );
-    }
-
-    /// **Where it sits: the window's bottom-right, clear of everything that
-    /// matters.**
-    ///
-    /// It must not cover the row that was just clicked (the rows lay out from
-    /// the top of the body down; this is anchored to the opposite corner), it
-    /// must not sit under the pane's own controls (Edit, Fill, the kebab and
-    /// the star are all in the header strip at the top), and it must still
-    /// read at the smallest window the app can be resized to.
-    ///
-    /// Every number is absolute against the pane, never re-derived from
-    /// `COPY_TOAST_INSET`.
-    #[test]
-    fn the_confirmation_sits_in_the_bottom_right_clear_of_the_row_and_the_header() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let header = laid_out.header_strip();
-        let row = laid_out.rect_of("Password");
-        let _ = pane.click(&item, &TotpState::NoSecret, row.center());
-        // One more frame, on a QUIET pane. Not because the placement needs
-        // to settle -- it does not, and that is the point: `draw_copy_toast`
-        // measures the galley itself and paints through a layer painter
-        // precisely so the toast is in its final position on the very frame
-        // the copy happened. The `Area` that had to be laid out before it
-        // knew its own size is the design this feature REJECTED, for that
-        // exact reason. This frame is read instead of the click's so the
-        // geometry is not taken off a frame that also carries a pointer
-        // press, a hover tint and the row's own click response.
-        let settled = pane.idle(&item, &TotpState::NoSecret);
-        let toast = settled.rect_of("Password copied");
-        assert_eq!(
-            settled.rendered_glyphs("Password copied"),
-            "Password copied",
-            "the confirmation was elided; `Galley::text` would not have shown it"
-        );
-
-        assert!(
-            toast.right() > 450.0 && toast.bottom() > 450.0,
-            "the confirmation is not in the pane's bottom-right quadrant: {toast:?}"
-        );
-        assert!(
-            toast.right() <= 900.0 && toast.bottom() <= 900.0,
-            "the confirmation runs off the bottom-right of a 900x900 pane: {toast:?}"
-        );
-
-        // **The BOX, to the point, not the quadrant.** Everything above is
-        // satisfied by a toast placed anywhere in a 450pt square, which is
-        // how a 24pt/18pt shift (drawing it against the padded body instead
-        // of the whole pane) passed the whole suite. The dark box is also the
-        // thing the user sees meet the window edge -- the galley sits a
-        // padding in from it, so the text's rect can never say where the
-        // toast IS. 880 is 900 less the documented 20pt inset, written
-        // absolutely rather than derived from `COPY_TOAST_INSET`.
-        let box_rect = settled.filled_box_around(toast, theme::INK);
-        assert!(
-            (box_rect.right() - 880.0).abs() < 0.5,
-            "the confirmation's box is at {box_rect:?}: its right edge is not 20pt \
-             in from a 900pt pane"
-        );
-        assert!(
-            (box_rect.bottom() - 880.0).abs() < 0.5,
-            "the confirmation's box is at {box_rect:?}: its bottom edge is not 20pt \
-             up from a 900pt pane"
-        );
-        assert!(
-            !toast.intersects(row),
-            "the confirmation covers the very row that was clicked: {toast:?} over {row:?}"
-        );
-        assert!(
-            toast.top() > header.bottom(),
-            "the confirmation sits over the header strip, where the pane's own \
-             controls are: {toast:?} over {header:?}"
-        );
-
-        // The smallest the window can get. Same message, still whole, still
-        // inside the pane.
-        let mut narrow = Pane::wide(MIN_PANE);
-        let narrow_laid_out = narrow.idle(&item, &TotpState::NoSecret);
-        let narrow_row = narrow_laid_out.rect_of("Password");
-        let _ = narrow.click(&item, &TotpState::NoSecret, narrow_row.center());
-        let narrow_settled = narrow.idle(&item, &TotpState::NoSecret);
-        assert_eq!(
-            narrow_settled.rendered_glyphs("Password copied"),
-            "Password copied",
-            "at the minimum window size the confirmation was elided"
-        );
-        let narrow_toast = narrow_settled.rect_of("Password copied");
-        assert!(
-            narrow_toast.left() >= 0.0 && narrow_toast.right() <= MIN_PANE,
-            "at the minimum window size the confirmation ({narrow_toast:?}) runs \
-             outside the {MIN_PANE}pt pane"
-        );
-    }
-
     /// **A chord that copies nothing says nothing.** The one thing standing
-    /// between the user and "TOTP copied" on an item with no TOTP.
+    /// between the user and "2FA code copied" on an item with no TOTP.
     ///
     /// Live behaviour is already correct, and that is the problem this pins:
     /// hoisting `note_copied` OUT of the `if let Some(copy)` guard -- so
@@ -21625,7 +20150,7 @@ mod tests {
         let chords = [
             (egui::Modifiers::CTRL, egui::Key::U, "Username copied"),
             (egui::Modifiers::CTRL, egui::Key::B, "Password copied"),
-            (egui::Modifiers::CTRL, egui::Key::T, "TOTP copied"),
+            (egui::Modifiers::CTRL, egui::Key::T, "2FA code copied"),
             (shift_ctrl, egui::Key::U, "Website copied"),
         ];
 
@@ -21736,161 +20261,6 @@ mod tests {
                 }
             }
         }
-    }
-
-    /// **The confirmation belongs to the item it was copied on.**
-    ///
-    /// The toast lives in the context, which is shared by every item the pane
-    /// ever draws: copy the password on a login, click any other item inside
-    /// the five seconds, and the new item painted "Password copied" -- on a
-    /// secure note, which has no Password row at all. That is this feature's
-    /// own claim (the toast names the row it belongs to) failing the moment
-    /// the selection changes.
-    ///
-    /// Three things in one test, because two of them are each other's
-    /// control:
-    ///   * a redraw of the SAME item keeps it -- a vault refresh or a write
-    ///     landing is not the user walking away, and a "clear on every frame"
-    ///     fix would pass the other two assertions while making the toast
-    ///     invisible in the app;
-    ///   * a different item does not get it;
-    ///   * and coming BACK does not resurrect it, which is what separates
-    ///     clearing the value from merely hiding it.
-    #[test]
-    fn the_confirmation_does_not_follow_the_pane_onto_another_item() {
-        let item = a_login();
-        let mut other = an_item(Some(2));
-        other.id = "id-2".to_string();
-        // **The same NAME, deliberately.** Two `Gmail` logins is an ordinary
-        // vault, and while these two fixtures differed in name as well as id
-        // this test could not say which of the two the toast was keyed on:
-        // substituting `&item.name` for `&item.id` at
-        // `forget_copy_toast_on_item_change`'s call site passed the whole
-        // suite. Under that mutant these two items are one item, the
-        // confirmation follows the pane across the selection change, and
-        // renaming an item mid-toast clears a live one. The id is the only
-        // thing that differs here, so only the id can be what carries the
-        // assertions below.
-        other.name = item.name.clone();
-        assert_ne!(item.id, other.id, "the two fixtures are the same item");
-        assert_eq!(
-            item.name, other.name,
-            "the two fixtures differ by name as well as id, so this test cannot tell a \
-             toast keyed on the id from one keyed on the name"
-        );
-
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let row = laid_out.rect_of("Password");
-        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
-        assert!(
-            copied.painted("Password copied"),
-            "nothing was confirmed on the item that was copied, so the assertions \
-             below are about a toast that never existed -- painted: {:?}",
-            copied.strings()
-        );
-
-        // Redrawn for a reason that is not a selection change.
-        let refreshed = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            refreshed.painted("Password copied"),
-            "a redraw of the SAME item lost the confirmation -- a vault refresh or a \
-             write landing must not cancel it; painted: {:?}",
-            refreshed.strings()
-        );
-
-        // The user clicks another item, well inside the five seconds.
-        let switched = pane.idle(&other, &TotpState::NoSecret);
-        assert!(
-            !switched.painted("Password copied"),
-            "the confirmation followed the pane onto another item, which has no \
-             Password row at all; it painted: {:?}",
-            switched.strings()
-        );
-        let claims: Vec<&str> = switched
-            .strings()
-            .into_iter()
-            .filter(|painted| painted.ends_with(" copied"))
-            .collect();
-        assert!(
-            claims.is_empty(),
-            "the newly selected item claimed {claims:?} about a copy made on a \
-             different item"
-        );
-
-        // And back again, still inside the five seconds: nothing returns.
-        let back = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            !back.painted("Password copied"),
-            "the confirmation came back when the item was reselected -- it was \
-             hidden rather than cleared; painted: {:?}",
-            back.strings()
-        );
-    }
-
-    /// The other door out of an item, which the read pane cannot see.
-    ///
-    /// `forget_copy_toast_on_item_change` fires on a *different* item. Opening
-    /// the editor and cancelling back, or deselecting and reselecting, never
-    /// changes the item -- so nothing fired, the toast was still in the map,
-    /// the recorded id still matched, and the confirmation came back for a
-    /// copy the user had looked away from five seconds ago. That is the
-    /// resurrection `forget_copy_toast_on_item_change`'s doc sets out to make
-    /// impossible, reached by a route it does not watch.
-    ///
-    /// `vault_window::mod` is what calls this on those routes (its own suite
-    /// pins the three call sites); here is the primitive doing what it claims,
-    /// on a real pane, with a real toast up.
-    #[test]
-    fn a_confirmation_does_not_survive_the_pane_being_looked_away_from() {
-        let item = a_login();
-        let mut pane = Pane::new();
-        let laid_out = pane.idle(&item, &TotpState::NoSecret);
-        let row = laid_out.rect_of("Password");
-        let copied = pane.click(&item, &TotpState::NoSecret, row.center());
-        assert!(
-            copied.painted("Password copied"),
-            "nothing was confirmed, so the assertions below are about a toast that never \
-             existed -- painted: {:?}",
-            copied.strings()
-        );
-        // Control: the SAME item redrawn keeps it, so what the clear below
-        // does is not something a redraw was going to do anyway.
-        assert!(
-            pane.idle(&item, &TotpState::NoSecret).painted("Password copied"),
-            "a plain redraw already lost the confirmation, so this test cannot show that \
-             the clear is what removed it"
-        );
-
-        // The user leaves the read pane: the editor opens, or the selection
-        // is dropped. No item change -- the item is the same one.
-        forget_copy_toast(&pane.ctx);
-        // The record went with the toast, so the item-change check starts
-        // from nothing rather than from a stale id that would make it a
-        // no-op. Asserted HERE, before the pane redraws: the next
-        // `draw_detail_read` records the item again, which is correct and
-        // would hide a clear that had left it behind.
-        assert_eq!(
-            pane.ctx.data(|data| data.get_temp::<String>(copy_toast_item_id())),
-            None,
-            "the toast is gone but the item it belonged to is still recorded"
-        );
-
-        let back = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            !back.painted("Password copied"),
-            "the confirmation came back on the SAME item after the user looked away -- a \
-             round trip through the edit pane, or a deselect and reselect, resurrects it; \
-             painted: {:?}",
-            back.strings()
-        );
-        // And it stays gone, rather than being suppressed for one frame.
-        let again = pane.idle(&item, &TotpState::NoSecret);
-        assert!(
-            !again.painted("Password copied"),
-            "the confirmation was hidden for a frame rather than cleared; painted: {:?}",
-            again.strings()
-        );
     }
 
     // -----------------------------------------------------------------
@@ -23130,6 +21500,159 @@ mod tests {
         }
     }
 
+
+    /// **And the two-line statuses still stack**, which is the half of
+    /// `totp_status_row` the repair above had to leave alone.
+    ///
+    /// `Unavailable` and `NoCodeReported` are genuinely two lines -- a status
+    /// with an explanation under it -- and their `ui.vertical` is right for
+    /// them. A repair that centred every status in the band would have taken
+    /// the stack with it, so this pins the stack directly: one run above the
+    /// other, both starting at the same left edge (a flowed pair would sit
+    /// side by side), and the status still at the band's TOP rather than at
+    /// the centred position the one-line state now takes.
+    ///
+    /// That last comparison is the one that would catch the repair leaking:
+    /// it is measured against the `Fetching…` run in a frame of its own, so
+    /// it names the difference between the two shapes rather than writing
+    /// down where either of them is.
+    #[test]
+    fn the_two_line_totp_statuses_still_stack_their_hint_under_their_status() {
+        let item = a_login_showing_a_code();
+        let fetching = painted_ink_showing(&item, &TotpState::Fetching, RevealState::default());
+        let (.., one_line_ink) = one_run(&fetching, FETCHING_STATUS);
+
+        for (state, status, hint) in STACKED_STATUSES {
+            let painted = painted_ink_showing(&item, &state, RevealState::default());
+            let (.., status_ink) = one_run(&painted, status);
+            let (.., hint_ink) = one_run(&painted, hint);
+            assert!(
+                hint_ink.top() >= status_ink.bottom(),
+                "{state:?} paints its hint's ink at {:?} and its status's at {:?} -- the \
+                 second line is not under the first",
+                hint_ink,
+                status_ink
+            );
+            // **2pt, and the slack is the LEFT SIDE BEARING**, not a loose
+            // assertion. The two lines start with different letters at
+            // different sizes -- `U` at 14px over `C` at 11px on the
+            // `Unavailable` row -- so their first glyph's outline begins a
+            // different distance inside the layout origin the two runs really
+            // do share; measured here at 1.0pt. What this rules out is the
+            // flowed alternative, where the second run would begin past the
+            // first run's RIGHT edge, over a hundred points away; that is
+            // asserted separately below so the tolerance is not the only
+            // thing standing between the two readings.
+            assert!(
+                (hint_ink.left() - status_ink.left()).abs() <= 2.0,
+                "{state:?} starts its two lines at x={} and x={} -- they are not one \
+                 column",
+                status_ink.left(),
+                hint_ink.left()
+            );
+            assert!(
+                hint_ink.left() < status_ink.right(),
+                "{state:?} begins its hint at x={} past its status's right edge at x={} \
+                 -- the two lines have been flowed onto one",
+                hint_ink.left(),
+                status_ink.right()
+            );
+            // The stack is top-aligned in the band and the one-line state is
+            // centred in it, so the two-line status must still sit ABOVE
+            // where `Fetching…` now sits. Equal tops would mean the stack had
+            // been centred along with it.
+            assert!(
+                status_ink.top() < one_line_ink.top() - 0.25,
+                "{state:?} paints its status at y={} where the one-line state paints its \
+                 own at y={} -- the two-line row has been pulled off the top of its band",
+                status_ink.top(),
+                one_line_ink.top()
+            );
+        }
+    }
+
+    /// Spec 3.3's body: field cards, the 2FA ring, Fills in, the card hero,
+    /// and the copies' toasts.
+    mod v2_body {
+        use super::*;
+        use crate::kit::tokens::Palette;
+
+        const P: Palette = Palette::LIGHT;
+
+        fn a_login_with_a_code() -> VaultItem {
+            let mut item = a_login();
+            item.login.as_mut().unwrap().totp = Some("JBSWY3DPEHPK3PXP".to_string().into());
+            item
+        }
+
+        fn code(seconds_left: u8) -> TotpState {
+            TotpState::Code { code: "123456".to_string(), seconds_left, period: 30 }
+        }
+
+        #[test]
+        fn the_2fa_row_groups_the_code_and_drains_its_ring() {
+            assert_eq!(grouped_code("123456"), "123 456");
+            assert_eq!(grouped_code("12345678"), "1234 5678");
+            assert_eq!(grouped_code("1234567"), "123 4567");
+            let mut pane = Pane::new();
+            let f = pane.idle(&a_login_with_a_code(), &code(15));
+            assert!(f.painted("2FA code"), "the row's label");
+            assert!(f.painted("123 456"), "the grouped code: {:?}", f.strings());
+            assert!(f.painted("15"), "the seconds in the ring's centre");
+            // The ring drains clockwise from twelve o'clock: half a period
+            // left is half a circle, ending at six.
+            let c = egui::pos2(100.0, 100.0);
+            let half = ring_points(c, 15.0, 0.5);
+            assert!((half[0] - egui::pos2(100.0, 85.0)).length() < 0.01, "starts at the top");
+            assert!((*half.last().unwrap() - egui::pos2(100.0, 115.0)).length() < 0.01, "half ends at the bottom");
+            let quarter = ring_points(c, 15.0, 0.25);
+            assert!((*quarter.last().unwrap() - egui::pos2(115.0, 100.0)).length() < 0.01, "clockwise: a quarter ends at three");
+            assert!(ring_points(c, 15.0, 0.0).len() < 2, "an empty ring draws nothing");
+        }
+
+        #[test]
+        fn the_code_turns_red_in_its_last_five_seconds() {
+            let mut pane = Pane::new();
+            let calm = pane.idle(&a_login_with_a_code(), &code(6));
+            assert_eq!(calm.text_colour_of("123 456"), P.blue);
+            let mut pane = Pane::new();
+            let late = pane.idle(&a_login_with_a_code(), &code(5));
+            assert_eq!(late.text_colour_of("123 456"), P.error);
+        }
+
+        #[test]
+        fn a_login_without_a_code_offers_add_2fa() {
+            let mut pane = Pane::new();
+            let item = a_login();
+            let f = pane.idle(&item, &TotpState::NoSecret);
+            assert!(f.painted(ADD_2FA_ROW_TITLE) && f.painted(ADD_2FA_ROW_DETAIL), "{:?}", f.strings());
+            let at = f.rect_of(ADD_2FA_ROW_DETAIL).center();
+            assert_eq!(pane.click(&item, &TotpState::NoSecret, at).action, DetailAction::AddTotp);
+            // A login that has a code offers its code instead.
+            let f = Pane::new().idle(&a_login_with_a_code(), &code(20));
+            assert!(!f.painted(ADD_2FA_ROW_DETAIL));
+            // And a received record cannot be given one.
+            let f = Pane::new().view_only("anna@x.io").idle(&item, &TotpState::NoSecret);
+            assert!(!f.painted(ADD_2FA_ROW_DETAIL));
+        }
+
+        #[test]
+        fn copying_a_field_shows_the_designs_toast() {
+            let totp = TotpState::Code { code: "123456".to_string(), seconds_left: 9, period: 30 };
+            for (key, want) in [
+                (egui::Key::U, "Username copied"),
+                (egui::Key::B, "Password copied"),
+                (egui::Key::T, "2FA code copied"),
+            ] {
+                let mut pane = Pane::new();
+                let item = a_login_with_a_code();
+                let _ = pane.idle(&item, &totp);
+                let _ = pane.frame(&item, &totp, ctrl(key));
+                assert_eq!(crate::kit::toast::current(&pane.ctx).as_deref(), Some(want), "{key:?}");
+            }
+        }
+    }
+
     /// Spec 3.3's header: the 72pt avatar, the title and its line, Close,
     /// and the action row -- Fill, Share, Edit, the star and the more menu.
     mod v2_header {
@@ -24078,99 +22601,6 @@ mod read_pane_scroll_tests {
     /// unlike its path's file name, and unlike every directory in its path --
     /// see `tests::CHROME_NAME` for why that matters.
     const TALL_ITEM_APP_NAME: &str = "Ledgerline Accounting Suite";
-
-    /// The copy confirmation is drawn on a foreground layer against the PANE,
-    /// not against the scrolled content, so it keeps the corner
-    /// `copy_toast_tests` pins it to -- 20pt in from the pane's bottom-right
-    /// -- however far the body has been scrolled, and the scroll area does
-    /// not clip it.
-    #[test]
-    fn the_copy_toast_keeps_its_corner_while_the_body_is_scrolled() {
-        let mut pane = ShortPane::new(egui::vec2(NARROW, SHORT));
-        let item = the_tallest_item();
-        let bounds = pane.bounds();
-
-        let _ = pane.scroll_to_bottom(&item);
-        note_copied(&pane.ctx, "Password");
-        let shot = pane.idle(&item);
-
-        let text = copy_toast_text("Password", false);
-        let glyphs = shot.rect_of(&text).unwrap_or_else(|| {
-            panic!(
-                "the confirmation was not painted; the pane painted {:?}",
-                shot.sources()
-            )
-        });
-        // The BOX, not the glyphs: the assertions in `copy_toast_tests` are
-        // about the box's own edges, and a box is what a scroll area would
-        // have clipped.
-        let boxes: Vec<egui::Rect> = shot
-            .rects
-            .iter()
-            .filter(|(rect, fill)| *fill == theme::INK && rect.contains_rect(glyphs))
-            .map(|(rect, _)| *rect)
-            .collect();
-        assert_eq!(
-            boxes.len(),
-            1,
-            "expected one confirmation box around {glyphs:?}, found {boxes:?}"
-        );
-        let toast = boxes[0];
-        assert_eq!(toast.right(), bounds.right() - COPY_TOAST_INSET);
-        assert_eq!(toast.bottom(), bounds.bottom() - COPY_TOAST_INSET);
-    }
-
-    /// **One copy, one confirmation.**
-    ///
-    /// The toast is a single record in the context's memory and two surfaces
-    /// can draw it -- this pane and the add-a-code card. Both drew it, so a
-    /// copy made on the card was painted twice: once over the card and once
-    /// over the window behind it, which is what the owner sent back as "it
-    /// duped".
-    ///
-    /// Read off the source. Producing the pair through a frame means standing
-    /// up the modal, its scrim and the pane together, and what would be
-    /// asserted at the end of it is exactly this: the pane's call is inside
-    /// the gate. A gate that got moved, negated or deleted is the whole of the
-    /// defect, and the needle carries the `!`.
-    #[test]
-    fn the_pane_leaves_the_confirmation_to_whatever_is_on_top_of_it() {
-        // **The whole file, and NOT the pre-`#[cfg(test)]` slice** that this
-        // module's other source pins take. The first `#[cfg(test)]` in
-        // `detail.rs` is on line 30 -- a test-only fixture, thousands of lines
-        // above the code this is about -- so that slice is thirty lines long
-        // and every needle checked against it matches nothing and passes
-        // whatever production does. Measured here, and worth remembering: a
-        // slice taken to exclude tests has to be checked against the file it
-        // is taken from.
-        //
-        // Both needles are `concat!`, so neither can match itself.
-        let code = include_str!("detail.rs").replace("\r\n", "\n");
-        let call = concat!("draw_copy_", "toast(ui, pane);");
-        assert_eq!(
-            code.matches(call).count(),
-            1,
-            "the pane draws the confirmation somewhere other than the one place, or not at all"
-        );
-        let gate = concat!("if !super::item_list::a_modal_is_", "up(ui.ctx()) {");
-        let at = code
-            .find(gate)
-            .unwrap_or_else(|| panic!("the pane no longer stands its toast down behind a modal"));
-        let called = code.find(call).expect("counted above");
-        assert!(
-            at < called,
-            "the pane's toast is drawn outside the modal gate, so a copy made on a modal is \
-             confirmed twice -- once by the modal and once by the window behind it"
-        );
-        // And nothing between them but the gate's own brace and the comment
-        // above it: a second statement sneaking in is a second thing the gate
-        // silently governs.
-        let between = &code[at + gate.len()..called];
-        assert!(
-            between.trim().is_empty(),
-            "something else was put inside the toast's gate: {between:?}"
-        );
-    }
 
     /// **The NOTES card at the app's minimum window size.** Three times a
     /// text or layout change in this file has pushed a control out of the

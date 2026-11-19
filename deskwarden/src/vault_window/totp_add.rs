@@ -4749,7 +4749,7 @@ pub fn copied_label(field: Option<TableField>) -> &'static str {
         Some(TableField::Issuer) => ISSUER_ROW_LABEL,
         Some(TableField::Account) => ACCOUNT_ROW_LABEL,
         Some(TableField::Secret) => SECRET_ROW_LABEL,
-        None => "TOTP",
+        None => "2FA code",
     }
 }
 
@@ -5328,7 +5328,8 @@ pub fn draw_add_modal(
             // layer: a toast raised by the read pane would be painted under
             // this card, which is why the first attempt at a confirmation here
             // was a hover text and the second was a word in the row.
-            crate::vault_window::detail::draw_copy_toast(ui, ui.min_rect());
+            // The confirmation is the window's one toast (`kit::toast`), which
+            // is painted above this card.
             reported
         });
     let action = card.inner;

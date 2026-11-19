@@ -1626,7 +1626,8 @@ pub(crate) fn draw_share_modal(
         // window does. Drawn inside the modal's area, on its layer, for
         // `totp_add`'s reason: the read pane's toast would be painted under
         // this card (and stands down while a modal is up).
-        super::detail::draw_copy_toast(ui, card);
+        // The copy's confirmation is the window's one toast (`kit::toast`),
+        // painted above every modal at the end of the frame.
     });
     // Escape is Cancel -- unless the forget question is standing over this
     // dialog, where Escape is that question's "No" and must not also close

@@ -5161,8 +5161,9 @@ pub fn build_frame_with_search(
                             // Above a live copy confirmation, never over it:
                             // the two share the corner.
                             if !item_list::a_modal_is_up(ui.ctx()) {
-                                let copy = detail::live_copy_toast_rect(ui, ui.clip_rect());
-                                share_ui::draw_share_toast(ui, ui.clip_rect(), copy, &sharing);
+                                // Copies confirm through the window's own
+                                // toast (`kit::toast`), not in this corner.
+                                share_ui::draw_share_toast(ui, ui.clip_rect(), None, &sharing);
                             }
                             // **The re-prompt, in the gating position.** A
                             // refused action becomes `DetailAction::None`
@@ -5820,7 +5821,6 @@ pub fn build_frame_with_search(
                             // `forget_copy_toast_on_item_change` sees the same
                             // id it recorded and leaves the toast alone. See
                             // `detail::forget_copy_toast`.
-                            detail::forget_copy_toast(ui.ctx());
                             // **No "Select an item." placeholder any more**,
                             // and its absence is the point rather than an
                             // omission.
@@ -5855,7 +5855,6 @@ pub fn build_frame_with_search(
                     // resume with the confirmation still up for a copy the
                     // user had looked away from.
                     DetailMode::Edit(draft) => {
-                        detail::forget_copy_toast(ui.ctx());
                         // The card form's bank picker offers domains the
                         // vault already has, and this is the only scope that
                         // holds the item list -- `draw_detail_edit` has never
@@ -6241,7 +6240,6 @@ pub fn build_frame_with_search(
                     // an action out of a pane nobody can reach would be acting
                     // on a click that did not happen.
                     DetailMode::Sequence(draft, parked) => {
-                        detail::forget_copy_toast(ui.ctx());
                         // The same live reads the two arms above make, for
                         // the same reason each gives: the settings file has
                         // not been written yet, so re-reading it would show
@@ -6433,7 +6431,6 @@ pub fn build_frame_with_search(
                         }
                     }
                     DetailMode::Create(draft) => {
-                        detail::forget_copy_toast(ui.ctx());
                         // A create has no item, so neither card has
                         // anything to say and neither is drawn -- see
                         // `history_rows` and `sharing_line`, which answer
@@ -28355,36 +28352,7 @@ mod copy_toast_wiring_tests {
 
     // `concat!`-split for `open_app_wiring_tests`' reason: `include_str!`
     // pulls this module in too.
-    const CLEARS: &str = concat!("detail::forget_copy_toast", "(ui.ctx());");
 
-    /// **4a's screen is the fourth route back into the read pane.** Opened
-    /// from the read pane, Discard and a successful Save both put
-    /// `DetailMode::Read` back -- so a copy confirmation left standing when
-    /// the builder opened would reappear over the pane the user returns to,
-    /// which is the whole of what this test is about and the reason a new mode
-    /// has to join the list rather than be excused from it.
-    ///
-    /// Opened from the EDIT form the two answers go back to that form instead,
-    /// and the clearing matters just as much: the form is the other surface
-    /// this toast can be left standing over.
-    const SEQUENCE: &str = concat!("DetailMode::Sequence(draft, parked)", " => {");
-    const EDIT: &str = concat!("DetailMode::Edit", "(draft) => {");
-    const CREATE: &str = concat!("DetailMode::Create", "(draft) => {");
-    /// The no-selection branch's anchor.
-    ///
-    /// **This used to be the branch's "Select an item." label statement** --
-    /// spelled out only in [`OLD_LABEL`], which is `concat!`-split so this
-    /// module does not contain the needle it searches for. It is a comment
-    /// now because that label is gone: with nothing selected
-    /// there is no detail pane to put it in (the item list runs to the right
-    /// edge), so it was clipped away in every resting frame, and the only
-    /// frames it WOULD have shown in were the ✕'s slide-out -- the closed item
-    /// replaced by an instruction to open one, sliding away. See the branch.
-    ///
-    /// A comment is a weaker anchor than a statement, so
-    /// [`the_label_that_used_to_anchor_the_no_selection_branch_stays_gone`]
-    /// carries the other half: the label must not come back.
-    const NOTHING_SELECTED: &str = concat!("// **No \"Select an item.\" placeholder", " any more**,");
     /// The label this branch no longer draws, for the test that keeps it gone.
     const OLD_LABEL: &str = concat!("ui.label(\"Select an", " item.\");");
 
@@ -28394,59 +28362,6 @@ mod copy_toast_wiring_tests {
 
     fn occurrences(haystack: &str, needle: &str) -> usize {
         haystack.match_indices(needle).count()
-    }
-
-    /// `before` bytes on one side of `marker` and `after` on the other, cut
-    /// back to char boundaries. Wide enough to hold the branch's own comment
-    /// and its statements, nothing like wide enough to reach the next branch
-    /// -- the length control on each assertion below says so.
-    fn window(source: &'static str, marker: &str, before: usize, after: usize) -> &'static str {
-        let at = source.find(marker).unwrap_or_else(|| panic!("no {marker:?} in this file"));
-        let mut start = at.saturating_sub(before);
-        while !source.is_char_boundary(start) {
-            start += 1;
-        }
-        let mut end = (at + marker.len() + after).min(source.len());
-        while !source.is_char_boundary(end) {
-            end -= 1;
-        }
-        &source[start..end]
-    }
-
-    #[test]
-    fn the_editors_and_the_empty_selection_drop_a_live_copy_confirmation() {
-        let source = source();
-        assert_eq!(
-            occurrences(source, CLEARS),
-            4,
-            "expected {CLEARS:?} exactly four times -- the edit pane, the create pane, the \
-             sequence builder and the no-selection branch. Fewer means one of the four \
-             routes back into the read pane still resurrects a confirmation the user has \
-             looked away from"
-        );
-        // The clear is the statement immediately after the branch opens, for
-        // the two editors; for the empty selection it is immediately before
-        // the label, which is what opens that branch's body. Hence the two
-        // directions -- the window is around the marker, not after it.
-        for (marker, what, before, after) in [
-            (EDIT, "the edit pane", 0usize, 120usize),
-            (CREATE, "the create pane", 0, 120),
-            // The clear sits immediately BEFORE this branch's anchor
-            // comment, so the window is widened a little to hold the comment
-            // itself -- see `NOTHING_SELECTED`.
-            (NOTHING_SELECTED, "the no-selection branch", 200, 0),
-            (SEQUENCE, "the sequence builder", 0, 120),
-        ] {
-            assert_eq!(occurrences(source, marker), 1, "expected exactly one {marker:?}");
-            let branch = window(source, marker, before, after);
-            assert_eq!(
-                occurrences(branch, CLEARS),
-                1,
-                "{what} does not clear the copy confirmation -- a round trip through it \
-                 brings back a confirmation for a copy the user has looked away from: \
-                 {branch}"
-            );
-        }
     }
 
     /// **The "Select an item." label stays gone**, which is the other half of
