@@ -269,9 +269,9 @@ fn search_field(ui: &mut Ui, rect: Rect, value: &mut String, placeholder: &str) 
         }
     } else {
         if chip_response.clicked() {
-            super::sidebar::request_shell(ui.ctx(), super::sidebar::ShellRequest::OpenPalette);
+            super::sidebar::request_shell(ui.ctx(), super::sidebar::ShellRequest::FocusSearch);
         }
-        tips::hint(ui, &chip_response, crate::i18n::t("topbar.quick_search"), &["Mod", "K"]);
+        tips::hint(ui, &chip_response, crate::i18n::t("topbar.search_placeholder"), &["Mod", "K"]);
     }
 
     let font = tokens::font_id(tokens::BODY);

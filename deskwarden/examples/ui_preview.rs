@@ -688,8 +688,6 @@ enum Surface {
     VaultShellOffline,
     /// The New item chooser over the shell (spec B §5).
     ModalNewItem,
-    /// The Ctrl+K palette over the shell, with a query (spec B §4).
-    ModalPalette,
     /// The delete confirmation over the shell (slice 15c).
     ModalDelete,
     /// The folder editor over the shell.
@@ -1041,7 +1039,6 @@ const ALL: &[Surface] = &[
     Surface::VaultShellCard,
     Surface::VaultShellOffline,
     Surface::ModalNewItem,
-    Surface::ModalPalette,
     Surface::ModalDelete,
     Surface::ModalFolder,
     Surface::ModalIcon,
@@ -1206,7 +1203,6 @@ impl Surface {
             Surface::VaultShellCard => "vault_shell_card",
             Surface::VaultShellOffline => "vault_shell_offline",
             Surface::ModalNewItem => "modal_new_item",
-            Surface::ModalPalette => "modal_palette",
             Surface::ModalDelete => "modal_delete",
             Surface::ModalFolder => "modal_folder_edit",
             Surface::ModalIcon => "modal_icon_pick",
@@ -1492,8 +1488,7 @@ impl Surface {
             | Surface::ModalAppPicker
             | Surface::ModalSequence
             | Surface::ModalTotpScanning
-            | Surface::ModalTotpCameras
-            | Surface::ModalPalette => egui::vec2(1280.0, 820.0),
+            | Surface::ModalTotpCameras => egui::vec2(1280.0, 820.0),
             Surface::ToolGenerator
             | Surface::SettingsGeneral
             | Surface::SettingsSecurity
@@ -1696,7 +1691,6 @@ fn main() -> eframe::Result {
             Surface::VaultShellCard,
             Surface::VaultShellOffline,
             Surface::ModalNewItem,
-            Surface::ModalPalette,
             Surface::ModalDelete,
             Surface::ModalFolder,
             Surface::ModalIcon,
@@ -2497,12 +2491,6 @@ impl eframe::App for Preview {
                         let _ = totp_add::draw_add_modal(&ctx, &mut state, PREVIEW_UNIX);
                     }
                 }
-            }
-            Surface::ModalPalette => {
-                self.list_selected = self.fixtures.list.first().map(|i| i.id.clone());
-                self.draw_vault_shell(root, deskwarden::kit::tokens::SidebarStyle::Navy, DetailShot::Login, false);
-                let mut state = deskwarden::vault_window::palette::PaletteState { query: "led".into(), active: 0 };
-                let _ = deskwarden::vault_window::palette::draw(root.ctx(), &mut state, &self.fixtures.list, Some("Ledgerline"));
             }
             surface @ (Surface::ModalImportSource
             | Surface::ModalImportFile

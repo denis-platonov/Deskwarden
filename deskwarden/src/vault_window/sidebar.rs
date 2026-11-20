@@ -1005,8 +1005,8 @@ pub enum ShellRequest {
     NewItem,
     Lock,
     OpenSettings,
-    /// The top bar's `Ctrl K` chip: open the command palette.
-    OpenPalette,
+    /// The top bar's `Ctrl K` chip: put the keyboard in the search box.
+    FocusSearch,
     /// Settings > Import & export > Import: open the Import wizard.
     OpenImport,
     /// Settings > Security > the score card: open Password health.

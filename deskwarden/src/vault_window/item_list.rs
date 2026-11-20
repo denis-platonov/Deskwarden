@@ -1283,7 +1283,6 @@ const MODAL_SCRIM_AREAS: &[&str] = &[
     "import-scrim",
     "launch-confirm-scrim",
     "new-item-scrim",
-    "palette-scrim",
     "password-generator-scrim",
     "prefs-modal-scrim",
     "record-forget-scrim",

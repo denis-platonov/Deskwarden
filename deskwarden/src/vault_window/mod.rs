@@ -16,7 +16,6 @@ pub mod import_formats;
 pub mod import_ui;
 pub mod item_list;
 pub mod new_item_modal;
-pub mod palette;
 pub mod password_health;
 pub mod preflight;
 pub mod record_ui;
@@ -1533,8 +1532,6 @@ pub fn build_frame_with_search(
     let mut new_item_chooser = false;
     // Spec C §3: "Empty trash?" is up.
     let mut empty_trash_ids: Option<Vec<String>> = None;
-    // Spec B §4: the command palette is up, with its query.
-    let mut palette_state: Option<palette::PaletteState> = None;
     // Spec B §3: the Import wizard is up.
     let mut import_wizard: Option<import_ui::Wizard> = None;
     // **Design 6b's overlay, while it is up.**
@@ -3020,7 +3017,7 @@ pub fn build_frame_with_search(
         });
         // The rail's Lock row asks for exactly what the chord does, a frame
         // later. Its New item row opens the chooser (spec B §5); Ctrl+N stays
-        // "new login" at once, as the palette's hint says.
+        // "new login" at once.
         let ctrl_l = ctrl_l || rail_lock;
         if rail_new_item {
             new_item_chooser = true;
@@ -3031,13 +3028,7 @@ pub fn build_frame_with_search(
         if add_totp_chord {
             add_totp_asked = true;
         }
-        // Spec B §4: Ctrl+K is the palette; Ctrl+F is the search box.
-        let chip_palette = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenPalette);
-        if (ctrl_k || chip_palette) && palette_state.is_none() {
-            palette_state = Some(palette::PaletteState::default());
-        }
-        // The Settings page's Import row asks for the wizard the same way the
-        // palette's action does.
+        // The Settings page's Import row asks for the Import wizard.
         if sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::OpenImport) && import_wizard.is_none() {
             import_wizard = Some(import_ui::Wizard::default());
         }
@@ -3050,7 +3041,10 @@ pub fn build_frame_with_search(
             settings_selected = false;
             health_selected = true;
         }
-        if chords && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F)) {
+        // Ctrl+K and Ctrl+F both put the keyboard in the search box, and so
+        // does a click on the box's `Ctrl K` chip.
+        let chip_search = sidebar::take_shell_request(ui.ctx(), sidebar::ShellRequest::FocusSearch);
+        if ctrl_k || chip_search || (chords && ui.ctx().input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::F))) {
             ui.memory_mut(|m| m.request_focus(egui::Id::new("vault-search")));
         }
         if ctrl_l {
@@ -7317,66 +7311,6 @@ pub fn build_frame_with_search(
         // on"). The pane draws no ✉ for one, and `detail::view_only` drops
         // the button's request; this filter is what the CTRL+SHIFT+S chord,
         // which never passes through the pane, meets.
-        // The palette, before the requests it can make are read below.
-        if let Some(state) = palette_state.as_mut() {
-            let selected_name = selected_id
-                .as_ref()
-                .and_then(|id| items.iter().find(|i| &i.id == id))
-                .map(|i| i.name.clone());
-            match palette::draw(ui.ctx(), state, &items, selected_name.as_deref()) {
-                palette::PaletteAnswer::Open => {}
-                palette::PaletteAnswer::Closed => palette_state = None,
-                palette::PaletteAnswer::Item(id) => {
-                    palette_state = None;
-                    // The vault, unfiltered, with the item in it: the pane
-                    // resolves its selection against the filter's list, so a
-                    // pick under Trash or a screen would show nothing.
-                    sends_selected = false;
-                    received_selected = false;
-                    health_selected = false;
-                    filter = SidebarFilter::All;
-                    detail_dismissed = false;
-                    if selected_id.as_deref() != Some(id.as_str()) && !asks_to_discard(&mut mode) {
-                        search.clear();
-                        selected_id = Some(id);
-                        mode = DetailMode::Read;
-                    }
-                }
-                palette::PaletteAnswer::Action(action) => {
-                    palette_state = None;
-                    match action {
-                        palette::PaletteAction::NewLogin => {
-                            sends_selected = false;
-                            received_selected = false;
-                            health_selected = false;
-                            if !asks_to_discard(&mut mode) {
-                                mode = DetailMode::Create(EditDraft::empty_of(crate::vault_bridge::ItemKind::Login))
-                            }
-                        }
-                        palette::PaletteAction::Share => send_record_asked = true,
-                        palette::PaletteAction::Generate => {
-                            sends_selected = false;
-                            received_selected = false;
-                            health_selected = false;
-                            settings_selected = false;
-                            generator_selected = true;
-                        }
-                        palette::PaletteAction::Settings => {
-                            sidebar::request_shell(ui.ctx(), sidebar::ShellRequest::OpenSettings)
-                        }
-                        palette::PaletteAction::Import => {
-                            if import_wizard.is_none() {
-                                import_wizard = Some(import_ui::Wizard::default());
-                            }
-                        }
-                        palette::PaletteAction::Lock => {
-                            *locked_for_closure.borrow_mut() = true;
-                            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                        }
-                    }
-                }
-            }
-        }
         if send_record_asked && record_send.is_none() {
             if let Some(item) = selected_id
                 .as_ref()
@@ -29335,8 +29269,9 @@ mod preferences_modal_wiring_tests {
             // chrome's gear, chevron and drag zone.
             // 70 with `edit_trash_wiring` (v2 editor, Move to trash); 71 with
             // `new_item_chooser_wiring`; 72 with `palette_wiring`; 73 with
-            // `slice5_review_guards`.
-            modules, 73,
+            // `slice5_review_guards`; 72 again when the Ctrl+K palette and
+            // `palette_wiring` were dropped.
+            modules, 72,
             "the number of top-level test modules below the cut changed. That is fine -- but \
              this count is the control that proves the walk really visited them, so update it \
              deliberately rather than loosening it"
@@ -42359,22 +42294,6 @@ mod new_item_chooser_wiring {
         assert!(!SOURCE.contains(concat!("ctrl_n || ", "rail_new_item")), "the rail still creates a login");
         let pick = SOURCE.find(concat!("ChooserAnswer::", "Picked(kind) => {")).expect("the pick arm");
         assert!(SOURCE[pick..pick + 320].contains(concat!("EditDraft::", "empty_of(kind)")));
-    }
-}
-
-#[cfg(test)]
-mod palette_wiring {
-    //! Ctrl+K opens the palette and Ctrl+F the search box. Source guards;
-    //! needles split across literals.
-    const SOURCE: &str = include_str!("mod.rs");
-
-    #[test]
-    fn ctrl_k_opens_the_palette() {
-        let at = SOURCE.find(concat!("if (ctrl_k", " || chip_palette)")).expect("the Ctrl+K arm");
-        assert!(SOURCE[at..at + 260].contains(concat!("palette_state = Some(", "palette::PaletteState::default())")));
-        let draw = SOURCE.find(concat!("palette::draw(", "ui.ctx()")).expect("the palette is drawn");
-        let send = SOURCE.find(concat!("if send_record_asked", " && record_send.is_none() {")).expect("the Share request is read");
-        assert!(draw < send, "the palette's Share would be read a frame late and dropped");
     }
 }
 
