@@ -15,6 +15,7 @@ pub mod icon;
 pub mod input;
 pub mod logo_paths;
 pub mod logos;
+pub mod menu;
 pub mod modal;
 pub mod motion;
 #[cfg(test)]

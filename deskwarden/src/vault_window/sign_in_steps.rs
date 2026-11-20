@@ -225,7 +225,6 @@ const CHIP_EDGE: Color32 = Color32::from_rgb(0xe8, 0xe6, 0xe3);
 const ARROW: Color32 = Color32::from_rgb(0xc9, 0xc6, 0xc2);
 const TEST_WELL: Color32 = Color32::from_rgb(0xf7, 0xf6, 0xf5);
 const FAINT: Color32 = Color32::from_rgb(0x9b, 0x97, 0x97);
-const MENU_HOVER: Color32 = Color32::from_rgb(0xf3, 0xf2, 0xf0);
 pub(crate) const CHIP_HEIGHT: f32 = 46.0;
 
 /// A chip's colours: (border, fill, ink).
@@ -312,34 +311,19 @@ pub fn draw(ui: &mut egui::Ui, sequence: &mut String, app: &str, session: u64) -
             .fixed_pos(add_rect.left_bottom() + Vec2::new(0.0, 8.0))
             .show(ui.ctx(), |ui| {
                 let mut picked = None;
-                egui::Frame::new()
-                    .fill(theme::CARD)
-                    .corner_radius(CornerRadius::same(16))
-                    .shadow(crate::kit::tokens::card_shadow())
-                    .inner_margin(6)
-                    .show(ui, |ui| {
-                        ui.set_width(240.0);
-                        for step in ALL {
-                            let (rect, _) = ui.allocate_exact_size(Vec2::new(228.0, 42.0), Sense::hover());
-                            let row = ui.interact(rect, menu_row_id(step), Sense::click());
-                            if row.hovered() {
-                                ui.painter().rect_filled(rect, CornerRadius::same(11), MENU_HOVER);
-                            }
-                            let ink = if step.secret() { theme::DANGER_INK } else { theme::INK };
-                            let glyph_rect = Rect::from_center_size(rect.left_center() + Vec2::new(20.0, 0.0), Vec2::splat(16.0));
-                            icon::stroke(ui.painter(), glyph_rect, step.icon(), 2.0, ink);
-                            ui.painter().text(
-                                rect.left_center() + Vec2::new(39.0, 0.0),
-                                egui::Align2::LEFT_CENTER,
-                                step.label(),
-                                egui::FontId::new(15.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-                                ink,
-                            );
-                            if row.clicked() {
-                                picked = Some(step);
-                            }
+                let palette = crate::kit::tokens::palette(ui.ctx());
+                crate::kit::menu::MENU.frame(&palette).show(ui, |ui| {
+                    ui.set_width(crate::kit::menu::MENU.content_width());
+                    for step in ALL {
+                        let mut row = crate::kit::menu::Item::new(step.label()).icon(step.icon()).id(menu_row_id(step));
+                        if step.secret() {
+                            row = row.ink(palette.danger_ink);
                         }
-                    });
+                        if crate::kit::menu::item(ui, row).clicked() {
+                            picked = Some(step);
+                        }
+                    }
+                });
                 picked
             });
         let picked = shown.inner;

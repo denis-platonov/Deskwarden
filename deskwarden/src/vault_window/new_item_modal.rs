@@ -34,7 +34,7 @@ pub struct Choice {
     pub kind: ItemKind,
     pub title: &'static str,
     pub sub: &'static str,
-    glyph: &'static str,
+    pub glyph: &'static str,
     tile: Color32,
     ink: Color32,
 }

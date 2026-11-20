@@ -15010,7 +15010,7 @@ fn account_menu(
     let plan = account_menu_plan(state, email, server_url, server_known);
 
     let mut action = None;
-    egui::Popup::menu(&avatar).show(|ui| {
+    crate::kit::menu::menu(&avatar, |ui| {
         ui.set_max_width(SWITCHER_MENU_WIDTH);
         // Whose vault am I looking at? -- the menu's first job, and the one the
         // avatar's two initials can only hint at. Labels, not buttons: there is
@@ -15029,9 +15029,9 @@ fn account_menu(
             ui.add(egui::Label::new(text).wrap());
         }
 
-        ui.separator();
+        crate::kit::menu::separator(ui);
         for (id, label) in &plan.switch_to {
-            if ui.button(label).clicked() {
+            if crate::kit::menu::item(ui, crate::kit::menu::Item::new(label)).clicked() {
                 action = Some(AccountAction::Switch(id.clone()));
                 ui.close();
             }
@@ -15047,12 +15047,9 @@ fn account_menu(
             );
         }
 
-        ui.separator();
+        crate::kit::menu::separator(ui);
         // The chord rides the row, the way design 2b's pill carried it.
-        if ui
-            .add(egui::Button::new(lock_label()).shortcut_text(LOCK_SHORTCUT))
-            .clicked()
-        {
+        if crate::kit::menu::item(ui, crate::kit::menu::Item::new(lock_label()).hint(LOCK_SHORTCUT)).clicked() {
             action = Some(AccountAction::Lock);
             ui.close();
         }
@@ -15060,15 +15057,15 @@ fn account_menu(
         // a read of the vault this window is already showing, so there is no
         // state in which it can only fail -- which is the test the `can_add`
         // and `can_remove` rows have to pass.
-        if ui.button(export_vault()).clicked() {
+        if crate::kit::menu::item(ui, crate::kit::menu::Item::new(export_vault())).clicked() {
             action = Some(AccountAction::Export);
             ui.close();
         }
-        if plan.can_add && ui.button(add_account()).clicked() {
+        if plan.can_add && crate::kit::menu::item(ui, crate::kit::menu::Item::new(add_account())).clicked() {
             action = Some(AccountAction::Add);
             ui.close();
         }
-        if plan.can_remove && ui.button(remove_account()).clicked() {
+        if plan.can_remove && crate::kit::menu::item(ui, crate::kit::menu::Item::new(remove_account())).clicked() {
             action = Some(AccountAction::Remove);
             ui.close();
         }

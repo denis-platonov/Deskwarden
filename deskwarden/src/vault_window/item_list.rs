@@ -2083,13 +2083,13 @@ fn item_row(
     // see that function's doc for why a per-kind decision must not live in
     // here.
     let mut command = None;
-    response.context_menu(|ui| {
+    crate::kit::menu::context(&response, |ui| {
         let entries = menu_entries(item, folders, source, may_unfile);
         // Nothing to offer: say why, as the read pane's kebab does, rather
         // than open a blank popup (`empty_menu_footer`).
         if let Some(footer) = empty_menu_footer(&entries) {
             ui.set_width(super::detail::VIEW_ONLY_MENU_WIDTH);
-            ui.add(egui::Label::new(RichText::new(footer).size(11.0).color(theme::TEXT_GHOST)).wrap());
+            crate::kit::menu::note(ui, footer);
         }
         for entry in entries {
             match entry {
@@ -2099,7 +2099,7 @@ fn item_row(
                     }
                 }
                 MenuEntry::MoveToFolder(destinations) => {
-                    ui.menu_button(move_to_folder_label(), |ui| match destinations {
+                    crate::kit::menu::submenu(ui, move_to_folder_label(), |ui| match destinations {
                         MoveMenu::Targets(targets) => {
                             for target in targets {
                                 if menu_command(ui, &target) {
@@ -2110,7 +2110,7 @@ fn item_row(
                         // Said out loud rather than left as an empty box,
                         // which reads as a submenu that failed to load.
                         MoveMenu::Empty(note) => {
-                            ui.add_enabled(false, egui::Button::new(note));
+                            crate::kit::menu::item(ui, crate::kit::menu::Item::new(note).enabled(false));
                         }
                     });
                 }
@@ -2119,7 +2119,7 @@ fn item_row(
                 // handing back a list with nothing in it, so there is no
                 // second variant here to unfold. See `MenuEntry::Icon`.
                 MenuEntry::Icon(actions) => {
-                    ui.menu_button(icon_label(), |ui| {
+                    crate::kit::menu::submenu(ui, icon_label(), |ui| {
                         for action in actions {
                             if menu_command(ui, &action) {
                                 command = Some(action.command);
@@ -2165,19 +2165,26 @@ fn list_header(ui: &mut egui::Ui, title: &str, count: usize) -> Option<ItemListA
                 // allocates here -- which keeps the list beneath in register
                 // (`the_new_menu_does_not_change_the_rows_below_it`).
                 let new = new_button(ui, &p);
-                egui::Popup::menu(&new).show(|ui| {
+                crate::kit::menu::menu(&new, |ui| {
                     // From `CREATABLE_KINDS`, never a list written out here:
                     // that array keeps `ItemKind::Unknown` out of creation.
                     for kind in super::detail_edit::CREATABLE_KINDS {
-                        if ui.button(super::detail::kind_label(kind)).clicked() {
+                        let label = super::detail::kind_label(kind);
+                        let mut row = crate::kit::menu::Item::new(&label);
+                        if let Some(choice) = super::new_item_modal::choices().iter().find(|c| c.kind == kind) {
+                            row = row.icon(choice.glyph);
+                        }
+                        if crate::kit::menu::item(ui, row).clicked() {
                             chosen = Some(ItemListAction::NewItem(kind));
                             ui.close();
                         }
                     }
                     // The import is not a kind (its type comes from the
                     // payload), so it sits below a separator.
-                    ui.separator();
-                    if ui.button(super::record_ui::import_from_send_label()).clicked() {
+                    crate::kit::menu::separator(ui);
+                    let import = crate::kit::menu::Item::new(super::record_ui::import_from_send_label())
+                        .icon(kit::icon::glyph::RECEIVED);
+                    if crate::kit::menu::item(ui, import).clicked() {
                         chosen = Some(ItemListAction::ImportFromSend);
                         ui.close();
                     }
@@ -2651,29 +2658,17 @@ pub(super) fn menu_command(ui: &mut egui::Ui, entry: &MenuCommand) -> bool {
 /// `detail::tests::the_pointer_tints_the_kebabs_delete_the_way_it_tints_its_siblings`,
 /// which is the assertion that keeps it that way.
 pub(super) fn menu_command_button(ui: &mut egui::Ui, entry: &MenuCommand) -> egui::Response {
-    // Plain `&str` for the ordinary entry rather than a `RichText` with the
-    // theme's own colour in it: an uncoloured label is the one that inherits
-    // `widgets.*.fg_stroke`, so disabled entries keep egui's greying and a
-    // theme change reaches them without passing through this file.
-    let label = if entry.command.is_destructive() {
-        egui::WidgetText::from(RichText::new(entry.label.as_str()).color(theme::ERROR))
-    } else {
-        egui::WidgetText::from(entry.label.as_str())
-    };
-    // **One line, and the menu widens to it.** egui remembers a menu's size
-    // between openings and lays wrapping text out inside that width, so it
-    // can never grow it: a submenu once opened with short folder names stayed
-    // that narrow, and "LA Lux Rental" broke over lines in it -- the owner's
-    // "no need to have two lines here". An entry is a name to click, never a
-    // paragraph. See `detail`'s
-    // `the_kebabs_move_submenu_draws_every_folder_name_on_one_line`.
-    let button = ui.add_enabled(
-        entry.enabled,
-        egui::Button::new(label).wrap_mode(egui::TextWrapMode::Extend),
-    );
+    // One row of the kit's menu: the red is the row's `danger` and nothing else
+    // is touched, so every entry, red or not, takes the same hover wash. A row
+    // is one line and the menu widens to it -- an entry is a name to click,
+    // never a paragraph.
+    let row = crate::kit::menu::Item::new(entry.label.as_str())
+        .danger(entry.command.is_destructive())
+        .enabled(entry.enabled);
+    let response = crate::kit::menu::item(ui, row);
     match entry.disabled_reason {
-        Some(reason) => button.on_disabled_hover_text(reason),
-        None => button,
+        Some(reason) if !entry.enabled => response.on_hover_text(reason),
+        _ => response,
     }
 }
 

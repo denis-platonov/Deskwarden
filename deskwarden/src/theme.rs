@@ -1076,6 +1076,14 @@ pub fn apply(ctx: &egui::Context) {
     // rounded".
     v.widgets.open.corner_radius = CornerRadius::same(7);
 
+    // Anything that opens an egui menu without going through `kit::menu` still
+    // wears the design's popover: the same corner, padding, shadow and scroll
+    // bar `kit::menu::MENU` applies to its own.
+    v.menu_corner_radius = CornerRadius::same(crate::kit::menu::MENU.radius);
+    v.popup_shadow = crate::kit::menu::MENU.shadow(&crate::kit::tokens::Palette::LIGHT);
+    style.spacing.menu_margin = egui::Margin::same(crate::kit::menu::MENU.pad);
+    style.spacing.scroll = scroll_style();
+
     style.visuals = v;
     ctx.set_theme(egui::Theme::Light);
     ctx.set_style_of(egui::Theme::Light, style);
@@ -3580,221 +3588,62 @@ pub const SEGMENT_TEXT_SIZE: f32 = 12.0;
 // The dropdown: the multiple-choice control for a set a run cannot hold
 // ---------------------------------------------------------------------------
 
-/// One row of a [`dropdown`]: what it says, and whether it is the answer
-/// currently in force.
-///
-/// The same shape as [`Segment`], and for the same stated reason -- two fields
-/// a caller could transpose and still compile.
-pub struct Choice<'a> {
-    /// The words on the row, and, when `selected`, the words in the closed
-    /// box. One string for both, so the control cannot say one thing shut and
-    /// another open.
-    pub label: &'a str,
-    /// Painted as the answer in force: [`BLUE_WASH`] behind [`BLUE_DEEP`].
-    pub selected: bool,
-}
+/// One row of a [`dropdown`]. The kit's: see [`crate::kit::menu::Choice`].
+pub use crate::kit::menu::Choice;
 
 /// **The app's multiple-choice control for a set too large to lay out.**
 ///
 /// Returns the index of the row that was chosen this frame, or `None`.
 ///
-/// # When this and not [`segmented_control`]
+/// A segmented run is the right control while the alternatives fit on one line
+/// and seeing them beside each other helps you choose; past five or six cells
+/// the question becomes this one. It costs one extra click, states the answer
+/// in force in the box, and does not grow when the set does.
 ///
-/// A segmented run is the right control while two things hold: the
-/// alternatives fit on one line, and seeing them beside each other helps you
-/// choose. Both are properties of the *set*, not of the question, and both
-/// fail at the same place -- somewhere around five or six cells a run stops
-/// being a row of alternatives and becomes a wall of boxes, and past the width
-/// of its container it stops being anything at all.
-///
-/// This control is what the question becomes on the other side of that line.
-/// It costs one extra click, states the answer in force in the same space a
-/// run's widest cell would have taken, and does not grow when the set does.
-/// **It is not a replacement for the run**: a two- or three-way choice still
-/// belongs in a segmented control, where the alternatives are worth reading
-/// together and a click is a click.
-///
-/// # It is one box wide, and the caller says how wide
-///
-/// Unlike a run, whose width is the sum of its labels, a dropdown is a fixed
-/// box -- so it can sit in a column of controls that line up, which is exactly
-/// what §5a's Access block is. The caller passes the width because the
-/// container knows it and this function cannot: a control that sized itself to
-/// its longest row would jump about as the answer changed.
-///
-/// # The popup is egui's menu layer, painted in this app's vocabulary
-///
-/// The layer, the click-outside behaviour and the escape key are
-/// `egui::Popup::menu`'s, which is what the detail pane's kebab menu already
-/// uses -- inventing a second floating-layer implementation for one control is
-/// exactly the kind of parallel machinery this module exists to prevent. What
-/// is *painted* into it is this file's own: no egui button frames, the same
-/// hover wash a segmented cell gets, and the answer in force in the wash
-/// rather than in a tick.
+/// **It is the kit's select** ([`crate::kit::menu::select`], at the row
+/// control's look): the design's popover under a field-style box, so every
+/// dropdown in the app opens the same menu. This stays as the name Send's
+/// lifetime control and the width tests know it by. The caller passes the
+/// width because the container knows it: a control that sized itself to its
+/// longest row would jump about as the answer changed.
 pub fn dropdown(ui: &mut Ui, width: f32, current: &str, choices: &[Choice<'_>]) -> Option<usize> {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, DROPDOWN_HEIGHT), Sense::click());
-    let hovered = response.hovered();
-    if hovered {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(SEGMENT_RADIUS),
-        if hovered { CANVAS } else { CARD },
-        Stroke::new(1.0, BORDER_STRONG),
-        StrokeKind::Inside,
-    );
-    let galley = segment_galley(ui, current, INK);
-    ui.painter().galley(
-        Pos2::new(rect.left() + DROPDOWN_PAD_X, rect.center().y - galley.size().y / 2.0),
-        galley,
-        INK,
-    );
-    paint_chevron(ui, chevron_rect(rect), TEXT_MUTED);
-
-    let mut chosen = None;
-    egui::Popup::menu(&response).show(|ui| {
-        ui.set_min_width(width);
-        for (index, choice) in choices.iter().enumerate() {
-            if dropdown_row(ui, width, choice) {
-                chosen = Some(index);
-                ui.close();
-            }
-        }
-    });
-    chosen
+    let salt = ui.next_auto_id();
+    crate::kit::menu::select(ui, salt, width, crate::kit::menu::ROW, current, choices)
 }
 
 /// [`dropdown`]'s inert twin, for a question whose answer is fixed by
-/// something outside the control.
+/// something outside the control: the answer at full strength on the quiet
+/// fill, no chevron, no click (see [`crate::kit::menu::select_disabled`]).
 ///
 /// A separate function rather than an `enabled` flag, which is the split this
 /// design system already makes twice ([`segmented_control_disabled`],
-/// [`toggle_pill_disabled`]) -- and the reason is the same one, sharpened.
-/// `add_enabled_ui(false)` round a live dropdown fades the whole box, answer
-/// included, to egui's disabled opacity; what the reader needs while a publish
-/// is running is not "you have no lifetime" but "you have this one and cannot
-/// change it". So the box keeps its full-strength text on [`CARD_TINT`], loses
-/// its chevron (there is nothing to open) and senses nothing at all.
+/// [`toggle_pill_disabled`]): `add_enabled_ui(false)` round a live dropdown
+/// fades the whole box, answer included.
 pub fn dropdown_disabled(ui: &mut Ui, width: f32, current: &str) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, DROPDOWN_HEIGHT), Sense::hover());
-    ui.painter().rect(
-        rect,
-        CornerRadius::same(SEGMENT_RADIUS),
-        CARD_TINT,
-        Stroke::new(1.0, BORDER),
-        StrokeKind::Inside,
-    );
-    let galley = segment_galley(ui, current, TEXT_MUTED);
-    ui.painter().galley(
-        Pos2::new(rect.left() + DROPDOWN_PAD_X, rect.center().y - galley.size().y / 2.0),
-        galley,
-        TEXT_MUTED,
-    );
+    crate::kit::menu::select_disabled(ui, crate::kit::menu::ROW, width, current);
 }
 
-/// The closed box's height: [`BUTTON_HEIGHT`], because a dropdown stands in a
-/// column beside text fields and buttons and a box a few points off would make
-/// the column look mismeasured.
-pub const DROPDOWN_HEIGHT: f32 = BUTTON_HEIGHT;
+/// The closed box's height: the row control's.
+pub const DROPDOWN_HEIGHT: f32 = crate::kit::menu::ROW.height;
 
 /// The gap between the box's edge and its text, both sides.
-pub const DROPDOWN_PAD_X: f32 = 10.0;
+pub const DROPDOWN_PAD_X: f32 = crate::kit::menu::ROW.pad_x;
 
-/// One open row's height. Shorter than the closed box: a list of rows is read
-/// as a list, and rows the height of buttons read as a stack of buttons.
-pub const DROPDOWN_ROW_HEIGHT: f32 = 24.0;
+/// One open row's height: the menu's row.
+pub const DROPDOWN_ROW_HEIGHT: f32 = crate::kit::menu::ROW_HEIGHT;
 
 /// How much of a [`dropdown`]'s width is NOT available to its text: a pad each
-/// side, plus the chevron the closed box carries.
+/// side, plus the chevron and its gap.
 ///
-/// `pub` for the reason [`SEGMENT_SEAM`] is: "every row fits the box" is a
-/// claim a caller's own test has to make about the set it passes -- a fixed
-/// box clips rather than overflows, so nothing else would catch a row that
-/// grew -- and a caller that restated this arithmetic would be a second copy
-/// of it waiting to disagree with the control.
-pub const DROPDOWN_TEXT_BUDGET: f32 = DROPDOWN_PAD_X * 3.0 + CHEVRON_HALF * 2.0;
+/// `pub` because "every row fits the box" is a claim a caller's own test has to
+/// make about the set it passes -- a fixed box clips rather than overflows.
+pub const DROPDOWN_TEXT_BUDGET: f32 = crate::kit::menu::ROW.pad_x * 2.0 + crate::kit::menu::CHEVRON_WIDTH + crate::kit::menu::ROW_GAP;
 
 /// How wide `label` is in a [`dropdown`], at the exact font the control lays
 /// it out in.
-///
-/// Exists so a caller's fit test measures what the control measures, rather
-/// than a guess at the font. See [`DROPDOWN_TEXT_BUDGET`].
 pub fn dropdown_text_width(ui: &Ui, label: &str) -> f32 {
-    segment_galley(ui, label, INK).size().x
-}
-
-/// Half the chevron's width, and the distance it stands in from the box's
-/// right edge.
-const CHEVRON_HALF: f32 = 4.0;
-
-/// Where the chevron sits inside a closed [`dropdown`] box.
-fn chevron_rect(box_rect: Rect) -> Rect {
-    let centre =
-        Pos2::new(box_rect.right() - DROPDOWN_PAD_X - CHEVRON_HALF, box_rect.center().y);
-    chevron_around(centre)
-}
-
-/// The chevron's box around `centre`: **half as tall as it is wide**. Drawn
-/// square, the two strokes met at a right angle and read as the letter "V"
-/// beside the value rather than as a dropdown's mark.
-fn chevron_around(centre: Pos2) -> Rect {
-    Rect::from_center_size(centre, Vec2::new(CHEVRON_HALF * 2.0, CHEVRON_HALF))
-}
-
-/// [`dropdown`]'s chevron, for an `egui::ComboBox` through its `icon` hook,
-/// so the form's folder and brand boxes wear the same mark as every other
-/// dropdown instead of egui's filled triangle.
-pub fn combo_chevron(ui: &Ui, rect: Rect, _visuals: &egui::style::WidgetVisuals, _open: bool) {
-    paint_chevron(ui, chevron_around(rect.center()), TEXT_MUTED);
-}
-
-/// The "there is more under this" glyph: two strokes, pointing down.
-///
-/// Drawn rather than typed. A `▾` is a font's idea of a triangle and this app
-/// paints every other glyph it uses -- see the star, the eye and the kebab --
-/// so a character here would be the one mark whose weight and size came from
-/// somewhere else.
-fn paint_chevron(ui: &Ui, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(ICON_STROKE, color);
-    let painter = ui.painter();
-    painter.line_segment(
-        [Pos2::new(rect.left(), rect.top()), Pos2::new(rect.center().x, rect.bottom())],
-        stroke,
-    );
-    painter.line_segment(
-        [Pos2::new(rect.center().x, rect.bottom()), Pos2::new(rect.right(), rect.top())],
-        stroke,
-    );
-}
-
-/// One open row, returning whether it was chosen.
-fn dropdown_row(ui: &mut Ui, width: f32, choice: &Choice<'_>) -> bool {
-    let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(width, DROPDOWN_ROW_HEIGHT), Sense::click());
-    let hovered = response.hovered();
-    if hovered {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    // The answer in force is the wash and not a tick in the margin: a tick
-    // needs a gutter every row pays for, and the wash is the weight this
-    // design system already gives "the one you have" in the nav.
-    let (fill, ink) = if choice.selected {
-        (BLUE_WASH, BLUE_DEEP)
-    } else if hovered {
-        (CANVAS, INK)
-    } else {
-        (Color32::TRANSPARENT, INK)
-    };
-    ui.painter().rect_filled(rect, CornerRadius::same(4), fill);
-    let galley = segment_galley(ui, choice.label, ink);
-    ui.painter().galley(
-        Pos2::new(rect.left() + DROPDOWN_PAD_X, rect.center().y - galley.size().y / 2.0),
-        galley,
-        ink,
-    );
-    response.clicked()
+    let job = crate::kit::tokens::job(crate::kit::menu::ROW.role, label, INK);
+    ui.fonts_mut(|f| f.layout_job(job)).size().x
 }
 
 // ---------------------------------------------------------------------------
@@ -6370,6 +6219,51 @@ pub fn footer_hints(ui: &mut Ui, hints: &[(&str, &str)]) {
 /// scroll bar anywhere in the design document to read a value off, so this
 /// follows egui rather than inventing a number.
 pub const SCROLLBAR_WIDTH: f32 = 6.0;
+
+/// **The scroll bar every `ScrollArea` gets** unless a surface asks for its own
+/// lane ([`scrollbar_in_gutter`]). Set once in [`apply`] as
+/// `Style::spacing.scroll`.
+///
+/// The design draws no scroll bar (its panes are `overflow: auto` under a
+/// browser's own), so this is the app's rule, recorded as a Ruling in
+/// `docs/superpowers/plans/2026-11-20-menus-scrollbars.md`: a thin floating
+/// bar, [`SCROLL_IDLE_WIDTH`] wide and [`SCROLL_HOVER_WIDTH`] under the
+/// pointer, rounded, in the ink colour at low alpha, **with no track**, set
+/// [`SCROLL_EDGE_MARGIN`] in from the edge. It takes no room from the content
+/// (`floating_allocated_width` is 0), is hidden until the pointer is over the
+/// area, and is never white-on-white: the handle is the ink at
+/// [`SCROLL_HANDLE_ACTIVE`] / [`SCROLL_HANDLE_GRABBED`] alpha.
+pub fn scroll_style() -> egui::style::ScrollStyle {
+    egui::style::ScrollStyle {
+        floating: true,
+        content_margin: egui::Margin::ZERO,
+        bar_width: SCROLL_HOVER_WIDTH,
+        handle_min_length: 28.0,
+        bar_inner_margin: 4.0,
+        bar_outer_margin: SCROLL_EDGE_MARGIN,
+        floating_width: SCROLL_IDLE_WIDTH,
+        floating_allocated_width: 0.0,
+        foreground_color: true,
+        dormant_background_opacity: 0.0,
+        active_background_opacity: 0.0,
+        interact_background_opacity: 0.0,
+        dormant_handle_opacity: 0.0,
+        active_handle_opacity: SCROLL_HANDLE_ACTIVE,
+        interact_handle_opacity: SCROLL_HANDLE_GRABBED,
+        fade: Default::default(),
+    }
+}
+
+/// The bar's width while the pointer is in the area but not on the bar.
+pub const SCROLL_IDLE_WIDTH: f32 = 6.0;
+/// The bar's width under the pointer.
+pub const SCROLL_HOVER_WIDTH: f32 = 10.0;
+/// How far the bar stands in from the area's edge.
+pub const SCROLL_EDGE_MARGIN: f32 = 3.0;
+/// The handle's alpha while the pointer is in the area.
+pub const SCROLL_HANDLE_ACTIVE: f32 = 0.4;
+/// The handle's alpha while the pointer is on the bar.
+pub const SCROLL_HANDLE_GRABBED: f32 = 0.7;
 
 /// How far short of its rect's right edge a single line of clipped text stops.
 ///

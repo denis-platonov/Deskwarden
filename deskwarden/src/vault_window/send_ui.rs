@@ -81,7 +81,7 @@
 use crate::local_time::LocalOffset;
 use crate::send::{SendClock, SendError, SendSummary};
 use crate::theme;
-use eframe::egui::{self, CornerRadius, Margin};
+use eframe::egui::{self, CornerRadius};
 
 mod shared_page;
 pub mod words;
@@ -2255,7 +2255,7 @@ const VIEW_LIMIT_FIELD_WIDTH: f32 = 60.0;
 /// each side, then a 96-point label column and a 14-point gap). That budget is
 /// the constraint this row failed against, and
 /// `the_access_block_fits_inside_the_modal_it_is_drawn_in` is what holds it.
-pub const EXPIRY_FIELD_WIDTH: f32 = 150.0;
+pub const EXPIRY_FIELD_WIDTH: f32 = 180.0;
 
 /// The salt `theme::date_picker` remembers its month under.
 ///
@@ -2562,8 +2562,8 @@ pub(crate) fn draw_people_suggestions(
             // and soft shadow, 8 of padding, tracked capitals over rows with
             // an initials tile.
             let palette = crate::kit::tokens::palette(ui.ctx());
-            crate::kit::tokens::card_frame(&palette, 14)
-                .inner_margin(Margin::same(8))
+            crate::kit::menu::RICH
+                .frame(&palette)
                 .show(ui, |ui| {
                     let inner = (width - 16.0).max(160.0);
                     ui.set_width(inner);
@@ -2784,15 +2784,17 @@ pub fn draw_access_block(
     let choices: Vec<theme::Choice<'_>> = labels
         .iter()
         .zip(crate::send::LIFETIME_CHOICES)
-        .map(|(label, choice)| theme::Choice {
-            label: label.as_str(),
+        .map(|(label, choice)| {
             // The picked-date row is the answer in force whenever the answer
             // IS a picked date, whatever date that is -- it is one row, not a
             // row per day.
-            selected: match choice {
-                Some(lifetime) => *controls.lifetime == lifetime,
-                None => matches!(*controls.lifetime, crate::send::SendLifetime::Until(_)),
-            },
+            theme::Choice::new(
+                label.as_str(),
+                match choice {
+                    Some(lifetime) => *controls.lifetime == lifetime,
+                    None => matches!(*controls.lifetime, crate::send::SendLifetime::Until(_)),
+                },
+            )
         })
         .collect();
     let current = crate::vault_window::send_ui::words::lifetime_label(*controls.lifetime, zone);
@@ -4636,7 +4638,7 @@ mod paint_tests {
         let (_, fill) = painted.control_under(&chosen);
         assert_eq!(
             fill,
-            theme::CARD_TINT,
+            crate::kit::tokens::Palette::LIGHT.list_bg,
             "the lifetime control is not the design system's inert box while a publish is \
              running -- either it is still live, or it has been faded out with everything \
              the user still needs to read on it"

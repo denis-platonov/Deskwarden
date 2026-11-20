@@ -2173,16 +2173,16 @@ fn step_row(
         if response.clicked() {
             press = RowPress::Select;
         }
-        response.context_menu(|ui| {
-            if ui.button(menu_move_up()).clicked() {
+        crate::kit::menu::context(&response, |ui| {
+            if crate::kit::menu::item(ui, crate::kit::menu::Item::new(menu_move_up())).clicked() {
                 press = RowPress::MoveUp;
                 ui.close();
             }
-            if ui.button(menu_move_down()).clicked() {
+            if crate::kit::menu::item(ui, crate::kit::menu::Item::new(menu_move_down())).clicked() {
                 press = RowPress::MoveDown;
                 ui.close();
             }
-            if ui.button(menu_remove()).clicked() {
+            if crate::kit::menu::item(ui, crate::kit::menu::Item::new(menu_remove()).danger(true)).clicked() {
                 press = RowPress::Remove;
                 ui.close();
             }
@@ -2708,9 +2708,11 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
     // menu that shut on the first click into its own field could never be
     // typed into.
     let width = palette_menu_width(ui, palette);
-    egui::Popup::menu(&button)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| {
+    crate::kit::menu::popover(
+        &button,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        crate::kit::menu::MENU.fit(),
+        |ui| {
             menu_body(ui, Some(width), |ui| {
                 menu_caption(ui, add_value_caption());
                 // **What the pills really measured**, read off the lane they
@@ -2798,7 +2800,7 @@ fn add_text_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft, palette: &[FieldR
 /// `+ Key`: the keys this app knows how to send.
 fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
     let button = theme::dashed_button(ui, add_key_label());
-    egui::Popup::menu(&button).show(|ui| {
+    crate::kit::menu::popover(&button, egui::PopupCloseBehavior::CloseOnClick, crate::kit::menu::MENU.fit(), |ui| {
         menu_body(ui, Some(ADD_MENU_WIDTH), |ui| {
             menu_caption(ui, add_key_caption());
             ui.horizontal_wrapped(|ui| {
@@ -2819,9 +2821,11 @@ fn add_key_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
 /// in -- the sequence stores the milliseconds.
 fn add_wait_menu(ui: &mut egui::Ui, draft: &mut SequenceDraft) {
     let button = theme::dashed_button(ui, add_wait_label());
-    egui::Popup::menu(&button)
-        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-        .show(|ui| {
+    crate::kit::menu::popover(
+        &button,
+        egui::PopupCloseBehavior::CloseOnClickOutside,
+        crate::kit::menu::MENU.fit(),
+        |ui| {
             menu_body(ui, None, |ui| {
                 menu_caption(ui, add_wait_caption());
                 ui.horizontal(|ui| {

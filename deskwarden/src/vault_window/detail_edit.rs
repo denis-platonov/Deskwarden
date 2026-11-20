@@ -5491,18 +5491,17 @@ fn website_row_trailing() -> f32 {
 /// [`UriMatchChoice::Unrecognised`] -- a value this build cannot name is
 /// SHOWN as one it cannot name, rather than reading blank.
 fn website_match_combo(ui: &mut egui::Ui, row_id: u64, choice: &mut UriMatchChoice) {
-    form_combo(ui, ("website-match", row_id))
-        .selected_text(choice.label())
-        .width(MATCH_COMBO_WIDTH)
-        .show_ui(ui, |ui| {
-            // Derived from the enumeration, never written out here. See
-            // [`UriMatchChoice::OFFERED`].
-            for offered in UriMatchChoice::OFFERED {
-                if ui.selectable_label(*choice == offered, offered.label()).clicked() {
-                    *choice = offered;
-                }
-            }
-        });
+    // Derived from the enumeration, never written out here. See
+    // [`UriMatchChoice::OFFERED`].
+    let choices: Vec<crate::kit::menu::Choice<'_>> = UriMatchChoice::OFFERED
+        .iter()
+        .map(|offered| crate::kit::menu::Choice::new(offered.label(), *choice == *offered))
+        .collect();
+    if let Some(index) =
+        crate::kit::menu::select(ui, ("website-match", row_id), MATCH_COMBO_WIDTH, crate::kit::menu::FIELD, choice.label(), &choices)
+    {
+        *choice = UriMatchChoice::OFFERED[index];
+    }
 }
 
 fn websites_block(ui: &mut egui::Ui, uris: &mut Vec<UriDraft>, typed: &mut String, creating: bool) {
@@ -8099,26 +8098,17 @@ fn number_badge(ui: &mut egui::Ui, net: crate::kit::logos::Net) {
 /// In a scope, because [`form_combo`] sets the `Ui`'s `interact_size` and the
 /// row's other widgets are not its to resize.
 fn brand_combo(ui: &mut egui::Ui, card: &mut CardDraft) -> f32 {
-    ui.scope(|ui| {
-        form_combo(ui, "card-brand")
-            .selected_text(if card.brand.is_empty() { brand_unset() } else { card.brand.as_str() })
-            .width(BRAND_COMBO_WIDTH)
-            .show_ui(ui, |ui| {
-                for brand in CARD_BRANDS {
-                    let canonical = brand.canonical();
-                    let chosen = card.brand == canonical;
-                    if ui.selectable_label(chosen, canonical).clicked() {
-                        // Through `pick_brand`, never by assigning `brand`:
-                        // this is the click that makes the choice permanent.
-                        card.pick_brand(canonical);
-                    }
-                }
-            })
-            .response
-            .rect
-            .width()
-    })
-    .inner
+    let choices: Vec<crate::kit::menu::Choice<'_>> = CARD_BRANDS
+        .iter()
+        .map(|brand| crate::kit::menu::Choice::new(brand.canonical(), card.brand == brand.canonical()))
+        .collect();
+    let current = if card.brand.is_empty() { brand_unset() } else { card.brand.as_str() };
+    if let Some(index) = crate::kit::menu::select(ui, "card-brand", BRAND_COMBO_WIDTH, crate::kit::menu::FIELD, current, &choices) {
+        // Through `pick_brand`, never by assigning `brand`: this is the click
+        // that makes the choice permanent.
+        card.pick_brand(CARD_BRANDS[index].canonical());
+    }
+    BRAND_COMBO_WIDTH
 }
 
 /// The card's `Expires` row: **month `/` year, then `Code` and its box, then
@@ -8227,15 +8217,13 @@ fn inline_caption(ui: &mut egui::Ui, text: &str, ink: egui::Color32) {
     ui.painter().galley(at, galley, ink);
 }
 
-/// **A button drawn as a closed drop-down**: `form_combo`'s box -- the same
-/// widget visuals, corner, fill and border, `button_padding`, and egui's own
-/// downward caret on the right -- at the row's [`theme::SECTION_FIELD_HEIGHT`],
-/// `width` wide, showing `text`. Painted in the `open` state while what it
-/// opens is open, as a combo's button is.
+/// **A button drawn as a closed drop-down**: the kit's select box
+/// ([`crate::kit::menu::trigger`], at the form's field look), `width` wide, showing
+/// `text`, painted in its open state while what it opens is open.
 ///
-/// The bank's picker. **Not a `ComboBox`**, because what it opens is not a
-/// popup list: it is the bank chooser that already lives under the row -- a
-/// search box over the vault's own sites -- which a popup in its own layer
+/// The bank's picker. **Not a `crate::kit::menu::select`**, because what it opens is
+/// not a popup list: it is the bank chooser that already lives under the row
+/// -- a search box over the vault's own sites -- which a popup in its own layer
 /// could neither hold nor be put in front of a test.
 fn dropdown_button(
     ui: &mut egui::Ui,
@@ -8243,42 +8231,7 @@ fn dropdown_button(
     width: f32,
     open: bool,
 ) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(width, theme::SECTION_FIELD_HEIGHT),
-        egui::Sense::click(),
-    );
-    if ui.is_rect_visible(rect) {
-        let visuals =
-            if open { ui.visuals().widgets.open } else { *ui.style().interact(&response) };
-        ui.painter().rect(
-            rect.expand(visuals.expansion),
-            visuals.corner_radius,
-            visuals.weak_bg_fill,
-            visuals.bg_stroke,
-            egui::StrokeKind::Inside,
-        );
-        let pad = ui.spacing().button_padding.x;
-        let icon = ui.spacing().icon_width;
-        // The chooser's own chevron, through the same hook its `ComboBox`
-        // paints with, in the square egui gives that hook.
-        let caret = egui::Rect::from_center_size(
-            egui::pos2(rect.right() - pad - icon / 2.0, rect.center().y),
-            egui::vec2(icon, icon),
-        );
-        theme::combo_chevron(ui, caret, &visuals, open);
-        let room = (rect.width() - 2.0 * pad - icon - ui.spacing().icon_spacing).max(0.0);
-        let galley = egui::WidgetText::from(text).into_galley(
-            ui,
-            Some(egui::TextWrapMode::Truncate),
-            room,
-            egui::TextStyle::Button,
-        );
-        // The combo's own ink, chosen or not: the brand chooser beside it says
-        // `Not set` in it, and two unset states side by side should match.
-        let at = egui::pos2(rect.left() + pad, rect.center().y - galley.size().y / 2.0);
-        ui.painter().galley(at, galley, visuals.text_color());
-    }
-    response
+    crate::kit::menu::trigger(ui, crate::kit::menu::FIELD, width, text, open)
 }
 
 /// What the bank picker's list says for its `index`th entry:
@@ -10622,14 +10575,20 @@ fn generator_options(ui: &mut egui::Ui, generator: &mut GeneratorDraft) {
     if generator.passphrase {
         theme::field_label(ui, crate::i18n::t("edit.gen_between_words"));
         ui.horizontal_wrapped(|ui| {
-            form_combo(ui, "generator-separator")
-                .selected_text(generator.separator.label())
-                .width(150.0)
-                .show_ui(ui, |ui| {
-                    for choice in Separator::ALL {
-                        ui.selectable_value(&mut generator.separator, choice, choice.label());
-                    }
-                });
+            let choices: Vec<crate::kit::menu::Choice<'_>> = Separator::ALL
+                .iter()
+                .map(|choice| crate::kit::menu::Choice::new(choice.label(), generator.separator == *choice))
+                .collect();
+            if let Some(index) = crate::kit::menu::select(
+                ui,
+                "generator-separator",
+                150.0,
+                crate::kit::menu::ROW,
+                generator.separator.label(),
+                &choices,
+            ) {
+                generator.separator = Separator::ALL[index];
+            }
         });
         ui.add_space(6.0);
         ui.horizontal_wrapped(|ui| {
@@ -10846,9 +10805,7 @@ fn edit_header(
             Some(choice) => choice.url().is_some(),
             None => !crate::favicon::icon_authorities_for(saved).is_empty(),
         };
-        egui::Popup::menu(&avatar_response)
-            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .show(|ui| {
+        crate::kit::menu::popover(&avatar_response, egui::PopupCloseBehavior::CloseOnClickOutside, crate::kit::menu::RICH, |ui| {
                 if let Some(picked) = avatar_menu(ui, app.as_deref(), colour, removable, refreshable) {
                     match picked {
                         AvatarRow::Refresh => action = EditAction::RefreshIcon,
@@ -11405,153 +11362,6 @@ fn row_with_buttons(ui: &mut egui::Ui, buttons: &[&str], add: impl FnOnce(&mut e
 /// ellipsis, which is not a field the user can work in.
 const FIELD_FLOOR: f32 = 140.0;
 
-/// **Every `ComboBox` on this form is built here**, and the reason is a bug
-/// that has now been found twice.
-///
-/// `draw_detail_edit` scopes `theme::scrollbar_in_gutter` over the whole card
-/// column so the FORM's own bar sits in a 24-point lane. Those are
-/// `Style::spacing.scroll` values, so every `Ui` under that scope inherits
-/// them -- including the one egui builds for a combo's drop-down, which is a
-/// `ScrollArea` of its own. The list is then drawn with a 24-point lane and a
-/// bar down it however short it is: the owner reported it on the folder
-/// chooser ("Folder has scroll in dropdown"), the fix was made there, and the
-/// website match chooser -- written later -- inherited the same defect and
-/// the same report ("scroll not needed here for just one record").
-///
-/// A helper rather than a fifth copy of the one line, because the line is
-/// invisible at the call site: a combo added without it looks perfectly
-/// correct and is wrong only when the pointer opens it.
-///
-/// Put back to egui's own default, which is what every list in this app that
-/// has NOT asked for a gutter gets -- `theme::apply` sets no `ScrollStyle`,
-/// and `scrollbar_in_gutter` is a per-surface opt-in this surface did not
-/// take.
-fn form_combo(
-    ui: &mut egui::Ui,
-    id_salt: impl std::hash::Hash + std::fmt::Debug,
-) -> egui::ComboBox {
-    // **8a's `height: 34px`, which is what the boxes beside it are**, and the
-    // second reason this helper exists.
-    //
-    // egui sizes a combo's button from `interact_size`, which this theme sets
-    // to 20 -- so a chooser between two `SECTION_FIELD_HEIGHT` boxes came out
-    // shorter than both AND sitting lower than both, because a short widget in
-    // an `Align::Center` row is centred on a line the taller boxes set.
-    // Measured on the websites row: the URL box at 538..566 and the match
-    // chooser at 543..569. The owner, with that row screenshotted: "fields are
-    // not aligned".
-    //
-    // `folder_combo` had already found this once ("render as per design -
-    // should be same height") and fixed it on itself; the website chooser,
-    // written later, did not inherit the fix. It does now -- which is the
-    // whole argument for one door.
-    ui.spacing_mut().interact_size.y = theme::SECTION_FIELD_HEIGHT;
-    egui::ComboBox::from_id_salt(id_salt)
-        .height(FORM_COMBO_HEIGHT)
-        .popup_style(form_popup_style())
-        .icon(theme::combo_chevron)
-}
-
-/// **How tall a drop-down on this form may grow before it scrolls.**
-///
-/// egui's own cap is `spacing.combo_height`, 200 points, and that is what the
-/// owner has now reported three times -- most recently with the six website
-/// match types on screen and a bar down the side of them: "still not fixed
-/// scroll".
-///
-/// The first two goes were about the scroll LANE, which was real and is fixed
-/// (see [`form_popup_style`]). This is the other half, and measuring it is
-/// what found it: the list of six lays out 214 points tall against that
-/// 200-point cap, so it really does overflow -- by fourteen points, which is
-/// exactly enough for a bar and not enough to look like one on purpose.
-///
-/// 420 rather than "as tall as the list": a cap still has to exist, because a
-/// vault with sixty folders would otherwise open a drop-down taller than the
-/// window. This is thirteen rows at the row height the popup really uses,
-/// which covers every fixed list this form offers -- the six match types, the
-/// four separators, the card brands -- and leaves the folder list, the only
-/// open-ended one, to scroll as it always did.
-const FORM_COMBO_HEIGHT: f32 = 420.0;
-
-/// **The one line that takes the gutter back off a drop-down**, applied to the
-/// POPUP's style and not to the `Ui` the combo was added to -- and that
-/// distinction is the whole of why the first fix did not take.
-///
-/// `ComboBox` builds its list with `Popup::menu(..).style(popup_style)`, and a
-/// `Popup` takes the CONTEXT's style rather than the style of the `Ui` the
-/// button sits in. So `ui.spacing_mut().scroll = ..` inside [`form_combo`]
-/// changed the button and nothing else: the list went on inheriting the form's
-/// 24-point lane from the context, and the owner reported the bar still there
-/// after it had been "fixed". `popup_style` is the hook egui provides for
-/// exactly this.
-///
-/// A named function rather than a closure inside [`form_combo`] so the reset
-/// can be asserted at all. A `StyleModifier` is an opaque `Arc<dyn Fn>` once it
-/// is inside a `ComboBox`, and the popup is drawn in a layer this file's
-/// harness does not collect -- so the only reachable proof that the gutter
-/// comes off is to apply the modifier to a `Style` that HAS one and look.
-///
-/// Put back to egui's own default, which is what every list in this app that
-/// has NOT asked for a gutter gets -- `theme::apply` sets no `ScrollStyle`,
-/// and `scrollbar_in_gutter` is a per-surface opt-in a drop-down never took.
-/// The rest of the context's style is untouched: this writes one field.
-///
-/// **And the bar is never painted.** egui keeps a popup a few points clear of
-/// the window's bottom edge, so a list whose button sits low gets a viewport
-/// a point or two shorter than its rows -- and a floating bar whose handle
-/// fills the whole track, for a list the user can already see all of. The
-/// owner, with six folders open and that bar down the side: "remove scroll
-/// here". The bar is floating, so it takes no room; with every opacity at
-/// zero it takes no ink either. The wheel still scrolls the rare list that
-/// truly outruns [`FORM_COMBO_HEIGHT`], whose cut-off last row says so.
-///
-/// **And a row is one size whatever state it is in.** The owner, with the
-/// card-brand list open: "this list shaking on hover". egui 0.35's `Button`
-/// takes its frame's stroke width out of the inner margin, so a framed row
-/// is `button_padding` all round -- but a selectable row that is NOT framed
-/// (inactive and unselected) reuses that reduced margin with no stroke to
-/// give it back. With this theme's 1-point strokes a plain row was 24 points
-/// and a framed one 26, so the selected row stood two points taller than the
-/// rest and hovering a row grew it and pushed every row below it down.
-///
-/// Two settings, both popup-only, close the gap without changing a pixel of
-/// what a row looks like:
-///
-/// - every state's `expansion` equals its `bg_stroke` width. egui lays a
-///   framed button out with `-expansion` of outer margin and paints the box
-///   that much outside it, so the stroke now costs no layout room in ANY
-///   state, the unframed one included. The outline is still drawn: it just
-///   sits on the row's edge instead of inside a taller row.
-/// - `button_padding` comes down by the inactive stroke's width, so the
-///   rows keep the 24-point height (and the list its pitch) they had while
-///   no pointer was on them -- and a highlighted row's box is the 26 points,
-///   text inset included, that it already was.
-fn form_popup_style() -> egui::style::StyleModifier {
-    egui::style::StyleModifier::new(|style| {
-        style.spacing.scroll = egui::style::ScrollStyle {
-            dormant_background_opacity: 0.0,
-            active_background_opacity: 0.0,
-            interact_background_opacity: 0.0,
-            dormant_handle_opacity: 0.0,
-            active_handle_opacity: 0.0,
-            interact_handle_opacity: 0.0,
-            ..egui::style::ScrollStyle::default()
-        };
-        let widgets = &mut style.visuals.widgets;
-        let plain_stroke = widgets.inactive.bg_stroke.width;
-        for state in [
-            &mut widgets.noninteractive,
-            &mut widgets.inactive,
-            &mut widgets.hovered,
-            &mut widgets.active,
-            &mut widgets.open,
-        ] {
-            state.expansion = state.bg_stroke.width;
-        }
-        style.spacing.button_padding -= egui::Vec2::splat(plain_stroke);
-    })
-}
-
 /// The folder chooser, drawn identically in both arms of the `ITEM` card.
 ///
 /// Lifted out when the card grew a grid: the control was written inline in
@@ -11604,34 +11414,28 @@ fn folder_combo(
     }
     // The row's height and the drop-down's scroll lane are both `form_combo`'s
     // now, and both were found here first -- see it for the two measurements.
-    form_combo(ui, "edit-folder")
-        // The cell's full width in the grid arm, which is what makes three
-        // controls of three different natural widths read as a row. egui's
-        // combo is otherwise as wide as its longest option.
-        .width(ui.available_width())
-        .selected_text(
-            assignable
-                .iter()
-                .find(|f| Some(&f.id) == draft.folder_id.as_ref())
-                .map(|f| f.name.as_str())
-                .unwrap_or(no_folder_label()),
-        )
-        .show_ui(ui, |ui| {
-            // "No folder" is offered only when it can actually take effect --
-            // see `EditDraft::may_unfile`. Shown disabled rather than hidden,
-            // so the option's absence is a visible limitation instead of a
-            // missing row.
-            let unfile = egui::Button::selectable(draft.folder_id.is_none(), no_folder_label());
-            if ui.add_enabled(may_unfile, unfile).clicked() {
-                draft.folder_id = None;
-            }
-            for folder in &assignable {
-                let selected = draft.folder_id.as_deref() == Some(folder.id.as_str());
-                if ui.selectable_label(selected, &folder.name).clicked() {
-                    draft.folder_id = Some(folder.id.clone());
-                }
-            }
-        });
+    // "No folder" is offered only when it can actually take effect -- see
+    // `EditDraft::may_unfile`. Shown disabled rather than hidden, so the
+    // option's absence is a visible limitation instead of a missing row.
+    let mut choices = vec![crate::kit::menu::Choice::new(no_folder_label(), draft.folder_id.is_none()).enabled(may_unfile)];
+    choices.extend(
+        assignable
+            .iter()
+            .map(|folder| crate::kit::menu::Choice::new(&folder.name, draft.folder_id.as_deref() == Some(folder.id.as_str()))),
+    );
+    let current = assignable
+        .iter()
+        .find(|f| Some(&f.id) == draft.folder_id.as_ref())
+        .map(|f| f.name.as_str())
+        .unwrap_or(no_folder_label());
+    // The cell's full width in the grid arm, which is what makes three
+    // controls of three different natural widths read as a row.
+    if let Some(index) = crate::kit::menu::select(ui, "edit-folder", ui.available_width(), crate::kit::menu::FIELD, current, &choices) {
+        draft.folder_id = match index.checked_sub(1) {
+            None => None,
+            Some(i) => Some(assignable[i].id.clone()),
+        };
+    }
 }
 
 /// What the folder cell says for an item that is in none.
@@ -23376,7 +23180,7 @@ mod edit_pane_layout_tests {
 
     /// **The bank picker is drawn as the brand chooser beside it is** -- the
     /// same fill, border, corner, height, caret and ink -- painted side by
-    /// side, so the hand-drawn one cannot drift from `form_combo`'s. Both are
+    /// side, so the bank's trigger cannot drift from `kit::menu::select`'s. Both are
     /// asked in their UNSET state, which is the pair the owner sees together.
     #[test]
     fn the_bank_picker_is_drawn_as_the_brand_chooser_is() {
@@ -23390,14 +23194,17 @@ mod edit_pane_layout_tests {
                 ui.spacing_mut().interact_size.y = crate::kit::controls::SMALL.height;
                 combo = ui
                     .scope(|ui| {
-                        form_combo(ui, "probe-brand")
-                            .selected_text(brand_unset())
-                            .width(BRAND_COMBO_WIDTH)
-                            .show_ui(ui, |_ui| {})
-                            .response
-                            .rect
+                        let _ = crate::kit::menu::select(
+                            ui,
+                            "probe-brand",
+                            BRAND_COMBO_WIDTH,
+                            crate::kit::menu::FIELD,
+                            brand_unset(),
+                            &[],
+                        );
                     })
-                    .inner;
+                    .response
+                    .rect;
                 picker = dropdown_button(ui, bank_choose(), BRAND_COMBO_WIDTH, false).rect;
             });
         });
@@ -29649,9 +29456,9 @@ mod edit_pane_layout_tests {
              would pass against a build that still inherited it"
         );
 
-        form_popup_style().apply(&mut style);
+        crate::kit::menu::MENU.style(crate::kit::tokens::Palette::LIGHT).apply(&mut style);
 
-        let plain = egui::style::ScrollStyle::default();
+        let plain = theme::scroll_style();
         assert_eq!(
             style.spacing.scroll.floating_allocated_width, plain.floating_allocated_width,
             "a drop-down opened from this form keeps the form's {}pt scroll lane, so it \
