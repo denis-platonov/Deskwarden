@@ -1083,19 +1083,12 @@ mod win32 {
         });
     }
 
+    /// Hands the card's corners to [`crate::card_shell`]: the design's 18 px
+    /// radius, antialiased, with its soft shadow, in place of the fixed ~8 px
+    /// corner `DWMWCP_ROUND` gave every card. The card's own background is
+    /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        unsafe {
-            use windows::Win32::Graphics::Dwm::{
-                DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            };
-            let preference = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
-                window,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &preference as *const _ as *const c_void,
-                std::mem::size_of_val(&preference) as u32,
-            );
-        }
+        crate::card_shell::attach(window, crate::theme::CARD);
     }
 
     fn dev(b: Box2) -> RECT {
@@ -1826,17 +1819,14 @@ mod win32 {
             w: super::DOT,
             h: super::DOT,
         };
-        unsafe {
-            let brush = CreateSolidBrush(rgb(dot_colour));
-            let pen = CreatePen(PS_SOLID, 1, rgb(dot_colour));
-            let (ob, op) = (SelectObject(hdc, brush), SelectObject(hdc, pen));
-            let d = dev(dot);
-            let _ = Ellipse(hdc, d.left, d.top, d.right, d.bottom);
-            SelectObject(hdc, ob);
-            SelectObject(hdc, op);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        let d = dev(dot);
+        crate::win32_draw::aa_round_rect(
+            hdc,
+            d,
+            (d.right - d.left).min(d.bottom - d.top) / 2,
+            rgb(dot_colour),
+            None,
+        );
         let text_x = dot.right() + super::DOT_GAP;
         text(
             hdc,

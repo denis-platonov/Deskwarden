@@ -1116,19 +1116,12 @@ mod win32 {
         Some(h)
     }
 
+    /// Hands the card's corners to [`crate::card_shell`]: the design's 18 px
+    /// radius, antialiased, with its soft shadow, in place of the fixed ~8 px
+    /// corner `DWMWCP_ROUND` gave every card. The card's own background is
+    /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        unsafe {
-            use windows::Win32::Graphics::Dwm::{
-                DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            };
-            let preference = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
-                window,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &preference as *const _ as *const c_void,
-                std::mem::size_of_val(&preference) as u32,
-            );
-        }
+        crate::card_shell::attach(window, crate::theme::CARD);
     }
 
     /// Takes over a control's painting without losing the focus and keyboard

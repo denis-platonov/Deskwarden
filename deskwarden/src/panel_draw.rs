@@ -21,18 +21,26 @@
 //!
 //! # What GDI cannot do, and what stands in
 //!
-//! GDI has no antialiasing, no alpha and no blur: corners are hard, the design's
-//! soft `0 24px 60px` panel shadow is not drawn (the window's own DWM rounding
-//! and shadow stand in), and the keyframes' opacity ramps (`dw-fade`, `dw-up`,
-//! the ring's fade in) are not drawn either. What is kept is **movement**: the
-//! done check's ring still overshoots and its stroke still draws on.
+//! GDI's own `RoundRect` and `Ellipse` do not antialias, so none of them is
+//! used here: every rounded shape -- the avatar tile, the row wash, the `Enter`
+//! badge, the pills, the `?` badge, the key tooltip, the done check's disc -- is
+//! painted by [`crate::win32_draw::aa_round_rect`], which composes the shape
+//! per pixel from its signed distance in a DIB section and blits it back. The
+//! panel's own **18 px silhouette and its soft `0 24px 60px` shadow** are drawn
+//! by [`crate::card_shell`], a click-through layered window under each card;
+//! Windows' fixed 8 px corner and its shadow no longer stand in.
+//!
+//! What GDI still has no answer for is the keyframes' opacity ramps (`dw-fade`,
+//! `dw-up`, the ring's fade in), which are not drawn. What is kept is
+//! **movement**: the done check's ring still overshoots and its stroke still
+//! draws on.
 
 use crate::win32_draw::{draw_mark, draw_text, mark_width, rgb, text_width_utf16, ButtonSkin};
 use eframe::egui::Color32;
 use std::ffi::c_void;
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, Ellipse, LineTo, MoveToEx, RoundRect, SelectObject,
+    CreatePen, CreateSolidBrush, DeleteObject, LineTo, MoveToEx, SelectObject,
     SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
     DT_VCENTER, HDC, HFONT, PS_SOLID, TRANSPARENT,
 };
@@ -55,7 +63,8 @@ pub const HEADER_PAD_X: i32 = 16;
 pub const HEADER_PAD_TOP: i32 = 14;
 /// The gap between a card's blocks (D 1.5: `gap 14`).
 pub const BLOCK_GAP: i32 = 14;
-/// The panel's outer radius. DWM rounds the window itself; see the module doc.
+/// The panel's outer radius. [`crate::card_shell`] draws the window's silhouette
+/// at it, antialiased; see the module doc.
 pub const RADIUS: i32 = 18;
 
 /// The lockup's shield is 20 x 23 (D 0).
@@ -225,19 +234,11 @@ pub fn draw_lockup(hdc: HDC, mark: RECT, word: RECT, font: HFONT) {
 
 /// A rounded rectangle in DEVICE pixels, filled and optionally edged. `radius`
 /// is the corner radius (not the ellipse's diameter).
+///
+/// **Antialiased**: it goes through [`crate::win32_draw::aa_round_rect`], so the
+/// edge is blended with what is already under it rather than stair-stepped.
 pub fn round_rect(hdc: HDC, rc: RECT, radius: i32, fill: Color32, edge: Option<Color32>) {
-    unsafe {
-        let brush = CreateSolidBrush(rgb(fill));
-        let pen = CreatePen(PS_SOLID, 1, rgb(edge.unwrap_or(fill)));
-        let old_brush = SelectObject(hdc, brush);
-        let old_pen = SelectObject(hdc, pen);
-        let d = radius.max(0) * 2;
-        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, d, d);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
-    }
+    crate::win32_draw::aa_round_rect(hdc, rc, radius, rgb(fill), edge.map(|colour| (rgb(colour), 1)));
 }
 
 fn px(v: i32, scale: i32) -> i32 {
@@ -305,18 +306,10 @@ pub fn pill_width(text_w: i32, scale: i32) -> i32 {
 
 /// The `?` badge: a 20 px circle, `?` at 12/800. Darker while `hot`.
 pub fn draw_help_badge(hdc: HDC, rc: RECT, font: HFONT, hot: bool) {
+    let fill = if hot { crate::theme::BORDER_STRONG } else { HELP_FILL };
+    // A circle is a rounded rectangle whose radius is half its side.
+    round_rect(hdc, rc, (rc.right - rc.left).min(rc.bottom - rc.top) / 2, fill, None);
     unsafe {
-        let fill = if hot { crate::theme::BORDER_STRONG } else { HELP_FILL };
-        let brush = CreateSolidBrush(rgb(fill));
-        let pen = CreatePen(PS_SOLID, 1, rgb(fill));
-        let old_brush = SelectObject(hdc, brush);
-        let old_pen = SelectObject(hdc, pen);
-        let _ = Ellipse(hdc, rc.left, rc.top, rc.right, rc.bottom);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
-
         let old = SelectObject(hdc, font);
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, rgb(crate::theme::TEXT_MUTED));
@@ -834,18 +827,9 @@ pub fn check_points(progress: f32) -> Vec<(f32, f32)> {
 /// its life: the green disc at [`ring_scale`], and the stroke at
 /// [`check_progress`].
 pub fn draw_done_check(hdc: HDC, centre: POINT, scale: i32, elapsed_ms: u32) {
+    let r = (px(DONE_DISC, scale) as f32 / 2.0 * ring_scale(elapsed_ms)).round() as i32;
+    crate::win32_draw::aa_circle(hdc, centre.x, centre.y, r, rgb(crate::theme::DONE_WASH), None);
     unsafe {
-        let r = (px(DONE_DISC, scale) as f32 / 2.0 * ring_scale(elapsed_ms)).round() as i32;
-        let brush = CreateSolidBrush(rgb(crate::theme::DONE_WASH));
-        let pen = CreatePen(PS_SOLID, 1, rgb(crate::theme::DONE_WASH));
-        let old_brush = SelectObject(hdc, brush);
-        let old_pen = SelectObject(hdc, pen);
-        let _ = Ellipse(hdc, centre.x - r, centre.y - r, centre.x + r, centre.y + r);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
-
         let points = check_points(check_progress(elapsed_ms));
         if points.len() < 2 {
             return;

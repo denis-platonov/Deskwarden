@@ -654,7 +654,7 @@ mod win32 {
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
         CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject,
-        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect,
+        EndPaint, FillRect, GetDC, GetDeviceCaps, InvalidateRect, ReleaseDC,
         SelectObject, SetBkColor, SetBkMode, SetTextCharacterExtra, SetTextColor,
         CLEARTYPE_QUALITY, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
         FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID,
@@ -1286,21 +1286,12 @@ mod win32 {
         Some(h)
     }
 
+    /// Hands the card's corners to [`crate::card_shell`]: the design's 18 px
+    /// radius, antialiased, with its soft shadow, in place of the fixed ~8 px
+    /// corner `DWMWCP_ROUND` gave every card. The card's own background is
+    /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        // The same `DWMWCP_ROUND` the login window's frameless chrome asks
-        // for, so the two surfaces have the same silhouette.
-        unsafe {
-            use windows::Win32::Graphics::Dwm::{
-                DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            };
-            let preference = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
-                window,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &preference as *const _ as *const c_void,
-                std::mem::size_of_val(&preference) as u32,
-            );
-        }
+        crate::card_shell::attach(window, crate::theme::CARD);
     }
 
     fn subclass(button: HWND, slot: &AtomicIsize) {
@@ -1769,27 +1760,20 @@ mod win32 {
         fill_colour: eframe::egui::Color32,
         border: Option<(i32, eframe::egui::Color32)>,
     ) {
-        unsafe {
-            let brush = CreateSolidBrush(rgb(fill_colour));
-            let (width, colour) = border.unwrap_or((1, fill_colour));
-            let pen = CreatePen(PS_SOLID, scale(width).max(1), rgb(colour));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let r = scale(radius) * 2;
-            let _ = RoundRect(
-                hdc,
-                scale(at.x),
-                scale(at.y),
-                scale(at.right()),
-                scale(at.bottom()),
-                r,
-                r,
-            );
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        // Antialiased: `win32_draw::aa_round_rect` mixes the edge with what is
+        // already under it, where `RoundRect` stair-stepped it.
+        crate::win32_draw::aa_round_rect(
+            hdc,
+            RECT {
+                left: scale(at.x),
+                top: scale(at.y),
+                right: scale(at.right()),
+                bottom: scale(at.bottom()),
+            },
+            scale(radius),
+            rgb(fill_colour),
+            border.map(|(width, colour)| (rgb(colour), scale(width).max(1))),
+        );
     }
 
     /// One run of text, vertically centred in `at`.

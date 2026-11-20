@@ -497,7 +497,7 @@ mod win32 {
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontIndirectW,
         CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint, FillRect, GetDC,
-        GetDeviceCaps, InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode,
+        GetDeviceCaps, InvalidateRect, ReleaseDC, SelectObject, SetBkMode,
         SetTextColor, CLEARTYPE_QUALITY, DRAW_TEXT_FORMAT, DT_CALCRECT, DT_EDITCONTROL,
         DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, FW_BOLD,
         FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY,
@@ -1078,19 +1078,12 @@ mod win32 {
         Some(h)
     }
 
+    /// Hands the card's corners to [`crate::card_shell`]: the design's 18 px
+    /// radius, antialiased, with its soft shadow, in place of the fixed ~8 px
+    /// corner `DWMWCP_ROUND` gave every card. The card's own background is
+    /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        unsafe {
-            use windows::Win32::Graphics::Dwm::{
-                DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            };
-            let preference = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
-                window,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &preference as *const _ as *const c_void,
-                std::mem::size_of_val(&preference) as u32,
-            );
-        }
+        crate::card_shell::attach(window, crate::theme::CARD);
     }
 
     fn subclass(control: HWND) {
@@ -1392,19 +1385,7 @@ mod win32 {
         fill_colour: eframe::egui::Color32,
         edge: eframe::egui::Color32,
     ) {
-        unsafe {
-            let brush = CreateSolidBrush(rgb(fill_colour));
-            let pen = CreatePen(PS_SOLID, 1, rgb(edge));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let r = scale(radius) * 2;
-            let rc = dev(at);
-            let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        crate::win32_draw::aa_round_rect(hdc, dev(at), scale(radius), rgb(fill_colour), Some((rgb(edge), 1)));
     }
 
     /// One run of text, through `win32_draw::draw_text` -- the crate's one

@@ -95,8 +95,9 @@
 //!
 //! So this window is the panel, and the panel's own chrome -- `border: 1px
 //! solid #d7d3d3; border-radius: 10px; box-shadow: 0 8px 20px rgba(45,43,43,
-//! .12)` -- is the frameless popup's: `DWMWCP_ROUND` and the shadow Windows
-//! hangs off a topmost popup, exactly as the other two Win32 cards get theirs.
+//! .12)` -- is the frameless popup's: [`crate::card_shell`] draws the antialiased
+//! 18 px silhouette, the hairline and the soft shadow, exactly as it does for
+//! every other Win32 card.
 //! Drawing the page as well would mean painting a **second, dead password field
 //! on top of the real one**, with a caret that blinks in no buffer, on the one
 //! surface in this app whose whole subject is a password. The page's one piece
@@ -1792,9 +1793,8 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC,
-        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, Ellipse,
-        EndPaint, FillRect, GetDC, GetDeviceCaps, GetStockObject, InvalidateRect, NULL_BRUSH,
-        Polyline, ReleaseDC, RoundRect,
+        CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, EndPaint,
+        FillRect, GetDC, GetDeviceCaps, InvalidateRect, Polyline, ReleaseDC,
         SelectObject, SetBkMode, SetTextColor, CLEARTYPE_QUALITY,
         DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT,
         DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT, LOGFONTW,
@@ -2788,18 +2788,13 @@ mod win32 {
     /// return arrow on the footer's primary -- the same idiom, the other way
     /// round.
     fn paint_regenerate(hdc: HDC, rc: RECT, fonts: &Fonts, skin: ButtonSkin, live: bool) {
-        unsafe {
-            let brush = CreateSolidBrush(skin.fill);
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), skin.border.unwrap_or(skin.fill));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let r = scale(super::RADIUS) * 2;
-            let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        crate::win32_draw::aa_round_rect(
+            hdc,
+            rc,
+            scale(super::RADIUS),
+            skin.fill,
+            skin.border.map(|colour| (colour, scale(1).max(1))),
+        );
 
         let dpi = DPI_PERCENT.load(Ordering::SeqCst);
         let lane = draw_hint_chip(hdc, rc, REGENERATE_SHORTCUT, fonts.hint, dpi);
@@ -2899,19 +2894,12 @@ mod win32 {
         Some(h)
     }
 
+    /// Hands the card's corners to [`crate::card_shell`]: the design's 18 px
+    /// radius, antialiased, with its soft shadow, in place of the fixed ~8 px
+    /// corner `DWMWCP_ROUND` gave every card. The card's own background is
+    /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        unsafe {
-            use windows::Win32::Graphics::Dwm::{
-                DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            };
-            let preference = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
-                window,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &preference as *const _ as *const c_void,
-                std::mem::size_of_val(&preference) as u32,
-            );
-        }
+        crate::card_shell::attach(window, crate::theme::CARD);
     }
 
     /// Takes over a control's painting without losing the focus and keyboard
@@ -3737,27 +3725,20 @@ mod win32 {
         fill_colour: eframe::egui::Color32,
         border: Option<(i32, eframe::egui::Color32)>,
     ) {
-        unsafe {
-            let brush = CreateSolidBrush(rgb(fill_colour));
-            let (width, colour) = border.unwrap_or((1, fill_colour));
-            let pen = CreatePen(PS_SOLID, scale(width).max(1), rgb(colour));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let r = scale(radius) * 2;
-            let _ = RoundRect(
-                hdc,
-                scale(at.x),
-                scale(at.y),
-                scale(at.right()),
-                scale(at.bottom()),
-                r,
-                r,
-            );
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        // Antialiased: `win32_draw::aa_round_rect` mixes the edge with what is
+        // already under it, where `RoundRect` stair-stepped it.
+        crate::win32_draw::aa_round_rect(
+            hdc,
+            RECT {
+                left: scale(at.x),
+                top: scale(at.y),
+                right: scale(at.right()),
+                bottom: scale(at.bottom()),
+            },
+            scale(radius),
+            rgb(fill_colour),
+            border.map(|(width, colour)| (rgb(colour), scale(width).max(1))),
+        );
     }
 
     /// [`rounded`] for a rectangle that is **already in device pixels** -- and
@@ -3776,19 +3757,13 @@ mod win32 {
         fill_colour: eframe::egui::Color32,
         border: Option<(i32, eframe::egui::Color32)>,
     ) {
-        unsafe {
-            let brush = CreateSolidBrush(rgb(fill_colour));
-            let (width, colour) = border.unwrap_or((1, fill_colour));
-            let pen = CreatePen(PS_SOLID, width.max(1), rgb(colour));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let r = radius.max(0) * 2;
-            let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, r, r);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        crate::win32_draw::aa_round_rect(
+            hdc,
+            rc,
+            radius,
+            rgb(fill_colour),
+            border.map(|(width, colour)| (rgb(colour), width.max(1))),
+        );
     }
 
     /// A filled circle in DEVICE pixels, optionally stroked -- the slider's
@@ -3804,17 +3779,14 @@ mod win32 {
         fill_colour: eframe::egui::Color32,
         border: Option<eframe::egui::Color32>,
     ) {
-        unsafe {
-            let brush = CreateSolidBrush(rgb(fill_colour));
-            let pen = CreatePen(PS_SOLID, scale(1).max(1), rgb(border.unwrap_or(fill_colour)));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let _ = Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        crate::win32_draw::aa_circle(
+            hdc,
+            cx,
+            cy,
+            r,
+            rgb(fill_colour),
+            border.map(|colour| (rgb(colour), scale(1).max(1))),
+        );
     }
 
     /// A rounded OUTLINE in logical coordinates, with nothing filled inside it.
@@ -3825,24 +3797,18 @@ mod win32 {
     /// The hollow brush is a STOCK object and is therefore selected out and
     /// never deleted.
     fn outline(hdc: HDC, at: Box2, radius: i32, width: i32, colour: eframe::egui::Color32) {
-        unsafe {
-            let pen = CreatePen(PS_SOLID, scale(width).max(1), rgb(colour));
-            let old_pen = SelectObject(hdc, pen);
-            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            let r = scale(radius).max(0) * 2;
-            let _ = RoundRect(
-                hdc,
-                scale(at.x),
-                scale(at.y),
-                scale(at.right()),
-                scale(at.bottom()),
-                r,
-                r,
-            );
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(pen);
-        }
+        crate::win32_draw::aa_round_ring(
+            hdc,
+            RECT {
+                left: scale(at.x),
+                top: scale(at.y),
+                right: scale(at.right()),
+                bottom: scale(at.bottom()),
+            },
+            scale(radius),
+            rgb(colour),
+            scale(width).max(1),
+        );
     }
 
     /// How every single-line run on this card is laid out in its box.

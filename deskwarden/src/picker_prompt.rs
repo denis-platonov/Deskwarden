@@ -1538,12 +1538,12 @@ mod win32 {
     use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
     use windows::Win32::Graphics::Gdi::{
         AlphaBlend, BeginPaint, BitBlt, CreateCompatibleBitmap,
-        CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreatePen, CreateSolidBrush,
+        CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW, CreateSolidBrush,
         DeleteDC, DeleteObject, EndPaint, FillRect, GetDC, GetDeviceCaps,
-        InvalidateRect, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA,
+        InvalidateRect, ReleaseDC, SelectObject, SetBkMode, SetTextColor, AC_SRC_ALPHA,
         AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, CLEARTYPE_QUALITY,
         DIB_RGB_COLORS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL,
-        HBITMAP, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, PS_SOLID, SRCCOPY,
+        HBITMAP, HBRUSH, HDC, HFONT, LOGFONTW, LOGPIXELSX, PAINTSTRUCT, SRCCOPY,
         SetBkColor, TRANSPARENT,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
@@ -2987,21 +2987,12 @@ mod win32 {
         Some(h)
     }
 
+    /// Hands the card's corners to [`crate::card_shell`]: the design's 18 px
+    /// radius, antialiased, with its soft shadow, in place of the fixed ~8 px
+    /// corner `DWMWCP_ROUND` gave every card. The card's own background is
+    /// `theme::CARD`, which is what the shell paints under it.
     fn round_corners(window: HWND) {
-        // The same `DWMWCP_ROUND` the login window's frameless chrome asks
-        // for, so every surface in this app has the same silhouette.
-        unsafe {
-            use windows::Win32::Graphics::Dwm::{
-                DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
-            };
-            let preference = DWMWCP_ROUND;
-            let _ = DwmSetWindowAttribute(
-                window,
-                DWMWA_WINDOW_CORNER_PREFERENCE,
-                &preference as *const _ as *const c_void,
-                std::mem::size_of_val(&preference) as u32,
-            );
-        }
+        crate::card_shell::attach(window, crate::theme::CARD);
     }
 
     /// Takes over a control's painting without losing the focus and keyboard
@@ -3564,22 +3555,29 @@ mod win32 {
     /// **The *Search the vault* row's icon**, drawn in its tile: a magnifier in
     /// the muted ink on the neutral tile, 2 px stroke (design icon weight).
     fn draw_search_glyph(hdc: HDC, tile: RECT, dpi: i32) {
-        use windows::Win32::Graphics::Gdi::{
-            CreatePen, Ellipse, GetStockObject, LineTo, MoveToEx, SelectObject, NULL_BRUSH, PS_SOLID,
-        };
+        use windows::Win32::Graphics::Gdi::{CreatePen, LineTo, MoveToEx, SelectObject, PS_SOLID};
         let side = tile.right - tile.left;
         let u = |v: i32| v * dpi / 100;
         let (cx, cy) = (tile.left + side * 9 / 20, tile.top + side * 9 / 20);
         let r = u(7);
+        // The lens is an antialiased ring: the muted ink as the edge, the
+        // neutral tile's own colour inside it. The old pen was centred on the
+        // radius, so the ring's outer edge is one half-stroke further out.
+        let stroke = u(2).max(1);
+        crate::win32_draw::aa_circle(
+            hdc,
+            cx,
+            cy,
+            r + stroke / 2,
+            rgb(panel_draw::HELP_FILL),
+            Some((rgb(crate::theme::TEXT_MUTED), stroke)),
+        );
         unsafe {
-            let pen = CreatePen(PS_SOLID, u(2).max(1), rgb(crate::theme::TEXT_MUTED));
+            let pen = CreatePen(PS_SOLID, stroke, rgb(crate::theme::TEXT_MUTED));
             let old_pen = SelectObject(hdc, pen);
-            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-            let _ = Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
             let from = (cx + r * 7 / 10, cy + r * 7 / 10);
             let _ = MoveToEx(hdc, from.0, from.1, None);
             let _ = LineTo(hdc, from.0 + u(6), from.1 + u(6));
-            SelectObject(hdc, old_brush);
             SelectObject(hdc, old_pen);
             let _ = DeleteObject(pen);
         }
@@ -3607,20 +3605,20 @@ mod win32 {
         fill_colour: eframe::egui::Color32,
         border: Option<(i32, eframe::egui::Color32)>,
     ) {
-        unsafe {
-            let brush = CreateSolidBrush(rgb(fill_colour));
-            let (width, colour) = border.unwrap_or((1, fill_colour));
-            let pen = CreatePen(PS_SOLID, scale(width).max(1), rgb(colour));
-            let old_brush = SelectObject(hdc, brush);
-            let old_pen = SelectObject(hdc, pen);
-            let r = scale(radius) * 2;
-            let _ =
-                RoundRect(hdc, scale(at.x), scale(at.y), scale(at.right()), scale(at.bottom()), r, r);
-            SelectObject(hdc, old_brush);
-            SelectObject(hdc, old_pen);
-            let _ = DeleteObject(brush);
-            let _ = DeleteObject(pen);
-        }
+        // Antialiased: `win32_draw::aa_round_rect` mixes the edge with what is
+        // already under it, where `RoundRect` stair-stepped it.
+        crate::win32_draw::aa_round_rect(
+            hdc,
+            RECT {
+                left: scale(at.x),
+                top: scale(at.y),
+                right: scale(at.right()),
+                bottom: scale(at.bottom()),
+            },
+            scale(radius),
+            rgb(fill_colour),
+            border.map(|(width, colour)| (rgb(colour), scale(width).max(1))),
+        );
     }
 
     /// One run of text, left-aligned and vertically centred in `at`.
