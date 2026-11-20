@@ -45,6 +45,11 @@ pub mod below_cut;
 /// does that, and falls back to the wordmark whenever this module has no
 /// answer for a brand.
 pub mod brand_mark;
+/// The antialiased 18 px silhouette, hairline and soft shadow of every bare-Win32
+/// fill-time card: a click-through layered window slaved to the card, painted
+/// once per size. **It does create a window**, and says so; see its docs and
+/// `foreground`'s classification.
+pub mod card_shell;
 pub mod breach;
 /// The whole-vault breach scan the Preferences page drives: one lookup per
 /// distinct password, bounded concurrency, failures counted out loud, and

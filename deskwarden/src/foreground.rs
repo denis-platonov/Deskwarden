@@ -1449,7 +1449,7 @@ mod tests {
         /// does not open a window" is a decision someone has to make; a module
         /// missing from BOTH lists fails below rather than being quietly
         /// unguarded.
-        const OPENS_NO_WINDOW: [&str; 97] = [
+        const OPENS_NO_WINDOW: [&str; 98] = [
             "accounts",
             // The API-key sign-in stage. It draws into `app_window`'s one
             // window, exactly as `second_factor_ui` and `login_ui`'s frame do
@@ -1517,6 +1517,23 @@ mod tests {
             // pure data with no I/O. The panes that draw what it returns are
             // `detail` and `item_list`, and neither is this module.
             "card_brand",
+            // **This one DOES create a window, and is classified here on
+            // purpose rather than by accident.** It is the decoration under
+            // each bare-Win32 card: a `WS_EX_LAYERED | WS_EX_TRANSPARENT |
+            // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW` popup carrying the card's
+            // antialiased 18 px silhouette, its hairline and its soft shadow,
+            // painted once per size with `UpdateLayeredWindow`. It is not a
+            // surface: it holds no content, takes no input (`HTTRANSPARENT`)
+            // and no focus (`MA_NOACTIVATE`), has no title, and exists only
+            // between a card's creation and its `WM_DESTROY`, slaved to it --
+            // placed directly below it in z-order, shown and hidden with it.
+            // The raise guard in this file protects windows a user types into
+            // from opening behind something; a click-through shadow cannot,
+            // and the card it is slaved to IS in `OPENS_WINDOWS`, raised and
+            // capture-excluded, with the shell mirroring the exclusion. Its
+            // own pins (the `card_shell` tests that read its source)
+            // hold the styles that make it harmless.
+            "card_shell",
             // The network marks: a lookup returning `include_bytes!`-ed PNG
             // bytes. It hands a picture to whoever is painting; the tile and
             // the detail pane draw it, and neither is this module.

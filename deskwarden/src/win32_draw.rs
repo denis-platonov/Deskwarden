@@ -14,7 +14,9 @@ use std::ffi::c_void;
 use std::sync::OnceLock;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE};
 use windows::Win32::Graphics::Gdi::{
-    AddFontMemResourceEx, CreateFontIndirectW, CreatePen, CreateSolidBrush, DeleteObject,
+    AddFontMemResourceEx, BitBlt, CreateCompatibleDC, CreateDIBSection, CreateFontIndirectW,
+    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    DIB_RGB_COLORS, SRCCOPY,
     DrawTextW, Ellipse, GetCurrentObject, GetObjectW, GetStockObject,
     GetTextExtentPoint32W, HBRUSH, HGDIOBJ, NULL_BRUSH, Polygon, Polyline, RoundRect,
     ScreenToClient, SelectObject, SetBkMode, SetTextCharacterExtra, SetTextColor, DRAW_TEXT_FORMAT,
@@ -613,18 +615,254 @@ impl ButtonSkin {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Antialiased shapes.
+//
+// **GDI's `RoundRect` and `Ellipse` do not antialias**, and every rounded thing
+// on these cards -- a row's wash, an avatar tile, the `Enter` badge, a pill, a
+// button, the done check's disc -- was one, so every edge was a visible stair.
+// Direct2D and GDI+ would smooth them and were measured at 53.85 MB against
+// this window's 1.79 MB, so the cards draw their own: the shape is composed
+// per pixel, in a 32 bpp DIB section, from its signed distance, and blitted
+// back. Plain GDI, no new crate, and it works on a memory DC and a window DC
+// alike.
+// ---------------------------------------------------------------------------
+
+/// The signed distance from the point `(px, py)` to the edge of the rounded
+/// rectangle `[0, w] x [0, h]` whose corners have radius `r`: negative inside,
+/// zero on the edge, positive outside. `r` is clamped to what fits. Pure.
+pub fn rounded_rect_sdf(px: f32, py: f32, w: f32, h: f32, r: f32) -> f32 {
+    let r = r.clamp(0.0, (w.min(h) / 2.0).max(0.0));
+    let qx = (px - w / 2.0).abs() - (w / 2.0 - r);
+    let qy = (py - h / 2.0).abs() - (h / 2.0 - r);
+    let outside = (qx.max(0.0) * qx.max(0.0) + qy.max(0.0) * qy.max(0.0)).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    outside + inside - r
+}
+
+/// How much of a pixel whose centre is `d` from the edge the shape covers: all
+/// of it a half pixel inside, none a half pixel outside, linear between. Pure.
+pub fn coverage(d: f32) -> f32 {
+    (0.5 - d).clamp(0.0, 1.0)
+}
+
+fn channels(c: COLORREF) -> [u8; 3] {
+    [(c.0 & 0xff) as u8, ((c.0 >> 8) & 0xff) as u8, ((c.0 >> 16) & 0xff) as u8]
+}
+
+fn mix(under: [f32; 3], over: [u8; 3], a: f32) -> [f32; 3] {
+    [
+        under[0] + (over[0] as f32 - under[0]) * a,
+        under[1] + (over[1] as f32 - under[1]) * a,
+        under[2] + (over[2] as f32 - under[2]) * a,
+    ]
+}
+
+/// Paints a rounded rectangle into `pixels` -- `w` x `h`, one `0x00RRGGBB` per
+/// pixel -- over whatever is already there: `fill` inside, and `edge`
+/// (`(colour, width)` in pixels, drawn INSIDE the outline) around it. Each
+/// pixel is blended by [`coverage`] of its centre's [`rounded_rect_sdf`], so the
+/// outline is antialiased; a pixel the shape does not touch is left alone.
+/// Pure.
+pub fn blend_round_rect(
+    pixels: &mut [u32],
+    w: i32,
+    h: i32,
+    radius: f32,
+    fill: [u8; 3],
+    edge: Option<([u8; 3], f32)>,
+) {
+    if w <= 0 || h <= 0 || pixels.len() < (w * h) as usize {
+        return;
+    }
+    let solid = ((fill[0] as u32) << 16) | ((fill[1] as u32) << 8) | fill[2] as u32;
+    for y in 0..h {
+        for x in 0..w {
+            let d = rounded_rect_sdf(x as f32 + 0.5, y as f32 + 0.5, w as f32, h as f32, radius);
+            let outer = coverage(d);
+            if outer <= 0.0 {
+                continue;
+            }
+            let at = (y * w + x) as usize;
+            let inner = match edge {
+                Some((_, width)) => coverage(d + width),
+                None => outer,
+            };
+            if outer >= 1.0 && inner >= 1.0 {
+                pixels[at] = solid;
+                continue;
+            }
+            let p = pixels[at];
+            let mut c = [((p >> 16) & 0xff) as f32, ((p >> 8) & 0xff) as f32, (p & 0xff) as f32];
+            match edge {
+                Some((colour, _)) => {
+                    c = mix(c, colour, outer);
+                    c = mix(c, fill, inner);
+                }
+                None => c = mix(c, fill, outer),
+            }
+            pixels[at] =
+                ((c[0].round() as u32) << 16) | ((c[1].round() as u32) << 8) | c[2].round() as u32;
+        }
+    }
+}
+
+/// Paints only the OUTLINE of a rounded rectangle into `pixels`: `colour`, `width`
+/// pixels thick, drawn inside the outline, with the interior left exactly as it
+/// was. [`blend_round_rect`]'s hollow sibling, for a focus ring that must not
+/// wipe out what it is marking. Pure.
+pub fn blend_round_ring(pixels: &mut [u32], w: i32, h: i32, radius: f32, colour: [u8; 3], width: f32) {
+    if w <= 0 || h <= 0 || pixels.len() < (w * h) as usize {
+        return;
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let d = rounded_rect_sdf(x as f32 + 0.5, y as f32 + 0.5, w as f32, h as f32, radius);
+            // The ring is what the outer shape covers and the inner one does not.
+            let a = (coverage(d) - coverage(d + width)).max(0.0);
+            if a <= 0.0 {
+                continue;
+            }
+            let at = (y * w + x) as usize;
+            let p = pixels[at];
+            let c = mix(
+                [((p >> 16) & 0xff) as f32, ((p >> 8) & 0xff) as f32, (p & 0xff) as f32],
+                colour,
+                a,
+            );
+            pixels[at] =
+                ((c[0].round() as u32) << 16) | ((c[1].round() as u32) << 8) | c[2].round() as u32;
+        }
+    }
+}
+
+/// Runs `paint` over the `rc` region of `hdc` as a `w` x `h` array of
+/// `0x00RRGGBB` pixels: the destination is copied into a DIB section, `paint`
+/// edits it, and it is copied back. `false` if any step was refused, in which
+/// case the caller falls back. The memory DC and the bitmap are deleted on every
+/// path out.
+fn with_pixels(hdc: HDC, rc: RECT, paint: impl FnOnce(&mut [u32], i32, i32)) -> bool {
+    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
+    if w <= 0 || h <= 0 {
+        return true;
+    }
+    unsafe {
+        let mem = CreateCompatibleDC(hdc);
+        let bmi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: -h,
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: BI_RGB.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits: *mut c_void = std::ptr::null_mut();
+        let dib = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0);
+        let mut done = false;
+        if let Ok(dib) = dib {
+            if !bits.is_null() && !mem.is_invalid() {
+                let old = SelectObject(mem, dib);
+                if BitBlt(mem, 0, 0, w, h, hdc, rc.left, rc.top, SRCCOPY).is_ok() {
+                    let pixels = std::slice::from_raw_parts_mut(bits as *mut u32, (w * h) as usize);
+                    paint(pixels, w, h);
+                    done = BitBlt(hdc, rc.left, rc.top, w, h, mem, 0, 0, SRCCOPY).is_ok();
+                }
+                SelectObject(mem, old);
+            }
+            let _ = DeleteObject(dib);
+        }
+        if !mem.is_invalid() {
+            let _ = DeleteDC(mem);
+        }
+        done
+    }
+}
+
+/// **An antialiased rounded outline** in DEVICE pixels, with the inside left
+/// alone: the focus ring. See [`blend_round_ring`].
+pub fn aa_round_ring(hdc: HDC, rc: RECT, radius: i32, colour: COLORREF, width: i32) {
+    let done = with_pixels(hdc, rc, |pixels, w, h| {
+        blend_round_ring(pixels, w, h, radius.max(0) as f32, channels(colour), width.max(1) as f32);
+    });
+    if !done {
+        // The hard-edged fallback: a hollow stock brush, so nothing is wiped.
+        unsafe {
+            let pen = CreatePen(PS_SOLID, width.max(1), colour);
+            let old_pen = SelectObject(hdc, pen);
+            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let d = radius.max(0) * 2;
+            let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, d, d);
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(pen);
+        }
+    }
+}
+
+/// **An antialiased rounded rectangle** in DEVICE pixels: `fill` inside,
+/// `edge` -- `(colour, width in pixels)` -- drawn just inside the outline. A
+/// circle is `radius = size / 2`. Same contract as the `RoundRect` it replaces,
+/// except that `radius` is the corner radius and not the ellipse's diameter.
+///
+/// The destination under the shape is copied into a DIB section, blended, and
+/// copied back, so the soft edge is mixed with what is really there. Every GDI
+/// object made here -- the memory DC and the bitmap -- is deleted before
+/// returning: this runs in the daemon's repaint path, and a leaked handle there
+/// exhausts the table. If the DIB cannot be made, the shape falls back to the
+/// hard-edged `RoundRect`, so a repaint never loses it.
+pub fn aa_round_rect(hdc: HDC, rc: RECT, radius: i32, fill: COLORREF, edge: Option<(COLORREF, i32)>) {
+    let done = with_pixels(hdc, rc, |pixels, w, h| {
+        blend_round_rect(
+            pixels,
+            w,
+            h,
+            radius.max(0) as f32,
+            channels(fill),
+            edge.map(|(colour, width)| (channels(colour), width.max(1) as f32)),
+        );
+    });
+    if !done {
+        hard_round_rect(hdc, rc, radius, fill, edge.map(|(colour, _)| colour));
+    }
+}
+
+/// The hard-edged `RoundRect` [`aa_round_rect`] falls back to.
+fn hard_round_rect(hdc: HDC, rc: RECT, radius: i32, fill: COLORREF, edge: Option<COLORREF>) {
+    unsafe {
+        let brush = CreateSolidBrush(fill);
+        let pen = CreatePen(PS_SOLID, 1, edge.unwrap_or(fill));
+        let old_brush = SelectObject(hdc, brush);
+        let old_pen = SelectObject(hdc, pen);
+        let d = radius.max(0) * 2;
+        let _ = RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, d, d);
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        let _ = DeleteObject(brush);
+        let _ = DeleteObject(pen);
+    }
+}
+
+/// **An antialiased disc** centred on `(cx, cy)`, radius `r` DEVICE pixels.
+pub fn aa_circle(hdc: HDC, cx: i32, cy: i32, r: i32, fill: COLORREF, edge: Option<(COLORREF, i32)>) {
+    let r = r.max(0);
+    aa_round_rect(hdc, RECT { left: cx - r, top: cy - r, right: cx + r, bottom: cy + r }, r, fill, edge);
+}
+
 /// Paint one button into `hdc`. `radius` is the corner radius in device
 /// pixels -- the caller's, since this module knows nothing about DPI
 /// scaling; the unlock prompt already picks one for its buttons and passes
 /// the scaled value in.
 ///
-/// `RoundRect` does not antialias, so the corners are hard. That is the
-/// accepted cost of GDI: Direct2D would smooth them and was measured at
-/// 53.85 MB against this window's 1.79 MB.
+/// The corners are antialiased by [`aa_round_rect`]: Direct2D would also
+/// smooth them but was measured at 53.85 MB against this window's 1.79 MB.
 ///
-/// Every GDI object created here (brush, pen, font selection) is restored
-/// and deleted before returning -- a leaked `HBRUSH` in a repaint path
-/// exhausts the handle table over a long-running daemon.
+/// Every GDI object created here (the shape's DIB and memory DC, the font
+/// selection) is restored and deleted before returning -- a leaked handle in
+/// a repaint path exhausts the handle table over a long-running daemon.
 pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonSkin, radius: i32) {
     draw_button_with_shortcut(hdc, rect, label, font, skin, radius, None, 100);
 }
@@ -641,13 +879,12 @@ pub fn draw_button(hdc: HDC, rect: RECT, label: &str, font: HFONT, skin: ButtonS
 /// `hint` of `None` is exactly [`draw_button`], which is why that function is
 /// this one with the argument left out rather than a second copy of the pill.
 ///
-/// `RoundRect` does not antialias, so the corners are hard. That is the
-/// accepted cost of GDI: Direct2D would smooth them and was measured at
-/// 53.85 MB against this window's 1.79 MB.
+/// The corners are antialiased by [`aa_round_rect`]: Direct2D would also
+/// smooth them but was measured at 53.85 MB against this window's 1.79 MB.
 ///
-/// Every GDI object created here (brush, pen, font selection) is restored
-/// and deleted before returning -- a leaked `HBRUSH` in a repaint path
-/// exhausts the handle table over a long-running daemon.
+/// Every GDI object created here (the shape's DIB and memory DC, the font
+/// selection) is restored and deleted before returning -- a leaked handle in
+/// a repaint path exhausts the handle table over a long-running daemon.
 // GDI draw helper: geometry and colour arguments.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_button_with_shortcut(
@@ -660,20 +897,8 @@ pub fn draw_button_with_shortcut(
     hint: Option<(&str, HFONT)>,
     scale: i32,
 ) {
+    aa_round_rect(hdc, rect, radius, skin.fill, skin.border.map(|colour| (colour, 1)));
     unsafe {
-        let brush = CreateSolidBrush(skin.fill);
-        let pen = match skin.border {
-            Some(colour) => CreatePen(PS_SOLID, 1, colour),
-            None => CreatePen(PS_SOLID, 1, skin.fill),
-        };
-        let old_brush = SelectObject(hdc, brush);
-        let old_pen = SelectObject(hdc, pen);
-        let _ = RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
-
         // The chip first, so the label below is centred in what is left.
         let hint_lane = match hint {
             Some((text, hint_font)) => draw_hint_chip(hdc, rect, text, hint_font, scale),
@@ -831,17 +1056,14 @@ pub fn draw_hint_chip(hdc: HDC, rect: RECT, hint: &str, font: HFONT, scale: i32)
         let ChipLane { left, right, lane } = hint_chip_lane(rect, size.cx, scale);
         let h = px(crate::theme::CHIP_HEIGHT);
         let top = rect.top + ((rect.bottom - rect.top) - h) / 2;
-        let radius = px(crate::theme::CHIP_RADIUS) * 2;
-
-        let brush = CreateSolidBrush(rgb(crate::theme::CANVAS));
-        let pen = CreatePen(PS_SOLID, 1, rgb(crate::theme::BORDER_STRONG));
-        let old_brush = SelectObject(hdc, brush);
-        let old_pen = SelectObject(hdc, pen);
-        let _ = RoundRect(hdc, left, top, right, top + h, radius, radius);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
+        let radius = px(crate::theme::CHIP_RADIUS);
+        aa_round_rect(
+            hdc,
+            RECT { left, top, right, bottom: top + h },
+            radius,
+            rgb(crate::theme::CANVAS),
+            Some((rgb(crate::theme::BORDER_STRONG), 1)),
+        );
 
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, rgb(crate::theme::TEXT_FAINT));
@@ -1046,21 +1268,8 @@ pub fn draw_button_with_return(
     with_return: bool,
     scale: i32,
 ) {
+    aa_round_rect(hdc, rect, radius, skin.fill, skin.border.map(|colour| (colour, 1)));
     unsafe {
-        let brush = CreateSolidBrush(skin.fill);
-        let pen = match skin.border {
-            Some(colour) => CreatePen(PS_SOLID, 1, colour),
-            None => CreatePen(PS_SOLID, 1, skin.fill),
-        };
-        let old_brush = SelectObject(hdc, brush);
-        let old_pen = SelectObject(hdc, pen);
-        let _ =
-            RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius * 2, radius * 2);
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        let _ = DeleteObject(brush);
-        let _ = DeleteObject(pen);
-
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, skin.text);
         let old_font = SelectObject(hdc, font);
@@ -1516,6 +1725,170 @@ pub fn draw_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the antialiased shapes (pure half) ---------------------------------
+
+    #[test]
+    fn the_distance_is_negative_inside_zero_on_the_edge_and_positive_outside() {
+        // 40 x 20, radius 6.
+        assert!(rounded_rect_sdf(20.0, 10.0, 40.0, 20.0, 6.0) < -9.0, "the centre is 10 from the top");
+        assert!((rounded_rect_sdf(0.0, 10.0, 40.0, 20.0, 6.0)).abs() < 1e-4, "the left edge");
+        assert!((rounded_rect_sdf(20.0, 0.0, 40.0, 20.0, 6.0)).abs() < 1e-4, "the top edge");
+        assert!(rounded_rect_sdf(-3.0, 10.0, 40.0, 20.0, 6.0) > 2.9, "3 outside the left edge");
+        // The corner is rounded: the bounding box's own corner is OUTSIDE by
+        // radius * (sqrt 2 - 1).
+        let d = rounded_rect_sdf(0.0, 0.0, 40.0, 20.0, 6.0);
+        assert!((d - 6.0 * (2f32.sqrt() - 1.0)).abs() < 1e-3, "{d}");
+        // A radius too big for the rectangle is clamped to a pill.
+        let pill = rounded_rect_sdf(10.0, 10.0, 40.0, 20.0, 999.0);
+        assert!((pill - (-10.0)).abs() < 1e-3, "{pill}");
+    }
+
+    #[test]
+    fn coverage_is_a_one_pixel_ramp_centred_on_the_edge() {
+        assert_eq!(coverage(-0.5), 1.0);
+        assert_eq!(coverage(0.0), 0.5);
+        assert_eq!(coverage(0.5), 0.0);
+        assert_eq!(coverage(-9.0), 1.0);
+        assert_eq!(coverage(9.0), 0.0);
+        assert!((coverage(0.25) - 0.25).abs() < 1e-6);
+    }
+
+    fn grid(w: i32, h: i32, colour: u32) -> Vec<u32> {
+        vec![colour; (w * h) as usize]
+    }
+
+    #[test]
+    fn a_rounded_rect_is_antialiased_at_its_corner_and_solid_inside() {
+        let (w, h) = (40, 30);
+        let mut px = grid(w, h, 0x00ff_ffff);
+        blend_round_rect(&mut px, w, h, 10.0, [0x10, 0x20, 0x30], None);
+        assert_eq!(px[(15 * w + 20) as usize], 0x0010_2030, "the middle is the fill");
+        // The very corner pixel is outside the arc and so untouched.
+        assert_eq!(px[0], 0x00ff_ffff);
+        // The arc has many in-between levels, which RoundRect never had.
+        let mut levels = std::collections::BTreeSet::new();
+        for y in 0..10 {
+            for x in 0..10 {
+                levels.insert(px[(y * w + x) as usize]);
+            }
+        }
+        assert!(levels.len() >= 6, "{} distinct levels along the arc", levels.len());
+        // A straight edge is crisp: a pixel row of the rect is one colour.
+        assert_eq!(px[(15 * w) as usize], 0x0010_2030, "the left edge column is full fill");
+    }
+
+    #[test]
+    fn an_edge_is_drawn_inside_the_outline_and_blends_into_the_fill() {
+        let (w, h) = (40, 30);
+        let mut px = grid(w, h, 0x00ff_ffff);
+        blend_round_rect(&mut px, w, h, 8.0, [0, 0, 0xff], Some(([0xff, 0, 0], 1.0)));
+        // Straight edges: the outer pixel is the edge colour, the next is fill.
+        assert_eq!(px[(15 * w) as usize], 0x00ff_0000, "the outline pixel");
+        assert_eq!(px[(15 * w + 1) as usize], 0x0000_00ff, "the fill beside it");
+        assert_eq!(px[(15 * w + 20) as usize], 0x0000_00ff);
+    }
+
+    #[test]
+    fn a_ring_paints_only_the_outline_and_leaves_the_inside_alone() {
+        let (w, h) = (40, 30);
+        let mut px = grid(w, h, 0x00ab_cdef);
+        blend_round_ring(&mut px, w, h, 8.0, [0xff, 0, 0], 2.0);
+        assert_eq!(px[(15 * w) as usize], 0x00ff_0000, "the outline pixel");
+        assert_eq!(px[(15 * w + 1) as usize], 0x00ff_0000, "the second pixel of a 2 px ring");
+        assert_eq!(px[(15 * w + 2) as usize], 0x00ab_cdef, "inside the ring is what was there");
+        assert_eq!(px[(15 * w + 20) as usize], 0x00ab_cdef);
+        assert_eq!(px[0], 0x00ab_cdef, "outside the arc is untouched");
+    }
+
+    #[test]
+    fn a_circle_is_a_rounded_rect_of_half_its_side() {
+        let (w, h) = (20, 20);
+        let mut px = grid(w, h, 0);
+        blend_round_rect(&mut px, w, h, 10.0, [255, 255, 255], None);
+        assert_eq!(px[(10 * w + 10) as usize], 0x00ff_ffff);
+        assert_eq!(px[0], 0, "the bounding box's corner is outside the disc");
+        // Symmetric in both axes.
+        for y in 0..h {
+            for x in 0..w {
+                assert_eq!(px[(y * w + x) as usize], px[((h - 1 - y) * w + (w - 1 - x)) as usize]);
+            }
+        }
+    }
+
+    #[test]
+    fn a_degenerate_rect_or_buffer_paints_nothing() {
+        let mut px = grid(4, 4, 7);
+        blend_round_rect(&mut px, 0, 4, 2.0, [1, 2, 3], None);
+        blend_round_rect(&mut px, 4, 4, 2.0, [1, 2, 3], None);
+        let mut short = vec![7u32; 3];
+        blend_round_rect(&mut short, 4, 4, 2.0, [1, 2, 3], None);
+        assert!(short.iter().all(|p| *p == 7));
+    }
+
+    /// **No painter in the cards' fill-time path draws a stair-stepped shape.**
+    /// The only `RoundRect` / `Ellipse` calls left in this crate's Win32 cards
+    /// are the fallback inside [`aa_round_rect`], the segmented control's
+    /// hanging cell and the field marks' tiny line-icon circles.
+    #[test]
+    fn the_cards_round_shapes_all_go_through_the_antialiased_painter() {
+        fn code(source: &str) -> String {
+            let production = source.replace("\r\n", "\n");
+            let production = production.split("#[cfg(test)]").next().unwrap().to_string();
+            production
+                .lines()
+                .map(|l| match l.find("//") {
+                    Some(at) => l[..at].to_string(),
+                    None => l.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        for (name, source) in [
+            ("panel_draw", include_str!("panel_draw.rs")),
+            ("picker_prompt", include_str!("picker_prompt.rs")),
+            ("prompt_card", include_str!("prompt_card.rs")),
+            ("locked_card", include_str!("locked_card.rs")),
+            ("notice_card", include_str!("notice_card.rs")),
+            ("save_login_card", include_str!("save_login_card.rs")),
+            ("unlock_prompt", include_str!("unlock_prompt.rs")),
+            ("generate_prompt", include_str!("generate_prompt.rs")),
+        ] {
+            let code = code(source);
+            assert!(!code.contains("RoundRect("), "`{name}` draws a hard-edged RoundRect again");
+            assert!(!code.contains("Ellipse("), "`{name}` draws a hard-edged Ellipse again");
+        }
+        let draw = code(include_str!("win32_draw.rs"));
+        // The two fallbacks (filled, and the hollow ring), the segmented cell's
+        // two (hanging end, one-pixel seam) and the listing row's
+        // square-cornered (radius 0) fill.
+        assert_eq!(draw.matches("RoundRect(").count(), 5, "win32_draw's RoundRect calls: {}", draw.matches("RoundRect(").count());
+        assert!(draw.contains("fn hard_round_rect"));
+        // The shared painters route through the antialiased one.
+        for (name, source) in [("panel_draw", include_str!("panel_draw.rs")), ("win32_draw", include_str!("win32_draw.rs"))] {
+            assert!(code(source).contains("aa_round_rect(") || code(source).contains("aa_circle("), "{name}");
+        }
+        let button = code(include_str!("win32_draw.rs"));
+        assert!(button.matches("aa_round_rect(hdc, rect, radius, skin.fill").count() == 2, "both button painters");
+    }
+
+    /// Every GDI object the painter makes is freed: one DIB, one memory DC.
+    #[test]
+    fn the_antialiased_painter_frees_what_it_makes() {
+        let source = include_str!("win32_draw.rs").replace("\r\n", "\n");
+        let body = source
+            .split("fn with_pixels(")
+            .nth(1)
+            .unwrap()
+            .split("/// **An antialiased rounded outline**")
+            .next()
+            .unwrap();
+        assert_eq!(body.matches("CreateDIBSection(").count(), 1);
+        assert_eq!(body.matches("CreateCompatibleDC(").count(), 1);
+        assert!(body.contains("DeleteObject(dib)"));
+        assert!(body.contains("DeleteDC(mem)"));
+        assert!(body.contains("SelectObject(mem, old)"));
+    }
 
     /// **Down and Up step one row and stop at the ends.**
     ///
