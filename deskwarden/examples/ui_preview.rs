@@ -319,6 +319,14 @@ enum Surface {
     EditNewLogin,
     /// The v2 editor with the avatar menu open.
     EditAvatarMenu,
+    /// **Menus slice**: a form select (a website's match chooser) held open.
+    MenuSelectOpen,
+    /// **Menus slice**: an item row's context menu held open over the list.
+    MenuContextOpen,
+    /// **Menus slice**: a long list scrolled, with the thin floating bar the
+    /// theme gives every `ScrollArea` drawn as it looks with the pointer over
+    /// the list (a still has no pointer, so the idle opacity is lifted to it).
+    ScrolledList,
     /// The v2 editor's sign-in steps, half way through a test.
     EditStepsTesting,
     /// The record composer -- the Send export form and its seed warning.
@@ -989,6 +997,9 @@ const ALL: &[Surface] = &[
     Surface::EditSparseAdding,
     Surface::EditNewLogin,
     Surface::EditAvatarMenu,
+    Surface::MenuSelectOpen,
+    Surface::MenuContextOpen,
+    Surface::ScrolledList,
     Surface::EditStepsTesting,
     Surface::RecordComposer,
     Surface::TotpAddConfirm,
@@ -1145,6 +1156,9 @@ impl Surface {
             Surface::EditSparseAdding => "edit_sparse_adding",
             Surface::EditNewLogin => "edit_new_login",
             Surface::EditAvatarMenu => "edit_avatar_menu",
+            Surface::MenuSelectOpen => "menu_select_open",
+            Surface::MenuContextOpen => "menu_context_open",
+            Surface::ScrolledList => "scrolled_list",
             Surface::EditStepsTesting => "edit_steps_testing",
             Surface::RecordComposer => "record_composer",
             Surface::TotpAddConfirm => "totp_add_confirm",
@@ -1398,6 +1412,9 @@ impl Surface {
             Surface::RecordComposer => egui::vec2(PANE_WIDTH, 900.0),
             Surface::EditSparse => egui::vec2(PANE_WIDTH, PANE_HEIGHT),
             Surface::EditSparseAdding => egui::vec2(PANE_WIDTH, 900.0),
+            Surface::MenuSelectOpen => egui::vec2(PANE_WIDTH, 1180.0),
+            Surface::MenuContextOpen => egui::vec2(LIST_WIDTH + 260.0, PANE_HEIGHT),
+            Surface::ScrolledList => egui::vec2(420.0, 520.0),
             // The v2 editor takes the window under the top bar: the wide
             // window's width less the rail, tall enough for the two columns.
             Surface::EditNewLogin | Surface::EditAvatarMenu | Surface::EditStepsTesting => {
@@ -2230,6 +2247,40 @@ impl eframe::App for Preview {
                 detail_edit::open_avatar_menu(root.ctx());
                 self.draw_pane(root, PaneKind::EditLogin(false))
             }
+            Surface::MenuSelectOpen => {
+                deskwarden::kit::menu::open_select_for_preview(root.ctx(), "(\"website-match\"");
+                self.draw_pane(root, PaneKind::EditWebsites)
+            }
+            Surface::MenuContextOpen => {
+                self.draw_vault_list(root);
+                if let Some(item) = self.fixtures.list.get(1) {
+                    let entries = item_list::menu_entries(item, &self.fixtures.folders, deskwarden::vault_window::sidebar::FilterSource::LiveVault, true);
+                    deskwarden::kit::menu::show_at(
+                        root.ctx(),
+                        egui::Id::new("preview-context-menu"),
+                        egui::pos2(150.0, 190.0),
+                        |ui| {
+                            for entry in &entries {
+                                match entry {
+                                    item_list::MenuEntry::Command(c) => {
+                                        let row = deskwarden::kit::menu::Item::new(&c.label)
+                                            .danger(c.label.starts_with("Delete"))
+                                            .enabled(c.enabled);
+                                        deskwarden::kit::menu::item(ui, row);
+                                    }
+                                    item_list::MenuEntry::MoveToFolder(_) => {
+                                        deskwarden::kit::menu::item(ui, deskwarden::kit::menu::Item::new(item_list::move_to_folder_label()));
+                                    }
+                                    item_list::MenuEntry::Icon(_) => {
+                                        deskwarden::kit::menu::item(ui, deskwarden::kit::menu::Item::new(item_list::icon_label()));
+                                    }
+                                }
+                            }
+                        },
+                    );
+                }
+            }
+            Surface::ScrolledList => draw_scrolled_list(root),
             Surface::EditStepsTesting => {
                 let sequence = self.fixtures.clean_draft.app.as_ref().map(|a| a.sequence.clone()).unwrap_or_default();
                 if !root.ctx().data(|d| d.get_temp::<bool>(egui::Id::new("preview-steps-started")).unwrap_or(false)) {
@@ -5586,4 +5637,30 @@ fn save_png(path: &PathBuf, image: &egui::ColorImage) -> Result<(), Box<dyn std:
     encoder.set_depth(png::BitDepth::Eight);
     encoder.write_header()?.write_image_data(&data)?;
     Ok(())
+}
+
+/// A long list scrolled part-way, in a card, under the theme's scroll bar.
+/// A still has no pointer, so the dormant opacity is lifted to the active one:
+/// the bar as it looks while the pointer is over the list.
+fn draw_scrolled_list(root: &mut egui::Ui) {
+    let p = deskwarden::kit::tokens::palette(root.ctx());
+    egui::CentralPanel::default().frame(egui::Frame::new().fill(p.window_bg).inner_margin(24)).show(root, |ui| {
+        deskwarden::kit::tokens::card_frame(&p, 18).inner_margin(egui::Margin::symmetric(8, 8)).show(ui, |ui| {
+            let scroll = &mut ui.spacing_mut().scroll;
+            scroll.dormant_handle_opacity = scroll.active_handle_opacity;
+            egui::ScrollArea::vertical().max_height(400.0).vertical_scroll_offset(260.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                for i in 0..40 {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 42.0), egui::Sense::hover());
+                    ui.painter().text(
+                        rect.left_center() + egui::vec2(12.0, 0.0),
+                        egui::Align2::LEFT_CENTER,
+                        format!("Row {i}"),
+                        egui::FontId::new(15.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
+                        p.ink,
+                    );
+                }
+            });
+        });
+    });
 }

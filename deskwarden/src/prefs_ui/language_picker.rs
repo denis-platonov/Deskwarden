@@ -14,12 +14,12 @@
 //!   window hands the edit to the daemon, which re-runs [`i18n::init`] for the
 //!   tray and the cards it draws).
 
-use eframe::egui::{self, CornerRadius, Rect, Sense, Ui, Vec2};
+use eframe::egui::{self, Ui, Vec2};
 
 use crate::i18n::{self, Fonts};
 use crate::kit::controls::{self, ButtonKind};
-use crate::kit::icon::{self, glyph};
-use crate::kit::tokens::{self, palette};
+use crate::kit::menu as kit_menu;
+use crate::kit::tokens::palette;
 use crate::settings::Settings;
 use crate::theme;
 
@@ -28,8 +28,7 @@ use crate::theme;
 const EVERY_SCRIPT: [Fonts; 5] =
     [Fonts::Greek, Fonts::ChineseSimplified, Fonts::ChineseTraditional, Fonts::Japanese, Fonts::Korean];
 
-const MENU_WIDTH: f32 = 300.0;
-const ROW_HEIGHT: f32 = 40.0;
+const MENU_WIDTH: f32 = 340.0;
 const MENU_MAX_HEIGHT: f32 = 360.0;
 
 fn open_id() -> egui::Id {
@@ -127,19 +126,15 @@ pub fn language_row(ui: &mut Ui, settings: &mut Settings, title: &str) {
     } else {
         (egui::Align2::RIGHT_TOP, anchor.right_bottom() + Vec2::new(0.0, 8.0))
     };
+    let look = kit_menu::MENU.at_least(MENU_WIDTH);
     let shown = egui::Area::new(area_id())
         .order(egui::Order::Foreground)
         .pivot(pivot)
         .fixed_pos(at)
         .show(&ctx, |ui| {
-            egui::Frame::new()
-                .fill(p.card)
-                .corner_radius(CornerRadius::same(16))
-                .shadow(tokens::card_shadow())
-                .stroke(egui::Stroke::new(1.0, p.hairline))
-                .inner_margin(6)
+            look.frame(&p)
                 .show(ui, |ui| {
-                    ui.set_width(MENU_WIDTH);
+                    ui.set_width(look.content_width());
                     egui::ScrollArea::vertical().max_height(MENU_MAX_HEIGHT).auto_shrink([false, true]).show(ui, |ui| {
                         let system = crate::i18n::t("settings.language_system");
                         if option_row(ui, None, system, "", selected.is_none()) {
@@ -165,38 +160,13 @@ pub fn language_row(ui: &mut Ui, settings: &mut Settings, title: &str) {
     }
 }
 
-/// One option; whether it was clicked this frame.
+/// One option; whether it was clicked this frame. The kit's row, under this
+/// option's own id, with the language's English name as its hint.
 fn option_row(ui: &mut Ui, tag: Option<&str>, name: &str, english: &str, selected: bool) -> bool {
-    let p = palette(ui.ctx());
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(MENU_WIDTH - 12.0, ROW_HEIGHT), Sense::click());
-    let _ = ui.interact(rect, option_id(tag), Sense::hover());
-    if selected {
-        ui.painter().rect_filled(rect, CornerRadius::same(11), p.blue_wash);
-    } else if response.hovered() {
-        ui.painter().rect_filled(rect, CornerRadius::same(11), p.hover);
+    let mut row =
+        kit_menu::Item::new(name).selected(selected).id(option_id(tag)).min_width(kit_menu::MENU.at_least(MENU_WIDTH).content_width());
+    if !english.is_empty() {
+        row = row.hint(english);
     }
-    if response.hovered() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-    }
-    let ink = if selected { p.blue_deep } else { p.ink };
-    ui.painter().text(
-        rect.left_center() + Vec2::new(14.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        name,
-        egui::FontId::new(15.0, egui::FontFamily::Name(theme::SEMIBOLD.into())),
-        ink,
-    );
-    if selected {
-        let mark = Rect::from_center_size(rect.right_center() - Vec2::new(18.0, 0.0), Vec2::splat(16.0));
-        icon::stroke(ui.painter(), mark, glyph::CHECK, 2.4, p.blue_deep);
-    } else if !english.is_empty() {
-        ui.painter().text(
-            rect.right_center() - Vec2::new(14.0, 0.0),
-            egui::Align2::RIGHT_CENTER,
-            english,
-            egui::FontId::new(13.0, egui::FontFamily::Proportional),
-            p.text_faint,
-        );
-    }
-    response.clicked()
+    kit_menu::item(ui, row).clicked()
 }

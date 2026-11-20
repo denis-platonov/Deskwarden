@@ -3453,9 +3453,7 @@ pub fn draw_detail_read(
                     kit::icon::stroke(painter, glyph, kit::icon::glyph::MORE, 3.0, p.text_icon);
                 });
                 kit::tips::hint(ui, &more, crate::i18n::t("detail.more"), &[]);
-                egui::Popup::menu(&more)
-                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                    .show(|ui| {
+                crate::kit::menu::popover(&more, egui::PopupCloseBehavior::CloseOnClickOutside, crate::kit::menu::MENU, |ui| {
                     // **Mock 6d's ⋮ on a received record: nothing that
                     // writes -- only why.** No Edit, Clone or Delete, and no
                     // Move to folder either, although the mock keeps it
@@ -3487,15 +3485,14 @@ pub fn draw_detail_read(
                         if let (Some(from), Some(org)) =
                             (people.view_only_from, crate::rest::organizations::organization_of(item))
                         {
-                            if ui.button(stop_receiving_label(from, people.view_only_unverified)).clicked() {
+                            let stop = stop_receiving_label(from, people.view_only_unverified);
+                            if crate::kit::menu::item(ui, crate::kit::menu::Item::new(&stop)).clicked() {
                                 action = DetailAction::StopReceiving(org.to_string());
                                 ui.close();
                             }
-                            ui.separator();
+                            crate::kit::menu::separator(ui);
                         }
-                        ui.add(
-                            egui::Label::new(RichText::new(footer).size(11.0).color(theme::TEXT_GHOST)).wrap(),
-                        );
+                        crate::kit::menu::note(ui, &footer);
                         return;
                     }
                     // **The Icon submenu is gone from here**, and from the
@@ -3508,14 +3505,13 @@ pub fn draw_detail_read(
                     // `item_list::icon_menu` is unchanged and still decides
                     // which of the three a given item is offered; see
                     // `detail_edit`'s `edit_header`, its one reader.
-                    if compact_actions && ui.button(share_label()).clicked() {
+                    if compact_actions && crate::kit::menu::item(ui, crate::kit::menu::Item::new(share_label())).clicked() {
                         action = DetailAction::SendRecord;
                         ui.close();
                     }
                     match people.share_control {
                         Some(ShareControl::Share) => {
-                            if ui
-                                .button(share_with_person_label())
+                            if crate::kit::menu::item(ui, crate::kit::menu::Item::new(share_with_person_label()))
                                 .on_hover_text(super::share_ui::share_tooltip())
                                 .clicked()
                             {
@@ -3524,12 +3520,14 @@ pub fn draw_detail_read(
                             }
                         }
                         Some(ShareControl::Disabled(why)) => {
-                            ui.add_enabled(false, egui::Button::new(share_with_person_label()))
-                                .on_disabled_hover_text(why);
+                            crate::kit::menu::item(ui, crate::kit::menu::Item::new(share_with_person_label()).enabled(false))
+                                .on_hover_text(why);
                         }
                         None => {}
                     }
-                    if item_takes_a_one_time_code(item) && ui.button(add_2fa_menu_label()).clicked() {
+                    if item_takes_a_one_time_code(item)
+                        && crate::kit::menu::item(ui, crate::kit::menu::Item::new(add_2fa_menu_label())).clicked()
+                    {
                         action = DetailAction::AddTotp;
                         ui.close();
                     }
@@ -3561,7 +3559,7 @@ pub fn draw_detail_read(
                     // payload" -- an SSH key satisfies only the second, and
                     // cloning one would POST an empty key.
                     if kind_offers_clone(kind) {
-                        let clone = ui.button(crate::i18n::t("detail.clone"));
+                        let clone = crate::kit::menu::item(ui, crate::kit::menu::Item::new(crate::i18n::t("detail.clone")));
                         if clone
                             .on_hover_text(
                                 crate::i18n::t("detail.clone_hover"),
@@ -3591,7 +3589,7 @@ pub fn draw_detail_read(
                     // item's folder is not a property of its type, and
                     // `move_menu` files a card or an SSH key exactly as it
                     // files a login.
-                    ui.menu_button(super::item_list::move_to_folder_label(), |ui| {
+                    crate::kit::menu::submenu(ui, super::item_list::move_to_folder_label(), |ui| {
                         match super::item_list::move_menu(item, folders, may_unfile) {
                             super::item_list::MoveMenu::Targets(targets) => {
                                 for target in &targets {
@@ -3629,7 +3627,7 @@ pub fn draw_detail_read(
                                 }
                             }
                             super::item_list::MoveMenu::Empty(note) => {
-                                ui.add_enabled(false, egui::Button::new(note));
+                                crate::kit::menu::item(ui, crate::kit::menu::Item::new(note).enabled(false));
                             }
                         }
                     });
@@ -5786,10 +5784,9 @@ fn app_card_open_control(ui: &mut egui::Ui, choices: &[OpenChoice], action: &mut
         // present".
         many => {
             let open = theme::row_button(ui, open_menu_label()).on_hover_text(open_menu_hover());
-            egui::Popup::menu(&open).show(|ui| {
+            crate::kit::menu::menu(&open, |ui| {
                 for choice in many {
-                    if ui
-                        .button(open_choice_label(choice))
+                    if crate::kit::menu::item(ui, crate::kit::menu::Item::new(&open_choice_label(choice)))
                         .on_hover_text(open_choice_hover(choice))
                         .clicked()
                     {
@@ -10239,10 +10236,14 @@ mod tests {
                  or not, so it has no hover at all"
             );
             let (_, sibling) = menu_row_colours(kind, crate::vault_window::item_list::move_to_folder_label());
+            // The kit's menu: an ordinary row takes the nav hover wash and a
+            // danger row the danger wash. Different colours, but each is a
+            // wash the kit names, so there is no private shade.
+            assert_eq!(sibling, crate::kit::tokens::Palette::LIGHT.hover, "{kind:?}: a sibling row's hover");
             assert_eq!(
-                hovered, sibling,
-                "{kind:?}: hovering Delete paints {hovered:?} but hovering Move to folder \
-                 paints {sibling:?} -- one menu, two hover treatments"
+                hovered,
+                crate::kit::tokens::Palette::LIGHT.danger_wash,
+                "{kind:?}: hovering Delete paints {hovered:?}, not the kit's danger wash"
             );
         }
     }
