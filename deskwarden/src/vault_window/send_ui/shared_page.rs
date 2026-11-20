@@ -274,7 +274,7 @@ fn recipient_line(row: &SendRow) -> String {
         .filter(|r| !r.is_empty())
         .unwrap_or(crate::i18n::t("sends.anyone_with_link"));
     if row.is_file {
-        crate::i18n::tf("sends.recipient_file_send", &[("who", &who.to_string())])
+        crate::i18n::tf("sends.recipient_file_send", &[("who", who)])
     } else {
         who.to_string()
     }
@@ -843,7 +843,7 @@ pub fn activity_events(row: &SendRow) -> Vec<(String, String)> {
     use crate::send::SendState;
     let mut events = vec![(crate::i18n::t("sends.created_by_you").to_string(), String::new())];
     if let Some(who) = row.sent.as_ref().map(|s| s.recipient.as_str()).filter(|r| !r.is_empty()) {
-        events.push((crate::i18n::tf("sends.link_sent_to", &[("who", &who.to_string())]), String::new()));
+        events.push((crate::i18n::tf("sends.link_sent_to", &[("who", who)]), String::new()));
     }
     let opened = match row.access_count {
         0 => crate::i18n::t("sends.not_opened_yet").to_string(),

@@ -364,3 +364,5 @@ main.cli_unrecognized_body = Bitwarden CLI, kurią Deskwarden ketina naudoti: {h
 main.signer_none = Jis neturi pasirašytojo sertifikato.
 main.signer_org = Pasirašė: {org}
 main.signer_no_org = Jo pasirašytojo sertifikate nenurodyta organizacija.
+login.server_eu = EU
+login.server_self_hosted = Savarankiškai talpinamas

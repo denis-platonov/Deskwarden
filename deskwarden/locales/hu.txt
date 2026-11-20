@@ -359,3 +359,5 @@ main.cli_unrecognized_body = A Bitwarden CLI, amelyet a Deskwarden használni k�
 main.signer_none = Nincs aláíró tanúsítványa.
 main.signer_org = Aláírta: {org}
 main.signer_no_org = Az aláíró tanúsítvány nem nevez meg szervezetet.
+login.server_eu = EU
+login.server_self_hosted = Saját kiszolgáló

@@ -860,15 +860,17 @@ impl ServerChoice {
         match self {
             Self::UsCloud => "bitwarden.com",
             Self::EuCloud => "bitwarden.eu",
-            Self::SelfHosted => "Self-hosted",
+            Self::SelfHosted => crate::i18n::t("login.server_self_hosted"),
         }
     }
 
     /// The sign-in screen's segmented control, in the design's words
     /// (spec C 5.2): bitwarden.com, EU, Self-hosted.
-    pub const SEGMENTS: [&'static str; 3] = ["bitwarden.com", "EU", "Self-hosted"];
+    pub fn segments() -> [&'static str; 3] {
+        ["bitwarden.com", crate::i18n::t("login.server_eu"), crate::i18n::t("login.server_self_hosted")]
+    }
 
-    /// Which of [`Self::SEGMENTS`] this choice is.
+    /// Which of [`Self::segments`] this choice is.
     pub fn segment(self) -> usize {
         match self {
             Self::UsCloud => 0,
@@ -2248,7 +2250,7 @@ fn draw_sign_in_form(
     });
     ui.add_space(auth::FIELD_LABEL_GAP);
     ui.add_enabled_ui(!auth_in_progress, |ui| {
-        let options = ServerChoice::SEGMENTS;
+        let options = ServerChoice::segments();
         if let Some(index) =
             controls::segmented(ui, &options, form.server_choice.segment(), controls::SEG_TABS)
         {

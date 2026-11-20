@@ -384,3 +384,5 @@ main.cli_unrecognized_body = La CLI di Bitwarden che Deskwarden sta per usare {h
 main.signer_none = Non ha un certificato del firmatario.
 main.signer_org = È firmata da: {org}
 main.signer_no_org = Il suo certificato del firmatario non indica alcuna organizzazione.
+login.server_eu = UE
+login.server_self_hosted = Self-hosted

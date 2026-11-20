@@ -362,3 +362,5 @@ main.cli_unrecognized_body = Deskwarden이 사용하려는 Bitwarden CLI는 다�
 main.signer_none = 서명자 인증서가 없습니다.
 main.signer_org = 서명자: {org}
 main.signer_no_org = 서명자 인증서에 조직 이름이 없습니다.
+login.server_eu = EU
+login.server_self_hosted = 자체 호스팅

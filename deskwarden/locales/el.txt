@@ -359,3 +359,5 @@ main.cli_unrecognized_body = Το Bitwarden CLI που πρόκειται να �
 main.signer_none = Δεν έχει πιστοποιητικό υπογράφοντος.
 main.signer_org = Υπογράφηκε από: {org}
 main.signer_no_org = Το πιστοποιητικό του υπογράφοντος δεν αναφέρει οργανισμό.
+login.server_eu = EU
+login.server_self_hosted = Δικός σας διακομιστής

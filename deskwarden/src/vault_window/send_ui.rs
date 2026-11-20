@@ -581,7 +581,7 @@ pub fn with_sent_facts(
                         let recipient = entry.recipient.trim().to_string();
                         if !recipient.is_empty() {
                             let short = recipient.split('@').next().unwrap_or(&recipient);
-                            row.expiry = crate::i18n::tf("sends.to_recipient_expiry", &[("short", &short.to_string()), ("expiry", &row.expiry.to_string())]);
+                            row.expiry = crate::i18n::tf("sends.to_recipient_expiry", &[("short", short), ("expiry", &row.expiry.to_string())]);
                         }
                         row.sent = Some(SentFacts {
                             recipient,

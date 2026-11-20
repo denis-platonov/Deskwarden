@@ -106,7 +106,7 @@ impl Page {
             Page::Devices => crate::i18n::t("settings.subtitle_devices").into(),
             Page::Shortcuts => return None,
             Page::Account => return None,
-            Page::About => crate::i18n::tf("settings.subtitle_about", &[("version", &(env!("CARGO_PKG_VERSION")).to_string())]),
+            Page::About => crate::i18n::tf("settings.subtitle_about", &[("version", env!("CARGO_PKG_VERSION"))]),
         })
     }
 

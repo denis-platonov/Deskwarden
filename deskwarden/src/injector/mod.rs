@@ -2,6 +2,7 @@ pub mod send_input;
 pub mod sequence;
 pub mod target;
 pub mod ui_automation;
+pub mod words;
 
 use crate::fill_stats::FillOutcome;
 use sequence::Plan;

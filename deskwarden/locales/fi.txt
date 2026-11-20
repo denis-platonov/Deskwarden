@@ -363,3 +363,5 @@ main.cli_unrecognized_body = Bitwarden CLI, jota Deskwarden on aikeissa käyttä
 main.signer_none = Siinä ei ole allekirjoittajan varmennetta.
 main.signer_org = Allekirjoittaja: {org}
 main.signer_no_org = Allekirjoittajan varmenteessa ei ole organisaatiota.
+login.server_eu = EU
+login.server_self_hosted = Itse ylläpidetty

@@ -108,6 +108,7 @@
 //! MB). See [`Locale::fonts`].
 
 pub mod catalog;
+pub mod edge;
 pub mod plural;
 mod system;
 

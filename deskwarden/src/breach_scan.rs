@@ -727,41 +727,32 @@ fn resolve(check: &BreachCheck, prefix: &Prefix, suffix: &Zeroizing<String>) -> 
 /// it. A sentence that ended on "3 found" with forty failures unmentioned is
 /// the lie this whole feature is arranged against.
 pub fn outcome_wording(record: &ScanRecord) -> String {
-    let passwords = plural(record.passwords_checked, "password", "passwords");
-    let items = plural(record.items_covered, "item", "items");
-    let head = format!(
-        "Checked {} {passwords} across {} {items}.",
-        record.passwords_checked, record.items_covered
-    );
+    let passwords = crate::i18n::tn("prefs.breach_passwords", u64::from(record.passwords_checked), &[]);
+    let items = crate::i18n::tn("prefs.breach_items", u64::from(record.items_covered), &[]);
+    let head = crate::i18n::tf("prefs.breach_checked", &[("passwords", &passwords), ("items", &items)]);
     let found = match record.found {
-        0 => " None was found in a breach.".to_string(),
-        1 => " 1 was found in a known breach.".to_string(),
-        n => format!(" {n} were found in known breaches."),
+        0 => crate::i18n::t("prefs.breach_found_none").to_string(),
+        n => crate::i18n::tn("prefs.breach_found", u64::from(n), &[]),
     };
-    let failed = match record.failed {
-        0 => String::new(),
-        1 => " 1 could not be checked, so nothing is known about it.".to_string(),
-        n => format!(" {n} could not be checked, so nothing is known about them."),
-    };
-    format!("{head}{found}{failed}")
+    let mut text = format!("{head} {found}");
+    if record.failed > 0 {
+        text.push(' ');
+        text.push_str(&crate::i18n::tn("prefs.breach_failed", u64::from(record.failed), &[]));
+    }
+    text
 }
 
 /// The progress line, while a scan is running.
 pub fn progress_wording(done: usize, total: usize, found: usize, failed: usize) -> String {
-    let mut text = format!("Checked {done} of {total}. {found} found so far");
-    if failed > 0 {
-        text.push_str(&format!(", {failed} could not be checked"));
-    }
-    text.push('.');
-    text
-}
-
-fn plural(count: u32, one: &'static str, many: &'static str) -> &'static str {
-    if count == 1 {
-        one
-    } else {
-        many
-    }
+    let numbers = [
+        ("done", done.to_string()),
+        ("total", total.to_string()),
+        ("found", found.to_string()),
+        ("failed", failed.to_string()),
+    ];
+    let numbers: Vec<(&str, &str)> = numbers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let key = if failed > 0 { "prefs.breach_progress_failed" } else { "prefs.breach_progress" };
+    crate::i18n::tf(key, &numbers)
 }
 
 #[cfg(test)]

@@ -363,3 +363,5 @@ main.cli_unrecognized_body = Bitwarden CLI som Deskwarden är på väg att anvä
 main.signer_none = Den har inget signercertifikat.
 main.signer_org = Den är signerad av: {org}
 main.signer_no_org = Dess signercertifikat anger ingen organisation.
+login.server_eu = EU
+login.server_self_hosted = Egen värd

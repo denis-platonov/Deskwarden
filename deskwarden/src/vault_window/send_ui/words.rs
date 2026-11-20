@@ -71,88 +71,31 @@ const TEMPLATED: &[&str] = &[
     "sends.err_link_other_server",
 ];
 
-/// A key's English, whatever language is in force.
-fn english(key: &'static str) -> &'static str {
-    i18n::with_language("en", || i18n::t(key))
-}
-
-/// The catalog key of a producer's fixed sentence, if it is one of the known.
-fn fixed_key(message: &str) -> Option<&'static str> {
-    FIXED.iter().copied().find(|key| english(key) == message)
-}
-
 /// A producer's `&'static str` sentence in the language in force; one this
 /// file does not know is returned as it is.
 pub fn refusal(sentence: &'static str) -> &'static str {
-    match fixed_key(sentence) {
+    match i18n::edge::fixed_key(FIXED, sentence) {
         Some(key) => i18n::t(key),
         None => sentence,
     }
 }
 
-/// Matches `message` against an English template with `{name}` holes.
-fn captures(template: &str, message: &str) -> Option<Vec<(String, String)>> {
-    let mut literals: Vec<&str> = Vec::new();
-    let mut names: Vec<&str> = Vec::new();
-    let mut rest = template;
-    while let Some(open) = rest.find('{') {
-        let close = open + rest[open..].find('}')?;
-        literals.push(&rest[..open]);
-        names.push(&rest[open + 1..close]);
-        rest = &rest[close + 1..];
+/// The one hole that is itself a phrase of ours.
+fn phrase(name: &str, value: &str) -> String {
+    if name != "what" {
+        return value.to_string();
     }
-    literals.push(rest);
-    let mut remaining = message.strip_prefix(literals[0])?;
-    let mut found = Vec::new();
-    for (i, name) in names.iter().enumerate() {
-        let next = literals[i + 1];
-        let last = i + 1 == names.len();
-        let value = if last {
-            remaining.strip_suffix(next)?
-        } else if next.is_empty() {
-            return None;
-        } else {
-            &remaining[..remaining.find(next)?]
-        };
-        found.push(((*name).to_string(), value.to_string()));
-        remaining = &remaining[value.len()..];
-        if !last {
-            remaining = remaining.strip_prefix(next)?;
-        } else {
-            remaining = "";
-        }
+    match value {
+        "deletion date" => i18n::t("sends.what_deletion_date").to_string(),
+        "expiration date" => i18n::t("sends.what_expiration_date").to_string(),
+        _ => value.to_string(),
     }
-    remaining.is_empty().then_some(found)
 }
 
 /// A producer's sentence in the language in force, or `None` if it is not one
 /// this file knows.
 pub fn localize(message: &str) -> Option<String> {
-    if let Some(key) = fixed_key(message) {
-        return Some(i18n::t(key).to_string());
-    }
-    for key in TEMPLATED.iter().copied() {
-        let Some(found) = captures(english(key), message) else { continue };
-        let args: Vec<(String, String)> = found
-            .into_iter()
-            .map(|(name, value)| {
-                // The one hole that is itself a phrase of ours.
-                let value = if name == "what" {
-                    match value.as_str() {
-                        "deletion date" => i18n::t("sends.what_deletion_date").to_string(),
-                        "expiration date" => i18n::t("sends.what_expiration_date").to_string(),
-                        _ => value,
-                    }
-                } else {
-                    value
-                };
-                (name, value)
-            })
-            .collect();
-        let borrowed: Vec<(&str, &str)> = args.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
-        return Some(i18n::tf(key, &borrowed));
-    }
-    None
+    i18n::edge::localize(FIXED, TEMPLATED, message, phrase)
 }
 
 impl SendError {
@@ -340,11 +283,11 @@ mod tests {
     #[test]
     fn the_tables_name_real_catalog_sentences_and_a_sentence_matches_only_its_own_key() {
         for key in FIXED.iter().chain(TEMPLATED) {
-            let text = english(key);
+            let text = i18n::edge::english(key);
             assert_ne!(text, *key, "{key} is not in the English catalog");
         }
         for key in FIXED {
-            assert_eq!(fixed_key(english(key)), Some(*key), "{key} is read as another sentence");
+            assert_eq!(i18n::edge::fixed_key(FIXED, i18n::edge::english(key)), Some(*key), "{key} is read as another sentence");
         }
     }
 

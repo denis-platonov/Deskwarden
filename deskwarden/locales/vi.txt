@@ -382,3 +382,5 @@ main.cli_unrecognized_body = Bitwarden CLI mà Deskwarden sắp dùng {headline}
 main.signer_none = Nó không có chứng chỉ người ký.
 main.signer_org = Nó được ký bởi: {org}
 main.signer_no_org = Chứng chỉ người ký của nó không nêu tổ chức nào.
+login.server_eu = EU
+login.server_self_hosted = Tự lưu trữ

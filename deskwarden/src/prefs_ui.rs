@@ -317,8 +317,7 @@ fn built_in_choice() -> &'static str {
 /// only one, so the row names the moment rather than one route to it.
 fn official_crypto_tip(self_hosted: bool) -> &'static str {
     if self_hosted {
-        "The official Bitwarden CLI (`bw`) holds your keys in a background process of its own and costs about 118 MB of RAM. \
-         Deskwarden's built-in client talks to your server itself for about 19 MB, but then the key that unlocks your vault is stored in the app, protected by Windows, and unlike a session it never expires, so anyone who can run programs as you on this PC can use it."
+        crate::i18n::t("prefs.official_crypto_tip")
     } else {
         // Not a silent no-op under the same label, and not a hidden row. The
         // owner's rule is "disabled if not self-hosted vault to avoid issues
@@ -489,8 +488,7 @@ fn disk_cache_tip() -> &'static str {
         // It still obeys this module's rules for such copy: it names what
         // is in the file, what gates it, and who can read it anyway,
         // without ever using the word "secure".
-        "The copy contains your usernames, passwords, notes and two-factor secrets, encrypted with a key kept on this PC and protected by Windows, so anyone who can run programs as you on this PC can read it, and so can someone who takes this disk and knows your Windows password. \
-         It is not deleted when your vault locks, only when you log out or after 7 days."
+        crate::i18n::t("prefs.disk_cache_tip")
     }
 }
 
@@ -982,6 +980,9 @@ fn auto_lock_label() -> &'static str {
 /// **A suffix rather than five more constants.** Every row can be in this
 /// state, and five hand-written "… — shortcut not working" labels are five
 /// chances for one of them to say something else.
+fn shortcut_unavailable_label(label: &str) -> String {
+    crate::i18n::tf("prefs.shortcut_unavailable", &[("shortcut", label)])
+}
 
 /// What the chip says on a row the user has cleared.
 fn shortcut_not_set() -> &'static str {
@@ -1031,7 +1032,7 @@ fn shortcut_needs_a_modifier() -> &'static str {
 /// app reporting a conflict *with itself* as though another program had taken
 /// the keys.
 fn shortcut_taken_note(other: crate::app::FillShortcut) -> String {
-    crate::i18n::tf("prefs.shortcut_taken_note", &[("other", &other.label().to_string())])
+    crate::i18n::tf("prefs.shortcut_taken_note", &[("other", other.label())])
 }
 
 /// Why a captured key cannot be bound at all.
@@ -1106,7 +1107,7 @@ fn account_no_email() -> &'static str {
 fn account_no_email_note() -> &'static str {
     crate::i18n::t("prefs.account_no_email_note")
 }
-/// Under a known address: which server this vault lives on.
+// Under a known address: which server this vault lives on is `prefs.account_signed_in_at`.
 
 /// What the About page knows about the signed-in account.
 ///
@@ -2862,11 +2863,9 @@ fn service_label() -> &'static str {
 ///    who assumes it does has misjudged the entire trade.
 fn service_tip(enabled: bool) -> &'static str {
     if enabled {
-        "Deskwarden is listening on 127.0.0.1 and hands out decrypted vault items (usernames, passwords, notes and two-factor secrets) to any program on this PC that presents one of the keys below. \
-         It never asks for your master password: a key is the whole credential, so anyone who can read one can use it."
+        crate::i18n::t("prefs.service_tip_on")
     } else {
-        "Turning it on starts a local HTTP endpoint on 127.0.0.1 that hands out decrypted vault items (usernames, passwords, notes and two-factor secrets) to any program on this PC that presents one of the keys you mint below. \
-         It never asks for your master password: a key is the whole credential, so anyone who can read one can use it."
+        crate::i18n::t("prefs.service_tip_off")
     }
 }
 
@@ -3038,12 +3037,7 @@ fn revoke_cancel_button() -> &'static str {
 /// failure it gets says nothing about why, and that there is no undo -- which
 /// is exactly the mis-click this confirmation exists for.
 fn revoke_prompt(name: &str) -> String {
-    format!(
-        "Revoke \u{201c}{name}\u{201d}? Any program still holding this key stops being answered \
-         the moment you do \u{2014} with a refusal that tells it nothing about why \u{2014} and the key \
-         cannot be brought back. Replacing it means putting a new key into whatever was using \
-         this one."
-    )
+    crate::i18n::tf("prefs.revoke_prompt", &[("name", name)])
 }
 
 /// Why a form was refused before [`crate::service_keys::mint`] ever saw it.
@@ -3122,7 +3116,7 @@ fn scope_wording(scope: &Scope) -> String {
             crate::i18n::tf("prefs.scope_unrecognised", &[("scope", raw)])
         }
     };
-    crate::i18n::tf("prefs.scope_line", &[("access", &access.to_string()), ("subject", &subject.to_string())])
+    crate::i18n::tf("prefs.scope_line", &[("access", access), ("subject", &subject.to_string())])
 }
 
 /// Every grant on a key, as one line.
@@ -3503,14 +3497,9 @@ fn backend_switch_cancel_button() -> &'static str {
 /// requirement.
 fn backend_switch_prompt(switch: BackendSwitch) -> &'static str {
     if switch.deletes_the_stored_vault_key() {
-        "Switch back to the official Bitwarden CLI? It does not take effect until you next \
-         sign in to this account \u{2014} either sign out and back in, or close Deskwarden and open \
-         it again yourself. This also deletes the vault key stored on this PC, so nothing is \
-         left behind by the switch."
+        crate::i18n::t("prefs.backend_switch_back_prompt")
     } else {
-        "Switch to Deskwarden's built-in client? It does not take effect until you next sign \
-         in to this account \u{2014} either sign out and back in, or close Deskwarden and open it \
-         again yourself."
+        crate::i18n::t("prefs.backend_switch_built_in_prompt")
     }
 }
 
@@ -4601,7 +4590,7 @@ fn shortcut_row(
     // a row that can be read as working.
     let broken = !capturing && bound.is_some() && matches!(live, HotkeyStatus::Unavailable(_));
     let label = if broken {
-        crate::i18n::tf("prefs.shortcut_unavailable", &[("shortcut", &which.label().to_string())])
+        shortcut_unavailable_label(which.label())
     } else {
         which.label().to_string()
     };
@@ -12044,7 +12033,7 @@ mod tests {
         // A row is titled with its suffix while its chord is not working,
         // and that is process-wide state this test does not own.
         let titled = |which: crate::app::FillShortcut| {
-            [which.label().to_string(), crate::i18n::tf("prefs.shortcut_unavailable", &[("shortcut", &which.label().to_string())])]
+            [which.label().to_string(), shortcut_unavailable_label(which.label())]
                 .into_iter()
                 .find(|label| page.contains(label))
                 .expect("the shortcut's row")

@@ -360,3 +360,5 @@ main.cli_unrecognized_body = Bitwarden CLI који Deskwarden намерава 
 main.signer_none = Нема сертификат потписника.
 main.signer_org = Потписао: {org}
 main.signer_no_org = Сертификат потписника не наводи организацију.
+login.server_eu = EU
+login.server_self_hosted = Сопствени сервер

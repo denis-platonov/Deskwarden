@@ -383,3 +383,5 @@ main.cli_unrecognized_body = De Bitwarden CLI die Deskwarden op het punt staat t
 main.signer_none = Hij heeft geen ondertekenaarscertificaat.
 main.signer_org = Hij is ondertekend door: {org}
 main.signer_no_org = Het ondertekenaarscertificaat noemt geen organisatie.
+login.server_eu = EU
+login.server_self_hosted = Zelf gehost

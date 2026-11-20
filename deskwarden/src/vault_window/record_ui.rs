@@ -697,7 +697,7 @@ pub fn replace_label() -> &'static str {
 
 /// The question above the two buttons.
 pub fn collision_prompt(name: &str) -> String {
-    crate::i18n::tf("record.collision_prompt", &[("name", &name.to_string())])
+    crate::i18n::tf("record.collision_prompt", &[("name", name)])
 }
 
 /// The link, the passphrase, and the collision answer.
@@ -1701,7 +1701,7 @@ pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUi
 /// "if records shared - we ask like these are shared, deleting will remove all
 /// shares yes\no".
 pub fn forget_title(email: &str) -> String {
-    crate::i18n::tf("record.forget_title", &[("email", &email.to_string())])
+    crate::i18n::tf("record.forget_title", &[("email", email)])
 }
 
 /// Names the records, so the answer is given knowing what goes.

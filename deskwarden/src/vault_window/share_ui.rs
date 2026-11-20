@@ -89,34 +89,34 @@ pub(crate) fn fingerprint_busy() -> &'static str {
 }
 
 pub(crate) fn shared_toast(email: &str) -> String {
-    crate::i18n::tf("share.toast_shared", &[("email", &email.to_string())])
+    crate::i18n::tf("share.toast_shared", &[("email", email)])
 }
 
 pub(crate) fn waiting_toast(email: &str, record: &str) -> String {
-    crate::i18n::tf("share.toast_waiting", &[("email", &email.to_string()), ("record", &record.to_string())])
+    crate::i18n::tf("share.toast_waiting", &[("email", email), ("record", record)])
 }
 
 /// Share anyway went through: the record is on its way to the key whose
 /// fingerprint was compared.
 pub(crate) fn confirmed_toast(email: &str) -> String {
-    crate::i18n::tf("share.toast_confirmed", &[("email", &email.to_string())])
+    crate::i18n::tf("share.toast_confirmed", &[("email", email)])
 }
 
 /// Stop receiving went through: every record from them has left the vault.
 pub(crate) fn stopped_receiving_toast(from: &str) -> String {
-    crate::i18n::tf("share.toast_stopped_receiving", &[("from", &from.to_string())])
+    crate::i18n::tf("share.toast_stopped_receiving", &[("from", from)])
 }
 
 /// A Re-invite went through.
 pub(crate) fn reinvited_toast(email: &str) -> String {
-    crate::i18n::tf("share.toast_reinvited", &[("email", &email.to_string())])
+    crate::i18n::tf("share.toast_reinvited", &[("email", email)])
 }
 
 /// A share the server left as a pending invitation, said as a toast when no
 /// dialog is open to say it. It claims nothing about an account
 /// (official-path spec §3.4).
 pub(crate) fn invited_toast(email: &str) -> String {
-    crate::i18n::tf("share.toast_invited", &[("email", &email.to_string())])
+    crate::i18n::tf("share.toast_invited", &[("email", email)])
 }
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -271,7 +271,7 @@ pub(crate) fn short_state(state: PersonState) -> &'static str {
 /// - Sharing available: [`ShareControl::Share`] -- unless the record cannot
 ///   be shared from here. One in another (real) organisation draws nothing:
 ///   it is that organisation's to share. One with attachments is greyed with
-///   the engine's own sentence ([`crate::rest::sharing::HAS_ATTACHMENTS`]),
+///   the engine's own sentence ([`crate::rest::sharing::has_attachments_text()`]),
 ///   rather than refused after the user has typed an address.
 /// - `server-too-old`: greyed, with [`share_too_old_tooltip()`] -- sharing is
 ///   a thing this server will do once updated.
@@ -306,7 +306,7 @@ pub(crate) fn share_control(view: Option<&SharingView>, linked: bool, item: &Vau
     }
     let attached = item.other.get("attachments").and_then(serde_json::Value::as_array).is_some_and(|a| !a.is_empty());
     if attached {
-        return Some(ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS));
+        return Some(ShareControl::Disabled(crate::rest::sharing::has_attachments_text()));
     }
     Some(ShareControl::Share)
 }
@@ -1463,7 +1463,7 @@ fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
 /// ever true for -- is told about the invite code a newcomer there needs,
 /// and that they can make it here.
 fn invited_band(email: &str, record: &str, admin: bool) -> (String, String) {
-    let head = crate::i18n::tf("share.toast_invited", &[("email", &email.to_string())]);
+    let head = crate::i18n::tf("share.toast_invited", &[("email", email)]);
     let code = if admin { crate::i18n::t("share.invite_code_admin_note") } else { "" };
     let body = crate::i18n::tf("share.invited_body", &[("code", code), ("record", record)]);
     (head, body)
@@ -1794,7 +1794,7 @@ fn invited_block(
                 });
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new(crate::i18n::tf("share.give_invite_code", &[("email", &email.to_string())]))
+                    egui::RichText::new(crate::i18n::tf("share.give_invite_code", &[("email", email)]))
                         .size(14.0)
                         .color(p.caution_ink),
                 );
@@ -2120,7 +2120,7 @@ const TOAST_STACK_GAP: f32 = 8.0;
 
 /// Mock 6b's red question, with the record and the person in it.
 pub(crate) fn stop_question(record: &str, email: &str) -> String {
-    crate::i18n::tf("share.stop_question", &[("record", &record.to_string()), ("email", &email.to_string())])
+    crate::i18n::tf("share.stop_question", &[("record", record), ("email", email)])
 }
 
 /// What a shown fingerprint is to be compared with (mock 6b).
@@ -2778,7 +2778,7 @@ pub(crate) fn share_rows(
                     name: item.name.clone(),
                     email: person.email.clone(),
                     state: person.state,
-                    subtitle: crate::i18n::tf("share.row_subtitle", &[("email", &person.email.to_string()), ("state", &(short_state(person.state)).to_string())]),
+                    subtitle: crate::i18n::tf("share.row_subtitle", &[("email", &person.email.to_string()), ("state", (short_state(person.state)))]),
                     since: at.map(|at| day(at, zone)),
                 },
             ));
@@ -3025,7 +3025,7 @@ const WAITING_LINE_SIZE: f32 = 12.0;
 /// confirmed. The sharer's daemon confirms on its next pass; until then the
 /// org shows this account nothing, and this line is why.
 pub(crate) fn waiting_line(from: &str) -> String {
-    crate::i18n::tf("share.waiting_line", &[("from", &from.to_string())])
+    crate::i18n::tf("share.waiting_line", &[("from", from)])
 }
 
 /// **Who a [`waiting_line`] names**: the sharer, and `(unverified)` after
@@ -3044,7 +3044,7 @@ pub(crate) fn named_sharer(from: &str, verified: bool) -> String {
     if verified {
         from.to_string()
     } else {
-        crate::i18n::tf("share.sharer_unverified", &[("from", &from.to_string())])
+        crate::i18n::tf("share.sharer_unverified", &[("from", from)])
     }
 }
 
@@ -3198,7 +3198,7 @@ pub(crate) fn keep_receiving_label() -> &'static str {
 }
 
 pub(crate) fn stop_receiving_title(from: &str) -> String {
-    crate::i18n::tf("share.stop_receiving_title", &[("from", &from.to_string())])
+    crate::i18n::tf("share.stop_receiving_title", &[("from", from)])
 }
 
 ///
@@ -3363,7 +3363,7 @@ mod tests {
         let mine = item(serde_json::json!({ "id": "in-mine", "name": "x", "organizationId": "my-sharing-org" }));
         assert_eq!(share_control(Some(&on), true, &mine), Some(ShareControl::Share), "already in the sharing org");
         let attached = item(serde_json::json!({ "id": "p1", "name": "x", "attachments": [{ "id": "a1" }] }));
-        assert_eq!(share_control(Some(&on), true, &attached), Some(ShareControl::Disabled(crate::rest::sharing::HAS_ATTACHMENTS)));
+        assert_eq!(share_control(Some(&on), true, &attached), Some(ShareControl::Disabled(crate::rest::sharing::has_attachments_text())));
         let empty = item(serde_json::json!({ "id": "p2", "name": "x", "attachments": [] }));
         assert_eq!(share_control(Some(&on), true, &empty), Some(ShareControl::Share), "an empty list is no attachment");
     }
