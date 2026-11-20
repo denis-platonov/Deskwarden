@@ -2208,6 +2208,9 @@ mod win32 {
     /// paints a live secret unmasked, so of the three Win32 cards this is the
     /// one the exclusion matters most on.
     pub(super) fn protect(window: GenerateWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.0), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 

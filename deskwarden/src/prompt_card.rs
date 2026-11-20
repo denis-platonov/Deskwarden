@@ -898,6 +898,9 @@ mod win32 {
     /// not a password -- this card shows none -- but the account names this
     /// user holds for the app they are in front of.
     pub(super) fn protect(window: PromptWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.0), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 

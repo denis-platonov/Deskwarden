@@ -1035,6 +1035,9 @@ mod win32 {
     /// not be masked against a keylogger's screen recorder catching the caret
     /// beside a known field.
     pub(super) fn protect(window: SaveWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.0), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 

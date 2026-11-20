@@ -16,6 +16,23 @@
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE, WDA_NONE};
 
+/// **Whether this build hides its windows from screen capture at all.**
+///
+/// A dev build -- any copy run under `DESKWARDEN_PROFILE`
+/// (`crate::app_profile`) -- never does, so its cards and windows can be
+/// screenshotted and recorded while it is being worked on. The installed
+/// release copy, which runs with no profile, keeps every protection.
+#[must_use]
+pub fn capture_protection_enabled() -> bool {
+    protection_for(crate::app_profile::active().is_some())
+}
+
+/// [`capture_protection_enabled`]'s decision, pure.
+#[must_use]
+pub const fn protection_for(profiled: bool) -> bool {
+    !profiled
+}
+
 /// The affinity value for the switch, as Windows spells it: 0x11
 /// (`WDA_EXCLUDEFROMCAPTURE`) while hiding, 0 (`WDA_NONE`) otherwise.
 #[must_use]
@@ -37,6 +54,7 @@ pub fn apply(window_title: &str, hide: bool) -> bool {
         return false;
     };
     let hwnd = HWND(handle as *mut core::ffi::c_void);
+    let hide = hide && capture_protection_enabled();
     let affinity = if hide { WDA_EXCLUDEFROMCAPTURE } else { WDA_NONE };
     match unsafe { SetWindowDisplayAffinity(hwnd, affinity) } {
         Ok(()) => true,
@@ -79,6 +97,30 @@ impl Applied {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_unprofiled_copy_hides_from_capture() {
+        assert!(protection_for(false));
+        assert!(!protection_for(true));
+    }
+
+    #[test]
+    fn every_card_asks_the_build_before_hiding_from_capture() {
+        for (name, code) in [
+            ("picker_prompt", include_str!("picker_prompt.rs")),
+            ("prompt_card", include_str!("prompt_card.rs")),
+            ("locked_card", include_str!("locked_card.rs")),
+            ("notice_card", include_str!("notice_card.rs")),
+            ("save_login_card", include_str!("save_login_card.rs")),
+            ("unlock_prompt", include_str!("unlock_prompt.rs")),
+            ("generate_prompt", include_str!("generate_prompt.rs")),
+            ("tray_popup", include_str!("tray_popup.rs")),
+        ] {
+            let call = code.find(concat!("unsafe { SetWindowDisplay", "Affinity(hwnd(")).unwrap();
+            let gate = code[..call].rfind(concat!("capture_protection_", "enabled()"));
+            assert!(gate.is_some_and(|g| call - g < 120), "{name} hides from capture without asking the build");
+        }
+    }
 
     #[test]
     fn hiding_is_the_exclude_from_capture_affinity() {

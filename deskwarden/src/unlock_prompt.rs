@@ -926,6 +926,9 @@ mod win32 {
     /// `SetWindowDisplayAffinity` on a child with `E_INVALIDARG`, and the
     /// top-level flag covers every child it owns.
     pub(super) fn protect(window: PromptWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.top_level), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 

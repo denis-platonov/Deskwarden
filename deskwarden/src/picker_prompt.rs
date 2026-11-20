@@ -2148,6 +2148,9 @@ mod win32 {
     /// user holds for the app they are in front of*, which is exactly the
     /// thing a screen recorder should not be handed.
     pub(super) fn protect(window: PickerWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.0), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 

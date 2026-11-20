@@ -1228,6 +1228,9 @@ mod win32 {
     }
 
     fn protect(window: PopupWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.0), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 

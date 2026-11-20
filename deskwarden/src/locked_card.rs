@@ -714,6 +714,9 @@ mod win32 {
     /// it owns. What it protects here is not a credential -- this card holds
     /// none -- but the name of the app this user is signing into.
     pub(super) fn protect(window: super::LockedWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.0), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 

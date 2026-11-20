@@ -774,6 +774,9 @@ mod win32 {
     /// on a child with `E_INVALIDARG`. A refusal can name an item's custom
     /// fields and the shape of its sequence, which a recorder need not keep.
     pub(super) fn protect(window: super::NoticeWindow) -> bool {
+        if !crate::screen_share::capture_protection_enabled() {
+            return true;
+        }
         unsafe { SetWindowDisplayAffinity(hwnd(window.0), WDA_EXCLUDEFROMCAPTURE).is_ok() }
     }
 
