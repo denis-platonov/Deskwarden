@@ -4,7 +4,7 @@
 # The format is documented at the top of src/i18n.rs.
 
 auth.headline = Bitwarden の保管庫を、すべてのアプリで。
-auth.brand_sub = 一度サインインするだけ。SAP や VPN などデスクトップのログインを Deskwarden が入力します。
+auth.brand_sub = 一度ログインするだけ。SAP や VPN などのログインも Deskwarden が入力します。
 auth.brand_foot = 既存の Bitwarden アカウントを使用
 auth.hello_label = Windows Hello でロック解除
 auth.hello_checking = 確認中…

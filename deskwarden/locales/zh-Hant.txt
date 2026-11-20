@@ -4,7 +4,7 @@
 # The format is documented at the top of src/i18n.rs.
 
 auth.headline = 您的 Bitwarden 密碼庫，適用於每個應用程式。
-auth.brand_sub = 只需登入一次。Deskwarden 為您填寫 SAP、VPN 和所有桌面登入。
+auth.brand_sub = 一次登入，SAP、VPN 等桌面登入由 Deskwarden 代填。
 auth.brand_foot = 使用您現有的 Bitwarden 帳戶
 auth.hello_label = 使用 Windows Hello 解鎖
 auth.hello_checking = 正在檢查…
