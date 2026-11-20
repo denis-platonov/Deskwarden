@@ -6002,16 +6002,21 @@ mod tests {
         assert_eq!(SIZE_BG_ALPHA, 219);
         assert_eq!(HALO_ALPHA, 71);
         assert_eq!(SELECTION_RING, 2.0);
-        // The vault window's root viewport does NOT ask for transparency
-        // either: on Windows that flag only reaches the GL config template,
-        // where it asks for a colour-key pixel format no driver has and a
+        // **The overlay itself is opaque; the vault window's root viewport IS
+        // transparent, for a different reason.** On Windows the flag reaches
+        // the GL config template as a colour-key pixel format request, which a
         // strict driver may answer with no formats at all -- a startup panic
-        // inside `eframe`'s config picker.
+        // inside `eframe`'s config picker -- so it is not free. It is paid on
+        // purpose now: every main window opens transparent so that its 18 px
+        // corners can be cut out of its own alpha (`window_host::CornerMask`),
+        // as the startup window always did. The overlay's own builder, above
+        // in this test, is what must stay without it.
         let vault = include_str!("vault_window/mod.rs").replace("\r\n", "\n");
         let vault = vault.split("#[cfg(test)]").next().unwrap();
         assert!(
-            !vault.contains(".with_transparent(true)"),
-            "the vault window asks for transparency again"
+            vault.contains(".with_transparent(true)"),
+            "the vault window no longer opens transparent, so its 18 px corners are square \
+             (an opaque window cannot have a see-through corner)"
         );
     }
 

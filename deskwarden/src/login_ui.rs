@@ -1075,11 +1075,18 @@ pub fn draw_window_chrome_with_extra(
         egui::Pos2::new(full.max.x, full.min.y + metrics.bar_height),
     );
 
-    // Backgrounds first: window body, titlebar, hairline.
+    // Backgrounds first: window body, titlebar, hairline. The outer corners
+    // follow the window's own radius (0 while maximized), so the bar's top
+    // corners and the border agree with the cut `window_host::CornerMask`
+    // makes over the top of everything.
+    let radius = theme::window_corner_radius(ui.ctx());
     ui.painter()
-        .rect_filled(full, CornerRadius::ZERO, theme::WINDOW_BG);
-    ui.painter()
-        .rect_filled(bar, CornerRadius::ZERO, theme::CARD);
+        .rect_filled(full, CornerRadius::same(radius), theme::WINDOW_BG);
+    ui.painter().rect_filled(
+        bar,
+        CornerRadius { nw: radius, ne: radius, sw: 0, se: 0 },
+        theme::CARD,
+    );
     ui.painter().rect_filled(
         egui::Rect::from_min_max(egui::Pos2::new(bar.min.x, bar.max.y - 1.0), bar.max),
         CornerRadius::ZERO,
@@ -1087,7 +1094,7 @@ pub fn draw_window_chrome_with_extra(
     );
     ui.painter().rect_stroke(
         full,
-        CornerRadius::ZERO,
+        CornerRadius::same(radius),
         Stroke::new(1.0, theme::BORDER),
         egui::StrokeKind::Inside,
     );
@@ -1163,8 +1170,12 @@ pub fn draw_window_chrome_with_extra(
         CloseControl::Active => {
             let close = ui.interact(close_rect, ui.id().with("chrome-close"), Sense::click());
             if close.hovered() {
-                ui.painter()
-                    .rect_filled(close_rect, CornerRadius::ZERO, theme::CANVAS);
+                // Its top-right corner is the window's: follow it.
+                ui.painter().rect_filled(
+                    close_rect,
+                    CornerRadius { nw: 0, ne: radius.saturating_sub(1), sw: 0, se: 0 },
+                    theme::CANVAS,
+                );
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
             }
             if close.clicked() {
@@ -1257,10 +1268,18 @@ pub fn draw_window_chrome_with_extra(
     action
 }
 
-/// Asks DWM to round this window's corners (and give it the standard
-/// drop-shadow) even though it is frameless. Windows 11 only; on Windows 10
-/// the call fails harmlessly and the window stays square. Resolved by title
-/// because eframe never exposes the HWND.
+/// Tells DWM to leave this frameless window's corners and border alone
+/// (`DWMWCP_DONOTROUND`, no border colour), because the window cuts its own
+/// 18 px corners -- see `window_host::CornerMask`. Windows 11 only; elsewhere
+/// the calls fail harmlessly. The name is the old one: it is still the call
+/// every window makes to get its corners right. Resolved by title because
+/// eframe never exposes the HWND.
+///
+/// **No DWM shadow.** A transparent window has none on Windows 11 here:
+/// `DwmExtendFrameIntoClientArea` with 1 px and with -1 margins were both
+/// tried on the real window over a dark backdrop and neither brought it back
+/// (measured: the pixels next to the window were untouched). The window's own
+/// 1 px border is what defines its edge.
 ///
 /// **Scoped to this process**, through
 /// [`crate::foreground::own_window_titled`]. It used to ask
@@ -1282,21 +1301,41 @@ pub fn draw_window_chrome_with_extra(
 pub fn round_window_corners(window_title: &str) {
     use windows::Win32::Foundation::HWND;
     use windows::Win32::Graphics::Dwm::{
-        DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND,
+        DwmExtendFrameIntoClientArea, DwmSetWindowAttribute, DWMWA_BORDER_COLOR,
+        DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
     };
+    use windows::Win32::UI::Controls::MARGINS;
 
     unsafe {
         let hwnd: HWND = match crate::foreground::own_window_titled(window_title) {
             Some(handle) => HWND(handle as *mut core::ffi::c_void),
             None => return,
         };
-        let preference = DWMWCP_ROUND;
+        let preference = DWMWCP_DONOTROUND;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             &preference as *const _ as *const core::ffi::c_void,
             std::mem::size_of_val(&preference) as u32,
         );
+        // `DWMWA_COLOR_NONE`: without it Windows 11 outlines a window that has
+        // no rounding of its own with a 1 px grey SQUARE border, which shows
+        // around the transparent corners as a ghost frame.
+        let no_border: u32 = 0xFFFF_FFFE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &no_border as *const _ as *const core::ffi::c_void,
+            std::mem::size_of_val(&no_border) as u32,
+        );
+        // **1 px of extended frame on every side.** Without it DWM paints an
+        // opaque 1 px line along the top edge of the window, square, straight
+        // across the transparent corners (measured on the real window over a
+        // dark backdrop). With it the whole client area, that row included, is
+        // the window's own alpha. It is also the margin winit's
+        // `undecorated_shadow` uses; it did not bring a shadow back here.
+        let margins = MARGINS { cxLeftWidth: 1, cxRightWidth: 1, cyTopHeight: 1, cyBottomHeight: 1 };
+        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
     }
 }
 
@@ -3557,9 +3596,11 @@ pub fn build_login_frame(
             // its own and hands this builder's frame closure `pre_styled`, so
             // the flag and the `Reveal` below travel together.
             //
-            // Not `with_transparent(true)`: no child viewport is ever opened
-            // from this window, so it keeps `eframe`'s ordinary clear colour.
-            // See `crate::window_host`.
+            // **Transparent, for the 18 px outer corners.** The window clears
+            // to nothing, paints its own background, and
+            // `window_host::CornerMask` cuts the corners out of it. See
+            // `crate::window_host` and `theme::WINDOW_RADIUS`.
+            .with_transparent(true)
             .with_visible(false)
             // The taskbar icon (there is no native titlebar to show one);
             // eframe windows don't inherit the exe's icon resource.
@@ -4379,7 +4420,9 @@ pub fn run_login_flow_for(
         None,
     );
 
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, frame| frame_fn(ui, frame));
+    let _ = crate::window_host::run_ui_native(WINDOW_TITLE, options, move |ui, frame| {
+        frame_fn(ui, frame)
+    });
 
     // `None` means the user closed the window with the X button rather than
     // completing the flow. What that *costs* is the caller's to decide, and
@@ -4536,6 +4579,71 @@ mod round_window_corners_stays_inside_this_process {
             "control: only {scanned} `use` lines were inspected across four modules, so this \
              guard is looking at almost nothing"
         );
+    }
+
+    /// Production code of a source file, comments stripped: everything above
+    /// the test modules, minus `//` lines.
+    fn code_of(source: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let production = source.split("#[cfg(test)]").next().unwrap().to_string();
+        production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// **The 18 px corners: DWM is asked for none, and every frameless window
+    /// is transparent and goes through the host that cuts them.**
+    ///
+    /// Replaces the pin on `DWMWCP_ROUND`, which was Windows 11's fixed ~8 px.
+    /// Each half is needed: `DWMWCP_ROUND` back would put an 8 px DWM clip
+    /// under the 18 px cut (harmless to look at, but the preference is then
+    /// not what the windows say it is); a window that lost
+    /// `.with_transparent(true)` cannot have a see-through corner at all; and
+    /// one that went back to `eframe::run_ui_native` would clear to near-black
+    /// and never be handed the corner mask.
+    #[test]
+    fn the_frameless_windows_cut_18_pixel_corners_and_ask_dwm_for_none() {
+        let body = {
+            let code = code_of(include_str!("login_ui.rs"));
+            let from = code
+                .find("pub fn round_window_corners(")
+                .expect("`round_window_corners` is gone");
+            code[from..].split("\n}\n").next().unwrap().to_string()
+        };
+        assert!(
+            body.contains("DWMWCP_DONOTROUND")
+                && body.contains("DWMWA_WINDOW_CORNER_PREFERENCE")
+                && !body.contains(concat!("= DWMWCP_", "ROUND;")),
+            "`round_window_corners` no longer asks DWM for `DWMWCP_DONOTROUND`"
+        );
+        assert!(
+            body.contains("DWMWA_BORDER_COLOR") && body.contains("DwmExtendFrameIntoClientArea"),
+            "`round_window_corners` no longer removes DWM's 1 px square border and top line, \
+             which show as a ghost frame around the transparent corners"
+        );
+        assert_eq!(crate::theme::WINDOW_RADIUS, 18, "the design's window radius is 18");
+
+        for (module, source) in [
+            ("login_ui.rs", include_str!("login_ui.rs")),
+            ("loading_ui.rs", include_str!("loading_ui.rs")),
+            ("prefs_ui.rs", include_str!("prefs_ui.rs")),
+            ("app_window.rs", include_str!("app_window.rs")),
+            ("vault_window/mod.rs", include_str!("vault_window/mod.rs")),
+        ] {
+            let code = code_of(source);
+            assert!(
+                code.contains(".with_transparent(true)"),
+                "{module} builds a viewport that is not transparent, so its corners cannot be \
+                 round"
+            );
+            assert!(
+                !code.contains(concat!("eframe::run_ui_", "native(")),
+                "{module} opens its window with `eframe::run_ui_native`, which clears to \
+                 near-black and never draws the corner mask; use `window_host::run_ui_native`"
+            );
+        }
     }
 }
 
@@ -12165,7 +12273,9 @@ mod login_frame_host_tests {
         // The CALL, not the words: this file's prose says "run_ui_native" in
         // doc comments, and a needle matching those would fail here for the
         // wrong reason.
-        const CALL: &str = concat!("eframe::run_ui_", "native(");
+        // `window_host::run_ui_native` since the 18 px corners: it is the loop
+        // that clears to nothing and draws the corner mask.
+        const CALL: &str = concat!("window_host::run_ui_", "native(");
         assert!(
             !builder_body().contains(CALL),
             "`build_login_frame` opens its own event loop, so `app_window` calling it would \

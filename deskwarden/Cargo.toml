@@ -59,6 +59,11 @@ windows = { version = "0.58", features = [
     # Rounded corners + shadow for the frameless login window's custom
     # titlebar (login_ui::round_window_corners).
     "Win32_Graphics_Dwm",
+    # `MARGINS`, the argument of `DwmExtendFrameIntoClientArea`, which
+    # `login_ui::round_window_corners` calls with 1 px margins so that DWM
+    # stops painting an opaque 1 px line along the top of a transparent
+    # frameless window.
+    "Win32_UI_Controls",
     # Native Authenticode verification (src/signature.rs): WinVerifyTrust
     # plus the crypt32 calls that read the signer certificate.
     "Win32_Security_WinTrust",

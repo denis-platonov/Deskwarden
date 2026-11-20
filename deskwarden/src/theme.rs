@@ -971,13 +971,47 @@ fn letterspaced_in(
 /// rest with one call -- one `rect_filled` per frame, which is nothing beside
 /// the item list drawn on top of it.
 ///
-/// The other five `eframe` windows in this crate still call this on their first
-/// frame only. They are not transparent, they still get the near-black clear,
-/// and giving them a transparent clear is what [`crate::window_host`] argues
-/// against.
+/// **Since the 18 px corners, `window_host` calls this on every frame for every
+/// frameless window**, before the window's own closure runs; the calls in the
+/// window modules are now redundant for the first frame and harmless. The
+/// corners follow [`window_corner_radius`].
 pub fn paint_window_background(ui: &Ui) {
-    ui.painter()
-        .rect_filled(ui.max_rect(), CornerRadius::ZERO, WINDOW_BG);
+    ui.painter().rect_filled(
+        ui.max_rect(),
+        CornerRadius::same(window_corner_radius(ui.ctx())),
+        WINDOW_BG,
+    );
+}
+
+/// **The radius of a main window's outer corners, in points: 18, the same
+/// value the daemon's fill-time cards use** (`panel_draw::RADIUS` there).
+///
+/// Windows 11's own `DWMWCP_ROUND` is a fixed ~8 px that no API lets a window
+/// change, so these windows ask DWM for none (`DWMWCP_DONOTROUND`), open
+/// transparent, and cut their own corners: [`window_corner_radius`] says
+/// where, and `window_host::CornerMask` does the cutting, antialiased, on the
+/// GPU.
+pub const WINDOW_RADIUS: u8 = 18;
+
+/// The radius to draw this window's outer corners at right now:
+/// [`WINDOW_RADIUS`], or **0 while the window is maximized or fullscreen** --
+/// a window that fills the screen has its corners at the screen's, and a
+/// rounded corner there is a hole in the edge of the display. Snapped windows
+/// are not "maximized" to the OS and keep their corners, as Windows 11's own
+/// do.
+pub fn window_corner_radius(ctx: &egui::Context) -> u8 {
+    let (maximized, fullscreen) = ctx.input(|i| {
+        let viewport = i.viewport();
+        (
+            viewport.maximized.unwrap_or(false),
+            viewport.fullscreen.unwrap_or(false),
+        )
+    });
+    if maximized || fullscreen {
+        0
+    } else {
+        WINDOW_RADIUS
+    }
 }
 
 /// Applies the Deskwarden look to an egui context. Call once per window,

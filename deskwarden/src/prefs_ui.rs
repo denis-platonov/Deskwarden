@@ -5815,15 +5815,17 @@ pub fn run(settings: Settings) -> Settings {
             // box is what the user reported blinking. See
             // `crate::window_host::Reveal`.
             //
-            // Not `with_transparent(true)`: no child viewport is opened from
-            // this window, so it keeps `eframe`'s ordinary clear colour. See
+            // **Transparent, for the 18 px outer corners**: the window clears
+            // to nothing, paints its own background, and
+            // `window_host::CornerMask` cuts the corners. See
             // `crate::window_host`.
+            .with_transparent(true)
             .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
     };
 
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
+    let _ = crate::window_host::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
             // Same first-frame guard every window here uses: egui only picks
             // up a new font set at the *start* of the next frame, so drawing

@@ -3222,7 +3222,17 @@ mod tests {
             // merged on v1. Same FNV-1a/64 implementation, first run against the v1
             // pair (30497, 0xa904_68e2_4a66_8243) and the slice-15f pair
             // (30780, 0x2bdb_3a18_b87d_81a1), reproducing both.
-            (31047, 0x2ca1_25c6_7fa6_fee0_u64),
+            //
+            // **31314 bytes, new hash: one `windows` FEATURE ADDED** --
+            // `Win32_UI_Controls`, 267 bytes with its comment. It carries `MARGINS`,
+            // the argument of `DwmExtendFrameIntoClientArea`, which
+            // `login_ui::round_window_corners` calls on each frameless window so the
+            // main windows can cut their own 18 px corners. No dependency was added,
+            // removed, re-pointed or re-versioned, no `[patch]`/`[replace]` table
+            // appeared, and `[build-dependencies]` still reads exactly
+            // `winresource = "0.1"`. Same FNV-1a/64 implementation, first run against
+            // the v1 pair (31047, 0x2ca1_25c6_7fa6_fee0), which it reproduced.
+            (31314, 0xf99c_5ac7_7f8b_c192_u64),
             "`Cargo.toml` is not the file this module pinned. Every line of the byte-pinned \
              `build.rs` is a call into a dependency named here, and re-pointing that name at a \
              path or a fork runs arbitrary code at BUILD time with `build.rs` untouched -- \

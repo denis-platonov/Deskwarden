@@ -1866,6 +1866,7 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |_cc| {
             Ok(Box::new(Preview {
+                corners: deskwarden::window_host::CornerMask::new(),
                 queue,
                 at: 0,
                 directory: all || vault || kinds || sends || totp || edit || shell,
@@ -1983,6 +1984,8 @@ const WARMUP_FRAMES: u32 = 12;
 const MOTION_SETTLE_SECONDS: f64 = 0.9;
 
 struct Preview {
+    /// Cuts the login window's corners; see `window_host::CornerMask`.
+    corners: deskwarden::window_host::CornerMask,
     /// The surfaces to draw, and where in them we are.
     queue: Vec<Surface>,
     at: usize,
@@ -2553,6 +2556,13 @@ impl eframe::App for Preview {
             | Surface::FirstWindowUnreachableDeclinedCopy => {
                 self.draw_first_window(root, self.current())
             }
+        }
+
+        // The login window's outer corners, cut the way the real window cuts
+        // them, so the PNG carries the rounded silhouette (transparent pixels
+        // outside it). The pane surfaces are not whole windows.
+        if self.current().is_login_window() {
+            self.corners.paint(&ctx);
         }
 
         if self.screenshot && !self.done {

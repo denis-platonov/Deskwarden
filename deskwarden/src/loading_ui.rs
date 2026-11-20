@@ -278,11 +278,12 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
             // `crate::window_host::Reveal`, which also records why an invisible
             // window still gets frames at all.
             //
-            // **Not `with_transparent(true)`, unlike the two vault hosts.**
-            // Nothing opens a child viewport from this window, so it has
-            // nothing to gain from an alpha channel, and it keeps `eframe`'s
-            // ordinary clear colour rather than a transparent one -- see
-            // `crate::window_host`, which argues that trade.
+            // **Transparent, like every frameless window here**, so that its
+            // outer corners can be 18 px and antialiased rather than Windows
+            // 11's fixed 8: it clears to nothing, paints its own background,
+            // and `window_host::CornerMask` cuts the corners. See
+            // `crate::window_host`.
+            .with_transparent(true)
             .with_visible(false)
             .with_icon(theme::window_icon()),
         ..Default::default()
@@ -291,7 +292,7 @@ pub fn show_while<T: Send + 'static>(message: &str, rx: Receiver<T>) -> Option<T
     let mut styled = false;
     let mut window_reveal = crate::window_host::Reveal::hidden();
 
-    let _ = eframe::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
+    let _ = crate::window_host::run_ui_native(WINDOW_TITLE, options, move |ui, _frame| {
         if !styled {
             // egui applies a new font set at the *start* of the next frame,
             // not the one that calls set_fonts -- drawing Archivo-styled

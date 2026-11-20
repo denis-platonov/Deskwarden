@@ -38,26 +38,29 @@
 //! host the overlay. And with the alpha channel in place the clear colour has
 //! to actually be transparent, which is this module.
 //!
-//! # Which windows go through here, and why not all seven
+//! # Which windows go through here
 //!
-//! **Only the two hosts that can open the region overlay**: the vault window
-//! (`vault_window::run`) and the single startup window
-//! (`app_window::run_the_one_window`), which becomes that same vault UI. The
-//! other five `eframe` windows in this crate -- the standalone sign-in card,
-//! the spinner, the two "Add app" windows and Preferences -- keep
-//! `eframe::run_ui_native` and keep the default clear.
+//! **Every frameless window**: the vault window (`vault_window::run`), the
+//! single startup window (`app_window::run_the_one_window`) which becomes that
+//! same vault UI, the standalone sign-in card, the spinner and Preferences. The
+//! two "Add app" pickers keep `eframe::run_ui_native` -- they have the OS's own
+//! frame and nothing to round.
 //!
-//! That is deliberate and it is the conservative side of the trade. A
-//! transparent clear moves the responsibility for a window's opacity from
+//! A transparent clear moves the responsibility for a window's opacity from
 //! `eframe` to the window: every pixel the app does not paint this frame is
-//! see-through rather than near-black. The two hosts here earn that by painting
-//! `theme::paint_window_background` over their whole rect on EVERY frame, which
-//! is a change made with this one -- they used to paint it on the first frame
-//! only and let the clear colour cover the rest. `picker_ui`'s "Add app" window
-//! does not paint a background at all on its first frame, and none of the five
-//! paints one on any later frame; handing them a transparent clear would punch
-//! visible holes in real windows to fix a bug none of them has. A window that
-//! cannot host the overlay gains nothing from being here.
+//! see-through rather than near-black. This module makes that safe for every
+//! window at once instead of asking each to remember: [`TransparentlyCleared`]
+//! paints `theme::paint_window_background` over the whole rect on EVERY frame,
+//! before the window's own closure runs.
+//!
+//! # 3. The 18 px corners, and what became of Windows 11's 8
+//!
+//! The windows used to ask DWM for `DWMWCP_ROUND`, a fixed ~8 px. They now
+//! ask for `DWMWCP_DONOTROUND`, are transparent, and [`CornerMask`] cuts the
+//! design's 18 px (`theme::WINDOW_RADIUS`) out of the framebuffer's alpha with
+//! a one-pixel antialiased ramp. **There is no shadow**: a transparent window
+//! has none on Windows 11, and `DwmExtendFrameIntoClientArea` did not bring it
+//! back; see `login_ui::round_window_corners`.
 //!
 //! # 2. The white box that blinked, and `Reveal`
 //!
@@ -133,6 +136,7 @@
 //! could no longer see. See
 //! `foreground::every_window_this_crate_opens_asks_to_be_brought_to_the_front`.
 
+use crate::theme;
 use eframe::egui;
 
 /// The clear colour every window opened through [`run_ui_native`] gets:
@@ -155,13 +159,22 @@ pub const FULLY_TRANSPARENT: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
 /// in nothing at all besides.
 struct TransparentlyCleared<U> {
     ui_fun: U,
+    corners: CornerMask,
 }
 
 impl<U: FnMut(&mut egui::Ui, &mut eframe::Frame) + 'static> eframe::App
     for TransparentlyCleared<U>
 {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        // **The window's own opacity, on every frame and before anything the
+        // closure does.** With a transparent clear an unpainted pixel is a
+        // see-through one, so every window through here -- not only the two
+        // that always painted it -- gets its background from the host.
+        theme::paint_window_background(ui);
         (self.ui_fun)(ui, frame);
+        // **Last, so that it lands on top of everything**: the cut that makes
+        // the outer corners round. See [`CornerMask`].
+        self.corners.paint(ui.ctx());
     }
 
     /// **Transparent, so that a window's opacity is the window's own doing.**
@@ -205,8 +218,268 @@ pub fn run_ui_native(
     eframe::run_native(
         app_name,
         native_options,
-        Box::new(|_cc| Ok(Box::new(TransparentlyCleared { ui_fun }))),
+        Box::new(|_cc| Ok(Box::new(TransparentlyCleared { ui_fun, corners: CornerMask::new() }))),
     )
+}
+
+/// **Cuts a window's four outer corners to [`theme::WINDOW_RADIUS`], smoothly
+/// antialiased, by erasing them from the framebuffer's alpha channel.**
+///
+/// # Why this is a GL callback and not egui shapes
+///
+/// The window is transparent and Windows 11's own rounding is switched off
+/// (`DWMWCP_DONOTROUND`), so what is left of a square corner after this is the
+/// desktop showing through. egui can only ever *add* to a framebuffer -- its
+/// blend is `ONE, ONE_MINUS_SRC_ALPHA` and nothing it paints lowers a pixel's
+/// alpha -- so "paint the corner transparent" is not expressible as a shape.
+/// The alternative is to make every painter that reaches a corner round its
+/// own: the title bar, the window border, the close button's hover, the
+/// sidebar's bottom-left, whatever the next screen adds. That is a list that
+/// is wrong the first time somebody forgets, and the failure is a square
+/// opaque corner on a window that is supposed to be round.
+///
+/// So one `egui::PaintCallback`, in the topmost layer, draws four small quads
+/// with `glBlendFuncSeparate(ZERO, ONE_MINUS_SRC_ALPHA, ..)` whose fragment
+/// alpha is the *outside* coverage of a circle of the window's radius:
+/// destination times one minus that. It works on whatever was painted before it
+/// -- and gets the antialiasing from the shader's one-pixel ramp rather than
+/// from a mesh.
+///
+/// # When it does nothing
+///
+/// * **Maximized or fullscreen** ([`theme::window_corner_radius`] is 0): square
+///   corners at the screen's edge. No callback is queued at all.
+/// * **A GL it cannot compile for** (anything but GLSL 1.40 or ES 3.00): it
+///   logs once and stays off. The window is then square-cornered but still
+///   correct -- the background is painted opaque to every corner -- rather than
+///   missing.
+///
+/// One per [`run_ui_native`] call, because the GL objects belong to that call's
+/// context and a later window opens a new one.
+pub struct CornerMask {
+    gl: std::sync::Arc<std::sync::Mutex<MaskGl>>,
+}
+
+enum MaskGl {
+    /// Nothing tried yet; the first callback builds the program.
+    Untried,
+    Ready(MaskProgram),
+    /// Compilation failed or the GLSL is too old. Logged once.
+    Unavailable,
+}
+
+struct MaskProgram {
+    program: eframe::glow::Program,
+    vao: eframe::glow::VertexArray,
+    size: Option<eframe::glow::UniformLocation>,
+    origin: Option<eframe::glow::UniformLocation>,
+    quad: Option<eframe::glow::UniformLocation>,
+    center: Option<eframe::glow::UniformLocation>,
+    dir: Option<eframe::glow::UniformLocation>,
+    radius: Option<eframe::glow::UniformLocation>,
+}
+
+impl CornerMask {
+    pub fn new() -> Self {
+        Self { gl: std::sync::Arc::new(std::sync::Mutex::new(MaskGl::Untried)) }
+    }
+
+    /// Queues this frame's cut, if the window has rounded corners right now.
+    pub fn paint(&self, ctx: &egui::Context) {
+        if theme::window_corner_radius(ctx) == 0 {
+            return;
+        }
+        let state = self.gl.clone();
+        let radius_points = f32::from(theme::WINDOW_RADIUS);
+        let callback = eframe::egui_glow::CallbackFn::new(move |info, painter| {
+            let mut state = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if matches!(*state, MaskGl::Untried) {
+                *state = match MaskProgram::build(painter.gl()) {
+                    Ok(program) => MaskGl::Ready(program),
+                    Err(reason) => {
+                        log::warn!(
+                            "window corners: the rounding shader is unavailable ({reason}); \
+                             this window keeps square corners"
+                        );
+                        MaskGl::Unavailable
+                    }
+                };
+            }
+            if let MaskGl::Ready(program) = &*state {
+                let [width, height] = info.screen_size_px;
+                program.draw(
+                    painter.gl(),
+                    width as f32,
+                    height as f32,
+                    radius_points * info.pixels_per_point,
+                );
+            }
+        });
+        let layer = egui::LayerId::new(egui::Order::Debug, egui::Id::new("window-corner-mask"));
+        // The whole window, and not the content rect: the callback's rect is
+        // the GL viewport, and the corner maths below is in framebuffer pixels.
+        let screen = ctx.content_rect();
+        let painter = ctx.layer_painter(layer).with_clip_rect(screen);
+        painter.add(egui::PaintCallback { rect: screen, callback: std::sync::Arc::new(callback) });
+    }
+}
+
+impl Default for CornerMask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MaskProgram {
+    fn build(gl: &std::sync::Arc<eframe::glow::Context>) -> Result<Self, String> {
+        use eframe::glow::HasContext as _;
+
+        let version = unsafe { gl.get_parameter_string(eframe::glow::SHADING_LANGUAGE_VERSION) };
+        let es = version.contains(" ES ");
+        let (major, minor) = {
+            let digits = version.find(|c: char| c.is_ascii_digit()).unwrap_or(0);
+            let mut parts = version[digits..].split(|c: char| !c.is_ascii_digit());
+            let major: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+            let minor: u32 = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+            (major, minor)
+        };
+        let header = if es && major >= 3 {
+            "#version 300 es\nprecision highp float;\n"
+        } else if !es && (major > 1 || (major == 1 && minor >= 40)) {
+            "#version 140\n"
+        } else {
+            return Err(format!("GLSL {version:?} has no gl_VertexID"));
+        };
+
+        // A triangle strip of four vertices per corner square, built from
+        // `gl_VertexID` so that no buffer is needed at all: (0,0) (1,0) (0,1)
+        // (1,1) scaled by the radius. `v_px` is the framebuffer position in
+        // pixels, y down, and is exact at a fragment because every quad edge
+        // is a whole pixel.
+        let vertex = format!(
+            "{header}\
+             uniform vec2 u_size;\n\
+             uniform vec2 u_origin;\n\
+             uniform float u_quad;\n\
+             out vec2 v_px;\n\
+             void main() {{\n\
+                 vec2 q = vec2(float(gl_VertexID & 1), float((gl_VertexID >> 1) & 1));\n\
+                 v_px = u_origin + q * u_quad;\n\
+                 gl_Position = vec4(v_px.x / u_size.x * 2.0 - 1.0, 1.0 - v_px.y / u_size.y * 2.0, 0.0, 1.0);\n\
+             }}\n"
+        );
+        // Outside coverage: 0 well inside the circle, 1 well outside, with a
+        // one-pixel linear ramp across the edge. The colour is irrelevant --
+        // the blend never reads it -- and the alpha is what is subtracted.
+        let fragment = format!(
+            "{header}\
+             uniform vec2 u_center;\n\
+             uniform vec2 u_dir;\n\
+             uniform float u_radius;\n\
+             in vec2 v_px;\n\
+             out vec4 o_color;\n\
+             void main() {{\n\
+                 vec2 toward = max((u_center - v_px) * u_dir, 0.0);\n\
+                 float inside = clamp(u_radius - length(toward) + 0.5, 0.0, 1.0);\n\
+                 o_color = vec4(0.0, 0.0, 0.0, 1.0 - inside);\n\
+             }}\n"
+        );
+
+        unsafe {
+            let program = gl.create_program()?;
+            let mut shaders = Vec::new();
+            for (kind, source) in
+                [(eframe::glow::VERTEX_SHADER, vertex), (eframe::glow::FRAGMENT_SHADER, fragment)]
+            {
+                let shader = gl.create_shader(kind)?;
+                gl.shader_source(shader, &source);
+                gl.compile_shader(shader);
+                if !gl.get_shader_compile_status(shader) {
+                    let log = gl.get_shader_info_log(shader);
+                    gl.delete_shader(shader);
+                    gl.delete_program(program);
+                    for done in shaders {
+                        gl.delete_shader(done);
+                    }
+                    return Err(log);
+                }
+                gl.attach_shader(program, shader);
+                shaders.push(shader);
+            }
+            gl.link_program(program);
+            let linked = gl.get_program_link_status(program);
+            for shader in shaders {
+                gl.detach_shader(program, shader);
+                gl.delete_shader(shader);
+            }
+            if !linked {
+                let log = gl.get_program_info_log(program);
+                gl.delete_program(program);
+                return Err(log);
+            }
+            let vao = gl.create_vertex_array()?;
+            Ok(Self {
+                size: gl.get_uniform_location(program, "u_size"),
+                origin: gl.get_uniform_location(program, "u_origin"),
+                quad: gl.get_uniform_location(program, "u_quad"),
+                center: gl.get_uniform_location(program, "u_center"),
+                dir: gl.get_uniform_location(program, "u_dir"),
+                radius: gl.get_uniform_location(program, "u_radius"),
+                program,
+                vao,
+            })
+        }
+    }
+
+    /// Erases the four corner squares' outside-the-circle pixels. The painter
+    /// re-establishes its own blend, program, scissor and vertex array after
+    /// every callback, so this leaves the state as it likes.
+    fn draw(&self, gl: &std::sync::Arc<eframe::glow::Context>, width: f32, height: f32, radius: f32) {
+        use eframe::glow::HasContext as _;
+
+        // The quads are whole pixels -- a fractional edge would put the quad
+        // between pixels -- and cover the circle's square with a pixel to
+        // spare; the circle itself keeps the exact radius.
+        let quad = radius.ceil() + 1.0;
+        if radius < 1.0 || width < 2.0 * quad || height < 2.0 * quad {
+            return;
+        }
+        unsafe {
+            gl.disable(eframe::glow::SCISSOR_TEST);
+            gl.enable(eframe::glow::BLEND);
+            gl.blend_equation_separate(eframe::glow::FUNC_ADD, eframe::glow::FUNC_ADD);
+            // dst = dst * (1 - mask), colour and alpha alike: premultiplied
+            // content stays premultiplied.
+            gl.blend_func_separate(
+                eframe::glow::ZERO,
+                eframe::glow::ONE_MINUS_SRC_ALPHA,
+                eframe::glow::ZERO,
+                eframe::glow::ONE_MINUS_SRC_ALPHA,
+            );
+            gl.use_program(Some(self.program));
+            gl.bind_vertex_array(Some(self.vao));
+            gl.uniform_2_f32(self.size.as_ref(), width, height);
+            gl.uniform_1_f32(self.quad.as_ref(), quad);
+            gl.uniform_1_f32(self.radius.as_ref(), radius);
+            let (right, bottom) = (width - radius, height - radius);
+            // (quad origin, circle centre, direction from a pixel towards the
+            // window's corner -- only the part of the quad that lies in that
+            // corner's quadrant is cut; the rest of it is the straight edge).
+            for ((ox, oy), (cx, cy), (dx, dy)) in [
+                ((0.0, 0.0), (radius, radius), (1.0, 1.0)),
+                ((width - quad, 0.0), (right, radius), (-1.0, 1.0)),
+                ((0.0, height - quad), (radius, bottom), (1.0, -1.0)),
+                ((width - quad, height - quad), (right, bottom), (-1.0, -1.0)),
+            ] {
+                gl.uniform_2_f32(self.origin.as_ref(), ox, oy);
+                gl.uniform_2_f32(self.center.as_ref(), cx, cy);
+                gl.uniform_2_f32(self.dir.as_ref(), dx, dy);
+                gl.draw_arrays(eframe::glow::TRIANGLE_STRIP, 0, 4);
+            }
+            gl.bind_vertex_array(None);
+            gl.use_program(None);
+        }
+    }
 }
 
 /// What [`Reveal::advance`] wants done this frame. Split out of the method so
@@ -613,6 +886,7 @@ mod tests {
     fn the_clear_colour_is_fully_transparent() {
         let app = TransparentlyCleared {
             ui_fun: |_: &mut egui::Ui, _: &mut eframe::Frame| {},
+            corners: CornerMask::new(),
         };
         let cleared = eframe::App::clear_color(&app, &egui::Visuals::light());
         assert_eq!(
@@ -880,6 +1154,62 @@ mod tests {
             presenting.contains("dwm.uncloak(hwnd)"),
             "the raise is answered before the uncloak is asked for, so the foreground lands \
              on a window the user cannot see"
+        );
+    }
+
+    /// **A maximized or fullscreen window has square corners; every other has
+    /// 18 px ones.** The mask queues nothing at radius 0, so the cut is off
+    /// with it -- rounded corners at the screen's edge are holes in the display.
+    #[test]
+    fn a_maximized_or_fullscreen_window_has_square_corners() {
+        let radius_when = |maximized: Option<bool>, fullscreen: Option<bool>| {
+            let ctx = egui::Context::default();
+            let mut raw = egui::RawInput::default();
+            raw.viewports.insert(
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo { maximized, fullscreen, ..Default::default() },
+            );
+            let mut seen = None;
+            let _ = ctx.run_ui(raw, |ui| seen = Some(theme::window_corner_radius(ui.ctx())));
+            seen.expect("the frame ran")
+        };
+        assert_eq!(radius_when(None, None), theme::WINDOW_RADIUS, "an unknown state is a window");
+        assert_eq!(radius_when(Some(false), Some(false)), 18);
+        assert_eq!(radius_when(Some(true), Some(false)), 0, "maximized is square");
+        assert_eq!(radius_when(Some(false), Some(true)), 0, "fullscreen is square");
+    }
+
+    /// The mask's alpha is *subtracted* (`dst * (1 - mask)`), which is the one
+    /// thing egui's own pipeline cannot do and the reason this is a GL
+    /// callback. Pinned in the source because there is no GL context in a
+    /// test: the blend must stay ZERO / ONE_MINUS_SRC_ALPHA for colour and alpha
+    /// alike, and the shader must keep its one-pixel antialiasing ramp.
+    #[test]
+    fn the_corner_mask_subtracts_with_an_antialiased_edge() {
+        let source = include_str!("window_host.rs").replace("\r\n", "\n");
+        // The production half only: this test's own literals are in the rest.
+        let source = source.split("#[cfg(test)]").next().unwrap();
+        let draw = source
+            .split("fn draw(&self")
+            .nth(1)
+            .expect("`MaskProgram::draw` is gone")
+            .split("\n    }\n")
+            .next()
+            .unwrap();
+        assert!(
+            draw.contains(
+                "eframe::glow::ZERO,\n                eframe::glow::ONE_MINUS_SRC_ALPHA,\n                eframe::glow::ZERO,\n                eframe::glow::ONE_MINUS_SRC_ALPHA,"
+            ),
+            "the corner mask no longer blends as dst * (1 - mask); it would paint the corners \
+             instead of erasing them"
+        );
+        assert!(
+            source.contains("clamp(u_radius - length(toward) + 0.5, 0.0, 1.0)"),
+            "the corner mask lost its one-pixel antialiasing ramp"
+        );
+        assert!(
+            source.contains("egui::Order::Debug"),
+            "the mask is no longer in the topmost layer, so a popup could draw over a cut corner"
         );
     }
 

@@ -1800,10 +1800,19 @@ pub fn build_frame_with_search(
         // desktop; that module's doc has the history.) That is a fix on the
         // window that needs it, and it leaves this one alone.
         //
-        // This window is opaque, paints its own background on every frame
-        // rather than relying on the clear colour, and is unaffected either
-        // way -- see `theme::paint_window_background` and
-        // `crate::window_host`.
+        // This window paints its own background on every frame rather than
+        // relying on the clear colour -- see `theme::paint_window_background`
+        // and `crate::window_host`.
+        //
+        // **And it is transparent again, for a reason that is its own**: the
+        // 18 px outer corners. `window_host::CornerMask` cuts them out of the
+        // framebuffer's alpha, which needs a window whose alpha reaches the
+        // compositor -- so this window asks for transparency exactly as
+        // `app_window::the_vault_windows_viewport`, which becomes this window,
+        // always has. The paragraph above is about what the flag costs on a
+        // driver that reads it as colour-key transparency; that cost is now
+        // the same for every window of this app, not saved by this one.
+        .with_transparent(true)
         // **Created hidden, shown by `Reveal` once it has painted something.**
         // Windows shows a new window with its own background while the GL
         // context and the font atlas are still being built, and that is the
