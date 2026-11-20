@@ -206,7 +206,7 @@ generate.avoid_lookalikes = Evitar caracteres parecidos
 generate.working = Generando…
 generate.failed = No se pudo generar una contraseña. Inténtalo de nuevo.
 generate.kind_password = Contraseña
-generate.kind_passphrase = Frase de contraseña
+generate.kind_passphrase = Frase
 generate.length = Longitud
 generate.words = Palabras
 
@@ -241,7 +241,7 @@ picker.send_totp_sub = Escribe un código de un solo uso
 picker.send_custom_sub = Escribe este campo personalizado
 picker.empty_new_login_sub = Guardar un inicio de sesión para esta app
 picker.empty_search_sub = Buscarlo con otro nombre
-picker.new_login = Nuevo inicio de sesión
+picker.new_login = Nuevo acceso
 picker.search_vault = Buscar en la caja fuerte
 picker.empty_title = No hay inicio de sesión guardado para {app_name}
 picker.empty_body = Deskwarden asocia ventanas por nombre de proceso y título.

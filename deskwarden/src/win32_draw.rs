@@ -456,7 +456,29 @@ pub fn draw_text(hdc: HDC, text: &str, rect: &mut RECT, format: DRAW_TEXT_FORMAT
         return 0;
     }
     let mut chars: Vec<u16> = text.encode_utf16().collect();
-    draw_text_utf16(hdc, &mut chars, rect, format)
+    draw_text_utf16(hdc, &mut chars, rect, with_ellipsis(format))
+}
+
+/// **A single line that does not fit ends in an ellipsis rather than being cut
+/// off mid-glyph.** Most painters already ask for `DT_END_ELLIPSIS`; the ones
+/// that did not (the picker's headings, the unlock prompt, button and cell
+/// labels, the tray popup's lines) hard-clipped, which in a language whose
+/// sentences run 40 % longer than English reads as a missing word. One place
+/// fixes them all. A run that is measured (`DT_CALCRECT`), wrapped, or that
+/// carries its own ellipsis style is left exactly as asked; the generated
+/// password goes through [`draw_text_utf16`], never this, because a password
+/// that quietly ends in "..." is worse than one that is cut.
+fn with_ellipsis(format: DRAW_TEXT_FORMAT) -> DRAW_TEXT_FORMAT {
+    const CALCRECT: u32 = 0x0400;
+    const PATH_ELLIPSIS: u32 = 0x4000;
+    const WORD_ELLIPSIS: u32 = 0x40000;
+    const END: u32 = DT_END_ELLIPSIS.0;
+    let bits = format.0;
+    if bits & DT_SINGLELINE.0 != 0 && bits & (CALCRECT | PATH_ELLIPSIS | WORD_ELLIPSIS | END) == 0 {
+        DRAW_TEXT_FORMAT(DT_END_ELLIPSIS.0 | bits)
+    } else {
+        format
+    }
 }
 
 /// [`draw_text`] for a caller that already holds the UTF-16 buffer.

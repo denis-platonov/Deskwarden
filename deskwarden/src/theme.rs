@@ -481,12 +481,117 @@ fn system_faces_for(need: crate::i18n::Fonts) -> Option<SystemFaces> {
     })
 }
 
+/// A face's vertical metrics in em, from its `hhea` table: `(ascent, descent,
+/// line gap)`, descent as a positive distance. `index` picks the member of a
+/// `.ttc` collection. Read by hand because the only consumer is
+/// [`baseline_shift_factor`] and a parser dependency for three integers is
+/// more than the job.
+fn sfnt_vertical_em(bytes: &[u8], index: u32) -> Option<(f32, f32, f32)> {
+    let u16_at = |o: usize| bytes.get(o..o + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    let i16_at = |o: usize| u16_at(o).map(|v| v as i16);
+    let u32_at = |o: usize| bytes.get(o..o + 4).map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+    let base = if bytes.get(0..4)? == b"ttcf" { u32_at(12 + 4 * index as usize)? as usize } else { 0 };
+    let tables = u16_at(base + 4)? as usize;
+    let (mut head, mut hhea) = (None, None);
+    for i in 0..tables {
+        let record = base + 12 + 16 * i;
+        let offset = u32_at(record + 8)? as usize;
+        match bytes.get(record..record + 4)? {
+            b"head" => head = Some(offset),
+            b"hhea" => hhea = Some(offset),
+            _ => {}
+        }
+    }
+    let (head, hhea) = (head?, hhea?);
+    let per_em = u16_at(head + 18)? as f32;
+    if per_em <= 0.0 {
+        return None;
+    }
+    Some((
+        i16_at(hhea + 4)? as f32 / per_em,
+        -(i16_at(hhea + 6)? as f32) / per_em,
+        i16_at(hhea + 8)? as f32 / per_em,
+    ))
+}
+
+/// **How far, as a fraction of the font size, a fallback face's glyphs must be
+/// drawn down to sit on Archivo's baseline.** Zero or negative means up.
+///
+/// egui puts a glyph's baseline at `face ascent + (row height of the FIRST
+/// face in the family - the face's own row height) / 2`: it centres the
+/// difference between the two faces' line boxes, which lines the baselines up
+/// only when both faces split their line box the same way. Yu Gothic reserves
+/// 0.88 above, 0.22 below and a 0.5 em gap, so its glyphs came out 0.255 em --
+/// 3-4 px at body size -- above the Latin beside them; Segoe UI and Malgun
+/// Gothic sit 0.08 em low. Rather than hard-code a number per face, this
+/// solves the same equation egui does for whichever face was found, so the
+/// Meiryo and MS Gothic fallbacks are right too.
+fn baseline_shift_factor(face: &[u8], index: u32) -> f32 {
+    let (Some(archivo), Some(other)) = (sfnt_vertical_em(ARCHIVO_FACES[0].3, 0), sfnt_vertical_em(face, index)) else {
+        return 0.0;
+    };
+    let height = |m: (f32, f32, f32)| m.0 + m.1 + m.2;
+    archivo.0 - (other.0 + 0.5 * (height(archivo) - height(other)))
+}
+
+/// The Greek codepoints Archivo maps (U+0394 Delta, U+03A9 Omega, U+03BC mu,
+/// U+03C0 pi) -- four of 75, so in a Greek session those four letters came
+/// from Archivo and the rest from Segoe UI: two typefaces, two sizes and two
+/// baselines in one word.
+const ARCHIVO_GREEK: [u16; 4] = [0x394, 0x3a9, 0x3bc, 0x3c0];
+
+/// `font` with the BMP codepoints in `unmap` mapped to `.notdef` in every
+/// format-4 `cmap` subtable. egui treats a `.notdef` answer as "this face does
+/// not have it" and asks the next face in the family, which is the point: the
+/// letter is then drawn by whoever draws the rest of the script. Only
+/// single-codepoint segments with no glyph-id array are rewritten (that is how
+/// Archivo stores these four); anything else is left alone.
+fn unmap_codepoints(font: &[u8], unmap: &[u16]) -> Vec<u8> {
+    let mut out = font.to_vec();
+    let u16_at = |b: &[u8], o: usize| b.get(o..o + 2).map(|v| u16::from_be_bytes([v[0], v[1]]));
+    let u32_at = |b: &[u8], o: usize| b.get(o..o + 4).map(|v| u32::from_be_bytes([v[0], v[1], v[2], v[3]]));
+    let Some(tables) = u16_at(font, 4) else { return out };
+    let cmap = (0..tables as usize).find_map(|i| {
+        let record = 12 + 16 * i;
+        (font.get(record..record + 4)? == b"cmap").then(|| u32_at(font, record + 8)).flatten()
+    });
+    let Some(cmap) = cmap.map(|o| o as usize) else { return out };
+    let subtables = u16_at(font, cmap + 2).unwrap_or(0) as usize;
+    for i in 0..subtables {
+        let Some(offset) = u32_at(font, cmap + 4 + 8 * i + 4) else { continue };
+        let table = cmap + offset as usize;
+        if u16_at(font, table) != Some(4) {
+            continue;
+        }
+        let Some(segments) = u16_at(font, table + 6).map(|v| v as usize / 2) else { continue };
+        let ends = table + 14;
+        let starts = ends + 2 * segments + 2;
+        let deltas = starts + 2 * segments;
+        let ranges = deltas + 2 * segments;
+        for seg in 0..segments {
+            let (Some(end), Some(start), Some(range)) =
+                (u16_at(font, ends + 2 * seg), u16_at(font, starts + 2 * seg), u16_at(font, ranges + 2 * seg))
+            else {
+                continue;
+            };
+            if start == end && range == 0 && unmap.contains(&start) {
+                // (code + delta) mod 65536 == 0
+                let delta = 0u16.wrapping_sub(start).to_be_bytes();
+                out[deltas + 2 * seg..deltas + 2 * seg + 2].copy_from_slice(&delta);
+            }
+        }
+    }
+    out
+}
+
 /// The first of `candidates` that is a readable file, as egui font data.
 fn first_system_face(candidates: &[(&str, u32)]) -> Option<egui::FontData> {
     candidates.iter().find_map(|(file, index)| {
         system_font(file).map(|bytes| {
+            let shift = baseline_shift_factor(&bytes, *index);
             let mut data = egui::FontData::from_owned(bytes);
             data.index = *index;
+            data.tweak.y_offset_factor = shift;
             data
         })
     })
@@ -557,16 +662,22 @@ fn add_system_script_faces(fonts: &mut egui::FontDefinitions, needs: &[crate::i1
 /// is the one in force.
 pub(crate) fn font_definitions_for(needs: &[crate::i18n::Fonts]) -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
+    let greek = needs.contains(&crate::i18n::Fonts::Greek);
     for (family, _, _, bytes) in ARCHIVO_FACES {
-        fonts
-            .font_data
-            .insert(family.to_owned(), Arc::new(egui::FontData::from_static(bytes)));
+        let data = if greek {
+            // Greek is drawn from ONE face: Archivo's four stray Greek letters
+            // are handed over to the system face behind it. See ARCHIVO_GREEK.
+            egui::FontData::from_owned(unmap_codepoints(bytes, &ARCHIVO_GREEK))
+        } else {
+            egui::FontData::from_static(bytes)
+        };
+        fonts.font_data.insert(family.to_owned(), Arc::new(data));
     }
 
     for (_, noto, bytes) in CYRILLIC_FACES {
-        fonts
-            .font_data
-            .insert(noto.to_owned(), Arc::new(egui::FontData::from_static(bytes)));
+        let mut data = egui::FontData::from_static(bytes);
+        data.tweak.y_offset_factor = baseline_shift_factor(bytes, 0);
+        fonts.font_data.insert(noto.to_owned(), Arc::new(data));
     }
 
     let default_stack = fonts
@@ -11939,6 +12050,423 @@ mod tests {
             let names = system(&both);
             assert!(names.iter().any(|n| n.contains("Korean")) && names.iter().any(|n| n.contains("Japanese")), "{names:?}");
         }
+    }
+
+    // -----------------------------------------------------------------
+    // The Win32/GDI surfaces ui_preview cannot draw.
+    // -----------------------------------------------------------------
+
+    /// One string a GDI surface paints: the catalog key, the Archivo family
+    /// and logical px size it is drawn in, the width in logical px of the
+    /// rect it is drawn into (the arithmetic is in the comment on each group,
+    /// read off the painter's own constants), and the extra px a tracked run
+    /// adds per character.
+    struct Budget {
+        key: &'static str,
+        family: &'static str,
+        px: i32,
+        width: i32,
+        tracking: i32,
+    }
+
+    const fn b(key: &'static str, family: &'static str, px: i32, width: i32) -> Budget {
+        Budget { key, family, px, width, tracking: 0 }
+    }
+
+    /// Every single-line catalog string the cards, prompts and the tray
+    /// popup paint, with the width it has. `DT_END_ELLIPSIS` rows would
+    /// truncate and the rest clip; either way text that does not fit is
+    /// text the user cannot read, so both are held to the same bound.
+    fn gdi_budgets() -> Vec<Budget> {
+        let mut v = vec![
+            // tray_popup: inner = 390 - 2*16 = 358; footer 350 - 7 - 8 = 335;
+            // tiles (358 - 16) / 3 = 114; search edit 374 - 14 - 56 = 304.
+            b("tray_popup.locked_title", "Archivo-ExtraBold", 19, 358),
+            b("tray_popup.locked_body", "Archivo-Regular", 15, 358),
+            b("tray_popup.unlock", "Archivo-Bold", 16, 358),
+            b("tray_popup.search", "Archivo-Regular", 15, 304),
+            Budget { key: "tray_popup.label_recent", family: "Archivo-ExtraBold", px: 12, width: 350, tracking: 1 },
+            Budget { key: "tray_popup.label_results", family: "Archivo-ExtraBold", px: 12, width: 350, tracking: 1 },
+            Budget { key: "tray_popup.label_top", family: "Archivo-ExtraBold", px: 12, width: 350, tracking: 1 },
+            b("tray_popup.empty_title", "Archivo-Bold", 15, 358),
+            b("tray_popup.no_matches_title", "Archivo-Bold", 15, 358),
+            b("tray_popup.empty_body", "Archivo-Regular", 13, 358),
+            b("tray_popup.no_matches_body", "Archivo-Regular", 13, 358),
+            b("tray_popup.tile_generate", "Archivo-Bold", 13, 114),
+            b("tray_popup.tile_new_item", "Archivo-Bold", 13, 114),
+            b("tray_popup.tile_share", "Archivo-Bold", 13, 114),
+            b("tray_popup.footer_locked", "Archivo-Regular", 13, 335),
+            b("tray_popup.footer_offline", "Archivo-Regular", 13, 335),
+            b("tray_popup.footer_syncing", "Archivo-Regular", 13, 335),
+            b("tray_popup.footer_synced", "Archivo-Regular", 13, 335),
+            b("tray_popup.footer_synced_one_minute", "Archivo-Regular", 13, 335),
+            b("tray_popup.footer_synced_minutes", "Archivo-Regular", 13, 335),
+            b("tray_popup.toast_username_copied", "Archivo-Regular", 13, 335),
+            b("tray_popup.toast_password_copied", "Archivo-Regular", 13, 335),
+            b("tray_popup.toast_no_username", "Archivo-Regular", 13, 335),
+            b("tray_popup.toast_no_password", "Archivo-Regular", 13, 335),
+            b("tray_popup.toast_cancelled", "Archivo-Regular", 13, 335),
+            b("tray_popup.toast_needs_hello", "Archivo-Regular", 13, 335),
+            b("tray_popup.toast_gone", "Archivo-Regular", 13, 335),
+            // panel_draw: the key tooltip is 230 - 2*14 = 202 wide, one line
+            // per hint; the Enter badge costs the row's name lane its width.
+            b("panel.hint_choose_account", "Archivo-Regular", 14, 202),
+            b("panel.hint_enter_fill", "Archivo-Regular", 14, 202),
+            b("panel.hint_esc_close", "Archivo-Regular", 14, 202),
+            b("panel.enter_label", "Archivo-Bold", 13, 60),
+            // locked_card: 410 - 2*18 = 374; the pill is 64; the button
+            // loses its ENTER chip lane (~46).
+            b("locked_card.pill", "Archivo-Bold", 12, 64),
+            b("locked_card.title", "Archivo-ExtraBold", 19, 374),
+            b("locked_card.body", "Archivo-Regular", 15, 374),
+            b("locked_card.unlock", "Archivo-Bold", 16, 324),
+            // prompt_card: a row's text lane is 384 - 3 - 65 = 316 (246 once
+            // the Enter badge is on it).
+            b("prompt_card.saved_credentials", "Archivo-Regular", 14, 246),
+            // notice_card: 374 - 24 = 350 titles; the done card is
+            // 320 - 2*28 = 264; OK is 140 minus a chip lane.
+            b("notice_card.nothing_typed", "Archivo-ExtraBold", 19, 350),
+            b("notice_card.stopped", "Archivo-ExtraBold", 19, 350),
+            b("notice_card.ok", "Archivo-Bold", 15, 90),
+            b("notice_card.saved_title", "Archivo-ExtraBold", 24, 344),
+            b("notice_card.updated_title", "Archivo-ExtraBold", 24, 344),
+            b("notice_card.signed_in_title", "Archivo-ExtraBold", 24, 344),
+            b("notice_card.saved_sub", "Archivo-Regular", 15, 344),
+            b("notice_card.updated_sub", "Archivo-Regular", 15, 344),
+            b("notice_card.signed_in_sub", "Archivo-Regular", 15, 344),
+            // save_login_card: 370 - 36 = 334; title 272; folder row 256;
+            // password caption 250; hints 306; Save loses a chip lane; the
+            // pair of buttons is 163 each; Generate is 78 less focus.
+            b("save_login.title", "Archivo-ExtraBold", 17, 272),
+            b("save_login.folder_row", "Archivo-Regular", 14, 256),
+            b("save_login.caption_username", "Archivo-SemiBold", 13, 334),
+            b("save_login.caption_password", "Archivo-SemiBold", 13, 250),
+            b("save_login.username_hint", "Archivo-Regular", 15, 306),
+            b("save_login.password_hint", "Archivo-Regular", 15, 306),
+            b("save_login.save", "Archivo-Bold", 15, 113),
+            b("save_login.not_now", "Archivo-Bold", 15, 159),
+            b("save_login.generate", "Archivo-SemiBold", 13, 74),
+            b("save_login.never", "Archivo-SemiBold", 14, 334),
+            // picker_prompt: 400 - 32 = 368; a palette row's lane is
+            // 368 - 3 - 65 - 24 = 276 (206 selected); the search rows 285;
+            // the footer buttons 180 less their chip lane; hints 202.
+            b("picker.list_title", "Archivo-ExtraBold", 17, 368),
+            b("picker.palette_title", "Archivo-ExtraBold", 17, 368),
+            b("picker.search_title", "Archivo-ExtraBold", 17, 368),
+            b("picker.empty_title", "Archivo-ExtraBold", 17, 368),
+            b("picker.list_sub", "Archivo-Regular", 14, 368),
+            b("picker.palette_sub", "Archivo-Regular", 14, 368),
+            b("picker.search_sub", "Archivo-Regular", 14, 368),
+            b("picker.empty_body", "Archivo-Regular", 14, 368),
+            b("picker.send_all", "Archivo-Bold", 16, 206),
+            b("picker.send_sequence", "Archivo-Bold", 16, 206),
+            b("picker.send_all_sub", "Archivo-Regular", 14, 206),
+            b("picker.send_sequence_sub", "Archivo-Regular", 14, 206),
+            b("picker.send_username_sub", "Archivo-Regular", 14, 206),
+            b("picker.send_password_sub", "Archivo-Regular", 14, 206),
+            b("picker.send_totp_sub", "Archivo-Regular", 14, 206),
+            b("picker.send_custom_sub", "Archivo-Regular", 14, 206),
+            b("picker.overflow_title", "Archivo-Bold", 16, 285),
+            b("picker.overflow_sub", "Archivo-Regular", 14, 285),
+            b("picker.nothing_title", "Archivo-Bold", 16, 285),
+            b("picker.nothing_sub", "Archivo-Regular", 14, 285),
+            b("picker.new_login", "Archivo-Bold", 15, 152),
+            b("picker.search_vault", "Archivo-Bold", 15, 340),
+            b("picker.edit_binding", "Archivo-Bold", 15, 152),
+            b("picker.cancel", "Archivo-Bold", 15, 141),
+            // generate_prompt: 410 - 36 = 374; see the painter for each cell.
+            b("generate.new_password", "Archivo-ExtraBold", 19, 350),
+            b("generate.suggested", "Archivo-Regular", 15, 286),
+            b("generate.failed", "Archivo-Regular", 12, 374),
+            b("generate.length", "Archivo-Regular", 12, 187),
+            b("generate.words", "Archivo-Regular", 12, 187),
+            b("generate.characters", "Archivo-Regular", 12, 374),
+            b("generate.min_digits", "Archivo-Regular", 12, 278),
+            b("generate.avoid_lookalikes", "Archivo-Regular", 12, 324),
+            b("generate.kind_password", "Archivo-SemiBold", 12, 78),
+            b("generate.kind_passphrase", "Archivo-SemiBold", 12, 72),
+            b("generate.regenerate", "Archivo-SemiBold", 12, 87),
+            b("generate.save_to_vault", "Archivo-Bold", 15, 186),
+            b("generate.copy", "Archivo-Bold", 15, 94),
+            // unlock_prompt: 470 - 52 = 418; label 386; buttons 108 / 88.
+            Budget { key: "unlock_prompt.tagline", family: "Archivo-Bold", px: 10, width: 367, tracking: 2 },
+            b("unlock_prompt.title", "Archivo-Bold", 19, 418),
+            b("unlock_prompt.subtitle", "Archivo-Regular", 13, 418),
+            b("unlock_prompt.label", "Archivo-Regular", 12, 386),
+            b("unlock_prompt.unlock", "Archivo-SemiBold", 13, 120),
+            b("unlock_prompt.cancel", "Archivo-SemiBold", 13, 84),
+        ];
+        v.shrink_to_fit();
+        v
+    }
+
+    /// The width, in device px at 100 %, GDI gives `text` in `family` at
+    /// `px` -- font linking to the system's CJK face included, which is the
+    /// whole reason this is measured by GDI and not by egui.
+    fn gdi_width(family: &str, px: i32, text: &str) -> i32 {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateFontIndirectW, DeleteDC, DeleteObject, CLEARTYPE_QUALITY, FW_BOLD, FW_NORMAL,
+            LOGFONTW,
+        };
+        crate::win32_draw::register_fonts();
+        let (face, weight) = crate::win32_draw::gdi_face_for_text(family, text);
+        let mut lf = LOGFONTW {
+            lfHeight: -px,
+            lfWeight: if weight >= 700 { FW_BOLD.0 as i32 } else { FW_NORMAL.0 as i32 },
+            lfQuality: CLEARTYPE_QUALITY,
+            ..Default::default()
+        };
+        for (i, ch) in face.encode_utf16().take(31).enumerate() {
+            lf.lfFaceName[i] = ch;
+        }
+        let units: Vec<u16> = text.encode_utf16().collect();
+        unsafe {
+            let hdc = CreateCompatibleDC(None);
+            let font = CreateFontIndirectW(&lf);
+            let width = crate::win32_draw::text_width_utf16(hdc, font, &units);
+            let _ = DeleteObject(font);
+            let _ = DeleteDC(hdc);
+            width
+        }
+    }
+
+    /// The catalog text for `key` as the surface would paint it, with the
+    /// widest plausible placeholder values: a plural key takes its widest
+    /// form.
+    fn painted_text(key: &'static str) -> Vec<String> {
+        let args: [(&str, &str); 6] = [
+            ("minutes", "10080"),
+            ("shown", "4"),
+            ("total", "9999"),
+            ("app_name", "Ledgerline Desktop"),
+            ("folder", "Personal"),
+            ("n", "9999"),
+        ];
+        let one = crate::i18n::tf(key, &args);
+        if one != key && !one.contains("missing") {
+            return vec![one];
+        }
+        [1u64, 2, 5, 22, 100].iter().map(|n| crate::i18n::tn(key, *n, &args)).collect()
+    }
+
+    /// **Every string a GDI card, prompt or the tray popup paints fits the
+    /// rect it is drawn into, in every language.** ui_preview cannot draw
+    /// these surfaces, so each string is measured by GDI itself with the face
+    /// and size the surface creates and checked against the width its layout
+    /// constants leave. The failure lists every key and language that does
+    /// not fit, with the measured and available widths.
+    #[test]
+    fn every_gdi_surface_string_fits_its_rect_in_every_language() {
+        let mut misfits = Vec::new();
+        let mut truncated = 0;
+        for locale in crate::i18n::available() {
+            crate::i18n::with_language(locale.tag, || {
+                for budget in gdi_budgets() {
+                    for text in painted_text(budget.key) {
+                        let chars = text.chars().count() as i32;
+                        let width = gdi_width(budget.family, budget.px, &text) + budget.tracking * chars;
+                        if width > budget.width && is_prose(budget.key) {
+                            truncated += 1;
+                        } else if width > budget.width {
+                            misfits.push(format!(
+                                "{} {}: {width}px > {}px ({} {}px) {text:?}",
+                                locale.tag, budget.key, budget.width, budget.family, budget.px
+                            ));
+                        }
+                    }
+                }
+            });
+        }
+        eprintln!("{truncated} sentence lines end in an ellipsis in some language (see is_prose)");
+        assert!(misfits.is_empty(), "{} labels overflow:\n{}", misfits.len(), misfits.join("\n"));
+    }
+
+    /// **Sentences versus labels.** A sentence line (a subtitle, a hint, a
+    /// caption, a toast, a row's secondary text) that is too long for its one
+    /// line is ellipsised by [`crate::win32_draw::draw_text`] and the reader
+    /// still gets the start of it; the surfaces are fixed-size Win32 windows
+    /// and cannot wrap. A LABEL -- a button, a pill, a segment cell, a title --
+    /// cut to "Regener..." is a control nobody can read, so labels must fit.
+    fn is_prose(key: &str) -> bool {
+        const PROSE: [&str; 23] = [
+            "_sub", "_body", "_hint", "hint_", "folder_row", "empty_title", "toast_", "footer_", "suggested",
+            "failed", "saved_credentials", "tray_popup.label_", "caption_", "generate.length", "generate.words",
+            "generate.characters", "generate.min_digits", "avoid_lookalikes", "unlock_prompt.label",
+            "unlock_prompt.tagline", "picker.send_", "locked_card.body", "unlock_prompt.subtitle",
+        ];
+        PROSE.iter().any(|needle| key.contains(needle))
+            || matches!(key, "picker.overflow_title" | "picker.nothing_title" | "picker.search_sub" | "picker.empty_body")
+    }
+
+    /// The `(top, bottom)` of the ink of every drawn glyph in a galley, one
+    /// pair per row, in the galley's own coordinates.
+    fn ink_rows(galley: &egui::Galley) -> Vec<(f32, f32)> {
+        galley
+            .rows
+            .iter()
+            .map(|row| {
+                let mut top = f32::INFINITY;
+                let mut bottom = f32::NEG_INFINITY;
+                for glyph in &row.glyphs {
+                    if glyph.uv_rect.is_nothing() || glyph.chr.is_whitespace() {
+                        continue;
+                    }
+                    let at = row.pos.y + glyph.pos.y + glyph.uv_rect.offset.y;
+                    top = top.min(at);
+                    bottom = bottom.max(at + glyph.uv_rect.size.y);
+                }
+                (top, bottom)
+            })
+            .collect()
+    }
+
+    /// The bottom of the ink of `text` set on one line in `family`.
+    fn ink_bottom(ctx: &egui::Context, family: &FontFamily, size: f32, text: &str) -> f32 {
+        ctx.fonts_mut(|f| {
+            let galley = f.layout_no_wrap(text.to_owned(), FontId::new(size, family.clone()), INK);
+            ink_rows(&galley)[0].1
+        })
+    }
+
+    /// **A fallback script sits on Archivo's baseline.** egui places a
+    /// fallback glyph at `its own ascent + half the difference of the two
+    /// faces' line boxes`, which is level only when both faces split their box
+    /// alike; Yu Gothic did not (0.88 above, 0.22 + 0.5 em gap below), and every
+    /// Japanese glyph rode 0.255 em -- 4 px at body size -- above the Latin
+    /// beside it. Flat-bottomed capitals (H / Eta / En) must end on the same
+    /// line, and a CJK glyph's frame must end just under it.
+    #[test]
+    fn a_fallback_script_sits_on_archivos_baseline() {
+        let weights = [
+            FontFamily::Proportional,
+            FontFamily::Name(SEMIBOLD.into()),
+            FontFamily::Name(BOLD.into()),
+            FontFamily::Name(EXTRABOLD.into()),
+        ];
+        // Flat-bottomed capital letters of each alphabet.
+        for (tag, capital) in [("el", "\u{397}"), ("ru", "\u{41d}")] {
+            if !has_system_faces(tag) {
+                continue;
+            }
+            crate::i18n::with_language(tag, || {
+                let ctx = ctx_with(font_definitions());
+                for family in &weights {
+                    for size in [11.0_f32, 13.0, 15.0, 22.0, 32.0] {
+                        let latin = ink_bottom(&ctx, family, size, "H");
+                        let other = ink_bottom(&ctx, family, size, capital);
+                        assert!(
+                            (latin - other).abs() <= 0.08 * size + 0.6,
+                            "{tag} {family:?} {size}px: the capital ends at {other}, Latin H at {latin}"
+                        );
+                    }
+                }
+            });
+        }
+        // CJK: the glyph frame ends a little UNDER the baseline (the design
+        // box has its own descent), never above it by an em fraction.
+        for (tag, glyph) in [("ja", "\u{56fd}"), ("zh-Hans", "\u{56fd}"), ("zh-Hant", "\u{570b}"), ("ko", "\u{d55c}")] {
+            if !has_system_faces(tag) {
+                continue;
+            }
+            crate::i18n::with_language(tag, || {
+                let ctx = ctx_with(font_definitions());
+                for family in &weights {
+                    for size in [11.0_f32, 13.0, 15.0, 22.0, 32.0] {
+                        let latin = ink_bottom(&ctx, family, size, "H");
+                        let cjk = ink_bottom(&ctx, family, size, glyph);
+                        let below = (cjk - latin) / size;
+                        assert!(
+                            (-0.10..=0.22).contains(&below) || (cjk - latin).abs() <= 0.6,
+                            "{tag} {family:?} {size}px: the glyph frame ends {below:.3} em below the Latin baseline"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    /// **A wrapped CJK paragraph's lines do not touch.** The row pitch is
+    /// Archivo's (the Latin tests pin it), so what must hold is that the ink of
+    /// one row ends above the ink of the next and that the pitch is at least
+    /// the glyphs' own height.
+    #[test]
+    fn a_wrapped_cjk_paragraph_never_overlaps_its_own_lines() {
+        let text = "\u{4e00}\u{5ea6}\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{3059}\u{308b}\u{3060}\u{3051}\u{3002}Bitwarden \u{3084} SAP \u{306a}\u{3069}\u{306e}\u{30ed}\u{30b0}\u{30a4}\u{30f3}\u{3082}Deskwarden \u{304c}\u{5165}\u{529b}\u{3057}\u{307e}\u{3059}\u{3002}";
+        let hans = "\u{5e94}\u{7528}\u{7a0b}\u{5e8f}\u{4f1a}\u{81ea}\u{52a8}\u{586b}\u{5199}\u{60a8}\u{7684}\u{767b}\u{5f55}\u{4fe1}\u{606f}\u{ff0c}Bitwarden \u{5bc6}\u{7801}\u{5e93}\u{5728}\u{89e3}\u{9501}\u{540e}\u{53ef}\u{7528}\u{3002}";
+        let hant = "\u{61c9}\u{7528}\u{7a0b}\u{5f0f}\u{6703}\u{81ea}\u{52d5}\u{586b}\u{5beb}\u{60a8}\u{7684}\u{767b}\u{5165}\u{8cc7}\u{8a0a}\u{ff0c}Bitwarden \u{5bc6}\u{78bc}\u{5eab}\u{89e3}\u{9396}\u{5f8c}\u{53ef}\u{7528}\u{3002}";
+        let hangul = "\u{c571}\u{c774} \u{b85c}\u{adf8}\u{c778} \u{c815}\u{bcf4}\u{b97c} \u{c790}\u{b3d9}\u{c73c}\u{b85c} \u{c785}\u{b825}\u{d569}\u{b2c8}\u{b2e4}. Bitwarden \u{bcf4}\u{ad00}\u{d568}\u{c744} \u{c5f4}\u{c5b4} \u{c8fc}\u{c138}\u{c694}.";
+        for (tag, text) in [("ja", text), ("zh-Hans", hans), ("zh-Hant", hant), ("ko", hangul)] {
+            if !has_system_faces(tag) {
+                continue;
+            }
+            crate::i18n::with_language(tag, || {
+                let ctx = ctx_with(font_definitions());
+                for family in [FontFamily::Proportional, FontFamily::Name(BOLD.into())] {
+                    for size in [11.0_f32, 12.0, 13.0, 15.0, 22.0] {
+                        ctx.fonts_mut(|f| {
+                            let mut job = egui::text::LayoutJob::simple(
+                                text.to_owned(),
+                                FontId::new(size, family.clone()),
+                                INK,
+                                size * 7.0,
+                            );
+                            job.wrap.max_width = size * 7.0;
+                            let galley = f.layout_job(job);
+                            assert!(galley.rows.len() >= 3, "{tag} {size}px: {} rows", galley.rows.len());
+                            let ink = ink_rows(&galley);
+                            for pair in 0..ink.len() - 1 {
+                                let pitch = galley.rows[pair + 1].pos.y - galley.rows[pair].pos.y;
+                                let glyph_height = ink[pair].1 - ink[pair].0;
+                                assert!(
+                                    pitch >= glyph_height,
+                                    "{tag} {family:?} {size}px row {pair}: line pitch {pitch} < glyph height {glyph_height}"
+                                );
+                                assert!(
+                                    ink[pair].1 <= ink[pair + 1].0 + 0.5,
+                                    "{tag} {family:?} {size}px: row {pair} ink ends at {} but the next starts at {}",
+                                    ink[pair].1,
+                                    ink[pair + 1].0
+                                );
+                            }
+                        });
+                    }
+                }
+            });
+        }
+    }
+
+    /// **Greek is drawn from one face.** Archivo carries four Greek letters
+    /// (Delta, Omega, mu, pi); left mapped they were drawn from Archivo while
+    /// the rest of the word came from Segoe UI. With Greek active they are
+    /// unmapped and fall through to Segoe, so every Greek letter has the
+    /// advance Segoe gives it; outside a Greek session nothing changes.
+    #[test]
+    fn greek_letters_all_come_from_the_greek_face() {
+        if !has_system_faces("el") {
+            return;
+        }
+        let segoe_only = {
+            let mut fonts = egui::FontDefinitions::default();
+            let mut data = first_system_face(&[("segoeui.ttf", 0)]).expect("Segoe UI");
+            data.tweak.y_offset_factor = 0.0;
+            fonts.font_data.insert("S".to_owned(), Arc::new(data));
+            fonts.families.insert(FontFamily::Proportional, vec!["S".to_owned()]);
+            fonts
+        };
+        let width = |ctx: &egui::Context, text: &str| {
+            ctx.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), FontId::new(30.0, FontFamily::Proportional), INK).size().x)
+        };
+        let reference = ctx_with(segoe_only);
+        let greek = crate::i18n::with_language("el", || ctx_with(font_definitions()));
+        let english = ctx_with(font_definitions());
+        for letter in ["\u{3c0}", "\u{3bc}", "\u{394}", "\u{3a9}", "\u{3b1}\u{3c0}\u{3b1}"] {
+            assert_eq!(width(&greek, letter), width(&reference, letter), "{letter:?} is not drawn by Segoe UI in Greek");
+        }
+        assert_ne!(
+            width(&english, "\u{3c0}"),
+            width(&reference, "\u{3c0}"),
+            "outside Greek, pi must stay where it was (Archivo)"
+        );
     }
 
     /// **Latin does not move in any language.** A system face goes BEHIND each

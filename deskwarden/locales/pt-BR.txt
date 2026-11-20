@@ -206,7 +206,7 @@ generate.avoid_lookalikes = Evitar caracteres parecidos
 generate.working = Gerando…
 generate.failed = Não foi possível gerar uma senha. Tente de novo.
 generate.kind_password = Senha
-generate.kind_passphrase = Frase secreta
+generate.kind_passphrase = Frase
 generate.length = Tamanho
 generate.words = Palavras
 

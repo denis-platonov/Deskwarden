@@ -159,7 +159,7 @@ loading.retry = Opnieuw
 loading.slow = Duurt langer dan normaal — {seconds} s
 loading.signed_in_as = Ingelogd als {account}
 
-locked_card.pill = Vergrendeld
+locked_card.pill = Op slot
 locked_card.unlock = Ontgrendelen
 locked_card.title = Deskwarden is vergrendeld
 locked_card.body = Ontgrendel om de kluis te doorzoeken voor {app_name}.
@@ -199,7 +199,7 @@ generate.new_password = Nieuw wachtwoord
 generate.suggested = Voorgesteld wachtwoord
 generate.save_to_vault = Opslaan in kluis
 generate.copy = Kopiëren
-generate.regenerate = Opnieuw genereren
+generate.regenerate = Opnieuw
 generate.characters = Tekens
 generate.min_digits = Minimaal zoveel cijfers
 generate.avoid_lookalikes = Op elkaar lijkende tekens vermijden

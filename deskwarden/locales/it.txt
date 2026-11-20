@@ -271,7 +271,7 @@ picker.palette_sub = Scegli un campo. Non viene digitato nulla finché non lo fa
 picker.list_title = Compila dalla cassaforte
 picker.list_sub = Questi account sembrano appartenere a questa app.
 picker.cancel = Annulla
-picker.edit_binding = Modifica associazione
+picker.edit_binding = Cambia legame
 
 region.drag_title = Trascina un riquadro attorno al codice QR
 region.drag_hint = Deskwarden lo legge appena rilasci. Non è ancora stato salvato nulla.
