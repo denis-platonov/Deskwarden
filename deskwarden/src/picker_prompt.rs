@@ -728,7 +728,7 @@ const MARGIN_TOP: i32 = crate::panel_draw::HEADER_PAD_TOP;
 /// One row. Tall enough for a name over a username, and for a square icon
 /// gutter beside them -- [`crate::win32_draw::draw_row`] takes the gutter to
 /// be the row's own height, so this is also the icon column's width.
-const ROW_H: i32 = 58;
+const ROW_H: i32 = crate::panel_draw::ROW_H + crate::panel_draw::ROW_GAP;
 
 /// **How many CANDIDATES the card has room for.**
 ///
@@ -987,7 +987,7 @@ pub fn layout_for(rows: usize, search: bool) -> Layout {
 
     let title =
         Box2 { x: MARGIN_X, y: mark.bottom() + TITLE_GAP, w: content_w, h: TITLE_H };
-    let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 1, w: content_w, h: SUBTITLE_H };
+    let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 4, w: content_w, h: SUBTITLE_H };
 
     // **The field starts where the list used to**, and in search mode its
     // first element is the search box rather than the first row. The box no
@@ -999,9 +999,15 @@ pub fn layout_for(rows: usize, search: bool) -> Layout {
         Some(box2) => box2.bottom(),
         None => field_y,
     };
-    let list = Box2 { x: MARGIN_X, y: list_y, w: content_w, h: ROW_H * rows as i32 };
-    let field =
-        Box2 { x: MARGIN_X, y: field_y, w: content_w, h: list.bottom() - field_y };
+    // Design D 1.3: the list is padded 8 px each side, so a row's wash runs
+    // 8..392 and its tile starts at 18. Search mode's rows sit inside the
+    // bordered field, which keeps the heading's 16 px margin.
+    let (list_x, list_w) = match search {
+        Some(_) => (MARGIN_X, content_w),
+        None => (crate::panel_draw::LIST_PAD_X, WIDTH - 2 * crate::panel_draw::LIST_PAD_X),
+    };
+    let list = Box2 { x: list_x, y: list_y, w: list_w, h: ROW_H * rows as i32 };
+    let field = Box2 { x: list.x, y: field_y, w: list.w, h: list.bottom() - field_y };
 
     // Two equal halves (design D 1.5), the card's own offer on the left and the
     // choice that does nothing on the right, where the eye leaves the card.
@@ -1049,6 +1055,19 @@ pub fn search_text_box(slot: Box2) -> Box2 {
         y: slot.y + (slot.h - TEXT_H) / 2,
         w: slot.w - 2 * FIELD_PAD_X,
         h: TEXT_H,
+    }
+}
+
+/// **A candidate row's two lines, as design D 1.3 sets them**: the account's
+/// username bold (16/700) and the item's name under it in the faint line --
+/// `a.novak` over `SAP Production`. The row used to lead with the item name.
+/// An item with no username has nothing to put first, so its name leads and
+/// the faint line stays empty rather than saying the same word twice.
+pub fn row_lines(candidate: &Candidate) -> (&str, &str) {
+    if candidate.username.is_empty() {
+        (&candidate.name, "")
+    } else {
+        (&candidate.username, &candidate.name)
     }
 }
 
@@ -1645,7 +1664,7 @@ mod win32 {
     struct Fonts {
         /// The wordmark: "Deskwarden" at 15/800 (design D 1.3).
         brand: HFONT,
-        /// The heading pair: 17/800 over 14.
+        /// The heading pair: 19/800 over 15 (D 1.5's title and body; gap 4).
         title: HFONT,
         subtitle: HFONT,
         /// A row's bold line (16/700) and its faint one (14), the tile's
@@ -1685,8 +1704,8 @@ mod win32 {
             use crate::theme::{BOLD, EXTRABOLD, REGULAR};
             Fonts {
                 brand: font(EXTRABOLD, panel_draw::WORD_PX),
-                title: font(EXTRABOLD, panel_draw::SAVE_TITLE_PX),
-                subtitle: font(REGULAR, panel_draw::ROW_SUB_PX),
+                title: font(EXTRABOLD, panel_draw::TITLE_PX),
+                subtitle: font(REGULAR, panel_draw::BODY_PX),
                 name: font(BOLD, panel_draw::ROW_NAME_PX),
                 username: font(REGULAR, panel_draw::ROW_SUB_PX),
                 avatar: font(BOLD, panel_draw::ROW_SUB_PX),
@@ -3217,6 +3236,16 @@ mod win32 {
             }
             WM_MOUSEMOVE => {
                 if HOVERED.swap(id, Ordering::SeqCst) != id {
+                    // Design D 1.3: hovering a row selects it -- the blue wash
+                    // and the `Enter` badge move to it -- and Enter then fills
+                    // it, because selection IS focus on this card. Only in
+                    // the two row lists: in search mode the keyboard belongs
+                    // to the text box, and the empty card's rows are buttons
+                    // that would grow a keyboard ring under a mere pointer.
+                    let mode = MODE.load(Ordering::SeqCst);
+                    if id >= ID_ROW as isize && (mode == MODE_LIST || mode == MODE_PALETTE) {
+                        let _ = SetFocus(control);
+                    }
                     repaint(control);
                 }
                 // A row or a button under the pointer is not the `?` badge.
@@ -3583,8 +3612,8 @@ mod win32 {
                     let shortcut = super::search_shortcut(at, shown.len());
                     look(
                         panel_draw::Tile::Initials(&candidate.name, at),
-                        &candidate.name,
-                        &candidate.username,
+                        super::row_lines(candidate).0,
+                        super::row_lines(candidate).1,
                         selected,
                         shortcut.as_deref(),
                     );
@@ -3679,8 +3708,8 @@ mod win32 {
             if let Some((bitmap, w, h)) = icon {
                 let tile = look(
                     panel_draw::Tile::Blank,
-                    &candidate.name,
-                    &candidate.username,
+                    super::row_lines(candidate).0,
+                    super::row_lines(candidate).1,
                     focused,
                     shortcut.as_deref(),
                 );
@@ -3688,8 +3717,8 @@ mod win32 {
             } else {
                 look(
                     panel_draw::Tile::Initials(&candidate.name, index),
-                    &candidate.name,
-                    &candidate.username,
+                    super::row_lines(candidate).0,
+                    super::row_lines(candidate).1,
                     focused,
                     shortcut.as_deref(),
                 );
@@ -4397,6 +4426,57 @@ mod card_tests {
              search box would leave this one behind"
         );
         assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H);
+    }
+
+    /// **Design D 1.3's rows, in numbers**: a 64 px row, 2 px apart, in a list
+    /// padded 8 px each side, so the wash runs 8..392 and the tile starts at 18.
+    /// The card's rows were 58 apart and 16 px in from each edge.
+    #[test]
+    fn the_rows_are_the_designs_64_with_a_2_gap_in_a_list_padded_8() {
+        assert_eq!(ROW_H, 64 + 2, "design 1b: row 64 + gap 2");
+        let l = layout(LIST_ROWS);
+        assert_eq!(l.list.x, 8, "design 1b: the list is padded `0 8 8`");
+        assert_eq!(l.list.w, WIDTH - 16);
+        assert_eq!(l.list.h, ROW_H * LIST_ROWS as i32);
+        let (first, second) = (row_at(LIST_ROWS, 0), row_at(LIST_ROWS, 1));
+        assert_eq!(second.y - first.y, 66);
+        // The drawn wash: 64 tall, centred in the 66 pitch.
+        let rc = windows::Win32::Foundation::RECT { left: 8, top: 0, right: 392, bottom: 66 };
+        let wash = crate::panel_draw::wash_rect(rc, 100);
+        assert_eq!((wash.top, wash.bottom), (1, 65));
+        // The tile 10 px in from the wash, 42 square, centred in it.
+        let tile = crate::panel_draw::tile_rect(rc, 100);
+        assert_eq!((tile.left, tile.right - tile.left, tile.bottom - tile.top), (18, 42, 42));
+        assert_eq!(tile.top, 12);
+        // Search mode keeps the bordered field's 16 px margin.
+        assert_eq!(layout_for(LIST_ROWS, true).list.x, MARGIN_X);
+    }
+
+    /// **The bold line is the username and the faint one the item's name**
+    /// (D 1.3: `a.novak` over `SAP Production`) -- it led with the name.
+    #[test]
+    fn a_row_leads_with_the_username_and_names_the_item_under_it() {
+        let item = |name: &str, username: &str| Candidate {
+            id: "x".into(),
+            name: name.into(),
+            username: username.into(),
+        };
+        assert_eq!(row_lines(&item("SAP Production", "a.novak")), ("a.novak", "SAP Production"));
+        assert_eq!(row_lines(&item("Shared with me", "deploy-bot")), ("deploy-bot", "Shared with me"));
+        // No username: the name leads and the faint line is empty, never the
+        // same word twice.
+        assert_eq!(row_lines(&item("SAP Quality", "")), ("SAP Quality", ""));
+    }
+
+    /// The heading pair uses the design's title (19/800) and body (15) sizes.
+    #[test]
+    fn the_heading_pair_is_the_designs_title_over_body() {
+        assert_eq!((crate::panel_draw::TITLE_PX, crate::panel_draw::BODY_PX), (19, 15));
+        let src = include_str!("picker_prompt.rs").replace("\r\n", "\n");
+        assert!(src.contains(concat!("title: font(EXTRA", "BOLD, panel_draw::TITLE_PX)")));
+        assert!(src.contains(concat!("subtitle: font(REG", "ULAR, panel_draw::BODY_PX)")));
+        let l = layout(LIST_ROWS);
+        assert_eq!(l.subtitle.y - l.title.bottom(), 4, "D 1.5: the title block's gap is 4");
     }
 
     /// The field's own numbers are the card's existing ones, not new ones.
