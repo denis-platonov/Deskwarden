@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = Din Bitwarden-boks i alle apps.
-auth.brand_sub = Log ind én gang. Deskwarden udfylder SAP, VPN'er og alle skrivebordslogins for dig.
-auth.brand_foot = Bruger din eksisterende Bitwarden-konto
+auth.headline = Din boks i alle apps.
+auth.brand_sub = Log ind én gang. Deskwarden udfylder skrivebordsprogrammer og websteder for dig.
+auth.brand_foot = Virker med din Bitwarden-konto. Ikke tilknyttet Bitwarden, Inc.
 auth.hello_label = Lås op med Windows Hello
 auth.hello_checking = Tjekker…
 auth.use_password = Brug hovedadgangskode i stedet
@@ -22,7 +22,7 @@ login.hello_setup_link = Lås op og opsæt Windows Hello
 login.hello_setup_hint = Første gang: skriv din hovedadgangskode, og klik så her
 login.sign_in_title = Log ind
 login.server_label = Server
-login.server_tip = De fleste bruger bitwarden.com. Vælg EU, hvis din konto er oprettet dér, eller Selvhostet, hvis din virksomhed driver sin egen.
+login.server_tip = De fleste bruger bitwarden.com. Vælg bitwarden.eu, hvis din konto er oprettet dér, eller Selvhostet, hvis din virksomhed driver sin egen.
 login.password_placeholder = Din Bitwarden-hovedadgangskode
 login.lock_placeholder = Hovedadgangskode
 login.enter_email = Indtast din e-mail.
@@ -344,7 +344,6 @@ scratch.sent_heading = HVAD DER BLEV SENDT
 scratch.close = Luk
 scratch.caption = prøvevindue
 main.second_lock_exit = Din boks er låst, og Deskwarden er lukket.\n\nStart Deskwarden igen for at logge ind igen.
-main.setup = Opsætter din boks...
 main.remove_account_warning = Fjern {label} fra Deskwarden?\n\nDet logger kontoen ud og SLETTER dens lokale Bitwarden-profil fra denne computer, inklusive dens gemte session og dens hurtige oplåsning med Windows Hello. Din boks på serveren røres ikke, og du kan logge ind på kontoen igen bagefter.\n\nDette kan ikke fortrydes.
 main.remove_account_title = Deskwarden: fjern konto
 main.cannot_start_title = Deskwarden kan ikke starte
@@ -1962,7 +1961,7 @@ sends.err_link_key_unreadable = Det Send-links nøgle kan ikke læses. Kopiér h
 sends.err_link_key_length = Det Send-links nøgle har den forkerte længde, så det er ikke et helt link. Kopiér det hele, og prøv igen.
 sends.err_link_no_key = Det ligner ikke et Send-link: nøglen kommer efter et `#`, og der er intet `#` i det.
 login.server_self_hosted = Selvhostet
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = Kunne ikke skifte til {account}.
 account.could_not_add = Kunne ikke tilføje en konto.
 account.still_on_previous = Du er stadig logget ind på den konto, du var på.

@@ -100,6 +100,25 @@ const WINDOW_TITLE: &str = "Deskwarden";
 /// window. That is also what makes it the one part of this feature a headless
 /// `egui::Context` can actually render and read glyphs back from; everything
 /// else here needs a live `eframe::Frame`, which no test can construct.
+/// **The startup window's own waits** -- after sign-in, and while locking --
+/// drawn as the v2 loading splash with `line` under the shield, so the wait
+/// before the vault and the vault's own splash are one screen, not two.
+/// [`draw_spinner_body`] stays for the small standalone spinner window, which
+/// is too small for the splash.
+pub fn draw_working_body(ui: &mut egui::Ui, line: &str, close: CloseControl) -> ChromeAction {
+    let saved_item_spacing_y = ui.spacing().item_spacing.y;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let action = draw_window_chrome_with_extra(ui, WINDOW_TITLE, HEADING, false, close, |_ui| {});
+    ui.spacing_mut().item_spacing.y = saved_item_spacing_y;
+    let full = ui.max_rect();
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(theme::CANVAS))
+        .show(ui, |_ui| {});
+    crate::vault_window::splash::paint_line(ui.ctx(), full, line, 0.0);
+    ui.ctx().request_repaint();
+    action
+}
+
 pub fn draw_spinner_body(ui: &mut egui::Ui, message: &str, close: CloseControl) -> ChromeAction {
     // `advance_cursor_after_rect` inside the chrome reads `item_spacing.y`
     // EAGERLY and bakes it into the cursor it leaves behind, so the gap between
@@ -1556,6 +1575,24 @@ mod first_window_body_tests {
 
     fn frame(body: FirstWindowBody) -> egui::FullOutput {
         frame_with(body, Some("a.novak@ledgerline.com"))
+    }
+
+    /// **After sign-in there is one loading screen, not two.** The wait while
+    /// the vault starts used to be its own "Setting up your vault..." page,
+    /// followed by the v2 splash; it is the splash now, with the same line
+    /// the vault window's own splash shows, so the two read as one screen.
+    #[test]
+    fn the_wait_after_sign_in_is_the_loading_splash() {
+        let opening = crate::vault_window::splash::opening();
+        let ctx = styled_ctx();
+        let out = ctx.run_ui(raw_input(), |ui| {
+            draw_working_body(ui, opening, CloseControl::Disabled);
+        });
+        let text = rendered(&out);
+        assert!(text.contains(opening), "{text}");
+        let navy = crate::kit::tokens::palette(&ctx).blue_deep;
+        let covered = out.shapes.iter().any(|c| matches!(&c.shape, egui::Shape::Rect(r) if r.fill == navy && r.rect.width() >= 1000.0));
+        assert!(covered, "the splash's navy does not cover the window");
     }
 
     /// **The v2 splash covers the first window while it loads** -- and only

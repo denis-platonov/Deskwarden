@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = Ditt Bitwarden-valv, i varje app.
-auth.brand_sub = Logga in en gång. Deskwarden fyller i SAP, VPN och alla skrivbordsinloggningar åt dig.
-auth.brand_foot = Använder ditt befintliga Bitwarden-konto
+auth.headline = Ditt valv, i varje app.
+auth.brand_sub = Logga in en gång. Deskwarden fyller i skrivbordsappar och webbplatser åt dig.
+auth.brand_foot = Fungerar med ditt Bitwarden-konto. Inte anknutet till Bitwarden, Inc.
 auth.hello_label = Lås upp med Windows Hello
 auth.hello_checking = Kontrollerar…
 auth.use_password = Använd huvudlösenord i stället
@@ -22,7 +22,7 @@ login.hello_setup_link = Lås upp och ställ in Windows Hello
 login.hello_setup_hint = Första gången: skriv ditt huvudlösenord och klicka sedan här
 login.sign_in_title = Logga in
 login.server_label = Server
-login.server_tip = De flesta använder bitwarden.com. Välj EU om ditt konto skapades där, eller Egen värd om ditt företag driver en egen server.
+login.server_tip = De flesta använder bitwarden.com. Välj bitwarden.eu om ditt konto skapades där, eller Egen värd om ditt företag driver en egen server.
 login.password_placeholder = Ditt Bitwarden-huvudlösenord
 login.lock_placeholder = Huvudlösenord
 login.enter_email = Ange din e-postadress.
@@ -344,7 +344,6 @@ scratch.sent_heading = VAD SOM SKICKADES
 scratch.close = Stäng
 scratch.caption = skrivfönster
 main.second_lock_exit = Ditt valv är låst och Deskwarden har stängts.\n\nStarta Deskwarden igen för att logga in på nytt.
-main.setup = Ställer in ditt valv...
 main.remove_account_warning = Ta bort {label} från Deskwarden?\n\nDet loggar ut kontot och RADERAR dess lokala Bitwarden-profil från den här datorn, inklusive dess sparade session och dess snabbupplåsning med Windows Hello. Ditt valv på servern påverkas inte, och du kan logga in på kontot igen efteråt.\n\nDet här går inte att ångra.
 main.remove_account_title = Deskwarden: ta bort konto
 main.cannot_start_title = Deskwarden kan inte starta
@@ -1962,7 +1961,7 @@ sends.err_link_key_unreadable = Nyckeln i den Send-länken går inte att läsa. 
 sends.err_link_key_length = Nyckeln i den Send-länken har fel längd, så det är inte en hel länk. Kopiera hela och försök igen.
 sends.err_link_no_key = Det ser inte ut som en Send-länk: nyckeln står efter ett `#` och det finns inget `#` i den.
 login.server_self_hosted = Egen värd
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = Det gick inte att byta till {account}.
 account.could_not_add = Det gick inte att lägga till ett konto.
 account.still_on_previous = Du är fortfarande inloggad på kontot du var på.

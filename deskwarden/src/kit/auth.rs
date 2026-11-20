@@ -309,7 +309,8 @@ fn brand_panel(ui: &mut Ui, rect: Rect) {
 
     // Foot.
     let foot_role = Role { size: 14.0, face: theme::REGULAR, tracking_em: 0.0 };
-    let foot = galley(&ctx, foot_role, brand_foot(), p.blue_soft, None, None);
+    // Wraps inside the panel: the compatibility note runs longer in some languages.
+    let foot = galley(&ctx, foot_role, brand_foot(), p.blue_soft, Some(inner.width()), Some(14.0 * 1.4));
     let foot_at = pos2(inner.left(), inner.bottom() - foot.size().y);
     ui.painter().galley(foot_at, foot, p.blue_soft);
 
@@ -571,7 +572,8 @@ pub fn field_text(
         let role = Role { size: 16.0, face: theme::REGULAR, tracking_em: 0.0 };
         let g = galley(ui.ctx(), role, prefix, p.text_ghost, None, None);
         let at = pos2(left, rect.center().y - g.size().y / 2.0);
-        left += g.size().x + 4.0;
+        // No gap: the prefix and the typing read as one address.
+        left += g.size().x;
         ui.painter().galley(at, g, p.text_ghost);
     }
     let inner = Rect::from_min_max(pos2(left, rect.top()), pos2(rect.right() - 16.0, rect.bottom()));
@@ -1052,7 +1054,9 @@ mod tests {
         });
         let prefix = p.text("https://").expect("the prefix");
         assert_eq!(prefix.1, palette(&ctx).text_ghost);
-        assert!(p.text("vault.example.com").unwrap().2.left() > prefix.2.right());
+        let typed = p.text("vault.example.com").unwrap().2;
+        assert!(typed.left() >= prefix.2.right() - 0.5, "the typing starts after the prefix");
+        assert!(typed.left() - prefix.2.right() <= 1.0, "and reads as one address, with no gap: {} -> {}", prefix.2.right(), typed.left());
     }
 
     #[test]

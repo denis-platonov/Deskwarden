@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = 您的 Bitwarden 密码库，适用于每个应用。
-auth.brand_sub = 一次登录，SAP、VPN 等桌面登录由 Deskwarden 代填。
-auth.brand_foot = 使用您现有的 Bitwarden 账户
+auth.headline = 您的密码库，适用于每个应用。
+auth.brand_sub = 一次登录，桌面应用和网站都由 Deskwarden 代填。
+auth.brand_foot = 适用于您的 Bitwarden 账户。与 Bitwarden, Inc. 无关联。
 auth.hello_label = 使用 Windows Hello 解锁
 auth.hello_checking = 正在检查…
 auth.use_password = 改用主密码
@@ -22,7 +22,7 @@ login.hello_setup_link = 解锁并设置 Windows Hello
 login.hello_setup_hint = 首次使用：输入主密码，然后点击此处
 login.sign_in_title = 登录
 login.server_label = 服务器
-login.server_tip = 大多数人使用 bitwarden.com。如果您的账户创建于欧盟，请选择 EU；如果公司自行部署，请选择自托管。
+login.server_tip = 大多数人使用 bitwarden.com。如果您的账户创建于欧盟，请选择 bitwarden.eu；如果公司自行部署，请选择自托管。
 login.password_placeholder = 您的 Bitwarden 主密码
 login.lock_placeholder = 主密码
 login.enter_email = 请输入您的电子邮件。
@@ -343,7 +343,6 @@ scratch.sent_heading = 已发送内容
 scratch.close = 关闭
 scratch.caption = 演练窗口
 main.second_lock_exit = 您的密码库已锁定，Deskwarden 已关闭。\n\n请重新启动 Deskwarden 以再次登录。
-main.setup = 正在设置您的密码库...
 main.remove_account_warning = 要从 Deskwarden 中移除 {label} 吗？\n\n这将退出该账户，并从此电脑上删除其本地 Bitwarden 配置文件，包括已保存的会话及其 Windows Hello 快速解锁。服务器上的密码库不受影响，之后您可以再次登录此账户。\n\n此操作无法撤销。
 main.remove_account_title = Deskwarden：移除账户
 main.cannot_start_title = Deskwarden 无法启动
@@ -1906,7 +1905,7 @@ sends.err_link_key_unreadable = 无法读取该 Send 链接的密钥。请复制
 sends.err_link_key_length = 该 Send 链接的密钥长度不对，所以它不是完整链接。请复制全部内容后重试。
 sends.err_link_no_key = 这看起来不像 Send 链接：密钥位于 `#` 之后，而其中没有 `#`。
 login.server_self_hosted = 自托管
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = 无法切换到 {account}。
 account.could_not_add = 无法添加账户。
 account.still_on_previous = 您仍登录在之前的账户上。

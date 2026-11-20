@@ -34,6 +34,12 @@ fn layer() -> LayerId {
 
 /// The splash over `rect`, `fade` of the way gone (0 is fully shown).
 pub fn paint(ctx: &egui::Context, rect: Rect, offline: bool, fade: f32) {
+    paint_line(ctx, rect, if offline { opening_offline() } else { opening() }, fade);
+}
+
+/// [`paint`], saying `line` under the shield: the startup window's waits
+/// (opening after sign-in, locking) are this same screen with their own words.
+pub fn paint_line(ctx: &egui::Context, rect: Rect, line: &str, fade: f32) {
     let p = palette(ctx);
     let shown = (1.0 - fade).clamp(0.0, 1.0);
     let t = ctx.input(|i| i.time);
@@ -61,7 +67,7 @@ pub fn paint(ctx: &egui::Context, rect: Rect, offline: bool, fade: f32) {
     // track -- centred as a block.
     let role = Role { size: 24.0, face: theme::EXTRABOLD, tracking_em: -0.01 };
     let white = Color32::WHITE.gamma_multiply(shown);
-    let line = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, if offline { opening_offline() } else { opening() }, white)));
+    let line = ctx.fonts_mut(|f| f.layout_job(tokens::job(role, line, white)));
     let block = SHIELD.y + 28.0 + line.size().y + 18.0 + TRACK.y;
     let top = rect.center().y - block / 2.0;
     let shield = Rect::from_center_size(

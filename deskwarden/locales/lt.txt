@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = Jūsų Bitwarden saugykla – kiekvienoje programoje.
-auth.brand_sub = Prisijunkite vieną kartą. Deskwarden užpildys SAP, VPN ir visus darbalaukio prisijungimus už jus.
-auth.brand_foot = Naudoja jūsų esamą Bitwarden paskyrą
+auth.headline = Jūsų saugykla – kiekvienoje programoje.
+auth.brand_sub = Prisijunkite vieną kartą. Deskwarden užpildys darbalaukio programas ir svetaines už jus.
+auth.brand_foot = Veikia su jūsų Bitwarden paskyra. Nesusijusi su Bitwarden, Inc.
 auth.hello_label = Atrakinti su Windows Hello
 auth.hello_checking = Tikrinama…
 auth.use_password = Naudoti pagrindinį slaptažodį
@@ -22,7 +22,7 @@ login.hello_setup_link = Atrakinti ir nustatyti Windows Hello
 login.hello_setup_hint = Pirmą kartą: įveskite pagrindinį slaptažodį ir spustelėkite čia
 login.sign_in_title = Prisijungti
 login.server_label = Serveris
-login.server_tip = Dauguma naudoja bitwarden.com. Pasirinkite EU, jei paskyra sukurta ten, arba Savarankiškai talpinamas, jei jūsų įmonė naudoja savo serverį.
+login.server_tip = Dauguma naudoja bitwarden.com. Pasirinkite bitwarden.eu, jei paskyra sukurta ten, arba Savarankiškai talpinamas, jei jūsų įmonė naudoja savo serverį.
 login.password_placeholder = Jūsų Bitwarden pagrindinis slaptažodis
 login.lock_placeholder = Pagrindinis slaptažodis
 login.enter_email = Įveskite savo el. pašto adresą.
@@ -345,7 +345,6 @@ scratch.sent_heading = KAS BUVO IŠSIŲSTA
 scratch.close = Uždaryti
 scratch.caption = bandymų langas
 main.second_lock_exit = Jūsų saugykla užrakinta, o Deskwarden uždarytas.\n\nPaleiskite Deskwarden iš naujo, kad vėl prisijungtumėte.
-main.setup = Nustatoma jūsų saugykla...
 main.remove_account_warning = Pašalinti {label} iš Deskwarden?\n\nTai atjungia paskyrą ir IŠTRINA jos vietinį Bitwarden profilį iš šio kompiuterio, įskaitant išsaugotą sesiją ir Windows Hello greitą atrakinimą. Jūsų saugykla serveryje nebus paliesta, o vėliau galėsite vėl prisijungti prie šios paskyros.\n\nŠio veiksmo anuliuoti negalima.
 main.remove_account_title = Deskwarden: pašalinti paskyrą
 main.cannot_start_title = Deskwarden negali pasileisti
@@ -2018,7 +2017,7 @@ sends.err_link_key_unreadable = Tos Send nuorodos rakto neįmanoma perskaityti. 
 sends.err_link_key_length = Tos Send nuorodos rakto ilgis netinkamas, todėl tai nėra visa nuoroda. Nukopijuokite viską ir bandykite dar kartą.
 sends.err_link_no_key = Tai neatrodo kaip Send nuoroda: raktas eina po `#`, o joje nėra `#`.
 login.server_self_hosted = Savarankiškai talpinamas
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = Nepavyko persijungti į {account}.
 account.could_not_add = Nepavyko pridėti paskyros.
 account.still_on_previous = Vis dar esate prisijungę prie paskyros, kurioje buvote.

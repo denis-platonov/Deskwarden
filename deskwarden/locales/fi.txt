@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = Bitwarden-holvisi, kaikissa sovelluksissa.
-auth.brand_sub = Kirjaudu kerran. Deskwarden täyttää SAP:n, VPN:t ja kaikki työpöytäkirjautumiset puolestasi.
-auth.brand_foot = Käyttää nykyistä Bitwarden-tiliäsi
+auth.headline = Holvisi, kaikissa sovelluksissa.
+auth.brand_sub = Kirjaudu kerran. Deskwarden täyttää työpöytäsovellukset ja verkkosivustot puolestasi.
+auth.brand_foot = Toimii Bitwarden-tilisi kanssa. Ei yhteydessä Bitwarden, Inc:iin.
 auth.hello_label = Avaa Windows Hellolla
 auth.hello_checking = Tarkistetaan…
 auth.use_password = Käytä pääsalasanaa
@@ -22,7 +22,7 @@ login.hello_setup_link = Avaa ja määritä Windows Hello
 login.hello_setup_hint = Ensimmäisellä kerralla: kirjoita pääsalasana ja napsauta tästä
 login.sign_in_title = Kirjaudu
 login.server_label = Palvelin
-login.server_tip = Useimmat käyttävät bitwarden.comia. Valitse EU, jos tilisi luotiin siellä, tai Itse ylläpidetty, jos yrityksesi ylläpitää omaa palvelinta.
+login.server_tip = Useimmat käyttävät bitwarden.comia. Valitse bitwarden.eu, jos tilisi luotiin siellä, tai Itse ylläpidetty, jos yrityksesi ylläpitää omaa palvelinta.
 login.password_placeholder = Bitwarden-pääsalasanasi
 login.lock_placeholder = Pääsalasana
 login.enter_email = Anna sähköpostiosoitteesi.
@@ -344,7 +344,6 @@ scratch.sent_heading = MITÄ LÄHETETTIIN
 scratch.close = Sulje
 scratch.caption = harjoitusikkuna
 main.second_lock_exit = Holvisi on lukittu ja Deskwarden on suljettu.\n\nKäynnistä Deskwarden uudelleen kirjautuaksesi takaisin.
-main.setup = Määritetään holvia...
 main.remove_account_warning = Poistetaanko {label} Deskwardenista?\n\nTämä kirjaa tilin ulos ja POISTAA sen paikallisen Bitwarden-profiilin tältä tietokoneelta, mukaan lukien tallennetun istunnon ja Windows Hellon pikalukituksen avauksen. Holvisi palvelimella ei muutu, ja voit kirjautua tälle tilille uudelleen myöhemmin.\n\nTätä ei voi perua.
 main.remove_account_title = Deskwarden: poista tili
 main.cannot_start_title = Deskwarden ei voi käynnistyä
@@ -1962,7 +1961,7 @@ sends.err_link_key_unreadable = Tämän Send-linkin avainta ei voi lukea. Kopioi
 sends.err_link_key_length = Tämän Send-linkin avain on väärän pituinen, joten se ei ole kokonainen linkki. Kopioi se kokonaan ja yritä uudelleen.
 sends.err_link_no_key = Tämä ei näytä Send-linkiltä: avain kulkee merkin `#` jälkeen, eikä siinä ole merkkiä `#`.
 login.server_self_hosted = Itse ylläpidetty
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = Tiliin {account} vaihtaminen ei onnistunut.
 account.could_not_add = Tiliä ei voitu lisätä.
 account.still_on_previous = Olet yhä kirjautuneena tilille, jolla olit.

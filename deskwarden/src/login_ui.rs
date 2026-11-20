@@ -6363,11 +6363,11 @@ mod first_run_notice_tests {
             "Master password",
             "Server",
             "bitwarden.com",
-            "EU",
+            "bitwarden.eu",
             "Self-hosted",
             "Log in and set up Windows Hello",
             crate::api_key_ui::use_api_key_label(),
-            "Uses your existing Bitwarden account",
+            crate::kit::auth::brand_foot(),
         ] {
             assert!(has(&painted, wanted), "{wanted:?} is missing; painted {painted:?}");
         }
@@ -6375,7 +6375,7 @@ mod first_run_notice_tests {
         assert!(!has(&painted, "https://"), "the address field is for Self-hosted only");
         // The form is in the right half.
         assert!(at(&painted, "Email").left() > 640.0);
-        assert!(at(&painted, "Uses your existing Bitwarden account").right() < 640.0);
+        assert!(at(&painted, crate::kit::auth::brand_foot()).right() < 640.0);
 
         form.server_choice = ServerChoice::SelfHosted;
         let (painted, _) =
@@ -6410,7 +6410,7 @@ mod first_run_notice_tests {
         let mut form = LoginForm::default();
         let (painted, _) =
             screen(&ctx, BwStatus::Unauthenticated, HelloState::unavailable(), &mut form, false, None);
-        let eu = at(&painted, "EU").center();
+        let eu = at(&painted, "bitwarden.eu").center();
         let _ = screen(&ctx, BwStatus::Unauthenticated, HelloState::unavailable(), &mut form, false, Some(eu));
         assert_eq!(form.server_choice, ServerChoice::EuCloud);
         assert_eq!(ServerChoice::from_segment(ServerChoice::SelfHosted.segment()), ServerChoice::SelfHosted);

@@ -616,8 +616,8 @@ mod tests {
     fn english_is_what_the_screens_always_said() {
         use crate::{kit::auth, login_ui, second_factor_ui as sf, tray, tray_popup};
         let pins: Vec<(String, &str)> = vec![
-            (auth::headline().into(), "Your Bitwarden vault, in every app."),
-            (auth::brand_foot().into(), "Uses your existing Bitwarden account"),
+            (auth::headline().into(), "Your vault, in every app."),
+            (auth::brand_foot().into(), "Works with your Bitwarden account. Not affiliated with Bitwarden, Inc."),
             (auth::hello_label().into(), "Unlock with Windows Hello"),
             (auth::hello_checking().into(), "Checking\u{2026}"),
             (auth::use_password_label().into(), "Use master password instead"),

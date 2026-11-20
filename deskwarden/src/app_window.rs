@@ -1771,7 +1771,7 @@ where
                 // process, and Task Manager is the only way out. So the poll
                 // arm ends the stage on a dead worker, and `WORKING_DEADLINE`
                 // ends it on a live one that never answers.
-                match loading_ui::draw_spinner_body(
+                match loading_ui::draw_working_body(
                     ui,
                     working_message,
                     login_ui::CloseControl::Disabled,
@@ -2536,7 +2536,7 @@ where
                 let _ = frame;
             }
             Stage::Working => {
-                match loading_ui::draw_spinner_body(
+                match loading_ui::draw_working_body(
                     ui,
                     working_message,
                     login_ui::CloseControl::Disabled,
@@ -2751,7 +2751,7 @@ where
                 // **`CloseControl::Active`, and the one place this host differs
                 // from the other two.** See this function's own doc for why
                 // abandoning is allowed here and refused there.
-                match loading_ui::draw_spinner_body(
+                match loading_ui::draw_working_body(
                     ui,
                     working_message,
                     login_ui::CloseControl::Active,
@@ -4019,7 +4019,7 @@ mod startup_window_tests {
                 concat!("Stage::Working ", "=>"),
                 (
                     "the spinner is never drawn",
-                    "loading_ui::draw_spinner_body(",
+                    "loading_ui::draw_working_body(",
                 ),
             ),
             (
@@ -4189,7 +4189,7 @@ mod startup_window_tests {
         // Positive control on the slice: it really is the working arm and stops
         // before the vault's, whose chrome passes `CloseControl::Active`.
         assert!(
-            arm.contains(concat!("draw_spinner_", "body(")),
+            arm.contains(concat!("draw_working_", "body(")),
             "control: the sliced region is not the arm that draws the spinner: {arm}"
         );
         assert!(
@@ -7118,7 +7118,7 @@ mod warm_launch_host_tests {
     fn the_warm_launch_host_draws_both_of_its_stages() {
         let host = host();
         assert!(
-            host.contains(concat!("draw_spinner_", "body(")),
+            host.contains(concat!("draw_working_", "body(")),
             "the warm-launch host's working stage draws no spinner, so the eight seconds the \
              report is about are an empty window: {host}"
         );

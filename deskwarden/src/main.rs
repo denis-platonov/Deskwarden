@@ -11360,7 +11360,9 @@ fn sync_outcome_from(
 /// nothing, and the recovery's retry happens inside the recovery window -- so
 /// there is nothing left for either message to distinguish.
 fn setup_message() -> &'static str {
-    deskwarden::i18n::t("main.setup")
+    // The same line the vault window's own splash says, so the wait after
+    // sign-in and the vault's splash read as one loading screen.
+    deskwarden::vault_window::splash::opening()
 }
 
 /// Outcome of [`wait_for_the_vault`].

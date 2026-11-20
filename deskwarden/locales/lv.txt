@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = Jūsu Bitwarden glabātuve katrā lietotnē.
-auth.brand_sub = Pierakstieties vienreiz. Deskwarden aizpilda SAP, VPN un visus darbvirsmas pieteikšanās datus jūsu vietā.
-auth.brand_foot = Izmanto jūsu esošo Bitwarden kontu
+auth.headline = Jūsu glabātuve katrā lietotnē.
+auth.brand_sub = Pierakstieties vienreiz. Deskwarden aizpilda darbvirsmas lietotnes un vietnes jūsu vietā.
+auth.brand_foot = Darbojas ar jūsu Bitwarden kontu. Nav saistīta ar Bitwarden, Inc.
 auth.hello_label = Atbloķēt ar Windows Hello
 auth.hello_checking = Pārbauda…
 auth.use_password = Izmantot galveno paroli
@@ -22,7 +22,7 @@ login.hello_setup_link = Atbloķēt un iestatīt Windows Hello
 login.hello_setup_hint = Pirmā reize: ievadiet galveno paroli, tad noklikšķiniet šeit
 login.sign_in_title = Pieteikties
 login.server_label = Serveris
-login.server_tip = Lielākā daļa izmanto bitwarden.com. Izvēlieties EU, ja konts izveidots tur, vai Pašmitināts, ja jūsu uzņēmums darbina savu serveri.
+login.server_tip = Lielākā daļa izmanto bitwarden.com. Izvēlieties bitwarden.eu, ja konts izveidots tur, vai Pašmitināts, ja jūsu uzņēmums darbina savu serveri.
 login.password_placeholder = Jūsu Bitwarden galvenā parole
 login.lock_placeholder = Galvenā parole
 login.enter_email = Ievadiet savu e-pasta adresi.
@@ -345,7 +345,6 @@ scratch.sent_heading = KAS TIKA NOSŪTĪTS
 scratch.close = Aizvērt
 scratch.caption = izmēģinājuma logs
 main.second_lock_exit = Jūsu glabātuve ir bloķēta, un Deskwarden ir aizvērts.\n\nPalaidiet Deskwarden vēlreiz, lai pieteiktos no jauna.
-main.setup = Iestata jūsu glabātuvi...
 main.remove_account_warning = Vai noņemt {label} no Deskwarden?\n\nTas izraksta kontu un DZĒŠ tā vietējo Bitwarden profilu no šī datora, ieskaitot saglabāto sesiju un Windows Hello ātro atbloķēšanu. Jūsu glabātuve serverī netiek skarta, un vēlāk varat kontā pieteikties vēlreiz.\n\nTo nevar atsaukt.
 main.remove_account_title = Deskwarden: noņemt kontu
 main.cannot_start_title = Deskwarden nevar startēt
@@ -2018,7 +2017,7 @@ sends.err_link_key_unreadable = Šīs Send saites atslēgu nevar nolasīt. Nokop
 sends.err_link_key_length = Šīs Send saites atslēgas garums ir nepareizs, tāpēc tā nav pilna saite. Nokopējiet visu un mēģiniet vēlreiz.
 sends.err_link_no_key = Tas neizskatās pēc Send saites: atslēga seko pēc `#`, un tajā nav `#`.
 login.server_self_hosted = Pašmitināts
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = Neizdevās pārslēgties uz {account}.
 account.could_not_add = Neizdevās pievienot kontu.
 account.still_on_previous = Jūs joprojām esat pieteicies kontā, kurā bijāt.

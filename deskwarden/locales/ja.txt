@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = Bitwarden の保管庫を、すべてのアプリで。
-auth.brand_sub = 一度ログインするだけ。SAP や VPN などのログインも Deskwarden が入力します。
-auth.brand_foot = 既存の Bitwarden アカウントを使用
+auth.headline = あなたの保管庫を、すべてのアプリで。
+auth.brand_sub = 一度ログインするだけ。デスクトップアプリも Web サイトも Deskwarden が入力します。
+auth.brand_foot = Bitwarden アカウントで使えます。Bitwarden, Inc. とは無関係です。
 auth.hello_label = Windows Hello でロック解除
 auth.hello_checking = 確認中…
 auth.use_password = マスターパスワードを使用
@@ -22,7 +22,7 @@ login.hello_setup_link = ロック解除して Windows Hello を設定
 login.hello_setup_hint = 初回のみ：マスターパスワードを入力し、ここをクリック
 login.sign_in_title = ログイン
 login.server_label = サーバー
-login.server_tip = 通常は bitwarden.com を使用します。アカウントを EU で作成した場合は EU、会社が独自に運用している場合はセルフホストを選択してください。
+login.server_tip = 通常は bitwarden.com を使用します。アカウントを bitwarden.eu で作成した場合は bitwarden.eu、会社が独自に運用している場合はセルフホストを選択してください。
 login.password_placeholder = Bitwarden のマスターパスワード
 login.lock_placeholder = マスターパスワード
 login.enter_email = メールアドレスを入力してください。
@@ -343,7 +343,6 @@ scratch.sent_heading = 送信された内容
 scratch.close = 閉じる
 scratch.caption = テストウィンドウ
 main.second_lock_exit = 保管庫がロックされ、Deskwarden を終了しました。\n\nもう一度ログインするには Deskwarden を起動してください。
-main.setup = 保管庫を設定中...
 main.remove_account_warning = Deskwarden から {label} を削除しますか？\n\nこのアカウントをログアウトし、保存済みセッションと Windows Hello のクイックロック解除を含む、このコンピューター上のローカルの Bitwarden プロファイルを削除します。サーバー上の保管庫には影響せず、後でこのアカウントに再度ログインできます。\n\nこの操作は元に戻せません。
 main.remove_account_title = Deskwarden: アカウントの削除
 main.cannot_start_title = Deskwarden を起動できません
@@ -1906,7 +1905,7 @@ sends.err_link_key_unreadable = その Send リンクのキーを読み取れま
 sends.err_link_key_length = その Send リンクのキーの長さが正しくないため、完全なリンクではありません。すべてコピーして、もう一度お試しください。
 sends.err_link_no_key = Send リンクではないようです。キーは `#` の後ろにありますが、`#` が含まれていません。
 login.server_self_hosted = セルフホスト
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = {account} に切り替えられませんでした。
 account.could_not_add = アカウントを追加できませんでした。
 account.still_on_previous = 以前のアカウントにはログインしたままです。

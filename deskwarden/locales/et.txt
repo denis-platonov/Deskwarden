@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = Sinu Bitwardeni hoidla igas rakenduses.
-auth.brand_sub = Logi sisse üks kord. Deskwarden täidab SAP-i, VPN-id ja kõik töölaua sisselogimised sinu eest.
-auth.brand_foot = Kasutab sinu olemasolevat Bitwardeni kontot
+auth.headline = Sinu hoidla igas rakenduses.
+auth.brand_sub = Logi sisse üks kord. Deskwarden täidab töölauarakendused ja veebisaidid sinu eest.
+auth.brand_foot = Töötab sinu Bitwardeni kontoga. Pole seotud ettevõttega Bitwarden, Inc.
 auth.hello_label = Ava Windows Hello'ga
 auth.hello_checking = Kontrollin…
 auth.use_password = Kasuta hoopis ülemparooli
@@ -22,7 +22,7 @@ login.hello_setup_link = Ava ja seadista Windows Hello
 login.hello_setup_hint = Esmakordsel kasutamisel: sisesta ülemparool ja klõpsa siin
 login.sign_in_title = Logi sisse
 login.server_label = Server
-login.server_tip = Enamik kasutab bitwarden.com-i. Vali EU, kui sinu konto loodi seal, või Isehostitatud, kui sinu ettevõte haldab oma serverit.
+login.server_tip = Enamik kasutab bitwarden.com-i. Vali bitwarden.eu, kui sinu konto loodi seal, või Isehostitatud, kui sinu ettevõte haldab oma serverit.
 login.password_placeholder = Sinu Bitwardeni ülemparool
 login.lock_placeholder = Ülemparool
 login.enter_email = Sisesta oma e-posti aadress.
@@ -344,7 +344,6 @@ scratch.sent_heading = MIS SAADETI
 scratch.close = Sulge
 scratch.caption = proovaken
 main.second_lock_exit = Sinu hoidla on lukus ja Deskwarden on suletud.\n\nKäivita Deskwarden uuesti, et uuesti sisse logida.
-main.setup = Hoidla seadistamine...
 main.remove_account_warning = Kas eemaldada {label} Deskwardenist?\n\nSee logib konto välja ja KUSTUTAB selle kohaliku Bitwardeni profiili sellest arvutist, sealhulgas salvestatud seansi ja Windows Hello kiirlukustuse avamise. Sinu hoidlat serveris see ei puuduta ja saad sellesse kontosse hiljem uuesti sisse logida.\n\nSeda ei saa tagasi võtta.
 main.remove_account_title = Deskwarden: eemalda konto
 main.cannot_start_title = Deskwarden ei saa käivituda
@@ -1962,7 +1961,7 @@ sends.err_link_key_unreadable = Selle Sendi lingi võtit ei saa lugeda. Kopeeri 
 sends.err_link_key_length = Selle Sendi lingi võti on vale pikkusega, seega see pole täielik link. Kopeeri kõik ja proovi uuesti.
 sends.err_link_no_key = See ei näi olevat Sendi link: võti liigub pärast märki `#` ja selles pole märki `#`.
 login.server_self_hosted = Isehostitatud
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = Kontole {account} ei õnnestunud lülituda.
 account.could_not_add = Kontot ei õnnestunud lisada.
 account.still_on_previous = Oled endiselt sisse logitud kontole, millel olid.

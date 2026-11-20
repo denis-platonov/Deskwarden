@@ -3,9 +3,9 @@
 # keep every {placeholder}, and for plurals write the forms this language uses.
 # The format is documented at the top of src/i18n.rs.
 
-auth.headline = 모든 앱에서 Bitwarden 보관함을.
-auth.brand_sub = 한 번만 로그인하세요. SAP, VPN 등 모든 데스크톱 로그인을 Deskwarden이 채워 줍니다.
-auth.brand_foot = 기존 Bitwarden 계정 사용
+auth.headline = 모든 앱에서 내 보관함을.
+auth.brand_sub = 한 번만 로그인하세요. 데스크톱 앱과 웹사이트를 Deskwarden이 채워 줍니다.
+auth.brand_foot = Bitwarden 계정으로 작동합니다. Bitwarden, Inc.와는 관련이 없습니다.
 auth.hello_label = Windows Hello로 잠금 해제
 auth.hello_checking = 확인 중…
 auth.use_password = 마스터 비밀번호 사용
@@ -22,7 +22,7 @@ login.hello_setup_link = 잠금 해제 후 Windows Hello 설정
 login.hello_setup_hint = 처음 사용 시: 마스터 비밀번호를 입력한 다음 여기를 클릭하세요
 login.sign_in_title = 로그인
 login.server_label = 서버
-login.server_tip = 대부분 bitwarden.com을 사용합니다. 계정을 EU에서 만들었다면 EU를, 회사에서 직접 운영한다면 자체 호스팅을 선택하세요.
+login.server_tip = 대부분 bitwarden.com을 사용합니다. 계정을 bitwarden.eu에서 만들었다면 bitwarden.eu를, 회사에서 직접 운영한다면 자체 호스팅을 선택하세요.
 login.password_placeholder = Bitwarden 마스터 비밀번호
 login.lock_placeholder = 마스터 비밀번호
 login.enter_email = 이메일을 입력하세요.
@@ -343,7 +343,6 @@ scratch.sent_heading = 전송된 내용
 scratch.close = 닫기
 scratch.caption = 연습 창
 main.second_lock_exit = 보관함이 잠겼고 Deskwarden이 종료되었습니다.\n\n다시 로그인하려면 Deskwarden을 시작하세요.
-main.setup = 보관함을 설정하는 중...
 main.remove_account_warning = Deskwarden에서 {label}을(를) 제거할까요?\n\n이 계정에서 로그아웃하고, 저장된 세션과 Windows Hello 빠른 잠금 해제를 포함한 이 컴퓨터의 로컬 Bitwarden 프로필을 삭제합니다. 서버의 보관함은 변경되지 않으며 나중에 이 계정으로 다시 로그인할 수 있습니다.\n\n이 작업은 되돌릴 수 없습니다.
 main.remove_account_title = Deskwarden: 계정 제거
 main.cannot_start_title = Deskwarden을 시작할 수 없습니다
@@ -1906,7 +1905,7 @@ sends.err_link_key_unreadable = 해당 Send 링크의 키를 읽을 수 없습�
 sends.err_link_key_length = 해당 Send 링크의 키 길이가 올바르지 않아 완전한 링크가 아닙니다. 전체를 복사하여 다시 시도하세요.
 sends.err_link_no_key = Send 링크가 아닌 것 같습니다. 키는 `#` 뒤에 오는데 `#`이 없습니다.
 login.server_self_hosted = 자체 호스팅
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = {account}(으)로 전환하지 못했습니다.
 account.could_not_add = 계정을 추가하지 못했습니다.
 account.still_on_previous = 이전에 사용하던 계정에는 계속 로그인되어 있습니다.

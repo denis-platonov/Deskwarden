@@ -3,9 +3,9 @@
 # Keys are `area.thing`; sections below are grouped by the file that owns them.
 
 # ---- kit/auth.rs (sign-in and lock screens) ----
-auth.headline = Your Bitwarden vault, in every app.
-auth.brand_sub = Sign in once. Deskwarden fills SAP, VPNs and every desktop login for you.
-auth.brand_foot = Uses your existing Bitwarden account
+auth.headline = Your vault, in every app.
+auth.brand_sub = Sign in once. Deskwarden fills desktop apps and websites for you.
+auth.brand_foot = Works with your Bitwarden account. Not affiliated with Bitwarden, Inc.
 auth.hello_label = Unlock with Windows Hello
 auth.hello_checking = Checking…
 auth.use_password = Use master password instead
@@ -24,7 +24,7 @@ login.hello_setup_link = Unlock and set up Windows Hello
 login.hello_setup_hint = First use: enter your master password, then click here
 login.sign_in_title = Log in
 login.server_label = Server
-login.server_tip = Most people use bitwarden.com. Pick EU if your account was made there, or Self-hosted if your company runs its own.
+login.server_tip = Most people use bitwarden.com. Pick bitwarden.eu if your account was made there, or Self-hosted if your company runs its own.
 login.password_placeholder = Your Bitwarden master password
 login.lock_placeholder = Master password
 login.enter_email = Enter your email.
@@ -394,7 +394,6 @@ scratch.caption = scratch window
 
 # ---- main.rs (message boxes the daemon raises) ----
 main.second_lock_exit = Your vault is locked and Deskwarden has closed.\n\nStart Deskwarden again to sign back in.
-main.setup = Setting up your vault...
 main.remove_account_warning = Remove {label} from Deskwarden?\n\nThis signs that account out and DELETES its local Bitwarden profile from this computer, including its saved session and its Windows Hello quick unlock. Your vault on the server is not touched, and you can sign in to this account again afterwards.\n\nThis cannot be undone.
 main.remove_account_title = Deskwarden: remove account
 main.cannot_start_title = Deskwarden cannot start
@@ -2015,7 +2014,7 @@ sends.err_link_key_unreadable = That Send link's key is not readable. Copy the w
 sends.err_link_key_length = That Send link's key is the wrong length, so it is not a whole link. Copy all of it and try again.
 sends.err_link_no_key = That does not look like a Send link: the key travels after a `#` and there is no `#` in it.
 login.server_self_hosted = Self-hosted
-login.server_eu = EU
+login.server_eu = bitwarden.eu
 account.could_not_switch = Could not switch to {account}.
 account.could_not_add = Could not add an account.
 account.still_on_previous = You are still signed in to the account you were on.
