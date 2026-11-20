@@ -1177,7 +1177,10 @@ mod tests {
             assert!(painted.text("Deutsch").is_some(), "the row now names the chosen language");
 
             fixture.click_text("Deutsch");
-            fixture.click_text(system);
+            // The screen is German now, so the menu's first row is too.
+            let system_in_german = crate::i18n::t("settings.language_system");
+            assert_ne!(system_in_german, system, "German has its own words for the system default");
+            fixture.click_text(system_in_german);
             assert_eq!(fixture.state.settings.language, None, "the system default is stored as no choice");
             assert_eq!(crate::i18n::current().tag, crate::i18n::system_default().tag);
         });
