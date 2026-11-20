@@ -12050,12 +12050,8 @@ mod tests {
             // picker_prompt: 400 - 32 = 368; a palette row's lane is
             // 368 - 3 - 65 - 24 = 276 (206 selected); the search rows 285;
             // the footer buttons 180 less their chip lane; hints 202.
-            b("picker.list_title", "Archivo-ExtraBold", 19, 368),
-            b("picker.palette_title", "Archivo-ExtraBold", 19, 368),
             b("picker.search_title", "Archivo-ExtraBold", 19, 368),
             b("picker.empty_title", "Archivo-ExtraBold", 19, 368),
-            b("picker.list_sub", "Archivo-Regular", 15, 368),
-            b("picker.palette_sub", "Archivo-Regular", 15, 368),
             b("picker.search_sub", "Archivo-Regular", 15, 368),
             b("picker.empty_body", "Archivo-Regular", 15, 368),
             b("picker.send_all", "Archivo-Bold", 16, 206),
@@ -12072,8 +12068,6 @@ mod tests {
             b("picker.nothing_sub", "Archivo-Regular", 14, 285),
             b("picker.new_login", "Archivo-Bold", 15, 152),
             b("picker.search_vault", "Archivo-Bold", 15, 340),
-            b("picker.edit_binding", "Archivo-Bold", 15, 152),
-            b("picker.cancel", "Archivo-Bold", 15, 141),
             // generate_prompt: 410 - 36 = 374; see the painter for each cell.
             b("generate.new_password", "Archivo-ExtraBold", 19, 350),
             b("generate.suggested", "Archivo-Regular", 15, 286),

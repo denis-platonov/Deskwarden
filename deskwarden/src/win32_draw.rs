@@ -1718,8 +1718,11 @@ mod tests {
                  close glyph is inside the region it reports as a title bar and clicking the ✕ \
                  does nothing"
             );
+            // The account picker has no ✕ any more (owner's ruling: design 1b's
+            // header is the shield, the word and the `?`), so it passes an
+            // empty glyph and has no rect to derive.
             assert!(
-                flat.contains("fn close_glyph_rect()"),
+                card == "picker_prompt.rs" || flat.contains("fn close_glyph_rect()"),
                 "control: {card} no longer derives its close glyph's rect once, so the rect the \
                  hit test excuses and the rect `WM_LBUTTONDOWN` answers on can drift apart"
             );
