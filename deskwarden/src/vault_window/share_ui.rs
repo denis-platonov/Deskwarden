@@ -89,34 +89,34 @@ pub(crate) fn fingerprint_busy() -> &'static str {
 }
 
 pub(crate) fn shared_toast(email: &str) -> String {
-    format!("Shared with {email}. It is in their vault now.")
+    crate::i18n::tf("share.toast_shared", &[("email", &email.to_string())])
 }
 
 pub(crate) fn waiting_toast(email: &str, record: &str) -> String {
-    format!("{email} was added. {record} appears in their vault once they accept.")
+    crate::i18n::tf("share.toast_waiting", &[("email", &email.to_string()), ("record", &record.to_string())])
 }
 
 /// Share anyway went through: the record is on its way to the key whose
 /// fingerprint was compared.
 pub(crate) fn confirmed_toast(email: &str) -> String {
-    format!("Shared with {email} on their new key.")
+    crate::i18n::tf("share.toast_confirmed", &[("email", &email.to_string())])
 }
 
 /// Stop receiving went through: every record from them has left the vault.
 pub(crate) fn stopped_receiving_toast(from: &str) -> String {
-    format!("Stopped receiving from {from}.")
+    crate::i18n::tf("share.toast_stopped_receiving", &[("from", &from.to_string())])
 }
 
 /// A Re-invite went through.
 pub(crate) fn reinvited_toast(email: &str) -> String {
-    format!("Invitation sent to {email}.")
+    crate::i18n::tf("share.toast_reinvited", &[("email", &email.to_string())])
 }
 
 /// A share the server left as a pending invitation, said as a toast when no
 /// dialog is open to say it. It claims nothing about an account
 /// (official-path spec §3.4).
 pub(crate) fn invited_toast(email: &str) -> String {
-    format!("Waiting for {email} to accept.")
+    crate::i18n::tf("share.toast_invited", &[("email", &email.to_string())])
 }
 
 const MILLIS_PER_DAY: i64 = 86_400_000;
@@ -196,9 +196,8 @@ fn day(millis: i64, zone: &dyn LocalOffset) -> String {
 /// is claimed, because the server's setting is invisible to a client.
 fn invited_ago(at: i64, now_ms: i64) -> String {
     match (now_ms - at).max(0) / MILLIS_PER_DAY {
-        0 => "invited today".to_string(),
-        1 => "invited 1 day ago".to_string(),
-        days => format!("invited {days} days ago"),
+        0 => crate::i18n::t("share.invited_today").to_string(),
+        days => crate::i18n::tn("share.invited_days_ago", days as u64, &[]),
     }
 }
 
@@ -231,21 +230,23 @@ pub(crate) fn person_lines(
         .map(|person| {
             let line = match person.state {
                 PersonState::Shared => match since(history, item_id, &person.email) {
-                    Some(at) => format!("Shared \u{b7} since {}", day(at, zone)),
-                    None => "Shared".to_string(),
+                    Some(at) => crate::i18n::tf("share.line_shared_since", &[("day", &day(at, zone))]),
+                    None => crate::i18n::t("share.line_shared").to_string(),
                 },
                 // Invited and Accepted read alike (official-path spec §3.4):
                 // the accept is the person's, and an Accepted one is
                 // confirmed on the next pass.
                 PersonState::WaitingAccept | PersonState::Invited => match since(history, item_id, &person.email) {
-                    Some(at) => format!("Waiting to accept \u{b7} {}", invited_ago(at, now_ms)),
-                    None => "Waiting to accept".to_string(),
+                    Some(at) => {
+                        crate::i18n::tf("share.line_waiting_since", &[("when", &invited_ago(at, now_ms))])
+                    }
+                    None => crate::i18n::t("share.line_waiting").to_string(),
                 },
-                PersonState::KeyChanged => "Their key changed. Check the fingerprint before sharing.".to_string(),
-                PersonState::WaitingSignIn => "Waiting for them to sign in once to a Bitwarden app".to_string(),
-                PersonState::Gone => "No longer receiving this".to_string(),
+                PersonState::KeyChanged => crate::i18n::t("share.line_key_changed").to_string(),
+                PersonState::WaitingSignIn => crate::i18n::t("share.line_waiting_sign_in").to_string(),
+                PersonState::Gone => crate::i18n::t("share.line_gone").to_string(),
             };
-            let line = if person.authenticated { line } else { format!("{unverified_prefix}{line}", unverified_prefix = unverified_prefix()) };
+            let line = if person.authenticated { line } else { format!("{}{line}", unverified_prefix()) };
             PersonLine { email: person.email.clone(), state: person.state, line, authenticated: person.authenticated }
         })
         .collect()
@@ -255,11 +256,11 @@ pub(crate) fn person_lines(
 /// for [`share_rows`].
 pub(crate) fn short_state(state: PersonState) -> &'static str {
     match state {
-        PersonState::Shared => "Shared",
-        PersonState::WaitingAccept | PersonState::Invited => "Waiting to accept",
-        PersonState::KeyChanged => "Key changed",
-        PersonState::WaitingSignIn => "Waiting for a first sign-in",
-        PersonState::Gone => "Not receiving",
+        PersonState::Shared => crate::i18n::t("share.short_shared"),
+        PersonState::WaitingAccept | PersonState::Invited => crate::i18n::t("share.short_waiting"),
+        PersonState::KeyChanged => crate::i18n::t("share.short_key_changed"),
+        PersonState::WaitingSignIn => crate::i18n::t("share.short_waiting_sign_in"),
+        PersonState::Gone => crate::i18n::t("share.short_gone"),
     }
 }
 
@@ -1153,7 +1154,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                     dialog.in_flight = false;
                     dialog.adopt = Some(question);
                 }
-                None => fail(pane, format!("{item_name} wasn't shared with {email}: Deskwarden needs you to choose an organisation. Share it again to choose.")),
+                None => fail(pane, crate::i18n::tf("share.adoption_not_asked", &[("item_name", &item_name.to_string()), ("email", &email.to_string())])),
             }
         }
         SharingReport::Stopped { email, result } => {
@@ -1170,7 +1171,7 @@ pub(crate) fn apply(pane: &mut SharingPane, report: SharingReport, now_seconds: 
                     if let (Some((old, _)), Some(new)) = (stopped, moved_to) {
                         pane.moved_home = Some((old, new));
                     }
-                    toast(pane, format!("Stopped sharing with {email}."));
+                    toast(pane, crate::i18n::tf("share.toast_stopped_sharing", &[("email", &email.to_string())]));
                 }
                 Err(sentence) => fail(pane, sentence),
             }
@@ -1440,17 +1441,13 @@ fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
         ..plain.clone()
     };
     let mut job = egui::text::LayoutJob::default();
-    job.append("They get ", 0.0, plain.clone());
-    job.append("view-only", 0.0, strong);
-    job.append(
-        &format!(
-            " access: they can see, copy and autofill it, but not edit, delete or share it on. \
-             When you edit {record}, their copy changes too. You can stop sharing at any time \
-             from the record."
-        ),
-        0.0,
-        plain,
-    );
+    // One sentence with its bold run marked `**..**`, so a translation can put
+    // the bold words wherever its grammar wants them.
+    let sentence = crate::i18n::tf("share.view_only_note", &[("record", record)]);
+    for (i, part) in sentence.split("**").enumerate() {
+        let format = if i % 2 == 1 { strong.clone() } else { plain.clone() };
+        job.append(part, 0.0, format);
+    }
     job.wrap.max_width = width;
     job
 }
@@ -1466,14 +1463,9 @@ fn access_job(record: &str, width: f32) -> egui::text::LayoutJob {
 /// ever true for -- is told about the invite code a newcomer there needs,
 /// and that they can make it here.
 fn invited_band(email: &str, record: &str, admin: bool) -> (String, String) {
-    let head = format!("Waiting for {email} to accept.");
-    let code = if admin {
-        "If they have no account on this server yet, they need an invite code to sign up. You are \
-         this server's administrator, so you can create one below and give it to them. "
-    } else {
-        ""
-    };
-    let body = format!("{code}{record} reaches their vault once they accept, and you can re-invite them from the record.");
+    let head = crate::i18n::tf("share.toast_invited", &[("email", &email.to_string())]);
+    let code = if admin { crate::i18n::t("share.invite_code_admin_note") } else { "" };
+    let body = crate::i18n::tf("share.invited_body", &[("code", code), ("record", record)]);
     (head, body)
 }
 
@@ -1486,9 +1478,12 @@ pub(crate) fn invite_text(code: &InviteCode) -> &str {
 /// A suggestion's count, by kind (mock 6a: "2 shared", "3 sent").
 fn person_count_words(person: &crate::sent_history::Person) -> String {
     match (person.sent, person.shared) {
-        (0, shared) => format!("{shared} shared"),
+        (0, shared) => crate::i18n::tf("share.count_shared", &[("shared", &shared.to_string())]),
         (sent, 0) => super::send_ui::sent_count_words(sent),
-        (sent, shared) => format!("{shared} shared, {sent} sent"),
+        (sent, shared) => crate::i18n::tf(
+            "share.count_shared_and_sent",
+            &[("shared", &shared.to_string()), ("sent", &sent.to_string())],
+        ),
     }
 }
 
@@ -1541,7 +1536,7 @@ pub(crate) fn draw_share_modal(
     let forget_up = ctx.memory(|m| {
         m.areas().is_visible(&egui::LayerId::new(theme::SCRIM_ORDER, egui::Id::new(FORGET_SCRIM)))
     });
-    let title = format!("Share {}", dialog.item_name);
+    let title = crate::i18n::tf("share.dialog_title", &[("name", &dialog.item_name.to_string())]);
     let (outcome, ()) = Dialog::new(SHARE_ID, MODAL_WIDTH).title(&title).esc_closes(!busy && !forget_up).show(ctx, |ui| {
         let p = crate::kit::tokens::palette(ui.ctx());
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -1799,7 +1794,7 @@ fn invited_block(
                 });
                 ui.add_space(6.0);
                 ui.label(
-                    egui::RichText::new(format!("Give it to {email}. They enter it when they sign up."))
+                    egui::RichText::new(crate::i18n::tf("share.give_invite_code", &[("email", &email.to_string())]))
                         .size(14.0)
                         .color(p.caution_ink),
                 );
@@ -2125,15 +2120,12 @@ const TOAST_STACK_GAP: f32 = 8.0;
 
 /// Mock 6b's red question, with the record and the person in it.
 pub(crate) fn stop_question(record: &str, email: &str) -> String {
-    format!("Stop sharing {record} with {email}? It leaves their vault at once.")
+    crate::i18n::tf("share.stop_question", &[("record", &record.to_string()), ("email", &email.to_string())])
 }
 
 /// What a shown fingerprint is to be compared with (mock 6b).
 fn fingerprint_note(email: &str) -> String {
-    format!(
-        "This should match the phrase {email} sees under Account \u{203a} Fingerprint phrase. If it \
-         does not, stop sharing: the record went to a key that is not theirs."
-    )
+    crate::i18n::tf("share.fingerprint_note", &[("email", email)])
 }
 
 /// **A changed key's fingerprint says what to do before Share anyway.** The
@@ -2143,11 +2135,7 @@ fn fingerprint_note(email: &str) -> String {
 /// read off this screen and the other person's screen alike proves nothing
 /// unless the two people say it to each other.
 pub(crate) fn key_changed_note(email: &str) -> String {
-    format!(
-        "Their key changed. Before you share anyway, compare these words with {email} by phone or \
-         in person: they see theirs under Account \u{203a} Fingerprint phrase. If the words do not \
-         match, do not share."
-    )
+    crate::i18n::tf("share.key_changed_note", &[("email", email)])
 }
 
 /// Two addresses name one person: the view's, the pane's and a report's are
@@ -2479,7 +2467,7 @@ fn person_entry(
                 *action = DetailAction::StopSharing(email.to_string());
             }
             if person.reinvite()
-                && theme::row_button(ui, reinvite_label()).on_hover_text("Send them a fresh invitation").clicked()
+                && theme::row_button(ui, reinvite_label()).on_hover_text(crate::i18n::t("share.reinvite_hover")).clicked()
             {
                 *action = DetailAction::Reinvite(email.to_string());
             }
@@ -2790,7 +2778,7 @@ pub(crate) fn share_rows(
                     name: item.name.clone(),
                     email: person.email.clone(),
                     state: person.state,
-                    subtitle: format!("to {} \u{b7} {}", person.email, short_state(person.state)),
+                    subtitle: crate::i18n::tf("share.row_subtitle", &[("email", &person.email.to_string()), ("state", &(short_state(person.state)).to_string())]),
                     since: at.map(|at| day(at, zone)),
                 },
             ));
@@ -2953,9 +2941,9 @@ pub struct ReceivedShareRow {
 /// claim (official-path spec §4.3).
 pub(crate) fn received_subtitle(row: &ReceivedShareRow) -> String {
     if row.verified {
-        format!("from {} \u{b7} view-only", row.from)
+        crate::i18n::tf("share.received_subtitle", &[("from", &row.from)])
     } else {
-        format!("from {} \u{b7} unverified \u{b7} view-only", row.from)
+        crate::i18n::tf("share.received_subtitle_unverified", &[("from", &row.from)])
     }
 }
 
@@ -3037,7 +3025,7 @@ const WAITING_LINE_SIZE: f32 = 12.0;
 /// confirmed. The sharer's daemon confirms on its next pass; until then the
 /// org shows this account nothing, and this line is why.
 pub(crate) fn waiting_line(from: &str) -> String {
-    format!("Waiting for {from} to finish sharing")
+    crate::i18n::tf("share.waiting_line", &[("from", &from.to_string())])
 }
 
 /// **Who a [`waiting_line`] names**: the sharer, and `(unverified)` after
@@ -3056,7 +3044,7 @@ pub(crate) fn named_sharer(from: &str, verified: bool) -> String {
     if verified {
         from.to_string()
     } else {
-        format!("{from} (unverified)")
+        crate::i18n::tf("share.sharer_unverified", &[("from", &from.to_string())])
     }
 }
 
@@ -3137,8 +3125,8 @@ pub(crate) fn join_no_label() -> &'static str {
 /// server's word; "this organisation" for a link that carries none.
 pub(crate) fn join_title(name: Option<&str>) -> String {
     match name {
-        Some(name) => format!("Join \"{name}\"?"),
-        None => "Join this organisation?".to_string(),
+        Some(name) => crate::i18n::tf("share.join_title_named", &[("name", name)]),
+        None => crate::i18n::t("share.join_title").to_string(),
     }
 }
 
@@ -3210,7 +3198,7 @@ pub(crate) fn keep_receiving_label() -> &'static str {
 }
 
 pub(crate) fn stop_receiving_title(from: &str) -> String {
-    format!("Stop receiving from {from}?")
+    crate::i18n::tf("share.stop_receiving_title", &[("from", &from.to_string())])
 }
 
 ///
@@ -3219,10 +3207,7 @@ pub(crate) fn stop_receiving_title(from: &str) -> String {
 /// decline -- so "They can invite you again later" promised a question that
 /// never comes.
 pub(crate) fn stop_receiving_body(from: &str) -> String {
-    format!(
-        "Every record {from} shares with you leaves your vault now. On this server they can add you back \
-         directly, without asking you first."
-    )
+    crate::i18n::tf("share.stop_receiving_body", &[("from", from)])
 }
 
 /// **"Stop receiving from X?"** -- every record from them leaves this vault,

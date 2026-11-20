@@ -237,10 +237,11 @@ fn paint_card(ui: &mut egui::Ui, rect: Rect, face: &Face<'_>, records: RecordTil
 /// A 4's `views`).
 pub fn views_words(row: &SendRow) -> String {
     match (row.max_access_count, row.access_count) {
-        (_, 0) => "Not opened yet".to_string(),
-        (Some(cap), used) => format!("{used} of {cap} opens"),
-        (None, 1) => "Opened once".to_string(),
-        (None, n) => format!("Opened {n} times"),
+        (_, 0) => crate::i18n::t("sends.not_opened_yet").to_string(),
+        (Some(cap), used) => {
+            crate::i18n::tf("sends.opens_of_cap", &[("used", &used.to_string()), ("cap", &cap.to_string())])
+        }
+        (None, n) => crate::i18n::tn("sends.opened_times", n as u64, &[]),
     }
 }
 
@@ -250,17 +251,17 @@ pub fn views_words(row: &SendRow) -> String {
 pub fn ends_words(row: &SendRow) -> String {
     use crate::send::SendState;
     match row.state {
-        SendState::Revoked => return "Switched off".to_string(),
-        SendState::Used => return "All views used".to_string(),
+        SendState::Revoked => return crate::i18n::t("sends.switched_off").to_string(),
+        SendState::Used => return crate::i18n::t("sends.all_views_used").to_string(),
         _ => {}
     }
     let relative = |text: &str| text.split_once(" \u{b7} ").map(|(_, rel)| rel.to_string());
     let rel = relative(&row.expires).or_else(|| relative(&row.deletes));
     match (rel, row.state.is_live()) {
-        (Some(rel), true) => format!("Ends {rel}"),
-        (Some(rel), false) => format!("Ended {rel}"),
-        (None, true) => "Lasts until deleted".to_string(),
-        (None, false) => "Ended".to_string(),
+        (Some(rel), true) => crate::i18n::tf("sends.ends_rel", &[("rel", &rel)]),
+        (Some(rel), false) => crate::i18n::tf("sends.ended_rel", &[("rel", &rel)]),
+        (None, true) => crate::i18n::t("sends.lasts_until_deleted").to_string(),
+        (None, false) => crate::i18n::t("sends.ended").to_string(),
     }
 }
 
@@ -271,9 +272,9 @@ fn recipient_line(row: &SendRow) -> String {
         .as_ref()
         .map(|s| s.recipient.as_str())
         .filter(|r| !r.is_empty())
-        .unwrap_or("Anyone with the link");
+        .unwrap_or(crate::i18n::t("sends.anyone_with_link"));
     if row.is_file {
-        format!("{who} \u{b7} File Send")
+        crate::i18n::tf("sends.recipient_file_send", &[("who", &who.to_string())])
     } else {
         who.to_string()
     }
@@ -282,10 +283,12 @@ fn recipient_line(row: &SendRow) -> String {
 /// What the Includes tile says: the record's fields, or the kind of Send.
 fn includes_words(row: &SendRow) -> String {
     match &row.sent {
-        Some(sent) if !sent.fields.is_empty() => sent.fields.join(", "),
+        Some(sent) if !sent.fields.is_empty() => {
+            sent.fields.iter().map(|f| crate::vault_window::record_ui::field_label(f).into_owned()).collect::<Vec<_>>().join(", ")
+        }
         Some(_) => "\u{2014}".to_string(),
-        None if row.is_file => "A file".to_string(),
-        None => "Text".to_string(),
+        None if row.is_file => crate::i18n::t("sends.includes_file").to_string(),
+        None => crate::i18n::t("sends.includes_text").to_string(),
     }
 }
 
@@ -316,7 +319,7 @@ fn share_face<'a>(share: &'a ShareRow) -> Face<'a> {
         name: &share.name,
         line: share.subtitle.clone(),
         pill: Some((kind.label().to_string(), tone.fill, tone.ink)),
-        clock: share.since.as_ref().map(|s| format!("Since {s}")),
+        clock: share.since.as_ref().map(|s| crate::i18n::tf("sends.since", &[("s", &s.to_string())])),
         eye: None,
         ended: kind == theme::SharePillKind::Gone,
         actions: false,
@@ -343,9 +346,9 @@ fn person_face<'a>(row: &'a ReceivedShareRow, subtitle: &str) -> Face<'a> {
 
 fn received_face(row: &ReceivedRow) -> Face<'_> {
     let (word, fill, ink) = if row.still_in_vault {
-        ("In your vault", Palette::LIGHT.done_wash, Palette::LIGHT.done_ink)
+        (crate::i18n::t("sends.received_in_vault"), Palette::LIGHT.done_wash, Palette::LIGHT.done_ink)
     } else {
-        ("Gone", Palette::LIGHT.hover, Palette::LIGHT.text_faint)
+        (crate::i18n::t("sends.received_gone"), Palette::LIGHT.hover, Palette::LIGHT.text_faint)
     };
     Face {
         key: &row.key,
@@ -789,7 +792,7 @@ fn detail_rows(ui: &mut egui::Ui, rows: &[(&str, Value<'_>)]) {
             }
             Value::Views { used, cap } => {
                 let text = match cap {
-                    Some(cap) => format!("{used} of {cap}"),
+                    Some(cap) => crate::i18n::tf("sends.views_of_cap", &[("used", &used.to_string()), ("cap", &cap.to_string())]),
                     None => format!("{used}"),
                 };
                 ui.painter().layout_no_wrap(text, bold(15.0), p.ink)
@@ -814,7 +817,7 @@ fn detail_rows(ui: &mut egui::Ui, rows: &[(&str, Value<'_>)]) {
         ui.painter().galley(pos2(value_x, mid - vh / 2.0), v, p.ink);
         match value {
             Value::Address { dead: true, .. } => {
-                ui.painter().text(pos2(rect.right() - pad, mid), egui::Align2::RIGHT_CENTER, "dead", regular(13.0), p.text_ghost);
+                ui.painter().text(pos2(rect.right() - pad, mid), egui::Align2::RIGHT_CENTER, super::dead_marker(), regular(13.0), p.text_ghost);
             }
             Value::Views { used, cap: Some(cap) } if *cap > 0 => {
                 let track = Rect::from_min_size(pos2(v_right + 12.0, mid - 2.0), vec2(90.0, 4.0));
@@ -838,25 +841,34 @@ fn detail_rows(ui: &mut egui::Ui, rows: &[(&str, Value<'_>)]) {
 /// history; the last entry is the one the blue dot marks.
 pub fn activity_events(row: &SendRow) -> Vec<(String, String)> {
     use crate::send::SendState;
-    let mut events = vec![("Created by you".to_string(), String::new())];
+    let mut events = vec![(crate::i18n::t("sends.created_by_you").to_string(), String::new())];
     if let Some(who) = row.sent.as_ref().map(|s| s.recipient.as_str()).filter(|r| !r.is_empty()) {
-        events.push((format!("Link sent to {who}"), String::new()));
+        events.push((crate::i18n::tf("sends.link_sent_to", &[("who", &who.to_string())]), String::new()));
     }
     let opened = match row.access_count {
-        0 => "Not opened yet".to_string(),
-        1 => "Opened once".to_string(),
-        n => format!("Opened {n} times"),
+        0 => crate::i18n::t("sends.not_opened_yet").to_string(),
+        n => crate::i18n::tn("sends.opened_times", n as u64, &[]),
     };
-    let cap = row.max_access_count.map(|cap| format!("{} of {cap} opens", row.access_count)).unwrap_or_default();
+    let cap = row
+        .max_access_count
+        .map(|cap| {
+            crate::i18n::tf("sends.opens_of_cap", &[("used", &row.access_count.to_string()), ("cap", &cap.to_string())])
+        })
+        .unwrap_or_default();
     events.push((opened, cap));
     events.push(match row.state {
-        SendState::Revoked => ("Switched off".to_string(), "The link no longer answers".to_string()),
-        SendState::Used => ("Every permitted view is spent".to_string(), "The link no longer answers".to_string()),
-        SendState::Expired => ("The link ran out of time".to_string(), row.expires.clone()),
-        _ if row.expires != super::no_expiry_of_its_own() && !row.expires.is_empty() => {
-            ("The link stops working".to_string(), row.expires.clone())
+        SendState::Revoked => {
+            (crate::i18n::t("sends.switched_off").to_string(), crate::i18n::t("sends.link_no_longer_answers").to_string())
         }
-        _ => ("Removed automatically".to_string(), row.deletes.clone()),
+        SendState::Used => (
+            crate::i18n::t("sends.every_view_spent").to_string(),
+            crate::i18n::t("sends.link_no_longer_answers").to_string(),
+        ),
+        SendState::Expired => (crate::i18n::t("sends.link_ran_out_of_time").to_string(), row.expires.clone()),
+        _ if row.expires != super::no_expiry_of_its_own() && !row.expires.is_empty() => {
+            (crate::i18n::t("sends.link_stops_working").to_string(), row.expires.clone())
+        }
+        _ => (crate::i18n::t("sends.removed_automatically").to_string(), row.deletes.clone()),
     });
     events
 }
@@ -864,7 +876,7 @@ pub fn activity_events(row: &SendRow) -> Vec<(String, String)> {
 /// Spec B 7's Activity: a heading, then each event on a rail.
 fn activity(ui: &mut egui::Ui, row: &SendRow) {
     let p = tokens::palette(ui.ctx());
-    ui.label(tokens::job(Role { size: 15.0, face: theme::EXTRABOLD, tracking_em: 0.0 }, "Activity", p.ink));
+    ui.label(tokens::job(Role { size: 15.0, face: theme::EXTRABOLD, tracking_em: 0.0 }, crate::i18n::t("sends.activity_heading"), p.ink));
     ui.add_space(6.0);
     ui.add(egui::Label::new(egui::RichText::new(row.activity.as_str()).size(14.0).color(p.text_nav)).wrap());
     ui.add_space(12.0);
@@ -1045,7 +1057,11 @@ fn send_modal(
                 }
                 ui.add_space(22.0);
             }
-            fact_tiles(ui, &[("Opens", views_words(row)), ("Link", ends_words(row)), ("Includes", includes_words(row))]);
+            fact_tiles(ui, &[
+                (crate::i18n::t("sends.tile_opens"), views_words(row)),
+                (crate::i18n::t("sends.tile_link"), ends_words(row)),
+                (crate::i18n::t("sends.tile_includes"), includes_words(row)),
+            ]);
             ui.add_space(22.0);
             let opens_with = if row.has_password { super::password_segment() } else { super::link_only() };
             let address = if row.access_url.is_empty() {

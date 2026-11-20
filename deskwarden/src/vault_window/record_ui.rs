@@ -174,6 +174,29 @@ pub fn export_heading() -> &'static str {
     crate::i18n::t("record.export_heading")
 }
 
+/// **The names `sent_history` stores for the fields that travelled -- English
+/// on purpose, because they are DATA**: they are written to a file on this PC
+/// and read back by whichever language the app is in next time, so they are
+/// matched here and shown through [`field_label`], never printed as they are.
+pub const STORED_USERNAME: &str = "Username";
+pub const STORED_PASSWORD: &str = "Password";
+pub const STORED_WEBSITES: &str = "Websites";
+pub const STORED_NOTES: &str = "Notes";
+pub const STORED_TOTP: &str = "One-time code";
+
+/// A stored field name, in the words of the language in force. A name this
+/// version does not know (a newer version's history) is shown as it was written.
+pub fn field_label(stored: &str) -> std::borrow::Cow<'_, str> {
+    match stored {
+        STORED_USERNAME => username_label().into(),
+        STORED_PASSWORD => password_label().into(),
+        STORED_WEBSITES => websites_label().into(),
+        STORED_NOTES => notes_label().into(),
+        STORED_TOTP => totp_label().into(),
+        other => other.into(),
+    }
+}
+
 /// The tick-box labels, in the order they are drawn.
 pub fn username_label() -> &'static str {
     crate::i18n::t("record.username_label")
@@ -254,8 +277,7 @@ pub fn include_counter(draft: &RecordDraft) -> String {
         .into_iter()
         .filter(|on| *on)
         .count();
-    let noun = if ticked == 1 { "field" } else { "fields" };
-    format!("{ticked} of {INCLUDE_FIELD_COUNT} {noun}")
+    crate::i18n::tn("record.include_counter", ticked as u64, &[("total", &INCLUDE_FIELD_COUNT.to_string())])
 }
 
 /// **The safety control of this whole feature, verbatim.**
@@ -456,6 +478,24 @@ pub fn seed_stays_note() -> &'static str {
 pub fn whole_record_fields(
     item: Option<&crate::vault_bridge::VaultItem>,
 ) -> Vec<(&'static str, bool)> {
+    stored_record_fields(item)
+        .into_iter()
+        .map(|(stored, secret)| {
+            let label = match stored {
+                STORED_USERNAME => username_label(),
+                STORED_PASSWORD => password_label(),
+                STORED_WEBSITES => websites_label(),
+                _ => notes_label(),
+            };
+            (label, secret)
+        })
+        .collect()
+}
+
+/// [`whole_record_fields`] by the names `sent_history` stores.
+fn stored_record_fields(
+    item: Option<&crate::vault_bridge::VaultItem>,
+) -> Vec<(&'static str, bool)> {
     let Some(item) = item else {
         return Vec::new();
     };
@@ -463,16 +503,16 @@ pub fn whole_record_fields(
     let filled = |value: Option<&str>| value.is_some_and(|v| !v.trim().is_empty());
     let mut fields = Vec::new();
     if filled(login.and_then(|l| l.username.as_deref())) {
-        fields.push((username_label(), false));
+        fields.push((STORED_USERNAME, false));
     }
     if filled(login.and_then(|l| l.password.as_ref().map(|p| p.as_str()))) {
-        fields.push((password_label(), true));
+        fields.push((STORED_PASSWORD, true));
     }
     if login.is_some_and(|l| l.uris.iter().any(|u| filled(u.uri.as_deref()))) {
-        fields.push((websites_label(), false));
+        fields.push((STORED_WEBSITES, false));
     }
     if filled(item.notes.as_ref().map(|n| n.as_str())) {
-        fields.push((notes_label(), false));
+        fields.push((STORED_NOTES, false));
     }
     fields
 }
@@ -486,19 +526,19 @@ pub fn fields_travelling(
     item: &crate::vault_bridge::VaultItem,
     seed_sealed: bool,
 ) -> Vec<String> {
-    let mut labels: Vec<String> = whole_record_fields(Some(item))
+    let mut labels: Vec<String> = stored_record_fields(Some(item))
         .into_iter()
-        .filter(|(label, _)| {
-            let label = *label;
-            (label == username_label() && selection.username)
-                || (label == password_label() && selection.password)
-                || (label == websites_label() && selection.uri)
-                || (label == notes_label() && selection.notes)
+        .filter(|(stored, _)| {
+            let stored = *stored;
+            (stored == STORED_USERNAME && selection.username)
+                || (stored == STORED_PASSWORD && selection.password)
+                || (stored == STORED_WEBSITES && selection.uri)
+                || (stored == STORED_NOTES && selection.notes)
         })
-        .map(|(label, _)| label.to_string())
+        .map(|(stored, _)| stored.to_string())
         .collect();
     if seed_sealed {
-        labels.push(totp_label().to_string());
+        labels.push(STORED_TOTP.to_string());
     }
     labels
 }
@@ -545,6 +585,7 @@ pub fn export_problem(
         draft.access.max_access_count,
         now,
     )
+    .map(super::send_ui::words::refusal)
 }
 
 /// Whether the export button may be pressed at all.
@@ -625,13 +666,15 @@ pub fn needs_collision_choice() -> &'static str {
 
 /// **The advisory staleness sentence, verbatim, pinned by content.**
 ///
-/// `{}` is the date. A vault item does not expire — the 2026-08-17 decision
+/// `{date}` is the date. A vault item does not expire — the 2026-08-17 decision
 /// accepted that knowingly — so `not_after` is *staleness information about
 /// the record* and never enforcement. "It will still import" is the load-
 /// bearing half of the sentence: copy implying the record lapses on its own
 /// would describe behaviour this app does not have and
 /// `record::import` has a test specifically forbidding.
-pub const STALE_TEMPLATE: &str = "This record was marked stale on {}. It will still import.";
+pub fn stale_text(date: &str) -> String {
+    crate::i18n::tf("record.stale_template", &[("date", date)])
+}
 
 /// The two answers to a name collision. **Neither is a default.**
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -654,7 +697,7 @@ pub fn replace_label() -> &'static str {
 
 /// The question above the two buttons.
 pub fn collision_prompt(name: &str) -> String {
-    format!("An item called \u{201c}{name}\u{201d} is already in your vault.")
+    crate::i18n::tf("record.collision_prompt", &[("name", &name.to_string())])
 }
 
 /// The link, the passphrase, and the collision answer.
@@ -736,7 +779,7 @@ pub fn stale_note(record: &Record, now: &dyn crate::send::SendClock) -> Option<S
     // The date the sender wrote, as they wrote it. `not_after` is RFC 3339 and
     // its first ten bytes are the calendar date; `parse_iso_utc_millis`
     // succeeding above is what makes that slice safe to take.
-    Some(STALE_TEMPLATE.replace("{}", not_after.trim().get(..10).unwrap_or(not_after)))
+    Some(stale_text(not_after.trim().get(..10).unwrap_or(not_after)))
 }
 
 /// The sentence a refusal is shown as.
@@ -998,8 +1041,7 @@ pub fn include_rows(
 pub fn uri_count(uris: usize) -> String {
     match uris {
         0 => String::new(),
-        1 => "1 address".to_string(),
-        n => format!("{n} addresses"),
+        n => crate::i18n::tn("record.uri_count", n as u64, &[]),
     }
 }
 
@@ -1299,12 +1341,19 @@ pub fn see_in_shared() -> &'static str {
 const SHARE_WIDTH: f32 = 560.0;
 
 /// Spec B §6.1's expiry choices.
-pub const LINK_LIFETIMES: [(&str, u32); 4] = [("1 hour", 1), ("1 day", 24), ("7 days", 168), ("30 days", 720)];
+pub fn link_lifetimes() -> [(&'static str, u32); 4] {
+    [
+        (crate::i18n::t("record.life_1_hour"), 1),
+        (crate::i18n::t("record.life_1_day"), 24),
+        (crate::i18n::t("record.life_7_days"), 168),
+        (crate::i18n::t("record.life_30_days"), 720),
+    ]
+}
 
 /// Which of [`LINK_LIFETIMES`] `lifetime` is, if any.
 pub fn lifetime_choice(lifetime: &crate::send::SendLifetime) -> Option<usize> {
     match lifetime {
-        crate::send::SendLifetime::Hours(h) => LINK_LIFETIMES.iter().position(|(_, hours)| hours == h),
+        crate::send::SendLifetime::Hours(h) => link_lifetimes().iter().position(|(_, hours)| hours == h),
         _ => None,
     }
 }
@@ -1314,7 +1363,7 @@ pub fn share_chips() -> [(&'static str, IncludeField); 5] {
     [
         (username_label(), IncludeField::Username),
         (password_label(), IncludeField::Password),
-        ("2FA code", IncludeField::Totp),
+        (crate::i18n::t("record.chip_totp"), IncludeField::Totp),
         (websites_label(), IncludeField::Uri),
         (notes_label(), IncludeField::Notes),
     ]
@@ -1340,10 +1389,11 @@ pub fn done_summary(draft: &RecordDraft, advanced: bool) -> String {
     let mut line = picked.join(", ");
     if let Some(i) = lifetime_choice(&draft.access.lifetime) {
         line.push_str(" \u{b7} ");
-        line.push_str(LINK_LIFETIMES[i].0);
+        line.push_str(link_lifetimes()[i].0);
     }
     if draft.access.max_access_count == Some(1) {
-        line.push_str(" \u{b7} opens once");
+        line.push_str(" \u{b7} ");
+        line.push_str(crate::i18n::t("record.summary_opens_once"));
     }
     line
 }
@@ -1392,7 +1442,7 @@ pub fn draw_export_modal(
     zone: &dyn crate::local_time::LocalOffset,
 ) -> RecordUiAction {
     let _ = folder;
-    let title = format!("Share {}", state.item_name);
+    let title = crate::i18n::tf("record.share_title", &[("name", &state.item_name.to_string())]);
     let busy = in_flight || state.waiting;
     let mut dialog = crate::kit::modal::Dialog::new(ID, SHARE_WIDTH);
     if state.done.is_none() {
@@ -1480,13 +1530,13 @@ pub fn draw_share_form(
 
     label(ui, link_works_for(), None);
     ui.add_space(10.0);
-    let labels: Vec<&str> = LINK_LIFETIMES.iter().map(|(l, _)| *l).collect();
+    let labels: Vec<&str> = link_lifetimes().iter().map(|(l, _)| *l).collect();
     let chosen = lifetime_choice(&draft.access.lifetime).unwrap_or(usize::MAX);
     if let Some(picked) = ui
         .add_enabled_ui(!busy, |ui| crate::kit::controls::segmented(ui, &labels, chosen, crate::kit::controls::SEG_EXPIRY))
         .inner
     {
-        draft.access.lifetime = crate::send::SendLifetime::Hours(LINK_LIFETIMES[picked].1);
+        draft.access.lifetime = crate::send::SendLifetime::Hours(link_lifetimes()[picked].1);
     }
     ui.add_space(22.0);
 
@@ -1651,7 +1701,7 @@ pub fn draw_share_done(ui: &mut egui::Ui, summary: &str, link: &str) -> RecordUi
 /// "if records shared - we ask like these are shared, deleting will remove all
 /// shares yes\no".
 pub fn forget_title(email: &str) -> String {
-    format!("Forget {email}?")
+    crate::i18n::tf("record.forget_title", &[("email", &email.to_string())])
 }
 
 /// Names the records, so the answer is given knowing what goes.
@@ -1659,19 +1709,14 @@ pub fn forget_body(names: &[String]) -> String {
     let listed = match names {
         [] => String::new(),
         [one] => one.clone(),
-        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+        [init @ .., last] => crate::i18n::tf("record.list_and", &[("init", &init.join(", ")), ("last", last)]),
     };
-    let noun = if names.len() == 1 { "record is" } else { "records are" };
-    format!(
-        "{} {noun} shared with this person: {listed}. Deleting them removes all these shares; \
-         the links stop working at once.",
-        names.len()
-    )
+    crate::i18n::tn("record.forget_body", names.len() as u64, &[("listed", &listed)])
 }
 
 /// The destructive answer, with its count.
 pub fn forget_confirm_label(count: usize) -> String {
-    format!("Yes, delete {count} share{}", if count == 1 { "" } else { "s" })
+    crate::i18n::tn("record.forget_confirm", count as u64, &[])
 }
 
 /// The safe answer.

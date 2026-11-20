@@ -84,6 +84,7 @@ use crate::theme;
 use eframe::egui::{self, CornerRadius, Margin};
 
 mod shared_page;
+pub mod words;
 
 /// The Shared page's own title. The rail row now says the same word (the
 /// design has one name for the screen), so it no longer proves the PANE drew.
@@ -580,7 +581,7 @@ pub fn with_sent_facts(
                         let recipient = entry.recipient.trim().to_string();
                         if !recipient.is_empty() {
                             let short = recipient.split('@').next().unwrap_or(&recipient);
-                            row.expiry = format!("to {short} \u{00b7} {}", row.expiry);
+                            row.expiry = crate::i18n::tf("sends.to_recipient_expiry", &[("short", &short.to_string()), ("expiry", &row.expiry.to_string())]);
                         }
                         row.sent = Some(SentFacts {
                             recipient,
@@ -616,7 +617,7 @@ pub fn row_from(send: &SendSummary, now: &dyn SendClock, zone: &dyn LocalOffset)
         sent: None,
         id: send.id.clone(),
         name: if send.name.trim().is_empty() {
-            "(no name)".to_string()
+            crate::i18n::t("sends.no_name").to_string()
         } else {
             send.name.clone()
         },
@@ -661,9 +662,8 @@ pub fn row_from(send: &SendSummary, now: &dyn SendClock, zone: &dyn LocalOffset)
 /// pill would be the labelled empty box in prose.
 pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
     let opened = match send.access_count {
-        0 => "Nobody has opened this link".to_string(),
-        1 => "Opened once".to_string(),
-        n => format!("Opened {n} times"),
+        0 => crate::i18n::t("sends.nobody_opened").to_string(),
+        n => crate::i18n::tn("sends.opened_times", n as u64, &[]),
     };
     match crate::send::send_state(send, now) {
         // Somebody switched the link off -- in another Bitwarden app, since
@@ -672,13 +672,13 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
         // and stops. Not the word "revoke", which on this screen means the
         // Send is gone rather than switched off.
         crate::send::SendState::Revoked => {
-            format!("{opened}. The link was switched off, so it no longer answers.")
+            crate::i18n::tf("sends.activity_revoked", &[("opened", &opened)])
         }
         crate::send::SendState::Used => {
-            format!("{opened}. Every permitted view is spent, so the link is dead.")
+            crate::i18n::tf("sends.activity_used", &[("opened", &opened)])
         }
         crate::send::SendState::Expired => {
-            format!("{opened}. The link ran out of time, so it no longer answers.")
+            crate::i18n::tf("sends.activity_expired", &[("opened", &opened)])
         }
         // Both live states say the same kind of thing -- what has been
         // opened and what is left -- because the first half of the sentence
@@ -694,10 +694,9 @@ pub fn activity_sentence(send: &SendSummary, now: &dyn SendClock) -> String {
             // live would otherwise print four billion views left.
             (Some(cap), used) => {
                 let left = cap.saturating_sub(used);
-                let views = if left == 1 { "view" } else { "views" };
-                format!("{opened}. {left} {views} left before the link stops working.")
+                crate::i18n::tn("sends.activity_views_left", left as u64, &[("opened", &opened)])
             }
-            (None, _) => format!("{opened}. The link works, as often as they like."),
+            (None, _) => crate::i18n::tf("sends.activity_unlimited", &[("opened", &opened)]),
         },
     }
 }
@@ -774,16 +773,16 @@ fn relative_words(remaining: i64) -> String {
     let hours = magnitude / crate::local_time::MILLIS_PER_HOUR.unsigned_abs();
     let days = magnitude / crate::local_time::MILLIS_PER_DAY.unsigned_abs();
     let amount = if days >= 1 {
-        format!("{days} day{}", if days == 1 { "" } else { "s" })
+        crate::i18n::tn("sends.rel_days", days, &[])
     } else if hours >= 1 {
-        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+        crate::i18n::tn("sends.rel_hours", hours, &[])
     } else {
-        "less than an hour".to_string()
+        crate::i18n::t("sends.rel_under_an_hour").to_string()
     };
     if past {
-        format!("{amount} ago")
+        crate::i18n::tf("sends.rel_ago", &[("amount", &amount)])
     } else {
-        format!("in {amount}")
+        crate::i18n::tf("sends.rel_in", &[("amount", &amount)])
     }
 }
 
@@ -832,13 +831,15 @@ pub fn row_subtitle(send: &SendSummary, now: &dyn SendClock) -> String {
     match (send.max_access_count, send.access_count) {
         // Capped: the design's own "3 of 10 views", which says the remaining
         // budget and the spent one in one phrase.
-        (Some(cap), used) => parts.push(format!("{used} of {cap} views")),
+        (Some(cap), used) => parts.push(crate::i18n::tf(
+            "sends.subtitle_views_of_cap",
+            &[("used", &used.to_string()), ("cap", &cap.to_string())],
+        )),
         // Uncapped and untouched: nothing. "0 views" on a link nobody has
         // opened yet reads as a failure rather than as a beginning, and the
         // state pill beside it already says `Waiting`.
         (None, 0) => {}
-        (None, 1) => parts.push("opened once".to_string()),
-        (None, used) => parts.push(format!("opened {used} times")),
+        (None, used) => parts.push(crate::i18n::tn("sends.subtitle_opened_times", used as u64, &[])),
     }
     if crate::send::send_state(send, now).is_live() {
         parts.push(expiry_words(&send.deletion_date, now));
@@ -869,17 +870,17 @@ const MILLIS_PER_DAY: i64 = 86_400_000;
 /// comes to be ignored.
 pub fn expiry_words(deletion_date: &str, now: &dyn SendClock) -> String {
     let Some(at) = parse_iso_utc_millis(deletion_date) else {
-        return "Expiry unknown".to_string();
+        return crate::i18n::t("sends.expiry_unknown").to_string();
     };
     let remaining = at - now.now_unix_millis();
     if remaining <= 0 {
-        return "Expired".to_string();
+        return expired_label().to_string();
     }
     let days = remaining / MILLIS_PER_DAY;
     match days {
-        0 => "Expires today".to_string(),
-        1 => "Expires tomorrow".to_string(),
-        d => format!("Expires in {d} days"),
+        0 => crate::i18n::t("sends.expires_today").to_string(),
+        1 => crate::i18n::t("sends.expires_tomorrow").to_string(),
+        d => crate::i18n::tn("sends.expires_in_days", d as u64, &[]),
     }
 }
 
@@ -1563,7 +1564,7 @@ pub fn received_rows(
                 record.item_id.clone()
             },
             name: if record.name.trim().is_empty() {
-                "(no name)".to_string()
+                crate::i18n::t("sends.no_name").to_string()
             } else {
                 record.name.clone()
             },
@@ -1633,7 +1634,7 @@ pub fn rows_in_scope(
 /// here would tell somebody who clicked `Used` that they have published
 /// nothing, which is false and alarming in the direction that matters.
 pub fn scope_empty_headline(scope: crate::vault_window::sidebar::SendScope) -> String {
-    format!("No Sends are {}.", scope.label().to_lowercase())
+    crate::i18n::tf("sends.scope_empty_headline", &[("scope", &(scope.label().to_lowercase()).to_string())])
 }
 
 /// The one way back out of an empty sub-row, said rather than left to be
@@ -1845,7 +1846,7 @@ pub fn change_password() -> &'static str {
 pub fn password_was_seen(row: &SendRow) -> bool {
     row.state == crate::send::SendState::Opened
         && row.sent.as_ref().is_some_and(|sent| {
-            !sent.item_id.is_empty() && sent.fields.iter().any(|f| f == super::record_ui::password_label())
+            !sent.item_id.is_empty() && sent.fields.iter().any(|f| f == super::record_ui::STORED_PASSWORD)
         })
 }
 
@@ -1888,10 +1889,7 @@ pub fn extend_label() -> &'static str {
 /// What hovering Extend says, with the period in it -- read off the same
 /// constant the arithmetic uses, so the promise and the date cannot differ.
 pub fn extend_hint() -> String {
-    format!(
-        "Keep this link working {} days longer",
-        crate::send::EXTEND_BY_DAYS
-    )
+    crate::i18n::tn("sends.extend_hint", crate::send::EXTEND_BY_DAYS as u64, &[])
 }
 
 /// Design 5b's first header button: the vault item the Send was made from.
@@ -1929,7 +1927,13 @@ pub fn copy_marker() -> &'static str {
     crate::i18n::t("sends.copy_marker")
 }
 /// Every field a record Send can carry, in the order the card names them.
-const ALL_SHARED_FIELDS: [&str; 5] = ["Username", "Password", "Websites", "Notes", "One-time code"];
+const ALL_SHARED_FIELDS: [&str; 5] = [
+    super::record_ui::STORED_USERNAME,
+    super::record_ui::STORED_PASSWORD,
+    super::record_ui::STORED_WEBSITES,
+    super::record_ui::STORED_NOTES,
+    super::record_ui::STORED_TOTP,
+];
 
 /// The sentence after the pills: what did NOT go.
 pub fn not_included(fields: &[String]) -> Option<String> {
@@ -1940,8 +1944,17 @@ pub fn not_included(fields: &[String]) -> Option<String> {
         .collect();
     match left.as_slice() {
         [] => None,
-        [one] => Some(format!("{one} was not included.")),
-        [init @ .., last] => Some(format!("{} and {} were not included.", init.join(", "), last.to_lowercase())),
+        [one] => Some(crate::i18n::tf("sends.not_included_one", &[("field", &super::record_ui::field_label(one))])),
+        [init @ .., last] => {
+            let shown: Vec<String> = init.iter().map(|f| super::record_ui::field_label(f).into_owned()).collect();
+            Some(crate::i18n::tf(
+                "sends.not_included_many",
+                &[
+                    ("fields", &shown.join(", ")),
+                    ("last", &super::record_ui::field_label(last).to_lowercase()),
+                ],
+            ))
+        }
     }
 }
 
@@ -2254,7 +2267,7 @@ const EXPIRY_CALENDAR_ID: &str = "send-expiry-calendar";
 
 /// One row of the expiry dropdown, named.
 ///
-/// The eight fixed rows are `crate::send::lifetime_label`'s job. The ninth has
+/// The eight fixed rows are `crate::vault_window::send_ui::words::lifetime_label`'s job. The ninth has
 /// no fixed value, so it says what pressing it does -- until a date has
 /// actually been picked, at which point the row says that date, because a row
 /// that still read "a date you pick" beside a calendar showing 14 March would
@@ -2265,11 +2278,11 @@ fn lifetime_row_label(
     zone: &dyn crate::local_time::LocalOffset,
 ) -> String {
     match choice {
-        Some(lifetime) => crate::send::lifetime_label(lifetime, zone),
+        Some(lifetime) => crate::vault_window::send_ui::words::lifetime_label(lifetime, zone),
         None if matches!(current, crate::send::SendLifetime::Until(_)) => {
-            crate::send::lifetime_label(current, zone)
+            crate::vault_window::send_ui::words::lifetime_label(current, zone)
         }
-        None => crate::send::PICK_A_DATE_LABEL.to_string(),
+        None => crate::vault_window::send_ui::words::pick_a_date_label().to_string(),
     }
 }
 
@@ -2451,7 +2464,7 @@ const SUGGESTION_ROW_HEIGHT: f32 = 44.0;
 
 /// How many Sends this file holds for a person, beside their address.
 pub fn sent_count_words(count: usize) -> String {
-    format!("{count} sent")
+    crate::i18n::tf("sends.sent_count", &[("count", &count.to_string())])
 }
 
 /// What the Recipient row reports: nothing, or that a suggestion's
@@ -2692,7 +2705,7 @@ pub(crate) fn draw_people_suggestions(
 /// be this file inventing a third treatment for secrets on a form that has
 /// two already. It is a coherent small feature and it is not this one.
 ///
-/// `now` and `zone` are injected for `crate::send::expiry_wording`'s reason,
+/// `now` and `zone` are injected for `crate::vault_window::send_ui::words::expiry_wording`'s reason,
 /// which is this whole feature's rule: nothing here reads the machine's clock
 /// or its timezone, so every assertion about the sentence under the Expires
 /// row is exact wherever the suite runs.
@@ -2782,7 +2795,7 @@ pub fn draw_access_block(
             },
         })
         .collect();
-    let current = crate::send::lifetime_label(*controls.lifetime, zone);
+    let current = crate::vault_window::send_ui::words::lifetime_label(*controls.lifetime, zone);
     access_row(ui, expires_label(), label_width, enabled, |ui| {
         // `dropdown_disabled` and not `add_enabled_ui`, for the reason that
         // split exists in this design system (see `toggle_pill` /
@@ -2811,7 +2824,7 @@ pub fn draw_access_block(
     // `Never` is a choice this form offers rather than one it tolerates.
     ui.add_space(4.0);
     ui.label(
-        egui::RichText::new(crate::send::expiry_wording(*controls.lifetime, now, zone))
+        egui::RichText::new(crate::vault_window::send_ui::words::expiry_wording(*controls.lifetime, now, zone))
             .size(11.0)
             .color(theme::TEXT_FAINT),
     );
@@ -4297,7 +4310,7 @@ mod paint_tests {
         for (where_, pane) in access_cards() {
             let mut plan = a_plan();
             let painted = paint_access_at(&mut plan, true, pane);
-            let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+            let chosen = crate::vault_window::send_ui::words::lifetime_label(plan.lifetime, &UTC);
 
             let expires = box_under(&painted, &chosen);
             let views = box_under(&painted, views_hint());
@@ -4431,7 +4444,7 @@ mod paint_tests {
     #[test]
     fn the_lifetime_picker_is_one_fixed_box_that_states_the_answer() {
         let mut plan = a_plan();
-        let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+        let chosen = crate::vault_window::send_ui::words::lifetime_label(plan.lifetime, &UTC);
         let painted = paint_access(&mut plan, true);
 
         let (shut, _) = painted.control_under(&chosen);
@@ -4454,7 +4467,7 @@ mod paint_tests {
         // segmented run with extra steps, and would overflow for the same
         // reason.
         for other in crate::send::LIFETIME_CHOICES.into_iter().flatten() {
-            let label = crate::send::lifetime_label(other, &UTC);
+            let label = crate::vault_window::send_ui::words::lifetime_label(other, &UTC);
             if label == chosen {
                 continue;
             }
@@ -4543,14 +4556,14 @@ mod paint_tests {
     fn the_picked_date_row_names_itself_and_then_names_the_date() {
         assert_eq!(
             lifetime_row_label(None, crate::send::DEFAULT_LIFETIME, &UTC),
-            crate::send::PICK_A_DATE_LABEL
+            crate::vault_window::send_ui::words::pick_a_date_label()
         );
         let picked = crate::send::SendLifetime::on_local_day(2027, 3, 14, &UTC);
         assert_eq!(lifetime_row_label(None, picked, &UTC), "14 Mar 2027");
         // And a fixed row is never affected by what is in force.
         assert_eq!(
             lifetime_row_label(Some(crate::send::SendLifetime::Never), picked, &UTC),
-            crate::send::NEVER_LABEL
+            crate::vault_window::send_ui::words::never_label()
         );
     }
 
@@ -4609,7 +4622,7 @@ mod paint_tests {
     #[test]
     fn a_publish_in_flight_leaves_the_lifetime_control_inert_and_readable() {
         let mut plan = a_plan();
-        let chosen = crate::send::lifetime_label(plan.lifetime, &UTC);
+        let chosen = crate::vault_window::send_ui::words::lifetime_label(plan.lifetime, &UTC);
         let live = paint_access(&mut plan, true);
         let (_, live_fill) = live.control_under(&chosen);
         let painted = paint_access(&mut plan, false);
@@ -4778,7 +4791,7 @@ mod paint_tests {
         // And the sub-day lifetime is the one now on screen, spelled by the
         // one function that spells lifetimes.
         assert!(
-            painted.has(&crate::send::lifetime_label(crate::send::SendLifetime::Hours(1), &UTC)),
+            painted.has(&crate::vault_window::send_ui::words::lifetime_label(crate::send::SendLifetime::Hours(1), &UTC)),
             "the one-hour answer is not the one in the shut box: {:?}",
             painted.text
         );
@@ -4983,7 +4996,7 @@ mod paint_tests {
             "a failed fetch told the user they have no Sends: {:?}",
             failed.text
         );
-        assert!(failed.has(SendError::Offline.user_message()));
+        assert!(failed.has(&SendError::Offline.user_message()));
         assert!(failed.has("Try again"), "a failure with no way to retry");
     }
 
@@ -10069,7 +10082,6 @@ mod source_pins {
         // are civil-date arithmetic and nothing else.
         "send.rs: pub enum SendLifetime {",
         "send.rs: pub const LIFETIME_CHOICES: [Option<SendLifetime>; 9] = [",
-        "send.rs: pub const PICK_A_DATE_LABEL: &str = \" \";",
         "send.rs: pub const DEFAULT_LIFETIME: SendLifetime = SendLifetime::Hours(24 * 7);",
         "send.rs: pub const NEVER_DELETION_DATE: &str = \" \";",
         "send.rs: pub const MAX_PICKED_MONTHS: u32 = 12;",
@@ -10108,6 +10120,8 @@ mod source_pins {
         // as the CLI path, rather than growing a second copy of the
         // arithmetic that the two backends could then disagree over.
         "send.rs: pub(crate) fn deletion_date(lifetime: SendLifetime, now: &dyn SendClock) -> String {",
+        // The instant behind `deletion_date`, which the Send words file reads to say the day.
+        "send.rs: pub(crate) fn deletion_instant(lifetime: SendLifetime, now: &dyn SendClock) -> Option<i64> {",
         // The enum's own two methods, and the window the calendar offers.
         // `on_local_day` is the single place a picked `(year, month, day)`
         // becomes an instant; `local_day` is the inverse, for a calendar that
@@ -10118,29 +10132,6 @@ mod source_pins {
         "send.rs: pub fn on_local_day(year: i64, month: u32, day: u32, zone: &dyn LocalOffset) -> Self {",
         "send.rs: pub fn local_day(self, now: &dyn SendClock, zone: &dyn LocalOffset) -> Option<(i64, u32, u32)> {",
         "send.rs: pub fn pickable_window(",
-        // **Moved here from `send_ui`, deliberately, and it is the only item
-        // the §5a Access block adds to this wall.** It was the Sends screen's
-        // own `pub fn lifetime_label(days: u8)` while `expiry_wording`, four
-        // lines below, built the same phrase out of its own `format!` -- two
-        // spellings of one duration, agreeing by coincidence. It is now one
-        // function that both screens' cells and that sentence all read.
-        //
-        // It is a door in the sense this list counts and in no other: it
-        // takes an enum and an offset and returns a `String`, reaches no runner, no
-        // invocation and no child, and there is nothing behind it but a
-        // `format!`.
-        "send.rs: pub fn lifetime_label(lifetime: SendLifetime, zone: &dyn LocalOffset) -> String {",
-        // The one word `Never` is named by, beside the function that names
-        // it. A `&str` constant, read by the label and by nothing else.
-        "send.rs: pub const NEVER_LABEL: &str = \" \";",
-        // `zone` was added beside `now` when the sentence stopped naming the
-        // UTC day and started naming the user's own. Both are injected, and
-        // that is the point of both: nothing in `send.rs` reads the machine's
-        // clock or the machine's timezone for itself.
-        "send.rs: pub fn expiry_wording(lifetime: SendLifetime, now: &dyn SendClock, zone: &dyn LocalOffset) -> String {",
-        // And the one sentence that has no date in it, for the same reason:
-        // a `&str` beside the function that returns it.
-        "send.rs: pub const NEVER_WORDING: &str =",
         "send.rs: pub struct SendInvocation {",
         "send.rs: pub fn args(&self) -> &[String] {",
         "send.rs: pub fn stdin_json_b64(&self) -> &str {",
@@ -10230,7 +10221,6 @@ mod source_pins {
         "send.rs: pub stdout: String,",
         "send.rs: pub stderr: String,",
         "send.rs: pub enum SendError {",
-        "send.rs: pub fn user_message(&self) -> &str {",
         "send.rs: pub fn is_ambiguous(&self) -> bool {",
         "send.rs: pub fn classify_failure(exit_code: Option<i32>, stdout: &str, stderr: &str) -> SendError {",
         "send.rs: pub fn parse_created_send(stdout: &str) -> Result<CreatedSend, SendError> {",
