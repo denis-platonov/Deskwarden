@@ -270,9 +270,7 @@ picker.empty_body = Deskwarden matches windows by process name and title.
 picker.hint_list_0 = ↑ ↓ choose an account
 picker.hint_list_1 = Enter fill
 picker.hint_list_2 = 1-5 fill that row
-picker.hint_list_3 = S search the vault
-picker.hint_list_4 = N new login
-picker.hint_list_5 = Esc close
+picker.hint_list_3 = Esc close
 picker.hint_palette_0 = ↑ ↓ choose a field
 picker.hint_palette_1 = Enter type it
 picker.hint_palette_2 = 1-5 type that row
@@ -288,12 +286,6 @@ picker.nothing_title = No matches
 picker.nothing_sub = Nothing in your vault is named like that
 picker.search_title = Search the vault
 picker.search_sub = Type to filter your accounts. Nothing is typed until you pick one.
-picker.palette_title = What should I type?
-picker.palette_sub = Pick a field. Nothing is typed until you do.
-picker.list_title = Fill from vault
-picker.list_sub = These accounts look like they belong to this app.
-picker.cancel = Cancel
-picker.edit_binding = Edit binding
 
 # ---- region_overlay.rs (the scan-a-region overlay) ----
 region.drag_title = Drag a box around the QR code

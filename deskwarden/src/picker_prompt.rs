@@ -752,9 +752,6 @@ pub const ROW_CAP: usize = 5;
 /// candidate cap and that is the whole of the difference.
 pub const LIST_ROWS: usize = ROW_CAP + 1;
 
-/// Button height. `theme::BUTTON_HEIGHT`.
-const BUTTON_H: i32 = crate::panel_draw::BUTTON_H;
-
 /// The search box's height. `theme::SEARCH_FIELD_HEIGHT` -- design 2b's search
 /// box, which is deliberately shorter than a form field, and this is the same
 /// control doing the same job on a smaller surface. Pinned against `theme` by
@@ -807,12 +804,12 @@ const FOCUS_RING_W: i32 = 2;
 /// slot the overflow notice holds here -- see [`search_overflow_label`].
 pub const SEARCH_CAP: usize = ROW_CAP;
 
-/// The footer's gap between its two equal buttons (design D 1.5: `gap 8`).
-const FOOTER_GAP: i32 = crate::panel_draw::BUTTON_GAP;
-
 /// The gap between the header and the title under it, and the title block's
 /// own line heights.
 const TITLE_GAP: i32 = 12;
+
+/// The gap between the header and the first row (D 1.3: `pad 14 16 10`).
+const HEADER_GAP: i32 = 10;
 const TITLE_H: i32 = 24;
 const SUBTITLE_H: i32 = 20;
 
@@ -820,14 +817,17 @@ const SUBTITLE_H: i32 = 20;
 pub const TIP_LINES_MAX: usize = 6;
 
 /// What the `?` tooltip says in the first step: the keys this card answers.
-pub fn list_key_hints() -> [&'static str; 6] {
+///
+/// Four lines, the design's (D 1.3: choose, Enter, Esc) plus the digits. Typing
+/// starts the search and Ctrl+N is *New login*; neither has a line, because
+/// the *Search the vault* row says the first and the empty card offers the
+/// second.
+pub fn list_key_hints() -> [&'static str; 4] {
     [
         crate::i18n::t("picker.hint_list_0"),
         crate::i18n::t("picker.hint_list_1"),
         crate::i18n::t("picker.hint_list_2"),
         crate::i18n::t("picker.hint_list_3"),
-        crate::i18n::t("picker.hint_list_4"),
-        crate::i18n::t("picker.hint_list_5"),
     ]
 }
 /// The second step's (a field to type).
@@ -889,6 +889,11 @@ pub struct Layout {
     /// The `?` badge on the lockup's line, and the key-hint tooltip it opens.
     pub help: Box2,
     pub tip: Box2,
+    /// The heading pair. **Only the empty card has one** (design 1.5's No-match
+    /// title and body); the list, the second step and search are the header
+    /// and the rows and nothing else, so there `heading` is false and both
+    /// boxes are empty.
+    pub heading: bool,
     pub title: Box2,
     pub subtitle: Box2,
     /// **The one bordered container**, and the only rectangle on this card
@@ -919,59 +924,58 @@ pub struct Layout {
     /// The rows' area, inside [`field`](Self::field). Individual rows are
     /// [`row_at`].
     pub list: Box2,
-    /// The footer's left button: *New login* in the first step, *Edit binding*
-    /// in the second.
-    pub secondary: Box2,
-    pub cancel: Box2,
-    pub close_glyph: Box2,
 }
 
-/// The card's geometry, for a list `rows` rows tall.
+/// The height of an empty-card offer's slot: the design's 46 px button and its
+/// 8 px gap (D 1.5).
+pub const EMPTY_ROW_H: i32 = crate::panel_draw::BUTTON_H + crate::panel_draw::BUTTON_GAP;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// Header, then rows: the first step and the second.
+    List,
+    /// Header, then one bordered field holding the search box and the results.
+    Search,
+    /// Design 1.5's No-match card: header, heading pair, two buttons.
+    Empty,
+}
+
+/// The card's geometry for a list `rows` rows tall: **the design's Fill panel
+/// and nothing else** -- the header (shield, "Deskwarden", `?`), then the rows
+/// at the design's 66 pitch, then the list's 8 px bottom padding.
 ///
-/// **The two steps that share a live window are both laid out at
-/// [`LIST_ROWS`], whichever of them is showing.** A window that shrank when the second step
-/// had fewer rows than the first would move its own Cancel button out from
-/// under the pointer at the moment the user is about to click it;
-/// `unlock_prompt::layout` reserves its error row for exactly that reason, and
-/// the same argument applies to a card whose two steps have different row
-/// counts.
-///
-/// **That argument does not reach the empty card.** `MODE_EMPTY` is decided
-/// once, in `open`, from an empty candidate slice, and never transitions to or
-/// from anything -- so sizing it to [`empty_rows`]`.len()` moves no control
-/// out from under a pointer that is already over it. Sizing it to `LIST_ROWS`
-/// instead left a band of `theme::CARD` between its last offer and its Cancel
-/// button, which reads as a list that lost its rows rather than as a card with
-/// two.
+/// **Sized to its content.** The first step is as tall as its candidates and
+/// the *Search the vault* row under them; the second step is as tall as its
+/// fields. Design 1b fixes no height, and a footer that moved out from under
+/// the pointer -- the reason this card was once laid out at a fixed six slots --
+/// is gone with the footer. Search mode is the one shape that stays at its
+/// full height, because its result count changes with every keystroke.
 pub fn layout(rows: usize) -> Layout {
-    layout_for(rows, false)
+    shaped(rows, Shape::List)
 }
 
-/// [`layout`], told whether the card is in **search mode**.
-///
-/// The one difference is the search box between the subtitle and the list, and
-/// the `SEARCH_H + SEARCH_GAP` it pushes everything below it down by. A second
-/// layout function would be a second set of rectangles that has to agree with
-/// the first; this is the same arithmetic with one box optionally in it, so
-/// `nothing_the_card_lays_out_falls_off_the_bottom_of_it` can be run over both
-/// shapes without either being a special case.
+/// [`layout`], told whether the card is in **search mode**: the same header
+/// over one bordered field holding the search box and the results.
 pub fn layout_for(rows: usize, search: bool) -> Layout {
+    shaped(rows, if search { Shape::Search } else { Shape::List })
+}
+
+/// The empty card (design 1.5): header, the heading pair, then `rows` offers.
+pub fn layout_empty(rows: usize) -> Layout {
+    shaped(rows, Shape::Empty)
+}
+
+fn shaped(rows: usize, shape: Shape) -> Layout {
     let content_w = WIDTH - 2 * MARGIN_X;
 
     let lockup = crate::panel_draw::lockup();
     let mark = Box2 { x: MARGIN_X, y: MARGIN_TOP, w: lockup.mark_w, h: lockup.mark_h };
     let wordmark =
         Box2 { x: mark.right() + lockup.gap, y: MARGIN_TOP, w: lockup.word_w, h: lockup.mark_h };
-    let close = crate::panel_draw::CLOSE;
-    let close_glyph = Box2 {
-        x: WIDTH - MARGIN_X - close,
-        y: mark.y + (mark.h - close) / 2,
-        w: close,
-        h: close,
-    };
+    // The `?` is the header's last item, 16 px from the edge (D 1.3).
     let badge = crate::panel_draw::HELP;
     let help = Box2 {
-        x: close_glyph.x - crate::panel_draw::BUTTON_GAP - badge,
+        x: WIDTH - MARGIN_X - badge,
         y: mark.y + (mark.h - badge) / 2,
         w: badge,
         h: badge,
@@ -985,55 +989,45 @@ pub fn layout_for(rows: usize, search: bool) -> Layout {
     );
     let tip = Box2 { x: tx, y: ty, w: tw, h: th };
 
-    let title =
-        Box2 { x: MARGIN_X, y: mark.bottom() + TITLE_GAP, w: content_w, h: TITLE_H };
-    let subtitle = Box2 { x: MARGIN_X, y: title.bottom() + 4, w: content_w, h: SUBTITLE_H };
+    let heading = shape == Shape::Empty;
+    let (title, subtitle, below) = if heading {
+        let title = Box2 { x: MARGIN_X, y: mark.bottom() + TITLE_GAP, w: content_w, h: TITLE_H };
+        let subtitle =
+            Box2 { x: MARGIN_X, y: title.bottom() + 4, w: content_w, h: SUBTITLE_H };
+        (title, subtitle, subtitle.bottom() + SEARCH_GAP)
+    } else {
+        let none = Box2 { x: MARGIN_X, y: mark.bottom(), w: content_w, h: 0 };
+        (none, none, mark.bottom() + HEADER_GAP)
+    };
 
-    // **The field starts where the list used to**, and in search mode its
-    // first element is the search box rather than the first row. The box no
-    // longer costs a second `SEARCH_GAP`: there is no gap between two
-    // containers because there are no longer two containers.
-    let field_y = subtitle.bottom() + SEARCH_GAP;
-    let search = search.then_some(Box2 { x: MARGIN_X, y: field_y, w: content_w, h: SEARCH_H });
+    let search = (shape == Shape::Search)
+        .then_some(Box2 { x: MARGIN_X, y: below, w: content_w, h: SEARCH_H });
     let list_y = match search {
         Some(box2) => box2.bottom(),
-        None => field_y,
+        None => below,
     };
     // Design D 1.3: the list is padded 8 px each side, so a row's wash runs
     // 8..392 and its tile starts at 18. Search mode's rows sit inside the
-    // bordered field, which keeps the heading's 16 px margin.
-    let (list_x, list_w) = match search {
-        Some(_) => (MARGIN_X, content_w),
-        None => (crate::panel_draw::LIST_PAD_X, WIDTH - 2 * crate::panel_draw::LIST_PAD_X),
+    // bordered field, which keeps a 16 px margin, and so do the empty card's
+    // buttons.
+    let (list_x, list_w) = match shape {
+        Shape::List => (crate::panel_draw::LIST_PAD_X, WIDTH - 2 * crate::panel_draw::LIST_PAD_X),
+        Shape::Search | Shape::Empty => (MARGIN_X, content_w),
     };
-    let list = Box2 { x: list_x, y: list_y, w: list_w, h: ROW_H * rows as i32 };
-    let field = Box2 { x: list.x, y: field_y, w: list.w, h: list.bottom() - field_y };
+    let pitch = if shape == Shape::Empty { EMPTY_ROW_H } else { ROW_H };
+    let list = Box2 { x: list_x, y: list_y, w: list_w, h: pitch * rows as i32 };
+    let field = Box2 { x: list.x, y: below, w: list.w, h: list.bottom() - below };
 
-    // Two equal halves (design D 1.5), the card's own offer on the left and the
-    // choice that does nothing on the right, where the eye leaves the card.
-    let half = (content_w - FOOTER_GAP) / 2;
-    let footer_y = list.bottom() + 12;
-    let secondary = Box2 { x: MARGIN_X, y: footer_y, w: half, h: BUTTON_H };
-    let cancel =
-        Box2 { x: MARGIN_X + content_w - half, y: footer_y, w: half, h: BUTTON_H };
+    // The last row's 2 px gap is not padding: the design's list ends 8 px under
+    // its last row.
+    let bottom = match shape {
+        Shape::List => list.bottom() - crate::panel_draw::ROW_GAP + crate::panel_draw::LIST_PAD_BOTTOM,
+        Shape::Search => list.bottom() + MARGIN_X,
+        Shape::Empty => list.bottom() + MARGIN_TOP,
+    };
+    let window = Box2 { x: 0, y: 0, w: WIDTH, h: bottom };
 
-    let window = Box2 { x: 0, y: 0, w: WIDTH, h: cancel.bottom() + MARGIN_TOP };
-
-    Layout {
-        window,
-        mark,
-        wordmark,
-        help,
-        tip,
-        title,
-        subtitle,
-        field,
-        search,
-        list,
-        secondary,
-        cancel,
-        close_glyph,
-    }
+    Layout { window, mark, wordmark, help, tip, heading, title, subtitle, field, search, list }
 }
 
 /// **Where the search text sits inside its slot in the field.**
@@ -1411,6 +1405,12 @@ pub fn row_at_for(rows: usize, search: bool, index: usize) -> Box2 {
     Box2 { x: list.x, y: list.y + ROW_H * index as i32, w: list.w, h: ROW_H }
 }
 
+/// The `index`th offer of the empty card.
+pub fn row_at_empty(rows: usize, index: usize) -> Box2 {
+    let list = layout_empty(rows).list;
+    Box2 { x: list.x, y: list.y + EMPTY_ROW_H * index as i32, w: list.w, h: EMPTY_ROW_H }
+}
+
 // ---------------------------------------------------------------------------
 // The Win32 half. No decisions live below this line.
 // ---------------------------------------------------------------------------
@@ -1487,6 +1487,11 @@ static SEARCH_TOTAL: AtomicIsize = AtomicIsize::new(0);
 /// [`moved_selection`] -- so no stale value can commit a fill.
 static SEARCH_SEL: AtomicIsize = AtomicIsize::new(0);
 
+/// The letter the user typed on the list that **started** the search: the
+/// first character of the box the card switches into, taken once by
+/// `show_search` on entering the mode.
+static SEARCH_SEED: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
 /// The Win32 calls, and **nothing else**.
 ///
 /// # Why every pixel here is painted by hand
@@ -1518,11 +1523,11 @@ static SEARCH_SEL: AtomicIsize = AtomicIsize::new(0);
 mod win32 {
     use super::{
         Box2, Candidate, EmptyAction, Event, Palette, PickerWindow, SearchResults, SearchRow,
-        APP_NAME, EDIT_BINDING_SHORTCUT, ENTRIES, ESC_SHORTCUT, GONE, LIST_ROWS, MODE,
+        APP_NAME, ENTRIES, GONE, LIST_ROWS, MODE,
         MODE_EMPTY, MODE_LIST,
-        MODE_PALETTE, MODE_SEARCH, NEW_LOGIN_SHORTCUT, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
-        FIELD_RADIUS, FIELD_RING_RADIUS, FOCUS_RING_W, SEARCH_CAP, SEARCH_SEL, SEARCH_SHORTCUT,
-        SEARCH_SHOWN, SEARCH_TOTAL, SHOWN,
+        MODE_PALETTE, MODE_SEARCH, PENDING, PICKER_PROMPT_TITLE, ROW_CAP,
+        FIELD_RADIUS, FIELD_RING_RADIUS, FOCUS_RING_W, SEARCH_CAP, SEARCH_SEL,
+        SEARCH_SEED, SEARCH_SHOWN, SEARCH_TOTAL, SHOWN,
         TRUNCATED,
     };
     use std::ffi::c_void;
@@ -1550,7 +1555,7 @@ mod win32 {
         BN_CLICKED, BS_PUSHBUTTON, CS_HREDRAW, CS_VREDRAW, ES_AUTOHSCROLL, GWLP_WNDPROC, HMENU,
         IDC_ARROW, MSG, PM_REMOVE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOZORDER, SW_HIDE,
         SW_SHOW, WDA_EXCLUDEFROMCAPTURE, WINDOW_EX_STYLE, WINDOW_STYLE, WM_COMMAND,
-        WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_LBUTTONDOWN, WM_MOUSEMOVE, WM_NCHITTEST,
+        WM_CTLCOLOREDIT, WM_DESTROY, WM_ERASEBKGND, WM_MOUSEMOVE, WM_NCHITTEST,
         WM_PAINT, WM_QUIT, WM_SETFONT, WNDCLASSW, WS_CHILD, WS_EX_TOPMOST, WS_POPUP, WS_TABSTOP,
         WS_VISIBLE,
     };
@@ -1571,8 +1576,6 @@ mod win32 {
     /// all, so a row id can never collide with a button id however many rows
     /// there are.
     const ID_ROW: usize = 200;
-    const ID_SECONDARY: usize = 101;
-    const ID_CANCEL: usize = 102;
     /// The search box. Below `ID_ROW` with the footer's two, so the `id <
     /// ID_ROW` test in [`clicked`] keeps meaning "not a row".
     const ID_SEARCH: usize = 103;
@@ -1970,7 +1973,7 @@ mod win32 {
 
         // **Sized from the one mode decision above**, never from a second
         // test of the candidate slice -- see `laid_out_rows`.
-        let l = super::layout(laid_out_rows());
+        let l = card();
         let (w, h) = (scale(l.window.w), scale(l.window.h));
         // Centred on the primary work area rather than on the foreground
         // window, for `unlock_prompt::centred`'s reason: a card that jumped
@@ -2042,10 +2045,10 @@ mod win32 {
         // The handles are copied out and the guard dropped at the end of this
         // statement: `abandon` locks `FONTS` itself, so holding the guard
         // across the `child` calls below would deadlock the failure path.
-        let Some((name_font, button_font, field_font)) = FONTS
+        let Some((name_font, field_font)) = FONTS
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().map(|f| (f.name, f.button, f.field)))
+            .and_then(|guard| guard.as_ref().map(|f| (f.name, f.field)))
         else {
             return abandon(window);
         };
@@ -2068,7 +2071,7 @@ mod win32 {
                 window,
                 w!("BUTTON"),
                 WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-                super::row_at(laid_out_rows(), index),
+                row_box(index),
                 ID_ROW + index,
                 name_font,
             ) else {
@@ -2076,29 +2079,6 @@ mod win32 {
             };
             subclass(control);
         }
-        let Some(secondary) = child(
-            window,
-            w!("BUTTON"),
-            WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-            l.secondary,
-            ID_SECONDARY,
-            button_font,
-        ) else {
-            return abandon(window);
-        };
-        let Some(cancel) = child(
-            window,
-            w!("BUTTON"),
-            WS_VISIBLE.0 | WS_TABSTOP.0 | BS_PUSHBUTTON as u32,
-            l.cancel,
-            ID_CANCEL,
-            button_font,
-        ) else {
-            return abandon(window);
-        };
-        subclass(secondary);
-        subclass(cancel);
-
         // **The search box, created here and shown only in `MODE_SEARCH`.**
         //
         // Created with the rest rather than when the mode is entered, for the
@@ -2293,9 +2273,7 @@ mod win32 {
         }
         unsafe {
             let focus = GetFocus();
-            let ids = (0..visible_row_count())
-                .map(|index| ID_ROW + index)
-                .chain([ID_SECONDARY, ID_CANCEL]);
+            let ids = (0..visible_row_count()).map(|index| ID_ROW + index);
             for id in ids {
                 if matches!(GetDlgItem(window, id as i32), Ok(control) if control == focus) {
                     clicked(id);
@@ -2346,13 +2324,6 @@ mod win32 {
                 // The rows paint their own highlight from `GetFocus`, and
                 // invalidating the parent does not reach child windows.
                 repaint_rows(window);
-                // And the footer buttons, one of which may be the control
-                // that just lost the keyboard and its focus ring.
-                for id in [ID_SECONDARY, ID_CANCEL] {
-                    if let Ok(control) = GetDlgItem(window, id as i32) {
-                        let _ = InvalidateRect(control, None, false);
-                    }
-                }
             }
         }
         true
@@ -2429,21 +2400,45 @@ mod win32 {
             }
             return true;
         }
-        if vk == LETTER_B {
-            if let Some(id) = edit_binding_control() {
-                clicked(id);
+        let mode = MODE.load(Ordering::SeqCst);
+        if ctrl_down() {
+            // **Ctrl+N is *New login* wherever the card offers one** -- a bare
+            // `N` is a letter the user may be typing into a search.
+            if vk == LETTER_N && (mode == MODE_LIST || mode == MODE_EMPTY) {
+                set_pending(Event::NewLogin);
+                return true;
             }
+            return false;
+        }
+        if mode == MODE_PALETTE && vk == LETTER_B {
+            set_pending(Event::EditSelected);
             return true;
         }
-        if vk == LETTER_N {
-            if let Some(id) = new_login_control() {
-                clicked(id);
+        if mode == MODE_EMPTY {
+            // The empty card has no typing: its two offers keep their letters.
+            if vk == LETTER_N {
+                if let Some(id) = new_login_control() {
+                    clicked(id);
+                }
+                return true;
             }
-            return true;
+            if vk == LETTER_S {
+                if let Some(id) = search_control() {
+                    clicked(id);
+                }
+                return true;
+            }
         }
-        if vk == LETTER_S {
-            if let Some(id) = search_control() {
-                clicked(id);
+        if mode == MODE_LIST && (b'A' as u16..=b'Z' as u16).contains(&vk) {
+            // **Typing starts the search.** The letter is kept: it becomes the
+            // first character of the box the card switches into.
+            use windows::Win32::UI::Input::KeyboardAndMouse::{MapVirtualKeyW, MAPVK_VK_TO_CHAR};
+            let ch = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_CHAR) } & 0x7fff_ffff;
+            if let Some(ch) = char::from_u32(ch).filter(|c| !c.is_control()) {
+                if let Ok(mut seed) = SEARCH_SEED.lock() {
+                    *seed = ch.to_lowercase().collect();
+                }
+                clicked(search_control().unwrap_or(ID_ROW));
             }
             return true;
         }
@@ -2480,6 +2475,10 @@ mod win32 {
                 clicked(ID_ROW + at);
                 return true;
             }
+        }
+        if ctrl_down() && vk == b'N' as u16 {
+            set_pending(Event::NewLogin);
+            return true;
         }
         if vk == VK_DOWN.0 || vk == VK_UP.0 {
             let current = SEARCH_SEL.load(Ordering::SeqCst).max(0) as usize;
@@ -2546,37 +2545,16 @@ mod win32 {
         }
     }
 
-    /// Which control *New login* is on in the step that is showing, or `None`
-    /// where the card does not offer it.
-    ///
-    /// The empty card's *New login* is a row rather than the footer button --
-    /// `apply_mode` hides that button there -- and the second step's footer
-    /// button is *Edit binding*, which is a different offer: a key that
-    /// silently edited a binding because the user expected a new login would
-    /// be worse than one that did nothing at all.
+    /// Which control *New login* is on in the empty card (its own row), or
+    /// `None` where the offer is a chord instead.
     fn new_login_control() -> Option<usize> {
         match MODE.load(Ordering::SeqCst) {
-            // Search mode keeps the footer button, and it is still *New login*:
-            // "none of these" is exactly what a user who has searched their
-            // whole vault and found nothing means.
-            MODE_LIST | MODE_SEARCH => Some(ID_SECONDARY),
             MODE_EMPTY => super::empty_rows()
                 .iter()
                 .position(|action| *action == EmptyAction::NewLogin)
                 .map(|index| ID_ROW + index),
             _ => None,
         }
-    }
-
-    /// Which control *Edit binding* is on in the step that is showing, or
-    /// `None` where the card does not offer it.
-    ///
-    /// [`new_login_control`]'s exact counterpart, and the two are disjoint on
-    /// purpose: the footer's one button is *New login* in every step but the
-    /// second and *Edit binding* only there, so a letter that fired in the
-    /// wrong step would run the offer the user was not looking at.
-    fn edit_binding_control() -> Option<usize> {
-        (MODE.load(Ordering::SeqCst) == MODE_PALETTE).then_some(ID_SECONDARY)
     }
 
     fn take_pending() -> Option<Event> {
@@ -2678,6 +2656,25 @@ mod win32 {
             unsafe {
                 if let Ok(control) = GetDlgItem(top, ID_SEARCH as i32) {
                     let _ = SetFocus(control);
+                    // The letter that started the search is already in the box,
+                    // with the caret after it. `EN_CHANGE` carries it to
+                    // `run_with` as an ordinary `Typed`.
+                    let seed = SEARCH_SEED.lock().map(|mut s| std::mem::take(&mut *s)).unwrap_or_default();
+                    if !seed.is_empty() {
+                        let wide: Vec<u16> = seed.encode_utf16().chain(std::iter::once(0)).collect();
+                        let _ = windows::Win32::UI::WindowsAndMessaging::SetWindowTextW(
+                            control,
+                            windows::core::PCWSTR(wide.as_ptr()),
+                        );
+                        /// `EM_SETSEL`: put the caret after the seed.
+                        const EM_SETSEL: u32 = 0x00B1;
+                        let _ = SendMessageW(
+                            control,
+                            EM_SETSEL,
+                            WPARAM(seed.encode_utf16().count()),
+                            LPARAM(seed.encode_utf16().count() as isize),
+                        );
+                    }
                 }
             }
         }
@@ -2694,7 +2691,21 @@ mod win32 {
     /// so a control placed against one shape and hit-tested against another is
     /// not expressible: every call below reads this.
     fn card() -> super::Layout {
-        super::layout_for(laid_out_rows(), in_search())
+        if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
+            super::layout_empty(laid_out_rows())
+        } else {
+            super::layout_for(laid_out_rows(), in_search())
+        }
+    }
+
+    /// Row `index`'s logical rectangle in the mode showing.
+    fn row_box(index: usize) -> Box2 {
+        let rows = laid_out_rows();
+        if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
+            super::row_at_empty(rows, index)
+        } else {
+            super::row_at_for(rows, in_search(), index)
+        }
     }
 
     /// Shows exactly the controls this step has rows for, hides the rest,
@@ -2716,7 +2727,6 @@ mod win32 {
     fn apply_mode(window: HWND) {
         let count = visible_row_count();
         let l = card();
-        let rows = laid_out_rows();
         let search = in_search();
         unsafe {
             // The window first, so a control moved into the new area is not
@@ -2734,12 +2744,10 @@ mod win32 {
             // there and the control is hidden a line later -- and inset by the
             // one function that decides the inset, so the box `open` created
             // and the box this moves cannot disagree.
-            place(window, ID_SEARCH, super::search_text_box(l.search.unwrap_or(l.subtitle)));
+            place(window, ID_SEARCH, super::search_text_box(l.search.unwrap_or(l.mark)));
             if let Ok(control) = GetDlgItem(window, ID_SEARCH as i32) {
                 let _ = ShowWindow(control, if search { SW_SHOW } else { SW_HIDE });
             }
-            place(window, ID_SECONDARY, l.secondary);
-            place(window, ID_CANCEL, cancel_box());
             let (tip_font, scale_now) = (
                 FONTS.lock().ok().and_then(|g| g.as_ref().map(|f| f.tip)),
                 DPI_PERCENT.load(Ordering::SeqCst),
@@ -2748,22 +2756,10 @@ mod win32 {
                 panel_draw::set_tip(tip_font, &tip_lines(), scale_now);
             }
             for index in 0..LIST_ROWS {
-                place(window, ID_ROW + index, super::row_at_for(rows, search, index));
+                place(window, ID_ROW + index, row_box(index));
                 if let Ok(control) = GetDlgItem(window, (ID_ROW + index) as i32) {
                     let _ = ShowWindow(control, if index < count { SW_SHOW } else { SW_HIDE });
                 }
-            }
-            // **The empty card's footer is Cancel alone.** Its two offers are
-            // rows, so a *New login* button beside them would be the same
-            // choice twice; and hiding it is what stops it -- an empty
-            // `BUTTON` left visible is still a tab stop and still posts
-            // `BN_CLICKED`, which is the same reason the unused rows above
-            // are hidden rather than merely unlabelled.
-            if let Ok(control) = GetDlgItem(window, ID_SECONDARY as i32) {
-                let _ = ShowWindow(
-                    control,
-                    if MODE.load(Ordering::SeqCst) == MODE_EMPTY { SW_HIDE } else { SW_SHOW },
-                );
             }
             // **Only when there is a row to focus.** A palette that came back
             // empty -- `palette_of` missing its item -- hides every row, and
@@ -2781,19 +2777,6 @@ mod win32 {
             }
         }
         repaint(window);
-    }
-
-    /// **The *Cancel* button's rectangle in the mode showing.** Half the footer
-    /// beside the card's own offer, and the whole footer on the empty card,
-    /// whose footer is Cancel alone -- an offer hidden beside it would leave a
-    /// button hanging off the right half of a card with nothing to its left.
-    fn cancel_box() -> Box2 {
-        let l = card();
-        if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
-            Box2 { x: l.secondary.x, w: l.cancel.right() - l.secondary.x, ..l.cancel }
-        } else {
-            l.cancel
-        }
     }
 
     /// The keys the `?` tooltip lists in the mode showing.
@@ -2841,14 +2824,14 @@ mod win32 {
     /// its own Cancel button. `MODE_EMPTY` never transitions -- `open` decides
     /// it once and nothing sets it -- so it is sized to its own two offers.
     fn laid_out_rows() -> usize {
-        if MODE.load(Ordering::SeqCst) == MODE_EMPTY {
-            super::empty_rows().len().min(LIST_ROWS)
-        } else {
-            // Search mode included, and deliberately at the full height: its
-            // row count changes with every keystroke, and a card that grew and
-            // shrank as the user typed would move its own footer under their
-            // hand between one character and the next.
-            LIST_ROWS
+        match MODE.load(Ordering::SeqCst) {
+            MODE_EMPTY => super::empty_rows().len().min(LIST_ROWS),
+            // Search mode at the full height: its row count changes with every
+            // keystroke, and a card that grew and shrank as the user typed
+            // would jump under their hand.
+            MODE_SEARCH => LIST_ROWS,
+            // The first two steps are as tall as their rows.
+            _ => visible_row_count().max(1),
         }
     }
 
@@ -3070,14 +3053,8 @@ mod win32 {
                     window,
                     DefWindowProcW(window, msg, wparam, lparam),
                     lparam,
-                    close_glyph_rect(),
+                    RECT::default(),
                 )
-            }
-            WM_LBUTTONDOWN => {
-                if in_close_glyph(lparam) {
-                    set_pending(Event::Cancel);
-                }
-                LRESULT(0)
             }
             WM_MOUSEMOVE => {
                 // A pointer that left a control without entering another one is
@@ -3158,19 +3135,6 @@ mod win32 {
         let palette = mode == MODE_PALETTE;
         let empty = mode == MODE_EMPTY;
         let search = mode == MODE_SEARCH;
-        if id == ID_CANCEL {
-            set_pending(Event::Cancel);
-            return;
-        }
-        if id == ID_SECONDARY {
-            // Hidden on the empty card -- `apply_mode` -- so this cannot be
-            // reached there by pointer or by Tab. Answering nothing is what
-            // makes that a fact rather than a layout accident.
-            if !empty {
-                set_pending(if palette { Event::EditSelected } else { Event::NewLogin });
-            }
-            return;
-        }
         if id < ID_ROW {
             return;
         }
@@ -3272,29 +3236,6 @@ mod win32 {
         }
     }
 
-    /// The close glyph's rect in DEVICE pixels.
-    ///
-    /// One derivation, read by both the hit test and `in_close_glyph`, so the
-    /// rect `WM_NCHITTEST` excuses from the drag and the rect `WM_LBUTTONDOWN`
-    /// answers on can never be two different rectangles.
-    fn close_glyph_rect() -> RECT {
-        let l = card();
-        RECT {
-            left: scale(l.close_glyph.x),
-            top: scale(l.close_glyph.y),
-            right: scale(l.close_glyph.right()),
-            bottom: scale(l.close_glyph.bottom()),
-        }
-    }
-
-    fn in_close_glyph(lparam: LPARAM) -> bool {
-        crate::win32_draw::on_close_glyph(
-            (lparam.0 & 0xffff) as i16 as i32,
-            ((lparam.0 >> 16) & 0xffff) as i16 as i32,
-            close_glyph_rect(),
-        )
-    }
-
     // ---- painting ----------------------------------------------------------
 
     /// The card's own surface: the heading pair, the list's card and the close
@@ -3380,11 +3321,11 @@ mod win32 {
                 if has_help() {
                     panel_draw::draw_help_badge(mem, dev(l.help), fonts.help, panel_draw::help_hot());
                 }
-                text(mem, fonts.title, l.title, &title_run, crate::theme::INK);
-                text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::theme::TEXT_FAINT);
+                if l.heading {
+                    text(mem, fonts.title, l.title, &title_run, crate::theme::INK);
+                    text(mem, fonts.subtitle, l.subtitle, subtitle_run, crate::theme::TEXT_FAINT);
+                }
             }
-
-            paint_close_glyph(mem, l.close_glyph);
 
             drop(guard);
             let _ = BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
@@ -3428,90 +3369,6 @@ mod win32 {
                     // a card that never said which account they were on.
                     paint_row(mem, whole, id - ID_ROW, focused, hovered, fonts);
                 }
-            } else {
-                // The footer sits on the panel's white, which is also what the
-                // button's rounded corners show through.
-                fill(mem, whole, crate::theme::CARD);
-                SetBkMode(mem, TRANSPARENT);
-                let skin = panel_draw::skin(PanelButton::Outline, hovered);
-                if let Some(fonts) = fonts {
-                    let label = footer_label(id);
-                    // *Cancel* always shows `ESC` -- Escape cancels the card
-                    // in every mode, unlike *New login*, which `new_login_control`
-                    // hides under `MODE_PALETTE`.
-                    // *New login*'s chip is dropped in search mode: `N` is a
-                    // letter the user is typing there, so the key does not
-                    // fire and a chip promising it would be a lie. `ESC` is
-                    // not dropped, because Escape still cancels in every mode.
-                    // The footer's other button carries whichever key runs
-                    // the offer it is showing: `N` for *New login*, `B` for
-                    // *Edit binding* in the second step -- the button that had
-                    // no key at all until it was asked for. Both are read off
-                    // the same `MODE` the label is, so the chip cannot outlive
-                    // the offer it names. In search mode the chip is dropped:
-                    // `N` is a letter the user is typing there, so the key
-                    // does not fire and a chip promising it would be a lie.
-                    // `ESC` is never dropped, because Escape cancels in every
-                    // mode.
-                    let hint = if id == ID_CANCEL {
-                        Some(ESC_SHORTCUT)
-                    } else if id != ID_SECONDARY || in_search() {
-                        None
-                    } else if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
-                        Some(EDIT_BINDING_SHORTCUT)
-                    } else {
-                        Some(NEW_LOGIN_SHORTCUT)
-                    }
-                    .map(|text| (text, fonts.hint));
-                    let dpi = DPI_PERCENT.load(Ordering::SeqCst);
-                    if focused {
-                        // **The ring is given LOGICAL size, from `layout`.**
-                        // `rounded` scales everything it is handed, and `rc`
-                        // came back from `GetClientRect` in device pixels
-                        // already: passing it drew the ring at 1.5x the
-                        // control at 150%, running past the client area and
-                        // being clipped -- losing exactly the rounded corners
-                        // the ring exists to draw. `layout` knows the button's
-                        // logical size independently, so nothing has to divide
-                        // device pixels back down and round badly doing it.
-                        let l = card();
-                        let button = if id == ID_CANCEL { cancel_box() } else { l.secondary };
-                        rounded(
-                            mem,
-                            Box2 { x: 0, y: 0, w: button.w, h: button.h },
-                            panel_draw::BUTTON_RADIUS + 1,
-                            crate::theme::FOCUS_RING,
-                            None,
-                        );
-                        let inner = RECT {
-                            left: whole.left + 2,
-                            top: whole.top + 2,
-                            right: whole.right - 2,
-                            bottom: whole.bottom - 2,
-                        };
-                        draw_button_with_shortcut(
-                            mem,
-                            inner,
-                            &label,
-                            fonts.button,
-                            skin,
-                            scale(panel_draw::BUTTON_RADIUS),
-                            hint,
-                            dpi,
-                        );
-                    } else {
-                        draw_button_with_shortcut(
-                            mem,
-                            whole,
-                            &label,
-                            fonts.button,
-                            skin,
-                            scale(panel_draw::BUTTON_RADIUS),
-                            hint,
-                            dpi,
-                        );
-                    }
-                }
             }
             drop(guard);
 
@@ -3528,35 +3385,8 @@ mod win32 {
     /// The empty card's pair is [`super::empty_text`]'s rather than a literal
     /// here, so the words the card shows are the ones a test can read.
     fn headings() -> (String, &'static str) {
-        match MODE.load(Ordering::SeqCst) {
-            MODE_PALETTE => (
-                crate::i18n::t("picker.palette_title").to_string(),
-                crate::i18n::t("picker.palette_sub"),
-            ),
-            MODE_EMPTY => {
-                let app = APP_NAME.lock().map(|n| n.clone()).unwrap_or_default();
-                super::empty_text(&app)
-            }
-            MODE_SEARCH => {
-                let (title, subtitle) = super::search_text();
-                (title.to_string(), subtitle)
-            }
-            _ => (
-                crate::i18n::t("picker.list_title").to_string(),
-                crate::i18n::t("picker.list_sub"),
-            ),
-        }
-    }
-
-    fn footer_label(id: usize) -> String {
-        if id == ID_CANCEL {
-            return crate::i18n::t("picker.cancel").to_string();
-        }
-        if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
-            crate::i18n::t("picker.edit_binding").to_string()
-        } else {
-            crate::i18n::t("picker.new_login").to_string()
-        }
+        let app = APP_NAME.lock().map(|n| n.clone()).unwrap_or_default();
+        super::empty_text(&app)
     }
 
     /// One row, in whichever step is showing.
@@ -3575,11 +3405,11 @@ mod win32 {
             badge: fonts.badge,
             chip: fonts.hint,
         };
-        let look = |tile, name: &str, sub: &str, selected: bool, chip: Option<&str>| {
+        let look = |tile, name: &str, sub: &str, selected: bool| {
             panel_draw::draw_account_row(
                 hdc,
                 rect,
-                panel_draw::RowLook { tile, name, sub, selected, hovered, chip },
+                panel_draw::RowLook { tile, name, sub, selected, hovered, chip: None },
                 &faces,
                 dpi,
             )
@@ -3609,13 +3439,11 @@ mod win32 {
                     // a row, and a focused row with no mark on it is the defect
                     // the other modes draw selection-from-focus to avoid.
                     let selected = focused || SEARCH_SEL.load(Ordering::SeqCst) == at as isize;
-                    let shortcut = super::search_shortcut(at, shown.len());
                     look(
                         panel_draw::Tile::Initials(&candidate.name, at),
                         super::row_lines(candidate).0,
                         super::row_lines(candidate).1,
                         selected,
-                        shortcut.as_deref(),
                     );
                 }
                 // **No chip on either.** Neither is an account, and a number on
@@ -3623,7 +3451,7 @@ mod win32 {
                 // row is drawn under.
                 SearchRow::Overflow { .. } | SearchRow::Nothing => {
                     let (name, says) = super::search_row_text(row);
-                    look(panel_draw::Tile::None, &name, &says, focused, None);
+                    look(panel_draw::Tile::None, &name, &says, focused);
                 }
             }
             return;
@@ -3637,9 +3465,9 @@ mod win32 {
             // `new_login_control` and `search_control` -- so they say so. They
             // are the design's two buttons (D 1.5): the primary is the offer
             // the card exists for, and the other is outlined.
-            let (kind, key) = match action {
-                EmptyAction::NewLogin => (PanelButton::Primary, NEW_LOGIN_SHORTCUT),
-                EmptyAction::SearchVault => (PanelButton::Outline, SEARCH_SHORTCUT),
+            let kind = match action {
+                EmptyAction::NewLogin => PanelButton::Primary,
+                EmptyAction::SearchVault => PanelButton::Outline,
             };
             let height = scale(panel_draw::BUTTON_H);
             let top = rect.top + ((rect.bottom - rect.top) - height) / 2;
@@ -3673,13 +3501,12 @@ mod win32 {
                 fonts.button,
                 panel_draw::skin(kind, hovered),
                 scale(panel_draw::BUTTON_RADIUS),
-                Some((key, fonts.hint)),
+                None,
                 dpi,
             );
             return;
         }
         if MODE.load(Ordering::SeqCst) == MODE_PALETTE {
-            let rows = ENTRIES.lock().map(|e| e.len()).unwrap_or(0);
             let Some(send) = ENTRIES.lock().ok().and_then(|e| e.get(index).cloned()) else {
                 return;
             };
@@ -3687,8 +3514,7 @@ mod win32 {
             // **The digit is drawn on the row it runs**, the same chip and the
             // same painter the first step's candidates carry --
             // `super::palette_for_digit` is the one rule both read.
-            let shortcut = super::palette_shortcut(index, rows);
-            let tile = look(panel_draw::Tile::Blank, &name, says, focused, shortcut.as_deref());
+            let tile = look(panel_draw::Tile::Blank, &name, says, focused);
             // The tile the row leaves blank: the field's own mark in it.
             crate::win32_draw::draw_field_mark(hdc, tile, super::send_mark(&send), dpi);
             return;
@@ -3699,7 +3525,6 @@ mod win32 {
             // **The shortcut is drawn on the row it runs.** A shortcut nobody
             // can see is a shortcut nobody uses, and this chip is the only
             // place the card says the digits exist.
-            let shortcut = super::row_shortcut(index);
             let icon = ICONS.lock().ok().and_then(|icons| {
                 icons.get(index).and_then(|slot| slot.as_ref().map(|i| (i.bitmap, i.w, i.h)))
             });
@@ -3711,7 +3536,6 @@ mod win32 {
                     super::row_lines(candidate).0,
                     super::row_lines(candidate).1,
                     focused,
-                    shortcut.as_deref(),
                 );
                 draw_icon(hdc, tile, &Icon { bitmap, w, h });
             } else {
@@ -3720,7 +3544,6 @@ mod win32 {
                     super::row_lines(candidate).0,
                     super::row_lines(candidate).1,
                     focused,
-                    shortcut.as_deref(),
                 );
             }
             return;
@@ -3734,19 +3557,38 @@ mod win32 {
         // is measured so none can land here. `S` is its own key for its own
         // thing, and `search_control` clicks this very control, so the chip
         // names what the key does rather than describing a second path.
-        look(panel_draw::Tile::None, name, says, focused, Some(SEARCH_SHORTCUT));
+        let tile = look(panel_draw::Tile::Blank, name, says, focused);
+        draw_search_glyph(hdc, tile, dpi);
+    }
+
+    /// **The *Search the vault* row's icon**, drawn in its tile: a magnifier in
+    /// the muted ink on the neutral tile, 2 px stroke (design icon weight).
+    fn draw_search_glyph(hdc: HDC, tile: RECT, dpi: i32) {
+        use windows::Win32::Graphics::Gdi::{
+            CreatePen, Ellipse, GetStockObject, LineTo, MoveToEx, SelectObject, NULL_BRUSH, PS_SOLID,
+        };
+        let side = tile.right - tile.left;
+        let u = |v: i32| v * dpi / 100;
+        let (cx, cy) = (tile.left + side * 9 / 20, tile.top + side * 9 / 20);
+        let r = u(7);
+        unsafe {
+            let pen = CreatePen(PS_SOLID, u(2).max(1), rgb(crate::theme::TEXT_MUTED));
+            let old_pen = SelectObject(hdc, pen);
+            let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            let _ = Ellipse(hdc, cx - r, cy - r, cx + r, cy + r);
+            let from = (cx + r * 7 / 10, cy + r * 7 / 10);
+            let _ = MoveToEx(hdc, from.0, from.1, None);
+            let _ = LineTo(hdc, from.0 + u(6), from.1 + u(6));
+            SelectObject(hdc, old_brush);
+            SelectObject(hdc, old_pen);
+            let _ = DeleteObject(pen);
+        }
     }
 
     /// The brand lockup, through [`panel_draw::draw_lockup`] -- which every
     /// panel card draws through.
     fn paint_lockup(hdc: HDC, l: &super::Layout, font: HFONT) {
         panel_draw::draw_lockup(hdc, dev(l.mark), dev(l.wordmark), font);
-    }
-
-    /// The header's close glyph, drawn as two strokes because no bundled face
-    /// has it at this weight.
-    fn paint_close_glyph(hdc: HDC, at: Box2) {
-        panel_draw::draw_close_x(hdc, dev(at), scale(1).max(1), crate::theme::TEXT_FAINT);
     }
 
     fn fill(hdc: HDC, rc: RECT, colour: eframe::egui::Color32) {
@@ -4035,36 +3877,24 @@ mod card_tests {
         assert_eq!(describe_send(&Send::All), "username, Tab and password");
     }
 
-    /// **Every control the card lays out is inside the window it lays out.**
-    ///
-    /// The card neither scrolls nor resizes, so a control whose bottom edge
-    /// fell past the window's would simply be invisible -- and the last row is
-    /// the one that would go first.
+    /// **Every control the card lays out is inside the window it lays out, and
+    /// the window is the design's Fill panel: header, rows, 8 px of padding.**
     #[test]
     fn nothing_the_card_lays_out_falls_off_the_bottom_of_it() {
         let l = layout(LIST_ROWS);
 
-        // **The brand lockup**, which the port had dropped entirely and which
-        // this card now carries again. Pinned to the new truth rather than
-        // loosened: the card grew by the lockup's height plus its gap, and the
-        // window's own height assertions below are what hold that honest.
         let lockup = crate::panel_draw::lockup();
-        assert_eq!(
-            (l.mark.x, l.mark.y),
-            (MARGIN_X, MARGIN_TOP),
-            "the lockup does not start at the card's own top-left inset"
-        );
+        assert_eq!((l.mark.x, l.mark.y), (MARGIN_X, MARGIN_TOP));
         assert_eq!(l.mark.h, lockup.mark_h);
-        assert_eq!(
-            l.mark.w,
-            crate::win32_draw::mark_width(l.mark.h),
-            "the mark's box is not the design artboard's ratio, so the shield would be letterboxed \
-             inside it and drift away from the word beside it"
-        );
+        assert_eq!(l.mark.w, crate::win32_draw::mark_width(l.mark.h));
         assert!(l.mark.right() < l.wordmark.x, "the wordmark is drawn over the shield");
         assert_eq!(l.wordmark.h, l.mark.h, "the lockup's two halves are different heights");
         assert!(l.wordmark.right() <= l.help.x, "the wordmark runs under the `?` badge");
-        assert!(l.help.right() < l.close_glyph.x, "the `?` badge touches the ✕");
+        assert_eq!(
+            l.help.right(),
+            l.window.right() - MARGIN_X,
+            "design 1.3: the `?` is the header's last item, 16 px from the edge"
+        );
         assert!(
             l.tip.right() <= l.help.x && l.tip.bottom() <= l.window.bottom(),
             "the key-hint tooltip is not inside the card, to the left of its badge"
@@ -4074,117 +3904,60 @@ mod card_tests {
             assert!(lines.len() <= TIP_LINES_MAX, "a mode lists more keys than the tooltip holds");
             assert!(lines.last().unwrap().starts_with("Esc"));
         }
-        assert!(
-            l.wordmark.bottom() <= l.title.y,
-            "the card's title runs into the brand lockup above it"
-        );
-        assert!(
-            l.close_glyph.right() <= l.window.right() - MARGIN_X,
-            "the close glyph has crossed the card's right margin"
-        );
 
-        assert!(l.subtitle.bottom() <= l.list.y);
-        assert!(l.list.bottom() <= l.cancel.y);
-        // **Against the MARGIN, not against the window's edge.** The card's
-        // rule is `MARGIN_X` either side and `MARGIN_TOP` under the footer; a
-        // pin that only forbade a control leaving the window is 16 px slacker
-        // than the layout it guards, and would have watched `CANCEL_W` grow
-        // from 84 to 104 without a word. What is asserted is the rule.
-        assert!(
-            l.cancel.bottom() + MARGIN_TOP <= l.window.bottom(),
-            "the footer has eaten the card's bottom margin"
-        );
-        assert!(l.secondary.right() < l.cancel.x, "the two footer buttons overlap");
-        assert!(
-            l.secondary.x >= MARGIN_X,
-            "the footer pair has outgrown the card's left margin: it starts at {} px, inside \
-             MARGIN_X of {MARGIN_X}",
-            l.secondary.x
-        );
+        // **Header, rows, padding -- nothing else.** No heading pair, and the
+        // first row starts 10 px under the 23 px lockup (D 1.3: `pad 14 16 10`).
+        assert!(!l.heading, "the list card has grown a heading the design's Fill panel lacks");
+        assert_eq!((l.title.h, l.subtitle.h), (0, 0));
+        assert_eq!(l.list.y, 14 + 23 + 10);
         let last = row_at(LIST_ROWS, LIST_ROWS - 1);
-        assert!(
-            last.bottom() <= l.list.bottom(),
-            "the last row is outside the list area, and this card cannot scroll to it"
-        );
-        assert!(
-            l.close_glyph.right() <= l.window.right() - MARGIN_X,
-            "the close glyph has crossed the card's right margin"
-        );
-        // The bottom row of a full card is the *Search the vault* row, and it
-        // is the one that goes first if `LIST_ROWS` and `ROW_CAP` ever drift
-        // apart again.
+        assert!(last.bottom() <= l.list.bottom());
         assert_eq!(
-            populated_rows(ROW_CAP).len(),
-            LIST_ROWS,
-            "a full card plans {} rows onto {LIST_ROWS} laid-out slots",
-            populated_rows(ROW_CAP).len()
+            l.window.h,
+            14 + 23 + 10 + 64 * LIST_ROWS as i32 + 2 * (LIST_ROWS as i32 - 1) + 8,
+            "the card is not header + rows + the design's 8 px list padding"
         );
+        assert_eq!(populated_rows(ROW_CAP).len(), LIST_ROWS);
     }
 
-    /// **The empty card is exactly as tall as the offers it has.**
-    ///
-    /// Not the same claim as
-    /// [`nothing_the_card_lays_out_falls_off_the_bottom_of_it`] and
-    /// [`a_wall_of_custom_fields_cannot_push_a_row_off_the_card`], which bound
-    /// the last row from above: two rows trivially fit a card with room for
-    /// five, and a test that asserted only that let a card sized for five rows
-    /// it does not have ship with 132 px of bare `theme::CARD` under its last
-    /// offer. What is asserted here is the other direction -- that the card
-    /// asks the OS for the height its own content needs, and that no dead band
-    /// is left between the last offer and the Cancel button.
-    ///
-    /// `MODE_EMPTY` is allowed to do this and the other two steps are not:
-    /// see [`layout`]. It is decided once in `open` and never transitions, so
-    /// there is no live window whose Cancel button could move.
+    /// **The card is as tall as the rows it has** (design 1b fixes no height):
+    /// every row count from one to the full six, in both list steps.
+    #[test]
+    fn the_card_is_sized_to_its_content() {
+        for rows in 1..=LIST_ROWS {
+            let l = layout(rows);
+            assert_eq!(l.window.h, 47 + 66 * rows as i32 - 2 + 8, "{rows} rows");
+            assert_eq!(row_at(rows, rows - 1).bottom() - 2 + 8, l.window.h, "{rows} rows");
+        }
+        assert!(layout(2).window.h < layout(5).window.h);
+    }
+
+    /// **The empty card is design 1.5's No-match card, exactly as tall as the
+    /// offers it has**: header, heading pair, then the two 46 px buttons 8 px
+    /// apart, and nothing under them.
     #[test]
     fn the_empty_card_is_no_taller_than_the_offers_it_has() {
         let rows = empty_rows();
         assert_eq!(
             rows,
             vec![EmptyAction::NewLogin, EmptyAction::SearchVault],
-            "3a offered exactly these two, in this order, and the card that replaced it offers \
-             the same two under the same two names"
+            "3a offered exactly these two, in this order"
         );
-        assert!(
-            rows.len() <= LIST_ROWS,
-            "the empty card offered {} rows onto a card with room for {LIST_ROWS}, and this card \
-             does not scroll -- the rest would simply be unreachable",
-            rows.len()
-        );
+        assert!(rows.len() <= LIST_ROWS);
 
-        let l = layout(rows.len());
-        let last = row_at(rows.len(), rows.len() - 1);
-        assert!(last.bottom() <= l.list.bottom());
+        let l = layout_empty(rows.len());
+        assert!(l.heading, "the No-match card has its title and body");
+        assert!(l.wordmark.bottom() <= l.title.y, "the title runs into the lockup");
+        assert!(l.title.bottom() <= l.subtitle.y);
+        assert_eq!(l.subtitle.y - l.title.bottom(), 4, "D 1.5: the title block's gap is 4");
+        assert!(l.subtitle.bottom() <= l.list.y);
+        assert_eq!(EMPTY_ROW_H, 46 + 8, "D 1.5: buttons 46 high, gap 8");
+        let last = row_at_empty(rows.len(), rows.len() - 1);
+        assert_eq!(last.bottom(), l.list.bottom(), "dead band under the last offer");
+        assert_eq!(l.window.h, l.list.bottom() + MARGIN_TOP);
         assert_eq!(
-            last.bottom(),
-            l.list.bottom(),
-            "the empty card's list is drawn taller than its own offers: {} px of bare \
-             `theme::CARD` sits under the last one. The card cannot scroll and has no rows to \
-             fill that band, so it reads as a list that lost its contents",
-            l.list.bottom() - last.bottom()
-        );
-
-        // The window follows the list, so the dead band is not merely pushed
-        // out of the card and into the gap above Cancel.
-        let full = layout(LIST_ROWS);
-        let needed = full.window.h - ROW_H * (LIST_ROWS - rows.len()) as i32;
-        assert_eq!(
-            l.window.h,
-            needed,
-            "the empty card asks the OS for a {} px window when its own {} offers need {needed} \
-             px. A card sized for rows it does not have is {} px of bare `theme::CARD` between \
-             *Search vault* and *Cancel* -- and the fixed height buys nothing here, because \
-             `MODE_EMPTY` never transitions and so has no Cancel button that could move out \
-             from under the pointer",
-            l.window.h,
-            rows.len(),
-            l.window.h - needed
-        );
-        assert_eq!(
-            l.cancel.y - l.list.bottom(),
-            full.cancel.y - full.list.bottom(),
-            "the empty card's footer does not sit the same distance below its list as the \
-             populated card's does"
+            row_at_empty(rows.len(), 1).y - row_at_empty(rows.len(), 0).y,
+            EMPTY_ROW_H
         );
     }
 
@@ -4257,50 +4030,32 @@ mod card_tests {
         }
     }
 
-    /// **The search card's own geometry**, held to the same rule as the list's.
-    ///
-    /// The mode adds a control between the subtitle and the list, and this card
-    /// neither scrolls nor resizes to reach anything that fell off the bottom
-    /// because of it.
+    /// **The search card's own geometry**: the header, then one field holding the
+    /// box and the six result slots, at a height that does not change with the
+    /// results.
     #[test]
     fn nothing_the_search_card_lays_out_falls_off_the_bottom_of_it() {
         let l = layout_for(LIST_ROWS, true);
         let slot = l.search.expect("the search shape has a search box");
-        assert!(l.subtitle.bottom() <= slot.y, "the search box overlaps the subtitle");
+        assert!(!l.heading);
+        assert_eq!(slot.y, l.mark.bottom() + 10, "the box sits where the first row would");
         assert!(slot.bottom() <= l.list.y, "the search box overlaps the list");
         assert!(slot.x >= MARGIN_X && slot.right() <= l.window.right() - MARGIN_X);
-        assert!(l.list.bottom() <= l.cancel.y);
-        assert!(
-            l.cancel.bottom() + MARGIN_TOP <= l.window.bottom(),
-            "the footer has eaten the search card's bottom margin"
-        );
-        assert!(l.secondary.right() < l.cancel.x, "the two footer buttons overlap");
+        assert!(l.list.bottom() + MARGIN_X <= l.window.bottom());
         let last = row_at_for(LIST_ROWS, true, LIST_ROWS - 1);
-        assert!(
-            last.bottom() <= l.list.bottom(),
-            "the search card's last row is outside its list area, and this card cannot scroll"
-        );
+        assert!(last.bottom() <= l.list.bottom());
 
-        // **The mode costs exactly the box, and no gap at all.** Pinned to
-        // the new truth rather than loosened: the box and the list used to be
-        // two bordered containers with a `SEARCH_GAP` between them, and they
-        // are one field now -- so the gap that separated them is gone with
-        // them and the card is that much shorter. A card that gained height
-        // for any other reason is a card whose layout has drifted from the
-        // list's.
+        // The box is the one thing search mode adds to the list's own content.
         let list = layout(LIST_ROWS);
         assert_eq!(
             l.window.h - list.window.h,
-            SEARCH_H,
-            "search mode changed the card's height by something other than its own box: the two \
-             containers are one field now, so the box costs its own height and nothing else"
+            SEARCH_H + MARGIN_X - 6,
+            "search mode changed the card's height by something other than its own box"
         );
         assert_eq!(l.title, list.title);
-        assert_eq!(l.subtitle, list.subtitle);
         assert_eq!(
             list.search, None,
-            "the list mode is laying out a search box it does not show, which is a control the \
-             user could tab into and a slot the card would draw a hairline across"
+            "the list mode is laying out a search box it does not show"
         );
     }
 
@@ -4425,7 +4180,6 @@ mod card_tests {
             "the card's search box has grown a height of its own, so a redesign of design 2b's \
              search box would leave this one behind"
         );
-        assert_eq!(BUTTON_H, crate::panel_draw::BUTTON_H);
     }
 
     /// **Design D 1.3's rows, in numbers**: a 64 px row, 2 px apart, in a list
@@ -4475,7 +4229,7 @@ mod card_tests {
         let src = include_str!("picker_prompt.rs").replace("\r\n", "\n");
         assert!(src.contains(concat!("title: font(EXTRA", "BOLD, panel_draw::TITLE_PX)")));
         assert!(src.contains(concat!("subtitle: font(REG", "ULAR, panel_draw::BODY_PX)")));
-        let l = layout(LIST_ROWS);
+        let l = layout_empty(2);
         assert_eq!(l.subtitle.y - l.title.bottom(), 4, "D 1.5: the title block's gap is 4");
     }
 
@@ -5437,10 +5191,9 @@ mod tests {
             "control: this scan is not reading the card's key map at all"
         );
         assert!(
-            flat.contains("if vk == LETTER_B { if let Some(id) = edit_binding_control() { \
-                           clicked(id); }"),
-            "`B` no longer clicks the control that means *Edit binding*, so the key and the \
-             mouse are two paths and `run_with` can tell them apart"
+            flat.contains("if mode == MODE_PALETTE && vk == LETTER_B { \
+                           set_pending(Event::EditSelected); return true; }"),
+            "`B` no longer asks for *Edit binding* in the second step"
         );
         assert!(
             flat.contains("if let Some(index) = super::palette_for_digit(digit, rows) { \
@@ -5449,7 +5202,7 @@ mod tests {
         );
         assert!(
             !flat.contains("fn shortcut(vk: u16) -> bool { set_pending"),
-            "control: the key map posts an event directly rather than clicking a control"
+            "control: the key map posts an event directly before it has read any key"
         );
     }
 
@@ -5649,80 +5402,44 @@ mod tests {
         let body = &flat[flat.find("fn enter_clicks_focus(").expect("the function is gone")..];
         let body = &body[..body.find("fn row_arrow(").expect("control: `row_arrow` follows it")];
         assert!(body.contains("clicked(id)"), "Enter no longer clicks through `clicked`");
-        for id in ["ID_ROW + index", "ID_SECONDARY", "ID_CANCEL"] {
-            assert!(body.contains(id), "Enter no longer reaches {id}");
-        }
+        assert!(body.contains("ID_ROW + index"), "Enter no longer reaches the rows");
     }
 
-    /// **The *Cancel* button advertises the key that has always cancelled
-    /// it.**
-    ///
-    /// A source pin, not a paint assertion -- nothing here can open the
-    /// window `paint_control` draws into. What is decidable is that the
-    /// production code hands `ESC_SHORTCUT` to `draw_button_with_shortcut`
-    /// for `ID_CANCEL`, the same call `ID_SECONDARY` uses for
-    /// `NEW_LOGIN_SHORTCUT`, so the two footer buttons get their chips from
-    /// one function rather than a second chip style growing beside it.
+    /// **The card is the header and the rows**: no footer buttons, no close
+    /// glyph, no key badges -- the owner's ruling, reversing slice 11's.
+    /// Escape, the digits, typing and Ctrl+N still work; they are just not drawn.
     #[test]
-    fn the_cancel_button_shows_its_escape_chip() {
+    fn the_card_draws_no_footer_no_close_glyph_and_no_key_badges() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let raw =
             std::fs::read_to_string(src.join("picker_prompt.rs")).unwrap().replace("\r\n", "\n");
         let production = raw.split(concat!("\n#[cfg(", "test)]\n")).next().unwrap();
-        // Comments stripped, like the pins beside this one: the prose above
-        // the branch names both `ID_CANCEL` and `ESC_SHORTCUT`, and a scan
-        // that could not tell code from the comment explaining it would pass
-        // on the explanation alone.
+        assert!(production.len() < raw.len(), "control: the cut marker was not found");
         let code: String = production
             .lines()
             .map(|line| line.split("//").next().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
-        // **Whitespace-normalised, so this pin is about the code and not
-        // about its indentation.** Matching twenty-four exact spaces made a
-        // `rustfmt` reflow of `paint_control` -- a wrapped `if`, a renamed
-        // binding one line up -- fail as though the chip had been deleted. A
-        // false alarm on a pin is how pins get deleted. The claim is the
-        // same: `ID_CANCEL`'s branch is the one that yields `ESC_SHORTCUT`.
         let flat = code.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains("fn paint_control"), "control: not reading the painter");
+        for gone in [
+            concat!("ID_", "CANCEL"),
+            concat!("ID_", "SECONDARY"),
+            concat!("paint_close", "_glyph"),
+            concat!("close_glyph", "_rect"),
+            concat!("footer", "_label"),
+            concat!("fonts.", "hint)"),
+        ] {
+            assert!(!flat.contains(gone), "`{gone}` is back on a card that has no footer or badges");
+        }
+        assert!(flat.contains("chip: None"), "a row is drawing a key badge again");
+        // The keys that replace the badges.
         assert!(
-            production.len() < raw.len(),
-            "control: the `#[cfg(test)]` cut marker was not found, so this scan is reading the \
-             test module as production"
+            flat.contains("if vk == LETTER_N && (mode == MODE_LIST || mode == MODE_EMPTY) { set_pending(Event::NewLogin);"),
+            "Ctrl+N no longer opens *New login* from the list"
         );
-        assert!(
-            flat.contains("if id == ID_CANCEL { Some(ESC_SHORTCUT)"),
-            "the production code no longer hands `ESC_SHORTCUT` to `ID_CANCEL`'s branch -- the \
-             Cancel button's chip is gone"
-        );
-        assert!(
-            flat.contains("draw_button_with_shortcut"),
-            "control: this scan is not reading the function that paints the footer buttons"
-        );
-        assert!(
-            flat.contains("id != ID_SECONDARY || in_search()"),
-            "control: the whitespace-normalised scan is not reading `paint_control`'s hint \
-             branch at all, so the rule above could be matching some other text"
-        );
-        // **And *New login* does not advertise `N` where `N` types.** Search
-        // mode's bare keys go to the `EDIT`, so the chip has to go with them.
-        // `ESC` is not conditioned this way, and must not be: Escape cancels
-        // in every mode.
-        assert!(
-            flat.contains("id != ID_SECONDARY || in_search() { None }"),
-            "the *New login* button still shows its `N` chip in search mode, where `N` is a \
-             letter the user is typing and the key does not fire"
-        );
-        // **The second step's footer button advertises its own key.** It had
-        // none at all -- "Edit shortcut as well" -- and the chip is drawn from
-        // the same `MODE` its label is read from, so a chip naming an offer
-        // the button is not showing is not a state this branch has.
-        assert!(
-            flat.contains("MODE_PALETTE { Some(EDIT_BINDING_SHORTCUT)"),
-            "*Edit binding* no longer shows the key that runs it, so the second step's footer \
-             button is back to advertising nothing"
-        );
-        assert_eq!(ESC_SHORTCUT, "ESC");
+        assert!(flat.contains("SEARCH_SEED"), "typing no longer starts the search");
+        assert!(flat.contains("VK_ESCAPE"), "Escape no longer cancels");
     }
 
     #[test]
@@ -6016,7 +5733,7 @@ mod no_device_pixels_in_a_logical_box_pin {
             found.len()
         );
         assert!(
-            found.iter().any(|body| body.contains("button.w")),
+            found.iter().any(|body| body.contains("FOCUS_RING_W")),
             "the focus ring's own literal was not among those scanned"
         );
     }
